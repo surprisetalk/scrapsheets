@@ -4,6 +4,7 @@ import Array exposing (Array)
 import Browser exposing (Document)
 import Html as H exposing (Html, text)
 import Html.Attributes as A exposing (style)
+import Html.Events as A
 import Regex exposing (Regex)
 import Task
 import Time
@@ -76,16 +77,20 @@ init _ =
     ( { selected = Nothing
       , editing = Nothing
       , sheet = { cols = 3, cells = Array.fromList <| [ "a", "b", "c", "d", "e", "f", "g", "h", "i" ] }
-      , rules = [ ( Rect ( ( 0, 1 ), ( 1, 1 ) ), \sheet -> { sheet | cells = Array.map String.toUpper sheet.cells }, ( 1, 0 ) ) ]
+      , rules = [ ( Rect ( ( 0, 0 ), ( 1, 0 ) ), \sheet -> { sheet | cells = Array.map String.toUpper sheet.cells }, ( 0, 1 ) ) ]
       }
-    , Cmd.none
+    , Task.perform CellsWritten (Task.succeed ( ( 0, 0 ), ( 2, 2 ) ))
     )
 
 
 origin : Rect -> Index
-origin query =
-    -- TODO
-    ( 0, 0 )
+origin ( ( xa, ya ), ( xb, yb ) ) =
+    ( min xa xb, min ya yb )
+
+
+single : Index -> Rect
+single i =
+    ( i, i )
 
 
 translate : Vector -> Index -> Index
@@ -98,6 +103,11 @@ toFlatIndex cols ( x, y ) =
     x * cols + y
 
 
+fromFlatIndex : Int -> Int -> Index
+fromFlatIndex cols i =
+    ( i // cols, modBy cols i )
+
+
 overlaps : Rect -> Rect -> Bool
 overlaps ( ( xaa, yaa ), ( xab, yab ) ) ( ( xba, yba ), ( xbb, ybb ) ) =
     False
@@ -106,8 +116,15 @@ overlaps ( ( xaa, yaa ), ( xab, yab ) ) ( ( xba, yba ), ( xbb, ybb ) ) =
 
 
 focus : Rect -> Sheet -> Sheet
-focus ( ( xa, ya ), ( xb, yb ) ) s =
-    { cols = abs (xb - xa), cells = Tuple.second (Array.foldl (\( i, x ) y -> ( i + 1, iif () (Array.push x y) y )) ( 0, Array.empty ) s.cells) }
+focus r s =
+    let
+        ( ( xa, ya ), ( xb, yb ) ) =
+            r
+
+        cols =
+            max 1 (abs (xb - xa))
+    in
+    { cols = cols, cells = Tuple.second (Array.foldl (\x ( i, y ) -> ( i + 1, iif (overlaps r (single (fromFlatIndex cols i))) (Array.push x y) y )) ( 0, Array.empty ) s.cells) }
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -150,10 +167,11 @@ update msg ({ sheet } as model) =
                                 subsheets
                     }
               }
-            , Cmd.batch <|
-                List.map (Task.perform CellsWritten << Task.succeed) <|
-                    List.map (\( ( x, y ), { cols, cells } ) -> ( ( x, y ), ( x + modBy cols (Array.length cells), y + Array.length cells // cols * sheet.cols ) )) <|
-                        subsheets
+            , Cmd.none
+              -- , Cmd.batch <|
+              --     List.map (Task.perform CellsWritten << Task.succeed) <|
+              --         List.map (\( ( x, y ), { cols, cells } ) -> ( ( x, y ), ( x + modBy cols (Array.length cells), y + Array.length cells // cols * sheet.cols ) )) <|
+              --             subsheets
             )
 
 
@@ -164,7 +182,7 @@ view model =
         [ H.div [ style "display" "grid", style "grid-template-columns" "2fr 1fr" ]
             [ H.div [ style "display" "grid", style "grid-template-columns" (String.repeat model.sheet.cols "1fr ") ] <|
                 Array.toList <|
-                    Array.map (\cell -> H.tr [] [ H.td [] [ text cell ] ]) <|
+                    Array.indexedMap (\i cell -> H.tr [] [ H.td [ A.onClick (CellsWritten ( fromFlatIndex model.sheet.cols i, fromFlatIndex model.sheet.cols i )) ] [ text cell ] ]) <|
                         model.sheet.cells
             , H.div [ style "display" "flex", style "flex-direction" "column" ] <|
                 List.map (\rule -> H.div [] [ text (Debug.toString rule) ]) <|
