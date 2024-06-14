@@ -20,7 +20,8 @@ iif c t f =
 
 
 type Msg
-    = CellsWritten Rect
+    = WriteCell Int String
+    | CellsWritten Rect
 
 
 type alias Cell =
@@ -76,16 +77,16 @@ init : () -> ( Model, Cmd Msg )
 init _ =
     ( { selected = Nothing
       , editing = Nothing
-      , sheet = { cols = 3, cells = Array.fromList <| [ "a", "b", "c", "d", "e", "f", "g", "h", "i" ] }
-      , rules = [ ( Rect ( ( 0, 0 ), ( 1, 0 ) ), \sheet -> { sheet | cells = Array.map String.toUpper sheet.cells }, ( 0, 1 ) ) ]
+      , sheet = { cols = 10, cells = Array.initialize (10 * 100) (\i -> String.fromInt (modBy 10 i) ++ "," ++ String.fromInt (i // 10)) }
+      , rules = [ ( Rect ( ( 0, 0 ), ( 3, 4 ) ), \sheet -> { sheet | cells = Array.map (\x -> "(" ++ x ++ ")") sheet.cells }, ( 3, 4 ) ) ]
       }
-    , Task.perform CellsWritten (Task.succeed ( ( 0, 0 ), ( 2, 2 ) ))
+    , Task.perform CellsWritten (Task.succeed ( ( 0, 0 ), ( 100, 100 ) ))
     )
 
 
 origin : Rect -> Index
-origin ( ( xa, ya ), ( xb, yb ) ) =
-    ( min xa xb, min ya yb )
+origin ( a, _ ) =
+    a
 
 
 single : Index -> Rect
@@ -100,7 +101,7 @@ translate ( x, y ) ( x_0, y_0 ) =
 
 toFlatIndex : Int -> Index -> Int
 toFlatIndex cols ( x, y ) =
-    x * cols + y
+    y * cols + x
 
 
 fromFlatIndex : Int -> Int -> Index
@@ -108,28 +109,39 @@ fromFlatIndex cols i =
     ( i // cols, modBy cols i )
 
 
+intersect : Rect -> Rect -> Rect
+intersect ( ( xaa, yaa ), ( xab, yab ) ) ( ( xba, yba ), ( xbb, ybb ) ) =
+    ( ( max xaa xba, max yaa yba ), ( min xab xbb, min yab ybb ) )
+
+
 overlaps : Rect -> Rect -> Bool
-overlaps ( ( xaa, yaa ), ( xab, yab ) ) ( ( xba, yba ), ( xbb, ybb ) ) =
-    False
-        || ((abs (xbb - xba) + abs (xab - xaa)) >= (abs (Maybe.withDefault 0 (List.maximum [ xbb, xba, xab, xaa ])) - abs (Maybe.withDefault 0 (List.minimum [ xbb, xba, xab, xaa ]))))
-        || ((abs (ybb - yba) + abs (yab - yaa)) >= (abs (Maybe.withDefault 0 (List.maximum [ ybb, yba, yab, yaa ])) - abs (Maybe.withDefault 0 (List.minimum [ ybb, yba, yab, yaa ]))))
+overlaps a b =
+    intersect a b |> (\( ( xa, ya ), ( xb, yb ) ) -> xa < xb && ya < yb)
 
 
-focus : Rect -> Sheet -> Sheet
-focus r s =
+crop : Rect -> Sheet -> Sheet
+crop r s =
     let
         ( ( xa, ya ), ( xb, yb ) ) =
-            r
+            intersect r ( ( 0, 0 ), ( s.cols - 1, Array.length s.cells // s.cols - 1 ) )
 
         cols =
-            max 1 (abs (xb - xa))
+            max 0 (xb - xa)
+
+        rows =
+            max 0 (yb - ya)
     in
-    { cols = cols, cells = Tuple.second (Array.foldl (\x ( i, y ) -> ( i + 1, iif (overlaps r (single (fromFlatIndex cols i))) (Array.push x y) y )) ( 0, Array.empty ) s.cells) }
+    { cols = cols, cells = Array.initialize (cols * rows) (\i -> s.cells |> Array.get (ya + (i // cols) * s.cols + xa + modBy (max 1 cols) i) |> Maybe.withDefault "") }
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg ({ sheet } as model) =
     case msg of
+        WriteCell i x ->
+            ( { model | sheet = { sheet | cells = Array.set i x sheet.cells } }
+            , Task.perform CellsWritten (Task.succeed ( fromFlatIndex sheet.cols i, Tuple.mapBoth ((+) 1) ((+) 1) (fromFlatIndex sheet.cols i) ))
+            )
+
         CellsWritten r ->
             let
                 subsheets : List ( Index, Sheet )
@@ -138,7 +150,7 @@ update msg ({ sheet } as model) =
                         (\( query, rule, vec ) ->
                             case query of
                                 Rect q ->
-                                    iif (overlaps r q) [ ( translate vec (origin q), rule (focus q model.sheet) ) ] []
+                                    iif (overlaps r q) [ ( translate vec (origin q), rule (crop q model.sheet) ) ] []
 
                                 -- TODO
                                 Pattern () ->
@@ -167,11 +179,10 @@ update msg ({ sheet } as model) =
                                 subsheets
                     }
               }
-            , Cmd.none
-              -- , Cmd.batch <|
-              --     List.map (Task.perform CellsWritten << Task.succeed) <|
-              --         List.map (\( ( x, y ), { cols, cells } ) -> ( ( x, y ), ( x + modBy cols (Array.length cells), y + Array.length cells // cols * sheet.cols ) )) <|
-              --             subsheets
+            , Cmd.batch <|
+                List.map (Task.perform CellsWritten << Task.succeed) <|
+                    List.map (\( ( x, y ), { cols, cells } ) -> ( ( x, y ), ( x + modBy cols (Array.length cells), y + Array.length cells // cols * sheet.cols ) )) <|
+                        subsheets
             )
 
 
@@ -182,7 +193,7 @@ view model =
         [ H.div [ style "display" "grid", style "grid-template-columns" "2fr 1fr" ]
             [ H.div [ style "display" "grid", style "grid-template-columns" (String.repeat model.sheet.cols "1fr ") ] <|
                 Array.toList <|
-                    Array.indexedMap (\i cell -> H.tr [] [ H.td [ A.onClick (CellsWritten ( fromFlatIndex model.sheet.cols i, fromFlatIndex model.sheet.cols i )) ] [ text cell ] ]) <|
+                    Array.indexedMap (\i cell -> H.tr [] [ H.td [ A.onClick (WriteCell i (cell ++ "!")) ] [ text cell ] ]) <|
                         model.sheet.cells
             , H.div [ style "display" "flex", style "flex-direction" "column" ] <|
                 List.map (\rule -> H.div [] [ text (Debug.toString rule) ]) <|
