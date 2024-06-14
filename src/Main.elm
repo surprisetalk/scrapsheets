@@ -76,7 +76,7 @@ init _ =
     ( { selected = Nothing
       , editing = Nothing
       , sheet = { cols = 3, cells = Array.fromList <| [ "a", "b", "c", "d", "e", "f", "g", "h", "i" ] }
-      , rules = [] -- [ ( Column 1, Array.get 0 >> Maybe.map String.toUpper, ( 1, 0 ) ) ]
+      , rules = [ ( Rect ( ( 0, 1 ), ( 1, 1 ) ), \sheet -> { sheet | cells = Array.map String.toUpper sheet.cells }, ( 1, 0 ) ) ]
       }
     , Cmd.none
     )
@@ -89,27 +89,25 @@ origin query =
 
 
 translate : Vector -> Index -> Index
-translate vec i =
-    -- TODO
-    i
+translate ( x, y ) ( x_0, y_0 ) =
+    ( x_0 + x, y_0 + y )
 
 
 toFlatIndex : Int -> Index -> Int
 toFlatIndex cols ( x, y ) =
-    -- TODO
-    0
+    x * cols + y
 
 
 overlaps : Rect -> Rect -> Bool
-overlaps a b =
-    -- TODO
+overlaps ( ( xaa, yaa ), ( xab, yab ) ) ( ( xba, yba ), ( xbb, ybb ) ) =
     False
+        || ((abs (xbb - xba) + abs (xab - xaa)) >= (abs (Maybe.withDefault 0 (List.maximum [ xbb, xba, xab, xaa ])) - abs (Maybe.withDefault 0 (List.minimum [ xbb, xba, xab, xaa ]))))
+        || ((abs (ybb - yba) + abs (yab - yaa)) >= (abs (Maybe.withDefault 0 (List.maximum [ ybb, yba, yab, yaa ])) - abs (Maybe.withDefault 0 (List.minimum [ ybb, yba, yab, yaa ]))))
 
 
 focus : Rect -> Sheet -> Sheet
-focus r s =
-    -- TODO
-    s
+focus ( ( xa, ya ), ( xb, yb ) ) s =
+    { cols = abs (xb - xa), cells = Tuple.second (Array.foldl (\( i, x ) y -> ( i + 1, iif () (Array.push x y) y )) ( 0, Array.empty ) s.cells) }
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
