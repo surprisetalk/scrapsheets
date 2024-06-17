@@ -2,10 +2,12 @@ module Main exposing (Model, Msg(..), Query(..), Rule, main)
 
 import Array exposing (Array)
 import Browser exposing (Document)
+import Browser.Dom as Dom
 import Html as H exposing (Html, text)
 import Html.Attributes as A exposing (style)
 import Html.Events as A
 import Html.Lazy as H
+import Json.Encode as E
 import Process
 import Regex exposing (Regex)
 import Task
@@ -21,10 +23,13 @@ iif c t f =
 
 
 type Msg
-    = WriteCell Int String
+    = NoOp
+    | WriteCell Int String
     | CellsWritten Rect
     | CellsSelecting Index
     | CellsSelected Index
+    | CellEditing Index String
+    | FrameDurationUpdated String
 
 
 type alias Cell =
@@ -80,7 +85,7 @@ type alias Model =
     , sheet : Sheet
     , rules : List Rule
     , newRule : ( Int, RuleDef )
-    , frameDuration : Float
+    , frameDuration : Int
     }
 
 
@@ -172,8 +177,17 @@ crop r s =
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg ({ sheet } as model) =
     case msg of
+        NoOp ->
+            ( model, Cmd.none )
+
+        FrameDurationUpdated n ->
+            ( { model | frameDuration = Maybe.withDefault model.frameDuration <| String.toInt n }, Cmd.none )
+
         WriteCell i x ->
-            ( { model | sheet = { sheet | cells = Array.set i x sheet.cells } }
+            ( { model
+                | sheet = { sheet | cells = Array.set i x sheet.cells }
+                , editing = ( ( -1, -1 ), "" )
+              }
             , Task.perform CellsWritten (Task.succeed ( fromFlatIndex sheet.cols i, Tuple.mapBoth ((+) 1) ((+) 1) (fromFlatIndex sheet.cols i) ))
             )
 
@@ -215,7 +229,7 @@ update msg ({ sheet } as model) =
                     }
               }
             , Cmd.batch <|
-                List.map (Task.perform CellsWritten << (\x -> Task.andThen (always (Task.succeed x)) (Process.sleep model.frameDuration))) <|
+                List.map (Task.perform CellsWritten << (\x -> Task.andThen (always (Task.succeed x)) (Process.sleep (toFloat model.frameDuration)))) <|
                     List.map (\( ( x, y ), { cols, cells } ) -> ( ( x, y ), ( x + modBy cols (Array.length cells), y + Array.length cells // cols * sheet.cols ) )) <|
                         subsheets
             )
@@ -231,19 +245,17 @@ update msg ({ sheet } as model) =
                 Pattern _ ->
                     ( { model | selected = Rect ( b, b ) }, Cmd.none )
 
+        CellEditing i s ->
+            ( { model | editing = ( i, s ) }, Task.attempt (\_ -> NoOp) (Dom.focus "edit") )
+
 
 view : Model -> Document Msg
 view model =
     { title = "scrapsheets"
     , body =
-        -- { selected : Query
-        -- , editing : ( Index, Cell )
-        -- , sheet : Sheet
-        -- , rules : List Rule
-        -- , newRule : ( Int, RuleDef )
-        -- , frameDuration : Float
-        -- }
-        [ H.node "style" [] [ text ".cell:hover { background: #eee;  }" ]
+        -- TODO: rules : List Rule
+        -- TODO: newRule : ( Int, RuleDef )
+        [ H.node "style" [] [ text ".cell:hover { background: #eee; }" ]
         , H.div
             [ style "display" "grid"
             , style "grid-template-columns" "2fr 1fr"
@@ -251,28 +263,59 @@ view model =
             , style "-webkit-user-select" "none"
             , style "cursor" "pointer"
             ]
-            [ H.lazy
-                (H.div
+            [ -- TODO: "resize table" settings
+              H.lazy
+                (H.form
                     [ style "display" "grid"
                     , style "grid-template-columns" (String.repeat model.sheet.cols "1fr ")
+                    , A.onSubmit (WriteCell (toFlatIndex model.sheet.cols (Tuple.first model.editing)) (Tuple.second model.editing))
                     ]
                     << Array.toList
                     << Array.indexedMap
                         (\i cell ->
+                            let
+                                index =
+                                    fromFlatIndex model.sheet.cols i
+                            in
                             H.div
                                 [ A.class "cell"
-                                , style "background" (iif (match model.selected (fromFlatIndex model.sheet.cols i) cell) "#ddd" "")
-                                , A.onClick (WriteCell i (cell ++ "!"))
-                                , A.onMouseDown (CellsSelecting (fromFlatIndex model.sheet.cols i))
-                                , A.onMouseUp (CellsSelected (fromFlatIndex model.sheet.cols i))
+                                , style "background" (iif (match model.selected index cell) "#ddd" "")
+                                , A.onClick (CellEditing index cell)
+                                , A.onMouseDown (CellsSelecting index)
+                                , A.onMouseUp (CellsSelected index)
                                 ]
-                                [ text cell ]
+                                [ if index == Tuple.first model.editing then
+                                    H.input
+                                        [ A.id "edit"
+                                        , style "width" "100%"
+                                        , A.value (Tuple.second model.editing)
+                                        , A.onInput (CellEditing index)
+                                        ]
+                                        []
+
+                                  else
+                                    text cell
+                                ]
                         )
                 )
                 model.sheet.cells
             , H.div [ style "display" "flex", style "flex-direction" "column" ] <|
-                List.map (\rule -> H.div [] [ text (Debug.toString rule) ]) <|
-                    model.rules
+                List.concat
+                    [ List.map (\rule -> H.div [] [ text (Debug.toString rule) ]) <|
+                        model.rules
+                    , [ H.div []
+                            [ H.span [] [ text (String.fromInt model.frameDuration) ]
+                            , H.input
+                                [ A.onInput FrameDurationUpdated
+                                , A.type_ "range"
+                                , A.min "10"
+                                , A.max "1000"
+                                , A.value (String.fromInt model.frameDuration)
+                                ]
+                                []
+                            ]
+                      ]
+                    ]
             ]
         ]
     }
