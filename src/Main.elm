@@ -36,15 +36,7 @@ type alias Cell =
     String
 
 
-type alias Rule =
-    { query : Query
-    , rule : Sheet -> Sheet
-    , def : RuleDef
-    , move : Vector
-    }
-
-
-type RuleDef
+type Rule
     = HttpFetch String
     | JS String
     | JsonPath String
@@ -83,8 +75,8 @@ type alias Model =
     { selected : Query
     , editing : ( Index, Cell )
     , sheet : Sheet
-    , rules : List Rule
-    , newRule : ( Int, RuleDef )
+    , rules : List ( Query, Rule, Vector )
+    , newRule : ( Int, Rule )
     , frameDuration : Int
     }
 
@@ -105,11 +97,10 @@ init _ =
       , editing = ( ( -1, -1 ), "" )
       , sheet = { cols = 10, cells = Array.initialize (10 * 100) (\i -> String.fromInt (modBy 10 i) ++ "," ++ String.fromInt (i // 10)) }
       , rules =
-            [ { query = Rect ( ( 0, 0 ), ( 3, 4 ) )
-              , rule = \sheet -> { sheet | cells = Array.map (\x -> "(" ++ x ++ ")") sheet.cells }
-              , def = JS "TODO"
-              , move = ( 3, 4 )
-              }
+            [ ( Rect ( ( 0, 0 ), ( 3, 4 ) )
+              , JS "TODO"
+              , ( 4, 5 )
+              )
             ]
       , newRule = ( -1, JS "" )
       , frameDuration = 100
@@ -137,6 +128,43 @@ match q ( xi, yi ) s =
         -- TODO
         Pattern _ ->
             False
+
+
+apply : Rule -> (Sheet -> ( Sheet, Cmd Msg ))
+apply rule sheet =
+    case rule of
+        HttpFetch x ->
+            -- TODO
+            ( { cols = 1, cells = Array.empty }, Cmd.none )
+
+        JS x ->
+            -- TODO
+            ( { sheet | cells = Array.map (always "TODO!") sheet.cells }, Cmd.none )
+
+        JsonPath x ->
+            -- TODO
+            ( { cols = 1, cells = Array.empty }, Cmd.none )
+
+        Copy ->
+            ( sheet, Cmd.none )
+
+        Sum ->
+            -- TODO
+            ( { cols = 1, cells = Array.empty }, Cmd.none )
+
+        Product ->
+            -- TODO
+            ( { cols = 1, cells = Array.empty }, Cmd.none )
+
+        Mean ->
+            -- TODO
+            ( { cols = 1, cells = Array.empty }, Cmd.none )
+
+        Max ->
+            ( { cols = 1, cells = [ sheet.cells |> Array.toList |> List.maximum ] |> List.filterMap identity |> Array.fromList }, Cmd.none )
+
+        Min ->
+            ( { cols = 1, cells = [ sheet.cells |> Array.toList |> List.minimum ] |> List.filterMap identity |> Array.fromList }, Cmd.none )
 
 
 toFlatIndex : Int -> Index -> Int
@@ -193,19 +221,19 @@ update msg ({ sheet } as model) =
 
         CellsWritten r ->
             let
-                subsheets : List ( Index, Sheet )
-                subsheets =
-                    List.concatMap
-                        (\{ query, rule, move } ->
-                            case query of
-                                Rect q ->
-                                    iif (overlaps r q) [ ( translate move (Tuple.first q), rule (crop q model.sheet) ) ] []
+                ( subsheets, subtasks ) =
+                    List.foldr (\( i, ( s, c ) ) ( a, b ) -> ( ( i, s ) :: a, c :: b )) ( [], [] ) <|
+                        List.concatMap
+                            (\( query, rule, move ) ->
+                                case query of
+                                    Rect q ->
+                                        iif (overlaps r q) [ ( translate move (Tuple.first q), apply rule (crop q model.sheet) ) ] []
 
-                                -- TODO
-                                Pattern () ->
-                                    []
-                        )
-                        model.rules
+                                    -- TODO
+                                    Pattern () ->
+                                        []
+                            )
+                            model.rules
             in
             ( { model
                 | sheet =
@@ -229,9 +257,12 @@ update msg ({ sheet } as model) =
                     }
               }
             , Cmd.batch <|
-                List.map (Task.perform CellsWritten << (\x -> Task.andThen (always (Task.succeed x)) (Process.sleep (toFloat model.frameDuration)))) <|
-                    List.map (\( ( x, y ), { cols, cells } ) -> ( ( x, y ), ( x + modBy cols (Array.length cells), y + Array.length cells // cols * sheet.cols ) )) <|
-                        subsheets
+                List.concat
+                    [ subtasks
+                    , List.map (Task.perform CellsWritten << (\x -> Task.andThen (always (Task.succeed x)) (Process.sleep (toFloat model.frameDuration)))) <|
+                        List.map (\( ( x, y ), { cols, cells } ) -> ( ( x, y ), ( x + modBy cols (Array.length cells), y + Array.length cells // cols * sheet.cols ) )) <|
+                            subsheets
+                    ]
             )
 
         CellsSelecting a ->
@@ -254,7 +285,7 @@ view model =
     { title = "scrapsheets"
     , body =
         -- TODO: rules : List Rule
-        -- TODO: newRule : ( Int, RuleDef )
+        -- TODO: newRule : ( Int, Rule )
         [ H.node "style" [] [ text ".cell:hover { background: #eee; }" ]
         , H.div
             [ style "display" "grid"
@@ -301,7 +332,54 @@ view model =
                 model.sheet.cells
             , H.div [ style "display" "flex", style "flex-direction" "column" ] <|
                 List.concat
-                    [ List.map (\rule -> H.div [] [ text (Debug.toString rule) ]) <|
+                    [ List.map
+                        (\( query, rule, move ) ->
+                            H.div [ style "display" "grid", style "grid-template-columns" "auto auto auto" ]
+                                [ H.span []
+                                    [ case query of
+                                        Rect ( ( xa, ya ), ( xb, yb ) ) ->
+                                            text <| String.join "" [ "(", String.fromInt xa, ",", String.fromInt ya, ")-->(", String.fromInt xb, ",", String.fromInt yb, ")" ]
+
+                                        Pattern _ ->
+                                            text "TODO"
+                                    ]
+                                , H.span []
+                                    [ case rule of
+                                        HttpFetch x ->
+                                            text x
+
+                                        JS x ->
+                                            text x
+
+                                        JsonPath x ->
+                                            text x
+
+                                        Copy ->
+                                            text "copy"
+
+                                        Sum ->
+                                            text "sum"
+
+                                        Product ->
+                                            text "product"
+
+                                        Mean ->
+                                            text "mean"
+
+                                        Max ->
+                                            text "max"
+
+                                        Min ->
+                                            text "min"
+                                    ]
+                                , H.span []
+                                    [ case move of
+                                        ( x, y ) ->
+                                            text <| String.join "" [ "(", String.fromInt x, ",", String.fromInt y, ")" ]
+                                    ]
+                                ]
+                        )
+                      <|
                         model.rules
                     , [ H.div []
                             [ H.span [] [ text (String.fromInt model.frameDuration) ]
