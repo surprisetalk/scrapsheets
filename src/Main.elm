@@ -5,9 +5,9 @@ import Browser exposing (Document)
 import Html as H exposing (Html, text)
 import Html.Attributes as A exposing (style)
 import Html.Events as A
+import Process
 import Regex exposing (Regex)
 import Task
-import Time
 
 
 iif : Bool -> a -> a -> a
@@ -29,7 +29,22 @@ type alias Cell =
 
 
 type alias Rule =
-    Sheet -> Sheet
+    { query : Query
+    , rule : Sheet -> Sheet
+    , def : RuleDef
+    , move : Vector
+    }
+
+
+type RuleDef
+    = HttpFetch String
+    | JS String
+    | JsonPath String
+    | Sum
+    | Product
+    | Mean
+    | Max
+    | Min
 
 
 type alias Sheet =
@@ -59,7 +74,9 @@ type alias Model =
     { selected : Maybe Query
     , editing : Maybe ( Index, Cell )
     , sheet : Sheet
-    , rules : List ( Query, Rule, Vector )
+    , rules : List Rule
+    , newRule : ( Int, RuleDef )
+    , frameDuration : Float
     }
 
 
@@ -78,20 +95,18 @@ init _ =
     ( { selected = Nothing
       , editing = Nothing
       , sheet = { cols = 10, cells = Array.initialize (10 * 100) (\i -> String.fromInt (modBy 10 i) ++ "," ++ String.fromInt (i // 10)) }
-      , rules = [ ( Rect ( ( 0, 0 ), ( 3, 4 ) ), \sheet -> { sheet | cells = Array.map (\x -> "(" ++ x ++ ")") sheet.cells }, ( 3, 4 ) ) ]
+      , rules =
+            [ { query = Rect ( ( 0, 0 ), ( 3, 4 ) )
+              , rule = \sheet -> { sheet | cells = Array.map (\x -> "(" ++ x ++ ")") sheet.cells }
+              , def = JS "TODO"
+              , move = ( 3, 4 )
+              }
+            ]
+      , newRule = ( -1, JS "" )
+      , frameDuration = 100
       }
     , Task.perform CellsWritten (Task.succeed ( ( 0, 0 ), ( 100, 100 ) ))
     )
-
-
-origin : Rect -> Index
-origin ( a, _ ) =
-    a
-
-
-single : Index -> Rect
-single i =
-    ( i, i )
 
 
 translate : Vector -> Index -> Index
@@ -147,10 +162,10 @@ update msg ({ sheet } as model) =
                 subsheets : List ( Index, Sheet )
                 subsheets =
                     List.concatMap
-                        (\( query, rule, vec ) ->
+                        (\{ query, rule, move } ->
                             case query of
                                 Rect q ->
-                                    iif (overlaps r q) [ ( translate vec (origin q), rule (crop q model.sheet) ) ] []
+                                    iif (overlaps r q) [ ( translate move (Tuple.first q), rule (crop q model.sheet) ) ] []
 
                                 -- TODO
                                 Pattern () ->
@@ -180,7 +195,7 @@ update msg ({ sheet } as model) =
                     }
               }
             , Cmd.batch <|
-                List.map (Task.perform CellsWritten << Task.succeed) <|
+                List.map (Task.perform CellsWritten << (\x -> Task.andThen (always (Task.succeed x)) (Process.sleep model.frameDuration))) <|
                     List.map (\( ( x, y ), { cols, cells } ) -> ( ( x, y ), ( x + modBy cols (Array.length cells), y + Array.length cells // cols * sheet.cols ) )) <|
                         subsheets
             )
