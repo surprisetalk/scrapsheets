@@ -44,6 +44,7 @@ type Rule
     | Sum
     | Product
     | Mean
+    | Median
     | Max
     | Min
 
@@ -75,6 +76,9 @@ type alias Model =
     { selected : Query
     , editing : ( Index, Cell )
     , sheet : Sheet
+
+    -- TODO: make it super easy to transpose the result! maybe in the rule?
+    -- TODO: it's useful to transpose before/after applying the rule in different cases
     , rules : List ( Query, Rule, Vector )
     , newRule : ( Int, Rule )
     , frameDuration : Int
@@ -149,22 +153,38 @@ apply rule sheet =
             ( sheet, Cmd.none )
 
         Sum ->
-            -- TODO
-            ( { cols = 1, cells = Array.empty }, Cmd.none )
+            ( reduceRows (Array.foldl (String.toFloat >> Maybe.withDefault 0 >> (+)) 0 >> String.fromFloat) sheet, Cmd.none )
 
         Product ->
-            -- TODO
-            ( { cols = 1, cells = Array.empty }, Cmd.none )
+            ( reduceRows (Array.foldl (String.toFloat >> Maybe.withDefault 1 >> (*)) 1 >> String.fromFloat) sheet, Cmd.none )
 
         Mean ->
-            -- TODO
-            ( { cols = 1, cells = Array.empty }, Cmd.none )
+            ( reduceRows (\xs -> String.fromFloat (List.sum (List.filterMap String.toFloat (Array.toList xs)) / toFloat (Array.length xs))) sheet, Cmd.none )
+
+        Median ->
+            ( reduceRows (Array.toList >> List.sort >> Array.fromList >> Array.get (sheet.cols // 2) >> Maybe.withDefault "") sheet, Cmd.none )
 
         Max ->
-            ( { cols = 1, cells = [ sheet.cells |> Array.toList |> List.maximum ] |> List.filterMap identity |> Array.fromList }, Cmd.none )
+            ( reduceRows (Array.toList >> List.maximum >> Maybe.withDefault "") sheet, Cmd.none )
 
         Min ->
-            ( { cols = 1, cells = [ sheet.cells |> Array.toList |> List.minimum ] |> List.filterMap identity |> Array.fromList }, Cmd.none )
+            ( reduceRows (Array.toList >> List.minimum >> Maybe.withDefault "") sheet, Cmd.none )
+
+
+reduceRows : (Array Cell -> Cell) -> Sheet -> Sheet
+reduceRows f { cols, cells } =
+    { cols = 1
+    , cells =
+        case compare cols 1 of
+            LT ->
+                Array.empty
+
+            EQ ->
+                Array.fromList [ f cells ]
+
+            GT ->
+                Array.initialize (Array.length cells // cols) (\i -> f (Array.slice (i * cols) ((i + 1) * cols) cells))
+    }
 
 
 toFlatIndex : Int -> Index -> Int
@@ -182,6 +202,17 @@ intersect ( ( xaa, yaa ), ( xab, yab ) ) ( ( xba, yba ), ( xbb, ybb ) ) =
     ( ( max xaa xba, max yaa yba ), ( min xab xbb, min yab ybb ) )
 
 
+transpose : Sheet -> Sheet
+transpose { cols, cells } =
+    let
+        len =
+            Array.length cells
+    in
+    { cols = len // cols
+    , cells = Array.initialize len (\i -> Array.get (i * cols |> modBy len) cells |> Maybe.withDefault "")
+    }
+
+
 overlaps : Rect -> Rect -> Bool
 overlaps a b =
     intersect a b |> (\( ( xa, ya ), ( xb, yb ) ) -> xa < xb && ya < yb)
@@ -193,13 +224,13 @@ crop r s =
         ( ( xa, ya ), ( xb, yb ) ) =
             intersect r ( ( 0, 0 ), ( s.cols - 1, Array.length s.cells // s.cols - 1 ) )
 
-        cols =
+        ncols =
             max 0 (xb - xa)
 
-        rows =
+        nrows =
             max 0 (yb - ya)
     in
-    { cols = cols, cells = Array.initialize (cols * rows) (\i -> s.cells |> Array.get (ya + (i // cols) * s.cols + xa + modBy (max 1 cols) i) |> Maybe.withDefault "") }
+    { cols = ncols, cells = Array.initialize (ncols * nrows) (\i -> s.cells |> Array.get (ya + (i // ncols) * s.cols + xa + modBy (max 1 ncols) i) |> Maybe.withDefault "") }
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -365,6 +396,9 @@ view model =
 
                                         Mean ->
                                             text "mean"
+
+                                        Median ->
+                                            text "median"
 
                                         Max ->
                                             text "max"
