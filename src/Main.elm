@@ -30,6 +30,10 @@ type Msg
     | CellsSelected Index
     | CellEditing Index String
     | FrameDurationUpdated String
+    | RuleReverted Int
+    | RuleEditing Int Rule Vector
+    | RuleSaved Int
+    | RuleNew
 
 
 type alias Cell =
@@ -47,6 +51,7 @@ type Rule
     | Median
     | Max
     | Min
+    | Nada
 
 
 type alias Sheet =
@@ -79,8 +84,7 @@ type alias Model =
 
     -- TODO: make it super easy to transpose the result! maybe in the rule?
     -- TODO: it's useful to transpose before/after applying the rule in different cases
-    , rules : List ( Query, Rule, Vector )
-    , newRule : ( Int, Rule )
+    , rules : Array ( Maybe ( Query, Rule, Vector ), ( Query, Rule, Vector ) )
     , frameDuration : Int
     }
 
@@ -99,14 +103,15 @@ init : () -> ( Model, Cmd Msg )
 init _ =
     ( { selected = Rect ( ( 8, 7 ), ( 12, 13 ) )
       , editing = ( ( -1, -1 ), "" )
-      , sheet = { cols = 10, cells = Array.initialize (10 * 100) (\i -> String.fromInt (modBy 10 i) ++ "," ++ String.fromInt (i // 10)) }
+      , sheet = { cols = 10, cells = Array.initialize (10 * 100) (\i -> String.fromInt (i // 10)) }
       , rules =
-            [ ( Rect ( ( 0, 0 ), ( 3, 4 ) )
-              , JS "TODO"
-              , ( 4, 5 )
-              )
-            ]
-      , newRule = ( -1, JS "" )
+            Array.map (Tuple.pair Nothing) <|
+                Array.fromList <|
+                    [ ( Rect ( ( 0, 0 ), ( 3, 4 ) )
+                      , JS "TODO"
+                      , ( 4, 5 )
+                      )
+                    ]
       , frameDuration = 100
       }
     , Task.perform CellsWritten (Task.succeed ( ( 0, 0 ), ( 100, 100 ) ))
@@ -169,6 +174,9 @@ apply rule sheet =
 
         Min ->
             ( reduceRows (Array.toList >> List.minimum >> Maybe.withDefault "") sheet, Cmd.none )
+
+        Nada ->
+            ( sheet, Cmd.none )
 
 
 reduceRows : (Array Cell -> Cell) -> Sheet -> Sheet
@@ -264,7 +272,9 @@ update msg ({ sheet } as model) =
                                     Pattern () ->
                                         []
                             )
-                            model.rules
+                        <|
+                            Array.toList <|
+                                Array.map Tuple.second model.rules
             in
             ( { model
                 | sheet =
@@ -310,13 +320,28 @@ update msg ({ sheet } as model) =
         CellEditing i s ->
             ( { model | editing = ( i, s ) }, Task.attempt (\_ -> NoOp) (Dom.focus "edit") )
 
+        RuleReverted i ->
+            -- TODO
+            ( model, Cmd.none )
+
+        RuleEditing i rule vec ->
+            -- TODO
+            ( model, Cmd.none )
+
+        RuleSaved i ->
+            -- TODO
+            ( model, Cmd.none )
+
+        RuleNew ->
+            -- TODO: the default vec should always be the selected width
+            ( { model | rules = model.rules |> Array.push ( Just ( model.selected, Nada, ( -1, 0 ) ), ( model.selected, Nada, ( -1, 0 ) ) ) }, Cmd.none )
+
 
 view : Model -> Document Msg
 view model =
     { title = "scrapsheets"
     , body =
         -- TODO: rules : List Rule
-        -- TODO: newRule : ( Int, Rule )
         [ H.node "style" [] [ text ".cell:hover { background: #eee; }" ]
         , H.div
             [ style "display" "grid"
@@ -361,7 +386,7 @@ view model =
                         )
                 )
                 model.sheet.cells
-            , H.div [ style "display" "flex", style "flex-direction" "column" ] <|
+            , H.div [ style "display" "flex", style "flex-direction" "column", style "gap" "1rem" ] <|
                 List.concat
                     [ List.map
                         (\( query, rule, move ) ->
@@ -405,6 +430,9 @@ view model =
 
                                         Min ->
                                             text "min"
+
+                                        Nada ->
+                                            text "nothing"
                                     ]
                                 , H.span []
                                     [ case move of
@@ -414,8 +442,12 @@ view model =
                                 ]
                         )
                       <|
-                        model.rules
+                        Array.toList <|
+                            Array.map Tuple.second model.rules
                     , [ H.div []
+                            [ H.button [ A.onClick RuleNew ] [ text "+ New Rule" ]
+                            ]
+                      , H.div []
                             [ H.span [] [ text (String.fromInt model.frameDuration) ]
                             , H.input
                                 [ A.onInput FrameDurationUpdated
