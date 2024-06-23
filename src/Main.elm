@@ -111,6 +111,10 @@ init _ =
                       , JS "TODO"
                       , ( 4, 5 )
                       )
+                    , ( Rect ( ( 0, 4 ), ( 3, 8 ) )
+                      , Copy
+                      , ( 5, 6 )
+                      )
                     ]
       , frameDuration = 100
       }
@@ -176,7 +180,7 @@ apply rule sheet =
             ( reduceRows (Array.toList >> List.minimum >> Maybe.withDefault "") sheet, Cmd.none )
 
         Nada ->
-            ( sheet, Cmd.none )
+            ( { sheet | cells = Array.empty }, Cmd.none )
 
 
 reduceRows : (Array Cell -> Cell) -> Sheet -> Sheet
@@ -230,7 +234,7 @@ crop : Rect -> Sheet -> Sheet
 crop r s =
     let
         ( ( xa, ya ), ( xb, yb ) ) =
-            intersect r ( ( 0, 0 ), ( s.cols - 1, Array.length s.cells // s.cols - 1 ) )
+            intersect r ( ( 0, 0 ), ( s.cols, Array.length s.cells // s.cols ) )
 
         ncols =
             max 0 (xb - xa)
@@ -238,7 +242,7 @@ crop r s =
         nrows =
             max 0 (yb - ya)
     in
-    { cols = ncols, cells = Array.initialize (ncols * nrows) (\i -> s.cells |> Array.get (ya + (i // ncols) * s.cols + xa + modBy (max 1 ncols) i) |> Maybe.withDefault "") }
+    { cols = ncols, cells = Array.initialize (ncols * nrows) (\i -> s.cells |> Array.get ((ya + i // ncols) * s.cols + xa + modBy (max 1 ncols) i) |> Maybe.withDefault "") }
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -352,40 +356,63 @@ view model =
             ]
             [ -- TODO: "resize table" settings
               H.lazy
-                (H.form
-                    [ style "display" "grid"
-                    , style "grid-template-columns" (String.repeat model.sheet.cols "1fr ")
-                    , A.onSubmit (WriteCell (toFlatIndex model.sheet.cols (Tuple.first model.editing)) (Tuple.second model.editing))
-                    ]
-                    << Array.toList
-                    << Array.indexedMap
-                        (\i cell ->
-                            let
-                                index =
-                                    fromFlatIndex model.sheet.cols i
-                            in
-                            H.div
-                                [ A.class "cell"
-                                , style "background" (iif (match model.selected index cell) "#ddd" "")
-                                , A.onClick (CellEditing index cell)
-                                , A.onMouseDown (CellsSelecting index)
-                                , A.onMouseUp (CellsSelected index)
-                                ]
-                                [ if index == Tuple.first model.editing then
-                                    H.input
-                                        [ A.id "edit"
-                                        , style "width" "100%"
-                                        , A.value (Tuple.second model.editing)
-                                        , A.onInput (CellEditing index)
-                                        ]
-                                        []
+                (\m ->
+                    let
+                        sources =
+                            m.rules |> Array.map (\( _, ( q, _, _ ) ) -> q) |> Array.toList
 
-                                  else
-                                    text cell
-                                ]
-                        )
+                        sinks =
+                            m.rules
+                                |> Array.map
+                                    (\( _, ( q, _, mov ) ) ->
+                                        case q of
+                                            Rect x ->
+                                                x |> Tuple.mapBoth (translate mov) (translate mov) |> Rect
+
+                                            Pattern x ->
+                                                Pattern x
+                                    )
+                                |> Array.toList
+                    in
+                    H.form
+                        [ style "display" "grid"
+                        , style "grid-template-columns" (String.repeat m.sheet.cols "1fr ")
+                        , A.onSubmit (WriteCell (toFlatIndex m.sheet.cols (Tuple.first m.editing)) (Tuple.second m.editing))
+                        ]
+                    <|
+                        Array.toList <|
+                            Array.indexedMap
+                                (\i cell ->
+                                    let
+                                        index =
+                                            fromFlatIndex m.sheet.cols i
+                                    in
+                                    H.div
+                                        [ A.class "cell"
+                                        , style "background" (iif (match m.selected index cell) "#ddd" "")
+                                        , style "color" (iif (List.any (\source -> match source index cell) sources) "blue" "")
+                                        , style "font-weight" (iif (List.any (\sink -> match sink index cell) sinks) "700" "")
+                                        , A.onClick (CellEditing index cell)
+                                        , A.onMouseDown (CellsSelecting index)
+                                        , A.onMouseUp (CellsSelected index)
+                                        ]
+                                        [ if index == Tuple.first m.editing then
+                                            H.input
+                                                [ A.id "edit"
+                                                , style "width" "100%"
+                                                , A.value (Tuple.second m.editing)
+                                                , A.onInput (CellEditing index)
+                                                ]
+                                                []
+
+                                          else
+                                            text cell
+                                        ]
+                                )
+                            <|
+                                m.sheet.cells
                 )
-                model.sheet.cells
+                model
             , H.div [ style "display" "flex", style "flex-direction" "column", style "gap" "1rem" ] <|
                 List.concat
                     [ List.map
