@@ -333,12 +333,13 @@ update msg ({ sheet } as model) =
             ( model, Cmd.none )
 
         RuleSaved i ->
-            -- TODO
-            ( model, Cmd.none )
+          case Array.get i model.rules of
+            Just rule -> ( { model | rules = model.rules |> Array.set i ((\(a,b) -> (Nothing, Maybe.withDefault b a)) rule) }, Cmd.none )
+            Nothing -> (model, Cmd.none)
 
         RuleNew ->
             -- TODO: the default vec should always be the selected width
-            ( { model | rules = model.rules |> Array.push ( Just ( model.selected, Nada, ( -1, 0 ) ), ( model.selected, Nada, ( -1, 0 ) ) ) }, Cmd.none )
+            ( { model | rules = model.rules |> Array.push ( Just ( model.selected, Copy, ( -1, 0 ) ), ( model.selected, Nada, ( -1, 0 ) ) ) }, Cmd.none )
 
 
 view : Model -> Document Msg
@@ -415,9 +416,9 @@ view model =
                 model
             , H.div [ style "display" "flex", style "flex-direction" "column", style "gap" "1rem" ] <|
                 List.concat
-                    [ List.map
-                        (\( query, rule, move ) ->
-                            H.div [ style "display" "grid", style "grid-template-columns" "auto auto auto" ]
+                    [ List.concatMap
+                        (\( i, isEditing, ( query, rule, move ) ) ->
+                            [ H.div [ style "display" "grid", style "grid-template-columns" "auto auto auto auto" ]
                                 [ H.span []
                                     [ case query of
                                         Rect ( ( xa, ya ), ( xb, yb ) ) ->
@@ -466,11 +467,19 @@ view model =
                                         ( x, y ) ->
                                             text <| String.join "" [ "(", String.fromInt x, ",", String.fromInt y, ")" ]
                                     ]
+                                , case isEditing of
+                                    True ->
+                                        H.button [ A.onClick (RuleSaved i) ] [ text "save" ]
+
+                                    False ->
+                                        text ""
                                 ]
+                            ]
                         )
                       <|
                         Array.toList <|
-                            Array.map Tuple.second model.rules
+                            Array.indexedMap (\i ( a, b ) -> ( i, a /= Nothing, Maybe.withDefault b a )) <|
+                                model.rules
                     , [ H.div []
                             [ H.button [ A.onClick RuleNew ] [ text "+ New Rule" ]
                             ]
