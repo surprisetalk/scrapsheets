@@ -3,10 +3,12 @@ module Main exposing (Model, Msg(..), Query(..), Rule, main)
 import Array exposing (Array)
 import Browser exposing (Document)
 import Browser.Dom as Dom
+import Browser.Events as Browser
 import Html as H exposing (Html, text)
 import Html.Attributes as A exposing (style)
 import Html.Events as A
 import Html.Lazy as H
+import Json.Decode as D
 import Json.Encode as E
 import Process
 import Regex exposing (Regex)
@@ -34,6 +36,7 @@ type Msg
     | RuleEditing Int Rule Vector
     | RuleSaved Int
     | RuleNew
+    | KeyPressed Bool String
 
 
 type alias Cell =
@@ -81,11 +84,10 @@ type alias Model =
     { selected : Query
     , editing : ( Index, Cell )
     , sheet : Sheet
-
-    -- TODO: make it super easy to transpose the result! maybe in the rule?
-    -- TODO: it's useful to transpose before/after applying the rule in different cases
+    , clipboard : Sheet
     , rules : Array ( Maybe ( Query, Rule, Vector ), ( Query, Rule, Vector ) )
     , frameDuration : Int
+    , isMetaKey : Bool
     }
 
 
@@ -93,7 +95,12 @@ main : Platform.Program () Model Msg
 main =
     Browser.document
         { init = init
-        , subscriptions = \_ -> Sub.none
+        , subscriptions =
+            \_ ->
+                Sub.batch
+                    [ Browser.onKeyDown (D.field "key" D.string |> D.map (KeyPressed True))
+                    , Browser.onKeyUp (D.field "key" D.string |> D.map (KeyPressed False))
+                    ]
         , update = update
         , view = view
         }
@@ -104,6 +111,7 @@ init _ =
     ( { selected = Rect ( ( 8, 7 ), ( 12, 13 ) )
       , editing = ( ( -1, -1 ), "" )
       , sheet = { cols = 10, cells = Array.initialize (10 * 100) (\i -> String.fromInt (i // 10)) }
+      , clipboard = { cols = 1, cells = Array.empty }
       , rules =
             Array.map (Tuple.pair Nothing) <|
                 Array.fromList <|
@@ -117,6 +125,7 @@ init _ =
                       )
                     ]
       , frameDuration = 100
+      , isMetaKey = False
       }
     , Task.perform CellsWritten (Task.succeed ( ( 0, 0 ), ( 100, 100 ) ))
     )
@@ -250,6 +259,19 @@ crop r s =
     { cols = ncols, cells = Array.initialize (ncols * nrows) (\i -> s.cells |> Array.get ((ya + i // ncols) * s.cols + xa + modBy (max 1 ncols) i) |> Maybe.withDefault "") }
 
 
+write sheet ( ( x, y ), { cols, cells } ) cells_ =
+    Array.foldl
+        (\( i, cell ) ->
+            if x + modBy cols i > sheet.cols then
+                identity
+
+            else
+                Array.set (toFlatIndex sheet.cols ( x, y ) + (i // cols) * sheet.cols + modBy cols i) cell
+        )
+        cells_
+        (Array.indexedMap Tuple.pair cells)
+
+
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg ({ sheet } as model) =
     case msg of
@@ -285,27 +307,7 @@ update msg ({ sheet } as model) =
                             Array.toList <|
                                 Array.map Tuple.second model.rules
             in
-            ( { model
-                | sheet =
-                    { sheet
-                        | cells =
-                            List.foldl
-                                (\( ( x, y ), { cols, cells } ) cells_ ->
-                                    Array.foldl
-                                        (\( i, cell ) ->
-                                            if x + modBy cols i > sheet.cols then
-                                                identity
-
-                                            else
-                                                Array.set (toFlatIndex sheet.cols ( x, y ) + (i // cols) * sheet.cols + modBy cols i) cell
-                                        )
-                                        cells_
-                                        (Array.indexedMap Tuple.pair cells)
-                                )
-                                sheet.cells
-                                subsheets
-                    }
-              }
+            ( { model | sheet = { sheet | cells = List.foldl (write sheet) sheet.cells subsheets } }
             , Cmd.batch <|
                 List.concat
                     [ subtasks
@@ -363,6 +365,36 @@ update msg ({ sheet } as model) =
                             ( 1, 0 )
             in
             ( { model | rules = model.rules |> Array.push ( Just ( model.selected, Copy, move ), ( model.selected, Nada, move ) ) }, Cmd.none )
+
+        KeyPressed isMetaKey "Meta" ->
+            ( { model | isMetaKey = isMetaKey }, Cmd.none )
+
+        KeyPressed True "c" ->
+            case model.selected of
+                Rect r ->
+                    ( { model | clipboard = crop r model.sheet }, Cmd.none )
+
+                Pattern () ->
+                    -- TODO: collect all the matches into a column or row
+                    ( { model | clipboard = { cols = 1, cells = Array.empty } }, Cmd.none )
+
+        KeyPressed True "v" ->
+            case model.selected of
+                Rect ( a, b ) ->
+                    ( { model
+                        | clipboard = { cols = 1, cells = Array.empty }
+                        , sheet = { sheet | cells = write sheet ( a, crop ( (0,0), translate (Tuple.mapBoth ((-) 0) ((-) 0) a) b ) model.clipboard ) model.sheet.cells }
+                      }
+                      -- TODO: get the overlap with the subsheet
+                    , Task.perform CellsWritten (Task.succeed ( a, b ))
+                    )
+
+                Pattern () ->
+                    -- TODO
+                    ( { model | clipboard = { cols = 1, cells = Array.empty } }, Cmd.none )
+
+        KeyPressed _ _ ->
+            ( model, Cmd.none )
 
 
 view : Model -> Document Msg
@@ -444,35 +476,6 @@ view model =
                                                 ]
                                                 [ text cell
                                                 ]
-                                        , case m.selected of
-                                            Rect ( a, b ) ->
-                                                if b == Tuple.mapFirst ((+) 1) index && Tuple.first m.editing == ( -1, -1 ) && isArea ( a, b ) then
-                                                    H.div
-                                                        [ A.class "tool"
-                                                        , style "position" "absolute"
-                                                        , style "top" "5px"
-                                                        , style "right" "5px"
-                                                        , style "border" "1px solid black"
-                                                        , style "background" "white"
-                                                        , style "z-index" "200"
-                                                        , style "overflow" "visible"
-                                                        , style "text-align" "right"
-                                                        , style "padding" "0.5rem"
-                                                        , style "display" "flex"
-                                                        , style "flex-direction" "column"
-                                                        , style "gap" "0.5rem"
-                                                        , style "pointer-events" "none"
-                                                        ]
-                                                        [ -- TODO
-                                                          H.button [ A.onClick NoOp, style "pointer-events" "auto" ] [ text "option 1" ]
-                                                        , H.button [ A.onClick NoOp, style "pointer-events" "auto" ] [ text "option 2" ]
-                                                        ]
-
-                                                else
-                                                    text ""
-
-                                            Pattern _ ->
-                                                text ""
                                         ]
                                 )
                             <|
@@ -565,6 +568,35 @@ view model =
                             ]
                       ]
                     ]
+            , if Array.length model.clipboard.cells > 0 then
+                H.div
+                    [ style "position" "absolute"
+                    , style "bottom" "6rem"
+                    , style "right" "2rem"
+                    , style "background" "white"
+                    , style "border" "1px solid black"
+                    , style "display" "flex"
+                    , style "flex-direction" "column"
+                    , style "box-shadow" "10px 10px rgba(0,0,0,0.5)"
+                    , style "padding" "1rem"
+                    , style "gap" "1rem"
+                    , style "min-width" "50vw"
+                    , style "min-height" "33vh"
+                    ]
+                    [ H.div
+                        [ style "display" "grid"
+                        , style "grid-template-columns" (String.repeat model.clipboard.cols "1fr ")
+                        ]
+                      <|
+                        Array.toList <|
+                            Array.map (H.div [ style "border" "1px solid black", style "padding" "0 0.25rem" ] << List.singleton << text) <|
+                                model.clipboard.cells
+                    , H.textarea []
+                        []
+                    ]
+
+              else
+                text ""
             ]
         ]
     }
