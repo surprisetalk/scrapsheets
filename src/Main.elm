@@ -227,7 +227,12 @@ transpose { cols, cells } =
 
 overlaps : Rect -> Rect -> Bool
 overlaps a b =
-    intersect a b |> (\( ( xa, ya ), ( xb, yb ) ) -> xa < xb && ya < yb)
+    intersect a b |> isArea
+
+
+isArea : Rect -> Bool
+isArea ( ( xa, ya ), ( xb, yb ) ) =
+    xa < xb && ya < yb
 
 
 crop : Rect -> Sheet -> Sheet
@@ -440,8 +445,8 @@ view model =
                                                 [ text cell
                                                 ]
                                         , case m.selected of
-                                            Rect ( _, b ) ->
-                                                if b == Tuple.mapFirst ((+) 1) index then
+                                            Rect ( a, b ) ->
+                                                if b == Tuple.mapFirst ((+) 1) index && Tuple.first m.editing == ( -1, -1 ) && isArea ( a, b ) then
                                                     H.div
                                                         [ A.class "tool"
                                                         , style "position" "absolute"
