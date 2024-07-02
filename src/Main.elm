@@ -311,7 +311,7 @@ update msg ({ sheet } as model) =
             )
 
         CellsSelecting a ->
-            ( { model | selected = Rect ( a, a ) }, Cmd.none )
+            ( { model | selected = Rect ( a, a ), editing = iif (a == Tuple.first model.editing) model.editing ( ( -1, -1 ), "" ) }, Cmd.none )
 
         CellsSelected b ->
             case model.selected of
@@ -364,8 +364,13 @@ view : Model -> Document Msg
 view model =
     { title = "scrapsheets"
     , body =
-        -- TODO: rules : List Rule
-        [ H.node "style" [] [ text ".cell:hover { background: #eee; }" ]
+        [ H.node "style"
+            []
+            [ text ".cell:hover { background: #eee; }"
+
+            -- , text ".tool::before { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); pointer-events: none; }"
+            , text "* { box-sizing: border-box; }"
+            ]
         , H.div
             [ style "display" "grid"
             , style "grid-template-columns" "2fr 1fr"
@@ -411,6 +416,9 @@ view model =
                                         , style "background" (iif (match m.selected index cell) "#ddd" "")
                                         , style "color" (iif (List.any (\source -> match source index cell) sources) "blue" "")
                                         , style "font-weight" (iif (List.any (\sink -> match sink index cell) sinks) "700" "")
+                                        , style "border" "1px solid #eee"
+                                        , style "text-overflow" "ellipsis"
+                                        , style "position" "relative"
                                         , A.onClick (CellEditing index cell)
                                         , A.onMouseDown (CellsSelecting index)
                                         , A.onMouseUp (CellsSelected index)
@@ -419,6 +427,7 @@ view model =
                                             H.input
                                                 [ A.id "edit"
                                                 , style "width" "100%"
+                                                , style "padding" "0"
                                                 , A.value (Tuple.second m.editing)
                                                 , A.onInput (CellEditing index)
                                                 ]
@@ -426,6 +435,35 @@ view model =
 
                                           else
                                             text cell
+                                        , case m.selected of
+                                            Rect ( _, b ) ->
+                                                if b == Tuple.mapFirst ((+) 1) index then
+                                                    H.div
+                                                        [ A.class "tool"
+                                                        , style "position" "absolute"
+                                                        , style "top" "5px"
+                                                        , style "right" "5px"
+                                                        , style "border" "1px solid black"
+                                                        , style "background" "white"
+                                                        , style "z-index" "100"
+                                                        , style "overflow" "visible"
+                                                        , style "text-align" "right"
+                                                        , style "padding" "0.5rem"
+                                                        , style "display" "flex"
+                                                        , style "flex-direction" "column"
+                                                        , style "gap" "0.5rem"
+                                                        , style "pointer-events" "auto"
+                                                        ]
+                                                        [ -- TODO
+                                                          H.button [ A.onClick NoOp ] [ text "option 1" ]
+                                                        , H.button [ A.onClick NoOp ] [ text "option 2" ]
+                                                        ]
+
+                                                else
+                                                    text ""
+
+                                            Pattern _ ->
+                                                text ""
                                         ]
                                 )
                             <|
