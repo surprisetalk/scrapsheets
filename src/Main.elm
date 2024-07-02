@@ -1,4 +1,4 @@
-module Main exposing (Model, Msg(..), Query(..), Rule, main)
+port module Main exposing (Model, Msg(..), Query(..), Rule, main)
 
 import Array exposing (Array)
 import Browser exposing (Document)
@@ -13,6 +13,12 @@ import Json.Encode as E
 import Process
 import Regex exposing (Regex)
 import Task
+
+
+port applyJsToSheet : { code : String, data : Sheet } -> Cmd msg
+
+
+port clipboardResultReceived : (Sheet -> msg) -> Sub msg
 
 
 iif : Bool -> a -> a -> a
@@ -37,6 +43,8 @@ type Msg
     | RuleSaved Int
     | RuleNew
     | KeyPressed Bool String
+    | ClipboardCodeEdited String
+    | ClipboardResultReceived Sheet
 
 
 type alias Cell =
@@ -84,7 +92,7 @@ type alias Model =
     { selected : Query
     , editing : ( Index, Cell )
     , sheet : Sheet
-    , clipboard : Sheet
+    , clipboard : { data : Sheet, code : String, result : Result String Sheet }
     , rules : Array ( Maybe ( Query, Rule, Vector ), ( Query, Rule, Vector ) )
     , frameDuration : Int
     , isMetaKey : Bool
@@ -100,6 +108,7 @@ main =
                 Sub.batch
                     [ Browser.onKeyDown (D.field "key" D.string |> D.map (KeyPressed True))
                     , Browser.onKeyUp (D.field "key" D.string |> D.map (KeyPressed False))
+                    , clipboardResultReceived ClipboardResultReceived
                     ]
         , update = update
         , view = view
@@ -111,7 +120,7 @@ init _ =
     ( { selected = Rect ( ( 8, 7 ), ( 12, 13 ) )
       , editing = ( ( -1, -1 ), "" )
       , sheet = { cols = 10, cells = Array.initialize (10 * 100) (\i -> String.fromInt (i // 10)) }
-      , clipboard = { cols = 1, cells = Array.empty }
+      , clipboard = emptyClipboard
       , rules =
             Array.map (Tuple.pair Nothing) <|
                 Array.fromList <|
@@ -129,6 +138,10 @@ init _ =
       }
     , Task.perform CellsWritten (Task.succeed ( ( 0, 0 ), ( 100, 100 ) ))
     )
+
+
+emptyClipboard =
+    { data = { cols = 1, cells = Array.empty }, code = "", result = Ok { cols = 1, cells = Array.empty } }
 
 
 inc : Index -> Index
@@ -273,7 +286,7 @@ write sheet ( ( x, y ), { cols, cells } ) cells_ =
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
-update msg ({ sheet } as model) =
+update msg ({ sheet, clipboard } as model) =
     case msg of
         NoOp ->
             ( model, Cmd.none )
@@ -372,29 +385,43 @@ update msg ({ sheet } as model) =
         KeyPressed True "c" ->
             case model.selected of
                 Rect r ->
-                    ( { model | clipboard = crop r model.sheet }, Cmd.none )
+                    ( { model | clipboard = { data = crop r model.sheet, code = "", result = Ok (crop r model.sheet) } }, Cmd.none )
 
                 Pattern () ->
                     -- TODO: collect all the matches into a column or row
-                    ( { model | clipboard = { cols = 1, cells = Array.empty } }, Cmd.none )
+                    ( { model | clipboard = emptyClipboard }, Cmd.none )
 
         KeyPressed True "v" ->
-            case model.selected of
-                Rect ( a, b ) ->
-                    ( { model
-                        | clipboard = { cols = 1, cells = Array.empty }
-                        , sheet = { sheet | cells = write sheet ( a, crop ( (0,0), translate (Tuple.mapBoth ((-) 0) ((-) 0) a) b ) model.clipboard ) model.sheet.cells }
-                      }
-                      -- TODO: get the overlap with the subsheet
-                    , Task.perform CellsWritten (Task.succeed ( a, b ))
-                    )
+            case model.clipboard.result of
+                Err _ ->
+                    ( { model | clipboard = emptyClipboard }, Cmd.none )
 
-                Pattern () ->
-                    -- TODO
-                    ( { model | clipboard = { cols = 1, cells = Array.empty } }, Cmd.none )
+                Ok sheet_ ->
+                    case model.selected of
+                        Rect ( a, b ) ->
+                            ( { model
+                                | clipboard = emptyClipboard
+                                , sheet = { sheet | cells = write sheet ( a, crop ( ( 0, 0 ), translate (Tuple.mapBoth ((-) 0) ((-) 0) a) b ) sheet_ ) model.sheet.cells }
+                              }
+                              -- TODO: get the overlap with the subsheet
+                            , Task.perform CellsWritten (Task.succeed ( a, b ))
+                            )
+
+                        Pattern () ->
+                            -- TODO
+                            ( { model | clipboard = emptyClipboard }, Cmd.none )
 
         KeyPressed _ _ ->
             ( model, Cmd.none )
+
+        ClipboardCodeEdited "" ->
+            ( { model | clipboard = { clipboard | code = "", result = Ok clipboard.data } }, Cmd.none )
+
+        ClipboardCodeEdited code ->
+            ( { model | clipboard = { clipboard | code = code, result = Err "Loading" } }, applyJsToSheet { code = code, data = clipboard.data } )
+
+        ClipboardResultReceived result ->
+            ( { model | clipboard = { clipboard | result = Ok result } }, Cmd.none )
 
 
 view : Model -> Document Msg
@@ -568,7 +595,11 @@ view model =
                             ]
                       ]
                     ]
-            , if Array.length model.clipboard.cells > 0 then
+            , let
+                clipboard =
+                    Result.withDefault model.clipboard.data model.clipboard.result
+              in
+              if Array.length clipboard.cells > 0 then
                 H.div
                     [ style "position" "absolute"
                     , style "bottom" "6rem"
@@ -585,13 +616,17 @@ view model =
                     ]
                     [ H.div
                         [ style "display" "grid"
-                        , style "grid-template-columns" (String.repeat model.clipboard.cols "1fr ")
+                        , style "grid-template-columns" (String.repeat clipboard.cols "1fr ")
                         ]
                       <|
                         Array.toList <|
                             Array.map (H.div [ style "border" "1px solid black", style "padding" "0 0.25rem" ] << List.singleton << text) <|
-                                model.clipboard.cells
-                    , H.textarea []
+                                clipboard.cells
+                    , H.textarea
+                        [ style "border" (iif (Nothing /= Result.toMaybe model.clipboard.result) "" "1px solid red")
+                        , A.onInput ClipboardCodeEdited
+                        , A.value model.clipboard.code
+                        ]
                         []
                     ]
 
