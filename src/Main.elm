@@ -367,8 +367,6 @@ view model =
         [ H.node "style"
             []
             [ text ".cell:hover { background: #eee; }"
-
-            -- , text ".tool::before { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); pointer-events: none; }"
             , text "* { box-sizing: border-box; }"
             ]
         , H.div
@@ -377,6 +375,7 @@ view model =
             , style "user-select" "none"
             , style "-webkit-user-select" "none"
             , style "cursor" "pointer"
+            , style "z-index" "0"
             ]
             [ -- TODO: "resize table" settings
               H.lazy
@@ -417,11 +416,7 @@ view model =
                                         , style "color" (iif (List.any (\source -> match source index cell) sources) "blue" "")
                                         , style "font-weight" (iif (List.any (\sink -> match sink index cell) sinks) "700" "")
                                         , style "border" "1px solid #eee"
-                                        , style "text-overflow" "ellipsis"
                                         , style "position" "relative"
-                                        , A.onClick (CellEditing index cell)
-                                        , A.onMouseDown (CellsSelecting index)
-                                        , A.onMouseUp (CellsSelected index)
                                         ]
                                         [ if index == Tuple.first m.editing then
                                             H.input
@@ -434,7 +429,16 @@ view model =
                                                 []
 
                                           else
-                                            text cell
+                                            H.div
+                                                [ style "text-overflow" "ellipsis"
+                                                , style "width" "100%"
+                                                , style "height" "100%"
+                                                , A.onClick (CellEditing index cell)
+                                                , A.onMouseDown (CellsSelecting index)
+                                                , A.onMouseUp (CellsSelected index)
+                                                ]
+                                                [ text cell
+                                                ]
                                         , case m.selected of
                                             Rect ( _, b ) ->
                                                 if b == Tuple.mapFirst ((+) 1) index then
@@ -445,18 +449,18 @@ view model =
                                                         , style "right" "5px"
                                                         , style "border" "1px solid black"
                                                         , style "background" "white"
-                                                        , style "z-index" "100"
+                                                        , style "z-index" "200"
                                                         , style "overflow" "visible"
                                                         , style "text-align" "right"
                                                         , style "padding" "0.5rem"
                                                         , style "display" "flex"
                                                         , style "flex-direction" "column"
                                                         , style "gap" "0.5rem"
-                                                        , style "pointer-events" "auto"
+                                                        , style "pointer-events" "none"
                                                         ]
                                                         [ -- TODO
-                                                          H.button [ A.onClick NoOp ] [ text "option 1" ]
-                                                        , H.button [ A.onClick NoOp ] [ text "option 2" ]
+                                                          H.button [ A.onClick NoOp, style "pointer-events" "auto" ] [ text "option 1" ]
+                                                        , H.button [ A.onClick NoOp, style "pointer-events" "auto" ] [ text "option 2" ]
                                                         ]
 
                                                 else
