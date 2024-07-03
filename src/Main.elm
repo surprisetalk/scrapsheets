@@ -33,7 +33,7 @@ iif c t f =
 type Msg
     = NoOp
     | WriteCell Int String
-    | CellsWritten Rect
+    | CellsWritten Query
     | CellsSelecting Index
     | CellsSelected Index
     | CellEditing Index String
@@ -136,7 +136,7 @@ init _ =
       , frameDuration = 100
       , isMetaKey = False
       }
-    , Task.perform CellsWritten (Task.succeed ( ( 0, 0 ), ( 100, 100 ) ))
+    , Task.perform CellsWritten (Task.succeed (Rect ( ( 0, 0 ), ( 100, 100 ) )))
     )
 
 
@@ -299,21 +299,24 @@ update msg ({ sheet, clipboard } as model) =
                 | sheet = { sheet | cells = Array.set i x sheet.cells }
                 , editing = ( ( -1, -1 ), "" )
               }
-            , Task.perform CellsWritten (Task.succeed ( fromFlatIndex sheet.cols i, Tuple.mapBoth ((+) 1) ((+) 1) (fromFlatIndex sheet.cols i) ))
+            , Task.perform CellsWritten (Task.succeed (Rect ( fromFlatIndex sheet.cols i, Tuple.mapBoth ((+) 1) ((+) 1) (fromFlatIndex sheet.cols i) )))
             )
 
-        CellsWritten r ->
+        CellsWritten w ->
             let
                 ( subsheets, subtasks ) =
                     List.foldr (\( i, ( s, c ) ) ( a, b ) -> ( ( i, s ) :: a, c :: b )) ( [], [] ) <|
                         List.concatMap
                             (\( query, rule, move ) ->
-                                case query of
-                                    Rect q ->
+                                case ( w, query ) of
+                                    ( Rect r, Rect q ) ->
                                         iif (overlaps r q) [ ( translate move (Tuple.first q), apply rule (crop q model.sheet) ) ] []
 
                                     -- TODO
-                                    Pattern () ->
+                                    ( Pattern (), Pattern () ) ->
+                                        []
+
+                                    _ ->
                                         []
                             )
                         <|
@@ -325,7 +328,7 @@ update msg ({ sheet, clipboard } as model) =
                 List.concat
                     [ subtasks
                     , List.map (Task.perform CellsWritten << (\x -> Task.andThen (always (Task.succeed x)) (Process.sleep (toFloat model.frameDuration)))) <|
-                        List.map (\( ( x, y ), { cols, cells } ) -> ( ( x, y ), ( x + modBy cols (Array.length cells), y + Array.length cells // cols * sheet.cols ) )) <|
+                        List.map (\( ( x, y ), { cols, cells } ) -> Rect ( ( x, y ), ( x + modBy cols (Array.length cells), y + Array.length cells // cols * sheet.cols ) )) <|
                             subsheets
                     ]
             )
@@ -361,8 +364,11 @@ update msg ({ sheet, clipboard } as model) =
 
         RuleSaved i ->
             case Array.get i model.rules of
-                Just rule ->
-                    ( { model | rules = model.rules |> Array.set i ((\( a, b ) -> ( Nothing, Maybe.withDefault b a )) rule) }, Cmd.none )
+                Just ( Just ( q, r, v ), _ ) ->
+                    ( { model | rules = model.rules |> Array.set i ( Nothing, ( q, r, v ) ) }, Task.perform CellsWritten (Task.succeed q) )
+
+                Just ( Nothing, ( q, r, v ) ) ->
+                    ( model, Cmd.none )
 
                 Nothing ->
                     ( model, Cmd.none )
@@ -404,7 +410,7 @@ update msg ({ sheet, clipboard } as model) =
                                 , sheet = { sheet | cells = write sheet ( a, crop ( ( 0, 0 ), translate (Tuple.mapBoth ((-) 0) ((-) 0) a) b ) sheet_ ) model.sheet.cells }
                               }
                               -- TODO: get the overlap with the subsheet
-                            , Task.perform CellsWritten (Task.succeed ( a, b ))
+                            , Task.perform CellsWritten (Task.succeed (Rect ( a, b )))
                             )
 
                         Pattern () ->
