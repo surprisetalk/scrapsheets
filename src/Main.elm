@@ -43,6 +43,7 @@ type Msg
     | CellsSelecting Index
     | CellsSelected Index
     | CellEditing Index String
+    | SearchEditing String
     | FrameDurationUpdated String
     | RuleReverted Int
     | RuleEditing Int Rule Vector
@@ -78,7 +79,7 @@ type alias Vector =
 
 type Query
     = Rect Rect
-    | Pattern ()
+    | Pattern String
 
 
 type alias Rect =
@@ -158,9 +159,8 @@ match q ( xi, yi ) s =
         Rect ( ( xa, ya ), ( xb, yb ) ) ->
             xa <= xi && xi < xb && ya <= yi && yi < yb
 
-        -- TODO
-        Pattern _ ->
-            False
+        Pattern x ->
+            String.startsWith x s
 
 
 apply : ( Query, Rule, Vector ) -> (Sheet -> ( Sheet, Cmd Msg ))
@@ -170,8 +170,8 @@ apply ( q, r, v ) sheet =
         Rect ( a, _ ) ->
             ( { cols = 1, cells = Array.empty }, sheetApply { code = r, data = sheet, dest = translate v a } )
 
-        Pattern () ->
-            ( { cols = 1, cells = Array.empty }, Cmd.none )
+        Pattern x ->
+            ( { cols = 1, cells = Array.empty }, sheet.cells |> Array.indexedMap (\i c -> iif (String.startsWith x c) (sheetApply { code = r, data = crop ( fromFlatIndex sheet.cols i, inc (fromFlatIndex sheet.cols i) ) sheet, dest = translate v (fromFlatIndex sheet.cols i) }) Cmd.none) |> Array.toList |> Cmd.batch )
 
 
 reduceRows : (Array Cell -> Cell) -> Sheet -> Sheet
@@ -281,11 +281,16 @@ update msg ({ sheet, clipboard } as model) =
                                     ( Rect r, Rect q ) ->
                                         iif (overlaps r q) [ ( translate move (Tuple.first q), apply ( query, rule, move ) (crop q model.sheet) ) ] []
 
-                                    -- TODO
-                                    ( Pattern (), Pattern () ) ->
+                                    ( Pattern p1, Pattern p2 ) ->
+                                        -- TODO: This is buggy
+                                        iif (String.startsWith p2 p1) [ ( ( 0, 0 ), apply ( query, rule, move ) model.sheet ) ] []
+
+                                    ( Rect r, Pattern p ) ->
+                                        -- TODO
                                         []
 
-                                    _ ->
+                                    ( Pattern p, Rect r ) ->
+                                        -- TODO
                                         []
                             )
                         <|
@@ -315,6 +320,9 @@ update msg ({ sheet, clipboard } as model) =
 
         CellEditing i s ->
             ( { model | editing = ( i, s ) }, Task.attempt (\_ -> NoOp) (Dom.focus "edit") )
+
+        SearchEditing p ->
+            ( { model | selected = Pattern p }, Cmd.none )
 
         RuleReverted i ->
             -- TODO
@@ -354,37 +362,56 @@ update msg ({ sheet, clipboard } as model) =
             in
             ( { model | rules = model.rules |> Array.push ( Just ( model.selected, "identity", move ), ( model.selected, "_=>sheet(1,[])", move ) ) }, Cmd.none )
 
-        KeyPressed isMetaKey "Meta" ->
+        KeyPressed isMetaKey "Control" ->
             ( { model | isMetaKey = isMetaKey }, Cmd.none )
 
         KeyPressed True "c" ->
-            case model.selected of
-                Rect r ->
-                    ( { model | clipboard = { data = crop r model.sheet, code = "", result = Ok (crop r model.sheet) } }, Cmd.none )
+            if not model.isMetaKey then
+                ( model, Cmd.none )
 
-                Pattern () ->
-                    -- TODO: collect all the matches into a column or row
-                    ( { model | clipboard = emptyClipboard }, Cmd.none )
+            else
+                case model.selected of
+                    Rect r ->
+                        ( { model | clipboard = { data = crop r model.sheet, code = "", result = Ok (crop r model.sheet) } }, Cmd.none )
+
+                    Pattern p ->
+                        ( { model | clipboard = { data = { cols = 1, cells = Array.filter (String.startsWith p) model.sheet.cells }, code = "", result = Ok { cols = 1, cells = Array.filter (String.startsWith p) model.sheet.cells } } }, Cmd.none )
 
         KeyPressed True "v" ->
-            case model.clipboard.result of
-                Err _ ->
-                    ( { model | clipboard = emptyClipboard }, Cmd.none )
+            if not model.isMetaKey then
+                ( model, Cmd.none )
 
-                Ok sheet_ ->
-                    case model.selected of
-                        Rect ( a, b ) ->
-                            ( { model
-                                | clipboard = emptyClipboard
-                                , sheet = { sheet | cells = write sheet ( a, crop ( ( 0, 0 ), translate (Tuple.mapBoth ((-) 0) ((-) 0) a) b ) sheet_ ) model.sheet.cells }
-                              }
-                              -- TODO: get the overlap with the subsheet
-                            , Task.perform CellsWritten (Task.succeed (Rect ( a, b )))
-                            )
+            else
+                case model.clipboard.result of
+                    Err _ ->
+                        ( { model | clipboard = emptyClipboard }, Cmd.none )
 
-                        Pattern () ->
-                            -- TODO
-                            ( { model | clipboard = emptyClipboard }, Cmd.none )
+                    Ok sheet_ ->
+                        case model.selected of
+                            Rect ( a, b ) ->
+                                ( { model
+                                    | clipboard = emptyClipboard
+                                    , sheet = { sheet | cells = write sheet ( a, crop ( ( 0, 0 ), translate (Tuple.mapBoth ((-) 0) ((-) 0) a) b ) sheet_ ) model.sheet.cells }
+                                  }
+                                  -- TODO: get the overlap with the subsheet
+                                , Task.perform CellsWritten (Task.succeed (Rect ( a, b )))
+                                )
+
+                            Pattern _ ->
+                                -- TODO
+                                ( { model | clipboard = emptyClipboard }, Cmd.none )
+
+        KeyPressed True "f" ->
+            if not model.isMetaKey then
+                ( model, Cmd.none )
+
+            else
+                case model.selected of
+                    Rect _ ->
+                        ( { model | selected = Pattern "" }, Task.attempt (\_ -> NoOp) (Dom.focus "search") )
+
+                    Pattern x ->
+                        ( { model | selected = Pattern x }, Task.attempt (\_ -> NoOp) (Dom.focus "search") )
 
         KeyPressed _ _ ->
             ( model, Cmd.none )
@@ -508,12 +535,14 @@ view model =
                                         Rect ( ( xa, ya ), ( xb, yb ) ) ->
                                             text <| String.join "" [ "(", String.fromInt xa, ",", String.fromInt ya, ")-->(", String.fromInt xb, ",", String.fromInt yb, ")" ]
 
-                                        Pattern _ ->
-                                            text "TODO"
+                                        Pattern p ->
+                                            text ("\"" ++ p ++ "\"")
                                     ]
-                                , H.span []
-                                    [ text rule
-                                    ]
+                                , if isEditing then
+                                    H.textarea [ A.onInput (\x -> RuleEditing i x move) ] [ text rule ]
+
+                                  else
+                                    H.span [] [ text rule ]
                                 , H.span []
                                     [ case move of
                                         ( x, y ) ->
@@ -547,6 +576,23 @@ view model =
                             ]
                       ]
                     ]
+            , case model.selected of
+                Rect _ ->
+                    text ""
+
+                Pattern p ->
+                    H.input
+                        [ A.onInput SearchEditing
+                        , A.value p
+                        , A.id "search"
+                        , style "position" "absolute"
+                        , style "bottom" "6rem"
+                        , style "right" "2rem"
+                        , style "background" "white"
+                        , style "border" "1px solid black"
+                        , style "box-shadow" "10px 10px rgba(0,0,0,0.5)"
+                        ]
+                        []
             , let
                 clipboard =
                     Result.withDefault model.clipboard.data model.clipboard.result
