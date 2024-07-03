@@ -418,7 +418,7 @@ update msg ({ sheet, clipboard } as model) =
             ( { model | clipboard = { clipboard | code = "", result = Ok clipboard.data } }, Cmd.none )
 
         ClipboardCodeEdited code ->
-            ( { model | clipboard = { clipboard | code = code, result = Err "Loading" } }, applyJsToSheet { code = code, data = clipboard.data } )
+            ( { model | clipboard = { clipboard | code = code, result = Err "" } }, applyJsToSheet { code = code, data = clipboard.data } )
 
         ClipboardResultReceived result ->
             ( { model | clipboard = { clipboard | result = Ok result } }, Cmd.none )
