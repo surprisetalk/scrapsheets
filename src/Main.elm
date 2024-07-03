@@ -365,6 +365,9 @@ update msg ({ sheet, clipboard } as model) =
         KeyPressed isMetaKey "Control" ->
             ( { model | isMetaKey = isMetaKey }, Cmd.none )
 
+        KeyPressed True "Escape" ->
+            ( { model | clipboard = emptyClipboard }, Cmd.none )
+
         KeyPressed True "c" ->
             if not model.isMetaKey then
                 ( model, Cmd.none )
@@ -410,8 +413,11 @@ update msg ({ sheet, clipboard } as model) =
                     Rect _ ->
                         ( { model | selected = Pattern "" }, Task.attempt (\_ -> NoOp) (Dom.focus "search") )
 
-                    Pattern x ->
-                        ( { model | selected = Pattern x }, Task.attempt (\_ -> NoOp) (Dom.focus "search") )
+                    Pattern "" ->
+                        ( { model | selected = Rect ( ( 0, 0 ), ( 0, 0 ) ) }, Cmd.none )
+
+                    Pattern _ ->
+                        ( { model | selected = Pattern "" }, Task.attempt (\_ -> NoOp) (Dom.focus "search") )
 
         KeyPressed _ _ ->
             ( model, Cmd.none )
