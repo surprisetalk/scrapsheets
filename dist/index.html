@@ -9,29 +9,32 @@
 <body>
   <div id="app"></div>
   <script>
+    const lib = `
+      "use strict";
+      const sum = xs => xs.reduce((a,b) => a + parseInt(b), 0);
+      const mean = xs => sum(xs) / xs.length;
+      const chunk = ({ cols: n, cells: xs }) => Array.from({ length: Math.ceil(xs.length/n) }, (v,i) => xs.slice(i*n,i*n+n));
+      const sheet = (cols, cells) => ({ cols, cells: cells.map(x => x?.toString() ?? "") });
+      const row = xs => sheet(xs.length, xs.map(x => x?.toString() ?? ""));
+      const col = xs => sheet(1, xs.map(x => x?.toString() ?? ""));
+      const identity = s => s;
+      const transpose = s => { const xs = chunk(s); return sheet(Math.floor(s.cells.length/s.cols), xs[0].flatMap((_,i) => xs.map(row => row[i]))) };
+      const mcells = f => s => ({ ...s, cells: s.cells.map(f).map(x => x?.toString() ?? "") });
+      const rrows = f => s => sheet(1, chunk(s).map(f));
+      const rcols = f => s => { const xs = chunk(s); return sheet(Math.floor(s.cells.length/s.cols), xs[0].map((_,i) => xs.map(row => row[i])).map(f)); };
+      const wrap = cols => s => ({ ...s, cols });
+      const ones = _ => col(Array(100).fill(1));
+      const squares = _ => col(Array(100).fill(0).map((_,i) => Math.pow(i,2)));
+      const planets = _ => col(["mercury","venus","earth","mars","jupiter","saturn","uranus","neptune"]);
+      const alphabet = _ => col(Array(26).fill(0).map((_, i) => String.fromCharCode(65 + i)));
+      const msheet = (...fs) => s => fs.reduce((x,f) => f(x), s);
+    `;
     const app = Elm.Main.init({ node: document.getElementById('app') });
-    app.ports.applyJsToSheet.subscribe(async ({code,data}) => 
-      app.ports.clipboardResultReceived.send(await eval?.(`
-        "use strict";
-        const sum = xs => xs.reduce((a,b) => a + parseInt(b), 0);
-        const mean = xs => sum(xs) / xs.length;
-        const chunk = ({ cols: n, cells: xs }) => Array.from({ length: Math.ceil(xs.length/n) }, (v,i) => xs.slice(i*n,i*n+n));
-        const sheet = (cols, cells) => ({ cols, cells: cells.map(x => x?.toString() ?? "") });
-        const row = xs => sheet(xs.length, xs.map(x => x?.toString() ?? ""));
-        const col = xs => sheet(1, xs.map(x => x?.toString() ?? ""));
-        const identity = s => s;
-        const transpose = s => { const xs = chunk(s); return sheet(Math.floor(s.cells.length/s.cols), xs[0].flatMap((_,i) => xs.map(row => row[i]))) };
-        const mcells = f => s => ({ ...s, cells: s.cells.map(f).map(x => x?.toString() ?? "") });
-        const rrows = f => s => sheet(1, chunk(s).map(f));
-        const rcols = f => s => { const xs = chunk(s); return sheet(Math.floor(s.cells.length/s.cols), xs[0].map((_,i) => xs.map(row => row[i])).map(f)); };
-        const wrap = cols => s => ({ ...s, cols });
-        const ones = _ => col(Array(100).fill(1));
-        const squares = _ => col(Array(100).fill(0).map((_,i) => Math.pow(i,2)));
-        const planets = _ => col(["mercury","venus","earth","mars","jupiter","saturn","uranus","neptune"]);
-        const alphabet = _ => col(Array(26).fill(0).map((_, i) => String.fromCharCode(65 + i)));
-        const msheet = (...fs) => s => fs.reduce((x,f) => f(x), s);
-        (${code})(${JSON.stringify(data)})
-      `))
+    app.ports.clipboardApply.subscribe(async ({code,data}) => 
+      app.ports.clipboardResultReceived.send(await eval?.(`${lib} (${code})(${JSON.stringify(data)})`))
+    );
+    app.ports.sheetApply.subscribe(async ({code,data,dest}) => 
+      app.ports.sheetResultReceived.send({ dest: dest, data: await eval?.(`${lib} (${code})(${JSON.stringify(data)})`) })
     );
   </script>
 </body>

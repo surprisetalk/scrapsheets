@@ -15,10 +15,16 @@ import Regex exposing (Regex)
 import Task
 
 
-port applyJsToSheet : { code : String, data : Sheet } -> Cmd msg
+port clipboardApply : { code : String, data : Sheet } -> Cmd msg
 
 
 port clipboardResultReceived : (Sheet -> msg) -> Sub msg
+
+
+port sheetApply : { code : String, data : Sheet, dest : Index } -> Cmd msg
+
+
+port sheetResultReceived : ({ data : Sheet, dest : Index } -> msg) -> Sub msg
 
 
 iif : Bool -> a -> a -> a
@@ -45,24 +51,15 @@ type Msg
     | KeyPressed Bool String
     | ClipboardCodeEdited String
     | ClipboardResultReceived Sheet
+    | SheetResultReceived { data : Sheet, dest : Index }
 
 
 type alias Cell =
     String
 
 
-type Rule
-    = HttpFetch String
-    | JS String
-    | JsonPath String
-    | Copy
-    | Sum
-    | Product
-    | Mean
-    | Median
-    | Max
-    | Min
-    | Nada
+type alias Rule =
+    String
 
 
 type alias Sheet =
@@ -109,6 +106,7 @@ main =
                     [ Browser.onKeyDown (D.field "key" D.string |> D.map (KeyPressed True))
                     , Browser.onKeyUp (D.field "key" D.string |> D.map (KeyPressed False))
                     , clipboardResultReceived ClipboardResultReceived
+                    , sheetResultReceived SheetResultReceived
                     ]
         , update = update
         , view = view
@@ -125,12 +123,12 @@ init _ =
             Array.map (Tuple.pair Nothing) <|
                 Array.fromList <|
                     [ ( Rect ( ( 0, 0 ), ( 3, 4 ) )
-                      , JS "TODO"
+                      , "msheet(rrows(sum),mcells(x=>'+'+x))"
                       , ( 4, 5 )
                       )
                     , ( Rect ( ( 0, 4 ), ( 3, 8 ) )
-                      , Copy
-                      , ( 5, 6 )
+                      , "msheet(squares,wrap(5))"
+                      , ( 5, 7 )
                       )
                     ]
       , frameDuration = 100
@@ -165,44 +163,15 @@ match q ( xi, yi ) s =
             False
 
 
-apply : Rule -> (Sheet -> ( Sheet, Cmd Msg ))
-apply rule sheet =
-    case rule of
-        HttpFetch x ->
-            -- TODO
+apply : ( Query, Rule, Vector ) -> (Sheet -> ( Sheet, Cmd Msg ))
+apply ( q, r, v ) sheet =
+    -- TODO: In the future, we should try to move everything from async to sync when possible.
+    case q of
+        Rect ( a, _ ) ->
+            ( { cols = 1, cells = Array.empty }, sheetApply { code = r, data = sheet, dest = translate v a } )
+
+        Pattern () ->
             ( { cols = 1, cells = Array.empty }, Cmd.none )
-
-        JS x ->
-            -- TODO
-            ( { sheet | cells = Array.map (always "TODO!") sheet.cells }, Cmd.none )
-
-        JsonPath x ->
-            -- TODO
-            ( { cols = 1, cells = Array.empty }, Cmd.none )
-
-        Copy ->
-            ( sheet, Cmd.none )
-
-        Sum ->
-            ( reduceRows (Array.foldl (String.toFloat >> Maybe.withDefault 0 >> (+)) 0 >> String.fromFloat) sheet, Cmd.none )
-
-        Product ->
-            ( reduceRows (Array.foldl (String.toFloat >> Maybe.withDefault 1 >> (*)) 1 >> String.fromFloat) sheet, Cmd.none )
-
-        Mean ->
-            ( reduceRows (\xs -> String.fromFloat (List.sum (List.filterMap String.toFloat (Array.toList xs)) / toFloat (Array.length xs))) sheet, Cmd.none )
-
-        Median ->
-            ( reduceRows (Array.toList >> List.sort >> Array.fromList >> Array.get (sheet.cols // 2) >> Maybe.withDefault "") sheet, Cmd.none )
-
-        Max ->
-            ( reduceRows (Array.toList >> List.maximum >> Maybe.withDefault "") sheet, Cmd.none )
-
-        Min ->
-            ( reduceRows (Array.toList >> List.minimum >> Maybe.withDefault "") sheet, Cmd.none )
-
-        Nada ->
-            ( { sheet | cells = Array.empty }, Cmd.none )
 
 
 reduceRows : (Array Cell -> Cell) -> Sheet -> Sheet
@@ -310,7 +279,7 @@ update msg ({ sheet, clipboard } as model) =
                             (\( query, rule, move ) ->
                                 case ( w, query ) of
                                     ( Rect r, Rect q ) ->
-                                        iif (overlaps r q) [ ( translate move (Tuple.first q), apply rule (crop q model.sheet) ) ] []
+                                        iif (overlaps r q) [ ( translate move (Tuple.first q), apply ( query, rule, move ) (crop q model.sheet) ) ] []
 
                                     -- TODO
                                     ( Pattern (), Pattern () ) ->
@@ -383,7 +352,7 @@ update msg ({ sheet, clipboard } as model) =
                         Pattern x ->
                             ( 1, 0 )
             in
-            ( { model | rules = model.rules |> Array.push ( Just ( model.selected, Copy, move ), ( model.selected, Nada, move ) ) }, Cmd.none )
+            ( { model | rules = model.rules |> Array.push ( Just ( model.selected, "identity", move ), ( model.selected, "_=>sheet(1,[])", move ) ) }, Cmd.none )
 
         KeyPressed isMetaKey "Meta" ->
             ( { model | isMetaKey = isMetaKey }, Cmd.none )
@@ -424,10 +393,19 @@ update msg ({ sheet, clipboard } as model) =
             ( { model | clipboard = { clipboard | code = "", result = Ok clipboard.data } }, Cmd.none )
 
         ClipboardCodeEdited code ->
-            ( { model | clipboard = { clipboard | code = code, result = Err "" } }, applyJsToSheet { code = code, data = clipboard.data } )
+            ( { model | clipboard = { clipboard | code = code, result = Err "" } }, clipboardApply { code = code, data = clipboard.data } )
 
         ClipboardResultReceived result ->
             ( { model | clipboard = { clipboard | result = Ok result } }, Cmd.none )
+
+        SheetResultReceived { data, dest } ->
+            let
+                svec { cols, cells } =
+                    fromFlatIndex cols (Array.length cells - 1)
+            in
+            ( { model | sheet = { sheet | cells = write sheet ( dest, data ) model.sheet.cells } }
+            , Task.perform CellsWritten (Task.succeed (Rect ( dest, translate dest (svec data) )))
+            )
 
 
 view : Model -> Document Msg
@@ -534,39 +512,7 @@ view model =
                                             text "TODO"
                                     ]
                                 , H.span []
-                                    [ case rule of
-                                        HttpFetch x ->
-                                            text x
-
-                                        JS x ->
-                                            text x
-
-                                        JsonPath x ->
-                                            text x
-
-                                        Copy ->
-                                            text "copy"
-
-                                        Sum ->
-                                            text "sum"
-
-                                        Product ->
-                                            text "product"
-
-                                        Mean ->
-                                            text "mean"
-
-                                        Median ->
-                                            text "median"
-
-                                        Max ->
-                                            text "max"
-
-                                        Min ->
-                                            text "min"
-
-                                        Nada ->
-                                            text "nothing"
+                                    [ text rule
                                     ]
                                 , H.span []
                                     [ case move of
