@@ -127,7 +127,7 @@ init _ =
                       , "msheet(rrows(sum),mcells(x=>'+'+x))"
                       , ( 4, 5 )
                       )
-                    , ( Rect ( ( 0, 4 ), ( 3, 8 ) )
+                    , ( Rect ( ( 0, 5 ), ( 3, 9 ) )
                       , "msheet(squares,wrap(5))"
                       , ( 5, 7 )
                       )
