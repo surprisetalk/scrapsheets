@@ -527,16 +527,39 @@ view model =
                                                 []
 
                                           else
-                                            H.div
-                                                [ style "text-overflow" "ellipsis"
-                                                , style "width" "100%"
-                                                , style "height" "100%"
-                                                , A.onClick (CellEditing index cell)
-                                                , A.onMouseDown (CellsSelecting index)
-                                                , A.onMouseUp (CellsSelected index)
-                                                ]
-                                                [ text cell
-                                                ]
+                                            case cell of
+                                                "[ ]" ->
+                                                    H.input
+                                                        [ A.type_ "checkbox"
+                                                        , A.checked False
+                                                        , A.onClick (WriteCell i "[X]")
+                                                        , A.onMouseDown (CellsSelecting index)
+                                                        , A.onMouseUp (CellsSelected index)
+                                                        ]
+                                                        []
+
+                                                "[X]" ->
+                                                    H.input
+                                                        [ A.type_ "checkbox"
+                                                        , A.checked True
+                                                        , A.onClick (WriteCell i "[ ]")
+                                                        , A.onMouseDown (CellsSelecting index)
+                                                        , A.onMouseUp (CellsSelected index)
+                                                        ]
+                                                        []
+
+                                                _ ->
+                                                    H.div
+                                                        [ style "text-overflow" "ellipsis"
+                                                        , style "width" "100%"
+                                                        , style "height" "100%"
+                                                        , style "background-color" <| iif (String.startsWith "#" cell) cell ""
+                                                        , A.onClick (CellEditing index cell)
+                                                        , A.onMouseDown (CellsSelecting index)
+                                                        , A.onMouseUp (CellsSelected index)
+                                                        ]
+                                                        [ text cell
+                                                        ]
                                         ]
                                 )
                             <|

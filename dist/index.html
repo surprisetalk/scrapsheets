@@ -29,6 +29,7 @@
       const alphabet = _ => col(Array(26).fill(0).map((_, i) => String.fromCharCode(65 + i)));
       const msheet = (...fs) => s => fs.reduce((x,f) => f(x), s);
       const expand = s => sheet(1, JSON.parse(s.cells?.[0] ?? []).map(JSON.parse));
+      const chart = s => sheet(6, chunk(s).map(sum).flatMap(n => Array.from({ length: 5+1 }, (_,i) => n > Math.min(...s.cells) + (i*(Math.max(...s.cells)-Math.min(...s.cells))/5) ? "#0af" : "" )));
     `;
     const app = Elm.Main.init({ node: document.getElementById('app') });
     app.ports.clipboardApply.subscribe(async ({code,data}) => 
