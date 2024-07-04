@@ -13,6 +13,7 @@ import Json.Encode as E
 import Process
 import Regex exposing (Regex)
 import Task
+import Time
 
 
 port clipboardApply : { code : String, data : Sheet } -> Cmd msg
@@ -49,6 +50,9 @@ type Msg
     | RuleEditing Int Rule Vector
     | RuleSaved Int
     | RuleNew
+    | ChannelEditing Int Int Index
+    | ChannelSaved Int
+    | ChannelNew
     | KeyPressed Bool String
     | ClipboardCodeEdited String
     | ClipboardResultReceived Sheet
@@ -92,6 +96,7 @@ type alias Model =
     , sheet : Sheet
     , clipboard : { data : Sheet, code : String, result : Result String Sheet }
     , rules : Array ( Maybe ( Query, Rule, Vector ), ( Query, Rule, Vector ) )
+    , channels : Array ( Maybe ( Int, Vector ), ( Int, Vector ) )
     , frameDuration : Int
     , isCtrlKey : Bool
     }
@@ -101,17 +106,25 @@ main : Platform.Program () Model Msg
 main =
     Browser.document
         { init = init
-        , subscriptions =
-            \_ ->
-                Sub.batch
-                    [ Browser.onKeyDown (D.field "key" D.string |> D.map (KeyPressed True))
-                    , Browser.onKeyUp (D.field "key" D.string |> D.map (KeyPressed False))
-                    , clipboardResultReceived ClipboardResultReceived
-                    , sheetResultReceived SheetResultReceived
-                    ]
+        , subscriptions = subscriptions
         , update = update
         , view = view
         }
+
+
+subscriptions : Model -> Sub.Sub Msg
+subscriptions model =
+    Sub.batch
+        [ Browser.onKeyDown (D.field "key" D.string |> D.map (KeyPressed True))
+        , Browser.onKeyUp (D.field "key" D.string |> D.map (KeyPressed False))
+        , clipboardResultReceived ClipboardResultReceived
+        , sheetResultReceived SheetResultReceived
+        , model.channels
+            |> Array.map Tuple.second
+            |> Array.map (\( t, index ) -> Time.every (toFloat t) (\now -> WriteCell (toFlatIndex model.sheet.cols index) (String.fromInt (Time.posixToMillis now // 1000 |> modBy 60))))
+            |> Array.toList
+            |> Sub.batch
+        ]
 
 
 init : () -> ( Model, Cmd Msg )
@@ -134,6 +147,13 @@ init _ =
                     , ( Pattern "HELLO"
                       , "_ => sheet(1, ['GOODBYE'])"
                       , ( 0, 0 )
+                      )
+                    ]
+      , channels =
+            Array.map (Tuple.pair Nothing) <|
+                Array.fromList <|
+                    [ ( 1000
+                      , ( 4, 5 )
                       )
                     ]
       , frameDuration = 100
@@ -367,6 +387,37 @@ update msg ({ sheet, clipboard } as model) =
             in
             ( { model | rules = model.rules |> Array.push ( Just ( model.selected, "identity", move ), ( model.selected, "_=>sheet(1,[])", move ) ) }, Cmd.none )
 
+        ChannelEditing i t index ->
+            case Array.get i model.channels of
+                Just ( Just _, c ) ->
+                    ( { model | channels = model.channels |> Array.set i ( Just ( t, index ), c ) }, Cmd.none )
+
+                Just ( Nothing, c ) ->
+                    ( { model | selected = Rect ( index, inc index ), channels = model.channels |> Array.set i ( Just ( t, index ), c ) }, Cmd.none )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        ChannelSaved i ->
+            case Array.get i model.channels of
+                Just ( Just ( t, index ), _ ) ->
+                    ( { model | channels = model.channels |> Array.set i ( Nothing, ( t, index ) ) }, Task.perform CellsWritten (Task.succeed (Rect ( index, inc index ))) )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        ChannelNew ->
+            let
+                index =
+                    case model.selected of
+                        Rect ( a, _ ) ->
+                            a
+
+                        Pattern x ->
+                            ( 0, 0 )
+            in
+            ( { model | channels = model.channels |> Array.push ( Just ( 1000, index ), ( 1000, index ) ) }, Cmd.none )
+
         KeyPressed isCtrlKey "Control" ->
             ( { model | isCtrlKey = isCtrlKey }, Cmd.none )
 
@@ -569,6 +620,36 @@ view model =
             , H.div [ style "display" "flex", style "flex-direction" "column", style "gap" "1rem" ] <|
                 List.concat
                     [ List.concatMap
+                        (\( i, isEditing, ( t, index ) ) ->
+                            [ H.div
+                                (List.concat
+                                    [ [ style "display" "grid", style "grid-template-columns" "auto auto auto" ]
+                                    , iif isEditing [] [ A.onClick (ChannelEditing i t index) ]
+                                    ]
+                                )
+                                [ H.span [] [ text (String.fromInt t) ]
+                                , H.span []
+                                    [ case index of
+                                        ( x, y ) ->
+                                            text <| String.join "" [ "(", String.fromInt x, ",", String.fromInt y, ")" ]
+                                    ]
+                                , if isEditing then
+                                    H.button [ A.onClick (ChannelSaved i) ] [ text "save" ]
+
+                                  else
+                                    text ""
+                                ]
+                            ]
+                        )
+                      <|
+                        Array.toList <|
+                            Array.indexedMap (\i ( a, b ) -> ( i, a /= Nothing, Maybe.withDefault b a )) <|
+                                model.channels
+                    , [ H.div []
+                            [ H.button [ A.onClick ChannelNew ] [ text "+ New Channel" ]
+                            ]
+                      ]
+                    , List.concatMap
                         (\( i, isEditing, ( query, rule, move ) ) ->
                             [ H.div
                                 (List.concat
