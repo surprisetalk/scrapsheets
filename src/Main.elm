@@ -93,7 +93,7 @@ type alias Model =
     , clipboard : { data : Sheet, code : String, result : Result String Sheet }
     , rules : Array ( Maybe ( Query, Rule, Vector ), ( Query, Rule, Vector ) )
     , frameDuration : Int
-    , isMetaKey : Bool
+    , isCtrlKey : Bool
     }
 
 
@@ -137,7 +137,7 @@ init _ =
                       )
                     ]
       , frameDuration = 100
-      , isMetaKey = False
+      , isCtrlKey = False
       }
     , Task.perform CellsWritten (Task.succeed (Rect ( ( 0, 0 ), ( 100, 100 ) )))
     )
@@ -248,7 +248,7 @@ crop r s =
 write sheet ( ( x, y ), { cols, cells } ) cells_ =
     Array.foldl
         (\( i, cell ) ->
-            if x + modBy cols i > sheet.cols then
+            if x + modBy cols i >= sheet.cols then
                 identity
 
             else
@@ -305,7 +305,7 @@ update msg ({ sheet, clipboard } as model) =
             , Cmd.batch <|
                 List.concat
                     [ subtasks
-                    , List.map (Task.perform CellsWritten << (\x -> Task.andThen (always (Task.succeed x)) (Process.sleep (toFloat model.frameDuration)))) <|
+                    , List.map (Task.perform CellsWritten << (\x -> Task.map (always x) (Process.sleep (toFloat model.frameDuration)))) <|
                         List.map (\( ( x, y ), { cols, cells } ) -> Rect ( ( x, y ), ( x + modBy cols (Array.length cells), y + Array.length cells // cols * sheet.cols ) )) <|
                             List.filter (\( _, { cells } ) -> Array.length cells > 0) <|
                                 subsheets
@@ -367,14 +367,14 @@ update msg ({ sheet, clipboard } as model) =
             in
             ( { model | rules = model.rules |> Array.push ( Just ( model.selected, "identity", move ), ( model.selected, "_=>sheet(1,[])", move ) ) }, Cmd.none )
 
-        KeyPressed isMetaKey "Control" ->
-            ( { model | isMetaKey = isMetaKey }, Cmd.none )
+        KeyPressed isCtrlKey "Control" ->
+            ( { model | isCtrlKey = isCtrlKey }, Cmd.none )
 
         KeyPressed True "Escape" ->
             ( { model | clipboard = emptyClipboard }, Cmd.none )
 
         KeyPressed True "c" ->
-            if not model.isMetaKey then
+            if not model.isCtrlKey then
                 ( model, Cmd.none )
 
             else
@@ -386,7 +386,7 @@ update msg ({ sheet, clipboard } as model) =
                         ( { model | clipboard = { data = { cols = 1, cells = Array.filter (String.startsWith p) model.sheet.cells }, code = "", result = Ok { cols = 1, cells = Array.filter (String.startsWith p) model.sheet.cells } } }, Cmd.none )
 
         KeyPressed True "v" ->
-            if not model.isMetaKey then
+            if not model.isCtrlKey then
                 ( model, Cmd.none )
 
             else
@@ -410,7 +410,7 @@ update msg ({ sheet, clipboard } as model) =
                                 ( { model | clipboard = emptyClipboard }, Cmd.none )
 
         KeyPressed True "f" ->
-            if not model.isMetaKey then
+            if not model.isCtrlKey then
                 ( model, Cmd.none )
 
             else
@@ -423,6 +423,18 @@ update msg ({ sheet, clipboard } as model) =
 
                     Pattern _ ->
                         ( { model | selected = Pattern "" }, Task.attempt (\_ -> NoOp) (Dom.focus "search") )
+
+        KeyPressed True "j" ->
+            iif (not model.isCtrlKey) ( model, Cmd.none ) ( { model | rules = model.rules |> Array.map (Tuple.mapFirst (Maybe.map (\( q, r, ( x, y ) ) -> ( q, r, ( x, y + 1 ) )))) }, Cmd.none )
+
+        KeyPressed True "k" ->
+            iif (not model.isCtrlKey) ( model, Cmd.none ) ( { model | rules = model.rules |> Array.map (Tuple.mapFirst (Maybe.map (\( q, r, ( x, y ) ) -> ( q, r, ( x, y - 1 ) )))) }, Cmd.none )
+
+        KeyPressed True "h" ->
+            iif (not model.isCtrlKey) ( model, Cmd.none ) ( { model | rules = model.rules |> Array.map (Tuple.mapFirst (Maybe.map (\( q, r, ( x, y ) ) -> ( q, r, ( x - 1, y ) )))) }, Cmd.none )
+
+        KeyPressed True "l" ->
+            iif (not model.isCtrlKey) ( model, Cmd.none ) ( { model | rules = model.rules |> Array.map (Tuple.mapFirst (Maybe.map (\( q, r, ( x, y ) ) -> ( q, r, ( x + 1, y ) )))) }, Cmd.none )
 
         KeyPressed _ _ ->
             ( model, Cmd.none )
@@ -442,7 +454,7 @@ update msg ({ sheet, clipboard } as model) =
                     fromFlatIndex cols (Array.length cells - 1)
             in
             ( { model | sheet = { sheet | cells = write sheet ( dest, data ) model.sheet.cells } }
-            , Task.perform CellsWritten (Task.succeed (Rect ( dest, translate dest (svec data) )))
+            , Task.perform CellsWritten (Task.map (always (Rect ( dest, translate dest (svec data) ))) (Process.sleep (toFloat model.frameDuration)))
             )
 
 
