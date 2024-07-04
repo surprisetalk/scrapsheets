@@ -131,6 +131,10 @@ init _ =
                       , "msheet(squares,wrap(5))"
                       , ( 5, 7 )
                       )
+                    , ( Pattern "HELLO"
+                      , "_ => sheet(1, ['GOODBYE'])"
+                      , ( 0, 0 )
+                      )
                     ]
       , frameDuration = 100
       , isMetaKey = False
@@ -285,9 +289,9 @@ update msg ({ sheet, clipboard } as model) =
                                         -- TODO: This is buggy
                                         iif (String.startsWith p2 p1) [ ( ( 0, 0 ), apply ( query, rule, move ) model.sheet ) ] []
 
-                                    ( Rect r, Pattern p ) ->
-                                        -- TODO
-                                        []
+                                    ( Rect _, Pattern p ) ->
+                                        -- TODO: Inefficient to search everything...
+                                        [ ( ( 0, 0 ), apply ( query, rule, move ) model.sheet ) ]
 
                                     ( Pattern p, Rect r ) ->
                                         -- TODO
@@ -303,7 +307,8 @@ update msg ({ sheet, clipboard } as model) =
                     [ subtasks
                     , List.map (Task.perform CellsWritten << (\x -> Task.andThen (always (Task.succeed x)) (Process.sleep (toFloat model.frameDuration)))) <|
                         List.map (\( ( x, y ), { cols, cells } ) -> Rect ( ( x, y ), ( x + modBy cols (Array.length cells), y + Array.length cells // cols * sheet.cols ) )) <|
-                            subsheets
+                            List.filter (\( _, { cells } ) -> Array.length cells > 0) <|
+                                subsheets
                     ]
             )
 
@@ -358,7 +363,7 @@ update msg ({ sheet, clipboard } as model) =
                             ( max 1 (xb - xa), 0 )
 
                         Pattern x ->
-                            ( 1, 0 )
+                            ( 0, 0 )
             in
             ( { model | rules = model.rules |> Array.push ( Just ( model.selected, "identity", move ), ( model.selected, "_=>sheet(1,[])", move ) ) }, Cmd.none )
 
