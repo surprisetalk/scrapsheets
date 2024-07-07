@@ -129,7 +129,7 @@ subscriptions model =
 
 init : () -> ( Model, Cmd Msg )
 init _ =
-    ( { selected = Rect ( ( 8, 7 ), ( 12, 13 ) )
+    ( { selected = Rect ( ( 0, 0 ), ( 0, 0 ) ) -- Rect ( ( 8, 7 ), ( 12, 13 ) )
       , editing = ( ( -1, -1 ), "" )
 
       -- , sheet = { cols = 10, cells = Array.initialize (10 * 100) (\i -> String.fromInt (i // 10)) }
@@ -138,20 +138,19 @@ init _ =
       , rules =
             Array.map (Tuple.pair Nothing) <|
                 Array.fromList <|
-                    [ ( Rect ( ( 0, 0 ), ( 3, 4 ) )
-                        -- , "msheet(rrows(sum),mcells(x=>'+'+x))"
-                      , "msheet(rrows(sum))"
-                      , ( 4, 5 )
-                      )
-
-                    -- , ( Rect ( ( 0, 5 ), ( 3, 9 ) )
-                    --   , "msheet(squares,wrap(5))"
-                    --   , ( 5, 7 )
-                    --   )
-                    , ( Pattern "HELLO"
-                      , "_ => sheet(1, ['GOODBYE'])"
-                      , ( 0, 0 )
-                      )
+                    [-- , ( Pattern "HELLO"
+                     --   , "_ => sheet(1, ['GOODBYE'])"
+                     --   , ( 0, 0 )
+                     --   )
+                     -- , ( Rect ( ( 0, 0 ), ( 3, 4 ) )
+                     --     -- , "msheet(rrows(sum),mcells(x=>'+'+x))"
+                     --   , "msheet(rrows(sum))"
+                     --   , ( 4, 5 )
+                     --   )
+                     -- , ( Rect ( ( 0, 5 ), ( 3, 9 ) )
+                     --   , "msheet(squares,wrap(5))"
+                     --   , ( 5, 7 )
+                     --   )
                     ]
       , channels =
             Array.map (Tuple.pair Nothing) <|
@@ -160,7 +159,7 @@ init _ =
                       , ( 8, 2 )
                       )
                     ]
-      , frameDuration = 100
+      , frameDuration = 900
       , isCtrlKey = False
       }
     , Task.perform CellsWritten (Task.succeed (Rect ( ( 0, 0 ), ( 100, 100 ) )))
