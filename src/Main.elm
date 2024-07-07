@@ -39,7 +39,7 @@ iif c t f =
 
 type Msg
     = NoOp
-    | WriteCell Int String
+    | WriteCell Bool Int String
     | CellsWritten Query
     | CellsSelecting Index
     | CellsSelected Index
@@ -121,7 +121,7 @@ subscriptions model =
         , sheetResultReceived SheetResultReceived
         , model.channels
             |> Array.map Tuple.second
-            |> Array.map (\( t, index ) -> Time.every (toFloat t) (\now -> WriteCell (toFlatIndex model.sheet.cols index) (String.fromInt (Time.posixToMillis now // 1000 |> modBy 60))))
+            |> Array.map (\( t, index ) -> Time.every (toFloat t) (\now -> WriteCell False (toFlatIndex model.sheet.cols index) (String.fromInt (Time.posixToMillis now // 1000 |> modBy 60))))
             |> Array.toList
             |> Sub.batch
         ]
@@ -131,19 +131,23 @@ init : () -> ( Model, Cmd Msg )
 init _ =
     ( { selected = Rect ( ( 8, 7 ), ( 12, 13 ) )
       , editing = ( ( -1, -1 ), "" )
-      , sheet = { cols = 10, cells = Array.initialize (10 * 100) (\i -> String.fromInt (i // 10)) }
+
+      -- , sheet = { cols = 10, cells = Array.initialize (10 * 100) (\i -> String.fromInt (i // 10)) }
+      , sheet = { cols = 10, cells = Array.initialize (10 * 50) (always "") }
       , clipboard = emptyClipboard
       , rules =
             Array.map (Tuple.pair Nothing) <|
                 Array.fromList <|
                     [ ( Rect ( ( 0, 0 ), ( 3, 4 ) )
-                      , "msheet(rrows(sum),mcells(x=>'+'+x))"
+                        -- , "msheet(rrows(sum),mcells(x=>'+'+x))"
+                      , "msheet(rrows(sum))"
                       , ( 4, 5 )
                       )
-                    , ( Rect ( ( 0, 5 ), ( 3, 9 ) )
-                      , "msheet(squares,wrap(5))"
-                      , ( 5, 7 )
-                      )
+
+                    -- , ( Rect ( ( 0, 5 ), ( 3, 9 ) )
+                    --   , "msheet(squares,wrap(5))"
+                    --   , ( 5, 7 )
+                    --   )
                     , ( Pattern "HELLO"
                       , "_ => sheet(1, ['GOODBYE'])"
                       , ( 0, 0 )
@@ -153,7 +157,7 @@ init _ =
             Array.map (Tuple.pair Nothing) <|
                 Array.fromList <|
                     [ ( 1000
-                      , ( 4, 5 )
+                      , ( 8, 2 )
                       )
                     ]
       , frameDuration = 100
@@ -287,10 +291,10 @@ update msg ({ sheet, clipboard } as model) =
         FrameDurationUpdated n ->
             ( { model | frameDuration = Maybe.withDefault model.frameDuration <| String.toInt n }, Cmd.none )
 
-        WriteCell i x ->
+        WriteCell reset i x ->
             ( { model
                 | sheet = { sheet | cells = Array.set i x sheet.cells }
-                , editing = ( ( -1, -1 ), "" )
+                , editing = iif reset ( ( -1, -1 ), "" ) model.editing
               }
             , Task.perform CellsWritten (Task.succeed (Rect ( fromFlatIndex sheet.cols i, Tuple.mapBoth ((+) 1) ((+) 1) (fromFlatIndex sheet.cols i) )))
             )
@@ -549,7 +553,7 @@ view model =
                     H.form
                         [ style "display" "grid"
                         , style "grid-template-columns" (String.repeat m.sheet.cols "1fr ")
-                        , A.onSubmit (WriteCell (toFlatIndex m.sheet.cols (Tuple.first m.editing)) (Tuple.second m.editing))
+                        , A.onSubmit (WriteCell True (toFlatIndex m.sheet.cols (Tuple.first m.editing)) (Tuple.second m.editing))
                         ]
                     <|
                         Array.toList <|
@@ -566,6 +570,7 @@ view model =
                                         , style "font-weight" (iif (List.any (\sink -> match sink index cell) sinks) "700" "")
                                         , style "border" "1px solid #eee"
                                         , style "position" "relative"
+                                        , style "min-height" "1rem"
                                         ]
                                         [ if index == Tuple.first m.editing then
                                             H.input
@@ -583,7 +588,7 @@ view model =
                                                     H.input
                                                         [ A.type_ "checkbox"
                                                         , A.checked False
-                                                        , A.onClick (WriteCell i "[X]")
+                                                        , A.onClick (WriteCell True i "[X]")
                                                         , A.onMouseDown (CellsSelecting index)
                                                         , A.onMouseUp (CellsSelected index)
                                                         ]
@@ -593,7 +598,7 @@ view model =
                                                     H.input
                                                         [ A.type_ "checkbox"
                                                         , A.checked True
-                                                        , A.onClick (WriteCell i "[ ]")
+                                                        , A.onClick (WriteCell True i "[ ]")
                                                         , A.onMouseDown (CellsSelecting index)
                                                         , A.onMouseUp (CellsSelected index)
                                                         ]
@@ -617,7 +622,7 @@ view model =
                                 m.sheet.cells
                 )
                 model
-            , H.div [ style "display" "flex", style "flex-direction" "column", style "gap" "1rem" ] <|
+            , H.div [ style "display" "flex", style "flex-direction" "column", style "gap" "1rem", style "padding" "1rem" ] <|
                 List.concat
                     [ List.concatMap
                         (\( i, isEditing, ( t, index ) ) ->
@@ -745,7 +750,16 @@ view model =
                         ]
                       <|
                         Array.toList <|
-                            Array.map (H.div [ style "border" "1px solid black", style "padding" "0 0.25rem" ] << List.singleton << text) <|
+                            Array.map
+                                (H.div
+                                    [ style "border" "1px solid black"
+                                    , style "padding" "0 0.25rem"
+                                    , style "min-height" "1rem"
+                                    ]
+                                    << List.singleton
+                                    << text
+                                )
+                            <|
                                 clipboard.cells
                     , H.textarea
                         [ style "border" (iif (Nothing /= Result.toMaybe model.clipboard.result) "" "1px solid red")

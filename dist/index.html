@@ -11,7 +11,7 @@
   <script>
     const lib = `
       "use strict";
-      const sum = xs => xs.reduce((a,b) => a + parseInt(b), 0);
+      const sum = xs => xs.reduce((a,b) => a + parseInt(b || 0), 0);
       const mean = xs => sum(xs) / xs.length;
       const chunk = ({ cols: n, cells: xs }) => Array.from({ length: Math.ceil(xs.length/n) }, (v,i) => xs.slice(i*n,i*n+n));
       const sheet = (cols, cells) => ({ cols, cells: cells.map(x => x?.toString() ?? "") });
