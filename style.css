@@ -1,0 +1,20 @@
+#clipboard {
+}
+
+main {
+  display: grid;
+  grid-template-columns: 1fr 20rem;
+}
+
+.sheet {
+  width: 100%;
+}
+
+.sheet input {
+  width: 100%;
+  padding: 0;
+}
+
+input[disabled] {
+  pointer-events: none;
+}
