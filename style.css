@@ -1,3 +1,7 @@
+* {
+  box-sizing: border-box;
+}
+
 #clipboard {
 }
 
@@ -6,8 +10,8 @@ main {
   grid-template-columns: 1fr 20rem;
 }
 
-.sheet {
-  width: 100%;
+input[disabled] {
+  pointer-events: none;
 }
 
 .sheet input {
@@ -15,6 +19,21 @@ main {
   padding: 0;
 }
 
-input[disabled] {
-  pointer-events: none;
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th,
+td {
+  border: 1px solid #ddd;
+  padding: 0;
+}
+
+tr:nth-child(even) {
+  background-color: #f9f9f9;
+}
+
+tr:hover {
+  background-color: #f1f1f1;
 }

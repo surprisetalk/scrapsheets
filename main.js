@@ -29,7 +29,7 @@ const Sheet = rows =>
     )
   );
 
-const sheet = van.state(new Array(20).fill(new Array(10).fill("")));
+const sheet = van.state(new Array(35).fill(new Array(10).fill("")));
 
 van.add(
   document.body,
