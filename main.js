@@ -1,14 +1,20 @@
 import van from "https://cdn.jsdelivr.net/gh/vanjs-org/van/public/van-1.5.2.min.js";
 
-const { div, table, tbody, tr, td, a, input, span, aside, main } = van.tags;
+const {div, table, tbody, tr, td, a, input, span, aside, main} = van.tags;
 
 const Cell = () => {
-  return input({ disabled: true, onblur: e => (e.target.disabled = true) });
+  return input({
+    disabled: true,
+    onblur: e => (e.target.disabled = true),
+    onchange: e => e.target.blur(),
+  });
 };
 
-const Sheet = rows =>
-  table(
-    { class: "sheet" },
+const Sheet = rows => {
+  const state = van.state(rows);
+  // TODO: van.derive
+  return table(
+    {class: "sheet"},
     tbody(
       rows.map(row =>
         tr(
@@ -28,14 +34,13 @@ const Sheet = rows =>
       )
     )
   );
-
-const sheet = van.state(new Array(35).fill(new Array(10).fill("")));
+}
 
 van.add(
   document.body,
-  div({ id: "clipboard" }),
+  div({id: "clipboard"}),
   main(
-    Sheet(sheet.val),
+    Sheet(new Array(35).fill(new Array(10).fill(""))),
     aside(
       div(), // channels
       div() // rules
