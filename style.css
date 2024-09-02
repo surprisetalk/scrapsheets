@@ -10,6 +10,9 @@ main {
   grid-template-columns: 1fr 20rem;
 }
 
+input {
+  background: none;
+}
 input[disabled] {
   pointer-events: none;
 }
