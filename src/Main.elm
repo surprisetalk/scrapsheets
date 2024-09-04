@@ -217,7 +217,13 @@ viewSheet sheet =
                         H.tr [] <|
                             Array.toList <|
                                 Array.initialize (Array.length sheet.cols)
-                                    (H.td [] << ls << Maybe.withDefault (text "") << Maybe.andThen (viewCell i) << Maybe.map Tuple.second << flip Array.get sheet.cols)
+                                    (H.td []
+                                        << ls
+                                        << Maybe.withDefault (text "")
+                                        << Maybe.andThen (viewCell i)
+                                        << Maybe.map Tuple.second
+                                        << flip Array.get sheet.cols
+                                    )
                     )
         ]
 
