@@ -85,16 +85,20 @@ type alias Input valid data =
     }
 
 
+type alias EditArray a =
+    { edits : Dict Int a, data : Array a }
+
+
 type Col
-    = Numbers (Array Float)
-    | Strings (Array String)
-    | Images (Array String)
-    | Links (Array String)
-    | Datepickers (Array (Input () Date))
-    | Checkboxes (Array (Input () Bool))
-    | Sliders (Array (Input ( Float, Float ) Float))
-    | Fields (Array (Input Regex String))
-    | Chart (Array ( Float, Float ))
+    = Numbers (EditArray Float)
+    | Strings (EditArray String)
+    | Images (EditArray String)
+    | Links (EditArray String)
+    | Datepickers (EditArray (Input () Date))
+    | Checkboxes (EditArray (Input () Bool))
+    | Sliders (EditArray (Input ( Float, Float ) Float))
+    | Fields (EditArray (Input Regex String))
+    | Chart (EditArray ( Float, Float ))
 
 
 type alias Sheet =
@@ -137,8 +141,8 @@ init _ url _ =
                             , rows = 4
                             , cols =
                                 Array.fromList
-                                    [ ( "Col", Numbers <| Array.fromList [ 1, 2, 3, 4 ] )
-                                    , ( "Col", Numbers <| Array.fromList [ 5, 6, 7, 8 ] )
+                                    [ ( "Col", Numbers { edits = Dict.empty, data = Array.fromList [ 1, 2, 3, 4 ] } )
+                                    , ( "Col", Numbers { edits = Dict.empty, data = Array.fromList [ 5, 6, 7, 8 ] } )
                                     ]
                             }
                     }
@@ -155,8 +159,11 @@ init _ url _ =
 
 
 type Msg
-    = SheetNew
-    | CodeEdit SheetId String
+    = SheetCreating
+    | CodeEditing SheetId String
+    | CodeEdited SheetId (Result String Scrapsheet)
+    | DataEditing SheetId ( Int, Int ) String
+    | SheetEdited SheetId
     | UrlChanged Url
     | LinkClicked Browser.UrlRequest
 
@@ -215,22 +222,10 @@ type alias Env =
 -}
 
 
-exec : Env -> String -> ( Scrapsheet, Cmd Msg )
-exec env code =
-    ( -- TODO: Create a simple parser.
-      { watch = Set.empty
-      , code = code
-      , sheet = Err "TODO"
-      }
-      -- TODO
-    , Cmd.none
-    )
-
-
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
-        SheetNew ->
+        SheetCreating ->
             let
                 sheetId : Int
                 sheetId =
@@ -250,24 +245,68 @@ update msg model =
                 []
             )
 
-        CodeEdit id code ->
+        CodeEditing id code ->
             let
                 env : Env
                 env =
                     model.sheets |> Dict.map (always (.sheet >> Result.toMaybe))
 
-                ( ss, cmd ) =
-                    exec env code
+                sheet : Result String Sheet
+                sheet =
+                    Err "TODO"
             in
+            ( model
+            , Task.attempt (CodeEdited id) <|
+                Task.succeed
+                    { watch = Set.empty
+                    , code = code
+                    , sheet = sheet
+                    }
+            )
+
+        CodeEdited id (Ok ss) ->
             ( { model | sheets = model.sheets |> Dict.insert id ss }
-            , Cmd.batch
-                [ cmd
-                , model.sheets
-                    |> Dict.filter (always (.watch >> Set.member id))
-                    |> Dict.map (\k v -> Task.succeed () |> Task.perform (\_ -> CodeEdit k v.code))
-                    |> Dict.values
-                    |> Cmd.batch
-                ]
+            , Task.succeed id |> Task.perform SheetEdited
+            )
+
+        CodeEdited id (Err _) ->
+            -- TODO
+            ( model, Cmd.none )
+
+        DataEditing id ( i, j ) value ->
+            let
+                edit_ : Col -> Col
+                edit_ col =
+                    Maybe.withDefault col <|
+                        case col of
+                            Numbers xs ->
+                                String.toFloat value
+                                    |> Maybe.map (\x -> Numbers { xs | edits = xs.edits |> Dict.insert j x })
+
+                            _ ->
+                                -- TODO
+                                Nothing
+
+                edit : Sheet -> Sheet
+                edit sheet =
+                    case Array.get i sheet.cols of
+                        Just col ->
+                            { sheet | cols = sheet.cols |> Array.set i (Tuple.mapSecond edit_ col) }
+
+                        Nothing ->
+                            sheet
+            in
+            ( { model | sheets = model.sheets |> Dict.update id (Maybe.map (\x -> { x | sheet = Result.map edit x.sheet })) }
+            , Task.succeed id |> Task.perform SheetEdited
+            )
+
+        SheetEdited id ->
+            ( model
+            , model.sheets
+                |> Dict.filter (always (.watch >> Set.member id))
+                |> Dict.map (\k v -> Task.succeed () |> Task.perform (\_ -> CodeEditing k v.code))
+                |> Dict.values
+                |> Cmd.batch
             )
 
         UrlChanged url ->
@@ -286,18 +325,31 @@ update msg model =
 
 viewCell : Int -> Col -> Maybe (Html Msg)
 viewCell i col =
+    let
+        get : EditArray a -> Maybe a
+        get arr =
+            case ( Dict.get i arr.edits, Array.get i arr.data ) of
+                ( Just x, _ ) ->
+                    Just x
+
+                ( _, Just x ) ->
+                    Just x
+
+                _ ->
+                    Nothing
+    in
     case col of
         Numbers xs ->
-            xs |> Array.get i |> Maybe.map (String.fromFloat >> text)
+            xs |> get |> Maybe.map (String.fromFloat >> text)
 
         Strings xs ->
-            xs |> Array.get i |> Maybe.map text
+            xs |> get |> Maybe.map text
 
         Images xs ->
-            xs |> Array.get i |> Maybe.map (\src -> H.img [ A.src src ] [])
+            xs |> get |> Maybe.map (\src -> H.img [ A.src src ] [])
 
         Links xs ->
-            xs |> Array.get i |> Maybe.map (\href -> H.a [ A.href href ] [])
+            xs |> get |> Maybe.map (\href -> H.a [ A.href href ] [])
 
         Datepickers xs ->
             -- TODO
@@ -361,7 +413,7 @@ view model =
         [ H.node "style" [] [ text "" ]
         , H.main_ []
             [ H.div [ S.displayFlex, S.flexDirectionColumn ] <|
-                List.append [ H.button [ A.onClick SheetNew ] [ text "New sheet" ] ] <|
+                List.append [ H.button [ A.onClick SheetCreating ] [ text "New sheet" ] ] <|
                     List.map (H.div [ S.displayFlex, S.flexDirectionRow ]) <|
                         List.map
                             (List.map
@@ -376,7 +428,7 @@ view model =
 
                                                         Err x ->
                                                             H.div [] [ text ("TODO: error: " ++ x) ]
-                                                    , H.textarea [ A.onInput (CodeEdit id), A.value code ] [ text code ]
+                                                    , H.textarea [ A.onInput (CodeEditing id), A.value code ] [ text code ]
                                                     ]
                                             )
                                         <|
