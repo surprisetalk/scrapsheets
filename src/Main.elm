@@ -145,7 +145,8 @@ init _ url _ =
 
 
 type Msg
-    = NewSheet
+    = SheetNew
+    | CodeEdit SheetId String
     | UrlChanged Url
     | LinkClicked Browser.UrlRequest
 
@@ -154,10 +155,48 @@ type Msg
 ---- UPDATE -------------------------------------------------------------------
 
 
+type alias Env =
+    Dict SheetId (Maybe Sheet)
+
+
+
+{-
+
+   sheet/from-json []
+     -- todo
+
+   sheet/from-csv [ sheet/col/numbers, shet/col/text ] csv
+   . csv : text = "col1,col2\n" ++ text/join "\n" [ "1,a" , "2,b" , "3,c" ]
+
+   sheet
+     [ sheet/col/numbers  "col1" [ 1, 2, 3 ]
+     , sheet/col/text     "col2" [ "a", "b", "c" ]
+     , sheet/col/checkbox "col3" [ true, false, false ]
+     ]
+
+   sheet/map2 add s1 s2
+
+   sheet/filter-number "col1" (gt 1) s1
+
+   sheet/select [ "col1" ] s1
+
+   sheet/join s1 s2
+
+   sheet/stack s1 s2
+
+-}
+
+
+exec : Env -> String -> Result String Sheet
+exec env code =
+    -- TODO: Create a simple parser.
+    Err "TODO"
+
+
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
-        NewSheet ->
+        SheetNew ->
             let
                 sheetId : Int
                 sheetId =
@@ -172,6 +211,16 @@ update msg model =
                             , sheet = Ok { transpose = False, rows = 0, cols = Array.empty }
                             }
               }
+            , Cmd.none
+            )
+
+        CodeEdit id code ->
+            let
+                env : Env
+                env =
+                    model.sheets |> Dict.map (always (.sheet >> Result.toMaybe))
+            in
+            ( { model | sheets = model.sheets |> Dict.insert id { code = code, sheet = exec env code } }
             , Cmd.none
             )
 
@@ -262,19 +311,30 @@ view : Model -> Browser.Document Msg
 view model =
     { title = "scrapsheets"
     , body =
-        -- TODO: Sheets that exist but aren't currently on the shelf should sit minimized in the corner or something like buffers waiting to be placed back on teh shelf.
+        -- TODO: Sheets that exist but aren't currently on the shelf should sit minimized in the corner or something like buffers waiting to be placed back on the shelf.
         [ H.node "style" [] [ text "" ]
         , H.main_ []
             [ H.div [ S.displayFlex, S.flexDirectionColumn ] <|
-                List.append [ H.button [ A.onClick NewSheet ] [ text "New sheet" ] ] <|
+                List.append [ H.button [ A.onClick SheetNew ] [ text "New sheet" ] ] <|
                     List.map (H.div [ S.displayFlex, S.flexDirectionRow ]) <|
                         List.map
                             (List.map
-                                (Result.withDefault (H.div [] [ text "TODO: error" ])
-                                    << Result.map viewSheet
-                                    << Result.andThen .sheet
-                                    << Result.fromMaybe "Sheet not found."
-                                    << flip Dict.get model.sheets
+                                (\id ->
+                                    Maybe.withDefault (H.div [] [ text "TODO: sheet not found" ]) <|
+                                        Maybe.map
+                                            (\{ code, sheet } ->
+                                                H.div [ S.displayFlex, S.flexDirectionColumn ]
+                                                    [ case sheet of
+                                                        Ok x ->
+                                                            viewSheet x
+
+                                                        Err x ->
+                                                            H.div [] [ text ("TODO: error: " ++ x) ]
+                                                    , H.textarea [ A.onInput (CodeEdit id), A.value code ] [ text code ]
+                                                    ]
+                                            )
+                                        <|
+                                            Dict.get id model.sheets
                                 )
                             )
                         <|
