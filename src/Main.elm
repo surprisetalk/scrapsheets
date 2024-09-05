@@ -16,6 +16,8 @@ import Http
 import Json.Decode as D
 import Json.Encode as E
 import Regex exposing (Regex)
+import Set exposing (Set)
+import Task exposing (Task)
 import Time exposing (Month(..))
 import Url exposing (Url)
 
@@ -102,9 +104,16 @@ type alias Sheet =
     }
 
 
+type alias Scrapsheet =
+    { watch : Set SheetId
+    , code : String
+    , sheet : Result String Sheet
+    }
+
+
 type alias Model =
     -- The output of `code` completely determines the shape and content of `sheet`.
-    { sheets : Dict SheetId { code : String, sheet : Result String Sheet }
+    { sheets : Dict SheetId Scrapsheet
 
     -- the row beneath the sheet opens up with its code and a pointer and tools
     , shelf : List (List SheetId) -- use empty sheets as row/col spacers
@@ -120,7 +129,8 @@ init _ url _ =
     ( { sheets =
             Dict.empty
                 |> Dict.insert 1
-                    { code = "TODO"
+                    { watch = Set.empty
+                    , code = "TODO"
                     , sheet =
                         Ok
                             { transpose = False
@@ -161,6 +171,7 @@ type alias Env =
 
 
 {-
+   -- TODO: Move all the corresponding elm code into a Sheet module
 
    "[ todo ]"
      |> sheet/from-json pair
@@ -195,13 +206,25 @@ type alias Env =
 
    sheet/from-columns
 
+   sheet/http { ... }
+
+   sheet/websocket { ... }
+
+   sheet/every 60
+
 -}
 
 
-exec : Env -> String -> Result String Sheet
+exec : Env -> String -> ( Scrapsheet, Cmd Msg )
 exec env code =
-    -- TODO: Create a simple parser.
-    Err "TODO"
+    ( -- TODO: Create a simple parser.
+      { watch = Set.empty
+      , code = code
+      , sheet = Err "TODO"
+      }
+      -- TODO
+    , Cmd.none
+    )
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -218,11 +241,13 @@ update msg model =
                 , sheets =
                     model.sheets
                         |> Dict.insert sheetId
-                            { code = "TODO"
+                            { watch = Set.empty
+                            , code = "sheet\n  [\n  ]"
                             , sheet = Ok { transpose = False, rows = 0, cols = Array.empty }
                             }
               }
-            , Cmd.none
+            , Cmd.batch
+                []
             )
 
         CodeEdit id code ->
@@ -230,9 +255,19 @@ update msg model =
                 env : Env
                 env =
                     model.sheets |> Dict.map (always (.sheet >> Result.toMaybe))
+
+                ( ss, cmd ) =
+                    exec env code
             in
-            ( { model | sheets = model.sheets |> Dict.insert id { code = code, sheet = exec env code } }
-            , Cmd.none
+            ( { model | sheets = model.sheets |> Dict.insert id ss }
+            , Cmd.batch
+                [ cmd
+                , model.sheets
+                    |> Dict.filter (always (.watch >> Set.member id))
+                    |> Dict.map (\k v -> Task.succeed () |> Task.perform (\_ -> CodeEdit k v.code))
+                    |> Dict.values
+                    |> Cmd.batch
+                ]
             )
 
         UrlChanged url ->
