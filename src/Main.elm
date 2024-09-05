@@ -162,27 +162,38 @@ type alias Env =
 
 {-
 
-   sheet/from-json []
-     -- todo
+   "[ todo ]"
+     |> sheet/from-json pair
+     |> sheet/col/numbers
+     |> sheet/col/text
 
-   sheet/from-csv [ sheet/col/numbers, shet/col/text ] csv
-   . csv : text = "col1,col2\n" ++ text/join "\n" [ "1,a" , "2,b" , "3,c" ]
+   text/join "\n" [ "1,a" , "2,b" , "3,c" ]
+     |> sheet/from-csv (a -> b -> { a, b })
+     |> sheet/col/numbers
+     |> sheet/col/text
 
-   sheet
-     [ sheet/col/numbers  "col1" [ 1, 2, 3 ]
-     , sheet/col/text     "col2" [ "a", "b", "c" ]
-     , sheet/col/checkbox "col3" [ true, false, false ]
-     ]
+   sheet/into (a -> b -> c -> { a, b, c })
+     |> sheet/col/numbers  [ 1, 2, 3 ]
+     |> sheet/col/text     [ "a", "b", "c" ]
+     |> sheet/col/checkbox [ true, false, false ]
 
    sheet/map2 add s1 s2
 
-   sheet/filter-number "col1" (gt 1) s1
+   sheet/filter (r1 -> r1.id == 1) s1
 
-   sheet/select [ "col1" ] s1
+   sheet/join (r1 -> r2 -> r1.id == r2.id) s1 s2
 
-   sheet/join s1 s2
+   sheet/union s1 s2
 
-   sheet/stack s1 s2
+   sheet/group s1 s2
+
+   sheet/sort (r -> r.id) s1
+
+   sheet/intersect s1 s2
+
+   sheet/to-columns
+
+   sheet/from-columns
 
 -}
 
