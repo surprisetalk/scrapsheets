@@ -73,7 +73,7 @@ subscriptions _ =
 
 
 type alias SheetId =
-    String
+    Int
 
 
 type alias Input valid data =
@@ -119,7 +119,7 @@ init : () -> Url -> Nav.Key -> ( Model, Cmd Msg )
 init _ url _ =
     ( { sheets =
             Dict.empty
-                |> Dict.insert "EXAMPLE"
+                |> Dict.insert 1
                     { code = "TODO"
                     , sheet =
                         Ok
@@ -133,7 +133,7 @@ init _ url _ =
                             }
                     }
       , shelf =
-            [ [ "EXAMPLE" ]
+            [ [ 1 ]
             ]
       }
     , Cmd.none
@@ -145,7 +145,7 @@ init _ url _ =
 
 
 type Msg
-    = NoOp
+    = NewSheet
     | UrlChanged Url
     | LinkClicked Browser.UrlRequest
 
@@ -157,7 +157,31 @@ type Msg
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
-        _ ->
+        NewSheet ->
+            let
+                sheetId : Int
+                sheetId =
+                    model.sheets |> Dict.keys |> List.maximum |> Maybe.withDefault 0 |> (+) 1
+            in
+            ( { model
+                | shelf = model.shelf ++ [ [ sheetId ] ]
+                , sheets =
+                    model.sheets
+                        |> Dict.insert sheetId
+                            { code = "TODO"
+                            , sheet = Ok { transpose = False, rows = 0, cols = Array.empty }
+                            }
+              }
+            , Cmd.none
+            )
+
+        UrlChanged url ->
+            ( model, Cmd.none )
+
+        LinkClicked (Browser.Internal url) ->
+            ( model, Cmd.none )
+
+        LinkClicked (Browser.External url) ->
             ( model, Cmd.none )
 
 
@@ -197,12 +221,18 @@ viewCell i col =
             Nothing
 
         Chart xs ->
-            -- TODO
-            Nothing
+            case i of
+                0 ->
+                    -- TODO: Put everything in row 0 with a rowspan of the whole table
+                    Nothing
+
+                _ ->
+                    Nothing
 
 
 viewSheet : Sheet -> Html Msg
 viewSheet sheet =
+    -- TODO: Show some call to action for empty sheets? Or make the region clickable?
     H.table []
         [ H.thead []
             [ H.tr [] <|
@@ -232,21 +262,23 @@ view : Model -> Browser.Document Msg
 view model =
     { title = "scrapsheets"
     , body =
+        -- TODO: Sheets that exist but aren't currently on the shelf should sit minimized in the corner or something like buffers waiting to be placed back on teh shelf.
         [ H.node "style" [] [ text "" ]
         , H.main_ []
             [ H.div [ S.displayFlex, S.flexDirectionColumn ] <|
-                List.map (H.div [ S.displayFlex, S.flexDirectionRow ]) <|
-                    List.map
-                        (List.map
-                            (Result.withDefault (H.div [] [ text "TODO: error" ])
-                                << Result.map viewSheet
-                                << Result.andThen .sheet
-                                << Result.fromMaybe "Sheet not found."
-                                << flip Dict.get model.sheets
+                List.append [ H.button [ A.onClick NewSheet ] [ text "New sheet" ] ] <|
+                    List.map (H.div [ S.displayFlex, S.flexDirectionRow ]) <|
+                        List.map
+                            (List.map
+                                (Result.withDefault (H.div [] [ text "TODO: error" ])
+                                    << Result.map viewSheet
+                                    << Result.andThen .sheet
+                                    << Result.fromMaybe "Sheet not found."
+                                    << flip Dict.get model.sheets
+                                )
                             )
-                        )
-                    <|
-                        model.shelf
+                        <|
+                            model.shelf
             , H.aside []
                 []
             ]
