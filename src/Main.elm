@@ -88,7 +88,9 @@ type alias Input valid data =
 
 
 type alias EditArray a =
-    { edits : Dict Int a, data : Array a }
+    { edits : Dict Int a
+    , data : Array a
+    }
 
 
 type Col
@@ -96,6 +98,7 @@ type Col
     | Strings (EditArray String)
     | Images (EditArray String)
     | Links (EditArray String)
+    | Buttons (EditArray (Input () Time.Posix))
     | Datepickers (EditArray (Input () Date))
     | Checkboxes (EditArray (Input () Bool))
     | Sliders (EditArray (Input ( Float, Float ) Float))
@@ -241,17 +244,23 @@ scrapscript =
 
    sheet/map2 add s1 s2
 
+   sheet/limit 10 s1
+
    sheet/filter (r1 -> r1.id == 1) s1
 
    sheet/join (r1 -> r2 -> r1.id == r2.id) s1 s2
 
-   sheet/union s1 s2
+   sheet/append s1 s2
 
-   sheet/group s1 s2
+   sheet/union (r -> r.id) s1 s2
+
+   sheet/intersect (r -> r.id) s1 s2
+
+   sheet/subtract (r -> r.id) s1 s2
+
+   sheet/group (r -> r.id) s1
 
    sheet/sort (r -> r.id) s1
-
-   sheet/intersect s1 s2
 
    sheet/to-columns
 
@@ -261,7 +270,16 @@ scrapscript =
 
    sheet/websocket { ... }
 
-   sheet/every 60
+   sheet/every 1
+
+   -- TODO: we need some sort of sheet/lazy
+
+   -- button clicks
+   s1 |> sheet/filter (r -> abs (now - r.updated) < 1)
+   . now = s2 |> sheet/get 0 (r -> r.now)
+
+   -- basic memory
+   s1 |> sheet/union (r -> r.id) self
 
 -}
 ---- UPDATE -------------------------------------------------------------------
@@ -395,6 +413,10 @@ viewCell i col =
 
         Links xs ->
             xs |> get |> Maybe.map (\href -> H.a [ A.href href ] [])
+
+        Buttons xs ->
+            -- TODO
+            Nothing
 
         Datepickers xs ->
             -- TODO
