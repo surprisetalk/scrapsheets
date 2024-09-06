@@ -195,7 +195,7 @@ scrapscript =
                     [ P.float |> P.map Number |> P.literal
                     , P.variable
                         { start = Char.isLower
-                        , inner = \c -> Char.isAlphaNum c || c == '-'
+                        , inner = \c -> Char.isAlphaNum c || c == '-' || c == '/'
                         , reserved = Set.empty
                         }
                         |> P.map Var
