@@ -15,6 +15,8 @@ import Html.Style as S
 import Http
 import Json.Decode as D
 import Json.Encode as E
+import Parser as P exposing ((|.), (|=), Parser)
+import Pratt as P
 import Regex exposing (Regex)
 import Set exposing (Set)
 import Task exposing (Task)
@@ -169,16 +171,58 @@ type Msg
 
 
 
----- UPDATE -------------------------------------------------------------------
+---- PARSER -------------------------------------------------------------------
 
 
 type alias Env =
     Dict SheetId (Maybe Sheet)
 
 
+type Scrapscript
+    = Number Float
+    | Var String
+    | Op String Scrapscript Scrapscript
+    | Apply Scrapscript Scrapscript
+
+
+scrapscript : Parser Scrapscript
+scrapscript =
+    let
+        expr : Parser Scrapscript
+        expr =
+            P.expression
+                { oneOf =
+                    [ P.float |> P.map Number |> P.literal
+                    , P.variable
+                        { start = Char.isLower
+                        , inner = \c -> Char.isAlphaNum c || c == '-'
+                        , reserved = Set.empty
+                        }
+                        |> P.map Var
+                        |> P.literal
+                    , \config ->
+                        P.succeed identity
+                            |. P.symbol "("
+                            |= P.subExpression 0 config
+                            |. P.symbol ")"
+                    ]
+                , andThenOneOf =
+                    [ P.infixRight 2 (P.symbol "|>") (Op "|>")
+                    , P.infixRight 2 (P.symbol "->") (Op "->")
+                    ]
+                , spaces = P.spaces
+                }
+    in
+    P.succeed identity
+        |= expr
+        |. P.end
+
+
 
 {-
    -- TODO: Move all the corresponding elm code into a Sheet module
+
+   -- TODO: Use these as tests
 
    "[ todo ]"
      |> sheet/from-json pair
@@ -220,6 +264,7 @@ type alias Env =
    sheet/every 60
 
 -}
+---- UPDATE -------------------------------------------------------------------
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
