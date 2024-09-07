@@ -87,23 +87,17 @@ type alias Input valid data =
     }
 
 
-type alias EditArray a =
-    { edits : Dict Int a
-    , data : Array a
-    }
-
-
 type Col
-    = Numbers (EditArray Float)
-    | Strings (EditArray String)
-    | Images (EditArray String)
-    | Links (EditArray String)
-    | Buttons (EditArray (Input () Time.Posix))
-    | Datepickers (EditArray (Input () Date))
-    | Checkboxes (EditArray (Input () Bool))
-    | Sliders (EditArray (Input ( Float, Float ) Float))
-    | Fields (EditArray (Input Regex String))
-    | Chart (EditArray ( Float, Float ))
+    = Numbers (Array Float)
+    | Strings (Array String)
+    | Images (Array String)
+    | Links (Array String)
+    | Buttons (Array (Input () Time.Posix))
+    | Datepickers (Array (Input () Date))
+    | Checkboxes (Array (Input () Bool))
+    | Sliders (Array (Input ( Float, Float ) Float))
+    | Fields (Array (Input Regex String))
+    | Chart (Array ( Float, Float ))
 
 
 type alias Sheet =
@@ -135,25 +129,100 @@ type alias Model =
 
 init : () -> Url -> Nav.Key -> ( Model, Cmd Msg )
 init _ url _ =
-    ( { sheets =
-            Dict.empty
-                |> Dict.insert 1
-                    { watch = Set.empty
-                    , code = "TODO"
-                    , sheet =
-                        Ok
-                            { transpose = False
-                            , rows = 4
-                            , cols =
-                                Array.fromList
-                                    [ ( "Col", Numbers { edits = Dict.empty, data = Array.fromList [ 1, 2, 3, 4 ] } )
-                                    , ( "Col", Numbers { edits = Dict.empty, data = Array.fromList [ 5, 6, 7, 8 ] } )
-                                    ]
-                            }
-                    }
-      , shelf =
-            [ [ 1 ]
+    let
+        sheets : List String
+        sheets =
+            [ """
+              "[ todo ]"
+                |> sheet/from-json pair
+                |> sheet/col/numbers
+                |> sheet/col/text
+              """
+            , """
+              text/join "" [ "1,a" , "2,b" , "3,c" ]
+                |> sheet/from-csv (a -> b -> { a, b })
+                |> sheet/col/numbers
+                |> sheet/col/text
+              """
+            , """
+              sheet/into (a -> b -> c -> { a, b, c })
+                |> sheet/col/numbers  [ 1, 2, 3 ]
+                |> sheet/col/text     [ "a", "b", "c" ]
+                |> sheet/col/checkbox [ true, false, false ]
+              """
+            , """
+              sheet/map2 add s1 s2
+              """
+            , """
+              sheet/limit 10 s1
+              """
+            , """
+              sheet/filter (r1 -> r1.id == 1) s1
+              """
+            , """
+              sheet/join (r1 -> r2 -> r1.id == r2.id) s1 s2
+              """
+            , """
+              sheet/append s1 s2
+              """
+            , """
+              sheet/union (r -> r.id) s1 s2
+              """
+            , """
+              sheet/intersect (r -> r.id) s1 s2
+              """
+            , """
+              sheet/subtract (r -> r.id) s1 s2
+              """
+            , """
+              sheet/group (r -> r.id) s1
+              """
+            , """
+              sheet/sort (r -> r.id) s1
+              """
+            , """
+              sheet/to-columns
+              """
+            , """
+              sheet/from-columns
+              """
+            , """
+              sheet/http { ... }
+              """
+            , """
+              sheet/websocket { ... }
+              """
+            , """
+              sheet/every 1
+              """
+            , """
+              sheet/lazy (sheet/http { ... }) s1
+              """
+            , """
+              -- button clicks
+              s1 |> sheet/lazy (sheet/filter (r -> r.updated >= now))
+              . now = s2 |> sheet/row 0 |> maybe/map (r -> r.now) |> maybe/default +&
+              """
+            , """
+              -- basic memory
+              s1 |> sheet/lazy (sheet/union (r -> r.id) self)
+              """
             ]
+    in
+    ( { sheets =
+            sheets
+                |> List.indexedMap
+                    (\i code ->
+                        Tuple.pair i
+                            { watch = Set.empty
+                            , code = code
+                            , sheet = Ok { transpose = False, rows = 0, cols = Array.empty }
+                            }
+                    )
+                |> Dict.fromList
+      , shelf =
+            sheets
+                |> List.indexedMap (\i _ -> [ i ])
       }
     , Cmd.none
     )
@@ -222,66 +291,6 @@ scrapscript =
 
 
 
-{-
-   -- TODO: Move all the corresponding elm code into a Sheet module
-
-   -- TODO: Use these as tests
-
-   "[ todo ]"
-     |> sheet/from-json pair
-     |> sheet/col/numbers
-     |> sheet/col/text
-
-   text/join "\n" [ "1,a" , "2,b" , "3,c" ]
-     |> sheet/from-csv (a -> b -> { a, b })
-     |> sheet/col/numbers
-     |> sheet/col/text
-
-   sheet/into (a -> b -> c -> { a, b, c })
-     |> sheet/col/numbers  [ 1, 2, 3 ]
-     |> sheet/col/text     [ "a", "b", "c" ]
-     |> sheet/col/checkbox [ true, false, false ]
-
-   sheet/map2 add s1 s2
-
-   sheet/limit 10 s1
-
-   sheet/filter (r1 -> r1.id == 1) s1
-
-   sheet/join (r1 -> r2 -> r1.id == r2.id) s1 s2
-
-   sheet/append s1 s2
-
-   sheet/union (r -> r.id) s1 s2
-
-   sheet/intersect (r -> r.id) s1 s2
-
-   sheet/subtract (r -> r.id) s1 s2
-
-   sheet/group (r -> r.id) s1
-
-   sheet/sort (r -> r.id) s1
-
-   sheet/to-columns
-
-   sheet/from-columns
-
-   sheet/http { ... }
-
-   sheet/websocket { ... }
-
-   sheet/every 1
-
-   sheet/lazy (sheet/http { ... }) s1
-
-   -- button clicks
-   s1 |> sheet/lazy (sheet/filter (r -> r.updated >= now))
-   . now = s2 |> sheet/row 0 |> maybe/map (r -> r.now) |> maybe/default +&
-
-   -- basic memory
-   s1 |> sheet/lazy (sheet/union (r -> r.id) self)
-
--}
 ---- UPDATE -------------------------------------------------------------------
 
 
@@ -343,8 +352,7 @@ update msg model =
                     Maybe.withDefault col <|
                         case col of
                             Numbers xs ->
-                                String.toFloat value
-                                    |> Maybe.map (\x -> Numbers { xs | edits = xs.edits |> Dict.insert j x })
+                                String.toFloat value |> Maybe.map (\x -> xs |> Array.set j x |> Numbers)
 
                             _ ->
                                 -- TODO
@@ -388,31 +396,18 @@ update msg model =
 
 viewCell : Int -> Col -> Maybe (Html Msg)
 viewCell i col =
-    let
-        get : EditArray a -> Maybe a
-        get arr =
-            case ( Dict.get i arr.edits, Array.get i arr.data ) of
-                ( Just x, _ ) ->
-                    Just x
-
-                ( _, Just x ) ->
-                    Just x
-
-                _ ->
-                    Nothing
-    in
     case col of
         Numbers xs ->
-            xs |> get |> Maybe.map (String.fromFloat >> text)
+            xs |> Array.get i |> Maybe.map (String.fromFloat >> text)
 
         Strings xs ->
-            xs |> get |> Maybe.map text
+            xs |> Array.get i |> Maybe.map text
 
         Images xs ->
-            xs |> get |> Maybe.map (\src -> H.img [ A.src src ] [])
+            xs |> Array.get i |> Maybe.map (\src -> H.img [ A.src src ] [])
 
         Links xs ->
-            xs |> get |> Maybe.map (\href -> H.a [ A.href href ] [])
+            xs |> Array.get i |> Maybe.map (\href -> H.a [ A.href href ] [])
 
         Buttons xs ->
             -- TODO
