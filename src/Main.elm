@@ -214,8 +214,8 @@ init _ url _ =
                 |> List.indexedMap
                     (\i code ->
                         Tuple.pair i
-                            { watch = Set.empty
-                            , code = code
+                            { watch = Set.singleton -1
+                            , code = String.trim code |> String.replace "             " ""
                             , sheet = Ok { transpose = False, rows = 0, cols = Array.empty }
                             }
                     )
@@ -224,7 +224,7 @@ init _ url _ =
             sheets
                 |> List.indexedMap (\i _ -> [ i ])
       }
-    , Cmd.none
+    , Task.succeed -1 |> Task.perform SheetEdited
     )
 
 
@@ -255,6 +255,25 @@ type Scrapscript
     | Var String
     | Op String Scrapscript Scrapscript
     | Apply Scrapscript Scrapscript
+
+
+eval : Dict String Scrapscript -> Scrapscript -> Result String Scrapscript
+eval env ss =
+    case ss of
+        Number n ->
+            n |> Number |> Ok
+
+        Var x ->
+            env |> Dict.get x |> Result.fromMaybe "TODO: var not found"
+
+        Op "+" (Number l) (Number r) ->
+            l + r |> Number |> Ok
+
+        Op op l r ->
+            Err "TODO: op"
+
+        Apply f x ->
+            Err "TODO: apply"
 
 
 scrapscript : Parser Scrapscript
@@ -323,9 +342,30 @@ update msg model =
                 env =
                     model.sheets |> Dict.map (always (.sheet >> Result.toMaybe))
 
+                scrapsheet : Scrapscript -> Result String Sheet
+                scrapsheet ss =
+                    case ss of
+                        _ ->
+                            Err "TODO: scrapscript -> sheet"
+
                 sheet : Result String Sheet
                 sheet =
-                    Err "TODO"
+                    code
+                        |> P.run scrapscript
+                        |> Result.mapError prettyError
+                        |> Result.andThen eval
+                        |> Result.andThen scrapsheet
+
+                prettyError : List P.DeadEnd -> String
+                prettyError xs =
+                    xs
+                        |> List.map
+                            (\x ->
+                                case x of
+                                    _ ->
+                                        "TODO: dead end"
+                            )
+                        |> String.join ", "
             in
             ( model
             , Task.attempt (CodeEdited id) <|
@@ -475,7 +515,7 @@ view model =
         [ H.node "style" [] [ text "" ]
         , H.main_ []
             [ H.div [ S.displayFlex, S.flexDirectionColumn ] <|
-                List.append [ H.button [ A.onClick SheetCreating ] [ text "New sheet" ] ] <|
+                flip List.append [ H.button [ A.onClick SheetCreating ] [ text "New sheet" ] ] <|
                     List.map (H.div [ S.displayFlex, S.flexDirectionRow ]) <|
                         List.map
                             (List.map
@@ -483,14 +523,14 @@ view model =
                                     Maybe.withDefault (H.div [] [ text "TODO: sheet not found" ]) <|
                                         Maybe.map
                                             (\{ code, sheet } ->
-                                                H.div [ S.displayFlex, S.flexDirectionColumn ]
+                                                H.div [ S.displayFlex, S.flexDirectionColumn, S.width "100%" ]
                                                     [ case sheet of
                                                         Ok x ->
                                                             viewSheet x
 
                                                         Err x ->
                                                             H.div [] [ text ("TODO: error: " ++ x) ]
-                                                    , H.textarea [ A.onInput (CodeEditing id), A.value code ] [ text code ]
+                                                    , H.textarea [ A.onInput (CodeEditing id), A.value code, S.width "100%", S.fontFamilyMonospace, code |> String.filter ((==) '\n') |> String.length |> (+) 1 |> A.rows ] [ text code ]
                                                     ]
                                             )
                                         <|
