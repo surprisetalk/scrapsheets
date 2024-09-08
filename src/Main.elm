@@ -290,24 +290,28 @@ eval env ss =
             eval (Dict.insert l x e) r
 
         Apply f x ->
-            Err "TODO: apply"
+            Err ("TODO: apply: " ++ Debug.toString ss)
 
 
 scrapscript : Parser Scrapscript
 scrapscript =
     let
+        var : Parser Scrapscript
+        var =
+            P.variable
+                { start = Char.isLower
+                , inner = \c -> Char.isAlphaNum c || c == '-' || c == '/'
+                , reserved = Set.empty
+                }
+                |> P.map Var
+
         expr : Parser Scrapscript
         expr =
             P.expression
                 { oneOf =
+                    -- TODO: Try implementing additional vars and application as postfix?
                     [ P.float |> P.map Number |> P.literal
-                    , P.variable
-                        { start = Char.isLower
-                        , inner = \c -> Char.isAlphaNum c || c == '-' || c == '/'
-                        , reserved = Set.empty
-                        }
-                        |> P.map Var
-                        |> P.literal
+                    , var |> P.literal
                     , \config ->
                         P.succeed identity
                             |. P.symbol "("
