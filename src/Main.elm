@@ -255,6 +255,8 @@ type Scrapscript
     | Var String
     | Op String Scrapscript Scrapscript
     | Apply Scrapscript Scrapscript
+    | Fun (Dict String Scrapscript) Scrapscript Scrapscript
+    | Rock String
 
 
 eval : Dict String Scrapscript -> Scrapscript -> Result String Scrapscript
@@ -266,11 +268,26 @@ eval env ss =
         Var x ->
             env |> Dict.get x |> Result.fromMaybe "TODO: var not found"
 
+        Rock x ->
+            Ok (Rock x)
+
         Op "+" (Number l) (Number r) ->
             l + r |> Number |> Ok
 
+        Op "|>" l r ->
+            eval env (Apply r l)
+
+        Op "->" l r ->
+            Ok (Fun env l r)
+
         Op op l r ->
             Err "TODO: op"
+
+        Fun e l r ->
+            Ok (Fun e l r)
+
+        Apply (Fun e (Var l) r) x ->
+            eval (Dict.insert l x e) r
 
         Apply f x ->
             Err "TODO: apply"
@@ -323,12 +340,12 @@ update msg model =
                     model.sheets |> Dict.keys |> List.maximum |> Maybe.withDefault 0 |> (+) 1
             in
             ( { model
-                | shelf = model.shelf ++ [ [ sheetId ] ]
+                | shelf = [ sheetId ] :: model.shelf
                 , sheets =
                     model.sheets
                         |> Dict.insert sheetId
                             { watch = Set.empty
-                            , code = "sheet\n  [\n  ]"
+                            , code = "sheet/from-list\n  [\n  ]"
                             , sheet = Ok { transpose = False, rows = 0, cols = Array.empty }
                             }
               }
@@ -348,12 +365,17 @@ update msg model =
                         _ ->
                             Err "TODO: scrapscript -> sheet"
 
+                env_ : Dict String Scrapscript
+                env_ =
+                    Dict.empty
+                        |> Dict.union ([ "sheet/limit" ] |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
+
                 sheet : Result String Sheet
                 sheet =
                     code
                         |> P.run scrapscript
                         |> Result.mapError prettyError
-                        |> Result.andThen eval
+                        |> Result.andThen (eval env_)
                         |> Result.andThen scrapsheet
 
                 prettyError : List P.DeadEnd -> String
@@ -363,7 +385,7 @@ update msg model =
                             (\x ->
                                 case x of
                                     _ ->
-                                        "TODO: dead end"
+                                        Debug.toString x
                             )
                         |> String.join ", "
             in
@@ -515,7 +537,7 @@ view model =
         [ H.node "style" [] [ text "" ]
         , H.main_ []
             [ H.div [ S.displayFlex, S.flexDirectionColumn ] <|
-                flip List.append [ H.button [ A.onClick SheetCreating ] [ text "New sheet" ] ] <|
+                List.append [ H.button [ A.onClick SheetCreating ] [ text "New sheet" ] ] <|
                     List.map (H.div [ S.displayFlex, S.flexDirectionRow ]) <|
                         List.map
                             (List.map
