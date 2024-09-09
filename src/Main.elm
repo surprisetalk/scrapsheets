@@ -252,6 +252,7 @@ type alias Env =
 
 type Scrapscript
     = Number Float
+    | Text String
     | Var String
     | Op String Scrapscript Scrapscript
     | Apply Scrapscript Scrapscript
@@ -264,6 +265,9 @@ eval env ss =
     case ss of
         Number n ->
             n |> Number |> Ok
+
+        Text x ->
+            x |> Text |> Ok
 
         Var x ->
             env |> Dict.get x |> Result.fromMaybe "TODO: var not found"
@@ -296,6 +300,10 @@ eval env ss =
 scrapscript : Parser Scrapscript
 scrapscript =
     let
+        space : Parser ()
+        space =
+            P.chompIf ((==) ' ')
+
         var : Parser Scrapscript
         var =
             P.variable
@@ -305,18 +313,46 @@ scrapscript =
                 }
                 |> P.map Var
 
+        term : Parser Scrapscript
+        term =
+            P.oneOf
+                [ P.float |> P.map Number |> P.literal
+                , P.symbol "\""
+                    |. P.chompUntil "\""
+                    |> P.getChompedString
+                    |> P.map Text
+                    |> P.literal
+                , var |> P.literal
+                , \config ->
+                    P.succeed identity
+                        |. P.symbol "("
+                        |= P.subExpression 0 config
+                        |. P.symbol ")"
+                ]
+
         expr : Parser Scrapscript
         expr =
             P.expression
                 { oneOf =
                     -- TODO: Try implementing additional vars and application as postfix?
-                    [ P.float |> P.map Number |> P.literal
-                    , var |> P.literal
-                    , \config ->
-                        P.succeed identity
-                            |. P.symbol "("
-                            |= P.subExpression 0 config
-                            |. P.symbol ")"
+                    [ term
+                        |> P.andThen
+                            (\f ->
+                                P.loop f
+                                    (\f_ ->
+                                        P.oneOf
+                                            [ P.succeed identity
+                                                |. space
+                                                |= P.oneOf
+                                                    [ P.succeed (\x -> P.Loop (Apply f_ x))
+                                                        |= term
+                                                    , P.succeed (P.Done f_)
+                                                    ]
+                                            , P.succeed (P.Done f_)
+                                            ]
+                                    )
+                            )
+                        |> P.literal
                     ]
                 , andThenOneOf =
                     [ P.infixRight 2 (P.symbol "|>") (Op "|>")
@@ -326,7 +362,9 @@ scrapscript =
                 }
     in
     P.succeed identity
+        |. P.spaces
         |= expr
+        |. P.spaces
         |. P.end
 
 
