@@ -296,13 +296,16 @@ eval env ss =
             Err "TODO: record"
 
         Arr xs ->
-            Err "TODO: arr"
+            xs |> List.foldr (\x y -> Result.map2 (::) (eval env x) y) (Ok []) |> Result.map Arr
 
         Apply (Fun e (Var l) r) x ->
             eval (Dict.insert l x e) r
 
+        Apply (Rock f) x ->
+            Result.map (Apply (Rock f)) (eval env x)
+
         Apply f x ->
-            Err ("TODO: apply: " ++ Debug.toString ss)
+            Result.map2 Apply (eval env f) (eval env x)
 
 
 scrapscript : Parser Scrapscript
@@ -414,12 +417,15 @@ update msg model =
                 scrapsheet ss =
                     case ss of
                         _ ->
-                            Err "TODO: scrapscript -> sheet"
+                            Err ("scrapscript -> sheet: " ++ Debug.toString ss)
 
                 env_ : Dict String Scrapscript
                 env_ =
                     Dict.empty
-                        |> Dict.union ([ "sheet/limit" ] |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
+                        |> Dict.union (model.sheets |> Dict.keys |> List.map (String.fromInt >> (++) "s") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
+                        |> Dict.union ([ "text/join", "add" ] |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
+                        |> Dict.union ([ "limit", "from-csv", "into", "map2", "limit", "filter", "join", "append", "union", "intersect", "subtract", "group", "sort", "to-columns", "from-columns", "http", "websocket", "every", "lazy", "row" ] |> List.map ((++) "sheet/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
+                        |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/col/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
 
                 sheet : Result String Sheet
                 sheet =
