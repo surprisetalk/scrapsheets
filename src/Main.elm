@@ -416,14 +416,17 @@ update msg model =
                 scrapsheet : Scrapscript -> Result String Sheet
                 scrapsheet ss =
                     case ss of
+                        Apply (Rock "sheet/from-csv") x ->
+                            Err ("TODO: sheet/from-csv: " ++ Debug.toString ss)
+
                         _ ->
-                            Err ("scrapscript -> sheet: " ++ Debug.toString ss)
+                            Err ("TODO: scrapscript -> sheet: " ++ Debug.toString ss)
 
                 env_ : Dict String Scrapscript
                 env_ =
                     Dict.empty
                         |> Dict.union (model.sheets |> Dict.keys |> List.map (String.fromInt >> (++) "s") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
-                        |> Dict.union ([ "text/join", "add" ] |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
+                        |> Dict.union ([ "text/join", "add", "true", "false" ] |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
                         |> Dict.union ([ "limit", "from-csv", "into", "map2", "limit", "filter", "join", "append", "union", "intersect", "subtract", "group", "sort", "to-columns", "from-columns", "http", "websocket", "every", "lazy", "row" ] |> List.map ((++) "sheet/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
                         |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/col/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
 
