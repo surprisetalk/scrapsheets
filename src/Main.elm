@@ -313,46 +313,45 @@ scrapscript =
                 }
                 |> P.map Var
 
-        term : Parser Scrapscript
-        term =
-            P.oneOf
-                [ P.float |> P.map Number |> P.literal
-                , P.symbol "\""
-                    |. P.chompUntil "\""
-                    |> P.getChompedString
-                    |> P.map Text
-                    |> P.literal
-                , var |> P.literal
-                , \config ->
-                    P.succeed identity
-                        |. P.symbol "("
-                        |= P.subExpression 0 config
-                        |. P.symbol ")"
-                ]
+        terms : Parser Scrapscript -> Parser Scrapscript
+        terms term =
+            term
+                |> P.andThen
+                    (\f ->
+                        P.loop f
+                            (\f_ ->
+                                P.oneOf
+                                    [ P.succeed identity
+                                        |. space
+                                        |= P.oneOf
+                                            [ P.succeed (\x -> P.Loop (Apply f_ x))
+                                                |= term
+                                            , P.succeed (P.Done f_)
+                                            ]
+                                    , P.succeed (P.Done f_)
+                                    ]
+                            )
+                    )
 
         expr : Parser Scrapscript
         expr =
             P.expression
                 { oneOf =
-                    -- TODO: Try implementing additional vars and application as postfix?
-                    [ term
-                        |> P.andThen
-                            (\f ->
-                                P.loop f
-                                    (\f_ ->
-                                        P.oneOf
-                                            [ P.succeed identity
-                                                |. space
-                                                |= P.oneOf
-                                                    [ P.succeed (\x -> P.Loop (Apply f_ x))
-                                                        |= term
-                                                    , P.succeed (P.Done f_)
-                                                    ]
-                                            , P.succeed (P.Done f_)
-                                            ]
-                                    )
-                            )
-                        |> P.literal
+                    -- TODO: not quite right
+                    [ \config ->
+                        P.oneOf
+                            [ P.float |> P.map Number |> flip P.literal config
+                            , P.symbol "\""
+                                |. P.chompUntil "\""
+                                |> P.getChompedString
+                                |> P.map Text
+                                |> flip P.literal config
+                            , P.succeed identity
+                                |. P.symbol "("
+                                |= P.subExpression 0 config
+                                |. P.symbol ")"
+                            ]
+                            |> terms
                     ]
                 , andThenOneOf =
                     [ P.infixRight 2 (P.symbol "|>") (Op "|>")
