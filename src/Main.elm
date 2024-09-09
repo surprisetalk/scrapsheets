@@ -260,6 +260,8 @@ type Scrapscript
     | Rock String
     | Record (List Scrapscript)
     | Arr (List Scrapscript)
+    | Tag String
+    | Hole
 
 
 eval : Dict String Scrapscript -> Scrapscript -> Result String Scrapscript
@@ -306,6 +308,12 @@ eval env ss =
 
         Apply f x ->
             Result.map2 Apply (eval env f) (eval env x)
+
+        Tag k ->
+            Ok (Tag k)
+
+        Hole ->
+            Ok Hole
 
 
 scrapscript : Parser Scrapscript
@@ -416,8 +424,8 @@ update msg model =
                 scrapsheet : Scrapscript -> Result String Sheet
                 scrapsheet ss =
                     case ss of
-                        Apply (Rock "sheet/from-csv") x ->
-                            Err ("TODO: sheet/from-csv: " ++ Debug.toString ss)
+                        Apply (Tag "sheet") x ->
+                            Err ("TODO: sheet: " ++ Debug.toString ss)
 
                         _ ->
                             Err ("TODO: scrapscript -> sheet: " ++ Debug.toString ss)
@@ -425,10 +433,13 @@ update msg model =
                 env_ : Dict String Scrapscript
                 env_ =
                     Dict.empty
+                        |> Dict.insert "true" (Apply (Tag "true") Hole)
+                        |> Dict.insert "false" (Apply (Tag "false") Hole)
+                        |> Dict.insert "sheet" (Apply (Tag "sheet") Hole)
+                        |> Dict.union ([ "text/join", "add" ] |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
+                        |> Dict.union ([ "limit", "from-csv", "into", "map2", "limit", "filter", "join", "append", "union", "intersect", "subtract", "group", "sort", "to-columns", "from-columns", "http", "websocket", "every", "lazy", "row" ] |> List.map ((++) "sheet/") |> List.map (\x -> ( x, Tag x )) |> Dict.fromList)
+                        |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/col/") |> List.map (\x -> ( x, Tag x )) |> Dict.fromList)
                         |> Dict.union (model.sheets |> Dict.keys |> List.map (String.fromInt >> (++) "s") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
-                        |> Dict.union ([ "text/join", "add", "true", "false" ] |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
-                        |> Dict.union ([ "limit", "from-csv", "into", "map2", "limit", "filter", "join", "append", "union", "intersect", "subtract", "group", "sort", "to-columns", "from-columns", "http", "websocket", "every", "lazy", "row" ] |> List.map ((++) "sheet/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
-                        |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/col/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
 
                 sheet : Result String Sheet
                 sheet =
