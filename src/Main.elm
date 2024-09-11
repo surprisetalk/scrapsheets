@@ -151,9 +151,6 @@ init _ url _ =
                 |> sheet/col/checkbox [ true, false, false ]
               """
             , """
-              sheet/map2 add s1 s2
-              """
-            , """
               sheet/limit 10 s1
               """
             , """
@@ -280,16 +277,6 @@ eval env ss =
         Rock x ->
             Err ("TODO: rock: " ++ x)
 
-        (Apply (Apply (Rock "text/join") (Text x)) (Arr xs)) ->
-          xs 
-          |> List.foldr 
-             (\x__ xs_ -> case x__ of
-                Text x_ -> xs_ |> Result.map ((::) x_)
-                _ -> Err "TODO: text/join error"
-             )
-             (Ok [])
-          |> Result.map (String.join "" >> Text)
-
         Op "+" (Number l) (Number r) ->
             l + r |> Number |> Ok
 
@@ -312,20 +299,42 @@ eval env ss =
         Arr xs ->
             xs |> List.foldr (\x y -> Result.map2 (::) (eval env x) y) (Ok []) |> Result.map Arr
 
-        Apply f_ x_ ->
-            case Result.map2 Apply (eval env f_) (eval env x_) of
-      
-              Ok (Apply (Fun e (Var l) r) x) ->
-                  eval (Dict.insert l x e) r
-      
-              Ok (Apply (Tag f) x) ->
-                  Result.map (Tagged f) (eval env x)
+        (Apply (Apply (Rock "text/join") (Text x)) (Arr xs)) ->
+         xs 
+         |> List.foldr 
+            (\x___ xs_ -> case x___ of
+               Text x__ -> xs_ |> Result.map ((::) x__)
+               _ -> Err "TODO: text/join error"
+            )
+            (Ok [])
+         |> Result.map (String.join "" >> Text)
 
-              Ok x ->
-                  Err ("TODO: apply" ++ Debug.toString x)
+        (Apply (Apply (Rock "sheet/from-csv") (Fun e l r)) (Text csv)) ->
+          Err "TODO: sheet/from-csv"
+      
+        (Apply (Rock "sheet/into") (Fun e l r)) ->
+          Err "TODO: sheet/into"
+      
+        (Apply (Apply (Fun e1 (Var l1) (Fun e2 (Var l2) r)) x1) x2) ->
+         eval (Dict.union e1 e2 |> Dict.insert l1 x1 |> Dict.insert l2 x2) r
+      
+        (Apply (Fun e (Var l) r) x) ->
+         eval (Dict.insert l x e) r
 
-              Err x ->
-                  Err ("TODO: apply" ++ x)
+        (Apply (Apply (Rock "sheet/limit") (Number n)) x) ->
+          Err "TODO: sheet/limit"
+      
+        (Apply (Apply (Var f) x1) x2) ->
+         Result.map3 (\f_ x1_ x2_ -> (Apply (Apply f_ x1_) x2_)) (eval env (Var f)) (eval env x1) (eval env x2) |> Result.andThen (eval env)
+
+        (Apply (Var f) x) ->
+         Result.map2 Apply (eval env (Var f)) (eval env x) |> Result.andThen (eval env)
+      
+        (Apply (Tag f) x) ->
+            Result.map (Tagged f) (eval env x)
+
+        Apply f x ->
+            Err ("TODO: apply" ++ Debug.toString (Apply f x))
 
         Tag k ->
             Ok (Tag k)
@@ -392,12 +401,27 @@ scrapscript =
                             |> P.map Arr
                     ]
                 , andThenOneOf =
-                    -- TODO: fix prec
-                    [ P.infixRight 2 (P.symbol "|>") (Op "|>")
-                    , P.infixRight 2 (P.symbol "->") (Op "->")
-                    , P.infixRight 3 (P.symbol "==") (Op "==")
-                    , P.infixRight 20 (P.symbol ".") (Op ".")
+                    [ P.infixLeft  20 (P.symbol "->")  (Op "->")
+                    , P.infixLeft  19 (P.symbol ">>")  (Op ">>")
+                    , P.infixLeft  15 (P.symbol "++")  (Op "++")
+                    , P.infixLeft  16 (P.symbol "+<")  (Op "+<")
+                    , P.infixRight 15 (P.symbol ">+")  (Op ">+")
+                    , P.infixLeft  14 (P.symbol ">=")  (Op ">=")
+                    , P.infixLeft  14 (P.symbol "<=")  (Op "<=")
+                    , P.infixLeft  10 (P.symbol "|>")  (Op "|>")
+                    , P.infixLeft  13 (P.symbol "<>")  (Op "<>")
+                    , P.infixLeft  13 (P.symbol "==")  (Op "==")
+                    , P.infixLeft  18 (P.symbol "//")  (Op "//")
+                    , P.infixRight 12 (P.symbol "&&")  (Op "&&")
+                    , P.infixRight 11 (P.symbol "||")  (Op "||")
+                    , P.infixRight 11 (P.symbol "^^")  (Op "^^")
+                    , P.infixLeft  18 (P.symbol "*" )  (Op "*" )
+                    , P.infixLeft  17 (P.symbol "+ ")  (Op "+ ")
+                    , P.infixLeft  14 (P.symbol "<" )  (Op "<" )
+                    , P.infixLeft  14 (P.symbol ">" )  (Op ">" )
+                    , P.infixLeft  18 (P.symbol "/" )  (Op "/" )
                     , P.infixLeft 100 (P.succeed ()) Apply
+                    , P.infixRight 20 (P.symbol ".") (Op ".")
                     ]
                 , spaces = P.spaces
                 }
@@ -458,8 +482,8 @@ update msg model =
                         |> Dict.insert "false" (Tagged "false" Hole)
                         |> Dict.insert "sheet" (Tagged "sheet" Hole)
                         |> Dict.union ([ "text/join", "add" ] |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
-                        |> Dict.union ([ "limit", "from-csv", "into", "map2", "limit", "filter", "join", "append", "union", "intersect", "subtract", "group", "sort", "to-columns", "from-columns", "http", "websocket", "every", "lazy", "row" ] |> List.map ((++) "sheet/") |> List.map (\x -> ( x, Tag x )) |> Dict.fromList)
-                        |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/col/") |> List.map (\x -> ( x, Tag x )) |> Dict.fromList)
+                        |> Dict.union ([ "limit", "from-csv", "into", "limit", "filter", "join", "append", "union", "intersect", "subtract", "group", "sort", "to-columns", "from-columns", "http", "websocket", "every", "lazy", "row" ] |> List.map ((++) "sheet/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
+                        |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/col/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
                         |> Dict.union (model.sheets |> Dict.keys |> List.map (String.fromInt >> (++) "s") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
 
                 sheet : Result String Sheet
