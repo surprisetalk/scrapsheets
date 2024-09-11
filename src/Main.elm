@@ -261,6 +261,7 @@ type Scrapscript
     | Record (List Scrapscript)
     | Arr (List Scrapscript)
     | Tag String
+    | Tagged String Scrapscript
     | Hole
 
 
@@ -277,7 +278,17 @@ eval env ss =
             env |> Dict.get x |> Result.fromMaybe "TODO: var not found"
 
         Rock x ->
-            Ok (Rock x)
+            Err ("TODO: rock: " ++ x)
+
+        (Apply (Apply (Rock "text/join") (Text x)) (Arr xs)) ->
+          xs 
+          |> List.foldr 
+             (\x__ xs_ -> case x__ of
+                Text x_ -> xs_ |> Result.map ((::) x_)
+                _ -> Err "TODO: text/join error"
+             )
+             (Ok [])
+          |> Result.map (String.join "" >> Text)
 
         Op "+" (Number l) (Number r) ->
             l + r |> Number |> Ok
@@ -286,7 +297,8 @@ eval env ss =
             eval env (Apply r l)
 
         Op "->" l r ->
-            Ok (Fun env l r)
+            -- Ok (Fun env l r)
+            Ok (Fun Dict.empty l r)
 
         Op op l r ->
             Err "TODO: op"
@@ -303,14 +315,17 @@ eval env ss =
         Apply (Fun e (Var l) r) x ->
             eval (Dict.insert l x e) r
 
-        Apply (Rock f) x ->
-            Result.map (Apply (Rock f)) (eval env x)
+        Apply (Tag f) x ->
+            Result.map (Tagged f) (eval env x)
 
         Apply f x ->
             Result.map2 Apply (eval env f) (eval env x)
 
         Tag k ->
             Ok (Tag k)
+
+        Tagged k v ->
+            Ok (Tagged k v)
 
         Hole ->
             Ok Hole
@@ -424,8 +439,8 @@ update msg model =
                 scrapsheet : Scrapscript -> Result String Sheet
                 scrapsheet ss =
                     case ss of
-                        Apply (Tag "sheet") x ->
-                            Err ("TODO: sheet: " ++ Debug.toString ss)
+                        -- Tagged "sheet" x ->
+                        --     Err ("TODO: sheet: " ++ Debug.toString ss)
 
                         _ ->
                             Err ("TODO: scrapscript -> sheet: " ++ Debug.toString ss)
@@ -433,9 +448,9 @@ update msg model =
                 env_ : Dict String Scrapscript
                 env_ =
                     Dict.empty
-                        |> Dict.insert "true" (Apply (Tag "true") Hole)
-                        |> Dict.insert "false" (Apply (Tag "false") Hole)
-                        |> Dict.insert "sheet" (Apply (Tag "sheet") Hole)
+                        |> Dict.insert "true" (Tagged "true" Hole)
+                        |> Dict.insert "false" (Tagged "false" Hole)
+                        |> Dict.insert "sheet" (Tagged "sheet" Hole)
                         |> Dict.union ([ "text/join", "add" ] |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
                         |> Dict.union ([ "limit", "from-csv", "into", "map2", "limit", "filter", "join", "append", "union", "intersect", "subtract", "group", "sort", "to-columns", "from-columns", "http", "websocket", "every", "lazy", "row" ] |> List.map ((++) "sheet/") |> List.map (\x -> ( x, Tag x )) |> Dict.fromList)
                         |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/col/") |> List.map (\x -> ( x, Tag x )) |> Dict.fromList)
