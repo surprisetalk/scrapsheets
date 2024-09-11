@@ -288,7 +288,7 @@ eval env ss =
             Ok (Fun Dict.empty l r)
 
         Op op l r ->
-            Err "TODO: op"
+            Err ("TODO: " ++ op)
 
         Fun e l r ->
             Ok (Fun e l r)
@@ -420,8 +420,8 @@ scrapscript =
                     , P.infixLeft  14 (P.symbol "<" )  (Op "<" )
                     , P.infixLeft  14 (P.symbol ">" )  (Op ">" )
                     , P.infixLeft  18 (P.symbol "/" )  (Op "/" )
-                    , P.infixLeft 100 (P.succeed ()) Apply
-                    , P.infixRight 20 (P.symbol ".") (Op ".")
+                    , P.infixRight 94 (P.symbol ".") (Op ".")
+                    , P.infixLeft  98 (P.succeed ()) Apply
                     ]
                 , spaces = P.spaces
                 }
