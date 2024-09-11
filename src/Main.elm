@@ -312,14 +312,20 @@ eval env ss =
         Arr xs ->
             xs |> List.foldr (\x y -> Result.map2 (::) (eval env x) y) (Ok []) |> Result.map Arr
 
-        Apply (Fun e (Var l) r) x ->
-            eval (Dict.insert l x e) r
+        Apply f_ x_ ->
+            case Result.map2 Apply (eval env f_) (eval env x_) of
+      
+              Ok (Apply (Fun e (Var l) r) x) ->
+                  eval (Dict.insert l x e) r
+      
+              Ok (Apply (Tag f) x) ->
+                  Result.map (Tagged f) (eval env x)
 
-        Apply (Tag f) x ->
-            Result.map (Tagged f) (eval env x)
+              Ok x ->
+                  Err ("TODO: apply" ++ Debug.toString x)
 
-        Apply f x ->
-            Result.map2 Apply (eval env f) (eval env x)
+              Err x ->
+                  Err ("TODO: apply" ++ x)
 
         Tag k ->
             Ok (Tag k)
