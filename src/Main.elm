@@ -195,13 +195,13 @@ init _ url _ =
             , """
               sheet/lazy (sheet/http { ... }) s1
               """
-            , """
               -- button clicks
+            , """
               s1 |> sheet/lazy (sheet/filter (r -> r.updated >= now))
               . now = s2 |> sheet/row 0 |> maybe/map (r -> r.now) |> maybe/default +&
               """
-            , """
               -- basic memory
+            , """
               s1 |> sheet/lazy (sheet/union (r -> r.id) self)
               """
             ]
