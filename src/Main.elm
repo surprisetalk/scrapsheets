@@ -140,9 +140,10 @@ init _ url _ =
               -- """
               """
               text/join "" [ "1,a" , "2,b" , "3,c" ]
-                |> sheet/from-csv (a -> b -> { a, b })
-                |> sheet/col/numbers
-                |> sheet/col/text
+                |> ( sheet/from-csv (a -> b -> { a, b }) 
+                     |> sheet/csv/col/numbers 
+                     |> sheet/csv/col/text
+                   )
               """
             , """
               sheet/into (a -> b -> c -> { a, b, c })
@@ -309,7 +310,7 @@ eval env ss =
             (Ok [])
          |> Result.map (String.join "" >> Text)
 
-        (Apply (Apply (Rock "sheet/from-csv") (Fun e l r)) (Text csv)) ->
+        (Apply (Rock "sheet/from-csv") (Fun e l r)) ->
           Err "TODO: sheet/from-csv"
       
         (Apply (Rock "sheet/into") (Fun e l r)) ->
@@ -333,8 +334,11 @@ eval env ss =
         (Apply (Tag f) x) ->
             Result.map (Tagged f) (eval env x)
 
-        Apply f x ->
-            Err ("TODO: apply" ++ Debug.toString (Apply f x))
+        Apply l r ->
+            Result.map2 Apply (eval env l) (eval env r) |> Result.andThen (eval env)
+
+        -- Apply f x ->
+        --     Err ("TODO: apply" ++ Debug.toString (Apply f x))
 
         Tag k ->
             Ok (Tag k)
@@ -484,6 +488,7 @@ update msg model =
                         |> Dict.union ([ "text/join", "add" ] |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
                         |> Dict.union ([ "limit", "from-csv", "into", "limit", "filter", "join", "append", "union", "intersect", "subtract", "group", "sort", "to-columns", "from-columns", "http", "websocket", "every", "lazy", "row" ] |> List.map ((++) "sheet/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
                         |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/col/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
+                        |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/csv/col/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
                         |> Dict.union (model.sheets |> Dict.keys |> List.map (String.fromInt >> (++) "s") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
 
                 sheet : Result String Sheet
@@ -650,7 +655,7 @@ view model =
     { title = "scrapsheets"
     , body =
         -- TODO: Sheets that exist but aren't currently on the shelf should sit minimized in the corner or something like buffers waiting to be placed back on the shelf.
-        [ H.node "style" [] [ text "" ]
+        [ H.node "style" [] [ text "main, * { background: black; color: #ccc; }" ]
         , H.main_ []
             [ H.div [ S.displayFlex, S.flexDirectionColumn ] <|
                 List.append [ H.button [ A.onClick SheetCreating ] [ text "New sheet" ] ] <|
