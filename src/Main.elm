@@ -132,20 +132,7 @@ init _ url _ =
     let
         sheets : List String
         sheets =
-            [ -- """
-              -- "[ todo ]"
-              --   |> sheet/from-json pair
-              --   |> sheet/col/numbers
-              --   |> sheet/col/text
-              -- """
-              """
-              text/join "" [ "1,a" , "2,b" , "3,c" ]
-                |> ( sheet/from-csv (a -> b -> { a, b }) 
-                     |> sheet/csv/col/numbers 
-                     |> sheet/csv/col/text
-                   )
-              """
-            , """
+            [ """
               sheet/into (a -> b -> c -> { a, b, c })
                 |> sheet/col/numbers  [ 1, 2, 3 ]
                 |> sheet/col/text     [ "a", "b", "c" ]
@@ -205,6 +192,19 @@ init _ url _ =
             , """
               s1 |> sheet/lazy (sheet/union (r -> r.id) self)
               """
+            -- , """
+            --   "[ todo ]"
+            --     |> sheet/from-json pair
+            --     |> sheet/col/numbers
+            --     |> sheet/col/text
+            --   """
+            -- , """
+            --   text/join "" [ "1,a" , "2,b" , "3,c" ]
+            --     |> ( sheet/from-csv (a -> b -> { a, b }) 
+            --          |> sheet/csv/col/numbers 
+            --          |> sheet/csv/col/text
+            --        )
+            --   """
             ]
     in
     ( { sheets =
@@ -256,7 +256,7 @@ type Scrapscript
     | Apply Scrapscript Scrapscript
     | Fun (Dict String Scrapscript) Scrapscript Scrapscript
     | Rock String
-    | Record (List Scrapscript)
+    | Record (Dict String Scrapscript)
     | Arr (List Scrapscript)
     | Tag String
     | Tagged String Scrapscript
@@ -273,10 +273,7 @@ eval env ss =
             x |> Text |> Ok
 
         Var x ->
-            env |> Dict.get x |> Result.fromMaybe "TODO: var not found"
-
-        Rock x ->
-            Err ("TODO: rock: " ++ x)
+            env |> Dict.get x |> Result.fromMaybe ("TODO: var not found: " ++ x )
 
         Op "+" (Number l) (Number r) ->
             l + r |> Number |> Ok
@@ -285,8 +282,7 @@ eval env ss =
             eval env (Apply r l)
 
         Op "->" l r ->
-            -- Ok (Fun env l r)
-            Ok (Fun Dict.empty l r)
+            Ok (Fun env l r)
 
         Op op l r ->
             Err ("TODO: " ++ op)
@@ -295,7 +291,7 @@ eval env ss =
             Ok (Fun e l r)
 
         Record xs ->
-            Err "TODO: record"
+          xs |> Dict.foldl (\k v kv -> Result.map2 (Dict.insert k) (eval env v) kv) (Ok Dict.empty) |> Result.map Record
 
         Arr xs ->
             xs |> List.foldr (\x y -> Result.map2 (::) (eval env x) y) (Ok []) |> Result.map Arr
@@ -313,11 +309,21 @@ eval env ss =
         (Apply (Rock "sheet/from-csv") (Fun e l r)) ->
           Err "TODO: sheet/from-csv"
       
-        (Apply (Rock "sheet/into") (Fun e l r)) ->
-          Err "TODO: sheet/into"
+        -- TODO: Redo this to actually work properly.
+        (Apply (Rock "sheet/into") f) ->
+          Ok f
       
-        (Apply (Apply (Fun e1 (Var l1) (Fun e2 (Var l2) r)) x1) x2) ->
-         eval (Dict.union e1 e2 |> Dict.insert l1 x1 |> Dict.insert l2 x2) r
+        (Apply (Apply (Rock "sheet/col/numbers") x) f) ->
+          eval env (Apply f (Tagged "sheet/col/numbers" x))
+
+        (Apply (Apply (Rock "sheet/col/text") x) f) ->
+          eval env (Apply f (Tagged "sheet/col/text" x))
+
+        (Apply (Apply (Rock "sheet/col/checkbox") x) f) ->
+          eval env (Apply f (Tagged "sheet/col/checkbox" x))
+
+        -- (Apply (Apply (Fun e1 (Var l1) (Fun e2 (Var l2) r)) x1) x2) ->
+        --  eval (Dict.union e1 e2 |> Dict.insert l1 x1 |> Dict.insert l2 x2) r
       
         (Apply (Fun e (Var l) r) x) ->
          eval (Dict.insert l x e) r
@@ -327,6 +333,9 @@ eval env ss =
       
         (Apply (Apply (Var f) x1) x2) ->
          Result.map3 (\f_ x1_ x2_ -> (Apply (Apply f_ x1_) x2_)) (eval env (Var f)) (eval env x1) (eval env x2) |> Result.andThen (eval env)
+
+        (Apply (Var _) (Var _)) ->
+          Err "TODO: Something went wrong."
 
         (Apply (Var f) x) ->
          Result.map2 Apply (eval env (Var f)) (eval env x) |> Result.andThen (eval env)
@@ -340,11 +349,14 @@ eval env ss =
         -- Apply f x ->
         --     Err ("TODO: apply" ++ Debug.toString (Apply f x))
 
+        Rock x ->
+            Err ("TODO: rock: " ++ x)
+
         Tag k ->
             Ok (Tag k)
 
         Tagged k v ->
-            Ok (Tagged k v)
+          eval env v |> Result.map (Tagged k)
 
         Hole ->
             Ok Hole
@@ -392,6 +404,15 @@ scrapscript =
                             , item = P.subExpression 1 config
                             , trailing = P.Forbidden
                             }
+                            |> P.andThen
+                               ( List.foldl
+                                 (\ x xs -> 
+                                   case x of
+                                     Var k -> P.map (Dict.insert k (Var k)) xs
+                                     _ -> P.problem "TODO: record stuff"
+                                 )
+                                 (P.succeed Dict.empty)
+                               )
                             |> P.map Record
                     , \config ->
                         P.sequence
@@ -405,7 +426,7 @@ scrapscript =
                             |> P.map Arr
                     ]
                 , andThenOneOf =
-                    [ P.infixLeft  20 (P.symbol "->")  (Op "->")
+                    [ P.infixRight 20 (P.symbol "->")  (Op "->")
                     , P.infixLeft  19 (P.symbol ">>")  (Op ">>")
                     , P.infixLeft  15 (P.symbol "++")  (Op "++")
                     , P.infixLeft  16 (P.symbol "+<")  (Op "+<")
@@ -475,6 +496,51 @@ update msg model =
                     case ss of
                         -- Tagged "sheet" x ->
                         --     Err ("TODO: sheet: " ++ Debug.toString ss)
+
+                        Record xs ->
+                          xs 
+                                |> Dict.toList 
+                                |> List.sortBy Tuple.first
+                                |> List.foldr
+                                   (\ (k,v) c ->
+                                       Result.map2 (flip (::)) c <|
+                                       case v of
+                                         (Tagged "sheet/col/numbers" (Arr xs_)) ->  xs_
+                                           |> List.foldl
+                                              (\v_ vs_ -> case v_ of
+                                                 Number n -> Result.map ((::) n) vs_
+                                                 _ -> Err "TODO: sheet/col/numbers: bad number"
+                                              )
+                                              (Ok [])
+                                           |> Result.map Array.fromList
+                                           |> Result.map Numbers
+                                           |> Result.map (Tuple.pair k)
+                                         (Tagged "sheet/col/text" (Arr xs_)) ->  xs_
+                                           |> List.foldl
+                                              (\v_ vs_ -> case v_ of
+                                                 Text n -> Result.map ((::) n) vs_
+                                                 _ -> Err "TODO: sheet/col/text: bad number"
+                                              )
+                                              (Ok [])
+                                           |> Result.map Array.fromList
+                                           |> Result.map Strings
+                                           |> Result.map (Tuple.pair k)
+                                         (Tagged "sheet/col/checkbox" (Arr xs_)) ->  xs_
+                                           |> List.foldl
+                                              (\v_ vs_ -> case v_ of
+                                                 Tagged "true" Hole -> Result.map ((::) { valid = (), default = False, data = True}) vs_
+                                                 Tagged "false" Hole -> Result.map ((::) { valid = (), default = False, data = False}) vs_
+                                                 _ -> Err "TODO: sheet/col/checkbox: bad boolean"
+                                              )
+                                              (Ok [])
+                                           |> Result.map Array.fromList
+                                           |> Result.map Checkboxes
+                                           |> Result.map (Tuple.pair k)
+                                         _ -> Err "TODO: record cols"
+                                   )
+                                   (Ok [])
+                                |> Result.map Array.fromList
+                                |> Result.map (\cols -> { transpose = False, rows = 10, cols = cols })
 
                         _ ->
                             Err ("TODO: scrapscript -> sheet: " ++ Debug.toString ss)
@@ -602,7 +668,7 @@ viewCell i col =
 
         Checkboxes xs ->
             -- TODO
-            Nothing
+            xs |> Array.get i |> Maybe.map (\x -> H.input [ A.type_ "checkbox", A.checked x.data ] [])
 
         Sliders xs ->
             -- TODO
@@ -655,7 +721,7 @@ view model =
     { title = "scrapsheets"
     , body =
         -- TODO: Sheets that exist but aren't currently on the shelf should sit minimized in the corner or something like buffers waiting to be placed back on the shelf.
-        [ H.node "style" [] [ text "main, * { background: black; color: #ccc; }" ]
+        [ H.node "style" [] [ text "main, * { background: black; color: #ccc; } td, th { text-align: center; }" ]
         , H.main_ []
             [ H.div [ S.displayFlex, S.flexDirectionColumn ] <|
                 List.append [ H.button [ A.onClick SheetCreating ] [ text "New sheet" ] ] <|
