@@ -136,7 +136,7 @@ init _ url _ =
               sheet/into (a -> b -> c -> { a, b, c })
                 |> sheet/col/numbers  [ 1, 2, 3 ]
                 |> sheet/col/text     [ "a", "b", "c" ]
-                |> sheet/col/checkbox [ true, false, false ]
+                |> sheet/col/checkbox [ true, false, true ]
               """
             , """
               sheet/limit 10 s1
@@ -328,8 +328,17 @@ eval env ss =
         (Apply (Fun e (Var l) r) x) ->
          eval (Dict.insert l x e) r
 
-        (Apply (Apply (Rock "sheet/limit") (Number n)) x) ->
-          Err "TODO: sheet/limit"
+        (Apply (Apply (Rock "sheet/limit") (Number n)) (Record xs)) ->
+          xs 
+          |> Dict.map 
+             (\_ v -> 
+               case v of
+                 (Tagged k (Arr x)) -> Tagged k (Arr (List.take (round n) x))
+                 (Tagged k _) -> Tagged k (Arr [])
+                 _ -> Tagged "" (Arr [])
+              )
+          |> Record
+          |> Ok
       
         (Apply (Apply (Var f) x1) x2) ->
          Result.map3 (\f_ x1_ x2_ -> (Apply (Apply f_ x1_) x2_)) (eval env (Var f)) (eval env x1) (eval env x2) |> Result.andThen (eval env)
