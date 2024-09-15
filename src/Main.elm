@@ -262,6 +262,8 @@ type Scrapscript
     | Tagged String Scrapscript
     | Hole
 
+-- apply : Dict String Scrapscript -> Scrapscript -> Scrapscript -> Result String Scrapscript
+-- apply env f_ x_ = case (f_, x_) of
 
 eval : Dict String Scrapscript -> Scrapscript -> Result String Scrapscript
 eval env ss =
@@ -339,7 +341,10 @@ eval env ss =
               )
           |> Record
           |> Ok
-      
+
+        (Apply (Apply (Rock k) x0) x1) ->
+          Result.map2 (Apply << (Apply (Rock k))) (eval env x0) (eval env x1)
+
         (Apply (Apply (Var f) x1) x2) ->
          Result.map3 (\f_ x1_ x2_ -> (Apply (Apply f_ x1_) x2_)) (eval env (Var f)) (eval env x1) (eval env x2) |> Result.andThen (eval env)
 
@@ -564,7 +569,7 @@ update msg model =
                         |> Dict.union ([ "limit", "from-csv", "into", "limit", "filter", "join", "append", "union", "intersect", "subtract", "group", "sort", "to-columns", "from-columns", "http", "websocket", "every", "lazy", "row" ] |> List.map ((++) "sheet/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
                         |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/col/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
                         |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/csv/col/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
-                        |> Dict.union (model.sheets |> Dict.keys |> List.map (String.fromInt >> (++) "s") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
+                        |> Dict.union (model.sheets |> Dict.keys |> List.map (String.fromInt >> (++) "s") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
 
                 sheet : Result String Sheet
                 sheet =
