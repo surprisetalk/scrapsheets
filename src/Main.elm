@@ -18,6 +18,7 @@ import Json.Encode as E
 import Parser as P exposing ((|.), (|=), Parser)
 import Pratt as P
 import Regex exposing (Regex)
+import Scrapscript as S exposing (Scrap(..))
 import Set exposing (Set)
 import Task exposing (Task)
 import Time exposing (Month(..))
@@ -183,15 +184,18 @@ init _ url _ =
             , """
               sheet/lazy (sheet/http { ... }) s1
               """
-              -- button clicks
+
+            -- button clicks
             , """
               s1 |> sheet/lazy (sheet/filter (r -> r.updated >= now))
               . now = s2 |> sheet/row 0 |> maybe/map (r -> r.now) |> maybe/default +&
               """
-              -- basic memory
+
+            -- basic memory
             , """
               s1 |> sheet/lazy (sheet/union (r -> r.id) self)
               """
+
             -- , """
             --   "[ todo ]"
             --     |> sheet/from-json pair
@@ -200,8 +204,8 @@ init _ url _ =
             --   """
             -- , """
             --   text/join "" [ "1,a" , "2,b" , "3,c" ]
-            --     |> ( sheet/from-csv (a -> b -> { a, b }) 
-            --          |> sheet/csv/col/numbers 
+            --     |> ( sheet/from-csv (a -> b -> { a, b })
+            --          |> sheet/csv/col/numbers
             --          |> sheet/csv/col/text
             --        )
             --   """
@@ -248,230 +252,6 @@ type alias Env =
     Dict SheetId (Maybe Sheet)
 
 
-type Scrapscript
-    = Number Float
-    | Text String
-    | Var String
-    | Op String Scrapscript Scrapscript
-    | Apply Scrapscript Scrapscript
-    | Fun (Dict String Scrapscript) Scrapscript Scrapscript
-    | Rock String
-    | Record (Dict String Scrapscript)
-    | Arr (List Scrapscript)
-    | Tag String
-    | Tagged String Scrapscript
-    | Hole
-
--- apply : Dict String Scrapscript -> Scrapscript -> Scrapscript -> Result String Scrapscript
--- apply env f_ x_ = case (f_, x_) of
-
-eval : Dict String Scrapscript -> Scrapscript -> Result String Scrapscript
-eval env ss =
-    case ss of
-        Number n ->
-            n |> Number |> Ok
-
-        Text x ->
-            x |> Text |> Ok
-
-        Var x ->
-            env |> Dict.get x |> Result.fromMaybe ("TODO: var not found: " ++ x )
-
-        Op "+" (Number l) (Number r) ->
-            l + r |> Number |> Ok
-
-        Op "|>" l r ->
-            eval env (Apply r l)
-
-        Op "->" l r ->
-            Ok (Fun env l r)
-
-        Op op l r ->
-            Err ("TODO: " ++ op)
-
-        Fun e l r ->
-            Ok (Fun e l r)
-
-        Record xs ->
-          xs |> Dict.foldl (\k v kv -> Result.map2 (Dict.insert k) (eval env v) kv) (Ok Dict.empty) |> Result.map Record
-
-        Arr xs ->
-            xs |> List.foldr (\x y -> Result.map2 (::) (eval env x) y) (Ok []) |> Result.map Arr
-
-        (Apply (Apply (Rock "text/join") (Text x)) (Arr xs)) ->
-         xs 
-         |> List.foldr 
-            (\x___ xs_ -> case x___ of
-               Text x__ -> xs_ |> Result.map ((::) x__)
-               _ -> Err "TODO: text/join error"
-            )
-            (Ok [])
-         |> Result.map (String.join "" >> Text)
-
-        (Apply (Rock "sheet/from-csv") (Fun e l r)) ->
-          Err "TODO: sheet/from-csv"
-      
-        -- TODO: Redo this to actually work properly.
-        (Apply (Rock "sheet/into") f) ->
-          Ok f
-      
-        (Apply (Apply (Rock "sheet/col/numbers") x) f) ->
-          eval env (Apply f (Tagged "sheet/col/numbers" x))
-
-        (Apply (Apply (Rock "sheet/col/text") x) f) ->
-          eval env (Apply f (Tagged "sheet/col/text" x))
-
-        (Apply (Apply (Rock "sheet/col/checkbox") x) f) ->
-          eval env (Apply f (Tagged "sheet/col/checkbox" x))
-
-        -- (Apply (Apply (Fun e1 (Var l1) (Fun e2 (Var l2) r)) x1) x2) ->
-        --  eval (Dict.union e1 e2 |> Dict.insert l1 x1 |> Dict.insert l2 x2) r
-      
-        (Apply (Fun e (Var l) r) x) ->
-         eval (Dict.insert l x e) r
-
-        (Apply (Apply (Rock "sheet/limit") (Number n)) (Record xs)) ->
-          xs 
-          |> Dict.map 
-             (\_ v -> 
-               case v of
-                 (Tagged k (Arr x)) -> Tagged k (Arr (List.take (round n) x))
-                 (Tagged k _) -> Tagged k (Arr [])
-                 _ -> Tagged "" (Arr [])
-              )
-          |> Record
-          |> Ok
-
-        (Apply (Apply (Rock k) x0) x1) ->
-          Result.map2 (Apply << (Apply (Rock k))) (eval env x0) (eval env x1)
-
-        (Apply (Apply (Var f) x1) x2) ->
-         Result.map3 (\f_ x1_ x2_ -> (Apply (Apply f_ x1_) x2_)) (eval env (Var f)) (eval env x1) (eval env x2) |> Result.andThen (eval env)
-
-        (Apply (Var _) (Var _)) ->
-          Err "TODO: Something went wrong."
-
-        (Apply (Var f) x) ->
-         Result.map2 Apply (eval env (Var f)) (eval env x) |> Result.andThen (eval env)
-      
-        (Apply (Tag f) x) ->
-            Result.map (Tagged f) (eval env x)
-
-        Apply l r ->
-            Result.map2 Apply (eval env l) (eval env r) |> Result.andThen (eval env)
-
-        -- Apply f x ->
-        --     Err ("TODO: apply" ++ Debug.toString (Apply f x))
-
-        Rock x ->
-            Err ("TODO: rock: " ++ x)
-
-        Tag k ->
-            Ok (Tag k)
-
-        Tagged k v ->
-          eval env v |> Result.map (Tagged k)
-
-        Hole ->
-            Ok Hole
-
-
-scrapscript : Parser Scrapscript
-scrapscript =
-    let
-        space : Parser ()
-        space =
-            P.chompIf ((==) ' ')
-
-        var : Parser Scrapscript
-        var =
-            P.variable
-                { start = Char.isLower
-                , inner = \c -> Char.isAlphaNum c || c == '-' || c == '/'
-                , reserved = Set.empty
-                }
-                |> P.map Var
-
-        expr : Parser Scrapscript
-        expr =
-            P.expression
-                { oneOf =
-                    [ P.float |> P.map Number |> P.literal
-                    , P.chompIf ((==) '"')
-                        |. P.chompWhile ((/=) '"')
-                        |. P.chompIf ((==) '"')
-                        |> P.getChompedString
-                        |> P.map Text
-                        |> P.literal
-                    , var |> P.literal
-                    , \config ->
-                        P.succeed identity
-                            |. P.symbol "("
-                            |= P.subExpression 0 config
-                            |. P.symbol ")"
-                    , \config ->
-                        P.sequence
-                            { start = "{"
-                            , separator = ","
-                            , end = "}"
-                            , spaces = P.spaces
-                            , item = P.subExpression 1 config
-                            , trailing = P.Forbidden
-                            }
-                            |> P.andThen
-                               ( List.foldl
-                                 (\ x xs -> 
-                                   case x of
-                                     Var k -> P.map (Dict.insert k (Var k)) xs
-                                     _ -> P.problem "TODO: record stuff"
-                                 )
-                                 (P.succeed Dict.empty)
-                               )
-                            |> P.map Record
-                    , \config ->
-                        P.sequence
-                            { start = "["
-                            , separator = ","
-                            , end = "]"
-                            , spaces = P.spaces
-                            , item = P.subExpression 1 config
-                            , trailing = P.Forbidden
-                            }
-                            |> P.map Arr
-                    ]
-                , andThenOneOf =
-                    [ P.infixRight 20 (P.symbol "->")  (Op "->")
-                    , P.infixLeft  19 (P.symbol ">>")  (Op ">>")
-                    , P.infixLeft  15 (P.symbol "++")  (Op "++")
-                    , P.infixLeft  16 (P.symbol "+<")  (Op "+<")
-                    , P.infixRight 15 (P.symbol ">+")  (Op ">+")
-                    , P.infixLeft  14 (P.symbol ">=")  (Op ">=")
-                    , P.infixLeft  14 (P.symbol "<=")  (Op "<=")
-                    , P.infixLeft  10 (P.symbol "|>")  (Op "|>")
-                    , P.infixLeft  13 (P.symbol "<>")  (Op "<>")
-                    , P.infixLeft  13 (P.symbol "==")  (Op "==")
-                    , P.infixLeft  18 (P.symbol "//")  (Op "//")
-                    , P.infixRight 12 (P.symbol "&&")  (Op "&&")
-                    , P.infixRight 11 (P.symbol "||")  (Op "||")
-                    , P.infixRight 11 (P.symbol "^^")  (Op "^^")
-                    , P.infixLeft  18 (P.symbol "*" )  (Op "*" )
-                    , P.infixLeft  17 (P.symbol "+ ")  (Op "+ ")
-                    , P.infixLeft  14 (P.symbol "<" )  (Op "<" )
-                    , P.infixLeft  14 (P.symbol ">" )  (Op ">" )
-                    , P.infixLeft  18 (P.symbol "/" )  (Op "/" )
-                    , P.infixRight 94 (P.symbol ".") (Op ".")
-                    , P.infixLeft  98 (P.succeed ()) Apply
-                    ]
-                , spaces = P.spaces
-                }
-    in
-    P.succeed identity
-        |. P.spaces
-        |= expr
-        |. P.spaces
-        |. P.end
-
-
 
 ---- UPDATE -------------------------------------------------------------------
 
@@ -505,90 +285,100 @@ update msg model =
                 env =
                     model.sheets |> Dict.map (always (.sheet >> Result.toMaybe))
 
-                scrapsheet : Scrapscript -> Result String Sheet
+                scrapsheet : Scrap -> Result String Sheet
                 scrapsheet ss =
                     case ss of
-                        -- Tagged "sheet" x ->
+                        -- Variant "sheet" x ->
                         --     Err ("TODO: sheet: " ++ Debug.toString ss)
-
                         Record xs ->
-                          xs 
-                                |> Dict.toList 
+                            xs
+                                |> Dict.toList
                                 |> List.sortBy Tuple.first
                                 |> List.foldr
-                                   (\ (k,v) c ->
-                                       Result.map2 (flip (::)) c <|
-                                       case v of
-                                         (Tagged "sheet/col/numbers" (Arr xs_)) ->  xs_
-                                           |> List.foldl
-                                              (\v_ vs_ -> case v_ of
-                                                 Number n -> Result.map ((::) n) vs_
-                                                 _ -> Err "TODO: sheet/col/numbers: bad number"
-                                              )
-                                              (Ok [])
-                                           |> Result.map Array.fromList
-                                           |> Result.map Numbers
-                                           |> Result.map (Tuple.pair k)
-                                         (Tagged "sheet/col/text" (Arr xs_)) ->  xs_
-                                           |> List.foldl
-                                              (\v_ vs_ -> case v_ of
-                                                 Text n -> Result.map ((::) n) vs_
-                                                 _ -> Err "TODO: sheet/col/text: bad number"
-                                              )
-                                              (Ok [])
-                                           |> Result.map Array.fromList
-                                           |> Result.map Strings
-                                           |> Result.map (Tuple.pair k)
-                                         (Tagged "sheet/col/checkbox" (Arr xs_)) ->  xs_
-                                           |> List.foldl
-                                              (\v_ vs_ -> case v_ of
-                                                 Tagged "true" Hole -> Result.map ((::) { valid = (), default = False, data = True}) vs_
-                                                 Tagged "false" Hole -> Result.map ((::) { valid = (), default = False, data = False}) vs_
-                                                 _ -> Err "TODO: sheet/col/checkbox: bad boolean"
-                                              )
-                                              (Ok [])
-                                           |> Result.map Array.fromList
-                                           |> Result.map Checkboxes
-                                           |> Result.map (Tuple.pair k)
-                                         _ -> Err "TODO: record cols"
-                                   )
-                                   (Ok [])
+                                    (\( k, v ) c ->
+                                        Result.map2 (flip (::)) c <|
+                                            case v of
+                                                Variant "sheet/col/numbers" (List xs_) ->
+                                                    xs_
+                                                        |> List.foldl
+                                                            (\v_ vs_ ->
+                                                                case v_ of
+                                                                    Float n ->
+                                                                        Result.map ((::) n) vs_
+
+                                                                    Int n ->
+                                                                        Result.map ((::) (toFloat n)) vs_
+
+                                                                    _ ->
+                                                                        Err "TODO: sheet/col/numbers: bad number"
+                                                            )
+                                                            (Ok [])
+                                                        |> Result.map Array.fromList
+                                                        |> Result.map Numbers
+                                                        |> Result.map (Tuple.pair k)
+
+                                                Variant "sheet/col/text" (List xs_) ->
+                                                    xs_
+                                                        |> List.foldl
+                                                            (\v_ vs_ ->
+                                                                case v_ of
+                                                                    Text n ->
+                                                                        Result.map ((::) n) vs_
+
+                                                                    _ ->
+                                                                        Err "TODO: sheet/col/text: bad number"
+                                                            )
+                                                            (Ok [])
+                                                        |> Result.map Array.fromList
+                                                        |> Result.map Strings
+                                                        |> Result.map (Tuple.pair k)
+
+                                                Variant "sheet/col/checkbox" (List xs_) ->
+                                                    xs_
+                                                        |> List.foldl
+                                                            (\v_ vs_ ->
+                                                                case v_ of
+                                                                    Variant "true" Hole ->
+                                                                        Result.map ((::) { valid = (), default = False, data = True }) vs_
+
+                                                                    Variant "false" Hole ->
+                                                                        Result.map ((::) { valid = (), default = False, data = False }) vs_
+
+                                                                    _ ->
+                                                                        Err "TODO: sheet/col/checkbox: bad boolean"
+                                                            )
+                                                            (Ok [])
+                                                        |> Result.map Array.fromList
+                                                        |> Result.map Checkboxes
+                                                        |> Result.map (Tuple.pair k)
+
+                                                _ ->
+                                                    Err "TODO: record cols"
+                                    )
+                                    (Ok [])
                                 |> Result.map Array.fromList
                                 |> Result.map (\cols -> { transpose = False, rows = 10, cols = cols })
 
                         _ ->
                             Err ("TODO: scrapscript -> sheet: " ++ Debug.toString ss)
 
-                env_ : Dict String Scrapscript
+                env_ : Dict String Scrap
                 env_ =
                     Dict.empty
-                        |> Dict.insert "true" (Tagged "true" Hole)
-                        |> Dict.insert "false" (Tagged "false" Hole)
-                        |> Dict.insert "sheet" (Tagged "sheet" Hole)
-                        |> Dict.union ([ "text/join", "add" ] |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
-                        |> Dict.union ([ "limit", "from-csv", "into", "limit", "filter", "join", "append", "union", "intersect", "subtract", "group", "sort", "to-columns", "from-columns", "http", "websocket", "every", "lazy", "row" ] |> List.map ((++) "sheet/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
-                        |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/col/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
-                        |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/csv/col/") |> List.map (\x -> ( x, Rock x )) |> Dict.fromList)
+                        |> Dict.insert "true" (Variant "true" Hole)
+                        |> Dict.insert "false" (Variant "false" Hole)
+                        |> Dict.insert "sheet" (Variant "sheet" Hole)
+                        |> Dict.union ([ "text/join", "add" ] |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
+                        |> Dict.union ([ "limit", "from-csv", "into", "limit", "filter", "join", "append", "union", "intersect", "subtract", "group", "sort", "to-columns", "from-columns", "http", "websocket", "every", "lazy", "row" ] |> List.map ((++) "sheet/") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
+                        |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/col/") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
+                        |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/csv/col/") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
                         |> Dict.union (model.sheets |> Dict.keys |> List.map (String.fromInt >> (++) "s") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
 
                 sheet : Result String Sheet
                 sheet =
                     code
-                        |> P.run scrapscript
-                        |> Result.mapError prettyError
-                        |> Result.andThen (eval env_)
+                        |> S.run env_
                         |> Result.andThen scrapsheet
-
-                prettyError : List P.DeadEnd -> String
-                prettyError xs =
-                    xs
-                        |> List.map
-                            (\x ->
-                                case x of
-                                    _ ->
-                                        Debug.toString x
-                            )
-                        |> String.join ", "
             in
             ( model
             , Task.attempt (CodeEdited id) <|
