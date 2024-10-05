@@ -197,6 +197,22 @@ init _ url _ =
               s1 |> sheet/lazy (sheet/union (r -> r.id) self)
               """
 
+            -- TODO: Turn this into a Chart.
+            -- monte carlo
+            , """
+              sheet/union (r -> r.id) 
+                (sheet/every 1 (sheet/http "https://taylor.town/random")) 
+                self 
+                |> sheet/limit 10
+              """
+
+            -- game of life
+            , """
+              self
+              |> sheet/map (TODO: game-of-life)
+              |> sheet/every 1
+              """
+
             -- , """
             --   "[ todo ]"
             --     |> sheet/from-json pair
