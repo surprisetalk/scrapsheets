@@ -12,7 +12,7 @@ import Html.Attributes as A exposing (..)
 import Html.Events as A exposing (..)
 import Html.Lazy as H
 import Html.Style as S
-import Http
+import Http exposing (stringResolver)
 import Json.Decode as D
 import Json.Encode as E
 import Parser as P exposing ((|.), (|=), Parser)
@@ -105,6 +105,7 @@ type alias Sheet =
     { transpose : Bool
     , rows : Int
     , cols : Array ( String, Col )
+    , every : Int
     }
 
 
@@ -218,7 +219,7 @@ init _ url _ =
                         Tuple.pair i
                             { watch = Set.singleton -1
                             , code = String.trim code |> String.replace "             " ""
-                            , sheet = Ok { transpose = False, rows = 0, cols = Array.empty }
+                            , sheet = Ok { transpose = False, rows = 0, cols = Array.empty, every = 0 }
                             }
                     )
                 |> Dict.fromList
@@ -272,7 +273,7 @@ update msg model =
                         |> Dict.insert sheetId
                             { watch = Set.empty
                             , code = "sheet/from-list\n  [\n  ]"
-                            , sheet = Ok { transpose = False, rows = 0, cols = Array.empty }
+                            , sheet = Ok { transpose = False, rows = 0, cols = Array.empty, every = 0 }
                             }
               }
             , Cmd.batch
@@ -285,12 +286,33 @@ update msg model =
                 env =
                     model.sheets |> Dict.map (always (.sheet >> Result.toMaybe))
 
-                scrapsheet : Scrap -> Result String Sheet
+                scrapsheet : Scrap -> Task String (Result String Sheet)
                 scrapsheet ss =
                     case ss of
-                        -- Variant "sheet" x ->
-                        --     Err ("TODO: sheet: " ++ Debug.toString ss)
-                        Record xs ->
+                        Variant "every" x ->
+                            scrapsheet x |> Task.map (Result.map (\s -> { s | every = 1 }))
+
+                        Variant "http" x ->
+                            Http.task
+                                { method = "GET"
+                                , headers = []
+                                , url = "TODO"
+                                , body = Http.emptyBody
+                                , resolver =
+                                    stringResolver
+                                        (\s ->
+                                            Ok <|
+                                                Ok
+                                                    { transpose = False
+                                                    , rows = 1
+                                                    , cols = Array.fromList [ ( "res", Strings (Array.fromList [ "TODO" ]) ) ]
+                                                    , every = 0
+                                                    }
+                                        )
+                                , timeout = Nothing
+                                }
+
+                        Variant "data" (Record xs) ->
                             xs
                                 |> Dict.toList
                                 |> List.sortBy Tuple.first
@@ -357,10 +379,11 @@ update msg model =
                                     )
                                     (Ok [])
                                 |> Result.map Array.fromList
-                                |> Result.map (\cols -> { transpose = False, rows = 10, cols = cols })
+                                |> Result.map (\cols -> { transpose = False, rows = 10, cols = cols, every = 0 })
+                                |> Task.succeed
 
                         _ ->
-                            Err ("TODO: scrapscript -> sheet: " ++ Debug.toString ss)
+                            Err ("TODO: scrapscript -> sheet: " ++ Debug.toString ss) |> Task.succeed
 
                 env_ : Dict String Scrap
                 env_ =
@@ -373,20 +396,18 @@ update msg model =
                         |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/col/") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
                         |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/csv/col/") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
                         |> Dict.union (model.sheets |> Dict.keys |> List.map (String.fromInt >> (++) "s") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
-
-                sheet : Result String Sheet
-                sheet =
-                    code
-                        |> S.run env_
-                        |> Result.andThen scrapsheet
             in
             ( model
-            , Task.attempt (CodeEdited id) <|
-                Task.succeed
-                    { watch = Set.empty
-                    , code = code
-                    , sheet = sheet
-                    }
+            , (case S.run env_ code of
+                Ok x ->
+                    Task.succeed x
+
+                Err x ->
+                    Task.fail x
+              )
+                |> Task.andThen scrapsheet
+                |> Task.map (\sheet -> { watch = Set.empty, code = code, sheet = sheet })
+                |> Task.attempt (CodeEdited id)
             )
 
         CodeEdited id (Ok ss) ->
