@@ -135,6 +135,13 @@ init _ url _ =
         sheets : List String
         sheets =
             [ """
+              (a -> b -> c -> a + b + c) 1 2 3
+              """
+            , """
+              sheet/empty
+                |> sheet/col/numbers  "c1" [ 1, 2, 3 ]
+              """
+            , """
               sheet/empty
                 |> sheet/col/numbers  "c1" [ 1, 2, 3 ]
                 |> sheet/col/text     "c2" [ "a", "b", "c" ]
