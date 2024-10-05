@@ -174,16 +174,16 @@ init _ url _ =
               sheet/from-columns
               """
             , """
-              sheet/http { ... }
+              sheet/http "TODO"
               """
             , """
-              sheet/websocket { ... }
+              sheet/websocket "TODO"
               """
             , """
-              sheet/every 1
+              sheet/every (sheet/http "TODO")
               """
             , """
-              sheet/lazy (sheet/http { ... }) s1
+              sheet/lazy (sheet/http "TODO") s1
               """
 
             -- button clicks
@@ -292,12 +292,13 @@ update msg model =
                         Variant "every" x ->
                             scrapsheet x |> Task.map (Result.map (\s -> { s | every = 1 }))
 
-                        Variant "http" x ->
+                        Variant "http" (Text x) ->
                             Http.task
                                 { method = "GET"
                                 , headers = []
-                                , url = "TODO"
+                                , url = x
                                 , body = Http.emptyBody
+                                , timeout = Nothing
                                 , resolver =
                                     stringResolver
                                         (\s ->
@@ -309,10 +310,10 @@ update msg model =
                                                     , every = 0
                                                     }
                                         )
-                                , timeout = Nothing
                                 }
 
                         Variant "data" (Record xs) ->
+                            -- TODO: This should be a Dic rather than a Record.
                             xs
                                 |> Dict.toList
                                 |> List.sortBy Tuple.first
