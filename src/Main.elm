@@ -7,7 +7,7 @@ import Browser
 import Browser.Navigation as Nav
 import Date exposing (Date)
 import Dict exposing (Dict)
-import Html as H exposing (Html, text)
+import Html as H exposing (Html, code, text)
 import Html.Attributes as A exposing (..)
 import Html.Events as A exposing (..)
 import Html.Lazy as H
@@ -135,10 +135,10 @@ init _ url _ =
         sheets : List String
         sheets =
             [ """
-              sheet/into (a -> b -> c -> { a, b, c })
-                |> sheet/col/numbers  [ 1, 2, 3 ]
-                |> sheet/col/text     [ "a", "b", "c" ]
-                |> sheet/col/checkbox [ true, false, true ]
+              sheet/empty
+                |> sheet/col/numbers  "c1" [ 1, 2, 3 ]
+                |> sheet/col/text     "c2" [ "a", "b", "c" ]
+                |> sheet/col/checkbox "c3" [ true, false, true ]
               """
             , """
               sheet/limit 10 s1
@@ -402,27 +402,37 @@ update msg model =
                         _ ->
                             Err ("TODO: scrapscript -> sheet: " ++ Debug.toString ss) |> Task.succeed
 
+                func : String -> Scrap -> Scrap
+                func =
+                    Binop "->" << Var
+
+                pair : Scrap -> Scrap -> Scrap
+                pair l r =
+                    Dict.empty
+                        |> Dict.insert "l" l
+                        |> Dict.insert "r" r
+                        |> Record
+
                 env_ : Dict String Scrap
                 env_ =
                     Dict.empty
                         |> Dict.insert "true" (Variant "true" Hole)
                         |> Dict.insert "false" (Variant "false" Hole)
-                        |> Dict.insert "sheet" (Variant "sheet" Hole)
-                        |> Dict.union ([ "text/join", "add" ] |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
-                        |> Dict.union ([ "limit", "from-csv", "into", "limit", "filter", "join", "append", "union", "intersect", "subtract", "group", "sort", "to-columns", "from-columns", "http", "websocket", "every", "lazy", "row" ] |> List.map ((++) "sheet/") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
-                        |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/col/") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
-                        |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map ((++) "sheet/csv/col/") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
                         |> Dict.union (model.sheets |> Dict.keys |> List.map (String.fromInt >> (++) "s") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
+                        |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map (\x -> ( "sheet/col/" ++ x, func "k" (func "col" (func "sheet" (Variant "col" (pair (Var "sheet") (pair (Var "k") (Variant x (Var "col"))))))) )) |> Dict.fromList)
+                        |> Dict.insert "sheet/empty" (Variant "empty" Hole)
             in
             ( model
-            , (case S.run env_ code of
-                Ok x ->
-                    Task.succeed x
+            , code
+                |> S.run env_
+                |> (\x_ ->
+                        case x_ of
+                            Ok x ->
+                                scrapsheet x
 
-                Err x ->
-                    Task.fail x
-              )
-                |> Task.andThen scrapsheet
+                            Err x ->
+                                Task.succeed (Err x)
+                   )
                 |> Task.map (\sheet -> { watch = Set.empty, code = code, sheet = sheet })
                 |> Task.attempt (CodeEdited id)
             )
