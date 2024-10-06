@@ -315,6 +315,7 @@ update msg model =
                                     x |> String.dropLeft 1 |> String.toInt |> Maybe.withDefault -1
                             in
                             env
+                                -- TODO: Turn input columns into values (e.g. Checkboxes -> Bools)
                                 |> Dict.get sheetId
                                 |> Result.fromMaybe "TODO: sheet not found"
                                 |> Result.andThen (Result.fromMaybe "TODO: sheet isn't here")
@@ -692,7 +693,9 @@ view model =
     { title = "scrapsheets"
     , body =
         -- TODO: Sheets that exist but aren't currently on the shelf should sit minimized in the corner or something like buffers waiting to be placed back on the shelf.
-        [ H.node "style" [] [ text "main, * { background: black; color: #ccc; } td, th { text-align: center; }" ]
+        [ H.node "style" [] [ text "main, * { background: black; color: #ccc; }" ]
+        , H.node "style" [] [ text "table { border-collapse: collapse; }" ]
+        , H.node "style" [] [ text "td, th { text-align: center; border: 1px solid #aaa; }" ]
         , H.main_ []
             [ H.div [ S.displayFlex, S.flexDirectionColumn ] <|
                 List.append [ H.button [ A.onClick SheetCreating ] [ text "New sheet" ] ] <|
@@ -710,7 +713,7 @@ view model =
 
                                                         Err x ->
                                                             H.div [] [ text ("TODO: error: " ++ x) ]
-                                                    , H.textarea [ A.onInput (CodeEditing id), A.value code, S.width "100%", S.fontFamilyMonospace, code |> String.filter ((==) '\n') |> String.length |> (+) 1 |> A.rows ] []
+                                                    , H.textarea [ A.onInput (CodeEditing id), S.width "100%", S.fontFamilyMonospace, code |> String.filter ((==) '\n') |> String.length |> (+) 1 |> A.rows ] [ text code ]
                                                     ]
                                             )
                                         <|
