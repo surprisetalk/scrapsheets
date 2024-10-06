@@ -693,7 +693,12 @@ view model =
     { title = "scrapsheets"
     , body =
         -- TODO: Sheets that exist but aren't currently on the shelf should sit minimized in the corner or something like buffers waiting to be placed back on the shelf.
-        [ H.node "style" [] [ text "main, * { background: black; color: #ccc; }" ]
+        [ H.node "style" [] [ text "main, input, button {  }" ]
+        , H.node "style" [] [ text "main > div:first-child > :nth-child(even) > :nth-child(even) { background: #fff; }" ]
+        , H.node "style" [] [ text "main > div:first-child > :nth-child(even) > :nth-child(odd) { background: #eee; }" ]
+        , H.node "style" [] [ text "main > div:first-child > :nth-child(odd) > :nth-child(even) { background: #ddd; }" ]
+        , H.node "style" [] [ text "main > div:first-child > :nth-child(odd) > :nth-child(odd) { background: #fff; }" ]
+        , H.node "style" [] [ text "textarea { background: none; }" ]
         , H.node "style" [] [ text "table { border-collapse: collapse; }" ]
         , H.node "style" [] [ text "td, th { text-align: center; border: 1px solid #aaa; }" ]
         , H.main_ []
