@@ -135,9 +135,6 @@ init _ url _ =
         sheets : List String
         sheets =
             [ """
-              (a -> b -> c -> a + b + c) 1 2 3
-              """
-            , """
               sheet/empty
                 |> sheet/col/numbers  "c1" [ 1, 2, 3 ]
               """
@@ -146,6 +143,9 @@ init _ url _ =
                 |> sheet/col/numbers  "c1" [ 1, 2, 3 ]
                 |> sheet/col/text     "c2" [ "a", "b", "c" ]
                 |> sheet/col/checkbox "c3" [ true, false, true ]
+              """
+            , """
+              (a -> b -> c -> a + b + c) 1 2 3
               """
             , """
               sheet/limit 10 s1
@@ -312,6 +312,72 @@ update msg model =
                 scrapsheet : Scrap -> Task String (Result String Sheet)
                 scrapsheet ss =
                     case ss of
+                        Variant "empty" Hole ->
+                            Task.succeed <|
+                                Ok
+                                    { transpose = False
+                                    , rows = 1
+                                    , cols = Array.empty
+                                    , every = 0
+                                    }
+
+                        Variant "col" (Record [ ( "l", sheet ), ( "r", Record [ ( "l", Text k ), ( "r", col ) ] ) ]) ->
+                            Task.map2 (Result.map2 (\a ( c, b ) -> { a | rows = Basics.max c a.rows, cols = Array.push ( k, b ) a.cols }))
+                                (scrapsheet sheet)
+                            <|
+                                Task.succeed <|
+                                    case col of
+                                        Variant "numbers" (List xs) ->
+                                            xs
+                                                |> List.map
+                                                    (\x ->
+                                                        case x of
+                                                            Int n ->
+                                                                Ok (toFloat n)
+
+                                                            Float n ->
+                                                                Ok n
+
+                                                            _ ->
+                                                                Err "TODO: bad number"
+                                                    )
+                                                |> List.foldr (Result.map2 (::)) (Ok [])
+                                                |> Result.map (\a -> ( List.length a, Numbers (Array.fromList a) ))
+
+                                        Variant "text" (List xs) ->
+                                            xs
+                                                |> List.map
+                                                    (\x ->
+                                                        case x of
+                                                            Text n ->
+                                                                Ok n
+
+                                                            _ ->
+                                                                Err "TODO: bad text"
+                                                    )
+                                                |> List.foldr (Result.map2 (::)) (Ok [])
+                                                |> Result.map (\a -> ( List.length a, Strings (Array.fromList a) ))
+
+                                        Variant "checkbox" (List xs) ->
+                                            xs
+                                                |> List.map
+                                                    (\x ->
+                                                        case x of
+                                                            Variant "true" Hole ->
+                                                                Ok (Input () True True)
+
+                                                            Variant "false" Hole ->
+                                                                Ok (Input () False False)
+
+                                                            _ ->
+                                                                Err "TODO: bad bool"
+                                                    )
+                                                |> List.foldr (Result.map2 (::)) (Ok [])
+                                                |> Result.map (\a -> ( List.length a, Checkboxes (Array.fromList a) ))
+
+                                        _ ->
+                                            Err "TODO: unknown col"
+
                         Variant "every" x ->
                             scrapsheet x |> Task.map (Result.map (\s -> { s | every = 1 }))
 
@@ -338,7 +404,6 @@ update msg model =
                         Variant "data" (Record xs) ->
                             -- TODO: This should be a Dic rather than a Record.
                             xs
-                                |> Dict.toList
                                 |> List.sortBy Tuple.first
                                 |> List.foldr
                                     (\( k, v ) c ->
@@ -415,10 +480,7 @@ update msg model =
 
                 pair : Scrap -> Scrap -> Scrap
                 pair l r =
-                    Dict.empty
-                        |> Dict.insert "l" l
-                        |> Dict.insert "r" r
-                        |> Record
+                    Record [ ( "l", l ), ( "r", r ) ]
 
                 env_ : Dict String Scrap
                 env_ =
