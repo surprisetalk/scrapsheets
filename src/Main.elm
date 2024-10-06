@@ -147,49 +147,49 @@ init _ url _ =
             , """
               sheet/limit 2 s1
               """
-            , """
-              sheet/filter (r1 -> r1.id == 1) s1
-              """
-            , """
-              sheet/join (r1 -> r2 -> r1.id == r2.id) s1 s2
-              """
-            , """
-              sheet/append s1 s2
-              """
-            , """
-              sheet/union (r -> r.id) s1 s2
-              """
-            , """
-              sheet/intersect (r -> r.id) s1 s2
-              """
-            , """
-              sheet/subtract (r -> r.id) s1 s2
-              """
-            , """
-              sheet/group (r -> r.id) s1
-              """
-            , """
-              sheet/sort (r -> r.id) s1
-              """
-            , """
-              sheet/to-columns
-              """
-            , """
-              sheet/from-columns
-              """
-            , """
-              sheet/http "TODO"
-              """
-            , """
-              sheet/websocket "TODO"
-              """
-            , """
-              sheet/every (sheet/http "TODO")
-              """
-            , """
-              sheet/lazy (sheet/http "TODO") s1
-              """
 
+            -- , """
+            --   sheet/filter (r1 -> r1.id == 1) s1
+            --   """
+            -- , """
+            --   sheet/join (r1 -> r2 -> r1.id == r2.id) s1 s2
+            --   """
+            -- , """
+            --   sheet/append s1 s2
+            --   """
+            -- , """
+            --   sheet/union (r -> r.id) s1 s2
+            --   """
+            -- , """
+            --   sheet/intersect (r -> r.id) s1 s2
+            --   """
+            -- , """
+            --   sheet/subtract (r -> r.id) s1 s2
+            --   """
+            -- , """
+            --   sheet/group (r -> r.id) s1
+            --   """
+            -- , """
+            --   sheet/sort (r -> r.id) s1
+            --   """
+            -- , """
+            --   sheet/to-columns
+            --   """
+            -- , """
+            --   sheet/from-columns
+            --   """
+            -- , """
+            --   sheet/http "TODO"
+            --   """
+            -- , """
+            --   sheet/websocket "TODO"
+            --   """
+            -- , """
+            --   sheet/every (sheet/http "TODO")
+            --   """
+            -- , """
+            --   sheet/lazy (sheet/http "TODO") s1
+            --   """
             -- button clicks
             , """
               s1 |> sheet/lazy (sheet/filter (r -> r.updated >= now))
