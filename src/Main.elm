@@ -693,19 +693,19 @@ view model =
     { title = "scrapsheets"
     , body =
         -- TODO: Sheets that exist but aren't currently on the shelf should sit minimized in the corner or something like buffers waiting to be placed back on the shelf.
-        [ H.node "style" [] [ text "main, input, button {  }" ]
+        [ H.node "style" [] [ text "main {}" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(even) > :nth-child(even) { background: #fff; }" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(even) > :nth-child(odd) { background: #eee; }" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(odd) > :nth-child(even) { background: #ddd; }" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(odd) > :nth-child(odd) { background: #fff; }" ]
         , H.node "style" [] [ text "main > div:first-child > div > div { border: 0; }" ]
-        , H.node "style" [] [ text "textarea { background: none; border: 0; box-shadow: inset 0px 4px 5px rgba(0, 0, 0, 0.1); }" ]
+        , H.node "style" [] [ text "textarea { background: #fff; border: 0; box-shadow: inset 0px 4px 5px rgba(0, 0, 0, 0.1); }" ]
         , H.node "style" [] [ text "table { border-collapse: collapse; }" ]
         , H.node "style" [] [ text "td, th { text-align: center; border: 1px solid #ccc; }" ]
         , H.main_ []
-            [ H.div [ S.displayFlex, S.flexDirectionColumn ] <|
+            [ H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 1 ] <|
                 List.append [ H.button [ A.onClick SheetCreating ] [ text "New sheet" ] ] <|
-                    List.map (H.div [ S.displayFlex, S.flexDirectionRow ]) <|
+                    List.map (H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 1 ]) <|
                         List.map
                             (List.map
                                 (\id ->
