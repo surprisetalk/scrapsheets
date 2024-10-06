@@ -145,9 +145,6 @@ init _ url _ =
                 |> sheet/col/checkbox "c3" [ true, false, true ]
               """
             , """
-              (a -> b -> c -> a + b + c) 1 2 3
-              """
-            , """
               sheet/limit 10 s1
               """
             , """
@@ -242,7 +239,7 @@ init _ url _ =
                         Tuple.pair i
                             { watch = Set.singleton -1
                             , code = String.trim code |> String.replace "             " ""
-                            , sheet = Ok { transpose = False, rows = 0, cols = Array.empty, every = 0 }
+                            , sheet = Ok { transpose = False, rows = 13, cols = Array.empty, every = 0 }
                             }
                     )
                 |> Dict.fromList
@@ -309,20 +306,34 @@ update msg model =
                 env =
                     model.sheets |> Dict.map (always (.sheet >> Result.toMaybe))
 
-                scrapsheet : Scrap -> Task String (Result String Sheet)
+                scrapsheet : Scrap -> Task String (Result String ( Set SheetId, Sheet ))
                 scrapsheet ss =
                     case ss of
+                        Var x ->
+                            let
+                                sheetId =
+                                    x |> String.dropLeft 1 |> String.toInt |> Maybe.withDefault -1
+                            in
+                            env
+                                |> Dict.get sheetId
+                                |> Result.fromMaybe "TODO: sheet not found"
+                                |> Result.andThen (Result.fromMaybe "TODO: sheet isn't here")
+                                |> Result.map (Tuple.pair (Set.singleton sheetId))
+                                |> Task.succeed
+
                         Variant "empty" Hole ->
                             Task.succeed <|
                                 Ok
-                                    { transpose = False
-                                    , rows = 1
-                                    , cols = Array.empty
-                                    , every = 0
-                                    }
+                                    ( Set.empty
+                                    , { transpose = False
+                                      , rows = 0
+                                      , cols = Array.empty
+                                      , every = 0
+                                      }
+                                    )
 
                         Variant "col" (Record [ ( "l", sheet ), ( "r", Record [ ( "l", Text k ), ( "r", col ) ] ) ]) ->
-                            Task.map2 (Result.map2 (\a ( c, b ) -> { a | rows = Basics.max c a.rows, cols = Array.push ( k, b ) a.cols }))
+                            Task.map2 (Result.map2 (\( watch, a ) ( c, b ) -> ( watch, { a | rows = Basics.max c a.rows, cols = Array.push ( k, b ) a.cols } )))
                                 (scrapsheet sheet)
                             <|
                                 Task.succeed <|
@@ -378,8 +389,44 @@ update msg model =
                                         _ ->
                                             Err "TODO: unknown col"
 
+                        Variant "limit" (Record [ ( "l", Int n ), ( "r", sheet ) ]) ->
+                            let
+                                limit x_ =
+                                    case x_ of
+                                        Numbers x ->
+                                            x |> Array.slice 0 n |> Numbers
+
+                                        Strings x ->
+                                            x |> Array.slice 0 n |> Strings
+
+                                        Images x ->
+                                            x |> Array.slice 0 n |> Images
+
+                                        Links x ->
+                                            x |> Array.slice 0 n |> Links
+
+                                        Buttons x ->
+                                            x |> Array.slice 0 n |> Buttons
+
+                                        Datepickers x ->
+                                            x |> Array.slice 0 n |> Datepickers
+
+                                        Checkboxes x ->
+                                            x |> Array.slice 0 n |> Checkboxes
+
+                                        Sliders x ->
+                                            x |> Array.slice 0 n |> Sliders
+
+                                        Fields x ->
+                                            x |> Array.slice 0 n |> Fields
+
+                                        Chart x ->
+                                            x |> Array.slice 0 n |> Chart
+                            in
+                            scrapsheet sheet |> Task.map (Result.map (Tuple.mapSecond (\s -> { s | rows = Basics.min n s.rows, cols = Array.map (Tuple.mapSecond limit) s.cols })))
+
                         Variant "every" x ->
-                            scrapsheet x |> Task.map (Result.map (\s -> { s | every = 1 }))
+                            scrapsheet x |> Task.map (Result.map (Tuple.mapSecond (\s -> { s | every = 1 })))
 
                         Variant "http" (Text x) ->
                             Http.task
@@ -393,11 +440,13 @@ update msg model =
                                         (\s ->
                                             Ok <|
                                                 Ok
-                                                    { transpose = False
-                                                    , rows = 1
-                                                    , cols = Array.fromList [ ( "res", Strings (Array.fromList [ "TODO" ]) ) ]
-                                                    , every = 0
-                                                    }
+                                                    ( Set.empty
+                                                    , { transpose = False
+                                                      , rows = 1
+                                                      , cols = Array.fromList [ ( "res", Strings (Array.fromList [ "TODO" ]) ) ]
+                                                      , every = 0
+                                                      }
+                                                    )
                                         )
                                 }
 
@@ -468,7 +517,7 @@ update msg model =
                                     )
                                     (Ok [])
                                 |> Result.map Array.fromList
-                                |> Result.map (\cols -> { transpose = False, rows = 10, cols = cols, every = 0 })
+                                |> Result.map (\cols -> ( Set.empty, { transpose = False, rows = 10, cols = cols, every = 0 } ))
                                 |> Task.succeed
 
                         _ ->
@@ -485,11 +534,12 @@ update msg model =
                 env_ : Dict String Scrap
                 env_ =
                     Dict.empty
-                        |> Dict.insert "true" (Variant "true" Hole)
-                        |> Dict.insert "false" (Variant "false" Hole)
                         |> Dict.union (model.sheets |> Dict.keys |> List.map (String.fromInt >> (++) "s") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
                         |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map (\x -> ( "sheet/col/" ++ x, func "k" (func "col" (func "sheet" (Variant "col" (pair (Var "sheet") (pair (Var "k") (Variant x (Var "col"))))))) )) |> Dict.fromList)
+                        |> Dict.insert "true" (Variant "true" Hole)
+                        |> Dict.insert "false" (Variant "false" Hole)
                         |> Dict.insert "sheet/empty" (Variant "empty" Hole)
+                        |> Dict.insert "sheet/limit" (func "a" (func "b" (Variant "limit" (pair (Var "a") (Var "b")))))
             in
             ( model
             , code
@@ -502,7 +552,7 @@ update msg model =
                             Err x ->
                                 Task.succeed (Err x)
                    )
-                |> Task.map (\sheet -> { watch = Set.empty, code = code, sheet = sheet })
+                |> Task.map (\s -> { watch = Result.map Tuple.first s |> Result.withDefault Set.empty, code = code, sheet = Result.map Tuple.second s })
                 |> Task.attempt (CodeEdited id)
             )
 
