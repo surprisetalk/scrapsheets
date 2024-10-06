@@ -145,7 +145,7 @@ init _ url _ =
                 |> sheet/col/checkbox "c3" [ true, false, true ]
               """
             , """
-              sheet/limit 10 s1
+              sheet/limit 2 s1
               """
             , """
               sheet/filter (r1 -> r1.id == 1) s1
@@ -710,7 +710,7 @@ view model =
 
                                                         Err x ->
                                                             H.div [] [ text ("TODO: error: " ++ x) ]
-                                                    , H.textarea [ A.onInput (CodeEditing id), A.value code, S.width "100%", S.fontFamilyMonospace, code |> String.filter ((==) '\n') |> String.length |> (+) 1 |> A.rows ] [ text code ]
+                                                    , H.textarea [ A.onInput (CodeEditing id), A.value code, S.width "100%", S.fontFamilyMonospace, code |> String.filter ((==) '\n') |> String.length |> (+) 1 |> A.rows ] []
                                                     ]
                                             )
                                         <|
