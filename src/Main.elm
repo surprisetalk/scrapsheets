@@ -187,24 +187,22 @@ init _ url _ =
             -- , """
             --   sheet/every (sheet/http "TODO")
             --   """
-            -- , """
-            --   sheet/lazy (sheet/http "TODO") s1
-            --   """
-            -- button clicks
-            , """
-              s1 |> sheet/lazy (sheet/filter (r -> r.updated >= now))
-              . now = s2 |> sheet/row 0 |> maybe/map (r -> r.now) |> maybe/default +&
-              """
-
+            --
             -- basic memory
             , """
-              s1 |> sheet/lazy (sheet/union (r -> r.id) self)
+              sheet/union self s1
+              """
+
+            -- button clicks
+            , """
+              s1 |> sheet/filter (r -> r.updated >= now)
+              . now = s2 |> sheet/row 0 |> maybe/map (r -> r.now) |> maybe/default 0
               """
 
             -- TODO: Turn this into a Chart.
             -- monte carlo
             , """
-              sheet/union (r -> r.id) 
+              sheet/union
                 (sheet/every 1 (sheet/http "https://taylor.town/random")) 
                 self 
                 |> sheet/limit 10
@@ -309,6 +307,22 @@ update msg model =
                 scrapsheet : Scrap -> Task String (Result String ( Set SheetId, Sheet ))
                 scrapsheet ss =
                     case ss of
+                        Var "self" ->
+                            env
+                                -- TODO: Turn input columns into values (e.g. Checkboxes -> Bools)
+                                |> Dict.get id
+                                |> Result.fromMaybe "TODO: sheet not found"
+                                |> Result.map
+                                    (Maybe.withDefault
+                                        { transpose = False
+                                        , rows = 0
+                                        , cols = Array.empty
+                                        , every = 0
+                                        }
+                                    )
+                                |> Result.map (Tuple.pair Set.empty)
+                                |> Task.succeed
+
                         Var x ->
                             let
                                 sheetId =
@@ -389,6 +403,63 @@ update msg model =
 
                                         _ ->
                                             Err "TODO: unknown col"
+
+                        Variant "union" (Record [ ( "l", l ), ( "r", r ) ]) ->
+                            let
+                                union : ( String, Col ) -> ( String, Col ) -> ( String, Col )
+                                union ( k, m ) ( _, n ) =
+                                    -- TODO: super kludge
+                                    Tuple.pair k <|
+                                        case ( m, n ) of
+                                            ( Numbers x, Numbers y ) ->
+                                                Numbers (Array.append x y)
+
+                                            ( Strings x, Strings y ) ->
+                                                Strings (Array.append x y)
+
+                                            ( Images x, Images y ) ->
+                                                Images (Array.append x y)
+
+                                            ( Links x, Links y ) ->
+                                                Links (Array.append x y)
+
+                                            ( Buttons x, Buttons y ) ->
+                                                Buttons (Array.append x y)
+
+                                            ( Datepickers x, Datepickers y ) ->
+                                                Datepickers (Array.append x y)
+
+                                            ( Checkboxes x, Checkboxes y ) ->
+                                                Checkboxes (Array.append x y)
+
+                                            ( Sliders x, Sliders y ) ->
+                                                Sliders (Array.append x y)
+
+                                            ( Fields x, Fields y ) ->
+                                                Fields (Array.append x y)
+
+                                            ( Chart x, Chart y ) ->
+                                                Chart (Array.append x y)
+
+                                            ( x, _ ) ->
+                                                x
+                            in
+                            Task.map2
+                                (Result.map2
+                                    (\( a, b ) ( c, d ) ->
+                                        ( Set.union a c
+                                        , { transpose = b.transpose || d.transpose
+
+                                          -- TODO: We have to union and then count.
+                                          , rows = b.rows + d.rows
+                                          , cols = List.map2 union (Array.toList b.cols) (Array.toList d.cols) |> Array.fromList
+                                          , every = Basics.max b.every d.every
+                                          }
+                                        )
+                                    )
+                                )
+                                (scrapsheet l)
+                                (scrapsheet r)
 
                         Variant "limit" (Record [ ( "l", Int n ), ( "r", sheet ) ]) ->
                             let
@@ -537,10 +608,12 @@ update msg model =
                     Dict.empty
                         |> Dict.union (model.sheets |> Dict.keys |> List.map (String.fromInt >> (++) "s") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
                         |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map (\x -> ( "sheet/col/" ++ x, func "k" (func "col" (func "sheet" (Variant "col" (pair (Var "sheet") (pair (Var "k") (Variant x (Var "col"))))))) )) |> Dict.fromList)
+                        |> Dict.insert "self" (Var "self")
                         |> Dict.insert "true" (Variant "true" Hole)
                         |> Dict.insert "false" (Variant "false" Hole)
                         |> Dict.insert "sheet/empty" (Variant "empty" Hole)
                         |> Dict.insert "sheet/limit" (func "a" (func "b" (Variant "limit" (pair (Var "a") (Var "b")))))
+                        |> Dict.insert "sheet/union" (func "a" (func "b" (Variant "union" (pair (Var "a") (Var "b")))))
             in
             ( model
             , code
@@ -693,17 +766,18 @@ view model =
     { title = "scrapsheets"
     , body =
         -- TODO: Sheets that exist but aren't currently on the shelf should sit minimized in the corner or something like buffers waiting to be placed back on the shelf.
-        [ H.node "style" [] [ text "main {}" ]
+        [ H.node "style" [] [ text "body * { box-sizing: border-box; }" ]
+        , H.node "style" [] [ text "main {}" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(even) > :nth-child(even) { background: #fff; }" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(even) > :nth-child(odd) { background: #eee; }" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(odd) > :nth-child(even) { background: #ddd; }" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(odd) > :nth-child(odd) { background: #fff; }" ]
         , H.node "style" [] [ text "main > div:first-child > div > div { border: 0; }" ]
-        , H.node "style" [] [ text "textarea { background: #fff; border: 0; box-shadow: inset 0px 4px 5px rgba(0, 0, 0, 0.1); }" ]
+        , H.node "style" [] [ text "textarea { background: #fff; border: 1px solid #ccc; box-shadow: inset 0px 4px 5px rgba(0, 0, 0, 0.1); }" ]
         , H.node "style" [] [ text "table { border-collapse: collapse; }" ]
         , H.node "style" [] [ text "td, th { text-align: center; border: 1px solid #ccc; }" ]
         , H.main_ []
-            [ H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 1 ] <|
+            [ H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 2, S.paddingRem 1 ] <|
                 List.append [ H.button [ A.onClick SheetCreating ] [ text "New sheet" ] ] <|
                     List.map (H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 1 ]) <|
                         List.map
