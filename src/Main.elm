@@ -190,7 +190,7 @@ init _ url _ =
             --
             -- basic memory
             , """
-              sheet/union self s1
+              sheet/union (sheet/limit 1 s1) self |> sheet/limit 10
               """
 
             -- button clicks
@@ -449,10 +449,27 @@ update msg model =
                                     (\( a, b ) ( c, d ) ->
                                         ( Set.union a c
                                         , { transpose = b.transpose || d.transpose
+                                          , rows =
+                                                case ( Array.length b.cols, Array.length d.cols ) of
+                                                    ( _, 0 ) ->
+                                                        b.rows
 
-                                          -- TODO: We have to union and then count.
-                                          , rows = b.rows + d.rows
-                                          , cols = List.map2 union (Array.toList b.cols) (Array.toList d.cols) |> Array.fromList
+                                                    ( 0, _ ) ->
+                                                        d.rows
+
+                                                    _ ->
+                                                        b.rows
+                                                            + d.rows
+                                          , cols =
+                                                case ( Array.length b.cols, Array.length d.cols ) of
+                                                    ( _, 0 ) ->
+                                                        b.cols
+
+                                                    ( 0, _ ) ->
+                                                        d.cols
+
+                                                    _ ->
+                                                        List.map2 union (Array.toList b.cols) (Array.toList d.cols) |> Array.fromList
                                           , every = Basics.max b.every d.every
                                           }
                                         )
