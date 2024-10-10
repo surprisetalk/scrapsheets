@@ -95,10 +95,13 @@ type Col
     | Links (Array String)
     | Buttons (Array (Input () Time.Posix))
     | Datepickers (Array (Input () Date))
+    | Colorpickers (Array (Input () String))
     | Checkboxes (Array (Input () Bool))
     | Sliders (Array (Input ( Float, Float ) Float))
     | Fields (Array (Input Regex String))
     | Chart (Array ( Float, Float ))
+    | Colors (Array String)
+    | Booleans (Array Bool)
 
 
 type alias Sheet =
@@ -191,12 +194,6 @@ init _ url _ =
             -- basic memory
             , """
               sheet/union (sheet/limit 1 s1) self |> sheet/limit 10
-              """
-
-            -- button clicks
-            , """
-              s1 |> sheet/filter (r -> r.updated >= now)
-              . now = s2 |> sheet/row 0 |> maybe/map (r -> r.now) |> maybe/default 0
               """
 
             -- TODO: Turn this into a Chart.
@@ -304,6 +301,7 @@ update msg model =
                 env =
                     model.sheets |> Dict.map (always (.sheet >> Result.toMaybe))
 
+                -- TODO: This should be (Set SheetId, Result String Sheet) so that errors don't percolate into the watch layer.
                 scrapsheet : Scrap -> Task String (Result String ( Set SheetId, Sheet ))
                 scrapsheet ss =
                     case ss of
@@ -329,10 +327,42 @@ update msg model =
                                     x |> String.dropLeft 1 |> String.toInt |> Maybe.withDefault -1
                             in
                             env
-                                -- TODO: Turn input columns into values (e.g. Checkboxes -> Bools)
                                 |> Dict.get sheetId
                                 |> Result.fromMaybe "TODO: sheet not found"
                                 |> Result.andThen (Result.fromMaybe "TODO: sheet isn't here")
+                                |> Result.map
+                                    (\sheet ->
+                                        { sheet
+                                            | cols =
+                                                sheet.cols
+                                                    |> Array.map
+                                                        (Tuple.mapSecond
+                                                            (\col ->
+                                                                case col of
+                                                                    Buttons xs ->
+                                                                        xs |> Array.map (.data >> Time.posixToMillis >> String.fromInt) |> Strings
+
+                                                                    Datepickers xs ->
+                                                                        xs |> Array.map (.data >> Date.toIsoString) |> Strings
+
+                                                                    Colorpickers xs ->
+                                                                        xs |> Array.map .data |> Strings
+
+                                                                    Checkboxes xs ->
+                                                                        xs |> Array.map .data |> Booleans
+
+                                                                    Sliders xs ->
+                                                                        xs |> Array.map .data |> Numbers
+
+                                                                    Fields xs ->
+                                                                        xs |> Array.map .data |> Strings
+
+                                                                    xs ->
+                                                                        xs
+                                                            )
+                                                        )
+                                        }
+                                    )
                                 |> Result.map (Tuple.pair (Set.singleton sheetId))
                                 |> Task.succeed
 
@@ -429,6 +459,9 @@ update msg model =
                                             ( Datepickers x, Datepickers y ) ->
                                                 Datepickers (Array.append x y)
 
+                                            ( Colorpickers x, Colorpickers y ) ->
+                                                Colorpickers (Array.append x y)
+
                                             ( Checkboxes x, Checkboxes y ) ->
                                                 Checkboxes (Array.append x y)
 
@@ -440,6 +473,12 @@ update msg model =
 
                                             ( Chart x, Chart y ) ->
                                                 Chart (Array.append x y)
+
+                                            ( Colors x, Colors y ) ->
+                                                Colors (Array.append x y)
+
+                                            ( Booleans x, Booleans y ) ->
+                                                Booleans (Array.append x y)
 
                                             ( x, _ ) ->
                                                 x
@@ -500,6 +539,9 @@ update msg model =
                                         Datepickers x ->
                                             x |> Array.slice 0 n |> Datepickers
 
+                                        Colorpickers x ->
+                                            x |> Array.slice 0 n |> Colorpickers
+
                                         Checkboxes x ->
                                             x |> Array.slice 0 n |> Checkboxes
 
@@ -511,6 +553,12 @@ update msg model =
 
                                         Chart x ->
                                             x |> Array.slice 0 n |> Chart
+
+                                        Colors x ->
+                                            x |> Array.slice 0 n |> Colors
+
+                                        Booleans x ->
+                                            x |> Array.slice 0 n |> Booleans
                             in
                             scrapsheet sheet |> Task.map (Result.map (Tuple.mapSecond (\s -> { s | rows = Basics.min n s.rows, cols = Array.map (Tuple.mapSecond limit) s.cols })))
 
@@ -728,6 +776,10 @@ viewCell i col =
             -- TODO
             Nothing
 
+        Colorpickers xs ->
+            -- TODO
+            Nothing
+
         Checkboxes xs ->
             -- TODO
             xs |> Array.get i |> Maybe.map (\x -> H.input [ A.type_ "checkbox", A.checked x.data ] [])
@@ -748,6 +800,14 @@ viewCell i col =
 
                 _ ->
                     Nothing
+
+        Colors xs ->
+            -- TODO
+            Nothing
+
+        Booleans xs ->
+            -- TODO
+            xs |> Array.get i |> Maybe.map (\x -> H.input [ A.type_ "checkbox", A.checked x, A.disabled True ] [])
 
 
 viewSheet : Sheet -> Html Msg
