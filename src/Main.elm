@@ -151,7 +151,7 @@ init _ url _ =
             , """
               sheet/empty
                 |> sheet/col/numbers  "c1" [ 1, 2, 3 ]
-                |> sheet/col/text     "c2" [ "a", "b", "c" ]
+                |> sheet/col/text     "c2" [ "apple", "pear", "banana" ]
                 |> sheet/col/checkbox "c3" [ true, false, true ]
               """
             , """
@@ -339,7 +339,10 @@ update msg model =
                                 static : ColType -> ColType
                                 static col_ =
                                     case col_ of
-                                        -- TODO
+                                        -- TODO: Do the rest of the input types.
+                                        Checkboxes ->
+                                            Booleans
+
                                         col ->
                                             col
                             in
@@ -557,8 +560,8 @@ update msg model =
 ---- VIEW ---------------------------------------------------------------------
 
 
-viewSheet : Sheet -> Html Msg
-viewSheet sheet =
+viewSheet : SheetId -> Sheet -> Html Msg
+viewSheet id sheet =
     -- TODO: Show some call to action for empty sheets? Or make the region clickable?
     H.table []
         [ H.thead []
@@ -581,7 +584,13 @@ viewSheet sheet =
                                                     Maybe.map
                                                         (\( typ, val ) ->
                                                             -- TODO: Display checkboxes, etc.
-                                                            case typ of
+                                                            case ( typ, val ) of
+                                                                ( Checkboxes, x ) ->
+                                                                    H.input [ A.type_ "checkbox", A.checked (x == "#true"), A.onCheck (\c -> DataEditing id ( j, i ) (iif c "#true" "#false")) ] []
+
+                                                                ( Booleans, x ) ->
+                                                                    H.input [ A.type_ "checkbox", A.checked (x == "#true"), A.disabled True ] []
+
                                                                 _ ->
                                                                     text val
                                                         )
@@ -622,7 +631,7 @@ view model =
                                                 H.div [ S.displayFlex, S.flexDirectionColumn, S.width "100%" ]
                                                     [ case sheet of
                                                         Ok x ->
-                                                            viewSheet x
+                                                            viewSheet id x
 
                                                         Err x ->
                                                             H.div [] [ text ("TODO: error: " ++ x) ]
