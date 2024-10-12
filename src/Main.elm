@@ -88,26 +88,33 @@ type alias Input valid data =
     }
 
 
-type Col
-    = Numbers (Array Float)
-    | Strings (Array String)
-    | Images (Array String)
-    | Links (Array String)
-    | Buttons (Array (Input () Time.Posix))
-    | Datepickers (Array (Input () Date))
-    | Colorpickers (Array (Input () String))
-    | Checkboxes (Array (Input () Bool))
-    | Sliders (Array (Input ( Float, Float ) Float))
-    | Fields (Array (Input Regex String))
-    | Chart (Array ( Float, Float ))
-    | Colors (Array String)
-    | Booleans (Array Bool)
+type ColType
+    = Numbers
+    | Strings
+    | Images
+    | Links
+    | Buttons
+    | Datepickers
+    | Colorpickers
+    | Checkboxes
+    | Sliders
+    | Fields
+    | Chart
+    | Colors
+    | Booleans
+
+
+type alias Col =
+    { label : String
+    , typ : ColType
+    , data : Array String
+    }
 
 
 type alias Sheet =
     { transpose : Bool
     , rows : Int
-    , cols : Array ( String, Col )
+    , cols : Array Col
     , every : Int
     }
 
@@ -192,6 +199,9 @@ init _ url _ =
             --   """
             --
             -- basic memory
+            , """
+              sheet/union s1 s2
+              """
             , """
               sheet/union (sheet/limit 1 s1) self |> sheet/limit 10
               """
@@ -325,44 +335,19 @@ update msg model =
                             let
                                 sheetId =
                                     x |> String.dropLeft 1 |> String.toInt |> Maybe.withDefault -1
+
+                                static : ColType -> ColType
+                                static col_ =
+                                    case col_ of
+                                        -- TODO
+                                        col ->
+                                            col
                             in
                             env
                                 |> Dict.get sheetId
                                 |> Result.fromMaybe "TODO: sheet not found"
                                 |> Result.andThen (Result.fromMaybe "TODO: sheet isn't here")
-                                |> Result.map
-                                    (\sheet ->
-                                        { sheet
-                                            | cols =
-                                                sheet.cols
-                                                    |> Array.map
-                                                        (Tuple.mapSecond
-                                                            (\col ->
-                                                                case col of
-                                                                    Buttons xs ->
-                                                                        xs |> Array.map (.data >> Time.posixToMillis >> String.fromInt) |> Strings
-
-                                                                    Datepickers xs ->
-                                                                        xs |> Array.map (.data >> Date.toIsoString) |> Strings
-
-                                                                    Colorpickers xs ->
-                                                                        xs |> Array.map .data |> Strings
-
-                                                                    Checkboxes xs ->
-                                                                        xs |> Array.map .data |> Booleans
-
-                                                                    Sliders xs ->
-                                                                        xs |> Array.map .data |> Numbers
-
-                                                                    Fields xs ->
-                                                                        xs |> Array.map .data |> Strings
-
-                                                                    xs ->
-                                                                        xs
-                                                            )
-                                                        )
-                                        }
-                                    )
+                                |> Result.map (\sheet -> { sheet | cols = sheet.cols |> Array.map (\col -> { col | typ = static col.typ }) })
                                 |> Result.map (Tuple.pair (Set.singleton sheetId))
                                 |> Task.succeed
 
@@ -378,137 +363,43 @@ update msg model =
                                     )
 
                         Variant "col" (Record [ ( "l", sheet ), ( "r", Record [ ( "l", Text k ), ( "r", col ) ] ) ]) ->
-                            Task.map2 (Result.map2 (\( watch, a ) ( c, b ) -> ( watch, { a | rows = Basics.max c a.rows, cols = Array.push ( k, b ) a.cols } )))
+                            Task.map2 (Result.map2 (\( watch, a ) b -> ( watch, { a | rows = Basics.max (Array.length b.data) a.rows, cols = Array.push b a.cols } )))
                                 (scrapsheet sheet)
                             <|
                                 Task.succeed <|
                                     case col of
-                                        Variant "numbers" (List xs) ->
-                                            xs
-                                                |> List.map
-                                                    (\x ->
-                                                        case x of
-                                                            Int n ->
-                                                                Ok (toFloat n)
+                                        Variant t (List xs) ->
+                                            Ok
+                                                { label = k
+                                                , data = xs |> List.map S.toString |> Array.fromList
+                                                , typ =
+                                                    case t of
+                                                        "number" ->
+                                                            Numbers
 
-                                                            Float n ->
-                                                                Ok n
+                                                        "text" ->
+                                                            Strings
 
-                                                            _ ->
-                                                                Err "TODO: bad number"
-                                                    )
-                                                |> List.foldr (Result.map2 (::)) (Ok [])
-                                                |> Result.map (\a -> ( List.length a, Numbers (Array.fromList a) ))
+                                                        "checkbox" ->
+                                                            Checkboxes
 
-                                        Variant "text" (List xs) ->
-                                            xs
-                                                |> List.map
-                                                    (\x ->
-                                                        case x of
-                                                            Text n ->
-                                                                Ok n
-
-                                                            _ ->
-                                                                Err "TODO: bad text"
-                                                    )
-                                                |> List.foldr (Result.map2 (::)) (Ok [])
-                                                |> Result.map (\a -> ( List.length a, Strings (Array.fromList a) ))
-
-                                        Variant "checkbox" (List xs) ->
-                                            xs
-                                                |> List.map
-                                                    (\x ->
-                                                        case x of
-                                                            Variant "true" Hole ->
-                                                                Ok (Input () True True)
-
-                                                            Variant "false" Hole ->
-                                                                Ok (Input () False False)
-
-                                                            _ ->
-                                                                Err "TODO: bad bool"
-                                                    )
-                                                |> List.foldr (Result.map2 (::)) (Ok [])
-                                                |> Result.map (\a -> ( List.length a, Checkboxes (Array.fromList a) ))
+                                                        _ ->
+                                                            -- TODO: Bad!
+                                                            Strings
+                                                }
 
                                         _ ->
                                             Err "TODO: unknown col"
 
                         Variant "union" (Record [ ( "l", l ), ( "r", r ) ]) ->
-                            let
-                                union : ( String, Col ) -> ( String, Col ) -> ( String, Col )
-                                union ( k, m ) ( _, n ) =
-                                    -- TODO: super kludge
-                                    Tuple.pair k <|
-                                        case ( m, n ) of
-                                            ( Numbers x, Numbers y ) ->
-                                                Numbers (Array.append x y)
-
-                                            ( Strings x, Strings y ) ->
-                                                Strings (Array.append x y)
-
-                                            ( Images x, Images y ) ->
-                                                Images (Array.append x y)
-
-                                            ( Links x, Links y ) ->
-                                                Links (Array.append x y)
-
-                                            ( Buttons x, Buttons y ) ->
-                                                Buttons (Array.append x y)
-
-                                            ( Datepickers x, Datepickers y ) ->
-                                                Datepickers (Array.append x y)
-
-                                            ( Colorpickers x, Colorpickers y ) ->
-                                                Colorpickers (Array.append x y)
-
-                                            ( Checkboxes x, Checkboxes y ) ->
-                                                Checkboxes (Array.append x y)
-
-                                            ( Sliders x, Sliders y ) ->
-                                                Sliders (Array.append x y)
-
-                                            ( Fields x, Fields y ) ->
-                                                Fields (Array.append x y)
-
-                                            ( Chart x, Chart y ) ->
-                                                Chart (Array.append x y)
-
-                                            ( Colors x, Colors y ) ->
-                                                Colors (Array.append x y)
-
-                                            ( Booleans x, Booleans y ) ->
-                                                Booleans (Array.append x y)
-
-                                            ( x, _ ) ->
-                                                x
-                            in
+                            -- TODO: This whole implementation is broken and quite bad.
                             Task.map2
                                 (Result.map2
                                     (\( a, b ) ( c, d ) ->
                                         ( Set.union a c
                                         , { transpose = b.transpose || d.transpose
-                                          , rows =
-                                                case ( Array.length b.cols, Array.length d.cols ) of
-                                                    ( _, 0 ) ->
-                                                        b.rows
-
-                                                    ( 0, _ ) ->
-                                                        d.rows
-
-                                                    _ ->
-                                                        b.rows
-                                                            + d.rows
-                                          , cols =
-                                                case ( Array.length b.cols, Array.length d.cols ) of
-                                                    ( _, 0 ) ->
-                                                        b.cols
-
-                                                    ( 0, _ ) ->
-                                                        d.cols
-
-                                                    _ ->
-                                                        List.map2 union (Array.toList b.cols) (Array.toList d.cols) |> Array.fromList
+                                          , rows = b.rows + d.rows
+                                          , cols = List.map2 (\b_ d_ -> { b_ | data = Array.append b_.data d_.data }) (Array.toList b.cols) (Array.toList d.cols) |> Array.fromList
                                           , every = Basics.max b.every d.every
                                           }
                                         )
@@ -518,49 +409,7 @@ update msg model =
                                 (scrapsheet r)
 
                         Variant "limit" (Record [ ( "l", Int n ), ( "r", sheet ) ]) ->
-                            let
-                                limit x_ =
-                                    case x_ of
-                                        Numbers x ->
-                                            x |> Array.slice 0 n |> Numbers
-
-                                        Strings x ->
-                                            x |> Array.slice 0 n |> Strings
-
-                                        Images x ->
-                                            x |> Array.slice 0 n |> Images
-
-                                        Links x ->
-                                            x |> Array.slice 0 n |> Links
-
-                                        Buttons x ->
-                                            x |> Array.slice 0 n |> Buttons
-
-                                        Datepickers x ->
-                                            x |> Array.slice 0 n |> Datepickers
-
-                                        Colorpickers x ->
-                                            x |> Array.slice 0 n |> Colorpickers
-
-                                        Checkboxes x ->
-                                            x |> Array.slice 0 n |> Checkboxes
-
-                                        Sliders x ->
-                                            x |> Array.slice 0 n |> Sliders
-
-                                        Fields x ->
-                                            x |> Array.slice 0 n |> Fields
-
-                                        Chart x ->
-                                            x |> Array.slice 0 n |> Chart
-
-                                        Colors x ->
-                                            x |> Array.slice 0 n |> Colors
-
-                                        Booleans x ->
-                                            x |> Array.slice 0 n |> Booleans
-                            in
-                            scrapsheet sheet |> Task.map (Result.map (Tuple.mapSecond (\s -> { s | rows = Basics.min n s.rows, cols = Array.map (Tuple.mapSecond limit) s.cols })))
+                            scrapsheet sheet |> Task.map (Result.map (Tuple.mapSecond (\s -> { s | rows = Basics.min n s.rows, cols = s.cols |> Array.map (\col -> { col | data = col.data |> Array.slice 0 n }) })))
 
                         Variant "every" x ->
                             scrapsheet x |> Task.map (Result.map (Tuple.mapSecond (\s -> { s | every = 1 })))
@@ -580,7 +429,7 @@ update msg model =
                                                     ( Set.empty
                                                     , { transpose = False
                                                       , rows = 1
-                                                      , cols = Array.fromList [ ( "res", Strings (Array.fromList [ "TODO" ]) ) ]
+                                                      , cols = Array.fromList [ { label = "res", typ = Strings, data = Array.fromList [ "TODO" ] } ]
                                                       , every = 0
                                                       }
                                                     )
@@ -595,59 +444,25 @@ update msg model =
                                     (\( k, v ) c ->
                                         Result.map2 (flip (::)) c <|
                                             case v of
-                                                Variant "sheet/col/numbers" (List xs_) ->
-                                                    xs_
-                                                        |> List.foldl
-                                                            (\v_ vs_ ->
-                                                                case v_ of
-                                                                    Float n ->
-                                                                        Result.map ((::) n) vs_
+                                                Variant t (List xs_) ->
+                                                    Ok
+                                                        { label = k
+                                                        , data = xs_ |> List.map S.toString |> Array.fromList
+                                                        , typ =
+                                                            case t of
+                                                                "sheet/col/numbers" ->
+                                                                    Numbers
 
-                                                                    Int n ->
-                                                                        Result.map ((::) (toFloat n)) vs_
+                                                                "sheet/col/text" ->
+                                                                    Strings
 
-                                                                    _ ->
-                                                                        Err "TODO: sheet/col/numbers: bad number"
-                                                            )
-                                                            (Ok [])
-                                                        |> Result.map Array.fromList
-                                                        |> Result.map Numbers
-                                                        |> Result.map (Tuple.pair k)
+                                                                "sheet/col/checkbox" ->
+                                                                    Checkboxes
 
-                                                Variant "sheet/col/text" (List xs_) ->
-                                                    xs_
-                                                        |> List.foldl
-                                                            (\v_ vs_ ->
-                                                                case v_ of
-                                                                    Text n ->
-                                                                        Result.map ((::) n) vs_
-
-                                                                    _ ->
-                                                                        Err "TODO: sheet/col/text: bad number"
-                                                            )
-                                                            (Ok [])
-                                                        |> Result.map Array.fromList
-                                                        |> Result.map Strings
-                                                        |> Result.map (Tuple.pair k)
-
-                                                Variant "sheet/col/checkbox" (List xs_) ->
-                                                    xs_
-                                                        |> List.foldl
-                                                            (\v_ vs_ ->
-                                                                case v_ of
-                                                                    Variant "true" Hole ->
-                                                                        Result.map ((::) { valid = (), default = False, data = True }) vs_
-
-                                                                    Variant "false" Hole ->
-                                                                        Result.map ((::) { valid = (), default = False, data = False }) vs_
-
-                                                                    _ ->
-                                                                        Err "TODO: sheet/col/checkbox: bad boolean"
-                                                            )
-                                                            (Ok [])
-                                                        |> Result.map Array.fromList
-                                                        |> Result.map Checkboxes
-                                                        |> Result.map (Tuple.pair k)
+                                                                _ ->
+                                                                    -- TODO: Bad!
+                                                                    Strings
+                                                        }
 
                                                 _ ->
                                                     Err "TODO: record cols"
@@ -706,22 +521,11 @@ update msg model =
 
         DataEditing id ( i, j ) value ->
             let
-                edit_ : Col -> Col
-                edit_ col =
-                    Maybe.withDefault col <|
-                        case col of
-                            Numbers xs ->
-                                String.toFloat value |> Maybe.map (\x -> xs |> Array.set j x |> Numbers)
-
-                            _ ->
-                                -- TODO
-                                Nothing
-
                 edit : Sheet -> Sheet
                 edit sheet =
                     case Array.get i sheet.cols of
                         Just col ->
-                            { sheet | cols = sheet.cols |> Array.set i (Tuple.mapSecond edit_ col) }
+                            { sheet | cols = sheet.cols |> Array.set i { col | data = col.data |> Array.set j value } }
 
                         Nothing ->
                             sheet
@@ -753,63 +557,6 @@ update msg model =
 ---- VIEW ---------------------------------------------------------------------
 
 
-viewCell : Int -> Col -> Maybe (Html Msg)
-viewCell i col =
-    case col of
-        Numbers xs ->
-            xs |> Array.get i |> Maybe.map (String.fromFloat >> text)
-
-        Strings xs ->
-            xs |> Array.get i |> Maybe.map text
-
-        Images xs ->
-            xs |> Array.get i |> Maybe.map (\src -> H.img [ A.src src ] [])
-
-        Links xs ->
-            xs |> Array.get i |> Maybe.map (\href -> H.a [ A.href href ] [])
-
-        Buttons xs ->
-            -- TODO
-            Nothing
-
-        Datepickers xs ->
-            -- TODO
-            Nothing
-
-        Colorpickers xs ->
-            -- TODO
-            Nothing
-
-        Checkboxes xs ->
-            -- TODO
-            xs |> Array.get i |> Maybe.map (\x -> H.input [ A.type_ "checkbox", A.checked x.data ] [])
-
-        Sliders xs ->
-            -- TODO
-            Nothing
-
-        Fields xs ->
-            -- TODO
-            Nothing
-
-        Chart xs ->
-            case i of
-                0 ->
-                    -- TODO: Put everything in row 0 with a rowspan of the whole table
-                    Nothing
-
-                _ ->
-                    Nothing
-
-        Colors xs ->
-            -- TODO
-            Nothing
-
-        Booleans xs ->
-            -- TODO
-            xs |> Array.get i |> Maybe.map (\x -> H.input [ A.type_ "checkbox", A.checked x, A.disabled True ] [])
-
-
 viewSheet : Sheet -> Html Msg
 viewSheet sheet =
     -- TODO: Show some call to action for empty sheets? Or make the region clickable?
@@ -817,7 +564,7 @@ viewSheet sheet =
         [ H.thead []
             [ H.tr [] <|
                 Array.toList <|
-                    Array.map (H.th [] << ls << text << Tuple.first) <|
+                    Array.map (H.th [] << ls << text << .label) <|
                         sheet.cols
             ]
         , H.tbody [] <|
@@ -827,12 +574,21 @@ viewSheet sheet =
                         H.tr [] <|
                             Array.toList <|
                                 Array.initialize (Array.length sheet.cols)
-                                    (H.td []
-                                        << ls
-                                        << Maybe.withDefault (text "")
-                                        << Maybe.andThen (viewCell i)
-                                        << Maybe.map Tuple.second
-                                        << flip Array.get sheet.cols
+                                    (\j ->
+                                        H.td [] <|
+                                            ls <|
+                                                Maybe.withDefault (text "") <|
+                                                    Maybe.map
+                                                        (\( typ, val ) ->
+                                                            -- TODO: Display checkboxes, etc.
+                                                            case typ of
+                                                                _ ->
+                                                                    text val
+                                                        )
+                                                    <|
+                                                        Maybe.andThen (\col -> col.data |> Array.get i |> Maybe.map (Tuple.pair col.typ)) <|
+                                                            Array.get j <|
+                                                                sheet.cols
                                     )
                     )
         ]
