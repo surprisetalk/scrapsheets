@@ -362,7 +362,7 @@ update msg model =
                                 |> Tuple.pair (Set.singleton sheetId)
                                 |> Task.succeed
 
-                        Apply (Var "game-of-life") x ->
+                        Variant "game-of-life" x ->
                             let
                                 getCell : Int -> Int -> Bool
                                 getCell i j =
@@ -546,6 +546,7 @@ update msg model =
                         |> Dict.insert "sheet/union" (func "a" (func "b" (Variant "union" (pair (Var "a") (Var "b")))))
                         |> Dict.insert "sheet/every" (func "a" (func "b" (Variant "every" (pair (Var "a") (Var "b")))))
                         |> Dict.insert "sheet/http" (func "a" (Variant "http" (Var "a")))
+                        |> Dict.insert "game-of-life" (func "a" (Variant "game-of-life" (Var "a")))
             in
             ( model
             , code
