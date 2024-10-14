@@ -223,7 +223,7 @@ init _ url _ =
             -- game of life
             , """
               self
-              |> sheet/map (TODO: game-of-life)
+              |> game-of-life
               |> sheet/every 1
               """
 
@@ -361,6 +361,21 @@ update msg model =
                                 |> Result.map (\sheet -> { sheet | cols = sheet.cols |> Array.map (\col -> { col | typ = static col.typ }) })
                                 |> Tuple.pair (Set.singleton sheetId)
                                 |> Task.succeed
+
+                        Apply (Var "game-of-life") x ->
+                            let
+                                getCell : Int -> Int -> Bool
+                                getCell i j =
+                                    -- TODO: Implement this.
+                                    True
+
+                                gol : Sheet -> Sheet
+                                gol =
+                                    -- TODO: Implement this.
+                                    identity
+                            in
+                            scrapsheet x
+                                |> Task.map (Tuple.mapSecond (Result.map gol))
 
                         Variant "empty" Hole ->
                             Task.succeed
