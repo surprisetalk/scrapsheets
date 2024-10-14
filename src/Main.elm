@@ -249,7 +249,7 @@ init _ url _ =
                         Tuple.pair i
                             { watch = Set.singleton -1
                             , code = String.trim code |> String.replace "             " ""
-                            , sheet = Ok { transpose = False, rows = 13, cols = Array.empty, every = 0 }
+                            , sheet = Ok { transpose = False, rows = 0, cols = Array.empty, every = 0 }
                             }
                     )
                 |> Dict.fromList
