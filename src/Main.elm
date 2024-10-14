@@ -69,8 +69,13 @@ main =
 
 
 subscriptions : Model -> Sub Msg
-subscriptions _ =
-    Sub.none
+subscriptions model =
+    model.sheets
+        |> Dict.toList
+        |> List.filterMap (\( id, s ) -> Result.map (Tuple.pair ( id, s.code )) s.sheet |> Result.toMaybe)
+        |> List.filter (\( _, s ) -> s.every > 0)
+        |> List.map (\( ( id, code ), s ) -> Time.every (1000 * toFloat s.every) (\_ -> CodeEditing id code))
+        |> Sub.batch
 
 
 
@@ -210,7 +215,7 @@ init _ url _ =
             -- monte carlo
             , """
               sheet/union
-                (sheet/every 1 (sheet/http "https://taylor.town/random")) 
+                (sheet/every 11 (sheet/http "https://taylor.town/random")) 
                 self 
                 |> sheet/limit 10
               """
@@ -311,8 +316,11 @@ update msg model =
                 env =
                     model.sheets |> Dict.map (always (.sheet >> Result.toMaybe))
 
-                -- TODO: This should be (Set SheetId, Result String Sheet) so that errors don't percolate into the watch layer.
-                scrapsheet : Scrap -> Task String (Result String ( Set SheetId, Sheet ))
+                tupleMap2 : (a -> c -> e) -> (b -> d -> f) -> ( a, b ) -> ( c, d ) -> ( e, f )
+                tupleMap2 e f ( a, b ) ( c, d ) =
+                    ( e a c, f b d )
+
+                scrapsheet : Scrap -> Task String ( Set SheetId, Result String Sheet )
                 scrapsheet ss =
                     case ss of
                         Var "self" ->
@@ -328,7 +336,7 @@ update msg model =
                                         , every = 0
                                         }
                                     )
-                                |> Result.map (Tuple.pair Set.empty)
+                                |> Tuple.pair Set.empty
                                 |> Task.succeed
 
                         Var x ->
@@ -351,60 +359,70 @@ update msg model =
                                 |> Result.fromMaybe "TODO: sheet not found"
                                 |> Result.andThen (Result.fromMaybe "TODO: sheet isn't here")
                                 |> Result.map (\sheet -> { sheet | cols = sheet.cols |> Array.map (\col -> { col | typ = static col.typ }) })
-                                |> Result.map (Tuple.pair (Set.singleton sheetId))
+                                |> Tuple.pair (Set.singleton sheetId)
                                 |> Task.succeed
 
                         Variant "empty" Hole ->
-                            Task.succeed <|
-                                Ok
-                                    ( Set.empty
-                                    , { transpose = False
-                                      , rows = 0
-                                      , cols = Array.empty
-                                      , every = 0
-                                      }
-                                    )
+                            Task.succeed
+                                ( Set.empty
+                                , Ok
+                                    { transpose = False
+                                    , rows = 0
+                                    , cols = Array.empty
+                                    , every = 0
+                                    }
+                                )
 
                         Variant "col" (Record [ ( "l", sheet ), ( "r", Record [ ( "l", Text k ), ( "r", col ) ] ) ]) ->
-                            Task.map2 (Result.map2 (\( watch, a ) b -> ( watch, { a | rows = Basics.max (Array.length b.data) a.rows, cols = Array.push b a.cols } )))
+                            Task.map2 (tupleMap2 Set.union (Result.map2 (\a b -> { a | rows = Basics.max (Array.length b.data) a.rows, cols = Array.push b a.cols })))
                                 (scrapsheet sheet)
                             <|
                                 Task.succeed <|
-                                    case col of
-                                        Variant t (List xs) ->
-                                            Ok
-                                                { label = k
-                                                , data = xs |> List.map S.toString |> Array.fromList
-                                                , typ =
-                                                    case t of
-                                                        "number" ->
-                                                            Numbers
+                                    Tuple.pair Set.empty <|
+                                        case col of
+                                            Variant t (List xs) ->
+                                                Ok
+                                                    { label = k
+                                                    , data = xs |> List.map S.toString |> Array.fromList
+                                                    , typ =
+                                                        case t of
+                                                            "number" ->
+                                                                Numbers
 
-                                                        "text" ->
-                                                            Strings
+                                                            "text" ->
+                                                                Strings
 
-                                                        "checkbox" ->
-                                                            Checkboxes
+                                                            "checkbox" ->
+                                                                Checkboxes
 
-                                                        _ ->
-                                                            -- TODO: Bad!
-                                                            Strings
-                                                }
+                                                            _ ->
+                                                                -- TODO: Bad!
+                                                                Strings
+                                                    }
 
-                                        _ ->
-                                            Err "TODO: unknown col"
+                                            _ ->
+                                                Err "TODO: unknown col"
 
                         Variant "union" (Record [ ( "l", l ), ( "r", r ) ]) ->
                             -- TODO: This whole implementation is broken and quite bad.
                             Task.map2
-                                (Result.map2
-                                    (\( a, b ) ( c, d ) ->
-                                        ( Set.union a c
-                                        , { transpose = b.transpose || d.transpose
-                                          , rows = b.rows + d.rows
-                                          , cols = List.map2 (\b_ d_ -> { b_ | data = Array.append b_.data d_.data }) (Array.toList b.cols) (Array.toList d.cols) |> Array.fromList
-                                          , every = Basics.max b.every d.every
-                                          }
+                                (tupleMap2 Set.union
+                                    (Result.map2
+                                        (\b d ->
+                                            { transpose = b.transpose || d.transpose
+                                            , rows = b.rows + d.rows
+                                            , cols =
+                                                case ( Array.length b.cols, Array.length d.cols ) of
+                                                    ( 0, _ ) ->
+                                                        d.cols
+
+                                                    ( _, 0 ) ->
+                                                        b.cols
+
+                                                    _ ->
+                                                        List.map2 (\b_ d_ -> { b_ | data = Array.append b_.data d_.data }) (Array.toList b.cols) (Array.toList d.cols) |> Array.fromList
+                                            , every = Basics.max b.every d.every
+                                            }
                                         )
                                     )
                                 )
@@ -412,30 +430,43 @@ update msg model =
                                 (scrapsheet r)
 
                         Variant "limit" (Record [ ( "l", Int n ), ( "r", sheet ) ]) ->
-                            scrapsheet sheet |> Task.map (Result.map (Tuple.mapSecond (\s -> { s | rows = Basics.min n s.rows, cols = s.cols |> Array.map (\col -> { col | data = col.data |> Array.slice 0 n }) })))
+                            scrapsheet sheet |> Task.map (Tuple.mapSecond (Result.map (\s -> { s | rows = Basics.min n s.rows, cols = s.cols |> Array.map (\col -> { col | data = col.data |> Array.slice 0 n }) })))
 
-                        Variant "every" x ->
-                            scrapsheet x |> Task.map (Result.map (Tuple.mapSecond (\s -> { s | every = 1 })))
+                        Variant "every" (Record [ ( "l", Int n ), ( "r", sheet ) ]) ->
+                            scrapsheet sheet |> Task.map (Tuple.mapSecond (Result.map (\s -> { s | every = n })))
 
                         Variant "http" (Text x) ->
-                            Http.task
+                            Http.riskyTask
                                 { method = "GET"
                                 , headers = []
                                 , url = x
                                 , body = Http.emptyBody
-                                , timeout = Nothing
+                                , timeout = Just 5000
                                 , resolver =
                                     stringResolver
                                         (\s ->
                                             Ok <|
-                                                Ok
-                                                    ( Set.empty
-                                                    , { transpose = False
-                                                      , rows = 1
-                                                      , cols = Array.fromList [ { label = "res", typ = Strings, data = Array.fromList [ "TODO" ] } ]
-                                                      , every = 0
-                                                      }
-                                                    )
+                                                Tuple.pair Set.empty <|
+                                                    case s of
+                                                        Http.BadUrl_ err ->
+                                                            Err err
+
+                                                        Http.Timeout_ ->
+                                                            Err "timeout"
+
+                                                        Http.NetworkError_ ->
+                                                            Err "network error"
+
+                                                        Http.BadStatus_ _ err ->
+                                                            Err err
+
+                                                        Http.GoodStatus_ _ body ->
+                                                            Ok
+                                                                { transpose = False
+                                                                , rows = 1
+                                                                , cols = Array.fromList [ { label = "res", typ = Strings, data = Array.fromList [ body ] } ]
+                                                                , every = 0
+                                                                }
                                         )
                                 }
 
@@ -472,11 +503,12 @@ update msg model =
                                     )
                                     (Ok [])
                                 |> Result.map Array.fromList
-                                |> Result.map (\cols -> ( Set.empty, { transpose = False, rows = 10, cols = cols, every = 0 } ))
+                                |> Result.map (\cols -> { transpose = False, rows = 10, cols = cols, every = 0 })
+                                |> Tuple.pair Set.empty
                                 |> Task.succeed
 
                         _ ->
-                            Err ("TODO: scrapscript -> sheet: " ++ Debug.toString ss) |> Task.succeed
+                            Err ("TODO: scrapscript -> sheet: " ++ Debug.toString ss) |> Tuple.pair Set.empty |> Task.succeed
 
                 func : String -> Scrap -> Scrap
                 func =
@@ -497,6 +529,8 @@ update msg model =
                         |> Dict.insert "sheet/empty" (Variant "empty" Hole)
                         |> Dict.insert "sheet/limit" (func "a" (func "b" (Variant "limit" (pair (Var "a") (Var "b")))))
                         |> Dict.insert "sheet/union" (func "a" (func "b" (Variant "union" (pair (Var "a") (Var "b")))))
+                        |> Dict.insert "sheet/every" (func "a" (func "b" (Variant "every" (pair (Var "a") (Var "b")))))
+                        |> Dict.insert "sheet/http" (func "a" (Variant "http" (Var "a")))
             in
             ( model
             , code
@@ -507,9 +541,9 @@ update msg model =
                                 scrapsheet x
 
                             Err x ->
-                                Task.succeed (Err x)
+                                Task.succeed ( Set.empty, Err x )
                    )
-                |> Task.map (\s -> { watch = Result.map Tuple.first s |> Result.withDefault Set.empty, code = code, sheet = Result.map Tuple.second s })
+                |> Task.map (\( watch, sheet ) -> { watch = watch, code = code, sheet = sheet })
                 |> Task.attempt (CodeEdited id)
             )
 
@@ -583,13 +617,15 @@ viewSheet id sheet =
                                                 Maybe.withDefault (text "") <|
                                                     Maybe.map
                                                         (\( typ, val ) ->
-                                                            -- TODO: Display checkboxes, etc.
                                                             case ( typ, val ) of
                                                                 ( Checkboxes, x ) ->
                                                                     H.input [ A.type_ "checkbox", A.checked (x == "#true"), A.onCheck (\c -> DataEditing id ( j, i ) (iif c "#true" "#false")) ] []
 
-                                                                ( Booleans, x ) ->
-                                                                    H.input [ A.type_ "checkbox", A.checked (x == "#true"), A.disabled True ] []
+                                                                ( Booleans, "#true" ) ->
+                                                                    text "✓"
+
+                                                                ( Booleans, "#false" ) ->
+                                                                    text ""
 
                                                                 _ ->
                                                                     text val
