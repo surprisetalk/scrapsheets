@@ -223,7 +223,7 @@ init _ url _ =
             -- game of life
             , """
               self
-              |> game-of-life
+              |> (game-of-life 20)
               |> sheet/every 1
               """
 
@@ -362,19 +362,37 @@ update msg model =
                                 |> Tuple.pair (Set.singleton sheetId)
                                 |> Task.succeed
 
-                        Variant "game-of-life" x ->
+                        Variant "game-of-life" (Record [ ( "l", Int n ), ( "r", sheet ) ]) ->
                             let
-                                getCell : Int -> Int -> Bool
-                                getCell i j =
-                                    -- TODO: Implement this.
-                                    True
-
                                 gol : Sheet -> Sheet
-                                gol =
-                                    -- TODO: Implement this.
-                                    identity
+                                gol s =
+                                    let
+                                        getCell : Int -> Int -> Bool
+                                        getCell i j =
+                                            "" /= (s.cols |> Array.get i |> Maybe.andThen (.data >> Array.get j) |> Maybe.withDefault (iif (modBy 20 (i * j) == 0) "✓" ""))
+                                    in
+                                    { s
+                                        | rows = n
+                                        , cols =
+                                            Array.initialize (n * 2)
+                                                (\i ->
+                                                    { label = ""
+                                                    , typ = Booleans
+                                                    , data =
+                                                        Array.initialize n
+                                                            (\j ->
+                                                                case List.sum (List.map2 (\i_ j_ -> iif (getCell (i + i_) (j + j_)) 1 0) [ -1, -1, -1, 0, 0, 1, 1, 1 ] [ -1, 0, 1, -1, 1, -1, 0, 1 ]) of
+                                                                    3 ->
+                                                                        "✓"
+
+                                                                    _ ->
+                                                                        ""
+                                                            )
+                                                    }
+                                                )
+                                    }
                             in
-                            scrapsheet x
+                            scrapsheet sheet
                                 |> Task.map (Tuple.mapSecond (Result.map gol))
 
                         Variant "empty" Hole ->
@@ -546,7 +564,7 @@ update msg model =
                         |> Dict.insert "sheet/union" (func "a" (func "b" (Variant "union" (pair (Var "a") (Var "b")))))
                         |> Dict.insert "sheet/every" (func "a" (func "b" (Variant "every" (pair (Var "a") (Var "b")))))
                         |> Dict.insert "sheet/http" (func "a" (Variant "http" (Var "a")))
-                        |> Dict.insert "game-of-life" (func "a" (Variant "game-of-life" (Var "a")))
+                        |> Dict.insert "game-of-life" (func "a" (func "b" (Variant "game-of-life" (pair (Var "a") (Var "b")))))
             in
             ( model
             , code
@@ -669,7 +687,7 @@ view model =
         , H.node "style" [] [ text "main > div:first-child > div > div { border: 0; }" ]
         , H.node "style" [] [ text "textarea { background: #fff; border: 1px solid #ccc; box-shadow: inset 0px 4px 5px rgba(0, 0, 0, 0.1); }" ]
         , H.node "style" [] [ text "table { border-collapse: collapse; }" ]
-        , H.node "style" [] [ text "td, th { text-align: center; border: 1px solid #ccc; }" ]
+        , H.node "style" [] [ text "td, th { text-align: center; border: 1px solid #ccc; height: 1rem; }" ]
         , H.main_ []
             [ H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 2, S.paddingRem 1 ] <|
                 List.append [ H.button [ A.onClick SheetCreating ] [ text "New sheet" ] ] <|
