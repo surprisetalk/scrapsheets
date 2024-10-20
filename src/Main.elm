@@ -162,6 +162,12 @@ init _ url _ =
             , """
               sheet/limit 2 s1
               """
+            , """
+              sheet/join "c1" s0 s1
+              """
+            , """
+              s1 |> sheet/reduce [ #sum, #count, #max ]
+              """
 
             -- , """
             --   sheet/filter (r1 -> r1.id == 1) s1
@@ -540,6 +546,61 @@ update msg model =
                                 |> Tuple.pair Set.empty
                                 |> Task.succeed
 
+                        Variant "reduce" (Record [ ( "l", List l ), ( "r", r ) ]) ->
+                            scrapsheet r
+                                |> Task.map
+                                    (Tuple.mapSecond
+                                        (Result.map
+                                            (\s ->
+                                                { s
+                                                    | rows = 1
+                                                    , cols =
+                                                        Array.fromList <|
+                                                            List.map2
+                                                                (\b_ d_ ->
+                                                                    { b_
+                                                                        | data =
+                                                                            Array.fromList <|
+                                                                                case d_ of
+                                                                                    Variant "sum" Hole ->
+                                                                                        b_.data |> Array.toList |> List.filterMap String.toFloat |> List.sum |> String.fromFloat |> List.singleton
+
+                                                                                    Variant "min" Hole ->
+                                                                                        b_.data |> Array.toList |> List.minimum |> Maybe.withDefault "" |> List.singleton
+
+                                                                                    Variant "max" Hole ->
+                                                                                        b_.data |> Array.toList |> List.maximum |> Maybe.withDefault "" |> List.singleton
+
+                                                                                    Variant "count" Hole ->
+                                                                                        b_.data |> Array.filter ((/=) "") |> Array.length |> String.fromInt |> List.singleton
+
+                                                                                    _ ->
+                                                                                        []
+                                                                    }
+                                                                )
+                                                                (Array.toList s.cols)
+                                                                l
+                                                }
+                                            )
+                                        )
+                                    )
+
+                        Variant "join" (Record [ ( "l", Record [ ( "l", Text k ), ( "r", l ) ] ), ( "r", r ) ]) ->
+                            Task.map2
+                                (tupleMap2 Set.union
+                                    (Result.map2
+                                        (\b d ->
+                                            { transpose = b.transpose || d.transpose
+                                            , rows = b.rows
+                                            , cols = Array.append b.cols (Array.map (\col -> col) d.cols) -- TODO: Implement this for real.
+                                            , every = Basics.max b.every d.every
+                                            }
+                                        )
+                                    )
+                                )
+                                (scrapsheet l)
+                                (scrapsheet r)
+
                         _ ->
                             Err ("TODO: scrapscript -> sheet: " ++ Debug.toString ss) |> Tuple.pair Set.empty |> Task.succeed
 
@@ -564,6 +625,8 @@ update msg model =
                         |> Dict.insert "sheet/union" (func "a" (func "b" (Variant "union" (pair (Var "a") (Var "b")))))
                         |> Dict.insert "sheet/every" (func "a" (func "b" (Variant "every" (pair (Var "a") (Var "b")))))
                         |> Dict.insert "sheet/http" (func "a" (Variant "http" (Var "a")))
+                        |> Dict.insert "sheet/reduce" (func "a" (func "b" (Variant "reduce" (pair (Var "a") (Var "b")))))
+                        |> Dict.insert "sheet/join" (func "a" (func "b" (func "c" (Variant "join" (pair (pair (Var "a") (Var "b")) (Var "c"))))))
                         |> Dict.insert "game-of-life" (func "a" (func "b" (Variant "game-of-life" (pair (Var "a") (Var "b")))))
             in
             ( model
