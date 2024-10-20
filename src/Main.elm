@@ -836,7 +836,7 @@ view model =
                                                             viewSheet id x
 
                                                         Err x ->
-                                                            H.div [] [ text ("TODO: error: " ++ x) ]
+                                                            H.div [ S.paddingRem 1, S.color "#666" ] [ text x ]
                                                     , H.textarea [ A.onInput (CodeEditing id), S.width "100%", S.fontFamilyMonospace, code |> String.filter ((==) '\n') |> String.length |> (+) 1 |> A.rows ] [ text code ]
                                                     ]
                                             )
