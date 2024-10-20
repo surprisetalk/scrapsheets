@@ -779,7 +779,7 @@ view model =
     , body =
         -- TODO: Sheets that exist but aren't currently on the shelf should sit minimized in the corner or something like buffers waiting to be placed back on the shelf.
         [ H.node "style" [] [ text "body * { box-sizing: border-box; }" ]
-        , H.node "style" [] [ text "main { padding-bottom: 10rem; }" ]
+        , H.node "style" [] [ text "main { padding-bottom: 10rem; font-family: sans-serif; }" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(even) > :nth-child(even) { background: #fff; }" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(even) > :nth-child(odd) { background: #eee; }" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(odd) > :nth-child(even) { background: #ddd; }" ]
