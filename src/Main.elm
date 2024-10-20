@@ -138,8 +138,9 @@ type alias Model =
     -- the row beneath the sheet opens up with its code and a pointer and tools
     , shelf : Array (Array SheetId) -- use empty sheets as row/col spacers
 
-    -- sheet being dragged
-    , drag : Maybe SheetId
+    -- sheet and row being dragged
+    , dragSheet : Maybe SheetId
+    , dragRow : Int
     }
 
 
@@ -286,7 +287,8 @@ init _ url _ =
                     , [ 0 ]
                     , [ 9 ]
                     ]
-      , drag = Nothing
+      , dragSheet = Nothing
+      , dragRow = -1
       }
     , Task.succeed -1 |> Task.perform SheetEdited
     )
@@ -297,9 +299,11 @@ init _ url _ =
 
 
 type Msg
-    = SheetCreating
+    = NoOp
+    | SheetCreating
     | SheetDragging SheetId
-    | SheetDropping { row : Int, after : Bool, x : Float }
+    | SheetDragginging { row : Int, after : Bool, x : Float }
+    | SheetDropping
     | CodeEditing SheetId String
     | CodeEdited SheetId (Result String Scrapsheet)
     | DataEditing SheetId ( Int, Int ) String
@@ -323,6 +327,9 @@ type alias Env =
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
+        NoOp ->
+            ( model, Cmd.none )
+
         SheetCreating ->
             let
                 sheetId : Int
@@ -344,15 +351,22 @@ update msg model =
             )
 
         SheetDragging id ->
-            ( { model | drag = Just id }, Cmd.none )
+            ( { model | dragSheet = Just id, dragRow = -1 }, Cmd.none )
 
-        SheetDropping { row, after, x } ->
-            case model.drag of
+        SheetDragginging { row, after, x } ->
+            ( { model | dragRow = row }, Cmd.none )
+
+        SheetDropping ->
+            case model.dragSheet of
                 Just drag ->
-                    ( { model | drag = Nothing, shelf = model.shelf |> Array.set row (model.shelf |> Array.get row |> Maybe.withDefault Array.empty |> Array.push drag) }, Cmd.none )
+                    let
+                        shelf =
+                            model.shelf |> Array.map (Array.filter ((/=) drag))
+                    in
+                    ( { model | dragSheet = Nothing, dragRow = -1, shelf = shelf |> Array.set model.dragRow (shelf |> Array.get model.dragRow |> Maybe.withDefault Array.empty |> Array.push drag) }, Cmd.none )
 
                 Nothing ->
-                    ( { model | drag = Nothing }, Cmd.none )
+                    ( { model | dragSheet = Nothing, dragRow = -1 }, Cmd.none )
 
         CodeEditing id code ->
             let
@@ -751,7 +765,7 @@ viewSheet id sheet =
         [ H.thead []
             [ H.tr [] <|
                 Array.toList <|
-                    Array.map (H.th [ A.onMouseDown (SheetDragging id) ] << ls << text << .label) <|
+                    Array.map (H.th [] << ls << text << .label) <|
                         sheet.cols
             ]
         , H.tbody [] <|
@@ -772,7 +786,7 @@ viewSheet id sheet =
                                                                     H.input [ A.type_ "checkbox", A.checked (x == "#true"), A.onCheck (\c -> DataEditing id ( j, i ) (iif c "#true" "#false")) ] []
 
                                                                 ( Sliders, x ) ->
-                                                                    H.input [ A.type_ "range", A.value x, A.onInput (DataEditing id ( j, i )) ] []
+                                                                    H.input [ A.custom "dragstart" (D.succeed { message = NoOp, stopPropagation = True, preventDefault = True }), A.draggable "true", A.type_ "range", A.value x, A.onInput (DataEditing id ( j, i )) ] []
 
                                                                 ( Booleans, "#true" ) ->
                                                                     text "✓"
@@ -807,16 +821,16 @@ view model =
         , H.node "style" [] [ text "tr > :first-child { padding-left: 0.5rem; }" ]
         , H.node "style" [] [ text "tr > :last-child  { padding-right: 0.5rem; }" ]
         , H.main_ []
-            [ H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 1.5, S.paddingRem 1 ] <|
-                List.append [ H.button [ A.onClick SheetCreating ] [ text "New sheet" ] ] <|
-                    List.indexedMap (\n -> H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 1.25, A.onMouseUp (SheetDropping { row = n, after = False, x = 0 }) ]) <|
+            [ H.div [ S.displayFlex, S.flexDirectionColumn ] <|
+                List.append [ H.button [ A.onClick SheetCreating, S.marginRem 1 ] [ text "New sheet" ] ] <|
+                    List.indexedMap (\n -> H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 1.25, S.paddingRem 1, S.background (iif (model.dragRow == n) "#eee" ""), S.borderRight (iif (model.dragRow == n) "25px solid #666" ""), A.preventDefaultOn "dragover" (D.succeed ( SheetDragginging { row = n, after = False, x = 0 }, True )), A.preventDefaultOn "drop" (D.succeed ( SheetDropping, True )) ]) <|
                         List.map
                             (List.map
                                 (\id ->
                                     Maybe.withDefault (H.div [] [ text "TODO: sheet not found" ]) <|
                                         Maybe.map
                                             (\{ code, sheet } ->
-                                                H.div [ S.displayFlex, S.flexDirectionColumn, S.width "100%", A.draggable "true" ]
+                                                H.div [ S.displayFlex, S.flexDirectionColumn, S.width "100%", A.draggable "true", A.on "dragstart" (D.succeed (SheetDragging id)), A.on "dragend" (D.succeed NoOp) ]
                                                     [ case sheet of
                                                         Ok x ->
                                                             viewSheet id x
