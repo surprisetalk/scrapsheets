@@ -136,7 +136,10 @@ type alias Model =
     { sheets : Dict SheetId Scrapsheet
 
     -- the row beneath the sheet opens up with its code and a pointer and tools
-    , shelf : List (List SheetId) -- use empty sheets as row/col spacers
+    , shelf : Array (Array SheetId) -- use empty sheets as row/col spacers
+
+    -- sheet being dragged
+    , drag : Maybe SheetId
     }
 
 
@@ -164,7 +167,7 @@ init _ url _ =
               sheet/limit 2 s1
               """
             , """
-              sheet/join "c1" s0 s1
+              sheet/join "" s0 s1
               """
             , """
               s1 
@@ -273,14 +276,17 @@ init _ url _ =
                 |> Dict.fromList
       , shelf =
             -- List.indexedMap (\i _ -> [ i ]) sheets
-            [ [ 1, 0 ]
-            , [ 2, 3, 5, 4 ]
-            , [ 6, 6, 6 ]
-            , [ 7, 8 ]
-            , [ 0 ]
-            , [ 0 ]
-            , [ 9 ]
-            ]
+            Array.fromList <|
+                List.map Array.fromList
+                    [ [ 1, 0 ]
+                    , [ 2, 3, 5, 4 ]
+                    , [ 6, 6, 6 ]
+                    , [ 7, 8 ]
+                    , [ 0 ]
+                    , [ 0 ]
+                    , [ 9 ]
+                    ]
+      , drag = Nothing
       }
     , Task.succeed -1 |> Task.perform SheetEdited
     )
@@ -292,6 +298,8 @@ init _ url _ =
 
 type Msg
     = SheetCreating
+    | SheetDragging SheetId
+    | SheetDropping { row : Int, after : Bool, x : Float }
     | CodeEditing SheetId String
     | CodeEdited SheetId (Result String Scrapsheet)
     | DataEditing SheetId ( Int, Int ) String
@@ -322,7 +330,7 @@ update msg model =
                     model.sheets |> Dict.keys |> List.maximum |> Maybe.withDefault 0 |> (+) 1
             in
             ( { model
-                | shelf = [ sheetId ] :: model.shelf
+                | shelf = Array.push (Array.fromList [ sheetId ]) model.shelf
                 , sheets =
                     model.sheets
                         |> Dict.insert sheetId
@@ -334,6 +342,17 @@ update msg model =
             , Cmd.batch
                 []
             )
+
+        SheetDragging id ->
+            ( { model | drag = Just id }, Cmd.none )
+
+        SheetDropping { row, after, x } ->
+            case model.drag of
+                Just drag ->
+                    ( { model | drag = Nothing, shelf = model.shelf |> Array.set row (model.shelf |> Array.get row |> Maybe.withDefault Array.empty |> Array.push drag) }, Cmd.none )
+
+                Nothing ->
+                    ( { model | drag = Nothing }, Cmd.none )
 
         CodeEditing id code ->
             let
@@ -732,7 +751,7 @@ viewSheet id sheet =
         [ H.thead []
             [ H.tr [] <|
                 Array.toList <|
-                    Array.map (H.th [] << ls << text << .label) <|
+                    Array.map (H.th [ A.onMouseDown (SheetDragging id) ] << ls << text << .label) <|
                         sheet.cols
             ]
         , H.tbody [] <|
@@ -780,28 +799,24 @@ view model =
         -- TODO: Sheets that exist but aren't currently on the shelf should sit minimized in the corner or something like buffers waiting to be placed back on the shelf.
         [ H.node "style" [] [ text "body * { box-sizing: border-box; }" ]
         , H.node "style" [] [ text "main { padding-bottom: 10rem; font-family: sans-serif; }" ]
-        , H.node "style" [] [ text "main > div:first-child > :nth-child(even) > :nth-child(even) { background: #fff; }" ]
-        , H.node "style" [] [ text "main > div:first-child > :nth-child(even) > :nth-child(odd) { background: #eee; }" ]
-        , H.node "style" [] [ text "main > div:first-child > :nth-child(odd) > :nth-child(even) { background: #ddd; }" ]
-        , H.node "style" [] [ text "main > div:first-child > :nth-child(odd) > :nth-child(odd) { background: #fff; }" ]
-        , H.node "style" [] [ text "main > div:first-child > div > div { border: 0; box-shadow: 0 4px 4px rgba(0,0,0, 0.35); overflow: hidden; border-radius: 5px; }" ]
+        , H.node "style" [] [ text "main > div:first-child > div > div { border: 0; box-shadow: 0 4px 4px rgba(0,0,0, 0.2); overflow: hidden; border-radius: 5px; }" ]
         , H.node "style" [] [ text "textarea { background: #fff; border: 0; height: 100%; padding: 0.5rem; }" ]
         , H.node "style" [] [ text "table { border-collapse: collapse; }" ]
         , H.node "style" [] [ text "td, th { text-align: center; border-bottom: 1px solid #ccc; height: 1rem; }" ]
-        , H.node "style" [] [ text "th { padding: 0.25rem 0.5rem; background-color: rgba(0,0,0,0.15); }" ]
+        , H.node "style" [] [ text "th { padding: 0.25rem 0.5rem; background-color: rgba(0,0,0,0.1); }" ]
         , H.node "style" [] [ text "tr > :first-child { padding-left: 0.5rem; }" ]
         , H.node "style" [] [ text "tr > :last-child  { padding-right: 0.5rem; }" ]
         , H.main_ []
             [ H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 1.5, S.paddingRem 1 ] <|
                 List.append [ H.button [ A.onClick SheetCreating ] [ text "New sheet" ] ] <|
-                    List.map (H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 1.25 ]) <|
+                    List.indexedMap (\n -> H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 1.25, A.onMouseUp (SheetDropping { row = n, after = False, x = 0 }) ]) <|
                         List.map
                             (List.map
                                 (\id ->
                                     Maybe.withDefault (H.div [] [ text "TODO: sheet not found" ]) <|
                                         Maybe.map
                                             (\{ code, sheet } ->
-                                                H.div [ S.displayFlex, S.flexDirectionColumn, S.width "100%" ]
+                                                H.div [ S.displayFlex, S.flexDirectionColumn, S.width "100%", A.draggable "true" ]
                                                     [ case sheet of
                                                         Ok x ->
                                                             viewSheet id x
@@ -816,7 +831,9 @@ view model =
                                 )
                             )
                         <|
-                            model.shelf
+                            Array.toList <|
+                                Array.map Array.toList <|
+                                    model.shelf
             , H.aside []
                 []
             ]
