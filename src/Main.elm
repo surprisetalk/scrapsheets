@@ -156,7 +156,7 @@ init _ url _ =
             , """
               sheet/empty
                 |> sheet/col/numbers  "c1" [ 1, 2, 3 ]
-                |> sheet/col/text     "c2" [ "apple", "pear", "banana" ]
+                |> sheet/col/text     "c2" ["apple","pear","mango"]
                 |> sheet/col/checkbox "c3" [ true, false, true ]
                 |> sheet/col/sliders  "c4" [ 0, 50, 75 ]
               """
@@ -221,19 +221,21 @@ init _ url _ =
               sheet/union s1 s2
               """
             , """
-              sheet/union (sheet/limit 1 s1) self |> sheet/limit 10
+              sheet/union (sheet/limit 1 s1) self 
+                |> sheet/limit 10
               """
 
             -- TODO: Turn this into a Chart.
             -- monte carlo
             , """
               sheet/union
-                (sheet/every 11 (sheet/http "https://taylor.town/random")) 
+                (sheet/every 5 
+                 (sheet/http "https://taylor.town/random")) 
                 self 
                 |> sheet/limit 10
               """
             , """
-              s1 |> sheet/reduce [ #max ]
+              s7 |> sheet/reduce [ #avg ]
               """
 
             -- game of life
@@ -275,6 +277,9 @@ init _ url _ =
             , [ 2, 3, 5, 4 ]
             , [ 6, 6, 6 ]
             , [ 7, 8 ]
+            , [ 0 ]
+            , [ 0 ]
+            , [ 9 ]
             ]
       }
     , Task.succeed -1 |> Task.perform SheetEdited
@@ -591,6 +596,9 @@ update msg model =
                                                                                     Variant "sum" Hole ->
                                                                                         b_.data |> Array.toList |> List.filterMap String.toFloat |> List.sum |> String.fromFloat |> List.singleton
 
+                                                                                    Variant "avg" Hole ->
+                                                                                        b_.data |> Array.toList |> List.filterMap String.toFloat |> List.sum |> flip (/) (toFloat (Basics.max 1 (Array.length b_.data))) |> String.fromFloat |> List.singleton
+
                                                                                     Variant "min" Hole ->
                                                                                         b_.data |> Array.toList |> List.minimum |> Maybe.withDefault "" |> List.singleton
 
@@ -771,19 +779,22 @@ view model =
     , body =
         -- TODO: Sheets that exist but aren't currently on the shelf should sit minimized in the corner or something like buffers waiting to be placed back on the shelf.
         [ H.node "style" [] [ text "body * { box-sizing: border-box; }" ]
-        , H.node "style" [] [ text "main {}" ]
+        , H.node "style" [] [ text "main { padding-bottom: 10rem; }" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(even) > :nth-child(even) { background: #fff; }" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(even) > :nth-child(odd) { background: #eee; }" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(odd) > :nth-child(even) { background: #ddd; }" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(odd) > :nth-child(odd) { background: #fff; }" ]
-        , H.node "style" [] [ text "main > div:first-child > div > div { border: 0; }" ]
-        , H.node "style" [] [ text "textarea { background: #fff; border: 1px solid #ccc; box-shadow: inset 0px 5px 5px rgba(0, 0, 0, 0.1); height: 100%; }" ]
+        , H.node "style" [] [ text "main > div:first-child > div > div { border: 0; box-shadow: 0 0.25rem 0.5rem rgba(0,0,0, 0.2); overflow: hidden; border-radius: 10px; }" ]
+        , H.node "style" [] [ text "textarea { background: #fff; border: 0; box-shadow: inset 0px 5px 5px rgba(0, 0, 0, 0.0); height: 100%; padding: 0.5rem; }" ]
         , H.node "style" [] [ text "table { border-collapse: collapse; }" ]
-        , H.node "style" [] [ text "td, th { text-align: center; border: 1px solid #ccc; height: 1rem; }" ]
+        , H.node "style" [] [ text "td, th { text-align: center; border-bottom: 1px solid #ccc; height: 1rem; }" ]
+        , H.node "style" [] [ text "th { padding: 0.25rem 0.5rem; background-color: rgba(0,0,0,0.15); }" ]
+        , H.node "style" [] [ text "tr > :first-child { padding-left: 0.5rem; }" ]
+        , H.node "style" [] [ text "tr > :last-child  { padding-right: 0.5rem; }" ]
         , H.main_ []
-            [ H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 2, S.paddingRem 1 ] <|
+            [ H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 1.5, S.paddingRem 1 ] <|
                 List.append [ H.button [ A.onClick SheetCreating ] [ text "New sheet" ] ] <|
-                    List.map (H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 1 ]) <|
+                    List.map (H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 1.25 ]) <|
                         List.map
                             (List.map
                                 (\id ->
