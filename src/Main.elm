@@ -158,6 +158,7 @@ init _ url _ =
                 |> sheet/col/numbers  "c1" [ 1, 2, 3 ]
                 |> sheet/col/text     "c2" [ "apple", "pear", "banana" ]
                 |> sheet/col/checkbox "c3" [ true, false, true ]
+                |> sheet/col/sliders  "c4" [ 0, 50, 75 ]
               """
             , """
               sheet/limit 2 s1
@@ -166,7 +167,13 @@ init _ url _ =
               sheet/join "c1" s0 s1
               """
             , """
-              s1 |> sheet/reduce [ #sum, #count, #max ]
+              s1 
+                |> sheet/reduce 
+                   [ #sum
+                   , #count
+                   , #max
+                   , #sum 
+                   ]
               """
 
             -- , """
@@ -225,6 +232,9 @@ init _ url _ =
                 self 
                 |> sheet/limit 10
               """
+            , """
+              s1 |> sheet/reduce [ #max ]
+              """
 
             -- game of life
             , """
@@ -260,8 +270,12 @@ init _ url _ =
                     )
                 |> Dict.fromList
       , shelf =
-            sheets
-                |> List.indexedMap (\i _ -> [ i ])
+            -- List.indexedMap (\i _ -> [ i ]) sheets
+            [ [ 1, 0 ]
+            , [ 2, 3, 5, 4 ]
+            , [ 6, 6, 6 ]
+            , [ 7, 8 ]
+            ]
       }
     , Task.succeed -1 |> Task.perform SheetEdited
     )
@@ -357,6 +371,9 @@ update msg model =
                                         Checkboxes ->
                                             Booleans
 
+                                        Sliders ->
+                                            Numbers
+
                                         col ->
                                             col
                             in
@@ -388,6 +405,9 @@ update msg model =
                                                         Array.initialize n
                                                             (\j ->
                                                                 case List.sum (List.map2 (\i_ j_ -> iif (getCell (i + i_) (j + j_)) 1 0) [ -1, -1, -1, 0, 0, 1, 1, 1 ] [ -1, 0, 1, -1, 1, -1, 0, 1 ]) of
+                                                                    2 ->
+                                                                        iif (getCell i j) "✓" ""
+
                                                                     3 ->
                                                                         "✓"
 
@@ -425,7 +445,7 @@ update msg model =
                                                     , data = xs |> List.map S.toString |> Array.fromList
                                                     , typ =
                                                         case t of
-                                                            "number" ->
+                                                            "numbers" ->
                                                                 Numbers
 
                                                             "text" ->
@@ -433,6 +453,9 @@ update msg model =
 
                                                             "checkbox" ->
                                                                 Checkboxes
+
+                                                            "sliders" ->
+                                                                Sliders
 
                                                             _ ->
                                                                 -- TODO: Bad!
@@ -532,6 +555,9 @@ update msg model =
                                                                 "sheet/col/checkbox" ->
                                                                     Checkboxes
 
+                                                                "sheet/col/sliders" ->
+                                                                    Sliders
+
                                                                 _ ->
                                                                     -- TODO: Bad!
                                                                     Strings
@@ -616,7 +642,7 @@ update msg model =
                 env_ =
                     Dict.empty
                         |> Dict.union (model.sheets |> Dict.keys |> List.map (String.fromInt >> (++) "s") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
-                        |> Dict.union ([ "numbers", "text", "checkbox" ] |> List.map (\x -> ( "sheet/col/" ++ x, func "k" (func "col" (func "sheet" (Variant "col" (pair (Var "sheet") (pair (Var "k") (Variant x (Var "col"))))))) )) |> Dict.fromList)
+                        |> Dict.union ([ "numbers", "text", "checkbox", "sliders" ] |> List.map (\x -> ( "sheet/col/" ++ x, func "k" (func "col" (func "sheet" (Variant "col" (pair (Var "sheet") (pair (Var "k") (Variant x (Var "col"))))))) )) |> Dict.fromList)
                         |> Dict.insert "self" (Var "self")
                         |> Dict.insert "true" (Variant "true" Hole)
                         |> Dict.insert "false" (Variant "false" Hole)
@@ -718,6 +744,9 @@ viewSheet id sheet =
                                                                 ( Checkboxes, x ) ->
                                                                     H.input [ A.type_ "checkbox", A.checked (x == "#true"), A.onCheck (\c -> DataEditing id ( j, i ) (iif c "#true" "#false")) ] []
 
+                                                                ( Sliders, x ) ->
+                                                                    H.input [ A.type_ "range", A.value x, A.onInput (DataEditing id ( j, i )) ] []
+
                                                                 ( Booleans, "#true" ) ->
                                                                     text "✓"
 
@@ -748,7 +777,7 @@ view model =
         , H.node "style" [] [ text "main > div:first-child > :nth-child(odd) > :nth-child(even) { background: #ddd; }" ]
         , H.node "style" [] [ text "main > div:first-child > :nth-child(odd) > :nth-child(odd) { background: #fff; }" ]
         , H.node "style" [] [ text "main > div:first-child > div > div { border: 0; }" ]
-        , H.node "style" [] [ text "textarea { background: #fff; border: 1px solid #ccc; box-shadow: inset 0px 4px 5px rgba(0, 0, 0, 0.1); }" ]
+        , H.node "style" [] [ text "textarea { background: #fff; border: 1px solid #ccc; box-shadow: inset 0px 5px 5px rgba(0, 0, 0, 0.1); height: 100%; }" ]
         , H.node "style" [] [ text "table { border-collapse: collapse; }" ]
         , H.node "style" [] [ text "td, th { text-align: center; border: 1px solid #ccc; height: 1rem; }" ]
         , H.main_ []
