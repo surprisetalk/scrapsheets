@@ -233,7 +233,7 @@ init _ url _ =
             -- monte carlo
             , """
               sheet/union
-                (sheet/every 5 
+                (sheet/every 2 
                  (sheet/http "https://taylor.town/random")) 
                 self 
                 |> sheet/limit 10
@@ -246,7 +246,7 @@ init _ url _ =
             , """
               self
               |> (game-of-life 30)
-              |> sheet/every 1
+              |> sheet/every (10/10)
               """
 
             -- , """
@@ -337,7 +337,7 @@ update msg model =
                     model.sheets |> Dict.keys |> List.maximum |> Maybe.withDefault 0 |> (+) 1
             in
             ( { model
-                | shelf = Array.push (Array.fromList [ sheetId ]) model.shelf
+                | shelf = Array.append (Array.fromList [ Array.fromList [ sheetId ] ]) model.shelf
                 , sheets =
                     model.sheets
                         |> Dict.insert sheetId
