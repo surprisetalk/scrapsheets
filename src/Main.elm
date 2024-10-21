@@ -248,6 +248,9 @@ init _ url _ =
               |> (game-of-life 30)
               |> sheet/every (10/10)
               """
+            , """
+              s9 |> sheet/reduce [ #count, #count, #count, #count, #count, #count, #count, #count, #count, #count, #count, #count, #count, #count, #count ]
+              """
 
             -- , """
             --   "[ todo ]"
@@ -283,8 +286,9 @@ init _ url _ =
                     , [ 2, 3, 5, 4 ]
                     , [ 6, 6, 6 ]
                     , [ 7, 8 ]
-                    , [ 0 ]
-                    , [ 0 ]
+                    , [ 10 ]
+                    , [ 10 ]
+                    , [ 10 ]
                     , [ 9 ]
                     ]
       , dragSheet = Nothing
