@@ -74,7 +74,7 @@ subscriptions model =
         |> Dict.toList
         |> List.filterMap (\( id, s ) -> Result.map (Tuple.pair ( id, s.code )) s.sheet |> Result.toMaybe)
         |> List.filter (\( _, s ) -> s.every > 0)
-        |> List.map (\( ( id, code ), s ) -> Time.every (1000 * toFloat s.every) (\_ -> CodeEditing id code))
+        |> List.map (\( ( id, code ), s ) -> Time.every (1000 * s.every) (\_ -> CodeEditing id code))
         |> Sub.batch
 
 
@@ -120,7 +120,7 @@ type alias Sheet =
     { transpose : Bool
     , rows : Int
     , cols : Array Col
-    , every : Int
+    , every : Float
     }
 
 
@@ -245,7 +245,7 @@ init _ url _ =
             -- game of life
             , """
               self
-              |> (game-of-life 20)
+              |> (game-of-life 30)
               |> sheet/every 1
               """
 
@@ -533,6 +533,9 @@ update msg model =
                             scrapsheet sheet |> Task.map (Tuple.mapSecond (Result.map (\s -> { s | rows = Basics.min n s.rows, cols = s.cols |> Array.map (\col -> { col | data = col.data |> Array.slice 0 n }) })))
 
                         Variant "every" (Record [ ( "l", Int n ), ( "r", sheet ) ]) ->
+                            scrapsheet sheet |> Task.map (Tuple.mapSecond (Result.map (\s -> { s | every = toFloat n })))
+
+                        Variant "every" (Record [ ( "l", Float n ), ( "r", sheet ) ]) ->
                             scrapsheet sheet |> Task.map (Tuple.mapSecond (Result.map (\s -> { s | every = n })))
 
                         Variant "http" (Text x) ->
