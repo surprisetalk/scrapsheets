@@ -43,7 +43,6 @@ import Json.Encode as E
 import Parser as P exposing ((|.), (|=), Parser)
 import Pratt as P
 import Regex exposing (Regex)
-import Rows
 import Set exposing (Set)
 import Task exposing (Task)
 import Time exposing (Month(..))
@@ -71,6 +70,16 @@ iif c t f =
 flip : (a -> b -> c) -> (b -> a -> c)
 flip f a b =
     f b a
+
+
+result : (x -> b) -> (a -> b) -> Result x a -> b
+result fx fa res =
+    case res of
+        Ok a ->
+            fa a
+
+        Err x ->
+            fx x
 
 
 
@@ -109,15 +118,21 @@ type alias Model =
     }
 
 
-type alias Sheet content =
-    { id : String
-    , tags : Set String
-    , created : Time.Posix
-    , updated : Time.Posix
-    , thumb : Url.Url
-    , content : content
-    , view : View
-    }
+type Sheet content
+    = Sheet
+        { id : String
+        , tags : Set String
+        , created : Time.Posix
+        , updated : Time.Posix
+        , columns : List Type
+        , thumb : Svg
+        , content : content
+        }
+
+
+type alias Svg =
+    -- TODO
+    ()
 
 
 type Content
@@ -127,36 +142,20 @@ type Content
     | Fql
     | Scrap
     | Js
-    | Json
-    | Bytes
+    | Json D.Value
+    | Raw
     | File
 
 
 type Api
     = Mailbox
     | Form
-    | Http
+    | Http (Result Http.Error ())
     | Gql
     | Db
-    | Rss
+    | Rss (Result Http.Error ())
     | Cal
     | Hook
-    | Form
-
-
-type View
-    = Raw {}
-    | Rows { columns : List Type }
-    | Shelf {}
-    | Gallery {}
-    | Doc {}
-    | Plot {}
-    | Map {}
-    | Canvas {}
-    | Kv {}
-    | Query {}
-    | Page {}
-    | App {}
 
 
 type Type
@@ -167,7 +166,7 @@ type Type
     | Date
     | Color
     | Image
-    | Sheet
+    | Subsheet
     | Shape2d
     | Shape3d
     | Vector
@@ -175,7 +174,7 @@ type Type
     | Doc
     | Plot
     | Map
-    | Checkbox bool
+    | Checkbox Bool
     | Input {}
     | Slider {}
     | Link {}
@@ -198,7 +197,6 @@ init _ _ _ =
 
 type Msg
     = NoOp
-    | RowsMsg Rows.Msg
     | UrlChanged Url
     | LinkClicked Browser.UrlRequest
 
@@ -242,28 +240,41 @@ view : Model -> Browser.Document Msg
 view model =
     { title = "scrapsheets"
     , body =
+        let
+            (Sheet sheet) =
+                model.open
+        in
         [ H.node "style" [] [ text "body * { box-sizing: border-box; }" ]
         , H.div [ S.displayFlex, S.flexDirectionColumn ] <|
-            let
-                { main_, settings } =
-                    case model.open.view of
-                        Rows rows ->
-                            H.map Rows.Msg (Rows.view rows model.open.content)
-            in
             [ H.aside [ S.displayFlex ] <|
                 List.map (\x -> H.a [ A.href x ] [ text x ])
                     [ "new", "library", "store", "settings", "help" ]
-            , H.main_ [ S.displayFlex ] <|
-                main__
-            , H.aside [ S.displayFlex ] <|
-                List.concatMap
-                    (\( title, section ) ->
-                        H.h2 [] [ text title ]
-                            :: List.concatMap
-                                (\( subtitle, setting ) -> [ H.h3 [] [ text subtitle ], setting ])
-                                section
-                    )
-                    settings
+            , H.main_ [ S.displayFlex ]
+                [ H.lazy2 viewSheet sheet.columns sheet.content
+                ]
+            , H.aside [ S.displayFlex ]
+                -- TODO: Settings/tools.
+                []
             ]
         ]
     }
+
+
+viewSheet : List Type -> Content -> Html Msg
+viewSheet columns content =
+    result (\_ -> text "TODO") (H.table [] << List.map (H.tr [])) <|
+        case content of
+            Json data ->
+                data
+                    |> D.decodeValue
+                        (D.oneOf
+                            [ D.fail "2d array" -- TODO
+                            , D.fail "array of objects" -- TODO
+                            , D.fail "object of arrays" -- TODO
+                            ]
+                        )
+                    |> Result.mapError Debug.toString
+                    |> Result.map (\_ -> [ [ text "TODO" ] ])
+
+            _ ->
+                Err "TODO"
