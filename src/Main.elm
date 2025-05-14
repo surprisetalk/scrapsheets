@@ -248,7 +248,7 @@ view model =
         , H.div [ S.displayFlex, S.flexDirectionColumn ] <|
             [ H.aside [ S.displayFlex ] <|
                 List.map (\x -> H.a [ A.href x ] [ text x ])
-                    [ "new", "library", "store", "settings", "help" ]
+                    [ "new", "books", "shop", "settings", "help" ]
             , H.main_ [ S.displayFlex ]
                 [ H.lazy2 viewSheet sheet.columns sheet.content
                 ]
