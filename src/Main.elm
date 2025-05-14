@@ -142,9 +142,13 @@ type Content
     | Scrap
     | Js
     | Json D.Value
-    | Cells { columns : List ( String, Type ), cells : Dict Int (Dict Int D.Value) }
+    | Cells
+        { columns : List { label : String, i : Int, type_ : Type }
+        , cells : Dict Int (Dict Int D.Value)
+        }
     | Raw
     | File
+    | Sheets
 
 
 type Api
