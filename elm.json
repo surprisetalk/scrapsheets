@@ -1,34 +1,31 @@
 {
-    "type": "application",
-    "source-directories": [
-        "src",
-        "../elm-scrapscript/src"
-    ],
-    "elm-version": "0.19.1",
-    "dependencies": {
-        "direct": {
-            "Orasund/elm-html-style": "1.6.0",
-            "dmy/elm-pratt-parser": "2.0.0",
-            "elm/browser": "1.0.2",
-            "elm/core": "1.0.5",
-            "elm/html": "1.0.0",
-            "elm/http": "2.0.0",
-            "elm/json": "1.1.3",
-            "elm/parser": "1.1.0",
-            "elm/regex": "1.0.0",
-            "elm/time": "1.0.0",
-            "elm/url": "1.0.0",
-            "elm-community/result-extra": "2.4.0",
-            "justinmimbs/date": "4.1.0"
-        },
-        "indirect": {
-            "elm/bytes": "1.0.8",
-            "elm/file": "1.0.5",
-            "elm/virtual-dom": "1.0.3"
-        }
+  "type": "application",
+  "source-directories": ["src"],
+  "elm-version": "0.19.1",
+  "dependencies": {
+    "direct": {
+      "Orasund/elm-html-style": "1.6.0",
+      "dmy/elm-pratt-parser": "2.0.0",
+      "elm/browser": "1.0.2",
+      "elm/core": "1.0.5",
+      "elm/html": "1.0.0",
+      "elm/http": "2.0.0",
+      "elm/json": "1.1.3",
+      "elm/parser": "1.1.0",
+      "elm/regex": "1.0.0",
+      "elm/time": "1.0.0",
+      "elm/url": "1.0.0",
+      "elm-community/result-extra": "2.4.0",
+      "justinmimbs/date": "4.1.0"
     },
-    "test-dependencies": {
-        "direct": {},
-        "indirect": {}
+    "indirect": {
+      "elm/bytes": "1.0.8",
+      "elm/file": "1.0.5",
+      "elm/virtual-dom": "1.0.3"
     }
+  },
+  "test-dependencies": {
+    "direct": {},
+    "indirect": {}
+  }
 }

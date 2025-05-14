@@ -44,7 +44,6 @@ import Parser as P exposing ((|.), (|=), Parser)
 import Pratt as P
 import Regex exposing (Regex)
 import Rows
-import Scrapscript as S exposing (Scrap(..))
 import Set exposing (Set)
 import Task exposing (Task)
 import Time exposing (Month(..))
@@ -104,55 +103,82 @@ subscriptions model =
 
 
 type alias Model =
-    -- { open : sheet content ; content : |#api api |#sql sql |#fql fql |#ss ss |# js js |#json json |#bytes bytes |#file file
-    -- , library : dict id (sheet ()) -- TODO: scrapbooks
-    -- , settings : { scrapbooks : dict text scrapbook }
-    -- }
-    -- ; sheet : content => { id, tags, created, updated, thumb, content, view }
-    -- ; api :
-    --     | #mailbox {}
-    --     | #form {}
-    --     | #http {}
-    --     | #gql {}
-    --     | #db {}
-    --     | #rss {}
-    --     | #cal {}
-    --     | #hook {}
-    --     | #form {}
-    -- ; view :
-    --     | #raw {}
-    --     | #rows { data : list celltype }
-    --     | #shelf {}
-    --     | #gallery {}
-    --     | #doc {}
-    --     | #plot {}
-    --     | #map {}
-    --     | #canvas {}
-    --     | #kv {}
-    --     | #query {}
-    --     | #page {}
-    --     | #app {}
-    -- ; celltype :
-    --     | #text
-    --     | #bytes
-    --     | #tag
-    --     | #list
-    --     | #date
-    --     | #color
-    --     | #image
-    --     | #sheet
-    --     | #shape2d
-    --     | #shape3d
-    --     | #vector
-    --     | #rows (list celltype)
-    --     | #doc
-    --     | #plot
-    --     | #map
-    --     | #checkbox bool
-    --     | #input {}
-    --     | #slider {}
-    --     | #link {}
-    {}
+    { open : Sheet Content
+    , library : Dict String (Sheet ())
+    , settings : { scrapbooks : Dict String () }
+    }
+
+
+type alias Sheet content =
+    { id : String
+    , tags : Set String
+    , created : Time.Posix
+    , updated : Time.Posix
+    , thumb : Url.Url
+    , content : content
+    , view : View
+    }
+
+
+type Content
+    = Api Api
+    | Sql
+    | Prql
+    | Fql
+    | Scrap
+    | Js
+    | Json
+    | Bytes
+    | File
+
+
+type Api
+    = Mailbox
+    | Form
+    | Http
+    | Gql
+    | Db
+    | Rss
+    | Cal
+    | Hook
+    | Form
+
+
+type View
+    = Raw {}
+    | Rows { columns : List Type }
+    | Shelf {}
+    | Gallery {}
+    | Doc {}
+    | Plot {}
+    | Map {}
+    | Canvas {}
+    | Kv {}
+    | Query {}
+    | Page {}
+    | App {}
+
+
+type Type
+    = Text
+    | Bytes
+    | Tag
+    | List
+    | Date
+    | Color
+    | Image
+    | Sheet
+    | Shape2d
+    | Shape3d
+    | Vector
+    | Rows (List Type)
+    | Doc
+    | Plot
+    | Map
+    | Checkbox bool
+    | Input {}
+    | Slider {}
+    | Link {}
 
 
 
