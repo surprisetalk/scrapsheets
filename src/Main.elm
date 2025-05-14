@@ -124,7 +124,6 @@ type Sheet content
         , tags : Set String
         , created : Time.Posix
         , updated : Time.Posix
-        , columns : List Type
         , thumb : Svg
         , content : content
         }
@@ -143,6 +142,7 @@ type Content
     | Scrap
     | Js
     | Json D.Value
+    | Cells { columns : List ( String, Type ), cells : Dict Int (Dict Int D.Value) }
     | Raw
     | File
 
@@ -250,31 +250,39 @@ view model =
                 List.map (\x -> H.a [ A.href x ] [ text x ])
                     [ "new", "books", "shop", "settings", "help" ]
             , H.main_ [ S.displayFlex ]
-                [ H.lazy2 viewSheet sheet.columns sheet.content
+                [ H.lazy viewMain sheet.content
+                , H.input [ A.type_ "search" ] []
                 ]
             , H.aside [ S.displayFlex ]
                 -- TODO: Settings/tools.
-                []
+                [ H.lazy viewSettings sheet.content
+                ]
             ]
         ]
     }
 
 
-viewSheet : List Type -> Content -> Html Msg
-viewSheet columns content =
+viewMain : Content -> Html Msg
+viewMain content =
     result (\_ -> text "TODO") (H.table [] << List.map (H.tr [])) <|
         case content of
             Json data ->
                 data
                     |> D.decodeValue
                         (D.oneOf
-                            [ D.fail "2d array" -- TODO
+                            [ D.list (D.list D.string) -- TODO: rows
+                            , D.list (D.list D.string) -- TODO: columns
                             , D.fail "array of objects" -- TODO
                             , D.fail "object of arrays" -- TODO
                             ]
                         )
                     |> Result.mapError Debug.toString
-                    |> Result.map (\_ -> [ [ text "TODO" ] ])
+                    |> Result.map (List.map (\_ -> [ text "TODO" ]))
 
             _ ->
                 Err "TODO"
+
+
+viewSettings : Content -> Html Msg
+viewSettings content =
+    text "TODO"
