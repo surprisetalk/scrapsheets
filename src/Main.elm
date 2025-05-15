@@ -45,7 +45,7 @@ import Pratt as P
 import Regex exposing (Regex)
 import Set exposing (Set)
 import Task exposing (Task)
-import Time exposing (Month(..))
+import Time exposing (Month(..), millisToPosix)
 import Url exposing (Url)
 
 
@@ -143,7 +143,7 @@ type Content
     | Js
     | Json D.Value
     | Cells
-        { columns : List { label : String, i : Int, type_ : Type }
+        { columns : Dict Int { label : String, type_ : Type }
         , cells : Dict Int (Dict Int D.Value)
         }
     | Raw
@@ -182,6 +182,7 @@ type Type
     | Input {}
     | Slider {}
     | Link {}
+    | Number
 
 
 
@@ -191,7 +192,33 @@ type Type
 init : () -> Url -> Nav.Key -> ( Model, Cmd Msg )
 init _ _ _ =
     Tuple.pair
-        {}
+        { open =
+            Sheet
+                { id = ""
+                , tags = Set.empty
+                , created = Time.millisToPosix 0
+                , updated = Time.millisToPosix 0
+                , thumb = ()
+                , content =
+                    Cells
+                        { columns =
+                            Dict.fromList
+                                [ ( 0, { label = "A", type_ = Text } )
+                                , ( 1, { label = "B", type_ = Number } )
+                                , ( 2, { label = "C", type_ = Checkbox False } )
+                                ]
+                        , cells =
+                            Dict.fromList <|
+                                List.map (Tuple.mapSecond Dict.fromList) <|
+                                    [ ( 0, [ ( 1, E.string "hello" ), ( 2, E.string "world" ), ( 5, E.int 89 ) ] )
+                                    , ( 1, [ ( 0, E.int 48 ), ( 2, E.float 1.23 ), ( 5, E.string "62" ) ] )
+                                    , ( 2, [ ( 0, E.bool True ), ( 3, E.bool False ), ( 4, E.string "true" ) ] )
+                                    ]
+                        }
+                }
+        , library = Dict.empty
+        , settings = { scrapbooks = Dict.empty }
+        }
         Cmd.none
 
 
@@ -268,23 +295,40 @@ view model =
 
 viewMain : Content -> Html Msg
 viewMain content =
-    result (\_ -> text "TODO") (H.table [] << List.map (H.tr [])) <|
+    result (\_ -> text "TODO") (H.table []) <|
         case content of
+            Cells { columns, cells } ->
+                Ok <|
+                    Array.toList <|
+                        Array.initialize (Maybe.withDefault 0 (List.maximum (List.concatMap Dict.keys (Dict.values cells))))
+                            (\y ->
+                                H.tr [] <|
+                                    (Array.toList <|
+                                        Array.initialize (Maybe.withDefault 0 (List.maximum (Dict.keys columns)))
+                                            (\x -> H.td [] <| Maybe.withDefault [] <| Maybe.map (ls << H.td [] << ls) <| Maybe.andThen (viewCell (Maybe.map .type_ <| Dict.get y columns)) <| Maybe.andThen (Dict.get y) <| Dict.get x <| cells)
+                                    )
+                            )
+
             Json data ->
                 data
                     |> D.decodeValue
                         (D.oneOf
-                            [ D.list (D.list D.string) -- TODO: rows
-                            , D.list (D.list D.string) -- TODO: columns
+                            [ D.fail "array of column arrays" -- TODO
+                            , D.fail "array of row arrays" -- TODO
                             , D.fail "array of objects" -- TODO
                             , D.fail "object of arrays" -- TODO
                             ]
                         )
                     |> Result.mapError Debug.toString
-                    |> Result.map (List.map (\_ -> [ text "TODO" ]))
+                    |> Result.map (List.map (\_ -> H.tr [] [ H.td [] [ text "TODO" ] ]))
 
             _ ->
                 Err "TODO"
+
+
+viewCell : Maybe Type -> D.Value -> Maybe (Html Msg)
+viewCell t x =
+    Just (text "TODO")
 
 
 viewSettings : Content -> Html Msg
