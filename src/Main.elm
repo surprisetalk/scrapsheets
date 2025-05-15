@@ -295,7 +295,7 @@ view model =
 
 viewMain : Content -> Html Msg
 viewMain content =
-    result (\_ -> text "TODO") (H.table []) <|
+    result (\_ -> text "TODO") (H.table [] << ls << H.tbody []) <|
         case content of
             Cells { columns, cells } ->
                 Ok <|
