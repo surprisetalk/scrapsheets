@@ -217,7 +217,7 @@ init _ _ _ =
                                 List.map (Tuple.mapSecond Dict.fromList) <|
                                     [ ( 0, [ ( 1, E.string "hello" ), ( 2, E.string "world" ), ( 5, E.int 89 ) ] )
                                     , ( 1, [ ( 0, E.int 48 ), ( 2, E.float 1.23 ), ( 5, E.string "62" ) ] )
-                                    , ( 2, [ ( 0, E.bool True ), ( 3, E.bool False ), ( 4, E.string "true" ) ] )
+                                    , ( 2, [ ( 2, E.bool True ), ( 3, E.bool False ), ( 4, E.string "true" ) ] )
                                     ]
                         }
                 }
@@ -309,7 +309,7 @@ viewMain content =
                         1 + Maybe.withDefault -1 (List.maximum (List.concatMap Dict.keys (Dict.values cells)))
 
                     nrows =
-                        1 + Maybe.withDefault 0 (List.maximum (Dict.keys columns))
+                        1 + Maybe.withDefault -1 (List.maximum (Dict.keys columns))
                 in
                 Ok <|
                     List.concat
@@ -320,7 +320,7 @@ viewMain content =
                                     H.tr [] <|
                                         (Array.toList <|
                                             Array.initialize nrows
-                                                (\x -> Maybe.withDefault (H.td [] []) <| Maybe.map2 viewCell (Maybe.map .type_ <| Dict.get y columns) <| Maybe.andThen (Dict.get y) <| Dict.get x <| cells)
+                                                (\x -> Maybe.withDefault (H.td [] []) <| Maybe.map2 viewCell (Maybe.map .type_ <| Dict.get x columns) <| Maybe.andThen (Dict.get y) <| Dict.get x <| cells)
                                         )
                                 )
                         ]
@@ -344,16 +344,56 @@ viewMain content =
 
 viewCell : Type -> D.Value -> Html Msg
 viewCell t x =
-    H.td [] <|
-        ls <|
-            text <|
-                Result.withDefault "TODO: error" <|
-                    flip D.decodeValue x <|
-                        case t of
-                            Text ->
-                                D.string
+    H.td
+        (case t of
+            Number ->
+                [ S.textAlignRight ]
 
-                            _ ->
+            _ ->
+                []
+        )
+    <|
+        ls <|
+            Result.withDefault (text "TODO: error") <|
+                flip D.decodeValue x <|
+                    case t of
+                        Text ->
+                            D.map text <|
+                                D.oneOf
+                                    [ D.string
+                                    , D.map String.fromInt D.int
+                                    , D.map String.fromFloat D.float
+                                    ]
+
+                        Number ->
+                            D.map text <|
+                                D.oneOf
+                                    [ D.map String.fromInt D.int
+                                    , D.map String.fromFloat D.float
+                                    ]
+
+                        Checkbox defaultChecked ->
+                            D.map (\checked -> H.input [ A.type_ "checkbox", A.checked checked ] []) <|
+                                D.oneOf
+                                    [ D.bool
+                                    , D.string
+                                        |> D.andThen
+                                            (\s ->
+                                                case String.toLower s of
+                                                    "true" ->
+                                                        D.succeed True
+
+                                                    "false" ->
+                                                        D.succeed False
+
+                                                    _ ->
+                                                        D.fail "expected \"true\" or \"false\""
+                                            )
+                                    , D.succeed defaultChecked
+                                    ]
+
+                        _ ->
+                            D.map text <|
                                 D.succeed "TODO: parse type"
 
 
