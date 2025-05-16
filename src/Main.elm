@@ -17,7 +17,7 @@ module Main exposing (main)
 --   - assistant
 --   - view settings
 --   - permissions
---   - history
+--   - history/timetravel
 --   - linting
 --   - backlinks
 --   - help
