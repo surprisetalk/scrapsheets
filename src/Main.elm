@@ -146,7 +146,11 @@ type Content
     | Fql
     | Scrap
     | Js
+    | Python
+    | R
+    | Julia
     | Json D.Value
+    | Canvas
     | Cells
         { columns : Dict Int ( String, Column )
         , cells : Array (Dict Int D.Value)
@@ -154,6 +158,9 @@ type Content
     | Raw
     | File
     | Sheets
+    | J
+    | K
+    | Apl
 
 
 type Api
@@ -303,9 +310,17 @@ view model =
                 List.map (\x -> H.a [ A.href x ] [ text x ])
                     [ "new", "books", "shop", "settings", "help" ]
             , H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%" ]
+                -- TODO: (1) query/schema, (2) filters, (3) preview/data
+                [ case sheet.content of
+                    Cells { columns } ->
+                        H.textarea [ S.maxHeight "80vh", A.disabled True ] [ text (Debug.toString columns) ]
+
+                    _ ->
+                        H.textarea [ S.maxHeight "80vh", A.disabled True ] [ text "TODO: editor" ]
+
                 -- TODO: All current filters should be rendered as text in the searchbar. This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
-                [ H.input [ A.type_ "search", S.width "100%" ] []
-                , H.lazy viewMain sheet.content
+                , H.input [ A.type_ "search", S.width "100%" ] []
+                , H.lazy viewSheet sheet.content
                 ]
             , H.aside [ S.displayFlex ]
                 -- TODO: Settings/tools.
@@ -316,8 +331,8 @@ view model =
     }
 
 
-viewMain : Content -> Html Msg
-viewMain content =
+viewSheet : Content -> Html Msg
+viewSheet content =
     -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
     case content of
         Cells { columns, cells } ->
