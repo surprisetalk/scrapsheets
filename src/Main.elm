@@ -337,6 +337,7 @@ viewMain content =
                             H.input
                                 [ A.disabled True
                                 , A.value <|
+                                    -- TODO: Consider making this a dropdown.
                                     case t of
                                         Text ->
                                             "same"
