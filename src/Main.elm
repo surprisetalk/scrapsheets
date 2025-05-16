@@ -328,6 +328,7 @@ viewMain content =
 
                 viewHeader : Int -> ( String, Column ) -> List (Html Msg)
                 viewHeader i ( label, column ) =
+                    -- TODO: Click on stats to populate the search bar filters.
                     [ H.p [] [ text "TODO: stats" ]
                     , case column of
                         Formula (Exceed formula) ->
@@ -349,9 +350,9 @@ viewMain content =
                     , H.input [ A.value label ] []
                     ]
 
-                viewRow : Dict Int D.Value -> Html Msg
-                viewRow row =
-                    H.tr [] <| List.map (\i -> H.td [] <| maybe [] (ls << viewCell (Dict.get i row) << Tuple.second) <| Dict.get i columns) <| List.range 0 ncols
+                viewRow : Int -> Dict Int D.Value -> Html Msg
+                viewRow n row =
+                    H.tr [] <| (::) (H.th [] [ text (String.fromInt n) ]) <| List.map (\i -> H.td [] <| maybe [] (ls << viewCell (Dict.get i row) << Tuple.second) <| Dict.get i columns) <| List.range 0 ncols
 
                 viewCell : Maybe D.Value -> Column -> Html Msg
                 viewCell x col =
@@ -367,8 +368,8 @@ viewMain content =
                                 |> result (always (text "TODO: parse error")) text
             in
             H.table [ S.borderCollapseCollapse ]
-                [ H.thead [] [ H.tr [] <| List.map (\i -> H.th [ S.textAlignLeft ] <| ls <| H.div [ S.displayFlex, S.flexDirectionColumn ] <| maybe [] (viewHeader i) <| Dict.get i columns) <| List.range 0 ncols ]
-                , H.tbody [] <| Array.toList <| Array.map viewRow cells
+                [ H.thead [] [ H.tr [] <| List.map (\i -> H.th [ S.textAlignLeft ] <| ls <| H.div [ S.displayFlex, S.flexDirectionColumn ] <| maybe [] (viewHeader i) <| Dict.get i columns) <| List.range -1 ncols ]
+                , H.tbody [] <| Array.toList <| Array.indexedMap viewRow cells
                 ]
 
         Json data ->
