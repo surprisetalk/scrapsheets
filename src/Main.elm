@@ -328,16 +328,24 @@ viewMain content =
 
                 viewHeader : Int -> ( String, Column ) -> List (Html Msg)
                 viewHeader i ( label, column ) =
-                    [ H.h3 [] [ text label ]
+                    [ H.p [] [ text "TODO: stats" ]
                     , case column of
                         Formula (Exceed formula) ->
                             H.input [ A.value formula ] []
 
-                        Data Text ->
-                            H.p [] [ text "TODO: stats" ]
+                        Data t ->
+                            H.input
+                                [ A.disabled True
+                                , A.value <|
+                                    case t of
+                                        Text ->
+                                            "same"
 
-                        Data Number ->
-                            H.p [] [ text "TODO: stats" ]
+                                        Number ->
+                                            "text/from-float"
+                                ]
+                                []
+                    , H.input [ A.value label ] []
                     ]
 
                 viewRow : Dict Int D.Value -> Html Msg
@@ -358,7 +366,7 @@ viewMain content =
                                 |> result (always (text "TODO: parse error")) text
             in
             H.table [ S.borderCollapseCollapse ]
-                [ H.thead [] [ H.tr [] <| List.map (\i -> H.th [ S.textAlignLeft ] <| maybe [] (viewHeader i) <| Dict.get i columns) <| List.range 0 ncols ]
+                [ H.thead [] [ H.tr [] <| List.map (\i -> H.th [ S.textAlignLeft ] <| ls <| H.div [ S.displayFlex, S.flexDirectionColumn ] <| maybe [] (viewHeader i) <| Dict.get i columns) <| List.range 0 ncols ]
                 , H.tbody [] <| Array.toList <| Array.map viewRow cells
                 ]
 
