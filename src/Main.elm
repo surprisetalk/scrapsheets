@@ -82,6 +82,11 @@ result fx fa res =
             fx x
 
 
+maybe : x -> (a -> x) -> Maybe a -> x
+maybe x fa =
+    Maybe.map fa >> Maybe.withDefault x
+
+
 
 ---- MAIN ---------------------------------------------------------------------
 
@@ -275,14 +280,15 @@ view model =
             (Sheet sheet) =
                 model.open
         in
-        [ H.node "style" [] [ text "body * { box-sizing: border-box; }" ]
-        , H.div [ S.displayFlex, S.flexDirectionColumn ] <|
-            [ H.aside [ S.displayFlex ] <|
+        [ H.node "style" [] [ text "body * { box-sizing: border-box; gap: 1rem; }" ]
+        , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
+        , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 1 ] <|
+            [ H.aside [ S.displayFlex, S.flexDirectionColumn ] <|
                 List.map (\x -> H.a [ A.href x ] [ text x ])
                     [ "new", "books", "shop", "settings", "help" ]
-            , H.main_ [ S.displayFlex ]
-                [ H.lazy viewMain sheet.content
-                , H.input [ A.type_ "search" ] []
+            , H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%" ]
+                [ H.input [ A.type_ "search", S.width "100%" ] []
+                , H.lazy viewMain sheet.content
                 ]
             , H.aside [ S.displayFlex ]
                 -- TODO: Settings/tools.
@@ -295,19 +301,29 @@ view model =
 
 viewMain : Content -> Html Msg
 viewMain content =
-    result (\_ -> text "TODO") (H.table [] << ls << H.tbody []) <|
+    result text (H.table [ S.borderCollapseCollapse ] << ls << H.tbody []) <|
         case content of
             Cells { columns, cells } ->
+                let
+                    ncols =
+                        1 + Maybe.withDefault -1 (List.maximum (List.concatMap Dict.keys (Dict.values cells)))
+
+                    nrows =
+                        1 + Maybe.withDefault 0 (List.maximum (Dict.keys columns))
+                in
                 Ok <|
-                    Array.toList <|
-                        Array.initialize (Maybe.withDefault 0 (List.maximum (List.concatMap Dict.keys (Dict.values cells))))
-                            (\y ->
-                                H.tr [] <|
-                                    (Array.toList <|
-                                        Array.initialize (Maybe.withDefault 0 (List.maximum (Dict.keys columns)))
-                                            (\x -> H.td [] <| Maybe.withDefault [] <| Maybe.map (ls << H.td [] << ls) <| Maybe.andThen (viewCell (Maybe.map .type_ <| Dict.get y columns)) <| Maybe.andThen (Dict.get y) <| Dict.get x <| cells)
-                                    )
-                            )
+                    List.concat
+                        [ ls <| H.tr [] <| Array.toList <| Array.initialize ncols (\x -> H.th [] [ text <| maybe "" .label <| Dict.get x columns ])
+                        , Array.toList <|
+                            Array.initialize ncols
+                                (\y ->
+                                    H.tr [] <|
+                                        (Array.toList <|
+                                            Array.initialize nrows
+                                                (\x -> Maybe.withDefault (H.td [] []) <| Maybe.map2 viewCell (Maybe.map .type_ <| Dict.get y columns) <| Maybe.andThen (Dict.get y) <| Dict.get x <| cells)
+                                        )
+                                )
+                        ]
 
             Json data ->
                 data
@@ -326,11 +342,21 @@ viewMain content =
                 Err "TODO"
 
 
-viewCell : Maybe Type -> D.Value -> Maybe (Html Msg)
+viewCell : Type -> D.Value -> Html Msg
 viewCell t x =
-    Just (text "TODO")
+    H.td [] <|
+        ls <|
+            text <|
+                Result.withDefault "TODO: error" <|
+                    flip D.decodeValue x <|
+                        case t of
+                            Text ->
+                                D.string
+
+                            _ ->
+                                D.succeed "TODO: parse type"
 
 
 viewSettings : Content -> Html Msg
 viewSettings content =
-    text "TODO"
+    text ""
