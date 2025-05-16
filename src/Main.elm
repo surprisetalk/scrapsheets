@@ -148,8 +148,8 @@ type Content
     | Js
     | Json D.Value
     | Cells
-        { columns : Dict Int { label : String, type_ : Type }
-        , cells : Dict Int (Dict Int D.Value)
+        { columns : Dict Int ( String, Column )
+        , cells : Array (Dict Int D.Value)
         }
     | Raw
     | File
@@ -167,26 +167,38 @@ type Api
     | Hook
 
 
-type Type
+type Column
+    = Formula Formula
+    | Data Type
+
+
+type Formula
+    = Exceed String
+
+
+type
+    Type
+    -- = Text
+    -- | Bytes
+    -- | Tag
+    -- | List
+    -- | Date
+    -- | Color
+    -- | Image
+    -- | Subsheet
+    -- | Shape2d
+    -- | Shape3d
+    -- | Vector
+    -- | Rows (List Type)
+    -- | Doc
+    -- | Plot
+    -- | Map
+    -- | Checkbox Bool
+    -- | Input {}
+    -- | Slider {}
+    -- | Link {}
+    -- | Number
     = Text
-    | Bytes
-    | Tag
-    | List
-    | Date
-    | Color
-    | Image
-    | Subsheet
-    | Shape2d
-    | Shape3d
-    | Vector
-    | Rows (List Type)
-    | Doc
-    | Plot
-    | Map
-    | Checkbox Bool
-    | Input {}
-    | Slider {}
-    | Link {}
     | Number
 
 
@@ -207,17 +219,20 @@ init _ _ _ =
                 , content =
                     Cells
                         { columns =
-                            Dict.fromList
-                                [ ( 0, { label = "A", type_ = Text } )
-                                , ( 1, { label = "B", type_ = Number } )
-                                , ( 2, { label = "C", type_ = Checkbox False } )
-                                ]
-                        , cells =
                             Dict.fromList <|
-                                List.map (Tuple.mapSecond Dict.fromList) <|
-                                    [ ( 0, [ ( 1, E.string "hello" ), ( 2, E.string "world" ), ( 5, E.int 89 ) ] )
-                                    , ( 1, [ ( 0, E.int 48 ), ( 2, E.float 1.23 ), ( 5, E.string "62" ) ] )
-                                    , ( 2, [ ( 2, E.bool True ), ( 3, E.bool False ), ( 4, E.string "true" ) ] )
+                                List.indexedMap Tuple.pair <|
+                                    [ ( "A", Data Text )
+                                    , ( "B", Data Number )
+                                    , ( "C", Formula (Exceed "A++2*B") )
+                                    , ( "D", Formula (Exceed "1.5*B") )
+                                    ]
+                        , cells =
+                            Array.fromList <|
+                                List.map Dict.fromList <|
+                                    [ [ ( 0, E.string "hello" ), ( 1, E.string "world" ), ( 2, E.int 89 ) ]
+                                    , [ ( 0, E.int 48 ), ( 1, E.float 1.23 ), ( 2, E.string "62" ) ]
+                                    , [ ( 0, E.bool True ), ( 1, E.bool False ), ( 2, E.string "true" ) ]
+                                    , [ ( 1, E.string "woof" ) ]
                                     ]
                         }
                 }
@@ -281,6 +296,7 @@ view model =
                 model.open
         in
         [ H.node "style" [] [ text "body * { box-sizing: border-box; gap: 1rem; }" ]
+        , H.node "style" [] [ text "body { font-family: sans-serif; }" ]
         , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
         , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 1 ] <|
             [ H.aside [ S.displayFlex, S.flexDirectionColumn ] <|
@@ -301,100 +317,53 @@ view model =
 
 viewMain : Content -> Html Msg
 viewMain content =
-    result text (H.table [ S.borderCollapseCollapse ] << ls << H.tbody []) <|
-        case content of
-            Cells { columns, cells } ->
-                let
-                    ncols =
-                        1 + Maybe.withDefault -1 (List.maximum (List.concatMap Dict.keys (Dict.values cells)))
+    -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
+    case content of
+        Cells { columns, cells } ->
+            let
+                ncols : Int
+                ncols =
+                    Maybe.withDefault -1 (List.maximum (Dict.keys columns))
 
-                    nrows =
-                        1 + Maybe.withDefault -1 (List.maximum (Dict.keys columns))
-                in
-                Ok <|
-                    List.concat
-                        [ ls <| H.tr [] <| Array.toList <| Array.initialize ncols (\x -> H.th [] [ text <| maybe "" .label <| Dict.get x columns ])
-                        , Array.toList <|
-                            Array.initialize ncols
-                                (\y ->
-                                    H.tr [] <|
-                                        (Array.toList <|
-                                            Array.initialize nrows
-                                                (\x -> Maybe.withDefault (H.td [] []) <| Maybe.map2 viewCell (Maybe.map .type_ <| Dict.get x columns) <| Maybe.andThen (Dict.get y) <| Dict.get x <| cells)
-                                        )
-                                )
+                viewHeader : Html Msg
+                viewHeader =
+                    H.tr [] <| List.map (\i -> H.th [] <| maybe [] (ls << text << Tuple.first) <| Dict.get i columns) <| List.range 0 ncols
+
+                viewRow : Dict Int D.Value -> Html Msg
+                viewRow row =
+                    H.tr [] <| List.map (\i -> H.td [] <| maybe [] (ls << viewCell (Dict.get i row) << Tuple.second) <| Dict.get i columns) <| List.range 0 ncols
+
+                viewCell : Maybe D.Value -> Column -> Html Msg
+                viewCell x col =
+                    case col of
+                        -- TODO: Show an error if there is cell data located at the formula cell.
+                        Formula (Exceed formula) ->
+                            text <| String.join "" [ "TODO: =(", formula, ")" ]
+
+                        Data _ ->
+                            x |> Maybe.withDefault (E.string "") |> D.decodeValue (D.oneOf [ D.string, D.map String.fromInt D.int, D.map String.fromFloat D.float ]) |> result (always (text "TODO: parse error")) text
+            in
+            H.table [ S.borderCollapseCollapse ]
+                [ H.tbody [] <|
+                    viewHeader
+                        :: (Array.toList <| Array.map viewRow cells)
+                ]
+
+        Json data ->
+            data
+                |> D.decodeValue
+                    (D.oneOf
+                        [ D.fail "array of column arrays" -- TODO
+                        , D.fail "array of row arrays" -- TODO
+                        , D.fail "array of objects" -- TODO
+                        , D.fail "object of arrays" -- TODO
                         ]
+                    )
+                |> result (Debug.toString >> text)
+                    (List.map (\_ -> H.tr [] [ H.td [] [ text "TODO: json cell" ] ]) >> H.tbody [] >> ls >> H.table [ S.borderCollapseCollapse ])
 
-            Json data ->
-                data
-                    |> D.decodeValue
-                        (D.oneOf
-                            [ D.fail "array of column arrays" -- TODO
-                            , D.fail "array of row arrays" -- TODO
-                            , D.fail "array of objects" -- TODO
-                            , D.fail "object of arrays" -- TODO
-                            ]
-                        )
-                    |> Result.mapError Debug.toString
-                    |> Result.map (List.map (\_ -> H.tr [] [ H.td [] [ text "TODO" ] ]))
-
-            _ ->
-                Err "TODO"
-
-
-viewCell : Type -> D.Value -> Html Msg
-viewCell t x =
-    H.td
-        (case t of
-            Number ->
-                [ S.textAlignRight ]
-
-            _ ->
-                []
-        )
-    <|
-        ls <|
-            Result.withDefault (text "TODO: error") <|
-                flip D.decodeValue x <|
-                    case t of
-                        Text ->
-                            D.map text <|
-                                D.oneOf
-                                    [ D.string
-                                    , D.map String.fromInt D.int
-                                    , D.map String.fromFloat D.float
-                                    ]
-
-                        Number ->
-                            D.map text <|
-                                D.oneOf
-                                    [ D.map String.fromInt D.int
-                                    , D.map String.fromFloat D.float
-                                    ]
-
-                        Checkbox defaultChecked ->
-                            D.map (\checked -> H.input [ A.type_ "checkbox", A.checked checked ] []) <|
-                                D.oneOf
-                                    [ D.bool
-                                    , D.string
-                                        |> D.andThen
-                                            (\s ->
-                                                case String.toLower s of
-                                                    "true" ->
-                                                        D.succeed True
-
-                                                    "false" ->
-                                                        D.succeed False
-
-                                                    _ ->
-                                                        D.fail "expected \"true\" or \"false\""
-                                            )
-                                    , D.succeed defaultChecked
-                                    ]
-
-                        _ ->
-                            D.map text <|
-                                D.succeed "TODO: parse type"
+        _ ->
+            text "TODO"
 
 
 viewSettings : Content -> Html Msg
