@@ -303,6 +303,7 @@ view model =
                 List.map (\x -> H.a [ A.href x ] [ text x ])
                     [ "new", "books", "shop", "settings", "help" ]
             , H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%" ]
+                -- TODO: All current filters should be rendered as text in the searchbar. This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                 [ H.input [ A.type_ "search", S.width "100%" ] []
                 , H.lazy viewMain sheet.content
                 ]
@@ -325,9 +326,19 @@ viewMain content =
                 ncols =
                     Maybe.withDefault -1 (List.maximum (Dict.keys columns))
 
-                viewHeader : Html Msg
-                viewHeader =
-                    H.tr [] <| List.map (\i -> H.th [] <| maybe [] (ls << text << Tuple.first) <| Dict.get i columns) <| List.range 0 ncols
+                viewHeader : Int -> ( String, Column ) -> List (Html Msg)
+                viewHeader i ( label, column ) =
+                    [ H.h3 [] [ text label ]
+                    , case column of
+                        Formula (Exceed formula) ->
+                            H.input [ A.value formula ] []
+
+                        Data Text ->
+                            H.p [] [ text "TODO: stats" ]
+
+                        Data Number ->
+                            H.p [] [ text "TODO: stats" ]
+                    ]
 
                 viewRow : Dict Int D.Value -> Html Msg
                 viewRow row =
@@ -336,17 +347,19 @@ viewMain content =
                 viewCell : Maybe D.Value -> Column -> Html Msg
                 viewCell x col =
                     case col of
-                        -- TODO: Show an error if there is cell data located at the formula cell.
+                        -- TODO: Show an error if there is cell data overwrites a formula cell.
                         Formula (Exceed formula) ->
                             text <| String.join "" [ "TODO: =(", formula, ")" ]
 
                         Data _ ->
-                            x |> Maybe.withDefault (E.string "") |> D.decodeValue (D.oneOf [ D.string, D.map String.fromInt D.int, D.map String.fromFloat D.float ]) |> result (always (text "TODO: parse error")) text
+                            x
+                                |> Maybe.withDefault (E.string "")
+                                |> D.decodeValue (D.oneOf [ D.string, D.map String.fromInt D.int, D.map String.fromFloat D.float ])
+                                |> result (always (text "TODO: parse error")) text
             in
             H.table [ S.borderCollapseCollapse ]
-                [ H.tbody [] <|
-                    viewHeader
-                        :: (Array.toList <| Array.map viewRow cells)
+                [ H.thead [] [ H.tr [] <| List.map (\i -> H.th [ S.textAlignLeft ] <| maybe [] (viewHeader i) <| Dict.get i columns) <| List.range 0 ncols ]
+                , H.tbody [] <| Array.toList <| Array.map viewRow cells
                 ]
 
         Json data ->
