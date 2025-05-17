@@ -285,29 +285,28 @@ view model =
         , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2 ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%" ]
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween ]
-                    -- TODO: - blank sheet
-                    -- TODO: - my sheets (as scrapsheet): tags (cloud, local, org, friend)
-                    -- TODO: - scrap store (as scrapsheet) for templates and formulas and starterkits and popular sheets
-                    -- TODO: - settings (as scrapsheet)
-                    -- TODO: - notifs (as scrapsheet)
-                    -- TODO: - help
                     [ H.div [ S.displayFlex, S.flexDirectionRow ]
-                        [ H.a [ A.href "/" ] [ text "scrapsheets" ]
+                        -- Badges indicate scrapscript news, book notifs, etc.
+                        [ H.a [ A.href "/" ] [ text "scrapsheets (2)" ]
                         , text "/"
-                        , H.a [ A.href "/account" ] [ text "taylor" ]
+                        , H.a [ A.href "/taylor" ] [ text "taylor (12)" ]
                         , text "/"
-                        , H.a [ A.href "/books/taylor" ] [ text "personal" ]
+                        , H.a [ A.href "/taylor/personal" ] [ text "personal (7)" ]
                         , text "/"
-                        , H.input [ A.value "my-sheet" ] []
-                        , H.a [ A.href "TODO" ] [ text "share" ]
-                        , H.div [ S.displayFlex, S.flexDirectionRow ]
-                            [ H.a [ A.href "TODO" ] [ text "taylor" ]
-                            , H.a [ A.href "TODO" ] [ text "sarah" ]
+                        , H.input [ A.value "my-sheet", A.onInput (always NoOp) ] []
+                        , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ]
+                            [ H.button [ A.onClick NoOp ] [ text "#" ]
+                            , H.a [ A.href "/taylor/personal?tag=my-tag" ] [ text "#my-tag-1" ]
                             ]
                         ]
-                    , H.div [ S.displayFlex, S.flexDirectionRow ]
-                        [ H.a [ A.href "/history" ] [ text "history" ]
-                        , H.a [ A.href "/notifs" ] [ text "notifs" ]
+                    , H.div [ S.displayFlex, S.flexDirectionRowReverse ]
+                        [ H.a [ A.href "#notifs" ] [ text "notifs (1)" ]
+                        , H.a [ A.href "#history" ] [ text "history" ]
+                        , H.a [ A.href "#share" ] [ text "share" ]
+                        , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ]
+                            [ H.a [ A.href "?following=" ] [ text "taylor" ]
+                            , H.a [ A.href "?following=sarah" ] [ text "sarah" ]
+                            ]
                         ]
                     ]
 
