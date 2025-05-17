@@ -282,31 +282,50 @@ view model =
         [ H.node "style" [] [ text "body * { box-sizing: border-box; gap: 1rem; }" ]
         , H.node "style" [] [ text "body { font-family: sans-serif; }" ]
         , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
-        , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2 ] <|
-            [ H.aside [ S.displayFlex, S.flexDirectionColumn, S.textAlignRight ] <|
-                -- TODO: - blank sheet
-                -- TODO: - my sheets (as scrapsheet): tags (cloud, local, org, friend)
-                -- TODO: - scrap store (as scrapsheet) for templates and formulas and starterkits and popular sheets
-                -- TODO: - settings (as scrapsheet)
-                -- TODO: - help
-                List.map (\x -> H.a [ A.href x ] [ text x ])
-                    [ "new", "books", "shop", "settings", "help" ]
-            , H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%" ]
-                -- TODO: (1) query/schema, (2) filters, (3) preview/data
-                [ case sheet.content of
-                    Cells { columns } ->
-                        H.textarea [ S.maxHeight "80vh", A.disabled True ] [ text (Debug.toString columns) ]
-
-                    _ ->
-                        H.textarea [ S.maxHeight "80vh", A.disabled True ] [ text "TODO: editor" ]
+        , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2 ]
+            [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%" ]
+                [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween ]
+                    -- TODO: - blank sheet
+                    -- TODO: - my sheets (as scrapsheet): tags (cloud, local, org, friend)
+                    -- TODO: - scrap store (as scrapsheet) for templates and formulas and starterkits and popular sheets
+                    -- TODO: - settings (as scrapsheet)
+                    -- TODO: - notifs (as scrapsheet)
+                    -- TODO: - help
+                    [ H.div [ S.displayFlex, S.flexDirectionRow ]
+                        [ H.a [ A.href "/" ] [ text "scrapsheets" ]
+                        , text "/"
+                        , H.a [ A.href "/account" ] [ text "taylor" ]
+                        , text "/"
+                        , H.a [ A.href "/books/taylor" ] [ text "personal" ]
+                        , text "/"
+                        , H.input [ A.value "my-sheet" ] []
+                        , H.a [ A.href "TODO" ] [ text "share" ]
+                        , H.div [ S.displayFlex, S.flexDirectionRow ]
+                            [ H.a [ A.href "TODO" ] [ text "taylor" ]
+                            , H.a [ A.href "TODO" ] [ text "sarah" ]
+                            ]
+                        ]
+                    , H.div [ S.displayFlex, S.flexDirectionRow ]
+                        [ H.a [ A.href "/history" ] [ text "history" ]
+                        , H.a [ A.href "/notifs" ] [ text "notifs" ]
+                        ]
+                    ]
 
                 -- TODO: All current filters should be rendered as text in the searchbar. This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                 , H.input [ A.type_ "search", S.width "100%" ] []
                 , H.lazy viewSheet sheet.content
                 ]
-            , H.aside [ S.displayFlex, S.flexDirectionColumn ] <|
-                List.map (\x -> H.a [ A.href x ] [ text x ])
-                    [ "assistant", "sharing", "history", "linting", "related", "help" ]
+            , H.aside [ S.displayFlex, S.flexDirectionColumn ]
+                -- TODO: This section automatically populates based on context. It's like an inspector that's shows you details on what you're currently doing.
+                -- TODO: [ "definition", "scrappy", "share", "history", "spunks", "related", "help" ]
+                [ H.span [] [ text "definition" ]
+                , case sheet.content of
+                    Cells { columns } ->
+                        H.textarea [ A.disabled True ] [ text (Debug.toString columns) ]
+
+                    _ ->
+                        H.textarea [ A.disabled True ] [ text "TODO: editor" ]
+                ]
             ]
         ]
     }
@@ -325,7 +344,8 @@ viewSheet content =
                 viewHeader : Int -> ( String, Column ) -> List (Html Msg)
                 viewHeader i ( label, column ) =
                     -- TODO: Click on stats to populate the search bar filters.
-                    [ H.p [] [ text "TODO: stats" ]
+                    [ H.span [] [ text "TODO: stats" ]
+                    , H.input [ A.value label ] []
                     , case column of
                         Formula (Exceed formula) ->
                             H.input [ A.value formula ] []
@@ -343,7 +363,6 @@ viewSheet content =
                                             "text/from-float"
                                 ]
                                 []
-                    , H.input [ A.value label ] []
                     ]
 
                 viewRow : Int -> Dict Int D.Value -> Html Msg
