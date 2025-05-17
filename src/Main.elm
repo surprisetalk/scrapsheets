@@ -304,10 +304,17 @@ view model =
                 , H.input [ A.type_ "search", S.width "100%" ] []
                 , H.lazy viewSheet sheet.content
                 ]
-            , H.aside [ S.displayFlex ]
-                -- TODO: Settings/tools.
-                [ H.lazy viewSettings sheet.content
-                ]
+            , H.aside [ S.displayFlex, S.flexDirectionColumn ] <|
+                List.concatMap (\( title, body ) -> H.h1 [] [ text title ] :: body) <|
+                    List.filter ((/=) 0 << List.length << Tuple.second)
+                        [ ( "Assistant", [ text "TODO: assistant " ] )
+                        , ( "View", [] )
+                        , ( "Permissions", [] )
+                        , ( "History", [] )
+                        , ( "Linting", [] )
+                        , ( "Backlinks", [] )
+                        , ( "Help", [] )
+                        ]
             ]
         ]
     }
@@ -384,15 +391,3 @@ viewSheet content =
 
         _ ->
             text "TODO"
-
-
-viewSettings : Content -> Html Msg
-viewSettings content =
-    -- TODO: - assistant
-    -- TODO: - view settings
-    -- TODO: - permissions
-    -- TODO: - history/timetravel
-    -- TODO: - linting
-    -- TODO: - backlinks
-    -- TODO: - help
-    text ""
