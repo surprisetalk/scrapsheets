@@ -311,7 +311,7 @@ view model =
                     ]
 
                 -- TODO: All current filters should be rendered as text in the searchbar. This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
-                , H.input [ A.type_ "search", S.width "100%" ] []
+                , H.input [ A.onInput (always NoOp), S.width "100%" ] []
                 , H.lazy viewSheet sheet.content
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn ]
