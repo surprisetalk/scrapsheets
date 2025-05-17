@@ -11,7 +11,7 @@ import Html as H exposing (Html, code, text)
 import Html.Attributes as A exposing (..)
 import Html.Events as A exposing (..)
 import Html.Lazy as H
-import Html.Style as S
+import Html.Style as S exposing (textAlignLeft)
 import Http exposing (stringResolver)
 import Json.Decode as D
 import Json.Encode as E
@@ -282,8 +282,8 @@ view model =
         [ H.node "style" [] [ text "body * { box-sizing: border-box; gap: 1rem; }" ]
         , H.node "style" [] [ text "body { font-family: sans-serif; }" ]
         , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
-        , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 1 ] <|
-            [ H.aside [ S.displayFlex, S.flexDirectionColumn ] <|
+        , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2 ] <|
+            [ H.aside [ S.displayFlex, S.flexDirectionColumn, S.textAlignRight ] <|
                 -- TODO: - blank sheet
                 -- TODO: - my sheets (as scrapsheet): tags (cloud, local, org, friend)
                 -- TODO: - scrap store (as scrapsheet) for templates and formulas and starterkits and popular sheets
@@ -305,16 +305,8 @@ view model =
                 , H.lazy viewSheet sheet.content
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn ] <|
-                List.concatMap (\( title, body ) -> H.h1 [] [ text title ] :: body) <|
-                    List.filter ((/=) 0 << List.length << Tuple.second)
-                        [ ( "Assistant", [ text "TODO: assistant " ] )
-                        , ( "View", [] )
-                        , ( "Permissions", [] )
-                        , ( "History", [] )
-                        , ( "Linting", [] )
-                        , ( "Backlinks", [] )
-                        , ( "Help", [] )
-                        ]
+                List.map (\x -> H.a [ A.href x ] [ text x ])
+                    [ "assistant", "sharing", "history", "linting", "related", "help" ]
             ]
         ]
     }
