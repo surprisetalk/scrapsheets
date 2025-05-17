@@ -1,30 +1,5 @@
 module Main exposing (main)
 
----- NOTES --------------------------------------------------------------------
---
--- - local first
--- - deno/hono/pg for syncing and "magic" ingestion link
--- - elm
--- - elm nativescript for native
---
--- - nav
---   - blank sheet
---   - my sheets (as scrapsheet): tags (cloud, local, org, friend)
---   - scrap store (as scrapsheet) for templates and formulas and starterkits and popular sheets
---   - settings (as scrapsheet)
---   - help
--- - sheet tools
---   - assistant
---   - view settings
---   - permissions
---   - history/timetravel
---   - linting
---   - backlinks
---   - help
---
--- email, settings, databases, git, github, stripe, logs, sheets, tests, code stats, social media keywords
---
---
 ---- IMPORTS ------------------------------------------------------------------
 
 import Array exposing (Array)
@@ -139,11 +114,14 @@ type alias Svg =
     ()
 
 
-type Content
-    = Api Api
-    | Sql
+type
+    Content
+    -- TODO: Move some of these to the shop as free templates.
+    -- TODO: email, settings, databases, git, github, stripe, logs, sheets, tests, code stats, social media keywords
+    = Sql
     | Prql
     | Fql
+    | Gql
     | Scrap
     | Js
     | Python
@@ -161,20 +139,19 @@ type Content
     | J
     | K
     | Apl
-
-
-type Api
-    = Mailbox
+    | Chart
+    | Mailbox
     | Form
     | Http (Result Http.Error ())
-    | Gql
     | Db
     | Rss (Result Http.Error ())
     | Cal
     | Hook
 
 
-type Column
+type
+    Column
+    -- TODO: Virtual vs. Concrete?
     = Formula Formula
     | Data Type
 
@@ -307,6 +284,11 @@ view model =
         , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
         , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 1 ] <|
             [ H.aside [ S.displayFlex, S.flexDirectionColumn ] <|
+                -- TODO: - blank sheet
+                -- TODO: - my sheets (as scrapsheet): tags (cloud, local, org, friend)
+                -- TODO: - scrap store (as scrapsheet) for templates and formulas and starterkits and popular sheets
+                -- TODO: - settings (as scrapsheet)
+                -- TODO: - help
                 List.map (\x -> H.a [ A.href x ] [ text x ])
                     [ "new", "books", "shop", "settings", "help" ]
             , H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%" ]
@@ -406,4 +388,11 @@ viewSheet content =
 
 viewSettings : Content -> Html Msg
 viewSettings content =
+    -- TODO: - assistant
+    -- TODO: - view settings
+    -- TODO: - permissions
+    -- TODO: - history/timetravel
+    -- TODO: - linting
+    -- TODO: - backlinks
+    -- TODO: - help
     text ""
