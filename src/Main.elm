@@ -412,15 +412,17 @@ view model =
 
                                     Just value ->
                                         [ H.input [ A.value value, A.onInput (TagEditing << Just) ] [] ]
-                                , List.map (\tag -> H.a [ A.href "?tag=TODO" ] [ text ("#" ++ tag) ]) <| Set.toList sheet.tags
+
+                                -- TODO: ?q=+any ?q=-any ?q==any
+                                , List.map (\tag -> H.a [ A.href "?q=+TODO" ] [ text ("#" ++ tag) ]) <| Set.toList sheet.tags
                                 ]
                         ]
                     , H.div [ S.displayFlex, S.flexDirectionRowReverse ]
                         [ H.a [ A.href "#history" ] [ text "history (1)" ]
                         , H.a [ A.href "#share" ] [ text "share" ]
                         , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ]
-                            [ H.a [ A.href "?following=" ] [ text "taylor" ]
-                            , H.a [ A.href "?following=sarah" ] [ text "sarah" ]
+                            [ H.a [ A.href "?following=+" ] [ text "taylor" ]
+                            , H.a [ A.href "?following=+sarah" ] [ text "sarah" ]
                             ]
                         ]
                     ]
