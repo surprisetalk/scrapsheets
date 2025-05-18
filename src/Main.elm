@@ -511,6 +511,7 @@ viewSheet focus content =
                         <|
                             List.map
                                 (\i ->
+                                    -- TODO: Don't allow editing if Formula column.
                                     H.td
                                         [ A.onClick (FocusEditing { index = ( i, n ), value = "" })
                                         , A.onMouseDown (RegionStarting ( i, n ))
