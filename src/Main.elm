@@ -416,10 +416,7 @@ view model =
                                 ]
                         ]
                     , H.div [ S.displayFlex, S.flexDirectionRowReverse ]
-                        [ H.a [ A.href "#notifs" ] [ text "notifs (1)" ]
-
-                        -- TODO: Conflicts too.
-                        , H.a [ A.href "#history" ] [ text "history (1)" ]
+                        [ H.a [ A.href "#history" ] [ text "history (1)" ]
                         , H.a [ A.href "#share" ] [ text "share" ]
                         , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ]
                             [ H.a [ A.href "?following=" ] [ text "taylor" ]
