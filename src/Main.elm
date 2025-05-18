@@ -4,6 +4,7 @@ module Main exposing (main)
 
 import Array exposing (Array)
 import Browser
+import Browser.Dom as Dom
 import Browser.Navigation as Nav
 import Date exposing (Date)
 import Dict exposing (Dict)
@@ -95,6 +96,8 @@ type alias Model =
     , library : Dict String (Sheet ())
     , settings : { scrapbooks : Dict String () }
     , focus : Focus
+    , newTag : Maybe String
+    , filter : String
     }
 
 
@@ -111,6 +114,7 @@ type alias Focus =
 type Sheet content
     = Sheet
         { id : String
+        , name : String
         , tags : Set String
         , created : Time.Posix
         , updated : Time.Posix
@@ -217,7 +221,8 @@ init _ _ _ =
         { open =
             Sheet
                 { id = ""
-                , tags = Set.empty
+                , tags = Set.empty |> Set.insert "my-tag-2"
+                , name = "my-sheet"
                 , created = Time.millisToPosix 0
                 , updated = Time.millisToPosix 0
                 , thumb = ()
@@ -244,6 +249,8 @@ init _ _ _ =
         , library = Dict.empty
         , settings = { scrapbooks = Dict.empty }
         , focus = { index = ( 2, 3 ), value = "goo" }
+        , newTag = Nothing
+        , filter = ""
         }
         Cmd.none
 
@@ -255,16 +262,15 @@ init _ _ _ =
 type Msg
     = NoOp
     | SheetNameEditing String
-    | TagCreating
+    | TagEditing (Maybe String)
     | FilterEditing String
     | ColumnLabelEditing Int String
     | ColumnEditing Int Column
     | DefinitionEditing String
     | CellHovering Index
-    | CellFocusing Index
     | RegionStarting Index
     | RegionEnding Index
-    | FocusEditing String
+    | FocusEditing Focus
     | UrlChanged Url
     | LinkClicked Browser.UrlRequest
 
@@ -292,14 +298,18 @@ update msg model =
         NoOp ->
             ( model, Cmd.none )
 
-        SheetNameEditing _ ->
-            ( model, Cmd.none )
+        SheetNameEditing name ->
+            let
+                (Sheet sheet) =
+                    model.open
+            in
+            ( { model | open = Sheet { sheet | name = name } }, Cmd.none )
 
-        TagCreating ->
-            ( model, Cmd.none )
+        TagEditing newTag ->
+            ( { model | newTag = newTag }, Cmd.none )
 
-        FilterEditing _ ->
-            ( model, Cmd.none )
+        FilterEditing filter ->
+            ( { model | filter = filter }, Cmd.none )
 
         DefinitionEditing _ ->
             ( model, Cmd.none )
@@ -313,16 +323,13 @@ update msg model =
         CellHovering _ ->
             ( model, Cmd.none )
 
-        CellFocusing _ ->
-            ( model, Cmd.none )
+        FocusEditing focus ->
+            ( { model | focus = focus }, Task.attempt (always NoOp) (Dom.focus "focus") )
 
         RegionStarting _ ->
             ( model, Cmd.none )
 
         RegionEnding _ ->
-            ( model, Cmd.none )
-
-        FocusEditing _ ->
             ( model, Cmd.none )
 
         UrlChanged url ->
@@ -364,11 +371,17 @@ view model =
                         , text "/"
                         , H.a [ A.href "/taylor/personal" ] [ text "personal (7)" ]
                         , text "/"
-                        , H.input [ A.value "my-sheet", A.onInput SheetNameEditing ] []
-                        , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ]
-                            [ H.button [ A.onClick TagCreating ] [ text "#" ]
-                            , H.a [ A.href "/taylor/personal?tag=my-tag" ] [ text "#my-tag-1" ]
-                            ]
+                        , H.input [ A.value sheet.name, A.onInput SheetNameEditing ] []
+                        , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <|
+                            List.concat
+                                [ case model.newTag of
+                                    Nothing ->
+                                        [ H.button [ A.onClick (TagEditing (Just "")) ] [ text "#" ] ]
+
+                                    Just value ->
+                                        [ H.input [ A.value value, A.onInput (TagEditing << Just) ] [] ]
+                                , List.map (\tag -> H.a [ A.href "?tag=TODO" ] [ text ("#" ++ tag) ]) <| Set.toList sheet.tags
+                                ]
                         ]
                     , H.div [ S.displayFlex, S.flexDirectionRowReverse ]
                         [ H.a [ A.href "#notifs" ] [ text "notifs (1)" ]
@@ -384,7 +397,7 @@ view model =
                     ]
 
                 -- TODO: All current filters should be rendered as text in the searchbar. This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
-                , H.input [ A.onInput FilterEditing, S.width "100%" ] []
+                , H.input [ A.value model.filter, A.onInput FilterEditing, S.width "100%" ] []
                 , H.lazy2 viewSheet model.focus sheet.content
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ]
@@ -488,7 +501,7 @@ viewSheet focus content =
                     H.tr [] <|
                         (::)
                             (H.th
-                                [ A.onClick (CellFocusing ( -1, n ))
+                                [ A.onClick (FocusEditing { index = ( -1, n ), value = "" })
                                 , A.onMouseDown (RegionStarting ( -1, n ))
                                 , A.onMouseUp (RegionEnding ( -1, n ))
                                 , A.onMouseEnter (CellHovering ( -1, n ))
@@ -499,14 +512,14 @@ viewSheet focus content =
                             List.map
                                 (\i ->
                                     H.td
-                                        [ A.onClick (CellFocusing ( i, n ))
+                                        [ A.onClick (FocusEditing { index = ( i, n ), value = "" })
                                         , A.onMouseDown (RegionStarting ( i, n ))
                                         , A.onMouseUp (RegionEnding ( i, n ))
                                         , A.onMouseEnter (CellHovering ( i, n ))
                                         ]
                                     <|
                                         if focus.index == ( i, n ) then
-                                            [ H.input [ A.value focus.value, A.onInput FocusEditing, S.width "100%" ] []
+                                            [ H.input [ A.id "focus", A.value focus.value, A.onInput (\value -> FocusEditing { index = ( i, n ), value = value }), S.width "100%" ] []
                                             ]
 
                                         else
