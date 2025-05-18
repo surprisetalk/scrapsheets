@@ -228,7 +228,7 @@ init _ _ _ =
                                     [ [ ( 0, E.string "hello" ), ( 1, E.string "world" ), ( 2, E.int 89 ) ]
                                     , [ ( 0, E.int 48 ), ( 1, E.float 1.23 ), ( 3, E.string "62" ) ]
                                     , [ ( 0, E.bool True ), ( 1, E.bool False ), ( 2, E.string "true" ) ]
-                                    , [ ( 1, E.string "woof" ), ( 3, E.string "boo" ) ]
+                                    , [ ( 1, E.string "4.56" ), ( 3, E.string "boo" ) ]
                                     ]
                         }
                 }
@@ -404,17 +404,18 @@ viewSheet content =
                                 let
                                     vals : Array (Maybe Float)
                                     vals =
-                                        cells |> Array.map (Dict.get i >> Maybe.andThen (D.decodeValue (D.oneOf [ D.float, D.map toFloat D.int ]) >> Result.toMaybe))
+                                        cells |> Array.map (Dict.get i >> Maybe.andThen (D.decodeValue (D.oneOf [ D.float, D.map toFloat D.int, D.andThen (String.toFloat >> maybe (D.fail "") D.succeed) D.string ]) >> Result.toMaybe))
 
                                     nums : List Float
                                     nums =
                                         vals |> Array.toList |> List.filterMap identity
                                 in
-                                List.map (\( k, v ) -> H.span [] [ text (k ++ ": " ++ (Maybe.withDefault "_" <| Maybe.map String.fromFloat v)) ]) <|
-                                    [ ( "min", List.minimum nums )
+                                -- TODO: String.left is a bad hack! figure out how to do better rounding.
+                                List.map (\( k, v ) -> H.span [] [ text (k ++ ": " ++ (String.left 5 <| Maybe.withDefault "_" <| Maybe.map String.fromFloat v)) ]) <|
+                                    [ ( "many", vals |> Array.filter ((/=) Nothing) |> Array.length |> toFloat |> Just )
+                                    , ( "min", List.minimum nums )
                                     , ( "mean", iif (List.length nums > 0) (Just (List.sum nums / toFloat (List.length nums))) Nothing )
                                     , ( "max", List.maximum nums )
-                                    , ( "null", vals |> Array.filter ((==) Nothing) |> Array.length |> toFloat |> Just )
                                     ]
                     , H.input [ A.value label, A.onInput (always NoOp) ] []
                     , case column of
@@ -441,7 +442,8 @@ viewSheet content =
                     H.tr [] <|
                         (::)
                             (H.th
-                                [ A.onMouseDown NoOp
+                                [ A.onClick NoOp
+                                , A.onMouseDown NoOp
                                 , A.onMouseUp NoOp
                                 , A.onMouseEnter NoOp
                                 ]
@@ -451,7 +453,8 @@ viewSheet content =
                             List.map
                                 (\i ->
                                     H.td
-                                        [ A.onMouseDown NoOp
+                                        [ A.onClick NoOp
+                                        , A.onMouseDown NoOp
                                         , A.onMouseUp NoOp
                                         , A.onMouseEnter NoOp
                                         ]
