@@ -211,6 +211,7 @@ init _ _ _ =
                                     , ( "D", Formula (Exceed "1.5*B") )
                                     ]
                         , cells =
+                            -- flip Array.append (Array.repeat 20 Dict.empty) <|
                             Array.fromList <|
                                 List.map Dict.fromList <|
                                     [ [ ( 0, E.string "hello" ), ( 1, E.string "world" ), ( 2, E.int 89 ) ]
@@ -242,6 +243,15 @@ type Msg
 
 decoder =
     "TODO"
+
+
+string : D.Decoder String
+string =
+    D.oneOf
+        [ D.string
+        , D.map String.fromInt D.int
+        , D.map String.fromFloat D.float
+        ]
 
 
 
@@ -301,7 +311,9 @@ view model =
                         ]
                     , H.div [ S.displayFlex, S.flexDirectionRowReverse ]
                         [ H.a [ A.href "#notifs" ] [ text "notifs (1)" ]
-                        , H.a [ A.href "#history" ] [ text "history" ]
+
+                        -- TODO: Conflicts too.
+                        , H.a [ A.href "#history" ] [ text "history (1)" ]
                         , H.a [ A.href "#share" ] [ text "share" ]
                         , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ]
                             [ H.a [ A.href "?following=" ] [ text "taylor" ]
@@ -314,16 +326,16 @@ view model =
                 , H.input [ A.onInput (always NoOp), S.width "100%" ] []
                 , H.lazy viewSheet sheet.content
                 ]
-            , H.aside [ S.displayFlex, S.flexDirectionColumn ]
+            , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ]
                 -- TODO: This section automatically populates based on context. It's like an inspector that's shows you details on what you're currently doing.
                 -- TODO: [ "definition", "scrappy", "share", "history", "spunks", "related", "help" ]
                 [ H.span [] [ text "definition" ]
                 , case sheet.content of
                     Cells { columns } ->
-                        H.textarea [ A.disabled True ] [ text (Debug.toString columns) ]
+                        H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ] [ text (Debug.toString columns) ]
 
                     _ ->
-                        H.textarea [ A.disabled True ] [ text "TODO: editor" ]
+                        H.span [] [ text "TODO: definition" ]
                 ]
             ]
         ]
@@ -343,7 +355,25 @@ viewSheet content =
                 viewHeader : Int -> ( String, Column ) -> List (Html Msg)
                 viewHeader i ( label, column ) =
                     -- TODO: Click on stats to populate the search bar filters.
-                    [ H.span [] [ text "TODO: stats" ]
+                    [ H.div [ S.displayFlex, S.flexWrapWrap, S.gapRem 0.5 ] <|
+                        case column of
+                            Formula _ ->
+                                [ text "TODO: distribution"
+                                ]
+
+                            Data Text ->
+                                cells
+                                    |> Array.foldl
+                                        (\a -> Dict.update (Dict.get i a |> Maybe.withDefault (E.string "") |> D.decodeValue string |> Result.withDefault "") (Maybe.withDefault 0 >> (+) 1 >> Just))
+                                        Dict.empty
+                                    |> Dict.toList
+                                    |> List.sortBy (Tuple.second >> negate)
+                                    |> List.map (\( k, v ) -> H.a [ A.href "?TODO" ] [ text (String.concat [ "\"", k, "\" (", String.fromInt v, ")" ]) ])
+                                    |> List.take 10
+
+                            Data Number ->
+                                [ text "TODO: distribution"
+                                ]
                     , H.input [ A.value label ] []
                     , case column of
                         Formula (Exceed formula) ->
@@ -396,7 +426,7 @@ viewSheet content =
                         , D.fail "object of arrays" -- TODO
                         ]
                     )
-                |> result (Debug.toString >> text)
+                |> result (D.errorToString >> text)
                     (List.map (\_ -> H.tr [] [ H.td [] [ text "TODO: json cell" ] ]) >> H.tbody [] >> ls >> H.table [ S.borderCollapseCollapse ])
 
         _ ->
