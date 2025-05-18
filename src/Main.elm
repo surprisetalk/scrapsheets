@@ -92,23 +92,18 @@ subscriptions model =
 
 
 type alias Model =
-    { open : Sheet Content
+    { nav : Nav.Key
+    , open : Sheet Content
     , library : Dict String (Sheet ())
     , settings : { scrapbooks : Dict String () }
-    , focus : Focus
     , newTag : Maybe String
+    , newCell : Maybe String
     , filter : String
     }
 
 
 type alias Index =
     ( Int, Int )
-
-
-type alias Focus =
-    { index : Index
-    , value : String
-    }
 
 
 type Sheet content
@@ -216,9 +211,10 @@ toType column =
 
 
 init : () -> Url -> Nav.Key -> ( Model, Cmd Msg )
-init _ _ _ =
+init _ _ nav =
     Tuple.pair
-        { open =
+        { nav = nav
+        , open =
             Sheet
                 { id = ""
                 , tags = Set.empty |> Set.insert "my-tag-2"
@@ -248,8 +244,8 @@ init _ _ _ =
                 }
         , library = Dict.empty
         , settings = { scrapbooks = Dict.empty }
-        , focus = { index = ( 2, 3 ), value = "goo" }
         , newTag = Nothing
+        , newCell = Just "hello"
         , filter = ""
         }
         Cmd.none
@@ -267,10 +263,9 @@ type Msg
     | ColumnLabelEditing Int String
     | ColumnEditing Int Column
     | DefinitionEditing String
+    | CellEditing (Maybe String)
     | CellHovering Index
-    | RegionStarting Index
-    | RegionEnding Index
-    | FocusEditing Focus
+    | ReplaceUrl String
     | UrlChanged Url
     | LinkClicked Browser.UrlRequest
 
@@ -320,17 +315,14 @@ update msg model =
         ColumnEditing _ _ ->
             ( model, Cmd.none )
 
+        CellEditing _ ->
+            ( model, Task.attempt (always NoOp) (Dom.focus "new-cell") )
+
         CellHovering _ ->
             ( model, Cmd.none )
 
-        FocusEditing focus ->
-            ( { model | focus = focus }, Task.attempt (always NoOp) (Dom.focus "focus") )
-
-        RegionStarting _ ->
-            ( model, Cmd.none )
-
-        RegionEnding _ ->
-            ( model, Cmd.none )
+        ReplaceUrl url ->
+            ( model, Nav.replaceUrl model.nav url )
 
         UrlChanged url ->
             -- TODO
@@ -398,7 +390,7 @@ view model =
 
                 -- TODO: All current filters should be rendered as text in the searchbar. This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                 , H.input [ A.value model.filter, A.onInput FilterEditing, S.width "100%" ] []
-                , H.lazy2 viewSheet model.focus sheet.content
+                , H.lazy2 viewSheet model.newCell sheet.content
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ]
                 -- TODO: This section automatically populates based on context. It's like an inspector that's shows you details on what you're currently doing.
@@ -416,8 +408,8 @@ view model =
     }
 
 
-viewSheet : Focus -> Content -> Html Msg
-viewSheet focus content =
+viewSheet : Maybe String -> Content -> Html Msg
+viewSheet newCell content =
     -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
     case content of
         Cells { columns, cells } ->
@@ -425,6 +417,11 @@ viewSheet focus content =
                 ncols : Int
                 ncols =
                     Maybe.withDefault -1 (List.maximum (Dict.keys columns))
+
+                region : { a : Index, b : Index }
+                region =
+                    -- TODO: Grab from url fragment.
+                    { a = ( -1, -1 ), b = ( -1, -1 ) }
 
                 viewHeader : Int -> ( String, Column ) -> List (Html Msg)
                 viewHeader i ( label, column ) =
@@ -501,9 +498,9 @@ viewSheet focus content =
                     H.tr [] <|
                         (::)
                             (H.th
-                                [ A.onClick (FocusEditing { index = ( -1, n ), value = "" })
-                                , A.onMouseDown (RegionStarting ( -1, n ))
-                                , A.onMouseUp (RegionEnding ( -1, n ))
+                                [ A.onClick (ReplaceUrl ("#" ++ String.fromInt n))
+                                , A.onMouseDown (ReplaceUrl ("#" ++ String.fromInt n))
+                                , A.onMouseUp (ReplaceUrl ("#-" ++ String.fromInt n))
                                 , A.onMouseEnter (CellHovering ( -1, n ))
                                 ]
                                 [ text (String.fromInt n) ]
@@ -513,14 +510,15 @@ viewSheet focus content =
                                 (\i ->
                                     -- TODO: Don't allow editing if Formula column.
                                     H.td
-                                        [ A.onClick (FocusEditing { index = ( i, n ), value = "" })
-                                        , A.onMouseDown (RegionStarting ( i, n ))
-                                        , A.onMouseUp (RegionEnding ( i, n ))
+                                        [ A.onClick (ReplaceUrl ("#" ++ String.fromInt i ++ "," ++ String.fromInt n))
+                                        , A.onMouseDown (ReplaceUrl ("#" ++ String.fromInt i ++ "," ++ String.fromInt n))
+                                        , A.onMouseUp (ReplaceUrl ("#-" ++ String.fromInt i ++ "," ++ String.fromInt n))
                                         , A.onMouseEnter (CellHovering ( i, n ))
                                         ]
                                     <|
-                                        if focus.index == ( i, n ) then
-                                            [ H.input [ A.id "focus", A.value focus.value, A.onInput (\value -> FocusEditing { index = ( i, n ), value = value }), S.width "100%" ] []
+                                        -- TODO: Needs to match selected region.
+                                        if False && newCell /= Nothing then
+                                            [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" newCell), A.onInput (CellEditing << Just), S.width "100%" ] []
                                             ]
 
                                         else
