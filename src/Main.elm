@@ -98,8 +98,13 @@ type alias Model =
     , settings : { scrapbooks : Dict String () }
     , newTag : Maybe String
     , newCell : Maybe String
+    , region : Region
     , filter : String
     }
+
+
+type alias Region =
+    { a : Index, b : Index }
 
 
 type alias Index =
@@ -246,6 +251,7 @@ init _ _ nav =
         , settings = { scrapbooks = Dict.empty }
         , newTag = Nothing
         , newCell = Just "hello"
+        , region = { a = ( -1, -1 ), b = ( -1, -1 ) }
         , filter = ""
         }
         Cmd.none
@@ -263,9 +269,9 @@ type Msg
     | ColumnLabelEditing Int String
     | ColumnEditing Int Column
     | DefinitionEditing String
+    | RegionSelecting (Maybe String) Region
     | CellEditing (Maybe String)
     | CellHovering Index
-    | ReplaceUrl String
     | UrlChanged Url
     | LinkClicked Browser.UrlRequest
 
@@ -315,14 +321,14 @@ update msg model =
         ColumnEditing _ _ ->
             ( model, Cmd.none )
 
-        CellEditing _ ->
-            ( model, Task.attempt (always NoOp) (Dom.focus "new-cell") )
+        RegionSelecting newCell region ->
+            ( { model | newCell = newCell, region = region }, Task.attempt (always NoOp) (Dom.focus "new-cell") )
+
+        CellEditing newCell ->
+            ( { model | newCell = newCell }, Cmd.none )
 
         CellHovering _ ->
             ( model, Cmd.none )
-
-        ReplaceUrl url ->
-            ( model, Nav.replaceUrl model.nav url )
 
         UrlChanged url ->
             -- TODO
@@ -390,7 +396,7 @@ view model =
 
                 -- TODO: All current filters should be rendered as text in the searchbar. This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                 , H.input [ A.value model.filter, A.onInput FilterEditing, S.width "100%" ] []
-                , H.lazy2 viewSheet model.newCell sheet.content
+                , H.lazy3 viewSheet model.region model.newCell sheet.content
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ]
                 -- TODO: This section automatically populates based on context. It's like an inspector that's shows you details on what you're currently doing.
@@ -408,8 +414,8 @@ view model =
     }
 
 
-viewSheet : Maybe String -> Content -> Html Msg
-viewSheet newCell content =
+viewSheet : Region -> Maybe String -> Content -> Html Msg
+viewSheet region newCell content =
     -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
     case content of
         Cells { columns, cells } ->
@@ -417,11 +423,6 @@ viewSheet newCell content =
                 ncols : Int
                 ncols =
                     Maybe.withDefault -1 (List.maximum (Dict.keys columns))
-
-                region : { a : Index, b : Index }
-                region =
-                    -- TODO: Grab from url fragment.
-                    { a = ( -1, -1 ), b = ( -1, -1 ) }
 
                 viewHeader : Int -> ( String, Column ) -> List (Html Msg)
                 viewHeader i ( label, column ) =
@@ -498,9 +499,9 @@ viewSheet newCell content =
                     H.tr [] <|
                         (::)
                             (H.th
-                                [ A.onClick (ReplaceUrl ("#" ++ String.fromInt n))
-                                , A.onMouseDown (ReplaceUrl ("#" ++ String.fromInt n))
-                                , A.onMouseUp (ReplaceUrl ("#-" ++ String.fromInt n))
+                                [ A.onClick (RegionSelecting Nothing { a = ( -1, n ), b = ( -1, n ) })
+                                , A.onMouseDown (RegionSelecting Nothing { a = ( -1, n ), b = ( -1, n ) })
+                                , A.onMouseUp (RegionSelecting Nothing { region | b = ( -1, n ) })
                                 , A.onMouseEnter (CellHovering ( -1, n ))
                                 ]
                                 [ text (String.fromInt n) ]
@@ -510,15 +511,15 @@ viewSheet newCell content =
                                 (\i ->
                                     -- TODO: Don't allow editing if Formula column.
                                     H.td
-                                        [ A.onClick (ReplaceUrl ("#" ++ String.fromInt i ++ "," ++ String.fromInt n))
-                                        , A.onMouseDown (ReplaceUrl ("#" ++ String.fromInt i ++ "," ++ String.fromInt n))
-                                        , A.onMouseUp (ReplaceUrl ("#-" ++ String.fromInt i ++ "," ++ String.fromInt n))
+                                        [ A.onClick (RegionSelecting (row |> Dict.get i |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault "" |> Just) { a = ( i, n ), b = ( i, n ) })
+                                        , A.onMouseDown (RegionSelecting Nothing { a = ( i, n ), b = ( i, n ) })
+                                        , A.onMouseUp (RegionSelecting Nothing { region | b = ( i, n ) })
                                         , A.onMouseEnter (CellHovering ( i, n ))
                                         ]
                                     <|
                                         -- TODO: Needs to match selected region.
-                                        if False && newCell /= Nothing then
-                                            [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" newCell), A.onInput (CellEditing << Just), S.width "100%" ] []
+                                        if newCell /= Nothing && ( i, n ) == region.a && ( i, n ) == region.b then
+                                            [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" newCell), A.onInput (CellEditing << Just), A.onBlur (CellEditing Nothing), S.width "100%" ] []
                                             ]
 
                                         else
