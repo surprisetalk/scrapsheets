@@ -339,7 +339,7 @@ view model =
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ]
                 -- TODO: This section automatically populates based on context. It's like an inspector that's shows you details on what you're currently doing.
-                -- TODO: [ "definition", "scrappy", "share", "history", "spunks", "related", "help" ]
+                -- TODO: [ "definition", "scrappy", "share", "history", "problems", "related", "help" ]
                 [ H.span [] [ text "definition" ]
                 , case sheet.content of
                     Cells { columns } ->
