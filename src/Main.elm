@@ -16,7 +16,6 @@ import Http exposing (stringResolver)
 import Json.Decode as D
 import Json.Encode as E
 import Parser as P exposing ((|.), (|=), Parser)
-import Pratt as P
 import Regex exposing (Regex)
 import Set exposing (Set)
 import Task exposing (Task)
@@ -233,7 +232,6 @@ init _ _ _ =
                                     , ( "D", Formula (Exceed "1.5*B") )
                                     ]
                         , cells =
-                            -- flip Array.append (Array.repeat 20 Dict.empty) <|
                             Array.fromList <|
                                 List.map Dict.fromList <|
                                     [ [ ( 0, E.string "hello" ), ( 1, E.string "world" ), ( 2, E.int 89 ) ]
@@ -256,16 +254,23 @@ init _ _ _ =
 
 type Msg
     = NoOp
+    | SheetNameEditing String
+    | TagCreating
+    | FilterEditing String
+    | ColumnLabelEditing Int String
+    | ColumnEditing Int Column
+    | DefinitionEditing String
+    | CellHovering Index
+    | CellFocusing Index
+    | RegionStarting Index
+    | RegionEnding Index
+    | FocusEditing String
     | UrlChanged Url
     | LinkClicked Browser.UrlRequest
 
 
 
 ---- PARSER -------------------------------------------------------------------
-
-
-decoder =
-    "TODO"
 
 
 string : D.Decoder String
@@ -285,6 +290,39 @@ update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
         NoOp ->
+            ( model, Cmd.none )
+
+        SheetNameEditing _ ->
+            ( model, Cmd.none )
+
+        TagCreating ->
+            ( model, Cmd.none )
+
+        FilterEditing _ ->
+            ( model, Cmd.none )
+
+        DefinitionEditing _ ->
+            ( model, Cmd.none )
+
+        ColumnLabelEditing _ _ ->
+            ( model, Cmd.none )
+
+        ColumnEditing _ _ ->
+            ( model, Cmd.none )
+
+        CellHovering _ ->
+            ( model, Cmd.none )
+
+        CellFocusing _ ->
+            ( model, Cmd.none )
+
+        RegionStarting _ ->
+            ( model, Cmd.none )
+
+        RegionEnding _ ->
+            ( model, Cmd.none )
+
+        FocusEditing _ ->
             ( model, Cmd.none )
 
         UrlChanged url ->
@@ -326,9 +364,9 @@ view model =
                         , text "/"
                         , H.a [ A.href "/taylor/personal" ] [ text "personal (7)" ]
                         , text "/"
-                        , H.input [ A.value "my-sheet", A.onInput (always NoOp) ] []
+                        , H.input [ A.value "my-sheet", A.onInput SheetNameEditing ] []
                         , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ]
-                            [ H.button [ A.onClick NoOp ] [ text "#" ]
+                            [ H.button [ A.onClick TagCreating ] [ text "#" ]
                             , H.a [ A.href "/taylor/personal?tag=my-tag" ] [ text "#my-tag-1" ]
                             ]
                         ]
@@ -346,7 +384,7 @@ view model =
                     ]
 
                 -- TODO: All current filters should be rendered as text in the searchbar. This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
-                , H.input [ A.onInput (always NoOp), S.width "100%" ] []
+                , H.input [ A.onInput FilterEditing, S.width "100%" ] []
                 , H.lazy2 viewSheet model.focus sheet.content
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ]
@@ -355,7 +393,7 @@ view model =
                 [ H.span [] [ text "definition" ]
                 , case sheet.content of
                     Cells { columns } ->
-                        H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ] [ text (Debug.toString columns) ]
+                        H.textarea [ A.onInput DefinitionEditing, S.minHeightRem 10 ] [ text (Debug.toString columns) ]
 
                     _ ->
                         H.span [] [ text "TODO: definition" ]
@@ -429,24 +467,20 @@ viewSheet focus content =
                                     , ( "mean", iif (List.length nums > 0) (Just (List.sum nums / toFloat (List.length nums))) Nothing )
                                     , ( "max", List.maximum nums )
                                     ]
-                    , H.input [ A.value label, A.onInput (always NoOp) ] []
+                    , H.input [ A.value label, A.onInput (ColumnLabelEditing i) ] []
                     , case column of
                         Formula (Exceed formula) ->
-                            H.input [ A.value formula, A.onInput (always NoOp) ] []
+                            H.input [ A.value formula, A.onInput (ColumnEditing i << Formula << Exceed) ] []
 
                         Data t ->
-                            H.input
-                                [ A.value <|
-                                    -- TODO: Consider making this a dropdown.
-                                    case t of
-                                        Text ->
-                                            "same"
-
-                                        Number ->
-                                            "text/from-float"
-                                , A.onInput (always NoOp)
-                                ]
-                                []
+                            let
+                                types : List ( String, Type )
+                                types =
+                                    [ ( "same", Text ), ( "text/from-float", Number ) ]
+                            in
+                            H.select [ A.onInput (ColumnEditing i << Data << Maybe.withDefault Text << flip Dict.get (Dict.fromList types)) ] <|
+                                List.map (\( k, v ) -> H.option [ A.value k, A.selected (v == t) ] [ text k ]) <|
+                                    types
                     ]
 
                 viewRow : Int -> Dict Int D.Value -> Html Msg
@@ -454,10 +488,10 @@ viewSheet focus content =
                     H.tr [] <|
                         (::)
                             (H.th
-                                [ A.onClick NoOp
-                                , A.onMouseDown NoOp
-                                , A.onMouseUp NoOp
-                                , A.onMouseEnter NoOp
+                                [ A.onClick (CellFocusing ( -1, n ))
+                                , A.onMouseDown (RegionStarting ( -1, n ))
+                                , A.onMouseUp (RegionEnding ( -1, n ))
+                                , A.onMouseEnter (CellHovering ( -1, n ))
                                 ]
                                 [ text (String.fromInt n) ]
                             )
@@ -465,14 +499,14 @@ viewSheet focus content =
                             List.map
                                 (\i ->
                                     H.td
-                                        [ A.onClick NoOp
-                                        , A.onMouseDown NoOp
-                                        , A.onMouseUp NoOp
-                                        , A.onMouseEnter NoOp
+                                        [ A.onClick (CellFocusing ( i, n ))
+                                        , A.onMouseDown (RegionStarting ( i, n ))
+                                        , A.onMouseUp (RegionEnding ( i, n ))
+                                        , A.onMouseEnter (CellHovering ( i, n ))
                                         ]
                                     <|
                                         if focus.index == ( i, n ) then
-                                            [ H.input [ A.value focus.value, A.onInput (always NoOp), S.width "100%" ] []
+                                            [ H.input [ A.value focus.value, A.onInput FocusEditing, S.width "100%" ] []
                                             ]
 
                                         else
@@ -489,7 +523,7 @@ viewSheet focus content =
                         |> D.decodeValue (D.oneOf [ D.string, D.map String.fromInt D.int, D.map String.fromFloat D.float ])
                         |> result (always (text "TODO: parse error")) text
             in
-            H.table [ S.borderCollapseCollapse, A.onMouseLeave NoOp ]
+            H.table [ S.borderCollapseCollapse, A.onMouseLeave (CellHovering ( -1, -1 )) ]
                 [ H.thead [] [ H.tr [] <| List.map (\i -> H.th [ S.textAlignLeft ] <| ls <| H.div [ S.displayFlex, S.flexDirectionColumn ] <| maybe [] (viewHeader i) <| Dict.get i columns) <| List.range -1 ncols ]
                 , H.tbody [] <| Array.toList <| Array.indexedMap viewRow cells
                 ]
