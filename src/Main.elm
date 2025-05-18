@@ -449,6 +449,7 @@ view model =
 viewSheet : Region -> Maybe String -> Content -> Html Msg
 viewSheet region newCell content =
     -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
+    -- TODO: For new rows and columns, always leave blank row/column at end.
     case content of
         Cells { columns, cells } ->
             let
