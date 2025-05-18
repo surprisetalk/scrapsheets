@@ -98,7 +98,8 @@ type alias Model =
     , settings : { scrapbooks : Dict String () }
     , newTag : Maybe String
     , newCell : Maybe String
-    , region : Region
+    , selected : Region
+    , hover : Index
     , filter : String
     }
 
@@ -251,7 +252,8 @@ init _ _ nav =
         , settings = { scrapbooks = Dict.empty }
         , newTag = Nothing
         , newCell = Just "hello"
-        , region = { a = ( -1, -1 ), b = ( -1, -1 ) }
+        , selected = { a = ( -1, -1 ), b = ( -1, -1 ) }
+        , hover = ( -1, -1 )
         , filter = ""
         }
         Cmd.none
@@ -271,6 +273,7 @@ type Msg
     | DefinitionEditing String
     | RegionSelecting (Maybe String) Region
     | CellEditing (Maybe String)
+    | CellSaving
     | CellHovering Index
     | UrlChanged Url
     | LinkClicked Browser.UrlRequest
@@ -313,22 +316,52 @@ update msg model =
             ( { model | filter = filter }, Cmd.none )
 
         DefinitionEditing _ ->
+            -- TODO: Update the columns.
             ( model, Cmd.none )
 
         ColumnLabelEditing _ _ ->
+            -- TODO: Update column labels.
             ( model, Cmd.none )
 
         ColumnEditing _ _ ->
+            -- TODO: Update column definition.
             ( model, Cmd.none )
 
         RegionSelecting newCell region ->
-            ( { model | newCell = newCell, region = region }, Task.attempt (always NoOp) (Dom.focus "new-cell") )
+            -- TODO: Always set .a to min() and .b to max() so that comparison is easy.
+            ( { model | newCell = newCell, selected = region }, Task.attempt (always NoOp) (Dom.focus "new-cell") )
+
+        CellSaving ->
+            let
+                (Sheet open) =
+                    model.open
+
+                ( x, y ) =
+                    model.selected.a
+            in
+            ( { model
+                | newCell = Nothing
+                , open =
+                    Sheet
+                        { open
+                            | content =
+                                case open.content of
+                                    Cells cells ->
+                                        Cells { cells | cells = cells.cells |> Array.set y (cells.cells |> Array.get y |> Maybe.map (Dict.update x (always (Maybe.map E.string model.newCell))) |> Maybe.withDefault Dict.empty) }
+
+                                    _ ->
+                                        -- TODO: More options.
+                                        open.content
+                        }
+              }
+            , Cmd.none
+            )
 
         CellEditing newCell ->
             ( { model | newCell = newCell }, Cmd.none )
 
-        CellHovering _ ->
-            ( model, Cmd.none )
+        CellHovering index ->
+            ( { model | hover = index }, Cmd.none )
 
         UrlChanged url ->
             -- TODO
@@ -358,6 +391,7 @@ view model =
         [ H.node "style" [] [ text "body * { box-sizing: border-box; gap: 1rem; }" ]
         , H.node "style" [] [ text "body { font-family: sans-serif; }" ]
         , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
+        , H.node "style" [] [ text "td:hover { background: #fafafa; }" ]
         , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%" ]
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween ]
@@ -396,10 +430,11 @@ view model =
 
                 -- TODO: All current filters should be rendered as text in the searchbar. This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                 , H.input [ A.value model.filter, A.onInput FilterEditing, S.width "100%" ] []
-                , H.lazy3 viewSheet model.region model.newCell sheet.content
+                , H.lazy3 viewSheet model.selected model.newCell sheet.content
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ]
                 -- TODO: This section automatically populates based on context. It's like an inspector that's shows you details on what you're currently doing.
+                -- TODO: Prefer .selected and fallback to .hover.
                 -- TODO: [ "definition", "scrappy", "share", "history", "problems", "related", "help" ]
                 [ H.span [] [ text "definition" ]
                 , case sheet.content of
@@ -515,11 +550,17 @@ viewSheet region newCell content =
                                         , A.onMouseDown (RegionSelecting Nothing { a = ( i, n ), b = ( i, n ) })
                                         , A.onMouseUp (RegionSelecting Nothing { region | b = ( i, n ) })
                                         , A.onMouseEnter (CellHovering ( i, n ))
+                                        , S.backgroundColor <|
+                                            if (region /= { a = ( -1, -1 ), b = ( -1, -1 ) }) && ((Tuple.first region.a <= i && i <= Tuple.first region.b) || (Tuple.first region.a == -1 && -1 == Tuple.first region.b)) && ((Tuple.second region.a <= n && n <= Tuple.second region.b) || (Tuple.second region.a == -1 && -1 == Tuple.second region.b)) then
+                                                "#eee"
+
+                                            else
+                                                ""
                                         ]
                                     <|
                                         -- TODO: Needs to match selected region.
                                         if newCell /= Nothing && ( i, n ) == region.a && ( i, n ) == region.b then
-                                            [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" newCell), A.onInput (CellEditing << Just), A.onBlur (CellEditing Nothing), S.width "100%" ] []
+                                            [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" newCell), A.onInput (CellEditing << Just), A.onBlur CellSaving, S.width "100%" ] []
                                             ]
 
                                         else
@@ -537,7 +578,26 @@ viewSheet region newCell content =
                         |> result (always (text "TODO: parse error")) text
             in
             H.table [ S.borderCollapseCollapse, A.onMouseLeave (CellHovering ( -1, -1 )) ]
-                [ H.thead [] [ H.tr [] <| List.map (\i -> H.th [ S.textAlignLeft ] <| ls <| H.div [ S.displayFlex, S.flexDirectionColumn ] <| maybe [] (viewHeader i) <| Dict.get i columns) <| List.range -1 ncols ]
+                [ H.thead []
+                    [ H.tr [] <|
+                        List.map
+                            (\i ->
+                                H.th
+                                    [ A.onClick (RegionSelecting Nothing { a = ( i, -1 ), b = ( i, -1 ) })
+                                    , A.onMouseDown (RegionSelecting Nothing { a = ( i, -1 ), b = ( i, -1 ) })
+                                    , A.onMouseUp (RegionSelecting Nothing { region | b = ( i, -1 ) })
+                                    , A.onMouseEnter (CellHovering ( i, -1 ))
+                                    , S.textAlignLeft
+                                    ]
+                                <|
+                                    ls <|
+                                        H.div [ S.displayFlex, S.flexDirectionColumn ] <|
+                                            maybe [] (viewHeader i) <|
+                                                Dict.get i columns
+                            )
+                        <|
+                            List.range -1 ncols
+                    ]
                 , H.tbody [] <| Array.toList <| Array.indexedMap viewRow cells
                 ]
 
