@@ -186,6 +186,17 @@ type
     | Number
 
 
+toType : Column -> Type
+toType column =
+    case column of
+        Formula (Exceed _) ->
+            -- TODO: Infer this.
+            Text
+
+        Data t ->
+            t
+
+
 
 ---- INIT ---------------------------------------------------------------------
 
@@ -215,9 +226,9 @@ init _ _ _ =
                             Array.fromList <|
                                 List.map Dict.fromList <|
                                     [ [ ( 0, E.string "hello" ), ( 1, E.string "world" ), ( 2, E.int 89 ) ]
-                                    , [ ( 0, E.int 48 ), ( 1, E.float 1.23 ), ( 2, E.string "62" ) ]
+                                    , [ ( 0, E.int 48 ), ( 1, E.float 1.23 ), ( 3, E.string "62" ) ]
                                     , [ ( 0, E.bool True ), ( 1, E.bool False ), ( 2, E.string "true" ) ]
-                                    , [ ( 1, E.string "woof" ) ]
+                                    , [ ( 1, E.string "woof" ), ( 3, E.string "boo" ) ]
                                     ]
                         }
                 }
@@ -354,35 +365,65 @@ viewSheet content =
 
                 viewHeader : Int -> ( String, Column ) -> List (Html Msg)
                 viewHeader i ( label, column ) =
-                    -- TODO: Click on stats to populate the search bar filters.
                     [ H.div [ S.displayFlex, S.flexWrapWrap, S.gapRem 0.5 ] <|
-                        case column of
-                            Formula _ ->
-                                [ text "TODO: distribution"
-                                ]
+                        case toType column of
+                            Text ->
+                                let
+                                    stats : Dict String Int
+                                    stats =
+                                        cells
+                                            |> Array.foldl
+                                                (\a -> Dict.update (Dict.get i a |> Maybe.withDefault (E.string "") |> D.decodeValue string |> Result.withDefault "") (Maybe.withDefault 0 >> (+) 1 >> Just))
+                                                Dict.empty
 
-                            Data Text ->
-                                cells
-                                    |> Array.foldl
-                                        (\a -> Dict.update (Dict.get i a |> Maybe.withDefault (E.string "") |> D.decodeValue string |> Result.withDefault "") (Maybe.withDefault 0 >> (+) 1 >> Just))
-                                        Dict.empty
-                                    |> Dict.toList
-                                    |> List.sortBy (Tuple.second >> negate)
-                                    |> List.map (\( k, v ) -> H.a [ A.href "?TODO" ] [ text (String.concat [ "\"", k, "\" (", String.fromInt v, ")" ]) ])
-                                    |> List.take 10
+                                    blanks : Int
+                                    blanks =
+                                        stats |> Dict.get "" |> Maybe.withDefault 0
 
-                            Data Number ->
-                                [ text "TODO: distribution"
-                                ]
-                    , H.input [ A.value label ] []
+                                    total : Int
+                                    total =
+                                        stats |> Dict.values |> List.sum
+                                in
+                                List.concat
+                                    [ [ H.a [ A.href "?TODO" ] [ text (String.concat [ "all (", String.fromInt total, ")" ]) ]
+                                      ]
+                                    , if Dict.size stats > 10 then
+                                        [ H.a [ A.href "?TODO" ] [ text (String.concat [ "\"\" (", String.fromInt blanks, ")" ]) ]
+                                        , H.a [ A.href "?TODO" ] [ text (String.concat [ "... (", String.fromInt (total - blanks), ")" ]) ]
+                                        ]
+
+                                      else
+                                        stats
+                                            |> Dict.toList
+                                            |> List.sortBy (Tuple.second >> negate)
+                                            |> List.map (\( k, v ) -> H.a [ A.href "?TODO" ] [ text (String.concat [ "\"", k, "\" (", String.fromInt v, ")" ]) ])
+                                    ]
+
+                            Number ->
+                                -- TODO: Histogram curve with filter sliders.
+                                let
+                                    vals : Array (Maybe Float)
+                                    vals =
+                                        cells |> Array.map (Dict.get i >> Maybe.andThen (D.decodeValue (D.oneOf [ D.float, D.map toFloat D.int ]) >> Result.toMaybe))
+
+                                    nums : List Float
+                                    nums =
+                                        vals |> Array.toList |> List.filterMap identity
+                                in
+                                List.map (\( k, v ) -> H.span [] [ text (k ++ ": " ++ (Maybe.withDefault "_" <| Maybe.map String.fromFloat v)) ]) <|
+                                    [ ( "min", List.minimum nums )
+                                    , ( "mean", iif (List.length nums > 0) (Just (List.sum nums / toFloat (List.length nums))) Nothing )
+                                    , ( "max", List.maximum nums )
+                                    , ( "null", vals |> Array.filter ((==) Nothing) |> Array.length |> toFloat |> Just )
+                                    ]
+                    , H.input [ A.value label, A.onInput (always NoOp) ] []
                     , case column of
                         Formula (Exceed formula) ->
-                            H.input [ A.value formula ] []
+                            H.input [ A.value formula, A.onInput (always NoOp) ] []
 
                         Data t ->
                             H.input
-                                [ A.disabled True
-                                , A.value <|
+                                [ A.value <|
                                     -- TODO: Consider making this a dropdown.
                                     case t of
                                         Text ->
@@ -390,28 +431,45 @@ viewSheet content =
 
                                         Number ->
                                             "text/from-float"
+                                , A.onInput (always NoOp)
                                 ]
                                 []
                     ]
 
                 viewRow : Int -> Dict Int D.Value -> Html Msg
                 viewRow n row =
-                    H.tr [] <| (::) (H.th [] [ text (String.fromInt n) ]) <| List.map (\i -> H.td [] <| maybe [] (ls << viewCell (Dict.get i row) << Tuple.second) <| Dict.get i columns) <| List.range 0 ncols
+                    H.tr [] <|
+                        (::)
+                            (H.th
+                                [ A.onMouseDown NoOp
+                                , A.onMouseUp NoOp
+                                , A.onMouseEnter NoOp
+                                ]
+                                [ text (String.fromInt n) ]
+                            )
+                        <|
+                            List.map
+                                (\i ->
+                                    H.td
+                                        [ A.onMouseDown NoOp
+                                        , A.onMouseUp NoOp
+                                        , A.onMouseEnter NoOp
+                                        ]
+                                    <|
+                                        maybe [] (ls << viewCell (Dict.get i row) << Tuple.second) <|
+                                            Dict.get i columns
+                                )
+                            <|
+                                List.range 0 ncols
 
                 viewCell : Maybe D.Value -> Column -> Html Msg
                 viewCell x col =
-                    case col of
-                        -- TODO: Show an error if there is cell data overwrites a formula cell.
-                        Formula (Exceed formula) ->
-                            text <| String.join "" [ "TODO: =(", formula, ")" ]
-
-                        Data _ ->
-                            x
-                                |> Maybe.withDefault (E.string "")
-                                |> D.decodeValue (D.oneOf [ D.string, D.map String.fromInt D.int, D.map String.fromFloat D.float ])
-                                |> result (always (text "TODO: parse error")) text
+                    x
+                        |> Maybe.withDefault (E.string "")
+                        |> D.decodeValue (D.oneOf [ D.string, D.map String.fromInt D.int, D.map String.fromFloat D.float ])
+                        |> result (always (text "TODO: parse error")) text
             in
-            H.table [ S.borderCollapseCollapse ]
+            H.table [ S.borderCollapseCollapse, A.onMouseLeave NoOp ]
                 [ H.thead [] [ H.tr [] <| List.map (\i -> H.th [ S.textAlignLeft ] <| ls <| H.div [ S.displayFlex, S.flexDirectionColumn ] <| maybe [] (viewHeader i) <| Dict.get i columns) <| List.range -1 ncols ]
                 , H.tbody [] <| Array.toList <| Array.indexedMap viewRow cells
                 ]
