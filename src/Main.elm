@@ -95,6 +95,17 @@ type alias Model =
     { open : Sheet Content
     , library : Dict String (Sheet ())
     , settings : { scrapbooks : Dict String () }
+    , focus : Focus
+    }
+
+
+type alias Index =
+    ( Int, Int )
+
+
+type alias Focus =
+    { index : Index
+    , value : String
     }
 
 
@@ -234,6 +245,7 @@ init _ _ _ =
                 }
         , library = Dict.empty
         , settings = { scrapbooks = Dict.empty }
+        , focus = { index = ( 2, 3 ), value = "goo" }
         }
         Cmd.none
 
@@ -303,7 +315,7 @@ view model =
         [ H.node "style" [] [ text "body * { box-sizing: border-box; gap: 1rem; }" ]
         , H.node "style" [] [ text "body { font-family: sans-serif; }" ]
         , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
-        , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2 ]
+        , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%" ]
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween ]
                     [ H.div [ S.displayFlex, S.flexDirectionRow ]
@@ -335,7 +347,7 @@ view model =
 
                 -- TODO: All current filters should be rendered as text in the searchbar. This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                 , H.input [ A.onInput (always NoOp), S.width "100%" ] []
-                , H.lazy viewSheet sheet.content
+                , H.lazy2 viewSheet model.focus sheet.content
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ]
                 -- TODO: This section automatically populates based on context. It's like an inspector that's shows you details on what you're currently doing.
@@ -353,8 +365,8 @@ view model =
     }
 
 
-viewSheet : Content -> Html Msg
-viewSheet content =
+viewSheet : Focus -> Content -> Html Msg
+viewSheet focus content =
     -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
     case content of
         Cells { columns, cells } ->
@@ -459,8 +471,13 @@ viewSheet content =
                                         , A.onMouseEnter NoOp
                                         ]
                                     <|
-                                        maybe [] (ls << viewCell (Dict.get i row) << Tuple.second) <|
-                                            Dict.get i columns
+                                        if focus.index == ( i, n ) then
+                                            [ H.input [ A.value focus.value, A.onInput (always NoOp), S.width "100%" ] []
+                                            ]
+
+                                        else
+                                            maybe [] (ls << viewCell (Dict.get i row) << Tuple.second) <|
+                                                Dict.get i columns
                                 )
                             <|
                                 List.range 0 ncols
