@@ -410,6 +410,10 @@ view ({ sheet } as model) =
 
         { name, tags, thumb } =
             book.sheets |> Dict.get sheet.sheetId |> Maybe.withDefault { name = "", tags = Set.empty, thumb = () }
+
+        nrows : Int
+        nrows =
+            Array.length (Result.withDefault Array.empty sheet.rows)
     in
     { title = "scrapsheets"
     , body =
@@ -459,7 +463,13 @@ view ({ sheet } as model) =
                     [ H.thead []
                         [ H.tr [] <|
                             List.concat
-                                [ [ H.th [] [] ]
+                                [ [ H.th
+                                        [ A.onClick (Selecting Nothing (rect -1 0 -1 nrows))
+                                        , A.onMouseEnter (CellHovering (xy -1 nrows))
+                                        , S.verticalAlignBottom
+                                        ]
+                                        [ text "↕️" ]
+                                  ]
                                 , List.indexedMap
                                     (\i col ->
                                         H.th
@@ -468,9 +478,10 @@ view ({ sheet } as model) =
                                             , A.onMouseUp (Selecting Nothing { a = sheet.select.a, b = xy i -1 })
                                             , A.onMouseEnter (CellHovering (xy i -1))
                                             , S.textAlignLeft
+                                            , S.verticalAlignBottom
                                             ]
-                                            [ H.div [ S.displayFlex, S.flexDirectionColumn ]
-                                                [ H.div [ S.displayFlex, S.flexWrapWrap, S.gapRem 0.5 ] <|
+                                            [ H.div [ S.displayFlex, S.flexDirectionColumn, S.justifyContentFlexEnd, S.gapRem 0 ]
+                                                [ H.div [ S.displayFlex, S.flexWrapWrap, S.gapRem 0.5, S.fontSizeSmall ] <|
                                                     case toType col.t of
                                                         Text ->
                                                             let
@@ -550,7 +561,7 @@ view ({ sheet } as model) =
                                             ]
                                     )
                                     (Array.toList sheet.cols)
-                                , [ H.th [] [ H.button [ A.onClick ColumnPushing ] [ text "+" ] ] ]
+                                , [ H.th [ A.onClick ColumnPushing, S.verticalAlignBottom ] [ text "➡️" ] ]
                                 ]
                         ]
                     , H.tbody [] <|
@@ -565,7 +576,7 @@ view ({ sheet } as model) =
                                                     , A.onMouseUp (Selecting Nothing { a = sheet.select.a, b = xy -1 n })
                                                     , A.onMouseEnter (CellHovering (xy -1 n))
                                                     ]
-                                                    [ text (String.fromInt n) ]
+                                                    [ text "↔️" ]
                                               ]
                                             , List.indexedMap
                                                 (\i col ->
@@ -591,7 +602,9 @@ view ({ sheet } as model) =
                                                         ]
                                                 )
                                                 (Array.toList sheet.cols)
-                                            , [ H.td [ A.onClick (RowPushing n) ] [ text "↵" ] ]
+
+                                            -- TODO: Drag this to reorder the row.
+                                            , [ H.th [ A.onClick (RowPushing n), S.textAlignCenter ] [ text "↩️" ] ]
                                             ]
                                 )
                             <|
