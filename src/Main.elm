@@ -593,7 +593,6 @@ view ({ sheet } as model) =
                                                             else
                                                                 ""
                                                         ]
-                                                        -- TODO: Needs to match selected region.
                                                         [ if sheet.write /= Nothing && sheet.select == rect i n i n then
                                                             H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput CellWriting, A.onBlur CellSaving, S.width "100%" ] []
 
