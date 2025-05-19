@@ -79,19 +79,22 @@ type alias Id =
 type alias Model =
     { nav : Nav.Key
     , library : Dict Id Book
-    , sheet :
-        -- TODO: We'll need to store/sync the rows/cols for certain sources but not others.
-        { bookId : Id
-        , sheetId : Id
-        , search : String
-        , newTag : Maybe String
-        , select : Rect
-        , hover : Index
-        , write : Maybe String
-        , cols : List { key : String, label : String, col : Column }
-        , rows : Result () (Array (Dict String D.Value))
-        , source : Source
-        }
+    , sheet : Sheet
+    }
+
+
+type alias Sheet =
+    -- TODO: We'll need to store/sync the rows/cols for certain sources but not others.
+    { bookId : Id
+    , sheetId : Id
+    , search : String
+    , newTag : Maybe String
+    , select : Rect
+    , hover : Index
+    , write : Maybe String
+    , cols : List { key : String, label : String, col : Column }
+    , rows : Result () (Array (Dict String D.Value))
+    , source : Source
     }
 
 
@@ -215,7 +218,20 @@ init _ _ nav =
         -- TODO: Load from root document via flag.
         -- TODO: Always add a "local" book with IndexedDB, filesystem, any available sheets from underlying platform.
         { nav = nav
-        , library = Dict.empty
+        , library =
+            Dict.empty
+                |> Dict.insert ""
+                    { id = ""
+                    , dir = "personal"
+                    , peers = Dict.empty
+                    , sheets =
+                        Dict.empty
+                            |> Dict.insert ""
+                                { name = "my-sheet-2"
+                                , tags = Set.empty |> Set.insert "my-tag-3"
+                                , thumb = ()
+                                }
+                    }
         , sheet =
             { bookId = ""
             , sheetId = ""
