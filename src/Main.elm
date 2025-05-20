@@ -1,5 +1,10 @@
 port module Main exposing (main)
 
+---- NOTES --------------------------------------------------------------------
+--
+-- TODO: We need to clean up how we're switching on Sources.
+--
+--
 ---- IMPORTS ------------------------------------------------------------------
 
 import Array exposing (Array)
@@ -26,13 +31,33 @@ import Url exposing (Url)
 
 
 ---- PORTS --------------------------------------------------------------------
--- TODO: Also pass in the doc IDs.
 
 
-port changeDoc : { x : String, y : Int, data : Maybe D.Value } -> Cmd msg
+port changeDoc : DocMsg (List Patch) -> Cmd msg
 
 
-port docChanged : ({ doc : D.Value, handle : D.Value, patchInfo : D.Value, patches : List Patch } -> msg) -> Sub msg
+port notifyDoc : DocMsg E.Value -> Cmd msg
+
+
+port docChanged : (DocMsg DocChange -> msg) -> Sub msg
+
+
+port docNotified : (DocMsg D.Value -> msg) -> Sub msg
+
+
+type alias DocChange =
+    { doc : D.Value
+    , handle : D.Value
+    , patchInfo : D.Value
+    , patches : List Patch
+    }
+
+
+type alias DocMsg a =
+    { bookId : Id
+    , sheetId : Id
+    , data : a
+    }
 
 
 type alias Patch =
@@ -74,7 +99,7 @@ main =
 subs : Model -> Sub Msg
 subs model =
     Sub.batch
-        [ docChanged (DocChanged << .doc)
+        [ docChanged DocChanged
         ]
 
 
@@ -100,8 +125,6 @@ type alias Sheet =
     , newTag : Maybe String
     , select : Rect
     , hover : Index
-    , write : Maybe String
-    , cols : Array Col
     , rows : Result String (Array (Dict String D.Value))
     , source : Source
     }
@@ -141,9 +164,13 @@ type
     Source
     -- TODO: Move some of these to the shop as free templates.
     -- TODO: email, settings, databases, git, github, stripe, logs, sheets, tests, code stats, social media keywords
-    = Table
+    = Booklet
+    | Table
+        { write : Maybe String
+        , cols : Array (Col String String)
+        }
     | Json
-    | Filesystem
+    | Files
     | Github {}
     | Stripe {}
     | Bluesky {}
@@ -175,8 +202,8 @@ type Language
     | Apl
 
 
-type alias Col =
-    { key : String, label : String, t : ColType }
+type alias Col key label =
+    { key : key, label : label, t : ColType }
 
 
 type ColType
@@ -263,16 +290,6 @@ init flags _ nav =
             , newTag = Nothing
             , hover = xy -1 -1
             , select = Rect (xy -1 -1) (xy -1 -1)
-            , write = Nothing
-            , cols =
-                -- TODO:
-                Array.fromList <|
-                    List.map (\( k, v ) -> { key = k, label = k, t = v }) <|
-                        [ ( "A", Concrete Text )
-                        , ( "B", Concrete Number )
-                        , ( "C", Virtual (Exceed "A++2*B") )
-                        , ( "D", Virtual (Exceed "1.5*B") )
-                        ]
             , rows =
                 flags.doc
                     |> D.decodeValue
@@ -282,15 +299,19 @@ init flags _ nav =
                             )
                         )
                     |> Result.mapError D.errorToString
-
-            -- Array.fromList <|
-            --     List.map Dict.fromList <|
-            --         [ [ ( "A", E.string "hello" ), ( "B", E.string "world" ), ( "C", E.int 89 ) ]
-            --         , [ ( "A", E.int 48 ), ( "B", E.float 1.23 ), ( "D", E.string "62" ) ]
-            --         , [ ( "A", E.bool True ), ( "B", E.bool False ), ( "C", E.string "true" ) ]
-            --         , [ ( "B", E.string "4.56" ), ( "D", E.string "boo" ) ]
-            --         ]
-            , source = Table
+            , source =
+                Table
+                    { write = Nothing
+                    , cols =
+                        -- TODO:
+                        Array.fromList <|
+                            List.map (\( k, v ) -> { key = k, label = k, t = v }) <|
+                                [ ( "A", Concrete Text )
+                                , ( "B", Concrete Number )
+                                , ( "C", Virtual (Exceed "A++2*B") )
+                                , ( "D", Virtual (Exceed "1.5*B") )
+                                ]
+                    }
             }
         }
         Cmd.none
@@ -338,13 +359,13 @@ type Msg
     | TagEditing (Maybe String)
     | SearchEditing String
     | ColumnPushing
-    | ColumnEditing Int Col
+    | ColumnEditing Int (Col String String)
     | RowPushing Int
     | Selecting (Maybe String) Rect
     | CellWriting String
     | CellSaving
     | CellHovering Index
-    | DocChanged D.Value
+    | DocChanged (DocMsg DocChange)
     | UrlChanged Url
     | LinkClicked Browser.UrlRequest
 
@@ -370,16 +391,57 @@ update msg ({ sheet } as model) =
             ( { model | sheet = { sheet | search = search } }, Cmd.none )
 
         ColumnPushing ->
-            ( { model | sheet = { sheet | cols = sheet.cols |> Array.push { key = "", label = "", t = Concrete Text } } }, Cmd.none )
+            ( { model
+                | sheet =
+                    { sheet
+                        | source =
+                            case sheet.source of
+                                Table table ->
+                                    Table { table | cols = table.cols |> Array.push { key = "", label = "", t = Concrete Text } }
+
+                                -- TODO:
+                                _ ->
+                                    sheet.source
+                    }
+              }
+            , Cmd.none
+            )
 
         ColumnEditing i col ->
-            ( { model | sheet = { sheet | cols = sheet.cols |> Array.set i col } }, Cmd.none )
+            ( { model
+                | sheet =
+                    { sheet
+                        | source =
+                            case sheet.source of
+                                Table table ->
+                                    Table { table | cols = table.cols |> Array.set i col }
+
+                                -- TODO:
+                                _ ->
+                                    sheet.source
+                    }
+              }
+            , Cmd.none
+            )
 
         RowPushing i ->
             ( { model | sheet = { sheet | rows = sheet.rows |> Result.map (\rows -> Array.slice 0 (i + 1) rows |> Array.push Dict.empty |> flip Array.append (Array.slice (i + 1) (Array.length rows) rows)) } }, Cmd.none )
 
         Selecting write s ->
-            ( { model | sheet = { sheet | write = write, select = rect (min s.a.x s.b.x) (min s.a.y s.b.y) (max s.a.x s.b.x) (max s.a.y s.b.y) } }
+            ( { model
+                | sheet =
+                    { sheet
+                        | select = rect (min s.a.x s.b.x) (min s.a.y s.b.y) (max s.a.x s.b.x) (max s.a.y s.b.y)
+                        , source =
+                            case sheet.source of
+                                Table table ->
+                                    Table { table | write = write }
+
+                                -- TODO:
+                                _ ->
+                                    sheet.source
+                    }
+              }
             , Task.attempt (always NoOp) (Dom.focus "new-cell")
             )
 
@@ -390,9 +452,24 @@ update msg ({ sheet } as model) =
 
                 key : Maybe String
                 key =
-                    sheet.cols
-                        |> Array.get x
-                        |> Maybe.map .key
+                    case sheet.source of
+                        Table table ->
+                            table.cols
+                                |> Array.get x
+                                |> Maybe.map .key
+
+                        -- TODO:
+                        _ ->
+                            Nothing
+
+                write : Maybe String
+                write =
+                    case sheet.source of
+                        Table table ->
+                            table.write
+
+                        _ ->
+                            Nothing
 
                 row : Dict String D.Value
                 row =
@@ -403,26 +480,54 @@ update msg ({ sheet } as model) =
                                     |> Result.withDefault Array.empty
                                     |> Array.get y
                                     |> Maybe.withDefault Dict.empty
-                                    |> Dict.update k (always (Maybe.map E.string sheet.write))
+                                    |> Dict.update k (always (Maybe.map E.string write))
                             )
                         |> Maybe.withDefault Dict.empty
             in
-            ( { model | sheet = { sheet | write = Nothing, rows = sheet.rows |> Result.map (Array.set y row) } }
-            , key |> Maybe.map (\k -> changeDoc { y = y, x = k, data = Maybe.map E.string sheet.write }) |> Maybe.withDefault Cmd.none
+            ( { model
+                | sheet =
+                    { sheet
+                        | rows = sheet.rows |> Result.map (Array.set y row)
+                        , source =
+                            case sheet.source of
+                                Table table ->
+                                    Table { table | write = Nothing }
+
+                                -- TODO:
+                                _ ->
+                                    sheet.source
+                    }
+              }
+              -- TODO: , key |> Maybe.map (\k -> changeDoc { y = y, x = k, data = Maybe.map E.string sheet.write }) |> Maybe.withDefault Cmd.none
+            , Cmd.none
             )
 
         CellWriting write ->
-            ( { model | sheet = { sheet | write = Just write } }, Cmd.none )
+            ( { model
+                | sheet =
+                    { sheet
+                        | source =
+                            case sheet.source of
+                                Table table ->
+                                    Table { table | write = Just write }
+
+                                -- TODO:
+                                _ ->
+                                    sheet.source
+                    }
+              }
+            , Cmd.none
+            )
 
         CellHovering hover ->
             ( { model | sheet = { sheet | hover = hover } }, Cmd.none )
 
-        DocChanged doc ->
+        DocChanged change ->
             ( { model
                 | sheet =
                     { sheet
                         | rows =
-                            doc
+                            change.data.doc
                                 |> D.decodeValue
                                     (D.map identity
                                         (D.field "rows"
@@ -465,6 +570,16 @@ view ({ sheet } as model) =
         nrows : Int
         nrows =
             Array.length (Result.withDefault Array.empty sheet.rows)
+
+        cols : List (Col String String)
+        cols =
+            case sheet.source of
+                Table table ->
+                    Array.toList table.cols
+
+                -- TODO:
+                _ ->
+                    []
     in
     { title = "scrapsheets"
     , body =
@@ -614,7 +729,7 @@ view ({ sheet } as model) =
                                                 ]
                                             ]
                                     )
-                                    (Array.toList sheet.cols)
+                                    cols
                                 , [ H.th [ A.onClick ColumnPushing, S.verticalAlignBottom ] [ text "➡️" ] ]
                                 ]
                         ]
@@ -644,14 +759,20 @@ view ({ sheet } as model) =
                                                             [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && ((sheet.select.a.x <= i && i <= sheet.select.b.x) || (sheet.select.a.x == -1 && -1 == sheet.select.b.x)) && ((sheet.select.a.y <= n && n <= sheet.select.b.y) || (sheet.select.a.y == -1 && -1 == sheet.select.b.y)) )
                                                             ]
                                                         ]
-                                                        [ if sheet.write /= Nothing && sheet.select == rect i n i n then
-                                                            H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput CellWriting, A.onBlur CellSaving, S.width "100%" ] []
+                                                    <|
+                                                        case sheet.source of
+                                                            Table { write } ->
+                                                                [ if write /= Nothing && sheet.select == rect i n i n then
+                                                                    H.input [ A.id "new-cell", A.value (Maybe.withDefault "" write), A.onInput CellWriting, A.onBlur CellSaving, S.width "100%" ] []
 
-                                                          else
-                                                            row |> Dict.get col.key |> Maybe.withDefault (E.string "") |> D.decodeValue string |> Result.withDefault "TODO: parse error" |> text
-                                                        ]
+                                                                  else
+                                                                    row |> Dict.get col.key |> Maybe.withDefault (E.string "") |> D.decodeValue string |> Result.withDefault "TODO: parse error" |> text
+                                                                ]
+
+                                                            _ ->
+                                                                []
                                                 )
-                                                (Array.toList sheet.cols)
+                                                cols
 
                                             -- TODO: Drag this to reorder the row.
                                             , [ H.th [ A.onClick (RowPushing n), S.textAlignCenter ] [ text "↩️" ] ]
@@ -665,14 +786,21 @@ view ({ sheet } as model) =
                     ]
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ]
-                -- TODO: This section automatically populates based on context. It's like an inspector that's shows you details on what you're currently doing.
-                -- TODO: Prefer .selected and fallback to .hover.
-                -- TODO: [ "definition", "scrappy", "share", "history", "problems", "related", "help" ]
-                [ H.span [] [ text "definition" ]
-                , H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ]
-                    [ text (Debug.toString sheet.cols)
-                    ]
-                ]
+              -- TODO: This section automatically populates based on context. It's like an inspector that's shows you details on what you're currently doing.
+              -- TODO: Prefer .selected and fallback to .hover.
+              -- TODO: [ "definition", "scrappy", "share", "history", "problems", "related", "help" ]
+              <|
+                case sheet.source of
+                    Table table ->
+                        [ H.span [] [ text "definition" ]
+                        , H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ]
+                            [ text (Debug.toString table.cols)
+                            ]
+                        ]
+
+                    -- TODO:
+                    _ ->
+                        []
             ]
         ]
     }
