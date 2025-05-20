@@ -8,19 +8,19 @@ import Browser.Dom as Dom
 import Browser.Navigation as Nav
 import Date exposing (Date)
 import Dict exposing (Dict)
-import Html as H exposing (Html, code, text)
+import Html as H exposing (Html, text)
 import Html.Attributes as A
 import Html.Events as A
 import Html.Lazy as H
-import Html.Style as S exposing (textAlignLeft)
-import Http exposing (stringResolver)
+import Html.Style as S
+import Http
 import Json.Decode as D
 import Json.Encode as E
 import Parser as P exposing ((|.), (|=), Parser)
 import Regex exposing (Regex)
 import Set exposing (Set)
 import Task exposing (Task)
-import Time exposing (Month(..), millisToPosix)
+import Time exposing (Month(..))
 import Url exposing (Url)
 
 
@@ -31,16 +31,6 @@ import Url exposing (Url)
 flip : (a -> b -> c) -> (b -> a -> c)
 flip f a b =
     f b a
-
-
-result : Result a a -> a
-result x =
-    case x of
-        Ok a ->
-            a
-
-        Err a ->
-            a
 
 
 
@@ -420,7 +410,10 @@ view ({ sheet } as model) =
         [ H.node "style" [] [ text "body * { box-sizing: border-box; gap: 1rem; }" ]
         , H.node "style" [] [ text "body { font-family: sans-serif; }" ]
         , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
-        , H.node "style" [] [ text "td:hover { background: #fafafa; }" ]
+        , H.node "style" [] [ text "td:hover { background: rgba(0,0,0,0.15); }" ]
+        , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { td:hover { background: rgba(255,255,255,0.15); } }" ]
+        , H.node "style" [] [ text ".selected { background: rgba(0,0,0,0.1); }" ]
+        , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { .selected { background: rgba(255,255,255,0.1); } }" ]
         , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%" ]
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween ]
@@ -586,12 +579,9 @@ view ({ sheet } as model) =
                                                         , A.onMouseDown (Selecting Nothing (rect i n i n))
                                                         , A.onMouseUp (Selecting Nothing { a = sheet.select.a, b = xy i n })
                                                         , A.onMouseEnter (CellHovering (xy i n))
-                                                        , S.backgroundColor <|
-                                                            if (sheet.select /= rect -1 -1 -1 -1) && ((sheet.select.a.x <= i && i <= sheet.select.b.x) || (sheet.select.a.x == -1 && -1 == sheet.select.b.x)) && ((sheet.select.a.y <= n && n <= sheet.select.b.y) || (sheet.select.a.y == -1 && -1 == sheet.select.b.y)) then
-                                                                "#eee"
-
-                                                            else
-                                                                ""
+                                                        , A.classList
+                                                            [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && ((sheet.select.a.x <= i && i <= sheet.select.b.x) || (sheet.select.a.x == -1 && -1 == sheet.select.b.x)) && ((sheet.select.a.y <= n && n <= sheet.select.b.y) || (sheet.select.a.y == -1 && -1 == sheet.select.b.y)) )
+                                                            ]
                                                         ]
                                                         [ if sheet.write /= Nothing && sheet.select == rect i n i n then
                                                             H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput CellWriting, A.onBlur CellSaving, S.width "100%" ] []
