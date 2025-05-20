@@ -265,6 +265,7 @@ init flags _ nav =
             , select = Rect (xy -1 -1) (xy -1 -1)
             , write = Nothing
             , cols =
+                -- TODO:
                 Array.fromList <|
                     List.map (\( k, v ) -> { key = k, label = k, t = v }) <|
                         [ ( "A", Concrete Text )
@@ -276,7 +277,7 @@ init flags _ nav =
                 flags.doc
                     |> D.decodeValue
                         (D.map identity
-                            (D.field "data"
+                            (D.field "rows"
                                 (D.list (D.dict D.value) |> D.map Array.fromList)
                             )
                         )
@@ -417,7 +418,22 @@ update msg ({ sheet } as model) =
             ( { model | sheet = { sheet | hover = hover } }, Cmd.none )
 
         DocChanged doc ->
-            ( model, Cmd.none )
+            ( { model
+                | sheet =
+                    { sheet
+                        | rows =
+                            doc
+                                |> D.decodeValue
+                                    (D.map identity
+                                        (D.field "rows"
+                                            (D.list (D.dict D.value) |> D.map Array.fromList)
+                                        )
+                                    )
+                                |> Result.mapError D.errorToString
+                    }
+              }
+            , Cmd.none
+            )
 
         UrlChanged url ->
             -- TODO

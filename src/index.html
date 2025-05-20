@@ -31,7 +31,7 @@
       const doc =
         docUrl && AM.isValidAutomergeUrl(docUrl)
           ? ((await repo.find(docUrl).catch(() => {})) ?? repo.create({}))
-          : repo.create({ data: [{}] });
+          : repo.create({ rows: [{}] });
       await doc.isReady();
       window.location.hash = doc.url || docUrl;
       const app = Elm.Main.init({
@@ -42,14 +42,14 @@
           doc: await doc.doc(),
         },
       });
+      doc.on("change", app.ports.docChanged.send);
       app.ports.changeDoc.subscribe(({ x, y, data }) => {
         doc.change(d => {
-          if (!d.data) d.data = [{}];
-          if (!d.data[y]) d.data[y] = {};
-          d.data[y][x] = data;
+          if (!d.rows) d.rows = [{}];
+          if (!d.rows[y]) d.rows[y] = {};
+          d.rows[y][x] = data;
         });
       });
-      doc.on("change", app.ports.docChanged.send);
     </script>
   </body>
 </html>
