@@ -2,7 +2,6 @@
 <html lang="en">
   <head>
     <title>scrapsheets</title>
-
     <meta charset="UTF-8" />
     <meta name="author" content="Taylor Troesh" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -15,17 +14,36 @@
       name="theme-color"
       content="#151515"
       media="(prefers-color-scheme: dark)" />
-
     <script src="/index.js"></script>
   </head>
   <body>
     <div id="elm"></div>
-    <script>
-      var app = Elm.Main.init({
+    <script type="module">
+      import * as AM from "https://esm.sh/@automerge/react@2.0.0/slim?bundle-deps";
+      await AM.initializeWasm(
+        fetch("https://esm.sh/@automerge/automerge/dist/automerge.wasm"),
+      );
+      const repo = new AM.Repo({
+        storage: new AM.IndexedDBStorageAdapter(),
+        // network: [new AutomergeRepo.BrowserWebSocketClientAdapter("wss://sync.automerge.org")],
+      });
+      const docUrl = window.location.hash.slice(1);
+      const doc =
+        docUrl && AM.isValidAutomergeUrl(docUrl)
+          ? repo.find(docUrl)
+          : repo.create({ text: "" });
+      window.location.hash = doc.url || docUrl;
+      const app = Elm.Main.init({
         node: document.getElementById("elm"),
         flags: {
           host: window.location.host,
         },
+      });
+      // TODO: Listen on port:
+      // TODO:   doc.change(d => (d.text = Math.random().toString()));
+      doc.on("change", ({ doc }) => {
+        // TODO: Send through port.
+        console.log("new text is ", doc.text);
       });
     </script>
   </body>
