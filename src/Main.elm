@@ -4,6 +4,8 @@ port module Main exposing (main)
 --
 -- TODO: We need to clean up how we're switching on Sources.
 --
+-- TODO: Create an immutable examples book?
+--
 --
 ---- IMPORTS ------------------------------------------------------------------
 
@@ -119,6 +121,7 @@ type alias Model =
 
 
 type alias Sheet =
+    -- TODO: isMutable : Bool
     { bookId : Id
     , sheetId : Id
     , search : String
@@ -132,6 +135,7 @@ type alias Sheet =
 
 type alias Book =
     { dir : String
+    , perms : ()
     , peers : Dict Id ()
     , sheets : Dict Id { name : String, tags : Set String, thumb : Svg }
     }
@@ -266,6 +270,7 @@ init flags _ nav =
             Dict.empty
                 |> Dict.insert "123"
                     { dir = "device"
+                    , perms = ()
                     , peers = Dict.empty
                     , sheets =
                         Dict.empty
@@ -274,6 +279,7 @@ init flags _ nav =
                     }
                 |> Dict.insert "234"
                     { dir = "personal"
+                    , perms = ()
                     , peers = Dict.empty
                     , sheets =
                         Dict.empty
@@ -562,7 +568,7 @@ view ({ sheet } as model) =
     let
         book : Book
         book =
-            model.library |> Dict.get sheet.bookId |> Maybe.withDefault { dir = "", peers = Dict.empty, sheets = Dict.empty }
+            model.library |> Dict.get sheet.bookId |> Maybe.withDefault { dir = "", perms = (), peers = Dict.empty, sheets = Dict.empty }
 
         { name, tags, thumb } =
             book.sheets |> Dict.get sheet.sheetId |> Maybe.withDefault { name = "", tags = Set.empty, thumb = () }
