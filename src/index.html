@@ -25,26 +25,31 @@
       );
       const repo = new AM.Repo({
         storage: new AM.IndexedDBStorageAdapter(),
-        // network: [new AutomergeRepo.BrowserWebSocketClientAdapter("wss://sync.automerge.org")],
+        // network: [new AM.BrowserWebSocketClientAdapter("wss://sync.automerge.org")],
       });
       const docUrl = window.location.hash.slice(1);
       const doc =
         docUrl && AM.isValidAutomergeUrl(docUrl)
-          ? repo.find(docUrl)
-          : repo.create({ text: "" });
+          ? ((await repo.find(docUrl).catch(() => {})) ?? repo.create({}))
+          : repo.create({ data: [{}] });
+      await doc.isReady();
       window.location.hash = doc.url || docUrl;
       const app = Elm.Main.init({
         node: document.getElementById("elm"),
         flags: {
           host: window.location.host,
+          docUrl,
+          doc: await doc.doc(),
         },
       });
-      // TODO: Listen on port:
-      // TODO:   doc.change(d => (d.text = Math.random().toString()));
-      doc.on("change", ({ doc }) => {
-        // TODO: Send through port.
-        console.log("new text is ", doc.text);
+      app.ports.changeDoc.subscribe(({ x, y, data }) => {
+        doc.change(d => {
+          if (!d.data) d.data = [{}];
+          if (!d.data[y]) d.data[y] = {};
+          d.data[y][x] = data;
+        });
       });
+      doc.on("change", app.ports.docChanged.send);
     </script>
   </body>
 </html>

@@ -1,4 +1,4 @@
-module Main exposing (main)
+port module Main exposing (main)
 
 ---- IMPORTS ------------------------------------------------------------------
 
@@ -25,6 +25,24 @@ import Url exposing (Url)
 
 
 
+---- PORTS --------------------------------------------------------------------
+-- TODO: Also pass in the doc IDs.
+
+
+port changeDoc : { x : String, y : Int, data : Maybe D.Value } -> Cmd msg
+
+
+port docChanged : ({ doc : D.Value, handle : D.Value, patchInfo : D.Value, patches : List Patch } -> msg) -> Sub msg
+
+
+type alias Patch =
+    { action : String
+    , path : List D.Value
+    , value : D.Value
+    }
+
+
+
 ---- HELPERS ------------------------------------------------------------------
 
 
@@ -37,7 +55,7 @@ flip f a b =
 ---- MAIN ---------------------------------------------------------------------
 
 
-main : Program () Model Msg
+main : Program Flags Model Msg
 main =
     Browser.application
         { init = init
@@ -54,8 +72,10 @@ main =
 
 
 subs : Model -> Sub Msg
-subs _ =
-    Sub.none
+subs model =
+    Sub.batch
+        [ docChanged (DocChanged << .doc)
+        ]
 
 
 
@@ -82,7 +102,7 @@ type alias Sheet =
     , hover : Index
     , write : Maybe String
     , cols : Array Col
-    , rows : Result () (Array (Dict String D.Value))
+    , rows : Result String (Array (Dict String D.Value))
     , source : Source
     }
 
@@ -203,8 +223,15 @@ toType column =
 ---- INIT ---------------------------------------------------------------------
 
 
-init : () -> Url -> Nav.Key -> ( Model, Cmd Msg )
-init _ _ nav =
+type alias Flags =
+    { host : String
+    , docUrl : String
+    , doc : D.Value
+    }
+
+
+init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
+init flags _ nav =
     Tuple.pair
         -- TODO: Load from root document via flag.
         { nav = nav
@@ -246,14 +273,22 @@ init _ _ nav =
                         , ( "D", Virtual (Exceed "1.5*B") )
                         ]
             , rows =
-                Ok <|
-                    Array.fromList <|
-                        List.map Dict.fromList <|
-                            [ [ ( "A", E.string "hello" ), ( "B", E.string "world" ), ( "C", E.int 89 ) ]
-                            , [ ( "A", E.int 48 ), ( "B", E.float 1.23 ), ( "D", E.string "62" ) ]
-                            , [ ( "A", E.bool True ), ( "B", E.bool False ), ( "C", E.string "true" ) ]
-                            , [ ( "B", E.string "4.56" ), ( "D", E.string "boo" ) ]
-                            ]
+                flags.doc
+                    |> D.decodeValue
+                        (D.map identity
+                            (D.field "data"
+                                (D.list (D.dict D.value) |> D.map Array.fromList)
+                            )
+                        )
+                    |> Result.mapError D.errorToString
+
+            -- Array.fromList <|
+            --     List.map Dict.fromList <|
+            --         [ [ ( "A", E.string "hello" ), ( "B", E.string "world" ), ( "C", E.int 89 ) ]
+            --         , [ ( "A", E.int 48 ), ( "B", E.float 1.23 ), ( "D", E.string "62" ) ]
+            --         , [ ( "A", E.bool True ), ( "B", E.bool False ), ( "C", E.string "true" ) ]
+            --         , [ ( "B", E.string "4.56" ), ( "D", E.string "boo" ) ]
+            --         ]
             , source = Table
             }
         }
@@ -308,6 +343,7 @@ type Msg
     | CellWriting String
     | CellSaving
     | CellHovering Index
+    | DocChanged D.Value
     | UrlChanged Url
     | LinkClicked Browser.UrlRequest
 
@@ -351,28 +387,37 @@ update msg ({ sheet } as model) =
                 { x, y } =
                     sheet.select.a
 
-                row : Dict String D.Value
-                row =
+                key : Maybe String
+                key =
                     sheet.cols
                         |> Array.get x
                         |> Maybe.map .key
+
+                row : Dict String D.Value
+                row =
+                    key
                         |> Maybe.map
-                            (\key ->
+                            (\k ->
                                 sheet.rows
                                     |> Result.withDefault Array.empty
                                     |> Array.get y
                                     |> Maybe.withDefault Dict.empty
-                                    |> Dict.update key (always (Maybe.map E.string sheet.write))
+                                    |> Dict.update k (always (Maybe.map E.string sheet.write))
                             )
                         |> Maybe.withDefault Dict.empty
             in
-            ( { model | sheet = { sheet | write = Nothing, rows = sheet.rows |> Result.map (Array.set y row) } }, Cmd.none )
+            ( { model | sheet = { sheet | write = Nothing, rows = sheet.rows |> Result.map (Array.set y row) } }
+            , key |> Maybe.map (\k -> changeDoc { y = y, x = k, data = Maybe.map E.string sheet.write }) |> Maybe.withDefault Cmd.none
+            )
 
         CellWriting write ->
             ( { model | sheet = { sheet | write = Just write } }, Cmd.none )
 
         CellHovering hover ->
             ( { model | sheet = { sheet | hover = hover } }, Cmd.none )
+
+        DocChanged doc ->
+            ( model, Cmd.none )
 
         UrlChanged url ->
             -- TODO
