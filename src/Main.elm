@@ -6,6 +6,10 @@ port module Main exposing (main)
 --
 -- TODO: Create an immutable examples book?
 --
+-- TODO: Each book gets its own creds that aren't transferred with sheets.
+-- TODO: Your user and your book both provide cred context for the request?
+-- TODO: e.g. copying DB URLs without moving the role/password
+--
 --
 ---- IMPORTS ------------------------------------------------------------------
 
