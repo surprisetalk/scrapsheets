@@ -2,8 +2,6 @@ port module Main exposing (main)
 
 ---- NOTES --------------------------------------------------------------------
 --
--- TODO: We need to clean up how we're switching on Sources.
---
 -- TODO: Create an immutable examples book?
 --
 -- TODO: Each book gets its own creds that aren't transferred with sheets.
@@ -24,7 +22,6 @@ import Html.Attributes as A
 import Html.Events as A
 import Html.Lazy as H
 import Html.Style as S
-import Http
 import Json.Decode as D
 import Json.Encode as E
 import Parser as P exposing ((|.), (|=), Parser)
@@ -37,6 +34,14 @@ import Url exposing (Url)
 
 
 ---- PORTS --------------------------------------------------------------------
+
+
+port libraryChanged :
+    -- TODO:
+    () -> Cmd msg
+
+
+port changeBook : DocMsg SheetInfo -> Cmd msg
 
 
 port changeDoc : DocMsg (List Patch) -> Cmd msg
@@ -119,29 +124,44 @@ type alias Id =
 
 type alias Model =
     { nav : Nav.Key
-    , library : Dict Id Book
+    , library : Library
     , sheet : Sheet
     }
 
 
 type alias Sheet =
-    -- TODO: isMutable : Bool
     { bookId : Id
     , sheetId : Id
     , search : String
     , newTag : Maybe String
     , select : Rect
     , hover : Index
-    , rows : Result String (Array (Dict String D.Value))
+    , rows : Result String (Array Row)
+    , cols : Result String (Array (Col Type))
     , source : Source
     }
+
+
+type alias Row =
+    Dict String D.Value
+
+
+type alias Library =
+    Dict Id Book
 
 
 type alias Book =
     { dir : String
     , perms : ()
     , peers : Dict Id ()
-    , sheets : Dict Id { name : String, tags : Set String, thumb : Svg }
+    , sheets : Dict Id SheetInfo
+    }
+
+
+type alias SheetInfo =
+    { name : String
+    , tags : List String
+    , thumb : Svg
     }
 
 
@@ -168,29 +188,35 @@ type alias Svg =
     ()
 
 
+type alias Query =
+    ()
+
+
+type Source
+    = Rows { write : Maybe String, cols : Array (Col Formula) }
+    | Query { query : Query }
+    | Feed Feed
+
+
 type
-    Source
+    Feed
     -- TODO: Move some of these to the shop as free templates.
     -- TODO: email, settings, databases, git, github, stripe, logs, sheets, tests, code stats, social media keywords
-    = Booklet
-    | Table
-        { write : Maybe String
-        , cols : Array (Col String String)
-        }
-    | Json
+    = Lib
+    | Shop
     | Files
+    | Rss { opml : () }
+    | Http { url : (), params : () }
     | Github {}
     | Stripe {}
     | Bluesky {}
     | Form {}
     | Email {}
-    | Rss {}
     | Calendar {}
-    | Http {}
     | Webhook {}
     | Code
         { lang : Language
-        , query : String
+        , code : String
         }
 
 
@@ -210,17 +236,13 @@ type Language
     | Apl
 
 
-type alias Col key label =
-    { key : key, label : label, t : ColType }
-
-
-type ColType
-    = Virtual Formula
-    | Concrete Type
+type alias Col t =
+    { key : String, label : String, t : t }
 
 
 type Formula
-    = Exceed String
+    = Parse Type
+    | Exceed String
 
 
 type
@@ -244,16 +266,6 @@ type
     | Number
 
 
-toType : ColType -> Type
-toType column =
-    case column of
-        Virtual (Exceed _) ->
-            Text
-
-        Concrete t ->
-            t
-
-
 
 ---- INIT ---------------------------------------------------------------------
 
@@ -262,42 +274,39 @@ type alias Flags =
     { host : String
     , docUrl : String
     , doc : D.Value
+    , library : D.Value
     }
 
 
 init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
 init flags _ nav =
-    Tuple.pair
-        -- TODO: Load from root document via flag.
-        { nav = nav
-        , library =
-            Dict.empty
-                |> Dict.insert "123"
-                    { dir = "device"
-                    , perms = ()
-                    , peers = Dict.empty
-                    , sheets =
-                        Dict.empty
-                            |> Dict.insert "123" { name = "indexed-db", tags = Set.empty, thumb = () }
-                            |> Dict.insert "234" { name = "filesystem", tags = Set.empty, thumb = () }
-                    }
-                |> Dict.insert "234"
-                    { dir = "personal"
-                    , perms = ()
-                    , peers = Dict.empty
-                    , sheets =
-                        Dict.empty
-                            |> Dict.insert "123"
-                                { name = "my-sheet-2"
-                                , tags = Set.empty |> Set.insert "my-tag-3"
-                                , thumb = ()
-                                }
-                    }
-        , sheet =
+    ( { nav = nav
+      , library =
+            flags.library
+                |> D.decodeValue
+                    (D.dict
+                        (D.map4 Book
+                            (D.field "dir" D.string)
+                            (D.succeed ())
+                            (D.succeed Dict.empty)
+                            (D.succeed Dict.empty)
+                        )
+                    )
+                |> Result.withDefault Dict.empty
+      , sheet =
             { bookId = "234"
             , sheetId = "123"
             , search = "TODO: search"
             , newTag = Nothing
+            , cols =
+                Ok <|
+                    Array.fromList <|
+                        List.map (\( k, v ) -> Col k k v) <|
+                            [ ( "A", Text )
+                            , ( "B", Number )
+                            , ( "C", Text )
+                            , ( "D", Number )
+                            ]
             , hover = xy -1 -1
             , select = Rect (xy -1 -1) (xy -1 -1)
             , rows =
@@ -310,21 +319,21 @@ init flags _ nav =
                         )
                     |> Result.mapError D.errorToString
             , source =
-                Table
+                Rows
                     { write = Nothing
                     , cols =
-                        -- TODO:
                         Array.fromList <|
-                            List.map (\( k, v ) -> { key = k, label = k, t = v }) <|
-                                [ ( "A", Concrete Text )
-                                , ( "B", Concrete Number )
-                                , ( "C", Virtual (Exceed "A++2*B") )
-                                , ( "D", Virtual (Exceed "1.5*B") )
+                            List.map (\( k, v ) -> Col k k v) <|
+                                [ ( "A", Parse Text )
+                                , ( "B", Parse Number )
+                                , ( "C", Exceed "A++2*B" )
+                                , ( "D", Exceed "1.5*B" )
                                 ]
                     }
             }
-        }
-        Cmd.none
+      }
+    , Cmd.none
+    )
 
 
 
@@ -365,19 +374,27 @@ number =
 
 type Msg
     = NoOp
-    | SheetNameEditing String
-    | TagEditing (Maybe String)
-    | SearchEditing String
-    | ColumnPushing
-    | ColumnEditing Int (Col String String)
-    | RowPushing Int
-    | Selecting (Maybe String) Rect
-    | CellWriting String
+    | InputChanging Input String
     | CellSaving
+    | CellMouseClick
+    | CellMouseDown
+    | CellMouseUp
     | CellHovering Index
+    | ColumnPushing
+    | RowPushing Int
     | DocChanged (DocMsg DocChange)
     | UrlChanged Url
     | LinkClicked Browser.UrlRequest
+
+
+type Input
+    = SheetName
+    | SheetTag
+    | SheetSearch
+    | CellWrite
+    | ColumnType Int
+    | ColumnKey Int
+    | ColumnLabel Int
 
 
 
@@ -390,149 +407,98 @@ update msg ({ sheet } as model) =
         NoOp ->
             ( model, Cmd.none )
 
-        SheetNameEditing name ->
+        InputChanging SheetName x ->
             -- TODO:
             ( model, Cmd.none )
 
-        TagEditing newTag ->
-            ( { model | sheet = { sheet | newTag = newTag } }, Cmd.none )
+        InputChanging SheetTag x ->
+            -- TODO:
+            ( model, Cmd.none )
 
-        SearchEditing search ->
-            ( { model | sheet = { sheet | search = search } }, Cmd.none )
+        InputChanging SheetSearch x ->
+            -- TODO:
+            ( model, Cmd.none )
 
-        ColumnPushing ->
-            ( { model
-                | sheet =
-                    { sheet
-                        | source =
-                            case sheet.source of
-                                Table table ->
-                                    Table { table | cols = table.cols |> Array.push { key = "", label = "", t = Concrete Text } }
+        InputChanging CellWrite x ->
+            -- TODO:
+            ( model, Cmd.none )
 
-                                -- TODO:
-                                _ ->
-                                    sheet.source
-                    }
-              }
-            , Cmd.none
-            )
+        InputChanging (ColumnType i) x ->
+            -- TODO:
+            ( model, Cmd.none )
 
-        ColumnEditing i col ->
-            ( { model
-                | sheet =
-                    { sheet
-                        | source =
-                            case sheet.source of
-                                Table table ->
-                                    Table { table | cols = table.cols |> Array.set i col }
+        InputChanging (ColumnKey i) x ->
+            -- TODO:
+            ( model, Cmd.none )
 
-                                -- TODO:
-                                _ ->
-                                    sheet.source
-                    }
-              }
-            , Cmd.none
-            )
-
-        RowPushing i ->
-            ( { model | sheet = { sheet | rows = sheet.rows |> Result.map (\rows -> Array.slice 0 (i + 1) rows |> Array.push Dict.empty |> flip Array.append (Array.slice (i + 1) (Array.length rows) rows)) } }, Cmd.none )
-
-        Selecting write s ->
-            ( { model
-                | sheet =
-                    { sheet
-                        | select = rect (min s.a.x s.b.x) (min s.a.y s.b.y) (max s.a.x s.b.x) (max s.a.y s.b.y)
-                        , source =
-                            case sheet.source of
-                                Table table ->
-                                    Table { table | write = write }
-
-                                -- TODO:
-                                _ ->
-                                    sheet.source
-                    }
-              }
-            , Task.attempt (always NoOp) (Dom.focus "new-cell")
-            )
+        InputChanging (ColumnLabel i) x ->
+            -- TODO:
+            ( model, Cmd.none )
 
         CellSaving ->
-            let
-                { x, y } =
-                    sheet.select.a
-
-                key : Maybe String
-                key =
-                    case sheet.source of
-                        Table table ->
-                            table.cols
-                                |> Array.get x
-                                |> Maybe.map .key
-
-                        -- TODO:
-                        _ ->
-                            Nothing
-
-                write : Maybe String
-                write =
-                    case sheet.source of
-                        Table table ->
-                            table.write
-
-                        _ ->
-                            Nothing
-
-                row : Dict String D.Value
-                row =
-                    key
-                        |> Maybe.map
-                            (\k ->
-                                sheet.rows
-                                    |> Result.withDefault Array.empty
-                                    |> Array.get y
-                                    |> Maybe.withDefault Dict.empty
-                                    |> Dict.update k (always (Maybe.map E.string write))
-                            )
-                        |> Maybe.withDefault Dict.empty
-            in
-            ( { model
-                | sheet =
-                    { sheet
-                        | rows = sheet.rows |> Result.map (Array.set y row)
-                        , source =
-                            case sheet.source of
-                                Table table ->
-                                    Table { table | write = Nothing }
-
-                                -- TODO:
-                                _ ->
-                                    sheet.source
-                    }
-              }
-              -- TODO: , key |> Maybe.map (\k -> changeDoc { y = y, x = k, data = Maybe.map E.string sheet.write }) |> Maybe.withDefault Cmd.none
-            , Cmd.none
-            )
-
-        CellWriting write ->
             ( { model
                 | sheet =
                     { sheet
                         | source =
                             case sheet.source of
-                                Table table ->
-                                    Table { table | write = Just write }
+                                Rows rows ->
+                                    Rows { rows | write = Nothing }
 
-                                -- TODO:
-                                _ ->
-                                    sheet.source
+                                source ->
+                                    source
                     }
               }
-            , Cmd.none
+            , changeDoc <|
+                DocMsg sheet.bookId sheet.sheetId <|
+                    case sheet.source of
+                        Rows rows ->
+                            sheet.cols
+                                |> Result.withDefault Array.empty
+                                |> Array.get sheet.select.a.x
+                                |> Maybe.map
+                                    (\col ->
+                                        [ { action = "put"
+                                          , path = [ E.int sheet.select.a.y, E.string col.key ]
+                                          , value = rows.write |> Maybe.withDefault "" |> E.string
+                                          }
+                                        ]
+                                    )
+                                |> Maybe.withDefault []
+
+                        _ ->
+                            []
             )
+
+        CellMouseClick ->
+            ( { model | sheet = { sheet | select = { a = sheet.hover, b = sheet.hover } } }, Cmd.none )
+
+        CellMouseDown ->
+            let
+                select =
+                    sheet.select
+            in
+            ( { model | sheet = { sheet | select = { select | a = sheet.hover } } }, Cmd.none )
+
+        CellMouseUp ->
+            let
+                select =
+                    sheet.select
+            in
+            ( { model | sheet = { sheet | select = { select | b = sheet.hover } } }, Cmd.none )
 
         CellHovering hover ->
             ( { model | sheet = { sheet | hover = hover } }, Cmd.none )
 
+        ColumnPushing ->
+            -- TODO:
+            ( model, Cmd.none )
+
+        RowPushing _ ->
+            -- TODO:
+            ( model, Cmd.none )
+
         DocChanged change ->
+            -- TODO:
             ( { model
                 | sheet =
                     { sheet
@@ -575,21 +541,11 @@ view ({ sheet } as model) =
             model.library |> Dict.get sheet.bookId |> Maybe.withDefault { dir = "", perms = (), peers = Dict.empty, sheets = Dict.empty }
 
         { name, tags, thumb } =
-            book.sheets |> Dict.get sheet.sheetId |> Maybe.withDefault { name = "", tags = Set.empty, thumb = () }
+            book.sheets |> Dict.get sheet.sheetId |> Maybe.withDefault { name = "", tags = [], thumb = () }
 
         nrows : Int
         nrows =
             Array.length (Result.withDefault Array.empty sheet.rows)
-
-        cols : List (Col String String)
-        cols =
-            case sheet.source of
-                Table table ->
-                    Array.toList table.cols
-
-                -- TODO:
-                _ ->
-                    []
     in
     { title = "scrapsheets"
     , body =
@@ -611,16 +567,16 @@ view ({ sheet } as model) =
                         , text "/"
                         , H.a [ A.href "/taylor/personal" ] [ text "personal (7)" ]
                         , text "/"
-                        , H.input [ A.value name, A.onInput SheetNameEditing ] []
+                        , H.input [ A.value name, A.onInput (InputChanging SheetName) ] []
                         , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <|
                             List.concat
                                 [ case sheet.newTag of
                                     Nothing ->
-                                        [ H.button [ A.onClick (TagEditing (Just "")) ] [ text "#" ] ]
+                                        [ H.button [ A.onClick (InputChanging SheetTag "") ] [ text "#" ] ]
 
                                     Just value ->
-                                        [ H.input [ A.value value, A.onInput (TagEditing << Just) ] [] ]
-                                , List.map (\tag -> H.a [ A.href ("?q=+tag:" ++ tag) ] [ text ("#" ++ tag) ]) <| Set.toList tags
+                                        [ H.input [ A.value value, A.onInput (InputChanging SheetTag) ] [] ]
+                                , List.map (\tag -> H.a [ A.href ("?q=+tag:" ++ tag) ] [ text ("#" ++ tag) ]) tags
                                 ]
                         ]
                     , H.div [ S.displayFlex, S.flexDirectionRowReverse ]
@@ -635,7 +591,7 @@ view ({ sheet } as model) =
 
                 -- All current filters should be rendered as text in the searchbar.
                 -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
-                , H.input [ A.value sheet.search, A.onInput SearchEditing, S.width "100%" ] []
+                , H.input [ A.value sheet.search, A.onInput (InputChanging SheetSearch), S.width "100%" ] []
 
                 -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
                 , H.table [ S.borderCollapseCollapse, A.onMouseLeave (CellHovering (xy -1 -1)) ]
@@ -643,7 +599,7 @@ view ({ sheet } as model) =
                         [ H.tr [] <|
                             List.concat
                                 [ [ H.th
-                                        [ A.onClick (Selecting Nothing (rect -1 0 -1 nrows))
+                                        [ A.onClick CellMouseUp
                                         , A.onMouseEnter (CellHovering (xy -1 nrows))
                                         , S.verticalAlignBottom
                                         ]
@@ -652,16 +608,16 @@ view ({ sheet } as model) =
                                 , List.indexedMap
                                     (\i col ->
                                         H.th
-                                            [ A.onClick (Selecting Nothing (rect i -1 i -1))
-                                            , A.onMouseDown (Selecting Nothing (rect i -1 i -1))
-                                            , A.onMouseUp (Selecting Nothing { a = sheet.select.a, b = xy i -1 })
+                                            [ A.onClick CellMouseClick
+                                            , A.onMouseDown CellMouseDown
+                                            , A.onMouseUp CellMouseUp
                                             , A.onMouseEnter (CellHovering (xy i -1))
                                             , S.textAlignLeft
                                             , S.verticalAlignBottom
                                             ]
                                             [ H.div [ S.displayFlex, S.flexDirectionColumn, S.justifyContentFlexEnd, S.gapRem 0 ]
                                                 [ H.div [ S.displayFlex, S.flexWrapWrap, S.gapRem 0.5, S.fontSizeSmall ] <|
-                                                    case toType col.t of
+                                                    case col.t of
                                                         Text ->
                                                             let
                                                                 stats : Dict String Int
@@ -721,25 +677,20 @@ view ({ sheet } as model) =
                                                                   )
                                                                 , ( "max", List.maximum nums )
                                                                 ]
-                                                , H.input [ A.value col.label, A.onInput (\label -> ColumnEditing i { col | label = label }) ] []
-                                                , H.input [ A.value col.key, A.onInput (\key -> ColumnEditing i { col | key = key }) ] []
-                                                , case col.t of
-                                                    Virtual (Exceed formula) ->
-                                                        H.input [ A.value formula, A.onInput (\x -> ColumnEditing i { col | t = Virtual (Exceed x) }) ] []
-
-                                                    Concrete t ->
-                                                        let
-                                                            types : List ( String, Type )
-                                                            types =
-                                                                [ ( "same", Text ), ( "text/from-float", Number ) ]
-                                                        in
-                                                        H.select [ A.onInput (\x -> ColumnEditing i { col | t = Concrete <| Maybe.withDefault Text <| Dict.get x <| Dict.fromList <| types }) ] <|
-                                                            List.map (\( k, v ) -> H.option [ A.value k, A.selected (v == t) ] [ text k ]) <|
-                                                                types
+                                                , H.input [ A.value col.label, A.onInput (InputChanging (ColumnLabel i)) ] []
+                                                , H.input [ A.value col.key, A.onInput (InputChanging (ColumnKey i)) ] []
+                                                , let
+                                                    types : List ( String, Type )
+                                                    types =
+                                                        [ ( "same", Text ), ( "text/from-float", Number ) ]
+                                                  in
+                                                  H.select [ A.onInput (InputChanging (ColumnType i)) ] <|
+                                                    List.map (\( k, v ) -> H.option [ A.value k, A.selected (v == col.t) ] [ text k ]) <|
+                                                        types
                                                 ]
                                             ]
                                     )
-                                    cols
+                                    (Array.toList (Result.withDefault Array.empty sheet.cols))
                                 , [ H.th [ A.onClick ColumnPushing, S.verticalAlignBottom ] [ text "➡️" ] ]
                                 ]
                         ]
@@ -750,9 +701,9 @@ view ({ sheet } as model) =
                                     H.tr [] <|
                                         List.concat
                                             [ [ H.th
-                                                    [ A.onClick (Selecting Nothing (rect -1 n -1 n))
-                                                    , A.onMouseDown (Selecting Nothing (rect -1 n -1 n))
-                                                    , A.onMouseUp (Selecting Nothing { a = sheet.select.a, b = xy -1 n })
+                                                    [ A.onClick CellMouseClick
+                                                    , A.onMouseDown CellMouseDown
+                                                    , A.onMouseUp CellMouseUp
                                                     , A.onMouseEnter (CellHovering (xy -1 n))
                                                     ]
                                                     [ text "↔️" ]
@@ -761,9 +712,9 @@ view ({ sheet } as model) =
                                                 (\i col ->
                                                     -- TODO: Don't allow editing if Virtual column.
                                                     H.td
-                                                        [ A.onClick (Selecting (row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault "" |> Just) { a = xy i n, b = xy i n })
-                                                        , A.onMouseDown (Selecting Nothing (rect i n i n))
-                                                        , A.onMouseUp (Selecting Nothing { a = sheet.select.a, b = xy i n })
+                                                        [ A.onClick CellMouseClick
+                                                        , A.onMouseDown CellMouseDown
+                                                        , A.onMouseUp CellMouseUp
                                                         , A.onMouseEnter (CellHovering (xy i n))
                                                         , A.classList
                                                             [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && ((sheet.select.a.x <= i && i <= sheet.select.b.x) || (sheet.select.a.x == -1 && -1 == sheet.select.b.x)) && ((sheet.select.a.y <= n && n <= sheet.select.b.y) || (sheet.select.a.y == -1 && -1 == sheet.select.b.y)) )
@@ -771,9 +722,9 @@ view ({ sheet } as model) =
                                                         ]
                                                     <|
                                                         case sheet.source of
-                                                            Table { write } ->
+                                                            Rows { write } ->
                                                                 [ if write /= Nothing && sheet.select == rect i n i n then
-                                                                    H.input [ A.id "new-cell", A.value (Maybe.withDefault "" write), A.onInput CellWriting, A.onBlur CellSaving, S.width "100%" ] []
+                                                                    H.input [ A.id "new-cell", A.value (Maybe.withDefault "" write), A.onInput (InputChanging CellWrite), A.onBlur CellSaving, S.width "100%" ] []
 
                                                                   else
                                                                     row |> Dict.get col.key |> Maybe.withDefault (E.string "") |> D.decodeValue string |> Result.withDefault "TODO: parse error" |> text
@@ -782,7 +733,7 @@ view ({ sheet } as model) =
                                                             _ ->
                                                                 []
                                                 )
-                                                cols
+                                                (Array.toList (Result.withDefault Array.empty sheet.cols))
 
                                             -- TODO: Drag this to reorder the row.
                                             , [ H.th [ A.onClick (RowPushing n), S.textAlignCenter ] [ text "↩️" ] ]
@@ -796,21 +747,14 @@ view ({ sheet } as model) =
                     ]
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ]
-              -- TODO: This section automatically populates based on context. It's like an inspector that's shows you details on what you're currently doing.
-              -- TODO: Prefer .selected and fallback to .hover.
-              -- TODO: [ "definition", "scrappy", "share", "history", "problems", "related", "help" ]
-              <|
-                case sheet.source of
-                    Table table ->
-                        [ H.span [] [ text "definition" ]
-                        , H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ]
-                            [ text (Debug.toString table.cols)
-                            ]
-                        ]
-
-                    -- TODO:
-                    _ ->
-                        []
+                -- TODO: This section automatically populates based on context. It's like an inspector that's shows you details on what you're currently doing.
+                -- TODO: Prefer .selected and fallback to .hover.
+                -- TODO: [ "definition", "scrappy", "share", "history", "problems", "related", "help" ]
+                [ H.span [] [ text "definition" ]
+                , H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ]
+                    [ text (Debug.toString sheet.cols)
+                    ]
+                ]
             ]
         ]
     }
