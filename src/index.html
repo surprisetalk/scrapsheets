@@ -40,6 +40,7 @@
           host: window.location.host,
           docUrl,
           doc: await doc.doc(),
+          library: {}, // TODO: Root doc.
         },
       });
       doc.on("change", app.ports.docChanged.send);
