@@ -46,38 +46,45 @@
           library: {}, // TODO: Root doc.
         },
       });
-      doc.on("change", data =>
-        app.ports.docChanged.send({ bookId: "TODO", sheetId: "TODO", data }),
-      );
-      app.ports.changeDoc.subscribe(({ bookId, sheetId, data: patches }) => {
-        // TODO: Check bookId and sheetId.
-        doc.change(d => {
-          for (const patch of patches) {
-            let o = d;
-            const i_ = patch.path.pop();
-            switch (patch.action) {
-              case "put":
-                for (const i in patch.path) {
-                  if (o[i] === undefined)
-                    o[i] = typeof i === "string" ? {} : [];
-                  o = o[i];
-                }
-                o[i_] = patch.value;
-                break;
-              case "insert":
-                for (const i of patch.path) {
-                  if (o[i] === undefined)
-                    o[i] = typeof i === "string" ? {} : [];
-                  o = o[i];
-                }
-                o.insertAt(i_, patch.value);
-                break;
-              default:
-                throw new Error("TODO");
-            }
-          }
-        });
+
+      console.log(await doc.doc());
+      doc.on("change", data => {
+        data.patches = data.patches.map(p => ({ ...p, values: [p.value] }));
+        app.ports.docChanged.send({ bookId: "TODO", sheetId: "TODO", data });
       });
+      app.ports.changeDoc.subscribe(
+        // TODO: Use custom patches for now.
+        ({ bookId, sheetId, data: patches }) => {
+          for (const patch of patches) {
+            // TODO: Check bookId and sheetId.
+            doc.change(d => {
+              console.log(patch);
+              if (!d.cols) d.cols = [];
+              if (!d.rows) d.rows = [];
+              switch (patch.action) {
+                case "cell-put":
+                  const [_, y, x] = patch.path;
+                  if (!d.rows[y]) d.rows[y] = {};
+                  d.rows[y][x] = patch.values[0];
+                  break;
+                case "row-insert":
+                  d.rows.insertAt(1 + patch.path[1], patch.values[0]);
+                  break;
+                case "col-insert":
+                  // TODO: Intelligently pick a column based on existing columns and rows.
+                  d.cols.push({
+                    key: Math.random().toString().slice(2),
+                    label: Math.random().toString().slice(2),
+                    type: "same",
+                  });
+                  break;
+                default:
+                  throw new Error("TODO");
+              }
+            });
+          }
+        },
+      );
     </script>
   </body>
 </html>

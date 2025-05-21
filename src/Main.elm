@@ -74,7 +74,7 @@ type alias DocMsg a =
 type alias Patch =
     { action : String
     , path : List D.Value
-    , value : D.Value
+    , values : List D.Value
     }
 
 
@@ -299,14 +299,21 @@ init flags _ nav =
             , search = "TODO: search"
             , newTag = Nothing
             , cols =
-                Ok <|
-                    Array.fromList <|
-                        List.map (\( k, v ) -> Col k k v) <|
-                            [ ( "A", Text )
-                            , ( "B", Number )
-                            , ( "C", Text )
-                            , ( "D", Number )
-                            ]
+                -- TODO: Calculate these from the source.
+                flags.doc
+                    |> D.decodeValue
+                        (D.map identity
+                            (D.field "cols"
+                                (D.array
+                                    (D.map3 Col
+                                        (D.field "key" D.string)
+                                        (D.field "label" D.string)
+                                        (D.field "type" (D.succeed Text))
+                                    )
+                                )
+                            )
+                        )
+                    |> Result.mapError D.errorToString
             , hover = xy -1 -1
             , select = Rect (xy -1 -1) (xy -1 -1)
             , rows =
@@ -322,13 +329,20 @@ init flags _ nav =
                 Rows
                     { write = Nothing
                     , cols =
-                        Array.fromList <|
-                            List.map (\( k, v ) -> Col k k v) <|
-                                [ ( "A", Parse Text )
-                                , ( "B", Parse Number )
-                                , ( "C", Exceed "A++2*B" )
-                                , ( "D", Exceed "1.5*B" )
-                                ]
+                        flags.doc
+                            |> D.decodeValue
+                                (D.map identity
+                                    (D.field "cols"
+                                        (D.array
+                                            (D.map3 Col
+                                                (D.field "key" D.string)
+                                                (D.field "label" D.string)
+                                                (D.field "type" (D.succeed (Exceed "TODO")))
+                                            )
+                                        )
+                                    )
+                                )
+                            |> Result.withDefault Array.empty
                     }
             }
       }
@@ -464,21 +478,21 @@ update msg ({ sheet } as model) =
                                     (\col ->
                                         [ case edit of
                                             SheetWrite ->
-                                                { action = "put"
+                                                { action = "cell-put"
                                                 , path = [ E.string "rows", E.int sheet.select.a.y, E.string col.key ]
-                                                , value = rows.write |> Maybe.withDefault "" |> E.string
+                                                , values = [ rows.write |> Maybe.withDefault "" |> E.string ]
                                                 }
 
                                             SheetRowPush i ->
-                                                { action = "insert"
+                                                { action = "row-insert"
                                                 , path = [ E.string "rows", E.int i ]
-                                                , value = rows.write |> Maybe.withDefault "" |> E.string
+                                                , values = [ E.object [] ]
                                                 }
 
                                             SheetColumnPush ->
-                                                { action = "insert"
+                                                { action = "col-insert"
                                                 , path = [ E.string "cols", E.int (Array.length (Result.withDefault Array.empty sheet.cols)) ]
-                                                , value = E.object []
+                                                , values = [ E.object [ ( "key", E.string "" ), ( "label", E.string "" ), ( "type", E.string "same" ) ] ]
                                                 }
                                         ]
                                     )
