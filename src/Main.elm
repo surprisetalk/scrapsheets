@@ -375,16 +375,20 @@ number =
 type Msg
     = NoOp
     | InputChanging Input String
-    | CellSaving
+    | SheetEditing SheetEdit
     | CellMouseClick
     | CellMouseDown
     | CellMouseUp
     | CellHovering Index
-    | ColumnPushing
-    | RowPushing Int
     | DocChanged (DocMsg DocChange)
     | UrlChanged Url
     | LinkClicked Browser.UrlRequest
+
+
+type SheetEdit
+    = SheetWrite
+    | SheetColumnPush
+    | SheetRowPush Int
 
 
 type Input
@@ -435,7 +439,7 @@ update msg ({ sheet } as model) =
             -- TODO:
             ( model, Cmd.none )
 
-        CellSaving ->
+        SheetEditing edit ->
             ( { model
                 | sheet =
                     { sheet
@@ -452,15 +456,30 @@ update msg ({ sheet } as model) =
                 DocMsg sheet.bookId sheet.sheetId <|
                     case sheet.source of
                         Rows rows ->
+                            -- TODO: what if we have no columns?
                             sheet.cols
                                 |> Result.withDefault Array.empty
                                 |> Array.get sheet.select.a.x
                                 |> Maybe.map
                                     (\col ->
-                                        [ { action = "put"
-                                          , path = [ E.int sheet.select.a.y, E.string col.key ]
-                                          , value = rows.write |> Maybe.withDefault "" |> E.string
-                                          }
+                                        [ case edit of
+                                            SheetWrite ->
+                                                { action = "put"
+                                                , path = [ E.string "rows", E.int sheet.select.a.y, E.string col.key ]
+                                                , value = rows.write |> Maybe.withDefault "" |> E.string
+                                                }
+
+                                            SheetRowPush i ->
+                                                { action = "insert"
+                                                , path = [ E.string "rows", E.int i ]
+                                                , value = rows.write |> Maybe.withDefault "" |> E.string
+                                                }
+
+                                            SheetColumnPush ->
+                                                { action = "insert"
+                                                , path = [ E.string "cols", E.int (Array.length (Result.withDefault Array.empty sheet.cols)) ]
+                                                , value = E.object []
+                                                }
                                         ]
                                     )
                                 |> Maybe.withDefault []
@@ -488,14 +507,6 @@ update msg ({ sheet } as model) =
 
         CellHovering hover ->
             ( { model | sheet = { sheet | hover = hover } }, Cmd.none )
-
-        ColumnPushing ->
-            -- TODO:
-            ( model, Cmd.none )
-
-        RowPushing _ ->
-            -- TODO:
-            ( model, Cmd.none )
 
         DocChanged change ->
             -- TODO:
@@ -691,7 +702,7 @@ view ({ sheet } as model) =
                                             ]
                                     )
                                     (Array.toList (Result.withDefault Array.empty sheet.cols))
-                                , [ H.th [ A.onClick ColumnPushing, S.verticalAlignBottom ] [ text "➡️" ] ]
+                                , [ H.th [ A.onClick (SheetEditing SheetColumnPush), S.verticalAlignBottom ] [ text "➡️" ] ]
                                 ]
                         ]
                     , H.tbody [] <|
@@ -724,7 +735,7 @@ view ({ sheet } as model) =
                                                         case sheet.source of
                                                             Rows { write } ->
                                                                 [ if write /= Nothing && sheet.select == rect i n i n then
-                                                                    H.input [ A.id "new-cell", A.value (Maybe.withDefault "" write), A.onInput (InputChanging CellWrite), A.onBlur CellSaving, S.width "100%" ] []
+                                                                    H.input [ A.id "new-cell", A.value (Maybe.withDefault "" write), A.onInput (InputChanging CellWrite), A.onBlur (SheetEditing SheetWrite), S.width "100%" ] []
 
                                                                   else
                                                                     row |> Dict.get col.key |> Maybe.withDefault (E.string "") |> D.decodeValue string |> Result.withDefault "TODO: parse error" |> text
@@ -736,7 +747,7 @@ view ({ sheet } as model) =
                                                 (Array.toList (Result.withDefault Array.empty sheet.cols))
 
                                             -- TODO: Drag this to reorder the row.
-                                            , [ H.th [ A.onClick (RowPushing n), S.textAlignCenter ] [ text "↩️" ] ]
+                                            , [ H.th [ A.onClick (SheetEditing (SheetRowPush n)), S.textAlignCenter ] [ text "↩️" ] ]
                                             ]
                                 )
                             <|

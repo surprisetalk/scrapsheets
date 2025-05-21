@@ -31,7 +31,10 @@
       const doc =
         docUrl && AM.isValidAutomergeUrl(docUrl)
           ? ((await repo.find(docUrl).catch(() => {})) ?? repo.create({}))
-          : repo.create({ rows: [{}] });
+          : repo.create({
+              cols: [{ key: "A", label: "A", type: "text" }],
+              rows: [{ A: "hello" }, { A: "world" }],
+            });
       await doc.isReady();
       window.location.hash = doc.url || docUrl;
       const app = Elm.Main.init({
@@ -43,12 +46,36 @@
           library: {}, // TODO: Root doc.
         },
       });
-      doc.on("change", app.ports.docChanged.send);
-      app.ports.changeDoc.subscribe(({ x, y, data }) => {
+      doc.on("change", data =>
+        app.ports.docChanged.send({ bookId: "TODO", sheetId: "TODO", data }),
+      );
+      app.ports.changeDoc.subscribe(({ bookId, sheetId, data: patches }) => {
+        // TODO: Check bookId and sheetId.
         doc.change(d => {
-          if (!d.rows) d.rows = [{}];
-          if (!d.rows[y]) d.rows[y] = {};
-          d.rows[y][x] = data;
+          for (const patch of patches) {
+            let o = d;
+            const i_ = patch.path.pop();
+            switch (patch.action) {
+              case "put":
+                for (const i in patch.path) {
+                  if (o[i] === undefined)
+                    o[i] = typeof i === "string" ? {} : [];
+                  o = o[i];
+                }
+                o[i_] = patch.value;
+                break;
+              case "insert":
+                for (const i of patch.path) {
+                  if (o[i] === undefined)
+                    o[i] = typeof i === "string" ? {} : [];
+                  o = o[i];
+                }
+                o.insertAt(i_, patch.value);
+                break;
+              default:
+                throw new Error("TODO");
+            }
+          }
         });
       });
     </script>
