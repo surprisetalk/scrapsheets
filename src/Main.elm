@@ -138,6 +138,7 @@ type alias Sheet =
     , newTag : Maybe String
     , select : Rect
     , hover : Index
+    , click : Bool
     , rows : Result String (Array Row)
     , cols : Result String (Array (Col Type))
     , source : Source
@@ -317,6 +318,7 @@ init flags _ nav =
                         )
                     |> Result.mapError D.errorToString
             , hover = xy -1 -1
+            , click = False
             , select = Rect (xy -1 -1) (xy -1 -1)
             , rows =
                 flags.doc
@@ -538,21 +540,24 @@ update msg ({ sheet } as model) =
             )
 
         CellMouseDown ->
-            let
-                select =
-                    sheet.select
-            in
-            ( { model | sheet = { sheet | select = { select | a = sheet.hover } } }, Cmd.none )
+            ( { model | sheet = { sheet | click = True, select = Rect sheet.hover sheet.select.b } }, Cmd.none )
 
         CellMouseUp ->
+            ( { model | sheet = { sheet | click = False, select = Rect sheet.select.a sheet.hover } }, Cmd.none )
+
+        CellHovering hover ->
             let
                 select =
                     sheet.select
-            in
-            ( { model | sheet = { sheet | select = { select | b = sheet.hover } } }, Cmd.none )
 
-        CellHovering hover ->
-            ( { model | sheet = { sheet | hover = hover } }, Cmd.none )
+                select_ =
+                    if sheet.click then
+                        { select | b = hover }
+
+                    else
+                        select
+            in
+            ( { model | sheet = { sheet | hover = hover, select = select_ } }, Cmd.none )
 
         DocChanged change ->
             -- TODO:
@@ -642,6 +647,7 @@ update msg ({ sheet } as model) =
                 DocMsg sheet.bookId sheet.sheetId <|
                     case sheet.source of
                         Rows rows ->
+                            -- TODO: Do multiple patches when ranges are selected.
                             case ( negate sheet.select.a.y, negate sheet.select.a.x ) of
                                 ( 1, 1 ) ->
                                     []
@@ -869,8 +875,20 @@ view ({ sheet } as model) =
                                                         , A.onMouseDown CellMouseDown
                                                         , A.onMouseUp CellMouseUp
                                                         , A.onMouseEnter (CellHovering (xy i n))
-                                                        , A.classList
-                                                            [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && ((sheet.select.a.x <= i && i <= sheet.select.b.x) || (sheet.select.a.x == -1 && -1 == sheet.select.b.x)) && ((sheet.select.a.y <= n && n <= sheet.select.b.y) || (sheet.select.a.y == -1 && -1 == sheet.select.b.y)) )
+                                                        , A.classList <|
+                                                            let
+                                                                { a, b } =
+                                                                    sheet.select
+
+                                                                between : number -> number -> number -> Bool
+                                                                between a_ b_ i_ =
+                                                                    min a_ b_ <= i_ && i_ <= max a_ b_
+
+                                                                eq : number -> number -> number -> Bool
+                                                                eq a_ b_ i_ =
+                                                                    a_ == i_ && i_ == b_
+                                                            in
+                                                            [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
                                                             ]
                                                         ]
                                                     <|
