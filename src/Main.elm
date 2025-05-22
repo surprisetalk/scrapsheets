@@ -14,6 +14,7 @@ port module Main exposing (main)
 import Array exposing (Array)
 import Browser
 import Browser.Dom as Dom
+import Browser.Events as Browser
 import Browser.Navigation as Nav
 import Date exposing (Date)
 import Dict exposing (Dict)
@@ -60,7 +61,7 @@ type alias DocChange =
     { doc : D.Value
     , handle : D.Value
     , patchInfo : D.Value
-    , patches : List Patch
+    , patches : List D.Value
     }
 
 
@@ -74,7 +75,7 @@ type alias DocMsg a =
 type alias Patch =
     { action : String
     , path : List D.Value
-    , values : List D.Value
+    , value : D.Value
     }
 
 
@@ -111,6 +112,7 @@ subs : Model -> Sub Msg
 subs model =
     Sub.batch
         [ docChanged DocChanged
+        , Browser.onKeyPress (D.map KeyPressed (D.field "key" D.string))
         ]
 
 
@@ -390,6 +392,7 @@ type Msg
     = NoOp
     | InputChanging Input String
     | SheetEditing SheetEdit
+    | KeyPressed String
     | CellMouseClick
     | CellMouseDown
     | CellMouseUp
@@ -400,7 +403,7 @@ type Msg
 
 
 type SheetEdit
-    = SheetWrite
+    = SheetWrite Index
     | SheetColumnPush
     | SheetRowPush Int
 
@@ -438,8 +441,20 @@ update msg ({ sheet } as model) =
             ( model, Cmd.none )
 
         InputChanging CellWrite x ->
-            -- TODO:
-            ( model, Cmd.none )
+            ( { model
+                | sheet =
+                    { sheet
+                        | source =
+                            case sheet.source of
+                                Rows rows ->
+                                    Rows { rows | write = Just x }
+
+                                source ->
+                                    source
+                    }
+              }
+            , Cmd.none
+            )
 
         InputChanging (ColumnType i) x ->
             -- TODO:
@@ -470,40 +485,57 @@ update msg ({ sheet } as model) =
                 DocMsg sheet.bookId sheet.sheetId <|
                     case sheet.source of
                         Rows rows ->
-                            -- TODO: what if we have no columns?
-                            sheet.cols
-                                |> Result.withDefault Array.empty
-                                |> Array.get sheet.select.a.x
-                                |> Maybe.map
-                                    (\col ->
-                                        [ case edit of
-                                            SheetWrite ->
-                                                { action = "cell-put"
-                                                , path = [ E.string "rows", E.int sheet.select.a.y, E.string col.key ]
-                                                , values = [ rows.write |> Maybe.withDefault "" |> E.string ]
-                                                }
+                            case edit of
+                                SheetWrite { x, y } ->
+                                    -- TODO: what if we have no columns?
+                                    sheet.cols
+                                        |> Result.withDefault Array.empty
+                                        |> Array.get x
+                                        |> Maybe.map
+                                            (\col ->
+                                                [ { action = "cell-put"
+                                                  , path = [ E.string "rows", E.int y, E.string col.key ]
+                                                  , value = rows.write |> Maybe.withDefault "" |> E.string
+                                                  }
+                                                ]
+                                            )
+                                        |> Maybe.withDefault []
 
-                                            SheetRowPush i ->
-                                                { action = "row-insert"
-                                                , path = [ E.string "rows", E.int i ]
-                                                , values = [ E.object [] ]
-                                                }
+                                SheetRowPush i ->
+                                    [ { action = "row-insert"
+                                      , path = [ E.string "rows", E.int i ]
+                                      , value = E.object []
+                                      }
+                                    ]
 
-                                            SheetColumnPush ->
-                                                { action = "col-insert"
-                                                , path = [ E.string "cols", E.int (Array.length (Result.withDefault Array.empty sheet.cols)) ]
-                                                , values = [ E.object [ ( "key", E.string "" ), ( "label", E.string "" ), ( "type", E.string "same" ) ] ]
-                                                }
-                                        ]
-                                    )
-                                |> Maybe.withDefault []
+                                SheetColumnPush ->
+                                    [ { action = "col-insert"
+                                      , path = [ E.string "cols", E.int (Array.length (Result.withDefault Array.empty sheet.cols)) ]
+                                      , value = E.object [ ( "key", E.string "" ), ( "label", E.string "" ), ( "type", E.string "same" ) ]
+                                      }
+                                    ]
 
                         _ ->
                             []
             )
 
         CellMouseClick ->
-            ( { model | sheet = { sheet | select = { a = sheet.hover, b = sheet.hover } } }, Cmd.none )
+            ( { model
+                | sheet =
+                    { sheet
+                        | select = { a = sheet.hover, b = sheet.hover }
+                        , source =
+                            case sheet.source of
+                                Rows rows ->
+                                    -- TODO: Fill in cell value.
+                                    Rows { rows | write = Just "" }
+
+                                _ ->
+                                    sheet.source
+                    }
+              }
+            , Task.attempt (always NoOp) (Dom.focus "new-cell")
+            )
 
         CellMouseDown ->
             let
@@ -527,7 +559,23 @@ update msg ({ sheet } as model) =
             ( { model
                 | sheet =
                     { sheet
-                        | rows =
+                        | cols =
+                            -- TODO: Calculate these from .source
+                            change.data.doc
+                                |> D.decodeValue
+                                    (D.map identity
+                                        (D.field "cols"
+                                            (D.array
+                                                (D.map3 Col
+                                                    (D.field "key" D.string)
+                                                    (D.field "label" D.string)
+                                                    (D.field "type" (D.succeed Text))
+                                                )
+                                            )
+                                        )
+                                    )
+                                |> Result.mapError D.errorToString
+                        , rows =
                             change.data.doc
                                 |> D.decodeValue
                                     (D.map identity
@@ -536,6 +584,30 @@ update msg ({ sheet } as model) =
                                         )
                                     )
                                 |> Result.mapError D.errorToString
+                        , source =
+                            case sheet.source of
+                                Rows rows ->
+                                    Rows
+                                        { rows
+                                            | cols =
+                                                change.data.doc
+                                                    |> D.decodeValue
+                                                        (D.map identity
+                                                            (D.field "cols"
+                                                                (D.array
+                                                                    (D.map3 Col
+                                                                        (D.field "key" D.string)
+                                                                        (D.field "label" D.string)
+                                                                        (D.field "type" (D.succeed (Exceed "TODO")))
+                                                                    )
+                                                                )
+                                                            )
+                                                        )
+                                                    |> Result.withDefault Array.empty
+                                        }
+
+                                _ ->
+                                    sheet.source
                     }
               }
             , Cmd.none
@@ -551,6 +623,62 @@ update msg ({ sheet } as model) =
 
         LinkClicked (Browser.External url) ->
             -- TODO
+            ( model, Cmd.none )
+
+        KeyPressed "Backspace" ->
+            ( { model
+                | sheet =
+                    { sheet
+                        | source =
+                            case sheet.source of
+                                Rows rows ->
+                                    Rows { rows | write = Nothing }
+
+                                source ->
+                                    source
+                    }
+              }
+            , changeDoc <|
+                DocMsg sheet.bookId sheet.sheetId <|
+                    case sheet.source of
+                        Rows rows ->
+                            case ( negate sheet.select.a.y, negate sheet.select.a.x ) of
+                                ( 1, 1 ) ->
+                                    []
+
+                                ( 1, i ) ->
+                                    [ { action = "col-del"
+                                      , path = [ E.string "cols", E.int (negate i) ]
+                                      , value = E.object []
+                                      }
+                                    ]
+
+                                ( i, 1 ) ->
+                                    [ { action = "row-del"
+                                      , path = [ E.string "rows", E.int (negate i) ]
+                                      , value = E.object []
+                                      }
+                                    ]
+
+                                ( y, x ) ->
+                                    sheet.cols
+                                        |> Result.withDefault Array.empty
+                                        |> Array.get (negate x)
+                                        |> Maybe.map
+                                            (\col ->
+                                                [ { action = "cell-put"
+                                                  , path = [ E.string "rows", E.int (negate y), E.string col.key ]
+                                                  , value = rows.write |> Maybe.withDefault "" |> E.string
+                                                  }
+                                                ]
+                                            )
+                                        |> Maybe.withDefault []
+
+                        _ ->
+                            []
+            )
+
+        KeyPressed _ ->
             ( model, Cmd.none )
 
 
@@ -749,7 +877,7 @@ view ({ sheet } as model) =
                                                         case sheet.source of
                                                             Rows { write } ->
                                                                 [ if write /= Nothing && sheet.select == rect i n i n then
-                                                                    H.input [ A.id "new-cell", A.value (Maybe.withDefault "" write), A.onInput (InputChanging CellWrite), A.onBlur (SheetEditing SheetWrite), S.width "100%" ] []
+                                                                    H.input [ A.id "new-cell", A.value (Maybe.withDefault "" write), A.onInput (InputChanging CellWrite), A.onBlur (SheetEditing (SheetWrite sheet.select.a)), S.width "100%" ] []
 
                                                                   else
                                                                     row |> Dict.get col.key |> Maybe.withDefault (E.string "") |> D.decodeValue string |> Result.withDefault "TODO: parse error" |> text
