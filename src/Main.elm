@@ -630,6 +630,9 @@ update msg ({ sheet } as model) =
             -- TODO
             ( model, Cmd.none )
 
+        KeyPressed "Enter" ->
+            ( model, Task.attempt (always NoOp) (Dom.blur "new-cell") )
+
         KeyPressed "Backspace" ->
             ( { model
                 | sheet =
