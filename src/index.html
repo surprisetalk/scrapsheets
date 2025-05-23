@@ -59,12 +59,6 @@
 
         window.location.hash = sheetDoc.documentId;
 
-        console.log({
-          sheetId: sheetDoc.documentId,
-          sheet: await sheetDoc.doc(),
-          library: await library(),
-        });
-
         const app = Elm.Main.init({
           node: document.getElementById("elm"),
           flags: {
@@ -74,9 +68,10 @@
           },
         });
 
-        sheetDoc.on("change", data =>
-          app.ports.sheetChanged.send({ sheetId: data.doc.documentId, data }),
-        );
+        sheetDoc.on("change", data => {
+          const payload = { sheetId: sheetDoc.documentId, data };
+          app.ports.sheetChanged.send(payload);
+        });
 
         for (const id in bookDocs)
           bookDocs[id].on("change", async data =>
@@ -95,18 +90,20 @@
             sheetDoc.removeAllListeners();
             sheetDoc = newDoc;
             await sheetDoc.isReady();
-            sheetDoc.on("change", data =>
-              app.ports.sheetChanged.send({ sheetId: sheetDoc, data }),
-            );
-            app.ports.sheetChanged.send({
-              sheetId: currentSheetId,
+            sheetDoc.on("change", data => {
+              const payload = { sheetId: sheetDoc.documentId, data };
+              app.ports.sheetChanged.send(payload);
+            });
+            const initialPayload = {
+              sheetId: sheetDoc.documentId,
               data: {
                 doc: await sheetDoc.doc(),
                 handle: null,
                 patchInfo: null,
                 patches: [],
               },
-            });
+            };
+            app.ports.sheetChanged.send(initialPayload);
           }
         });
 
