@@ -40,22 +40,22 @@ import Url exposing (Url)
 port libraryChanged : (D.Value -> msg) -> Sub msg
 
 
-port changeBook : DocMsg SheetInfo -> Cmd msg
+port changeBook : DocMsg { sheetId : Id, data : SheetInfo } -> Cmd msg
 
 
-port changeDoc : DocMsg (List Patch) -> Cmd msg
+port changeSheet : DocMsg (List Patch) -> Cmd msg
 
 
-port notifyDoc : DocMsg E.Value -> Cmd msg
+port notifySheet : DocMsg E.Value -> Cmd msg
 
 
-port docChanged : (DocMsg DocChange -> msg) -> Sub msg
+port sheetChanged : (DocMsg DocChange -> msg) -> Sub msg
 
 
-port docNotified : (DocMsg D.Value -> msg) -> Sub msg
+port sheetNotified : (DocMsg D.Value -> msg) -> Sub msg
 
 
-port selectSheet : { bookId : Id, sheetId : Id } -> Cmd msg
+port selectSheet : Id -> Cmd msg
 
 
 type alias DocChange =
@@ -67,8 +67,7 @@ type alias DocChange =
 
 
 type alias DocMsg a =
-    { bookId : Id
-    , sheetId : Id
+    { sheetId : Id
     , data : a
     }
 
@@ -112,7 +111,7 @@ main =
 subs : Model -> Sub Msg
 subs model =
     Sub.batch
-        [ docChanged DocChanged
+        [ sheetChanged DocChanged
         , libraryChanged LibraryChanged
         , Browser.onKeyPress (D.map KeyPressed (D.field "key" D.string))
         ]
@@ -128,14 +127,13 @@ type alias Id =
 
 type alias Model =
     { nav : Nav.Key
-    , library : Library
+    , library : Dict Id Book
     , sheet : Sheet
     }
 
 
 type alias Sheet =
-    { bookId : Id
-    , sheetId : Id
+    { sheetId : Id
     , search : String
     , newTag : Maybe String
     , select : Rect
@@ -149,10 +147,6 @@ type alias Sheet =
 
 type alias Row =
     Dict String D.Value
-
-
-type alias Library =
-    Dict Id Book
 
 
 type alias Book =
@@ -276,12 +270,9 @@ type
 
 
 type alias Flags =
-    { host : String
-    , docUrl : String
-    , doc : D.Value
+    { sheetId : String
+    , sheet : D.Value
     , library : D.Value
-    , bookId : String
-    , sheetId : String
     }
 
 
@@ -296,18 +287,25 @@ init flags _ nav =
                             (D.field "dir" D.string)
                             (D.succeed ())
                             (D.succeed Dict.empty)
-                            (D.succeed Dict.empty)
+                            (D.field "sheets"
+                                (D.dict
+                                    (D.map3 SheetInfo
+                                        (D.field "name" D.string)
+                                        (D.field "tags" (D.list D.string))
+                                        (D.succeed ())
+                                    )
+                                )
+                            )
                         )
                     )
                 |> Result.withDefault Dict.empty
       , sheet =
-            { bookId = flags.bookId
-            , sheetId = flags.sheetId
+            { sheetId = flags.sheetId
             , search = "TODO: search"
             , newTag = Nothing
             , cols =
                 -- TODO: Calculate these from the source.
-                flags.doc
+                flags.sheet
                     |> D.decodeValue
                         (D.map identity
                             (D.field "cols"
@@ -325,7 +323,7 @@ init flags _ nav =
             , click = False
             , select = Rect (xy -1 -1) (xy -1 -1)
             , rows =
-                flags.doc
+                flags.sheet
                     |> D.decodeValue
                         (D.map identity
                             (D.field "rows"
@@ -337,7 +335,7 @@ init flags _ nav =
                 Rows
                     { write = Nothing
                     , cols =
-                        flags.doc
+                        flags.sheet
                             |> D.decodeValue
                                 (D.map identity
                                     (D.field "cols"
@@ -488,8 +486,8 @@ update msg ({ sheet } as model) =
                                     source
                     }
               }
-            , changeDoc <|
-                DocMsg sheet.bookId sheet.sheetId <|
+            , changeSheet <|
+                DocMsg sheet.sheetId <|
                     case sheet.source of
                         Rows rows ->
                             case edit of
@@ -651,19 +649,10 @@ update msg ({ sheet } as model) =
 
         UrlChanged url ->
             case url.fragment of
-                Just fragment ->
-                    case String.split "/" fragment of
-                        [ bookId, sheetId ] ->
-                            if bookId /= sheet.bookId || sheetId /= sheet.sheetId then
-                                ( model
-                                , selectSheet { bookId = bookId, sheetId = sheetId }
-                                )
-
-                            else
-                                ( model, Cmd.none )
-
-                        _ ->
-                            ( model, Cmd.none )
+                Just sheetId ->
+                    ( model
+                    , selectSheet sheetId
+                    )
 
                 Nothing ->
                     ( model, Cmd.none )
@@ -692,8 +681,8 @@ update msg ({ sheet } as model) =
                                     source
                     }
               }
-            , changeDoc <|
-                DocMsg sheet.bookId sheet.sheetId <|
+            , changeSheet <|
+                DocMsg sheet.sheetId <|
                     case sheet.source of
                         Rows rows ->
                             -- TODO: Do multiple patches when ranges are selected.
@@ -746,7 +735,8 @@ view ({ sheet } as model) =
     let
         book : Book
         book =
-            model.library |> Dict.get sheet.bookId |> Maybe.withDefault { dir = "", perms = (), peers = Dict.empty, sheets = Dict.empty }
+            -- TODO:
+            { dir = "", perms = (), peers = Dict.empty, sheets = Dict.empty }
 
         { name, tags, thumb } =
             book.sheets |> Dict.get sheet.sheetId |> Maybe.withDefault { name = "", tags = [], thumb = () }
@@ -779,9 +769,9 @@ view ({ sheet } as model) =
                         -- Badges indicate scrapscript news, book notifs, etc.
                         [ H.a [ A.href "/" ] [ text "scrapsheets (2)" ]
                         , text "/"
-                        , H.a [ A.href ("#/" ++ sheet.bookId) ] [ text (bookName ++ " (12)") ]
+                        , H.a [ A.href ("#" ++ "TODO") ] [ text (book.dir ++ " (12)") ]
                         , text "/"
-                        , H.a [ A.href ("#/" ++ sheet.bookId ++ "/" ++ sheet.sheetId) ] [ text (name ++ " (7)") ]
+                        , H.a [ A.href ("#" ++ sheet.sheetId) ] [ text (name ++ " (7)") ]
                         , text "/"
                         , H.input [ A.value name, A.onInput (InputChanging SheetName) ] []
                         , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <|
