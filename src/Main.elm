@@ -37,9 +37,7 @@ import Url exposing (Url)
 ---- PORTS --------------------------------------------------------------------
 
 
-port libraryChanged :
-    -- TODO:
-    () -> Cmd msg
+port libraryChanged : (D.Value -> msg) -> Sub msg
 
 
 port changeBook : DocMsg SheetInfo -> Cmd msg
@@ -55,6 +53,9 @@ port docChanged : (DocMsg DocChange -> msg) -> Sub msg
 
 
 port docNotified : (DocMsg D.Value -> msg) -> Sub msg
+
+
+port selectSheet : { bookId : Id, sheetId : Id } -> Cmd msg
 
 
 type alias DocChange =
@@ -112,6 +113,7 @@ subs : Model -> Sub Msg
 subs model =
     Sub.batch
         [ docChanged DocChanged
+        , libraryChanged LibraryChanged
         , Browser.onKeyPress (D.map KeyPressed (D.field "key" D.string))
         ]
 
@@ -278,6 +280,8 @@ type alias Flags =
     , docUrl : String
     , doc : D.Value
     , library : D.Value
+    , bookId : String
+    , sheetId : String
     }
 
 
@@ -297,8 +301,8 @@ init flags _ nav =
                     )
                 |> Result.withDefault Dict.empty
       , sheet =
-            { bookId = "234"
-            , sheetId = "123"
+            { bookId = flags.bookId
+            , sheetId = flags.sheetId
             , search = "TODO: search"
             , newTag = Nothing
             , cols =
@@ -400,6 +404,7 @@ type Msg
     | CellMouseUp
     | CellHovering Index
     | DocChanged (DocMsg DocChange)
+    | LibraryChanged D.Value
     | UrlChanged Url
     | LinkClicked Browser.UrlRequest
 
@@ -618,9 +623,50 @@ update msg ({ sheet } as model) =
             , Cmd.none
             )
 
+        LibraryChanged libraryData ->
+            ( { model
+                | library =
+                    libraryData
+                        |> D.decodeValue
+                            (D.dict
+                                (D.map4 Book
+                                    (D.field "dir" D.string)
+                                    (D.field "perms" (D.succeed ()))
+                                    (D.field "peers" (D.dict (D.succeed ())))
+                                    (D.field "sheets"
+                                        (D.dict
+                                            (D.map3 SheetInfo
+                                                (D.field "name" D.string)
+                                                (D.field "tags" (D.list D.string))
+                                                (D.field "thumb" (D.succeed ()))
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        |> Result.withDefault model.library
+              }
+            , Cmd.none
+            )
+
         UrlChanged url ->
-            -- TODO
-            ( model, Cmd.none )
+            case url.fragment of
+                Just fragment ->
+                    case String.split "/" fragment of
+                        [ bookId, sheetId ] ->
+                            if bookId /= sheet.bookId || sheetId /= sheet.sheetId then
+                                ( model
+                                , selectSheet { bookId = bookId, sheetId = sheetId }
+                                )
+
+                            else
+                                ( model, Cmd.none )
+
+                        _ ->
+                            ( model, Cmd.none )
+
+                Nothing ->
+                    ( model, Cmd.none )
 
         LinkClicked (Browser.Internal url) ->
             -- TODO: ?q=+any ?q=-any ?q==any
@@ -705,6 +751,14 @@ view ({ sheet } as model) =
         { name, tags, thumb } =
             book.sheets |> Dict.get sheet.sheetId |> Maybe.withDefault { name = "", tags = [], thumb = () }
 
+        bookName : String
+        bookName =
+            book.dir
+                |> String.split "/"
+                |> List.reverse
+                |> List.head
+                |> Maybe.withDefault "unknown"
+
         nrows : Int
         nrows =
             Array.length (Result.withDefault Array.empty sheet.rows)
@@ -725,9 +779,9 @@ view ({ sheet } as model) =
                         -- Badges indicate scrapscript news, book notifs, etc.
                         [ H.a [ A.href "/" ] [ text "scrapsheets (2)" ]
                         , text "/"
-                        , H.a [ A.href "/taylor" ] [ text "taylor (12)" ]
+                        , H.a [ A.href ("#/" ++ sheet.bookId) ] [ text (bookName ++ " (12)") ]
                         , text "/"
-                        , H.a [ A.href "/taylor/personal" ] [ text "personal (7)" ]
+                        , H.a [ A.href ("#/" ++ sheet.bookId ++ "/" ++ sheet.sheetId) ] [ text (name ++ " (7)") ]
                         , text "/"
                         , H.input [ A.value name, A.onInput (InputChanging SheetName) ] []
                         , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <|

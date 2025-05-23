@@ -27,28 +27,207 @@
         storage: new AM.IndexedDBStorageAdapter(),
         // network: [new AM.BrowserWebSocketClientAdapter("wss://sync.automerge.org")],
       });
-      const docUrl = window.location.hash.slice(1);
-      const doc =
-        docUrl && AM.isValidAutomergeUrl(docUrl)
-          ? ((await repo.find(docUrl).catch(() => {})) ?? repo.create({}))
-          : repo.create({
-              cols: [{ key: "A", label: "A", type: "text" }],
-              rows: [{ A: "hello" }, { A: "world" }],
-            });
+      const [bookId, sheetId] = window.location.hash.slice(1).split("/");
+
+      let library;
+      const libraryId = localStorage.getItem("scrapsheets-library-id");
+      if (libraryId && AM.isValidAutomergeUrl(libraryId)) {
+        library = await repo.find(libraryId).catch(() => null);
+      }
+
+      if (!library) {
+        const personalBook = repo.create({
+          dir: "/taylor/personal",
+          sheets: {},
+        });
+        const workBook = repo.create({
+          dir: "/taylor/work",
+          sheets: {},
+        });
+        const recipesBook = repo.create({
+          dir: "/shared/recipes",
+          sheets: {},
+        });
+        const demoSheet = repo.create({
+          cols: [
+            { key: "A", label: "Task", type: "text" },
+            { key: "B", label: "Status", type: "text" },
+          ],
+          rows: [
+            { A: "Setup project", B: "Done" },
+            { A: "Create demo", B: "In Progress" },
+          ],
+        });
+        const budgetSheet = repo.create({
+          cols: [
+            { key: "A", label: "Item", type: "text" },
+            { key: "B", label: "Amount", type: "number" },
+          ],
+          rows: [
+            { A: "Groceries", B: "150" },
+            { A: "Gas", B: "80" },
+          ],
+        });
+        const taskSheet = repo.create({
+          cols: [
+            { key: "A", label: "Project", type: "text" },
+            { key: "B", label: "Priority", type: "text" },
+          ],
+          rows: [
+            { A: "Website redesign", B: "High" },
+            { A: "Documentation", B: "Medium" },
+          ],
+        });
+
+        await Promise.all([
+          personalBook.isReady(),
+          workBook.isReady(),
+          recipesBook.isReady(),
+          demoSheet.isReady(),
+          budgetSheet.isReady(),
+          taskSheet.isReady(),
+        ]);
+
+        library = repo.create({
+          [personalBook.documentId]: {
+            dir: "/taylor/personal",
+            sheets: {
+              [demoSheet.documentId]: {
+                name: "Demo Sheet",
+                tags: ["demo", "example"],
+                thumb: null,
+              },
+              [budgetSheet.documentId]: {
+                name: "Budget Tracker",
+                tags: ["finance", "personal"],
+                thumb: null,
+              },
+            },
+          },
+          [workBook.documentId]: {
+            dir: "/taylor/work",
+            sheets: {
+              [taskSheet.documentId]: {
+                name: "Project Tasks",
+                tags: ["project", "tasks"],
+                thumb: null,
+              },
+            },
+          },
+          [recipesBook.documentId]: {
+            dir: "/shared/recipes",
+            sheets: {},
+          },
+        });
+
+        await library.isReady();
+        localStorage.setItem("scrapsheets-library-id", library.documentId);
+      }
+
+      const libraryData = await library.doc();
+      let doc, currentBookId, currentSheetId;
+
+      if (bookId && sheetId) {
+        doc = await repo.find(sheetId).catch(() => null);
+        currentBookId = bookId;
+        currentSheetId = sheetId;
+      } else {
+        for (const [bId, book] of Object.entries(libraryData)) {
+          const sId = Object.keys(book.sheets || {})[0];
+          if (sId) {
+            doc = await repo.find(sId).catch(() => null);
+            if (doc) {
+              currentBookId = bId;
+              currentSheetId = sId;
+              break;
+            }
+          }
+        }
+        currentBookId = currentBookId || Object.keys(libraryData)[0];
+      }
+
+      if (!doc) {
+        doc = repo.create({
+          cols: [{ key: "A", label: "A", type: "text" }],
+          rows: [{ A: "hello" }, { A: "world" }],
+        });
+        await doc.isReady();
+        currentSheetId = doc.documentId;
+
+        await library.change(l => {
+          if (!l[currentBookId]) l[currentBookId] = { dir: "/new", sheets: {} };
+          l[currentBookId].sheets[currentSheetId] = {
+            name: "New Sheet",
+            tags: [],
+            thumb: null,
+          };
+        });
+      }
+
+      if (!bookId || !sheetId)
+        window.location.hash = `${currentBookId}/${currentSheetId}`;
+
       await doc.isReady();
-      window.location.hash = doc.url || docUrl;
+
       const app = Elm.Main.init({
         node: document.getElementById("elm"),
         flags: {
           host: window.location.host,
-          docUrl,
+          docUrl: doc.documentId,
           doc: await doc.doc(),
-          library: {}, // TODO: Root doc.
+          library: await library.doc(),
+          bookId: currentBookId,
+          sheetId: currentSheetId,
         },
       });
       doc.on("change", data =>
-        app.ports.docChanged.send({ bookId: "TODO", sheetId: "TODO", data }),
+        app.ports.docChanged.send({
+          bookId: currentBookId,
+          sheetId: currentSheetId,
+          data,
+        }),
       );
+      library.on("change", async data => {
+        app.ports.libraryChanged.send(await library.doc());
+      });
+      app.ports.selectSheet.subscribe(async ({ bookId, sheetId }) => {
+        // Update current IDs
+        currentBookId = bookId;
+        currentSheetId = sheetId;
+
+        // Load the new document
+        const newDoc = await repo.find(sheetId).catch(() => null);
+        if (newDoc) {
+          // Remove old listener
+          doc.removeAllListeners();
+
+          // Set new doc
+          doc = newDoc;
+          await doc.isReady();
+
+          // Add new listener
+          doc.on("change", data =>
+            app.ports.docChanged.send({
+              bookId: currentBookId,
+              sheetId: currentSheetId,
+              data,
+            }),
+          );
+
+          // Send the new doc data to Elm
+          app.ports.docChanged.send({
+            bookId: currentBookId,
+            sheetId: currentSheetId,
+            data: {
+              doc: await doc.doc(),
+              handle: null,
+              patchInfo: null,
+              patches: [],
+            },
+          });
+        }
+      });
+
       app.ports.changeDoc.subscribe(
         // TODO: Use custom patches for now.
         ({ bookId, sheetId, data: patches }) => {
