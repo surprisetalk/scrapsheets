@@ -201,7 +201,8 @@ type
     Feed
     -- TODO: Move some of these to the shop as free templates.
     -- TODO: email, settings, databases, git, github, stripe, logs, sheets, tests, code stats, social media keywords
-    = Lib
+    = Void
+    | Lib
     | Shop
     | Files
     | Rss { opml : () }
@@ -263,6 +264,7 @@ type
     -- | Link
     = Text
     | Number
+    | Many Type
 
 
 
@@ -270,7 +272,7 @@ type
 
 
 type alias Flags =
-    { sheetId : String
+    { sheetId : Maybe String
     , sheet : D.Value
     , library : D.Value
     }
@@ -278,8 +280,22 @@ type alias Flags =
 
 init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
 init flags _ nav =
-    ( { nav = nav
-      , library =
+    let
+        default : Sheet
+        default =
+            { sheetId = ""
+            , search = ""
+            , newTag = Nothing
+            , hover = xy -1 -1
+            , click = False
+            , select = Rect (xy -1 -1) (xy -1 -1)
+            , cols = Err "TODO: default sheet"
+            , rows = Err "TODO: default sheet"
+            , source = Feed Void
+            }
+
+        library : Dict Id Book
+        library =
             flags.library
                 |> D.decodeValue
                     (D.dict
@@ -299,58 +315,95 @@ init flags _ nav =
                         )
                     )
                 |> Result.withDefault Dict.empty
+    in
+    ( { nav = nav
+      , library = library
       , sheet =
-            { sheetId = flags.sheetId
-            , search = "TODO: search"
-            , newTag = Nothing
-            , cols =
-                -- TODO: Calculate these from the source.
-                flags.sheet
-                    |> D.decodeValue
-                        (D.map identity
-                            (D.field "cols"
-                                (D.array
-                                    (D.map3 Col
-                                        (D.field "key" D.string)
-                                        (D.field "label" D.string)
-                                        (D.field "type" (D.succeed Text))
+            case flags.sheetId of
+                Nothing ->
+                    { default
+                        | sheetId = ""
+                        , cols =
+                            [ ( "book_id", Text )
+                            , ( "dir", Text )
+                            , ( "sheet_id", Text )
+                            , ( "name", Text )
+                            , ( "tags", Many Text )
+                            ]
+                                |> List.map (\( k, t ) -> Col k k t)
+                                |> Array.fromList
+                                |> Ok
+                        , rows =
+                            library
+                                |> Dict.toList
+                                |> List.concatMap
+                                    (\( bookId, book ) ->
+                                        book.sheets
+                                            |> Dict.toList
+                                            |> List.map
+                                                (\( sheetId, sheet ) ->
+                                                    Dict.fromList
+                                                        [ ( "book_id", E.string bookId )
+                                                        , ( "dir", E.string book.dir )
+                                                        , ( "sheet_id", E.string sheetId )
+                                                        , ( "name", E.string sheet.name )
+                                                        , ( "tags", E.list E.string sheet.tags )
+                                                        ]
+                                                )
                                     )
-                                )
-                            )
-                        )
-                    |> Result.mapError D.errorToString
-            , hover = xy -1 -1
-            , click = False
-            , select = Rect (xy -1 -1) (xy -1 -1)
-            , rows =
-                flags.sheet
-                    |> D.decodeValue
-                        (D.map identity
-                            (D.field "rows"
-                                (D.list (D.dict D.value) |> D.map Array.fromList)
-                            )
-                        )
-                    |> Result.mapError D.errorToString
-            , source =
-                Rows
-                    { write = Nothing
-                    , cols =
-                        flags.sheet
-                            |> D.decodeValue
-                                (D.map identity
-                                    (D.field "cols"
-                                        (D.array
-                                            (D.map3 Col
-                                                (D.field "key" D.string)
-                                                (D.field "label" D.string)
-                                                (D.field "type" (D.succeed (Exceed "TODO")))
+                                |> Array.fromList
+                                |> Ok
+                        , source = Feed Lib
+                    }
+
+                Just sheetId ->
+                    { default
+                        | sheetId = sheetId
+                        , cols =
+                            -- TODO: Calculate these from the source.
+                            flags.sheet
+                                |> D.decodeValue
+                                    (D.map identity
+                                        (D.field "cols"
+                                            (D.array
+                                                (D.map3 Col
+                                                    (D.field "key" D.string)
+                                                    (D.field "label" D.string)
+                                                    (D.field "type" (D.succeed Text))
+                                                )
                                             )
                                         )
                                     )
-                                )
-                            |> Result.withDefault Array.empty
+                                |> Result.mapError D.errorToString
+                        , rows =
+                            flags.sheet
+                                |> D.decodeValue
+                                    (D.map identity
+                                        (D.field "rows"
+                                            (D.list (D.dict D.value) |> D.map Array.fromList)
+                                        )
+                                    )
+                                |> Result.mapError D.errorToString
+                        , source =
+                            Rows
+                                { write = Nothing
+                                , cols =
+                                    flags.sheet
+                                        |> D.decodeValue
+                                            (D.map identity
+                                                (D.field "cols"
+                                                    (D.array
+                                                        (D.map3 Col
+                                                            (D.field "key" D.string)
+                                                            (D.field "label" D.string)
+                                                            (D.field "type" (D.succeed (Exceed "TODO")))
+                                                        )
+                                                    )
+                                                )
+                                            )
+                                        |> Result.withDefault Array.empty
+                                }
                     }
-            }
       }
     , Cmd.none
     )
@@ -883,6 +936,10 @@ view ({ sheet } as model) =
                                                                   )
                                                                 , ( "max", List.maximum nums )
                                                                 ]
+
+                                                        Many _ ->
+                                                            -- TODO:
+                                                            []
                                                 , H.input [ A.value col.label, A.onInput (InputChanging (ColumnLabel i)) ] []
                                                 , H.input [ A.value col.key, A.onInput (InputChanging (ColumnKey i)) ] []
                                                 , let
@@ -939,17 +996,20 @@ view ({ sheet } as model) =
                                                             ]
                                                         ]
                                                     <|
-                                                        case sheet.source of
-                                                            Rows { write } ->
-                                                                [ if write /= Nothing && sheet.select == rect i n i n then
-                                                                    H.input [ A.id "new-cell", A.value (Maybe.withDefault "" write), A.onInput (InputChanging CellWrite), A.onBlur (SheetEditing (SheetWrite sheet.select.a)), S.width "100%" ] []
+                                                        Maybe.withDefault
+                                                            [ row |> Dict.get col.key |> Maybe.withDefault (E.string "") |> D.decodeValue string |> Result.withDefault "TODO: parse error" |> text
+                                                            ]
+                                                        <|
+                                                            case sheet.source of
+                                                                Rows { write } ->
+                                                                    if write /= Nothing && sheet.select == rect i n i n then
+                                                                        Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" write), A.onInput (InputChanging CellWrite), A.onBlur (SheetEditing (SheetWrite sheet.select.a)), S.width "100%" ] [] ]
 
-                                                                  else
-                                                                    row |> Dict.get col.key |> Maybe.withDefault (E.string "") |> D.decodeValue string |> Result.withDefault "TODO: parse error" |> text
-                                                                ]
+                                                                    else
+                                                                        Nothing
 
-                                                            _ ->
-                                                                []
+                                                                _ ->
+                                                                    Nothing
                                                 )
                                                 (Array.toList (Result.withDefault Array.empty sheet.cols))
 

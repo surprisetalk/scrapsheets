@@ -49,27 +49,21 @@
             ),
           );
 
-        let sheetDoc = await repo.find(window.location.hash.slice(1)).catch(
-          async () =>
-            await repo.create({
-              cols: [{ key: "A", label: "A", type: "same" }],
-              rows: [{ A: "hello" }, { A: "world" }],
-            }),
-        );
-
-        window.location.hash = sheetDoc.documentId;
+        let sheetDoc = await repo
+          .find(window.location.hash.slice(1))
+          .catch(() => null);
 
         const app = Elm.Main.init({
           node: document.getElementById("elm"),
           flags: {
-            sheetId: sheetDoc.documentId,
-            sheet: await sheetDoc.doc(),
+            sheetId: sheetDoc?.documentId ?? null,
+            sheet: (await sheetDoc?.doc()) ?? null,
             library: await library(),
           },
         });
 
-        sheetDoc.on("change", data => {
-          const payload = { sheetId: sheetDoc.documentId, data };
+        sheetDoc?.on("change", data => {
+          const payload = { sheetId: sheetDoc?.documentId, data };
           app.ports.sheetChanged.send(payload);
         });
 
@@ -87,7 +81,7 @@
         app.ports.selectSheet.subscribe(async sheetId => {
           const newDoc = await repo.find(sheetId).catch(() => null);
           if (newDoc) {
-            sheetDoc.removeAllListeners();
+            sheetDoc?.removeAllListeners();
             sheetDoc = newDoc;
             await sheetDoc.isReady();
             sheetDoc.on("change", data => {
@@ -111,7 +105,7 @@
           // TODO: Use custom patches for now.
           ({ sheetId, data: patches }) => {
             for (const patch of patches) {
-              sheetDoc.change(d => {
+              sheetDoc?.change(d => {
                 if (!d.cols) d.cols = [];
                 if (!d.rows) d.rows = [];
                 switch (patch.action) {
