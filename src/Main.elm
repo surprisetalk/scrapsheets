@@ -265,6 +265,7 @@ type
     = Text
     | Number
     | Many Type
+    | Link
 
 
 
@@ -324,9 +325,9 @@ init flags _ nav =
                     { default
                         | sheetId = ""
                         , cols =
-                            [ ( "book_id", Text )
+                            [ ( "book_id", Link )
                             , ( "dir", Text )
-                            , ( "sheet_id", Text )
+                            , ( "sheet_id", Link )
                             , ( "name", Text )
                             , ( "tags", Many Text )
                             ]
@@ -940,6 +941,10 @@ view ({ sheet } as model) =
                                                         Many _ ->
                                                             -- TODO:
                                                             []
+
+                                                        Link ->
+                                                            -- TODO:
+                                                            []
                                                 , H.input [ A.value col.label, A.onInput (InputChanging (ColumnLabel i)) ] []
                                                 , H.input [ A.value col.key, A.onInput (InputChanging (ColumnKey i)) ] []
                                                 , let
@@ -997,7 +1002,20 @@ view ({ sheet } as model) =
                                                         ]
                                                     <|
                                                         Maybe.withDefault
-                                                            [ row |> Dict.get col.key |> Maybe.withDefault (E.string "") |> D.decodeValue string |> Result.withDefault "TODO: parse error" |> text
+                                                            [ row
+                                                                |> Dict.get col.key
+                                                                |> Maybe.withDefault (E.string "")
+                                                                |> D.decodeValue
+                                                                    (case col.t of
+                                                                        Link ->
+                                                                            D.string
+                                                                                |> D.map ((++) "#")
+                                                                                |> D.map (\href -> H.a [ A.href href ] [ text href ])
+
+                                                                        _ ->
+                                                                            D.map text string
+                                                                    )
+                                                                |> Result.withDefault (text "TODO: parse error")
                                                             ]
                                                         <|
                                                             case sheet.source of
