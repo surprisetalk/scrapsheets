@@ -85,10 +85,12 @@
             sheetDoc = newDoc;
             await sheetDoc.isReady();
             sheetDoc.on("change", data => {
-              const payload = { sheetId: sheetDoc.documentId, data };
-              app.ports.sheetChanged.send(payload);
+              app.ports.sheetChanged.send({
+                sheetId: sheetDoc.documentId,
+                data,
+              });
             });
-            const initialPayload = {
+            app.ports.sheetChanged.send({
               sheetId: sheetDoc.documentId,
               data: {
                 doc: await sheetDoc.doc(),
@@ -96,8 +98,7 @@
                 patchInfo: null,
                 patches: [],
               },
-            };
-            app.ports.sheetChanged.send(initialPayload);
+            });
           }
         });
 

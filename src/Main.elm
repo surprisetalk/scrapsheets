@@ -627,7 +627,8 @@ update msg ({ sheet } as model) =
             ( { model
                 | sheet =
                     { sheet
-                        | cols =
+                        | sheetId = change.sheetId
+                        , cols =
                             -- TODO: Calculate these from .source
                             change.data.doc
                                 |> D.decodeValue
@@ -713,7 +714,7 @@ update msg ({ sheet } as model) =
                     ( model, selectSheet sheetId )
 
                 Nothing ->
-                    ( { model | sheet = libSheet model.library }, Cmd.none )
+                    ( { model | sheet = libSheet model.library }, selectSheet "" )
 
         LinkClicked (Browser.Internal url) ->
             -- TODO: ?q=+any ?q=-any ?q==any
@@ -722,7 +723,7 @@ update msg ({ sheet } as model) =
                     ( model, Cmd.batch [ selectSheet sheetId, Nav.pushUrl model.nav (Url.toString url) ] )
 
                 Nothing ->
-                    ( { model | sheet = libSheet model.library }, Nav.pushUrl model.nav (Url.toString { url | fragment = Nothing }) )
+                    ( { model | sheet = libSheet model.library }, Cmd.batch [ selectSheet "", Nav.pushUrl model.nav (Url.toString { url | fragment = Nothing }) ] )
 
         LinkClicked (Browser.External url) ->
             ( model, Nav.load url )
