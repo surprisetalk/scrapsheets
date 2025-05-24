@@ -282,19 +282,6 @@ type alias Flags =
 init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
 init flags _ nav =
     let
-        default : Sheet
-        default =
-            { sheetId = ""
-            , search = ""
-            , newTag = Nothing
-            , hover = xy -1 -1
-            , click = False
-            , select = Rect (xy -1 -1) (xy -1 -1)
-            , cols = Err "TODO: default sheet"
-            , rows = Err "TODO: default sheet"
-            , source = Feed Void
-            }
-
         library : Dict Id Book
         library =
             flags.library
@@ -322,43 +309,10 @@ init flags _ nav =
       , sheet =
             case flags.sheetId of
                 Nothing ->
-                    { default
-                        | sheetId = ""
-                        , cols =
-                            [ ( "book_id", Link )
-                            , ( "dir", Text )
-                            , ( "sheet_id", Link )
-                            , ( "name", Text )
-                            , ( "tags", Many Text )
-                            ]
-                                |> List.map (\( k, t ) -> Col k k t)
-                                |> Array.fromList
-                                |> Ok
-                        , rows =
-                            library
-                                |> Dict.toList
-                                |> List.concatMap
-                                    (\( bookId, book ) ->
-                                        book.sheets
-                                            |> Dict.toList
-                                            |> List.map
-                                                (\( sheetId, sheet ) ->
-                                                    Dict.fromList
-                                                        [ ( "book_id", E.string bookId )
-                                                        , ( "dir", E.string book.dir )
-                                                        , ( "sheet_id", E.string sheetId )
-                                                        , ( "name", E.string sheet.name )
-                                                        , ( "tags", E.list E.string sheet.tags )
-                                                        ]
-                                                )
-                                    )
-                                |> Array.fromList
-                                |> Ok
-                        , source = Feed Lib
-                    }
+                    libSheet library
 
                 Just sheetId ->
-                    { default
+                    { defaultSheet
                         | sheetId = sheetId
                         , cols =
                             -- TODO: Calculate these from the source.
@@ -408,6 +362,58 @@ init flags _ nav =
       }
     , Cmd.none
     )
+
+
+defaultSheet : Sheet
+defaultSheet =
+    { sheetId = ""
+    , search = ""
+    , newTag = Nothing
+    , hover = xy -1 -1
+    , click = False
+    , select = Rect (xy -1 -1) (xy -1 -1)
+    , cols = Err "TODO: default sheet"
+    , rows = Err "TODO: default sheet"
+    , source = Feed Void
+    }
+
+
+libSheet : Dict Id Book -> Sheet
+libSheet library =
+    { defaultSheet
+        | sheetId = ""
+        , cols =
+            [ ( "book_id", Link )
+            , ( "dir", Text )
+            , ( "sheet_id", Link )
+            , ( "name", Text )
+            , ( "tags", Many Text )
+            ]
+                |> List.map (\( k, t ) -> Col k k t)
+                |> Array.fromList
+                |> Ok
+        , rows =
+            library
+                |> Dict.toList
+                |> List.concatMap
+                    (\( bookId, book ) ->
+                        book.sheets
+                            |> Dict.toList
+                            |> List.map
+                                (\( sheetId, sheet ) ->
+                                    Dict.fromList
+                                        [ ( "book_id", E.string bookId )
+                                        , ( "dir", E.string book.dir )
+                                        , ( "sheet_id", E.string sheetId )
+                                        , ( "name", E.string sheet.name )
+                                        , ( "tags", E.list E.string sheet.tags )
+                                        ]
+                                )
+                    )
+                |> Array.fromList
+                |> Ok
+        , source = Feed Lib
+    }
 
 
 
@@ -704,20 +710,22 @@ update msg ({ sheet } as model) =
         UrlChanged url ->
             case url.fragment of
                 Just sheetId ->
-                    ( model
-                    , selectSheet sheetId
-                    )
+                    ( model, selectSheet sheetId )
 
                 Nothing ->
-                    ( model, Cmd.none )
+                    ( { model | sheet = libSheet model.library }, Cmd.none )
 
         LinkClicked (Browser.Internal url) ->
             -- TODO: ?q=+any ?q=-any ?q==any
-            ( model, Cmd.none )
+            case url.fragment of
+                Just sheetId ->
+                    ( model, Cmd.batch [ selectSheet sheetId, Nav.pushUrl model.nav (Url.toString url) ] )
+
+                Nothing ->
+                    ( { model | sheet = libSheet model.library }, Nav.pushUrl model.nav (Url.toString { url | fragment = Nothing }) )
 
         LinkClicked (Browser.External url) ->
-            -- TODO
-            ( model, Cmd.none )
+            ( model, Nav.load url )
 
         KeyPressed "Enter" ->
             ( model, Task.attempt (always NoOp) (Dom.blur "new-cell") )
