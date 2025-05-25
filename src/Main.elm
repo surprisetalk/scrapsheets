@@ -88,6 +88,15 @@ flip f a b =
     f b a
 
 
+iif : Bool -> a -> a -> a
+iif c a b =
+    if c then
+        a
+
+    else
+        b
+
+
 
 ---- MAIN ---------------------------------------------------------------------
 
@@ -879,13 +888,7 @@ view ({ sheet } as model) =
                                                             List.map (\( k, v ) -> H.span [] [ text (k ++ ": " ++ (String.left 5 <| Maybe.withDefault "_" <| Maybe.map String.fromFloat v)) ]) <|
                                                                 [ ( "many", vals |> Array.filter ((/=) Nothing) |> Array.length |> toFloat |> Just )
                                                                 , ( "min", List.minimum nums )
-                                                                , ( "mean"
-                                                                  , if List.length nums > 0 then
-                                                                        Just (List.sum nums / toFloat (List.length nums))
-
-                                                                    else
-                                                                        Nothing
-                                                                  )
+                                                                , ( "mean", iif (List.length nums > 0) (Just (List.sum nums / toFloat (List.length nums))) Nothing )
                                                                 , ( "max", List.maximum nums )
                                                                 ]
 
@@ -960,14 +963,7 @@ view ({ sheet } as model) =
                                                                     (case col.t of
                                                                         Link ->
                                                                             D.string
-                                                                                |> D.map
-                                                                                    (\href ->
-                                                                                        if href == "" then
-                                                                                            "/"
-
-                                                                                        else
-                                                                                            href
-                                                                                    )
+                                                                                |> D.map (\href -> iif (href == "") "/" href)
                                                                                 |> D.map (\href -> H.a [ A.href href ] [ text href ])
 
                                                                         _ ->
