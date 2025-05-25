@@ -280,26 +280,21 @@ type
 type
     Tool
     -- TODO: auto, metadata, actions (contextual keys), problems (lint), stats, ideas, related (sources/backlinks), history (contextual history)
-    = Auto
-    | Metadata
-    | Actions
-    | Problems
-    | Stats
-    | Ideas
-    | Related
+    -- TODO: I like the idea of also linking to /:sheetId/history as another sheet from the tool.
+    = Settings
+    | Hints
+    | Stats { following : Maybe () }
+    | Share
     | History
 
 
 tools : Dict String Tool
 tools =
     Dict.fromList
-        [ ( "auto", Auto )
-        , ( "metadata", Metadata )
-        , ( "actions", Actions )
-        , ( "problems", Problems )
-        , ( "stats", Stats )
-        , ( "ideas", Ideas )
-        , ( "related", Related )
+        [ ( "settings", Settings )
+        , ( "stats", Stats { following = Nothing } )
+        , ( "share", Share )
+        , ( "hints", Hints )
         , ( "history", History )
         ]
 
@@ -342,7 +337,7 @@ defaultSheet =
     , cols = Err "TODO: default sheet"
     , rows = Err "TODO: default sheet"
     , source = Err "TODO: default sheet"
-    , tool = Auto
+    , tool = Settings
     }
 
 
@@ -829,13 +824,12 @@ view ({ sheet } as model) =
                                 ]
                             ]
                     , H.div [ S.displayFlex, S.flexDirectionRowReverse ]
-                        -- TODO: I like the idea of /:sheetId/history as another sheet.
-                        [ H.a [ A.href "history" ] [ text "history (1)" ]
+                        -- TODO: If we need to, we can collapse the tools into a dropdown that only shows the current one.
+                        [ H.a [ A.href "#settings" ] [ text "settings (1)" ]
+                        , H.a [ A.href "#history" ] [ text "history (2)" ]
+                        , H.a [ A.href "#hints" ] [ text "hints (3)" ]
+                        , H.a [ A.href "#stats" ] [ text "stats (2)" ]
                         , H.a [ A.href "#share" ] [ text "share" ]
-                        , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ]
-                            [ H.a [ A.href "?following=+" ] [ text "taylor" ]
-                            , H.a [ A.href "?following=+sarah" ] [ text "sarah" ]
-                            ]
                         ]
                     ]
 
@@ -1005,18 +999,25 @@ view ({ sheet } as model) =
                                     sheet.rows
                     ]
                 ]
-            , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ]
-              -- TODO: Prefer .selected and fallback to .hover.
-              <|
+            , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ] <|
                 List.concat
-                    [ [ H.div [ S.displayFlex ] <| List.indexedMap (\i tool -> H.a [ A.href ("#" ++ tool) ] [ text (String.fromInt (i + 1)) ]) <| Dict.keys tools
-                      ]
-                    , [ H.span [] [ text (Debug.toString sheet.tool) ]
+                    [ [ H.span [] [ text (Debug.toString sheet.tool) ]
                       ]
                     , case sheet.tool of
+                        Share ->
+                            [ H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ]
+                                [ H.a [ A.href "?following=" ] [ text "taylor" ]
+                                , H.a [ A.href "?following=123" ] [ text "sarah" ]
+                                ]
+                            ]
+
                         _ ->
                             [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ]
+                                -- TODO: Link to the column configs.
                                 [ text (Debug.toString sheet.source)
+                                ]
+                            , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd ]
+                                [ H.button [ A.onClick NoOp ] [ text "new column (C)" ]
                                 ]
                             ]
                     ]
