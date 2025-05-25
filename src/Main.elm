@@ -790,6 +790,7 @@ view ({ sheet } as model) =
     , body =
         [ H.node "style" [] [ text "body * { box-sizing: border-box; gap: 1rem; }" ]
         , H.node "style" [] [ text "body { font-family: sans-serif; }" ]
+        , H.node "style" [] [ text "a { text-decoration: none; }" ]
         , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { td { background: rgba(255,255,255,0.05); } }" ]
         , H.node "style" [] [ text "td:hover { background: rgba(0,0,0,0.15); }" ]
