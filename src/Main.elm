@@ -289,7 +289,7 @@ init flags _ nav =
     in
     ( { nav = nav
       , library = library
-      , sheet = decodeSheet (Maybe.withDefault "" flags.sheetId) flags.sheet
+      , sheet = decodeSheet library (Maybe.withDefault "" flags.sheetId) flags.sheet
       }
     , Cmd.none
     )
@@ -398,36 +398,36 @@ libraryDecoder =
         )
 
 
-decodeSheet : Id -> D.Value -> Sheet
-decodeSheet id sheet =
+decodeSheet : Dict Id Book -> Id -> D.Value -> Sheet
+decodeSheet library id sheet =
     -- TODO: Consider doing D.Decoder ({cols, rows, source}) instead.
-    let
-        colsDecoder : D.Decoder (Array (Col Type))
-        colsDecoder =
-            -- TODO: Calculate these from the source.
-            D.map identity
-                (D.field "cols"
-                    (D.array
-                        (D.map3 Col
-                            (D.field "key" D.string)
-                            (D.field "label" D.string)
-                            (D.field "type" (D.succeed Text))
+    case id of
+        "" ->
+            libSheet library
+
+        _ ->
+            let
+                colsDecoder : D.Decoder (Array (Col Type))
+                colsDecoder =
+                    -- TODO: Calculate these from the source.
+                    D.map identity
+                        (D.field "cols"
+                            (D.array
+                                (D.map3 Col
+                                    (D.field "key" D.string)
+                                    (D.field "label" D.string)
+                                    (D.field "type" (D.succeed Text))
+                                )
+                            )
                         )
-                    )
-                )
 
-        rowsDecoder : D.Decoder (Array Row)
-        rowsDecoder =
-            D.field "rows"
-                (D.list (D.dict D.value) |> D.map Array.fromList)
+                rowsDecoder : D.Decoder (Array Row)
+                rowsDecoder =
+                    D.field "rows"
+                        (D.list (D.dict D.value) |> D.map Array.fromList)
 
-        sourceDecoder : D.Decoder Source
-        sourceDecoder =
-            case id of
-                "" ->
-                    D.succeed (Feed Lib)
-
-                _ ->
+                sourceDecoder : D.Decoder Source
+                sourceDecoder =
                     D.oneOf
                         [ D.map Rows
                             (D.map (\cols -> { write = Nothing, cols = cols })
@@ -444,13 +444,13 @@ decodeSheet id sheet =
                                 )
                             )
                         ]
-    in
-    { defaultSheet
-        | sheetId = id
-        , cols = sheet |> D.decodeValue colsDecoder |> Result.mapError D.errorToString
-        , rows = sheet |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString
-        , source = sheet |> D.decodeValue sourceDecoder |> Result.mapError D.errorToString
-    }
+            in
+            { defaultSheet
+                | sheetId = id
+                , cols = sheet |> D.decodeValue colsDecoder |> Result.mapError D.errorToString
+                , rows = sheet |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString
+                , source = sheet |> D.decodeValue sourceDecoder |> Result.mapError D.errorToString
+            }
 
 
 
@@ -629,7 +629,7 @@ update msg ({ sheet } as model) =
 
         DocChanged change ->
             -- TODO:
-            ( { model | sheet = decodeSheet change.sheetId change.data.doc }, Cmd.none )
+            ( { model | sheet = decodeSheet model.library change.sheetId change.data.doc }, Cmd.none )
 
         LibraryChanged libraryData ->
             ( { model
@@ -990,7 +990,7 @@ view ({ sheet } as model) =
                 -- TODO: [ "definition", "scrappy", "share", "history", "problems", "related", "help" ]
                 [ H.span [] [ text "definition" ]
                 , H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ]
-                    [ text (Debug.toString sheet.cols)
+                    [ text (Debug.toString sheet.source)
                     ]
                 ]
             ]
