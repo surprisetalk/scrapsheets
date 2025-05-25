@@ -57,7 +57,6 @@
         const app = Elm.Main.init({
           node: document.getElementById("elm"),
           flags: {
-            sheetId: hash || null,
             sheet: (await sheetDocs[hash]?.doc()) ?? null,
             library: await library(),
           },
