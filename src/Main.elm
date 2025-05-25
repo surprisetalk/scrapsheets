@@ -333,9 +333,9 @@ libSheet library =
                             |> List.map
                                 (\( sheetId, sheet ) ->
                                     Dict.fromList
-                                        [ ( "book_id", E.string bookId )
+                                        [ ( "book_id", E.string ("#" ++ bookId) )
                                         , ( "dir", E.string book.dir )
-                                        , ( "sheet_id", E.string sheetId )
+                                        , ( "sheet_id", E.string ("#" ++ sheetId) )
                                         , ( "name", E.string sheet.name )
                                         , ( "tags", E.list E.string sheet.tags )
                                         ]
@@ -960,7 +960,14 @@ view ({ sheet } as model) =
                                                                     (case col.t of
                                                                         Link ->
                                                                             D.string
-                                                                                |> D.map ((++) "#")
+                                                                                |> D.map
+                                                                                    (\href ->
+                                                                                        if href == "" then
+                                                                                            "/"
+
+                                                                                        else
+                                                                                            href
+                                                                                    )
                                                                                 |> D.map (\href -> H.a [ A.href href ] [ text href ])
 
                                                                         _ ->
@@ -997,7 +1004,7 @@ view ({ sheet } as model) =
                 -- TODO: This section automatically populates based on context. It's like an inspector that's shows you details on what you're currently doing.
                 -- TODO: Prefer .selected and fallback to .hover.
                 -- TODO: [ "definition", "scrappy", "share", "history", "problems", "related", "help" ]
-                [ H.span [] [ text "definition" ]
+                [ H.span [] [ text "source" ]
                 , H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ]
                     [ text (Debug.toString sheet.source)
                     ]
