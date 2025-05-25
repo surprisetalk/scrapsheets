@@ -341,9 +341,9 @@ libSheet library =
                             |> List.map
                                 (\( sheetId, sheet ) ->
                                     Dict.fromList
-                                        [ ( "book_id", E.string bookId )
+                                        [ ( "book_id", E.string ("/?book_id=" ++ bookId) )
                                         , ( "dir", E.string book.dir )
-                                        , ( "sheet_id", E.string sheetId )
+                                        , ( "sheet_id", E.string ("#" ++ sheetId) )
                                         , ( "name", E.string sheet.name )
                                         , ( "tags", E.list E.string sheet.tags )
                                         ]
@@ -748,25 +748,15 @@ update msg ({ sheet } as model) =
 view : Model -> Browser.Document Msg
 view ({ sheet } as model) =
     let
-        book : Book
-        book =
-            -- TODO:
-            { dir = "", perms = (), peers = Dict.empty, sheets = Dict.empty }
+        ( bookId, book ) =
+            model.library
+                |> Dict.filter (\_ -> .sheets >> Dict.keys >> Set.fromList >> Set.member sheet.sheetId)
+                |> Dict.toList
+                |> List.head
+                |> Maybe.withDefault ( "", { dir = "", perms = (), peers = Dict.empty, sheets = Dict.empty } )
 
         { name, tags, thumb } =
             book.sheets |> Dict.get sheet.sheetId |> Maybe.withDefault { name = "", tags = [], thumb = () }
-
-        bookName : String
-        bookName =
-            book.dir
-                |> String.split "/"
-                |> List.reverse
-                |> List.head
-                |> Maybe.withDefault "unknown"
-
-        nrows : Int
-        nrows =
-            Array.length (Result.withDefault Array.empty sheet.rows)
     in
     { title = "scrapsheets"
     , body =
@@ -781,26 +771,34 @@ view ({ sheet } as model) =
         , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%" ]
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween ]
-                    [ H.div [ S.displayFlex, S.flexDirectionRow ]
+                    [ H.div [ S.displayFlex, S.flexDirectionRow ] <|
                         -- Badges indicate scrapscript news, book notifs, etc.
-                        [ H.a [ A.href "/" ] [ text "scrapsheets (2)" ]
-                        , text "/"
-                        , H.a [ A.href ("#" ++ "TODO") ] [ text (book.dir ++ " (12)") ]
-                        , text "/"
-                        , H.a [ A.href ("#" ++ sheet.sheetId) ] [ text (name ++ " (7)") ]
-                        , text "/"
-                        , H.input [ A.value name, A.onInput (InputChanging SheetName) ] []
-                        , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <|
-                            List.concat
-                                [ case sheet.newTag of
-                                    Nothing ->
-                                        [ H.button [ A.onClick (InputChanging SheetTag "") ] [ text "#" ] ]
-
-                                    Just value ->
-                                        [ H.input [ A.value value, A.onInput (InputChanging SheetTag) ] [] ]
-                                , List.map (\tag -> H.a [ A.href ("?q=+tag:" ++ tag) ] [ text ("#" ++ tag) ]) tags
+                        List.concat
+                            [ [ H.a [ A.href "/" ] [ text "scrapsheets (2)" ]
+                              ]
+                            , iif (book.dir == "")
+                                []
+                                [ text "/"
+                                , H.a [ A.href ("/?book_id=" ++ bookId) ] [ text (book.dir ++ " (12)") ]
                                 ]
-                        ]
+                            , iif (sheet.sheetId == "")
+                                [ text "/"
+                                , H.span [] [ text "library" ]
+                                ]
+                                [ text "/"
+                                , H.input [ A.value name, A.onInput (InputChanging SheetName) ] []
+                                , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <|
+                                    List.concat
+                                        [ case sheet.newTag of
+                                            Nothing ->
+                                                [ H.button [ A.onClick (InputChanging SheetTag "") ] [ text "#" ] ]
+
+                                            Just value ->
+                                                [ H.input [ A.value value, A.onInput (InputChanging SheetTag) ] [] ]
+                                        , List.map (\tag -> H.a [ A.href ("?q=+tag:" ++ tag) ] [ text ("#" ++ tag) ]) tags
+                                        ]
+                                ]
+                            ]
                     , H.div [ S.displayFlex, S.flexDirectionRowReverse ]
                         -- TODO: I like the idea of /:sheetId/history as another sheet.
                         [ H.a [ A.href "history" ] [ text "history (1)" ]
@@ -948,9 +946,7 @@ view ({ sheet } as model) =
                                                             |> D.decodeValue
                                                                 (case col.t of
                                                                     Link ->
-                                                                        D.string
-                                                                            |> D.map ((++) "#")
-                                                                            |> D.map (\href -> H.a [ A.href href ] [ text href ])
+                                                                        D.string |> D.map (\href -> H.a [ A.href href, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock, S.maxWidthRem 12 ] [ text href ])
 
                                                                     _ ->
                                                                         D.map text string
@@ -986,8 +982,23 @@ view ({ sheet } as model) =
               <|
                 List.concatMap (\( title, body ) -> H.span [] [ text title ] :: body) <|
                     List.filter (Tuple.second >> List.length >> (<) 0) <|
-                        [ ( "problems"
+                        [ ( "metadata"
+                          , iif (sheet.select == rect -1 -1 -1 -1)
+                                [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ]
+                                    [ text (Debug.toString sheet.source)
+                                    ]
+                                ]
+                                []
+                          )
+                        , ( "actions"
+                            -- TODO: Contextual keyboard shortcuts.
+                          , []
+                          )
+                        , ( "problems"
                             -- TODO: Linting errors.
+                          , []
+                          )
+                        , ( "stats"
                           , []
                           )
                         , ( "ideas"
@@ -997,12 +1008,6 @@ view ({ sheet } as model) =
                         , ( "related"
                             -- TODO: Related sheets, underlying sources, backlinks.
                           , []
-                          )
-                        , ( "metadata"
-                          , [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ]
-                                [ text (Debug.toString sheet.source)
-                                ]
-                            ]
                           )
                         , ( "history"
                             -- TODO: Relevant history.
