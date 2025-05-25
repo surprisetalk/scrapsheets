@@ -312,53 +312,7 @@ init flags _ nav =
                     libSheet library
 
                 Just sheetId ->
-                    { defaultSheet
-                        | sheetId = sheetId
-                        , cols =
-                            -- TODO: Calculate these from the source.
-                            flags.sheet
-                                |> D.decodeValue
-                                    (D.map identity
-                                        (D.field "cols"
-                                            (D.array
-                                                (D.map3 Col
-                                                    (D.field "key" D.string)
-                                                    (D.field "label" D.string)
-                                                    (D.field "type" (D.succeed Text))
-                                                )
-                                            )
-                                        )
-                                    )
-                                |> Result.mapError D.errorToString
-                        , rows =
-                            flags.sheet
-                                |> D.decodeValue
-                                    (D.map identity
-                                        (D.field "rows"
-                                            (D.list (D.dict D.value) |> D.map Array.fromList)
-                                        )
-                                    )
-                                |> Result.mapError D.errorToString
-                        , source =
-                            Rows
-                                { write = Nothing
-                                , cols =
-                                    flags.sheet
-                                        |> D.decodeValue
-                                            (D.map identity
-                                                (D.field "cols"
-                                                    (D.array
-                                                        (D.map3 Col
-                                                            (D.field "key" D.string)
-                                                            (D.field "label" D.string)
-                                                            (D.field "type" (D.succeed (Exceed "TODO")))
-                                                        )
-                                                    )
-                                                )
-                                            )
-                                        |> Result.withDefault Array.empty
-                                }
-                    }
+                    decodeSheet sheetId flags.sheet
       }
     , Cmd.none
     )
@@ -446,6 +400,56 @@ number =
         , D.map toFloat D.int
         , D.andThen (String.toFloat >> Maybe.map D.succeed >> Maybe.withDefault (D.fail "")) D.string
         ]
+
+
+decodeSheet : Id -> D.Value -> Sheet
+decodeSheet id sheet =
+    -- TODO: Consider doing D.Decoder ({cols, rows, source}) instead.
+    let
+        colsDecoder : D.Decoder (Array (Col Type))
+        colsDecoder =
+            -- TODO: Calculate these from the source.
+            D.map identity
+                (D.field "cols"
+                    (D.array
+                        (D.map3 Col
+                            (D.field "key" D.string)
+                            (D.field "label" D.string)
+                            (D.field "type" (D.succeed Text))
+                        )
+                    )
+                )
+
+        rowsDecoder : D.Decoder (Array Row)
+        rowsDecoder =
+            D.field "rows"
+                (D.list (D.dict D.value) |> D.map Array.fromList)
+
+        sourceDecoder : D.Decoder Source
+        sourceDecoder =
+            D.oneOf
+                [ D.map Rows
+                    (D.map (\cols -> { write = Nothing, cols = cols })
+                        (D.map identity
+                            (D.field "cols"
+                                (D.array
+                                    (D.map3 Col
+                                        (D.field "key" D.string)
+                                        (D.field "label" D.string)
+                                        (D.field "type" (D.succeed (Exceed "TODO")))
+                                    )
+                                )
+                            )
+                        )
+                    )
+                ]
+    in
+    { defaultSheet
+        | sheetId = id
+        , cols = sheet |> D.decodeValue colsDecoder |> Result.mapError D.errorToString
+        , rows = sheet |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString
+        , source = sheet |> D.decodeValue sourceDecoder |> Result.withDefault (Feed Void)
+    }
 
 
 
@@ -624,63 +628,7 @@ update msg ({ sheet } as model) =
 
         DocChanged change ->
             -- TODO:
-            ( { model
-                | sheet =
-                    { sheet
-                        | sheetId = change.sheetId
-                        , cols =
-                            -- TODO: Calculate these from .source
-                            change.data.doc
-                                |> D.decodeValue
-                                    (D.map identity
-                                        (D.field "cols"
-                                            (D.array
-                                                (D.map3 Col
-                                                    (D.field "key" D.string)
-                                                    (D.field "label" D.string)
-                                                    (D.field "type" (D.succeed Text))
-                                                )
-                                            )
-                                        )
-                                    )
-                                |> Result.mapError D.errorToString
-                        , rows =
-                            change.data.doc
-                                |> D.decodeValue
-                                    (D.map identity
-                                        (D.field "rows"
-                                            (D.list (D.dict D.value) |> D.map Array.fromList)
-                                        )
-                                    )
-                                |> Result.mapError D.errorToString
-                        , source =
-                            case sheet.source of
-                                Rows rows ->
-                                    Rows
-                                        { rows
-                                            | cols =
-                                                change.data.doc
-                                                    |> D.decodeValue
-                                                        (D.map identity
-                                                            (D.field "cols"
-                                                                (D.array
-                                                                    (D.map3 Col
-                                                                        (D.field "key" D.string)
-                                                                        (D.field "label" D.string)
-                                                                        (D.field "type" (D.succeed (Exceed "TODO")))
-                                                                    )
-                                                                )
-                                                            )
-                                                        )
-                                                    |> Result.withDefault Array.empty
-                                        }
-
-                                _ ->
-                                    sheet.source
-                    }
-              }
-            , Cmd.none
-            )
+            ( { model | sheet = decodeSheet change.sheetId change.data.doc }, Cmd.none )
 
         LibraryChanged libraryData ->
             ( { model

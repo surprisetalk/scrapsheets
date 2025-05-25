@@ -49,21 +49,22 @@
             ),
           );
 
-        let sheetDoc = await repo
-          .find(window.location.hash.slice(1))
-          .catch(() => null);
+        const hash = window.location.hash.slice(1) || null;
+
+        const sheetDocs = {};
+        sheetDocs[hash] = await repo.find(hash).catch(() => null);
 
         const app = Elm.Main.init({
           node: document.getElementById("elm"),
           flags: {
-            sheetId: sheetDoc?.documentId ?? null,
-            sheet: (await sheetDoc?.doc()) ?? null,
+            sheetId: hash || null,
+            sheet: (await sheetDocs[hash]?.doc()) ?? null,
             library: await library(),
           },
         });
 
-        sheetDoc?.on("change", data => {
-          const payload = { sheetId: sheetDoc?.documentId, data };
+        sheetDocs[hash]?.on("change", data => {
+          const payload = { sheetId: sheetDocs[hash]?.documentId, data };
           app.ports.sheetChanged.send(payload);
         });
 
@@ -79,19 +80,19 @@
         });
 
         app.ports.selectSheet.subscribe(async sheetId => {
-          const newDoc = await repo.find(sheetId).catch(() => null);
-          if (newDoc) {
-            sheetDoc?.removeAllListeners();
-            sheetDoc = newDoc;
-            await sheetDoc.isReady();
+          const sheetDoc = await repo.find(sheetId).catch(() => null);
+          if (!sheetDocs[sheetId]) sheetDocs[sheetId] = sheetDoc;
+          if (sheetDoc) {
+            console.log("SHEETDOC", sheetDoc);
             sheetDoc.on("change", data => {
+              console.log("CHANGE", data);
               app.ports.sheetChanged.send({
-                sheetId: sheetDoc.documentId,
+                sheetId: data.handle.documentId,
                 data,
               });
             });
             app.ports.sheetChanged.send({
-              sheetId: sheetDoc.documentId,
+              sheetId,
               data: {
                 doc: await sheetDoc.doc(),
                 handle: null,
@@ -105,8 +106,9 @@
         app.ports.changeSheet.subscribe(
           // TODO: Use custom patches for now.
           ({ sheetId, data: patches }) => {
+            console.log("PATCHES", patches);
             for (const patch of patches) {
-              sheetDoc?.change(d => {
+              sheetDocs[sheetId]?.change(d => {
                 if (!d.cols) d.cols = [];
                 if (!d.rows) d.rows = [];
                 switch (patch.action) {
