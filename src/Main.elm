@@ -380,9 +380,9 @@ libSheet library =
                     )
                 |> (::)
                     (Dict.fromList
-                        [ ( "book_id", E.string "" )
+                        [ ( "book_id", E.string "/" )
                         , ( "dir", E.string "" )
-                        , ( "sheet_id", E.string "" )
+                        , ( "sheet_id", E.string "/" )
                         , ( "name", E.string "library" )
                         , ( "tags", E.list E.string [] )
                         ]
