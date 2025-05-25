@@ -151,6 +151,7 @@ type alias Sheet =
     , rows : Result String (Array Row)
     , cols : Result String (Array (Col Type))
     , source : Result String Source
+    , tool : Tool
     }
 
 
@@ -276,6 +277,33 @@ type
     | Link
 
 
+type
+    Tool
+    -- TODO: auto, metadata, actions (contextual keys), problems (lint), stats, ideas, related (sources/backlinks), history (contextual history)
+    = Auto
+    | Metadata
+    | Actions
+    | Problems
+    | Stats
+    | Ideas
+    | Related
+    | History
+
+
+tools : Dict String Tool
+tools =
+    Dict.fromList
+        [ ( "auto", Auto )
+        , ( "metadata", Metadata )
+        , ( "actions", Actions )
+        , ( "problems", Problems )
+        , ( "stats", Stats )
+        , ( "ideas", Ideas )
+        , ( "related", Related )
+        , ( "history", History )
+        ]
+
+
 
 ---- INIT ---------------------------------------------------------------------
 
@@ -314,6 +342,7 @@ defaultSheet =
     , cols = Err "TODO: default sheet"
     , rows = Err "TODO: default sheet"
     , source = Err "TODO: default sheet"
+    , tool = Auto
     }
 
 
@@ -669,10 +698,9 @@ update msg ({ sheet } as model) =
 
         LinkClicked (Browser.Internal url) ->
             -- TODO: ?q=+any ?q=-any ?q==any
-            case url.fragment of
-                Just "share" ->
-                    -- TODO: Share sheet?
-                    ( model, Cmd.none )
+            case url.fragment |> Maybe.andThen (flip Dict.get tools) of
+                Just tool ->
+                    ( { model | sheet = { sheet | tool = tool } }, Cmd.none )
 
                 _ ->
                     ( model, Nav.pushUrl model.nav (Url.toString url) )
@@ -977,43 +1005,20 @@ view ({ sheet } as model) =
                     ]
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ]
-              -- TODO: This section automatically populates based on context. It's like an inspector that shows you details on what you're currently doing.
               -- TODO: Prefer .selected and fallback to .hover.
               <|
-                List.concatMap (\( title, body ) -> H.span [] [ text title ] :: body) <|
-                    List.filter (Tuple.second >> List.length >> (<) 0) <|
-                        [ ( "metadata"
-                          , iif (sheet.select == rect -1 -1 -1 -1)
-                                [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ]
-                                    [ text (Debug.toString sheet.source)
-                                    ]
+                List.concat
+                    [ [ H.div [ S.displayFlex ] <| List.indexedMap (\i tool -> H.a [ A.href ("#" ++ tool) ] [ text (String.fromInt (i + 1)) ]) <| Dict.keys tools
+                      ]
+                    , [ H.span [] [ text (Debug.toString sheet.tool) ]
+                      ]
+                    , case sheet.tool of
+                        _ ->
+                            [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ]
+                                [ text (Debug.toString sheet.source)
                                 ]
-                                []
-                          )
-                        , ( "actions"
-                            -- TODO: Contextual keyboard shortcuts.
-                          , []
-                          )
-                        , ( "problems"
-                            -- TODO: Linting errors.
-                          , []
-                          )
-                        , ( "stats"
-                          , []
-                          )
-                        , ( "ideas"
-                            -- TODO: Suggestions based on selection.
-                          , []
-                          )
-                        , ( "related"
-                            -- TODO: Related sheets, underlying sources, backlinks.
-                          , []
-                          )
-                        , ( "history"
-                            -- TODO: Relevant history.
-                          , []
-                          )
-                        ]
+                            ]
+                    ]
             ]
         ]
     }
