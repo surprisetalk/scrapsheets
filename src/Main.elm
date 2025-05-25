@@ -141,7 +141,7 @@ type alias Sheet =
     , click : Bool
     , rows : Result String (Array Row)
     , cols : Result String (Array (Col Type))
-    , source : Source
+    , source : Result String Source
     }
 
 
@@ -201,8 +201,7 @@ type
     Feed
     -- TODO: Move some of these to the shop as free templates.
     -- TODO: email, settings, databases, git, github, stripe, logs, sheets, tests, code stats, social media keywords
-    = Void
-    | Lib
+    = Lib
     | Shop
     | Files
     | Rss { opml : () }
@@ -285,34 +284,12 @@ init flags _ nav =
         library : Dict Id Book
         library =
             flags.library
-                |> D.decodeValue
-                    (D.dict
-                        (D.map4 Book
-                            (D.field "dir" D.string)
-                            (D.succeed ())
-                            (D.succeed Dict.empty)
-                            (D.field "sheets"
-                                (D.dict
-                                    (D.map3 SheetInfo
-                                        (D.field "name" D.string)
-                                        (D.field "tags" (D.list D.string))
-                                        (D.succeed ())
-                                    )
-                                )
-                            )
-                        )
-                    )
+                |> D.decodeValue libraryDecoder
                 |> Result.withDefault Dict.empty
     in
     ( { nav = nav
       , library = library
-      , sheet =
-            case flags.sheetId of
-                Nothing ->
-                    libSheet library
-
-                Just sheetId ->
-                    decodeSheet sheetId flags.sheet
+      , sheet = decodeSheet (Maybe.withDefault "" flags.sheetId) flags.sheet
       }
     , Cmd.none
     )
@@ -328,7 +305,7 @@ defaultSheet =
     , select = Rect (xy -1 -1) (xy -1 -1)
     , cols = Err "TODO: default sheet"
     , rows = Err "TODO: default sheet"
-    , source = Feed Void
+    , source = Err "TODO: default sheet"
     }
 
 
@@ -366,7 +343,7 @@ libSheet library =
                     )
                 |> Array.fromList
                 |> Ok
-        , source = Feed Lib
+        , source = Ok (Feed Lib)
     }
 
 
@@ -402,6 +379,25 @@ number =
         ]
 
 
+libraryDecoder : D.Decoder (Dict Id Book)
+libraryDecoder =
+    D.dict
+        (D.map4 Book
+            (D.field "dir" D.string)
+            (D.succeed ())
+            (D.succeed Dict.empty)
+            (D.field "sheets"
+                (D.dict
+                    (D.map3 SheetInfo
+                        (D.field "name" D.string)
+                        (D.field "tags" (D.list D.string))
+                        (D.succeed ())
+                    )
+                )
+            )
+        )
+
+
 decodeSheet : Id -> D.Value -> Sheet
 decodeSheet id sheet =
     -- TODO: Consider doing D.Decoder ({cols, rows, source}) instead.
@@ -427,28 +423,33 @@ decodeSheet id sheet =
 
         sourceDecoder : D.Decoder Source
         sourceDecoder =
-            D.oneOf
-                [ D.map Rows
-                    (D.map (\cols -> { write = Nothing, cols = cols })
-                        (D.map identity
-                            (D.field "cols"
-                                (D.array
-                                    (D.map3 Col
-                                        (D.field "key" D.string)
-                                        (D.field "label" D.string)
-                                        (D.field "type" (D.succeed (Exceed "TODO")))
+            case id of
+                "" ->
+                    D.succeed (Feed Lib)
+
+                _ ->
+                    D.oneOf
+                        [ D.map Rows
+                            (D.map (\cols -> { write = Nothing, cols = cols })
+                                (D.map identity
+                                    (D.field "cols"
+                                        (D.array
+                                            (D.map3 Col
+                                                (D.field "key" D.string)
+                                                (D.field "label" D.string)
+                                                (D.field "type" (D.succeed (Exceed "TODO")))
+                                            )
+                                        )
                                     )
                                 )
                             )
-                        )
-                    )
-                ]
+                        ]
     in
     { defaultSheet
         | sheetId = id
         , cols = sheet |> D.decodeValue colsDecoder |> Result.mapError D.errorToString
         , rows = sheet |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString
-        , source = sheet |> D.decodeValue sourceDecoder |> Result.withDefault (Feed Void)
+        , source = sheet |> D.decodeValue sourceDecoder |> Result.mapError D.errorToString
     }
 
 
@@ -515,8 +516,8 @@ update msg ({ sheet } as model) =
                     { sheet
                         | source =
                             case sheet.source of
-                                Rows rows ->
-                                    Rows { rows | write = Just x }
+                                Ok (Rows rows) ->
+                                    Ok (Rows { rows | write = Just x })
 
                                 source ->
                                     source
@@ -543,8 +544,8 @@ update msg ({ sheet } as model) =
                     { sheet
                         | source =
                             case sheet.source of
-                                Rows rows ->
-                                    Rows { rows | write = Nothing }
+                                Ok (Rows rows) ->
+                                    Ok (Rows { rows | write = Nothing })
 
                                 source ->
                                     source
@@ -553,7 +554,7 @@ update msg ({ sheet } as model) =
             , changeSheet <|
                 DocMsg sheet.sheetId <|
                     case sheet.source of
-                        Rows rows ->
+                        Ok (Rows rows) ->
                             case edit of
                                 SheetWrite { x, y } ->
                                     -- TODO: what if we have no columns?
@@ -595,9 +596,9 @@ update msg ({ sheet } as model) =
                         | select = { a = sheet.hover, b = sheet.hover }
                         , source =
                             case sheet.source of
-                                Rows rows ->
+                                Ok (Rows rows) ->
                                     -- TODO: Fill in cell value.
-                                    Rows { rows | write = Just "" }
+                                    Ok (Rows { rows | write = Just "" })
 
                                 _ ->
                                     sheet.source
@@ -634,23 +635,7 @@ update msg ({ sheet } as model) =
             ( { model
                 | library =
                     libraryData
-                        |> D.decodeValue
-                            (D.dict
-                                (D.map4 Book
-                                    (D.field "dir" D.string)
-                                    (D.field "perms" (D.succeed ()))
-                                    (D.field "peers" (D.dict (D.succeed ())))
-                                    (D.field "sheets"
-                                        (D.dict
-                                            (D.map3 SheetInfo
-                                                (D.field "name" D.string)
-                                                (D.field "tags" (D.list D.string))
-                                                (D.field "thumb" (D.succeed ()))
-                                            )
-                                        )
-                                    )
-                                )
-                            )
+                        |> D.decodeValue libraryDecoder
                         |> Result.withDefault model.library
               }
             , Cmd.none
@@ -685,8 +670,8 @@ update msg ({ sheet } as model) =
                     { sheet
                         | source =
                             case sheet.source of
-                                Rows rows ->
-                                    Rows { rows | write = Nothing }
+                                Ok (Rows rows) ->
+                                    Ok (Rows { rows | write = Nothing })
 
                                 source ->
                                     source
@@ -695,7 +680,7 @@ update msg ({ sheet } as model) =
             , changeSheet <|
                 DocMsg sheet.sheetId <|
                     case sheet.source of
-                        Rows rows ->
+                        Ok (Rows rows) ->
                             -- TODO: Do multiple patches when ranges are selected.
                             case ( negate sheet.select.a.y, negate sheet.select.a.x ) of
                                 ( 1, 1 ) ->
@@ -976,7 +961,7 @@ view ({ sheet } as model) =
                                                             ]
                                                         <|
                                                             case sheet.source of
-                                                                Rows { write } ->
+                                                                Ok (Rows { write }) ->
                                                                     if write /= Nothing && sheet.select == rect i n i n then
                                                                         Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" write), A.onInput (InputChanging CellWrite), A.onBlur (SheetEditing (SheetWrite sheet.select.a)), S.width "100%" ] [] ]
 

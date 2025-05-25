@@ -83,9 +83,7 @@
           const sheetDoc = await repo.find(sheetId).catch(() => null);
           if (!sheetDocs[sheetId]) sheetDocs[sheetId] = sheetDoc;
           if (sheetDoc) {
-            console.log("SHEETDOC", sheetDoc);
             sheetDoc.on("change", data => {
-              console.log("CHANGE", data);
               app.ports.sheetChanged.send({
                 sheetId: data.handle.documentId,
                 data,
@@ -106,7 +104,6 @@
         app.ports.changeSheet.subscribe(
           // TODO: Use custom patches for now.
           ({ sheetId, data: patches }) => {
-            console.log("PATCHES", patches);
             for (const patch of patches) {
               sheetDocs[sheetId]?.change(d => {
                 if (!d.cols) d.cols = [];
