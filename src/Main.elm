@@ -277,10 +277,7 @@ type
     | Link
 
 
-type
-    Tool
-    -- TODO: auto, metadata, actions (contextual keys), problems (lint), stats, ideas, related (sources/backlinks), history (contextual history)
-    -- TODO: I like the idea of also linking to /:sheetId/history as another sheet from the tool.
+type Tool
     = Settings
     | Hints
     | Stats { following : Maybe () }
@@ -783,9 +780,8 @@ view ({ sheet } as model) =
     in
     { title = "scrapsheets"
     , body =
-        [ H.node "style" [] [ text "body * { box-sizing: border-box; gap: 1rem; }" ]
-        , H.node "style" [] [ text "body { font-family: sans-serif; }" ]
-        , H.node "style" [] [ text "a { text-decoration: none; }" ]
+        [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
+        , H.node "style" [] [ text "th, td { padding: 0 0.25rem; font-weight: normal; }" ]
         , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { td { background: rgba(255,255,255,0.05); } }" ]
         , H.node "style" [] [ text "td:hover { background: rgba(0,0,0,0.15); }" ]
@@ -795,7 +791,7 @@ view ({ sheet } as model) =
         , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%" ]
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween ]
-                    [ H.div [ S.displayFlex, S.flexDirectionRow ] <|
+                    [ H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <|
                         -- Badges indicate scrapscript news, book notifs, etc.
                         List.concat
                             [ [ H.a [ A.href "/" ] [ text "scrapsheets (2)" ]
@@ -810,7 +806,7 @@ view ({ sheet } as model) =
                                 , H.span [] [ text "library" ]
                                 ]
                                 [ text "/"
-                                , H.input [ A.value name, A.onInput (InputChanging SheetName) ] []
+                                , H.a [ A.href "#settings" ] [ text name ]
                                 , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <|
                                     List.concat
                                         [ case sheet.newTag of
@@ -823,13 +819,17 @@ view ({ sheet } as model) =
                                         ]
                                 ]
                             ]
-                    , H.div [ S.displayFlex, S.flexDirectionRowReverse ]
+                    , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ]
                         -- TODO: If we need to, we can collapse the tools into a dropdown that only shows the current one.
-                        [ H.a [ A.href "#settings" ] [ text "settings (1)" ]
+                        [ H.a [ A.href "#settings" ] [ text "settings" ]
                         , H.a [ A.href "#history" ] [ text "history (2)" ]
                         , H.a [ A.href "#hints" ] [ text "hints (3)" ]
                         , H.a [ A.href "#stats" ] [ text "stats (2)" ]
-                        , H.a [ A.href "#share" ] [ text "share" ]
+                        , H.a [ A.href "#share" ] [ text "share (4)" ]
+                        , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ]
+                            [ H.a [ A.href "?following=" ] [ text "@tt" ]
+                            , H.a [ A.href "?following=123" ] [ text "@sa" ]
+                            ]
                         ]
                     ]
 
@@ -841,177 +841,121 @@ view ({ sheet } as model) =
                 , H.table [ S.borderCollapseCollapse, A.onMouseLeave (CellHovering (xy -1 -1)) ]
                     [ H.thead []
                         [ H.tr [] <|
-                            List.indexedMap
-                                (\i col ->
-                                    H.th
-                                        [ A.onClick CellMouseClick
-                                        , A.onMouseDown CellMouseDown
-                                        , A.onMouseUp CellMouseUp
-                                        , A.onMouseEnter (CellHovering (xy i -1))
-                                        , S.textAlignLeft
-                                        , S.verticalAlignBottom
-                                        ]
-                                        [ H.div [ S.displayFlex, S.flexDirectionColumn, S.justifyContentFlexEnd, S.gapRem 0 ]
-                                            [ H.div [ S.displayFlex, S.flexWrapWrap, S.gapRem 0.5, S.fontSizeSmall ] <|
-                                                case col.t of
-                                                    Text ->
-                                                        let
-                                                            stats : Dict String Int
-                                                            stats =
-                                                                sheet.rows
-                                                                    |> Result.withDefault Array.empty
-                                                                    |> Array.foldl
-                                                                        (\a -> Dict.update (Dict.get col.key a |> Maybe.withDefault (E.string "") |> D.decodeValue string |> Result.withDefault "") (Maybe.withDefault 0 >> (+) 1 >> Just))
-                                                                        Dict.empty
-
-                                                            blanks : Int
-                                                            blanks =
-                                                                stats |> Dict.get "" |> Maybe.withDefault 0
-
-                                                            total : Int
-                                                            total =
-                                                                stats |> Dict.values |> List.sum
-                                                        in
-                                                        List.concat
-                                                            [ [ H.a [ A.href "?TODO" ] [ text (String.concat [ "all (", String.fromInt total, ")" ]) ]
-                                                              ]
-                                                            , if Dict.size stats > 10 then
-                                                                [ H.a [ A.href "?TODO" ] [ text (String.concat [ "\"\" (", String.fromInt blanks, ")" ]) ]
-                                                                , H.a [ A.href "?TODO" ] [ text (String.concat [ "... (", String.fromInt (total - blanks), ")" ]) ]
-                                                                ]
-
-                                                              else
-                                                                stats
-                                                                    |> Dict.toList
-                                                                    |> List.sortBy (Tuple.second >> negate)
-                                                                    |> List.map (\( k, v ) -> H.a [ A.href "?TODO" ] [ text (String.concat [ "\"", k, "\" (", String.fromInt v, ")" ]) ])
-                                                            ]
-
-                                                    Number ->
-                                                        -- TODO: Histogram curve with filter sliders.
-                                                        let
-                                                            vals : Array (Maybe Float)
-                                                            vals =
-                                                                sheet.rows
-                                                                    |> Result.withDefault Array.empty
-                                                                    |> Array.map (Dict.get col.key >> Maybe.andThen (D.decodeValue number >> Result.toMaybe))
-
-                                                            nums : List Float
-                                                            nums =
-                                                                vals |> Array.toList |> List.filterMap identity
-                                                        in
-                                                        -- TODO: String.left is a bad hack! figure out how to do better rounding.
-                                                        List.map (\( k, v ) -> H.span [] [ text (k ++ ": " ++ (String.left 5 <| Maybe.withDefault "_" <| Maybe.map String.fromFloat v)) ]) <|
-                                                            [ ( "many", vals |> Array.filter ((/=) Nothing) |> Array.length |> toFloat |> Just )
-                                                            , ( "min", List.minimum nums )
-                                                            , ( "mean", iif (List.length nums > 0) (Just (List.sum nums / toFloat (List.length nums))) Nothing )
-                                                            , ( "max", List.maximum nums )
-                                                            ]
-
-                                                    Many _ ->
-                                                        -- TODO:
-                                                        []
-
-                                                    Link ->
-                                                        -- TODO:
-                                                        []
-                                            , H.input [ A.value col.label, A.onInput (InputChanging (ColumnLabel i)) ] []
-                                            , H.input [ A.value col.key, A.onInput (InputChanging (ColumnKey i)) ] []
-                                            , let
-                                                types : List ( String, Type )
-                                                types =
-                                                    [ ( "same", Text ), ( "text/from-float", Number ) ]
-                                              in
-                                              H.select [ A.onInput (InputChanging (ColumnType i)) ] <|
-                                                List.map (\( k, v ) -> H.option [ A.value k, A.selected (v == col.t) ] [ text k ]) <|
-                                                    types
-                                            ]
-                                        ]
+                            (::)
+                                (H.th
+                                    [ A.onClick (SheetEditing (SheetRowPush -1))
+                                    , A.onMouseEnter (CellHovering (xy -1 -1))
+                                    , S.textAlignRight
+                                    , S.widthRem 0.001
+                                    , S.whiteSpaceNowrap
+                                    ]
+                                    [ text "0" ]
                                 )
                             <|
-                                Array.toList <|
-                                    Result.withDefault Array.empty sheet.cols
+                                List.indexedMap
+                                    (\i col ->
+                                        H.th
+                                            [ A.onClick CellMouseClick
+                                            , A.onMouseDown CellMouseDown
+                                            , A.onMouseUp CellMouseUp
+                                            , A.onMouseEnter (CellHovering (xy i -1))
+                                            , S.textAlignLeft
+                                            , S.verticalAlignBottom
+                                            ]
+                                            [ H.a [ A.href "#settings", S.displayInlineBlock, S.width "100%" ]
+                                                [ text col.label ]
+                                            ]
+                                    )
+                                <|
+                                    Array.toList <|
+                                        Result.withDefault Array.empty sheet.cols
                         ]
                     , H.tbody [] <|
                         Array.toList <|
                             Array.indexedMap
                                 (\n row ->
                                     H.tr [] <|
-                                        List.indexedMap
-                                            (\i col ->
-                                                -- TODO: Don't allow editing if Virtual column.
-                                                H.td
-                                                    [ A.onClick CellMouseClick
-                                                    , A.onMouseDown CellMouseDown
-                                                    , A.onMouseUp CellMouseUp
-                                                    , A.onMouseEnter (CellHovering (xy i n))
-                                                    , A.classList <|
-                                                        let
-                                                            { a, b } =
-                                                                sheet.select
-
-                                                            between : number -> number -> number -> Bool
-                                                            between a_ b_ i_ =
-                                                                min a_ b_ <= i_ && i_ <= max a_ b_
-
-                                                            eq : number -> number -> number -> Bool
-                                                            eq a_ b_ i_ =
-                                                                a_ == i_ && i_ == b_
-                                                        in
-                                                        [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
-                                                        ]
-                                                    ]
-                                                <|
-                                                    Maybe.withDefault
-                                                        [ row
-                                                            |> Dict.get col.key
-                                                            |> Maybe.withDefault (E.string "")
-                                                            |> D.decodeValue
-                                                                (case col.t of
-                                                                    Link ->
-                                                                        D.string |> D.map (\href -> H.a [ A.href href, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock, S.maxWidthRem 12 ] [ text href ])
-
-                                                                    _ ->
-                                                                        D.map text string
-                                                                )
-                                                            |> Result.withDefault (text "TODO: parse error")
-                                                        ]
-                                                    <|
-                                                        case sheet.source of
-                                                            Ok (Rows { write }) ->
-                                                                if write /= Nothing && sheet.select == rect i n i n then
-                                                                    Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" write), A.onInput (InputChanging CellWrite), A.onBlur (SheetEditing (SheetWrite sheet.select.a)), S.width "100%" ] [] ]
-
-                                                                else
-                                                                    Nothing
-
-                                                            _ ->
-                                                                Nothing
+                                        (::)
+                                            (H.th
+                                                [ A.onClick (SheetEditing (SheetRowPush n))
+                                                , A.onMouseEnter (CellHovering (xy -1 n))
+                                                , S.textAlignRight
+                                                , S.widthRem 0.001
+                                                , S.whiteSpaceNowrap
+                                                ]
+                                                -- TODO: The row number needs to be pre-filter.
+                                                [ text (String.fromInt (n + 1)) ]
                                             )
                                         <|
-                                            Array.toList <|
-                                                Result.withDefault Array.empty sheet.cols
+                                            List.indexedMap
+                                                (\i col ->
+                                                    -- TODO: Don't allow editing if Virtual column.
+                                                    H.td
+                                                        [ A.onClick CellMouseClick
+                                                        , A.onMouseDown CellMouseDown
+                                                        , A.onMouseUp CellMouseUp
+                                                        , A.onMouseEnter (CellHovering (xy i n))
+                                                        , S.heightRem 1.25
+                                                        , A.classList <|
+                                                            let
+                                                                { a, b } =
+                                                                    sheet.select
+
+                                                                between : number -> number -> number -> Bool
+                                                                between a_ b_ i_ =
+                                                                    min a_ b_ <= i_ && i_ <= max a_ b_
+
+                                                                eq : number -> number -> number -> Bool
+                                                                eq a_ b_ i_ =
+                                                                    a_ == i_ && i_ == b_
+                                                            in
+                                                            [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
+                                                            ]
+                                                        ]
+                                                    <|
+                                                        Maybe.withDefault
+                                                            [ row
+                                                                |> Dict.get col.key
+                                                                |> Maybe.withDefault (E.string "")
+                                                                |> D.decodeValue
+                                                                    (case col.t of
+                                                                        Link ->
+                                                                            D.string |> D.map (\href -> H.a [ A.href href, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock, S.maxWidthRem 12 ] [ text href ])
+
+                                                                        _ ->
+                                                                            D.map text string
+                                                                    )
+                                                                |> Result.withDefault (text "TODO: parse error")
+                                                            ]
+                                                        <|
+                                                            case sheet.source of
+                                                                Ok (Rows { write }) ->
+                                                                    if write /= Nothing && sheet.select == rect i n i n then
+                                                                        Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" write), A.onInput (InputChanging CellWrite), A.onBlur (SheetEditing (SheetWrite sheet.select.a)), S.width "100%" ] [] ]
+
+                                                                    else
+                                                                        Nothing
+
+                                                                _ ->
+                                                                    Nothing
+                                                )
+                                            <|
+                                                Array.toList <|
+                                                    Result.withDefault Array.empty sheet.cols
                                 )
                             <|
                                 -- TODO: Better error.
-                                Result.withDefault Array.empty
-                                <|
-                                    sheet.rows
+                                Result.withDefault Array.empty sheet.rows
                     ]
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ] <|
                 List.concat
-                    [ [ H.span [] [ text (Debug.toString sheet.tool) ]
+                    [ [ H.span [] [ text (Debug.toString sheet.tool ++ " ⌘B") ]
                       ]
                     , case sheet.tool of
-                        Share ->
-                            [ H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ]
-                                [ H.a [ A.href "?following=" ] [ text "taylor" ]
-                                , H.a [ A.href "?following=123" ] [ text "sarah" ]
-                                ]
-                            ]
-
-                        _ ->
+                        -- TODO: Hovering over columns/etc should highlight relevant cells, and vice versa.
+                        Settings ->
+                            -- TODO:
                             [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ]
                                 -- TODO: Link to the column configs.
                                 [ text (Debug.toString sheet.source)
@@ -1020,6 +964,23 @@ view ({ sheet } as model) =
                                 [ H.button [ A.onClick NoOp ] [ text "new column (C)" ]
                                 ]
                             ]
+
+                        Hints ->
+                            -- TODO: problems (linting), ideas, related (sources/backlinks)
+                            []
+
+                        Stats stats ->
+                            -- TODO:
+                            []
+
+                        Share ->
+                            -- TODO:
+                            []
+
+                        History ->
+                            -- TODO: contextual history
+                            -- TODO: I like the idea of also linking to /:sheetId/history as another sheet from the tool.
+                            []
                     ]
             ]
         ]
