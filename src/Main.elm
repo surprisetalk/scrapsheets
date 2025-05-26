@@ -950,7 +950,7 @@ view ({ sheet } as model) =
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ] <|
                 List.concat
-                    [ [ H.span [] [ text (Debug.toString sheet.tool ++ " ⌘B") ]
+                    [ [ H.span [] [ text (String.toLower (Debug.toString sheet.tool)) ]
                       ]
                     , case sheet.tool of
                         -- TODO: Hovering over columns/etc should highlight relevant cells, and vice versa.
