@@ -22,11 +22,10 @@ port module Main exposing (main)
 --       , share : bool
 --       }
 --   ; doc :
---       { cols : list { name : text, key : text, type }
---       , rows : list (dict text json)
+--       { cols : list { name : text, key : int, type }
+--       , rows : list (list json)
 --       }
 --   ; feed :
---       -- available row/bulk actions are determined by the feed and query
 --       | #library
 --       | #shop
 --       | #files
@@ -42,16 +41,20 @@ port module Main exposing (main)
 --       | #box { query }
 --   ; query :
 --       -- queries fail if any sources not shared with you
---       -- row actions/abilities (e.g. delete) are columns too
+--       -- row actions/abilities (e.g. delete) are cells/columns too
 --       | #from { source }
 --       | #join { source }
 --       | #filter {}
---       | #select {}
+--       | #select select
 --   ; source :
 --       | #hole
 --       | #doc { id }
 --       | #feed { id }
 --       | #query { id }
+--   ; select :
+--       | #columns {}
+--       | #chart {}
+--       | #app {}
 --
 --
 --
