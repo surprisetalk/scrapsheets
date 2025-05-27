@@ -2,11 +2,57 @@ port module Main exposing (main)
 
 ---- NOTES --------------------------------------------------------------------
 --
--- TODO: Create an immutable examples book?
+-- New architecture:
 --
--- TODO: Each book gets its own creds that aren't transferred with sheets.
--- TODO: Your user and your book both provide cred context for the request?
--- TODO: e.g. copying DB URLs without moving the role/password
+--   dict id sheet
+--   ; sheet :
+--       { name : text
+--       , tags : set text
+--       , peers :
+--           | #private (dict id peer)
+--           | #public
+--       , table :
+--           | #doc doc      -- synced to server via automerge
+--           | #feed feed    -- data materialized on server, configs synced via automerge
+--           | #query query  -- data materialized on server, query synced via automerge
+--       }
+--   ; peer :
+--       { write : bool
+--       , read : bool
+--       , share : bool
+--       }
+--   ; doc :
+--       { cols : list { name : text, key : text, type }
+--       , rows : list (dict text json)
+--       }
+--   ; feed :
+--       -- available row/bulk actions are determined by the feed and query
+--       | #library
+--       | #shop
+--       | #files
+--       | #email {}
+--       | #database {} -- the table displays the SCHEMA not a table
+--       | #oauth {} -- the table display the SCHEMA not an endpoint
+--       | #form {}
+--       | #webhook {}
+--       | #kv {}
+--       | #webdav {}
+--       | #crawler {}
+--       | #rss { query }
+--       | #box { query }
+--   ; query :
+--       -- queries fail if any sources not shared with you
+--       -- row actions/abilities (e.g. delete) are columns too
+--       | #from { source }
+--       | #join { source }
+--       | #filter {}
+--       | #select {}
+--   ; source :
+--       | #hole
+--       | #doc { id }
+--       | #feed { id }
+--       | #query { id }
+--
 --
 --
 ---- IMPORTS ------------------------------------------------------------------
@@ -160,9 +206,12 @@ type alias Row =
 
 
 type alias Book =
+    -- TODO: To publish/share something, just loan it to a public/open book.
+    -- TODO:   The trick is communicating how/when data moves across boundaries.
+    -- TODO: Consider adding .queries
     { dir : String
-    , perms : ()
     , peers : Dict Id ()
+    , feeds : Dict Id Feed
     , sheets : Dict Id SheetInfo
     }
 
@@ -172,6 +221,40 @@ type alias SheetInfo =
     , tags : List String
     , thumb : Svg
     }
+
+
+type
+    Feed
+    -- TODO: Move some of these to the shop as free templates.
+    -- TODO:   email, settings, databases, git, github, stripe, logs, sheets, tests, code stats, social media keywords
+    -- TODO: When you add feeds, it automatically adds some queries to your library, which you can hide?
+    = Http { url : (), params : (), every : () }
+    | Rss { opml : () }
+    | Form {}
+    | Email {}
+    | Calendar {}
+    | Webhook {}
+    | Database {}
+    | Code
+        { lang : Lang
+        , code : String
+        }
+
+
+type Lang
+    = Sql
+    | Prql
+    | Fql
+    | Gql
+    | Jq
+    | Scrapscript
+    | Js
+    | Python
+    | R
+    | Julia
+    | J
+    | K
+    | Apl
 
 
 type alias Rect =
@@ -197,52 +280,27 @@ type alias Svg =
     ()
 
 
-type alias Query =
-    ()
+type
+    Query
+    -- TODO: Use PRQL AST?
+    = Base Base
+    | Queet Id
+    | Queed Id
+    | Select {}
+    | Filter {}
+    | Join {}
 
 
-type Source
-    = Rows { write : Maybe String, cols : Array (Col Formula) }
-    | Query { query : Query }
-    | Feed Feed
+type Base
+    = Lib
+    | Shop
 
 
 type
-    Feed
-    -- TODO: Move some of these to the shop as free templates.
-    -- TODO: email, settings, databases, git, github, stripe, logs, sheets, tests, code stats, social media keywords
-    = Lib
-    | Shop
-    | Files
-    | Rss { opml : () }
-    | Http { url : (), params : () }
-    | Github {}
-    | Stripe {}
-    | Bluesky {}
-    | Form {}
-    | Email {}
-    | Calendar {}
-    | Webhook {}
-    | Code
-        { lang : Language
-        , code : String
-        }
-
-
-type Language
-    = Sql
-    | Prql
-    | Fql
-    | Gql
-    | Jq
-    | Scrapscript
-    | Js
-    | Python
-    | R
-    | Julia
-    | J
-    | K
-    | Apl
+    Source
+    -- TODO: Rename to Concrete vs Virtual
+    = Data { write : Maybe String, cols : Array (Col Formula) }
+    | Query Query
 
 
 type alias Col t =
@@ -467,7 +525,7 @@ decodeSheet library id sheet =
                 sourceDecoder : D.Decoder Source
                 sourceDecoder =
                     D.oneOf
-                        [ D.map Rows
+                        [ D.map Data
                             (D.map (\cols -> { write = Nothing, cols = cols })
                                 (D.map identity
                                     (D.field "cols"
@@ -554,8 +612,8 @@ update msg ({ sheet } as model) =
                     { sheet
                         | source =
                             case sheet.source of
-                                Ok (Rows rows) ->
-                                    Ok (Rows { rows | write = Just x })
+                                Ok (Data rows) ->
+                                    Ok (Data { rows | write = Just x })
 
                                 source ->
                                     source
@@ -582,8 +640,8 @@ update msg ({ sheet } as model) =
                     { sheet
                         | source =
                             case sheet.source of
-                                Ok (Rows rows) ->
-                                    Ok (Rows { rows | write = Nothing })
+                                Ok (Data rows) ->
+                                    Ok (Data { rows | write = Nothing })
 
                                 source ->
                                     source
@@ -592,7 +650,7 @@ update msg ({ sheet } as model) =
             , changeSheet <|
                 DocMsg sheet.sheetId <|
                     case sheet.source of
-                        Ok (Rows rows) ->
+                        Ok (Data rows) ->
                             case edit of
                                 SheetWrite { x, y } ->
                                     -- TODO: what if we have no columns?
@@ -634,9 +692,9 @@ update msg ({ sheet } as model) =
                         | select = { a = sheet.hover, b = sheet.hover }
                         , source =
                             case sheet.source of
-                                Ok (Rows rows) ->
+                                Ok (Data rows) ->
                                     -- TODO: Fill in cell value.
-                                    Ok (Rows { rows | write = Just "" })
+                                    Ok (Data { rows | write = Just "" })
 
                                 _ ->
                                     sheet.source
@@ -709,8 +767,8 @@ update msg ({ sheet } as model) =
                     { sheet
                         | source =
                             case sheet.source of
-                                Ok (Rows rows) ->
-                                    Ok (Rows { rows | write = Nothing })
+                                Ok (Data rows) ->
+                                    Ok (Data { rows | write = Nothing })
 
                                 source ->
                                     source
@@ -719,7 +777,7 @@ update msg ({ sheet } as model) =
             , changeSheet <|
                 DocMsg sheet.sheetId <|
                     case sheet.source of
-                        Ok (Rows rows) ->
+                        Ok (Data rows) ->
                             -- TODO: Do multiple patches when ranges are selected.
                             case ( negate sheet.select.a.y, negate sheet.select.a.x ) of
                                 ( 1, 1 ) ->
@@ -781,6 +839,7 @@ view ({ sheet } as model) =
     { title = "scrapsheets"
     , body =
         [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
+        , H.node "style" [] [ text "body { font-family: monospace; }" ]
         , H.node "style" [] [ text "th, td { padding: 0 0.25rem; font-weight: normal; }" ]
         , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { td { background: rgba(255,255,255,0.05); } }" ]
@@ -794,7 +853,7 @@ view ({ sheet } as model) =
                     [ H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <|
                         -- Badges indicate scrapscript news, book notifs, etc.
                         List.concat
-                            [ [ H.a [ A.href "/" ] [ text "scrapsheets (2)" ]
+                            [ [ H.a [ A.href "/", S.fontWeightBold ] [ text "scrapsheets (2)" ]
                               ]
                             , iif (book.dir == "")
                                 []
@@ -841,6 +900,7 @@ view ({ sheet } as model) =
                 , H.table [ S.borderCollapseCollapse, A.onMouseLeave (CellHovering (xy -1 -1)) ]
                     [ H.thead []
                         [ H.tr [] <|
+                            -- TODO: Add additional header rows for stats and column def.
                             (::)
                                 (H.th
                                     [ A.onClick (SheetEditing (SheetRowPush -1))
@@ -929,7 +989,7 @@ view ({ sheet } as model) =
                                                             ]
                                                         <|
                                                             case sheet.source of
-                                                                Ok (Rows { write }) ->
+                                                                Ok (Data { write }) ->
                                                                     if write /= Nothing && sheet.select == rect i n i n then
                                                                         Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" write), A.onInput (InputChanging CellWrite), A.onBlur (SheetEditing (SheetWrite sheet.select.a)), S.width "100%" ] [] ]
 
