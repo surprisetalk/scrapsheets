@@ -158,7 +158,8 @@ type alias Svg =
 
 
 type Table
-    = TableDoc Doc
+    = Library
+    | TableDoc Doc
     | TableFeed Feed
     | TableQuery Query
 
@@ -185,7 +186,7 @@ type
     -- TODO: Move some of these to the shop as free templates.
     -- TODO:   email, settings, databases, git, github, stripe, logs, sheets, tests, code stats, social media keywords
     -- TODO: When you add feeds, it automatically adds some queries to your library, which you can hide?
-    = Library
+    = Device
     | Shop
     | Files
     | Email {}
@@ -321,6 +322,7 @@ string =
         [ D.string
         , D.map String.fromInt D.int
         , D.map String.fromFloat D.float
+        , D.null "NULL"
         ]
 
 
@@ -335,6 +337,11 @@ number =
 
 tableDecoder : D.Decoder Table
 tableDecoder =
+    let
+        intKeys : Dict String a -> Dict Int a
+        intKeys =
+            Dict.toList >> List.map (Tuple.mapFirst (Maybe.withDefault -1 << String.toInt)) >> Dict.fromList
+    in
     D.field "type" D.string
         |> D.andThen
             (\typ ->
@@ -352,7 +359,7 @@ tableDecoder =
                                         )
                                     )
                                 )
-                                (D.field "rows" (D.array (D.map (Dict.fromList << List.filterMap (\( k, v ) -> Maybe.map (flip Tuple.pair v) (String.toInt k)) << Dict.toList) (D.dict D.value))))
+                                (D.field "rows" (D.array (D.map intKeys (D.dict D.value))))
                             )
 
                     "feed" ->
@@ -381,15 +388,13 @@ route url ({ sheet } as model) =
     let
         id : Id
         id =
-            Maybe.withDefault "" url.fragment
+            url.fragment |> Maybe.withDefault ""
+
+        tool : Tool
+        tool =
+            tools |> Dict.get id |> Maybe.withDefault sheet.tool
     in
-    ( { model
-        | sheet =
-            tools
-                |> Dict.get id
-                |> Maybe.map (\tool -> { sheet | tool = tool })
-                |> Maybe.withDefault sheet
-      }
+    ( { model | sheet = { sheet | tool = tool } }
     , if Dict.member id tools then
         Cmd.none
 
@@ -422,11 +427,6 @@ default =
     , table = Err "TODO: not loaded"
     , tool = Settings
     }
-
-
-catalog : Sheet
-catalog =
-    { default | id = "", table = Ok (TableFeed Library) }
 
 
 
@@ -495,12 +495,23 @@ update msg ({ sheet } as model) =
 
         UrlChange url ->
             -- TODO: We should eventually change #:sheetId to /:sheetId, but for now it confuses stupid local webserver.
-            case url.fragment of
-                Just sheetId ->
-                    ( model, selectSheet sheetId )
-
-                Nothing ->
-                    ( { model | sheet = catalog }, selectSheet "" )
+            let
+                id : String
+                id =
+                    url.fragment |> Maybe.withDefault ""
+            in
+            ( { model
+                | sheet =
+                    [ { default | id = "", name = "library", table = Ok Library }
+                    , { default | id = "device", name = "device", table = Ok (TableFeed Device) }
+                    ]
+                        |> List.map (\s -> ( s.id, s ))
+                        |> Dict.fromList
+                        |> Dict.get id
+                        |> Maybe.withDefault model.sheet
+              }
+            , selectSheet id
+            )
 
         LinkClick (Browser.Internal url) ->
             -- TODO: ?q=+any ?q=-any ?q==any
@@ -756,7 +767,7 @@ view ({ sheet } as model) =
                 Ok (TableDoc doc) ->
                     Ok doc
 
-                Ok (TableFeed Library) ->
+                Ok Library ->
                     Ok
                         { cols =
                             [ ( "sheet_id", Link )
@@ -776,6 +787,14 @@ view ({ sheet } as model) =
                                                 , E.string s.name
                                                 , E.list E.string s.tags
                                                 ]
+                                    )
+                                |> (::)
+                                    (Dict.fromList <|
+                                        List.indexedMap Tuple.pair
+                                            [ E.string "/#device"
+                                            , E.string "device"
+                                            , E.list E.string []
+                                            ]
                                     )
                                 |> (::)
                                     (Dict.fromList <|

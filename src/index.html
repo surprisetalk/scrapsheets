@@ -49,11 +49,50 @@
         {
           let sheet;
 
+          let mouse = {};
+          document.addEventListener(
+            "mousemove",
+            e => {
+              mouse = { x: e.pageX, y: e.pageY };
+            },
+            false,
+          );
+
+          setInterval(() => {
+            switch (sheet?.documentId) {
+              case "device":
+                app.ports.sheetChanged.send({
+                  id: sheet?.documentId,
+                  data: {
+                    doc: {
+                      name: "Device",
+                      type: "doc",
+                      cols: [
+                        { key: 0, name: "Key", type: "text" },
+                        { key: 1, name: "Value", type: "text" },
+                      ],
+                      rows: [
+                        { 0: "Time", 1: new Date().getTime() },
+                        { 0: "Mouse X", 1: mouse.x ?? null },
+                        { 0: "Mouse Y", 1: mouse.y ?? null },
+                        { 0: "Screen Height", 1: window.screen.height },
+                        { 0: "Screen Width", 1: window.screen.width },
+                      ],
+                    },
+                    handle: null,
+                    patchInfo: null,
+                    patches: [],
+                  },
+                });
+                break;
+            }
+          }, 100);
+
           app.ports.selectSheet.subscribe(async id => {
             if (id === sheet?.documentId) return;
             // TODO: Remove existing listeners.
-            sheet = await find(id);
-            if (!sheet) return;
+            sheet = (await find(id)) || { documentId: id };
+            if (!sheet?.doc) return;
             sheet.on("change", data => {
               app.ports.sheetChanged.send({
                 id: data.handle.documentId,
@@ -128,6 +167,7 @@
         if (!(await library.doc()).sheets.length) {
           const sheets = [
             repo.create({
+              name: "Task List",
               type: "doc",
               cols: [
                 { key: 0, name: "Task", type: "text" },
@@ -139,6 +179,7 @@
               ],
             }),
             repo.create({
+              name: "Grocery List",
               type: "doc",
               cols: [
                 { key: 0, name: "Item", type: "text" },
@@ -150,6 +191,7 @@
               ],
             }),
             repo.create({
+              name: "Sprint Planning",
               type: "doc",
               cols: [
                 { key: 0, name: "Project", type: "text" },
@@ -158,6 +200,21 @@
               rows: [
                 { 0: "Website redesign", 1: "High" },
                 { 0: "Documentation", 1: "Medium" },
+              ],
+            }),
+            repo.create({
+              name: "Bluesky Firehose",
+              type: "feed",
+              feed: "crawler",
+              url: "TODO",
+              history: [],
+            }),
+            repo.create({
+              name: "TODO",
+              type: "query",
+              query: [
+                { type: "from", data: null },
+                { type: "limit", data: 1 },
               ],
             }),
           ];
