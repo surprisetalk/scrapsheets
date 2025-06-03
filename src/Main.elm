@@ -196,6 +196,7 @@ type
     | Webhook {}
     | Kv {}
     | Webdav {}
+    | Http {}
     | Crawler {}
     | Code { lang : Lang, code : String }
     | Rss { query : Query }
@@ -791,7 +792,7 @@ view ({ sheet } as model) =
                                 |> (::)
                                     (Dict.fromList <|
                                         List.indexedMap Tuple.pair
-                                            [ E.string "/#device"
+                                            [ E.string "#device"
                                             , E.string "device"
                                             , E.list E.string []
                                             ]

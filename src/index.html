@@ -35,7 +35,159 @@
 
         const library = await repo
           .find(localStorage.getItem("scrapsheets"))
-          .catch(async () => await repo.create({ sheets: [] }));
+          .catch(async () => {
+            const bsky = repo.create({
+              name: "Bluesky Firehose",
+              type: "feed",
+              feed: "websocket",
+              url: "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post",
+            });
+            const bets = repo.create({
+              name: "Manifold Bets Firehose",
+              type: "feed",
+              feed: "websocket",
+              url: "wss://api.manifold.markets/ws",
+            });
+            const markets = repo.create({
+              name: "Manifold Markets",
+              type: "feed",
+              feed: "http",
+              url: "TODO",
+            });
+            const git = repo.create({
+              name: "Ding",
+              type: "feed",
+              feed: "git",
+              url: "https://github.com/surprisetalk/ding.git",
+            });
+            const sheets = [
+              repo.create({
+                name: "Tasks",
+                type: "doc",
+                cols: [
+                  { key: 2, name: "", type: "bool" },
+                  { key: 0, name: "Task", type: "text" },
+                  { key: 1, name: "Notes", type: "text" },
+                ],
+                rows: [
+                  {
+                    2: true,
+                    0: "Setup project",
+                    1: "Fill out details, etc.",
+                  },
+                  {
+                    2: false,
+                    0: "Create demo",
+                    1: "Prep for the pitch contest",
+                  },
+                ],
+              }),
+              repo.create({
+                name: "Budget",
+                type: "doc",
+                cols: [
+                  { key: 1, name: "Item", type: "text" },
+                  { key: 2, name: "Amount", type: "number" },
+                ],
+                rows: [
+                  { 1: "Groceries", 2: "150" },
+                  { 1: "Gas", 2: "80" },
+                ],
+              }),
+              repo.create({
+                name: "Sprint",
+                type: "doc",
+                cols: [
+                  { key: 0, name: "Project", type: "text" },
+                  { key: 1, name: "Priority", type: "text" },
+                ],
+                rows: [
+                  { 0: "Website redesign", 1: "High" },
+                  { 0: "Documentation", 1: "Medium" },
+                ],
+              }),
+              bsky,
+              repo.create({
+                name: "Bluesky Stats",
+                type: "query",
+                query: [
+                  { type: "from", data: bsky.url },
+                  {
+                    type: "derive",
+                    data: {
+                      l: { type: "len", data: { type: "col", data: "text" } },
+                    },
+                  },
+                  {
+                    type: "group",
+                    data: {
+                      by: { type: "col", data: "l" },
+                      agg: { c: { type: "count", data: null } },
+                    },
+                  },
+                  { type: "select", data: ["l", "c"] },
+                  { type: "take", data: 100 },
+                ],
+              }),
+              repo.create({
+                name: "Employees",
+                type: "feed",
+                feed: "code",
+                url: "postgresql://localhost",
+                lang: "sql",
+                code: "select * from employees",
+              }),
+              git,
+              repo.create({
+                name: "Contributors",
+                type: "query",
+                query: [
+                  { type: "from", data: git.url },
+                  {
+                    type: "group",
+                    data: {
+                      by: { type: "col", data: "email" },
+                      agg: { c: { type: "count", data: null } },
+                    },
+                  },
+                  { type: "select", data: ["author", "c"] },
+                ],
+              }),
+              repo.create({
+                name: "Manifold Bet Stats",
+                type: "query",
+                query: [
+                  { type: "from", data: bets.url },
+                  {
+                    type: "group",
+                    data: {
+                      by: { type: "col", data: "creatorId" },
+                      agg: {
+                        c: { type: "count", data: null },
+                        avg: {
+                          type: "average",
+                          data: { type: "col", data: "TODO" },
+                        },
+                      },
+                    },
+                  },
+                  { type: "select", data: ["author", "c"] },
+                ],
+              }),
+              repo.create({
+                name: "Manifold Market Latest",
+                type: "query",
+                query: [
+                  { type: "from", data: markets.url },
+                  { type: "take", data: 1 },
+                  { type: "join", data: "TODO" }, // TODO: self-join on JSON recordset
+                ],
+              }),
+            ];
+            return await repo.create({
+              sheets: sheets.map(doc => doc.documentId),
+            });
+          });
         localStorage.setItem("scrapsheets", library.documentId);
 
         const hash = window.location.hash.slice(1) || null;
@@ -164,64 +316,34 @@
             });
         }
 
-        if (!(await library.doc()).sheets.length) {
-          const sheets = [
-            repo.create({
-              name: "Task List",
-              type: "doc",
-              cols: [
-                { key: 0, name: "Task", type: "text" },
-                { key: 1, name: "Status", type: "text" },
-              ],
-              rows: [
-                { 0: "Setup project", 1: "Done" },
-                { 0: "Create demo", 1: "In Progress" },
-              ],
+        /*
+        const ws = new WebSocket("wss://api.manifold.markets/ws");
+        let txid = 0;
+        ws.onopen = () => {
+          // Subscribe to global bets
+          ws.send(
+            JSON.stringify({
+              type: "subscribe",
+              txid: txid++,
+              topics: ["global/new-bet"],
             }),
-            repo.create({
-              name: "Grocery List",
-              type: "doc",
-              cols: [
-                { key: 0, name: "Item", type: "text" },
-                { key: 1, name: "Amount", type: "number" },
-              ],
-              rows: [
-                { 0: "Groceries", 1: "150" },
-                { 0: "Gas", 1: "80" },
-              ],
-            }),
-            repo.create({
-              name: "Sprint Planning",
-              type: "doc",
-              cols: [
-                { key: 0, name: "Project", type: "text" },
-                { key: 1, name: "Priority", type: "text" },
-              ],
-              rows: [
-                { 0: "Website redesign", 1: "High" },
-                { 0: "Documentation", 1: "Medium" },
-              ],
-            }),
-            repo.create({
-              name: "Bluesky Firehose",
-              type: "feed",
-              feed: "crawler",
-              url: "TODO",
-              history: [],
-            }),
-            repo.create({
-              name: "TODO",
-              type: "query",
-              query: [
-                { type: "from", data: null },
-                { type: "limit", data: 1 },
-              ],
-            }),
-          ];
-          library.change(d =>
-            d.sheets.push(...sheets.map(doc => doc.documentId)),
           );
-        }
+        };
+        ws.onmessage = event => {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "broadcast") {
+            console.log("Received broadcast:", msg.data);
+          }
+        };
+        setInterval(() => {
+          ws.send(
+            JSON.stringify({
+              type: "ping",
+              txid: txid++,
+            }),
+          );
+        }, 30000);
+        */
       } catch (error) {
         console.error(error);
       }
