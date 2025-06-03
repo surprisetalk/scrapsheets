@@ -193,6 +193,7 @@ type
     | Database {}
     | OAuth {}
     | Form {}
+    | Websocket { url : String, rows : Array D.Value }
     | Webhook {}
     | Kv {}
     | Webdav {}
@@ -282,6 +283,7 @@ type
     | Number
     | Many Type
     | Link
+    | Json
 
 
 type Tool
@@ -350,7 +352,6 @@ tableDecoder =
                     "doc" ->
                         D.map TableDoc
                             (D.map2 Doc
-                                -- TODO:
                                 (D.field "cols"
                                     (D.array
                                         (D.map3 Col
@@ -364,13 +365,23 @@ tableDecoder =
                             )
 
                     "feed" ->
-                        D.fail "TODO"
+                        D.field "feed" D.string
+                            |> D.andThen
+                                (\feed ->
+                                    case feed of
+                                        "websocket" ->
+                                            D.map (\url -> TableFeed (Websocket { url = url, rows = Array.empty }))
+                                                (D.field "url" D.string)
+
+                                        feed_ ->
+                                            D.fail ("Bad feed type: " ++ feed_)
+                                )
 
                     "query" ->
-                        D.fail "TODO"
+                        D.fail "TODO: query"
 
-                    _ ->
-                        D.fail "Error: TODO"
+                    typ_ ->
+                        D.fail ("Bad table type: " ++ typ_)
             )
 
 
@@ -808,8 +819,14 @@ view ({ sheet } as model) =
                                 |> Array.fromList
                         }
 
-                _ ->
-                    Err "TODO"
+                Ok (TableFeed (Websocket ws)) ->
+                    Ok
+                        { cols = Array.fromList [ Col 0 "Payload" Json ]
+                        , rows = ws.rows |> Array.map (Dict.singleton 0)
+                        }
+
+                error ->
+                    Err ("Unimplemented: " ++ Debug.toString error)
     in
     { title = "scrapsheets"
     , body =
