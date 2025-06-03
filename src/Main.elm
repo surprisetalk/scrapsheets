@@ -83,58 +83,7 @@ import Url exposing (Url)
 
 
 
----- PORTS --------------------------------------------------------------------
-
-
-port libraryChanged : (D.Value -> msg) -> Sub msg
-
-
-port changeBook : DocMsg { sheetId : Id, data : SheetInfo } -> Cmd msg
-
-
-port changeSheet : DocMsg (List Patch) -> Cmd msg
-
-
-port notifySheet : DocMsg E.Value -> Cmd msg
-
-
-port sheetChanged : (DocMsg DocChange -> msg) -> Sub msg
-
-
-port sheetNotified : (DocMsg D.Value -> msg) -> Sub msg
-
-
-port selectSheet : Id -> Cmd msg
-
-
-type alias DocChange =
-    { doc : D.Value
-    , handle : D.Value
-    , patchInfo : D.Value
-    , patches : List D.Value
-    }
-
-
-type alias DocMsg a =
-    { sheetId : Id
-    , data : a
-    }
-
-
-type alias Patch =
-    { action : String
-    , path : List D.Value
-    , value : D.Value
-    }
-
-
-
 ---- HELPERS ------------------------------------------------------------------
-
-
-flip : (a -> b -> c) -> (b -> a -> c)
-flip f a b =
-    f b a
 
 
 iif : Bool -> a -> a -> a
@@ -144,6 +93,49 @@ iif c a b =
 
     else
         b
+
+
+
+---- PORTS --------------------------------------------------------------------
+
+
+port libraryChanged : (D.Value -> msg) -> Sub msg
+
+
+port changeSheet : SheetMsg (List Patch) -> Cmd msg
+
+
+port notifySheet : SheetMsg E.Value -> Cmd msg
+
+
+port sheetChanged : (SheetMsg SheetChange -> msg) -> Sub msg
+
+
+port sheetNotified : (SheetMsg D.Value -> msg) -> Sub msg
+
+
+port selectSheet : Id -> Cmd msg
+
+
+type alias SheetChange =
+    { doc : D.Value
+    , handle : D.Value
+    , patchInfo : D.Value
+    , patches : List D.Value
+    }
+
+
+type alias SheetMsg a =
+    { id : Id
+    , data : a
+    }
+
+
+type alias Patch =
+    { action : String
+    , path : List D.Value
+    , value : D.Value
+    }
 
 
 
@@ -157,22 +149,9 @@ main =
         , update = update
         , view = view
         , subscriptions = subs
-        , onUrlChange = UrlChanged
-        , onUrlRequest = LinkClicked
+        , onUrlChange = UrlChange
+        , onUrlRequest = LinkClick
         }
-
-
-
----- SUBSCRIPTIONS ------------------------------------------------------------
-
-
-subs : Model -> Sub Msg
-subs model =
-    Sub.batch
-        [ sheetChanged DocChanged
-        , libraryChanged LibraryChanged
-        , Browser.onKeyPress (D.map KeyPressed (D.field "key" D.string))
-        ]
 
 
 
@@ -185,37 +164,8 @@ type alias Id =
 
 type alias Model =
     { nav : Nav.Key
-    , library : Dict Id Book
+    , library : Dict Id SheetInfo
     , sheet : Sheet
-    }
-
-
-type alias Sheet =
-    { sheetId : Id
-    , search : String
-    , newTag : Maybe String
-    , select : Rect
-    , hover : Index
-    , click : Bool
-    , rows : Result String (Array Row)
-    , cols : Result String (Array (Col Type))
-    , source : Result String Source
-    , tool : Tool
-    }
-
-
-type alias Row =
-    Dict String D.Value
-
-
-type alias Book =
-    -- TODO: To publish/share something, just loan it to a public/open book.
-    -- TODO:   The trick is communicating how/when data moves across boundaries.
-    -- TODO: Consider adding .queries
-    { dir : String
-    , peers : Dict Id ()
-    , feeds : Dict Id Feed
-    , sheets : Dict Id SheetInfo
     }
 
 
@@ -223,7 +173,64 @@ type alias SheetInfo =
     { name : String
     , tags : List String
     , thumb : Svg
+    , peers : List Peer
     }
+
+
+type Peer
+    = Private (Dict Id Perm)
+    | Public
+
+
+type alias Perm =
+    { read : Bool
+    , write : Bool
+    , share : Bool
+    }
+
+
+type alias Sheet =
+    { id : Id
+    , name : String
+    , tags : List String
+    , thumb : Svg
+    , search : String
+    , tag : Maybe String
+    , select : Rect
+    , hover : Index
+    , drag : Bool
+    , write : Maybe String
+    , table : Result String Table
+    , tool : Tool
+    }
+
+
+type alias Svg =
+    -- TODO: Generate nice preview Svg based on sheet contents.
+    ()
+
+
+type Table
+    = TableDoc Doc
+    | TableFeed Feed
+    | TableQuery Query
+
+
+type alias Doc =
+    { cols : Array Col
+    , rows : Array Row
+    }
+
+
+type alias Col =
+    { name : String
+    , key : String
+    , typ : Type
+    }
+
+
+type alias Row =
+    Array D.Value
 
 
 type
@@ -231,17 +238,44 @@ type
     -- TODO: Move some of these to the shop as free templates.
     -- TODO:   email, settings, databases, git, github, stripe, logs, sheets, tests, code stats, social media keywords
     -- TODO: When you add feeds, it automatically adds some queries to your library, which you can hide?
-    = Http { url : (), params : (), every : () }
-    | Rss { opml : () }
-    | Form {}
+    = Library
+    | Shop
+    | Files
     | Email {}
-    | Calendar {}
-    | Webhook {}
     | Database {}
-    | Code
-        { lang : Lang
-        , code : String
-        }
+    | OAuth {}
+    | Form {}
+    | Webhook {}
+    | Kv {}
+    | Webdav {}
+    | Crawler {}
+    | Code { lang : Lang, code : String }
+    | Rss { query : Query }
+    | Box { query : Query }
+
+
+type
+    Query
+    -- TODO: queries fail if any sources not shared with you
+    -- TODO: row actions/abilities (e.g. delete) are cells/columns too
+    -- TODO: use PRQL AST?
+    = From { source : Source }
+    | Join { source : Source }
+    | Filter {}
+    | Select Select
+
+
+type Source
+    = Hole
+    | DocId Id
+    | FeedId Id
+    | QueryId Id
+
+
+type Select
+    = Columns {}
+    | Chart {}
+    | App {}
 
 
 type Lang
@@ -276,43 +310,6 @@ type alias Index =
 xy : Int -> Int -> Index
 xy x y =
     Index x y
-
-
-type alias Svg =
-    -- TODO: Generate nice preview Svg based on sheet contents.
-    ()
-
-
-type
-    Query
-    -- TODO: Use PRQL AST?
-    = Base Base
-    | Queet Id
-    | Queed Id
-    | Select {}
-    | Filter {}
-    | Join {}
-
-
-type Base
-    = Lib
-    | Shop
-
-
-type
-    Source
-    -- TODO: Rename to Concrete vs Virtual
-    = Data { write : Maybe String, cols : Array (Col Formula) }
-    | Query Query
-
-
-type alias Col t =
-    { key : String, label : String, t : t }
-
-
-type Formula
-    = Parse Type
-    | Exceed String
 
 
 type
@@ -358,95 +355,6 @@ tools =
 
 
 
----- INIT ---------------------------------------------------------------------
-
-
-type alias Flags =
-    { sheet : D.Value
-    , library : D.Value
-    }
-
-
-init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
-init flags url nav =
-    let
-        library : Dict Id Book
-        library =
-            flags.library
-                |> D.decodeValue libraryDecoder
-                |> Result.withDefault Dict.empty
-    in
-    ( { nav = nav
-      , library = library
-      , sheet = decodeSheet library (Maybe.withDefault "" url.fragment) flags.sheet
-      }
-    , Cmd.none
-    )
-
-
-defaultSheet : Sheet
-defaultSheet =
-    { sheetId = ""
-    , search = ""
-    , newTag = Nothing
-    , hover = xy -1 -1
-    , click = False
-    , select = Rect (xy -1 -1) (xy -1 -1)
-    , cols = Err "TODO: default sheet"
-    , rows = Err "TODO: default sheet"
-    , source = Err "TODO: default sheet"
-    , tool = Settings
-    }
-
-
-libSheet : Dict Id Book -> Sheet
-libSheet library =
-    { defaultSheet
-        | sheetId = ""
-        , cols =
-            [ ( "book_id", Link )
-            , ( "dir", Text )
-            , ( "sheet_id", Link )
-            , ( "name", Text )
-            , ( "tags", Many Text )
-            ]
-                |> List.map (\( k, t ) -> Col k k t)
-                |> Array.fromList
-                |> Ok
-        , rows =
-            library
-                |> Dict.toList
-                |> List.concatMap
-                    (\( bookId, book ) ->
-                        book.sheets
-                            |> Dict.toList
-                            |> List.map
-                                (\( sheetId, sheet ) ->
-                                    Dict.fromList
-                                        [ ( "book_id", E.string ("/?book_id=" ++ bookId) )
-                                        , ( "dir", E.string book.dir )
-                                        , ( "sheet_id", E.string ("#" ++ sheetId) )
-                                        , ( "name", E.string sheet.name )
-                                        , ( "tags", E.list E.string sheet.tags )
-                                        ]
-                                )
-                    )
-                |> (::)
-                    (Dict.fromList
-                        [ ( "book_id", E.string "/" )
-                        , ( "dir", E.string "" )
-                        , ( "sheet_id", E.string "/" )
-                        , ( "name", E.string "library" )
-                        , ( "tags", E.list E.string [] )
-                        ]
-                    )
-                |> Array.fromList
-                |> Ok
-        , source = Ok (Feed Lib)
-    }
-
-
-
 ---- PARSER -------------------------------------------------------------------
 
 
@@ -478,78 +386,159 @@ number =
         ]
 
 
-libraryDecoder : D.Decoder (Dict Id Book)
+libraryDecoder : D.Decoder (Dict Id SheetInfo)
 libraryDecoder =
     D.dict
-        (D.map4 Book
-            (D.field "dir" D.string)
+        (D.map4 SheetInfo
+            (D.field "name" D.string)
+            (D.field "tags" (D.list D.string))
             (D.succeed ())
-            (D.succeed Dict.empty)
-            (D.field "sheets"
-                (D.dict
-                    (D.map3 SheetInfo
-                        (D.field "name" D.string)
-                        (D.field "tags" (D.list D.string))
-                        (D.succeed ())
-                    )
-                )
-            )
+            (D.succeed [])
         )
 
 
-decodeSheet : Dict Id Book -> Id -> D.Value -> Sheet
-decodeSheet library id sheet =
-    -- TODO: Consider doing D.Decoder ({cols, rows, source}) instead.
-    case id of
-        "" ->
-            libSheet library
-
-        _ ->
-            let
-                colsDecoder : D.Decoder (Array (Col Type))
-                colsDecoder =
-                    -- TODO: Calculate these from the source.
-                    D.map identity
-                        (D.field "cols"
-                            (D.array
-                                (D.map3 Col
-                                    (D.field "key" D.string)
-                                    (D.field "label" D.string)
-                                    (D.field "type" (D.succeed Text))
-                                )
-                            )
-                        )
-
-                rowsDecoder : D.Decoder (Array Row)
-                rowsDecoder =
-                    D.field "rows"
-                        (D.list (D.dict D.value) |> D.map Array.fromList)
-
-                sourceDecoder : D.Decoder Source
-                sourceDecoder =
-                    D.oneOf
-                        [ D.map Data
-                            (D.map (\cols -> { write = Nothing, cols = cols })
-                                (D.map identity
-                                    (D.field "cols"
-                                        (D.array
-                                            (D.map3 Col
-                                                (D.field "key" D.string)
-                                                (D.field "label" D.string)
-                                                (D.field "type" (D.succeed (Exceed "TODO")))
-                                            )
+tableDecoder : D.Decoder Table
+tableDecoder =
+    D.field "type" D.string
+        |> D.andThen
+            (\typ ->
+                case typ of
+                    "doc" ->
+                        D.map TableDoc
+                            (D.map2 Doc
+                                -- TODO:
+                                (D.field "cols"
+                                    (D.array
+                                        (D.map3 Col
+                                            (D.field "key" D.string)
+                                            (D.field "label" D.string)
+                                            (D.field "type" (D.succeed Text))
                                         )
                                     )
                                 )
+                                (D.field "rows" (D.array (D.array D.value)))
                             )
-                        ]
-            in
-            { defaultSheet
-                | sheetId = id
-                , cols = sheet |> D.decodeValue colsDecoder |> Result.mapError D.errorToString
-                , rows = sheet |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString
-                , source = sheet |> D.decodeValue sourceDecoder |> Result.mapError D.errorToString
+
+                    "feed" ->
+                        D.fail "TODO"
+
+                    "query" ->
+                        D.fail "TODO"
+
+                    _ ->
+                        D.fail "Error: TODO"
+            )
+
+
+
+---- INIT ---------------------------------------------------------------------
+
+
+type alias Flags =
+    { sheet : D.Value
+    , library : D.Value
+    }
+
+
+type alias Route =
+    { id : Id
+    , tool : Tool
+    , query : ()
+    }
+
+
+route : Url -> Route
+route url =
+    -- TODO: Store the ID in the path instead and serve from local server.
+    { id = Maybe.withDefault "" url.fragment
+    , tool = Settings
+    , query = ()
+    }
+
+
+init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
+init flags url nav =
+    let
+        loc : Route
+        loc =
+            route url
+
+        library : Dict Id SheetInfo
+        library =
+            flags.library
+                |> D.decodeValue libraryDecoder
+                |> Result.withDefault Dict.empty
+    in
+    ( { nav = nav
+      , library = library
+      , sheet =
+            case loc.id of
+                "" ->
+                    catalog library
+
+                _ ->
+                    { default
+                        | id = loc.id
+                        , tool = loc.tool
+                        , table = flags.sheet |> D.decodeValue tableDecoder |> Result.mapError D.errorToString
+                    }
+      }
+    , Cmd.none
+    )
+
+
+default : Sheet
+default =
+    { id = ""
+    , name = ""
+    , tags = []
+    , thumb = ()
+    , search = ""
+    , tag = Nothing
+    , select = Rect (xy -1 -1) (xy -1 -1)
+    , hover = xy -1 -1
+    , drag = False
+    , write = Nothing
+    , table = Err "TODO: not loaded"
+    , tool = Settings
+    }
+
+
+catalog : Dict Id SheetInfo -> Sheet
+catalog library =
+    { default
+        | id = ""
+        , table =
+            { cols =
+                [ ( "sheet_id", Link )
+                , ( "name", Text )
+                , ( "tags", Many Text )
+                ]
+                    |> List.map (\( k, t ) -> Col k k t)
+                    |> Array.fromList
+            , rows =
+                library
+                    |> Dict.toList
+                    |> List.map
+                        (\( id, sheet ) ->
+                            Array.fromList
+                                [ E.string ("#" ++ id)
+                                , E.string sheet.name
+                                , E.list E.string sheet.tags
+                                ]
+                        )
+                    |> (::)
+                        (Array.fromList
+                            [ E.string "/"
+                            , E.string "library"
+                            , E.list E.string []
+                            ]
+                        )
+                    |> Array.fromList
             }
+                |> TableDoc
+                |> Ok
+    }
 
 
 
@@ -558,20 +547,26 @@ decodeSheet library id sheet =
 
 type Msg
     = NoOp
-    | InputChanging Input String
-    | SheetEditing SheetEdit
-    | KeyPressed String
+    | UrlChange Url
+    | LinkClick Browser.UrlRequest
+    | LibraryChange D.Value
+    | DocChange (SheetMsg SheetChange)
+    | TableMsg TableMsg
+    | KeyPress String
     | CellMouseClick
     | CellMouseDown
     | CellMouseUp
-    | CellHovering Index
-    | DocChanged (DocMsg DocChange)
-    | LibraryChanged D.Value
-    | UrlChanged Url
-    | LinkClicked Browser.UrlRequest
+    | CellHover Index
+    | InputChange Input String
 
 
-type SheetEdit
+type TableMsg
+    = DocMsg DocMsg
+    | FeedMsg ()
+    | QueryMsg ()
+
+
+type DocMsg
     = SheetWrite Index
     | SheetColumnPush
     | SheetRowPush Int
@@ -588,6 +583,19 @@ type Input
 
 
 
+---- SUBSCRIPTIONS ------------------------------------------------------------
+
+
+subs : Model -> Sub Msg
+subs model =
+    Sub.batch
+        [ sheetChanged DocChange
+        , libraryChanged LibraryChange
+        , Browser.onKeyPress (D.map KeyPress (D.field "key" D.string))
+        ]
+
+
+
 ---- UPDATE -------------------------------------------------------------------
 
 
@@ -597,247 +605,247 @@ update msg ({ sheet } as model) =
         NoOp ->
             ( model, Cmd.none )
 
-        InputChanging SheetName x ->
+        _ ->
             -- TODO:
             ( model, Cmd.none )
 
-        InputChanging SheetTag x ->
-            -- TODO:
-            ( model, Cmd.none )
-
-        InputChanging SheetSearch x ->
-            -- TODO:
-            ( model, Cmd.none )
-
-        InputChanging CellWrite x ->
-            ( { model
-                | sheet =
-                    { sheet
-                        | source =
-                            case sheet.source of
-                                Ok (Data rows) ->
-                                    Ok (Data { rows | write = Just x })
-
-                                source ->
-                                    source
-                    }
-              }
-            , Cmd.none
-            )
-
-        InputChanging (ColumnType i) x ->
-            -- TODO:
-            ( model, Cmd.none )
-
-        InputChanging (ColumnKey i) x ->
-            -- TODO:
-            ( model, Cmd.none )
-
-        InputChanging (ColumnLabel i) x ->
-            -- TODO:
-            ( model, Cmd.none )
-
-        SheetEditing edit ->
-            ( { model
-                | sheet =
-                    { sheet
-                        | source =
-                            case sheet.source of
-                                Ok (Data rows) ->
-                                    Ok (Data { rows | write = Nothing })
-
-                                source ->
-                                    source
-                    }
-              }
-            , changeSheet <|
-                DocMsg sheet.sheetId <|
-                    case sheet.source of
-                        Ok (Data rows) ->
-                            case edit of
-                                SheetWrite { x, y } ->
-                                    -- TODO: what if we have no columns?
-                                    sheet.cols
-                                        |> Result.withDefault Array.empty
-                                        |> Array.get x
-                                        |> Maybe.map
-                                            (\col ->
-                                                [ { action = "cell-put"
-                                                  , path = [ E.string "rows", E.int y, E.string col.key ]
-                                                  , value = rows.write |> Maybe.withDefault "" |> E.string
-                                                  }
-                                                ]
-                                            )
-                                        |> Maybe.withDefault []
-
-                                SheetRowPush i ->
-                                    [ { action = "row-insert"
-                                      , path = [ E.string "rows", E.int i ]
-                                      , value = E.object []
-                                      }
-                                    ]
-
-                                SheetColumnPush ->
-                                    [ { action = "col-insert"
-                                      , path = [ E.string "cols", E.int (Array.length (Result.withDefault Array.empty sheet.cols)) ]
-                                      , value = E.object [ ( "key", E.string "" ), ( "label", E.string "" ), ( "type", E.string "same" ) ]
-                                      }
-                                    ]
-
-                        _ ->
-                            []
-            )
-
-        CellMouseClick ->
-            ( { model
-                | sheet =
-                    { sheet
-                        | select = { a = sheet.hover, b = sheet.hover }
-                        , source =
-                            case sheet.source of
-                                Ok (Data rows) ->
-                                    -- TODO: Fill in cell value.
-                                    Ok (Data { rows | write = Just "" })
-
-                                _ ->
-                                    sheet.source
-                    }
-              }
-            , Task.attempt (always NoOp) (Dom.focus "new-cell")
-            )
-
-        CellMouseDown ->
-            ( { model | sheet = { sheet | click = True, select = Rect sheet.hover sheet.select.b } }, Cmd.none )
-
-        CellMouseUp ->
-            ( { model | sheet = { sheet | click = False, select = Rect sheet.select.a sheet.hover } }, Cmd.none )
-
-        CellHovering hover ->
-            let
-                select =
-                    sheet.select
-
-                select_ =
-                    if sheet.click then
-                        { select | b = hover }
-
-                    else
-                        select
-            in
-            ( { model | sheet = { sheet | hover = hover, select = select_ } }, Cmd.none )
-
-        DocChanged change ->
-            -- TODO:
-            ( { model | sheet = decodeSheet model.library change.sheetId change.data.doc }, Cmd.none )
-
-        LibraryChanged libraryData ->
-            ( { model
-                | library =
-                    libraryData
-                        |> D.decodeValue libraryDecoder
-                        |> Result.withDefault model.library
-              }
-            , Cmd.none
-            )
-
-        UrlChanged url ->
-            -- TODO: We should eventually change #:sheetId to /:sheetId, but for now it confuses stupid local webserver.
-            case url.fragment of
-                Just sheetId ->
-                    ( model, selectSheet sheetId )
-
-                Nothing ->
-                    ( { model | sheet = libSheet model.library }, selectSheet "" )
-
-        LinkClicked (Browser.Internal url) ->
-            -- TODO: ?q=+any ?q=-any ?q==any
-            case url.fragment |> Maybe.andThen (flip Dict.get tools) of
-                Just tool ->
-                    ( { model | sheet = { sheet | tool = tool } }, Cmd.none )
-
-                _ ->
-                    ( model, Nav.pushUrl model.nav (Url.toString url) )
-
-        LinkClicked (Browser.External url) ->
-            ( model, Nav.load url )
-
-        KeyPressed "Enter" ->
-            ( model, Task.attempt (always NoOp) (Dom.blur "new-cell") )
-
-        KeyPressed "Backspace" ->
-            ( { model
-                | sheet =
-                    { sheet
-                        | source =
-                            case sheet.source of
-                                Ok (Data rows) ->
-                                    Ok (Data { rows | write = Nothing })
-
-                                source ->
-                                    source
-                    }
-              }
-            , changeSheet <|
-                DocMsg sheet.sheetId <|
-                    case sheet.source of
-                        Ok (Data rows) ->
-                            -- TODO: Do multiple patches when ranges are selected.
-                            case ( negate sheet.select.a.y, negate sheet.select.a.x ) of
-                                ( 1, 1 ) ->
-                                    []
-
-                                ( 1, i ) ->
-                                    [ { action = "col-del"
-                                      , path = [ E.string "cols", E.int (negate i) ]
-                                      , value = E.object []
-                                      }
-                                    ]
-
-                                ( i, 1 ) ->
-                                    [ { action = "row-del"
-                                      , path = [ E.string "rows", E.int (negate i) ]
-                                      , value = E.object []
-                                      }
-                                    ]
-
-                                ( y, x ) ->
-                                    sheet.cols
-                                        |> Result.withDefault Array.empty
-                                        |> Array.get (negate x)
-                                        |> Maybe.map
-                                            (\col ->
-                                                [ { action = "cell-put"
-                                                  , path = [ E.string "rows", E.int (negate y), E.string col.key ]
-                                                  , value = rows.write |> Maybe.withDefault "" |> E.string
-                                                  }
-                                                ]
-                                            )
-                                        |> Maybe.withDefault []
-
-                        _ ->
-                            []
-            )
-
-        KeyPressed _ ->
-            ( model, Cmd.none )
 
 
-
+--         InputChanging SheetName x ->
+--             -- TODO:
+--             ( model, Cmd.none )
+--
+--         InputChanging SheetTag x ->
+--             -- TODO:
+--             ( model, Cmd.none )
+--
+--         InputChanging SheetSearch x ->
+--             -- TODO:
+--             ( model, Cmd.none )
+--
+--         InputChanging CellWrite x ->
+--             ( { model
+--                 | sheet =
+--                     { sheet
+--                         | source =
+--                             case sheet.source of
+--                                 Ok (Data rows) ->
+--                                     Ok (Data { rows | write = Just x })
+--
+--                                 source ->
+--                                     source
+--                     }
+--               }
+--             , Cmd.none
+--             )
+--
+--         InputChanging (ColumnType i) x ->
+--             -- TODO:
+--             ( model, Cmd.none )
+--
+--         InputChanging (ColumnKey i) x ->
+--             -- TODO:
+--             ( model, Cmd.none )
+--
+--         InputChanging (ColumnLabel i) x ->
+--             -- TODO:
+--             ( model, Cmd.none )
+--
+--         SheetEditing edit ->
+--             ( { model
+--                 | sheet =
+--                     { sheet
+--                         | source =
+--                             case sheet.source of
+--                                 Ok (Data rows) ->
+--                                     Ok (Data { rows | write = Nothing })
+--
+--                                 source ->
+--                                     source
+--                     }
+--               }
+--             , changeSheet <|
+--                 DocMsg sheet.sheetId <|
+--                     case sheet.source of
+--                         Ok (Data rows) ->
+--                             case edit of
+--                                 SheetWrite { x, y } ->
+--                                     -- TODO: what if we have no columns?
+--                                     sheet.cols
+--                                         |> Result.withDefault Array.empty
+--                                         |> Array.get x
+--                                         |> Maybe.map
+--                                             (\col ->
+--                                                 [ { action = "cell-put"
+--                                                   , path = [ E.string "rows", E.int y, E.string col.key ]
+--                                                   , value = rows.write |> Maybe.withDefault "" |> E.string
+--                                                   }
+--                                                 ]
+--                                             )
+--                                         |> Maybe.withDefault []
+--
+--                                 SheetRowPush i ->
+--                                     [ { action = "row-insert"
+--                                       , path = [ E.string "rows", E.int i ]
+--                                       , value = E.object []
+--                                       }
+--                                     ]
+--
+--                                 SheetColumnPush ->
+--                                     [ { action = "col-insert"
+--                                       , path = [ E.string "cols", E.int (Array.length (Result.withDefault Array.empty sheet.cols)) ]
+--                                       , value = E.object [ ( "key", E.string "" ), ( "label", E.string "" ), ( "type", E.string "same" ) ]
+--                                       }
+--                                     ]
+--
+--                         _ ->
+--                             []
+--             )
+--
+--         CellMouseClick ->
+--             ( { model
+--                 | sheet =
+--                     { sheet
+--                         | select = { a = sheet.hover, b = sheet.hover }
+--                         , source =
+--                             case sheet.source of
+--                                 Ok (Data rows) ->
+--                                     -- TODO: Fill in cell value.
+--                                     Ok (Data { rows | write = Just "" })
+--
+--                                 _ ->
+--                                     sheet.source
+--                     }
+--               }
+--             , Task.attempt (always NoOp) (Dom.focus "new-cell")
+--             )
+--
+--         CellMouseDown ->
+--             ( { model | sheet = { sheet | click = True, select = Rect sheet.hover sheet.select.b } }, Cmd.none )
+--
+--         CellMouseUp ->
+--             ( { model | sheet = { sheet | click = False, select = Rect sheet.select.a sheet.hover } }, Cmd.none )
+--
+--         CellHovering hover ->
+--             let
+--                 select =
+--                     sheet.select
+--
+--                 select_ =
+--                     if sheet.click then
+--                         { select | b = hover }
+--
+--                     else
+--                         select
+--             in
+--             ( { model | sheet = { sheet | hover = hover, select = select_ } }, Cmd.none )
+--
+--         DocChanged change ->
+--             -- TODO:
+--             ( { model | sheet = decodeSheet model.library change.sheetId change.data.doc }, Cmd.none )
+--
+--         LibraryChanged libraryData ->
+--             ( { model
+--                 | library =
+--                     libraryData
+--                         |> D.decodeValue libraryDecoder
+--                         |> Result.withDefault model.library
+--               }
+--             , Cmd.none
+--             )
+--
+--         UrlChanged url ->
+--             -- TODO: We should eventually change #:sheetId to /:sheetId, but for now it confuses stupid local webserver.
+--             case url.fragment of
+--                 Just sheetId ->
+--                     ( model, selectSheet sheetId )
+--
+--                 Nothing ->
+--                     ( { model | sheet = libSheet model.library }, selectSheet "" )
+--
+--         LinkClicked (Browser.Internal url) ->
+--             -- TODO: ?q=+any ?q=-any ?q==any
+--             case url.fragment |> Maybe.andThen (flip Dict.get tools) of
+--                 Just tool ->
+--                     ( { model | sheet = { sheet | tool = tool } }, Cmd.none )
+--
+--                 _ ->
+--                     ( model, Nav.pushUrl model.nav (Url.toString url) )
+--
+--         LinkClicked (Browser.External url) ->
+--             ( model, Nav.load url )
+--
+--         KeyPressed "Enter" ->
+--             ( model, Task.attempt (always NoOp) (Dom.blur "new-cell") )
+--
+--         KeyPressed "Backspace" ->
+--             ( { model
+--                 | sheet =
+--                     { sheet
+--                         | source =
+--                             case sheet.source of
+--                                 Ok (Data rows) ->
+--                                     Ok (Data { rows | write = Nothing })
+--
+--                                 source ->
+--                                     source
+--                     }
+--               }
+--             , changeSheet <|
+--                 DocMsg sheet.sheetId <|
+--                     case sheet.source of
+--                         Ok (Data rows) ->
+--                             -- TODO: Do multiple patches when ranges are selected.
+--                             case ( negate sheet.select.a.y, negate sheet.select.a.x ) of
+--                                 ( 1, 1 ) ->
+--                                     []
+--
+--                                 ( 1, i ) ->
+--                                     [ { action = "col-del"
+--                                       , path = [ E.string "cols", E.int (negate i) ]
+--                                       , value = E.object []
+--                                       }
+--                                     ]
+--
+--                                 ( i, 1 ) ->
+--                                     [ { action = "row-del"
+--                                       , path = [ E.string "rows", E.int (negate i) ]
+--                                       , value = E.object []
+--                                       }
+--                                     ]
+--
+--                                 ( y, x ) ->
+--                                     sheet.cols
+--                                         |> Result.withDefault Array.empty
+--                                         |> Array.get (negate x)
+--                                         |> Maybe.map
+--                                             (\col ->
+--                                                 [ { action = "cell-put"
+--                                                   , path = [ E.string "rows", E.int (negate y), E.string col.key ]
+--                                                   , value = rows.write |> Maybe.withDefault "" |> E.string
+--                                                   }
+--                                                 ]
+--                                             )
+--                                         |> Maybe.withDefault []
+--
+--                         _ ->
+--                             []
+--             )
+--
+--         KeyPressed _ ->
+--             ( model, Cmd.none )
+--
+--
+--
 ---- VIEW ---------------------------------------------------------------------
 
 
 view : Model -> Browser.Document Msg
 view ({ sheet } as model) =
     let
-        ( bookId, book ) =
-            model.library
-                |> Dict.filter (\_ -> .sheets >> Dict.keys >> Set.fromList >> Set.member sheet.sheetId)
-                |> Dict.toList
-                |> List.head
-                |> Maybe.withDefault ( "", { dir = "", perms = (), peers = Dict.empty, sheets = Dict.empty } )
-
-        { name, tags, thumb } =
-            book.sheets |> Dict.get sheet.sheetId |> Maybe.withDefault { name = "", tags = [], thumb = () }
+        info : SheetInfo
+        info =
+            model.library |> Dict.get sheet.id |> Maybe.withDefault { name = "", tags = [], thumb = (), peers = [] }
     in
     { title = "scrapsheets"
     , body =
@@ -858,26 +866,21 @@ view ({ sheet } as model) =
                         List.concat
                             [ [ H.a [ A.href "/", S.fontWeightBold ] [ text "scrapsheets (2)" ]
                               ]
-                            , iif (book.dir == "")
-                                []
-                                [ text "/"
-                                , H.a [ A.href ("/?book_id=" ++ bookId) ] [ text (book.dir ++ " (12)") ]
-                                ]
-                            , iif (sheet.sheetId == "")
+                            , iif (sheet.id == "")
                                 [ text "/"
                                 , H.span [] [ text "library" ]
                                 ]
                                 [ text "/"
-                                , H.a [ A.href "#settings" ] [ text name ]
+                                , H.a [ A.href "#settings" ] [ text info.name ]
                                 , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <|
                                     List.concat
-                                        [ case sheet.newTag of
+                                        [ case sheet.tag of
                                             Nothing ->
-                                                [ H.button [ A.onClick (InputChanging SheetTag "") ] [ text "#" ] ]
+                                                [ H.button [ A.onClick (InputChange SheetTag "") ] [ text "#" ] ]
 
                                             Just value ->
-                                                [ H.input [ A.value value, A.onInput (InputChanging SheetTag) ] [] ]
-                                        , List.map (\tag -> H.a [ A.href ("?q=+tag:" ++ tag) ] [ text ("#" ++ tag) ]) tags
+                                                [ H.input [ A.value value, A.onInput (InputChange SheetTag) ] [] ]
+                                        , List.map (\tag -> H.a [ A.href ("?q=+tag:" ++ tag) ] [ text ("#" ++ tag) ]) info.tags
                                         ]
                                 ]
                             ]
@@ -897,17 +900,17 @@ view ({ sheet } as model) =
 
                 -- All current filters should be rendered as text in the searchbar.
                 -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
-                , H.input [ A.value sheet.search, A.onInput (InputChanging SheetSearch), S.width "100%" ] []
+                , H.input [ A.value sheet.search, A.onInput (InputChange SheetSearch), S.width "100%" ] []
 
                 -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
-                , H.table [ S.borderCollapseCollapse, A.onMouseLeave (CellHovering (xy -1 -1)) ]
+                , H.table [ S.borderCollapseCollapse, A.onMouseLeave (CellHover (xy -1 -1)) ]
                     [ H.thead []
                         [ H.tr [] <|
                             -- TODO: Add additional header rows for stats and column def.
                             (::)
                                 (H.th
-                                    [ A.onClick (SheetEditing (SheetRowPush -1))
-                                    , A.onMouseEnter (CellHovering (xy -1 -1))
+                                    [ A.onClick (TableMsg (DocMsg (SheetRowPush -1)))
+                                    , A.onMouseEnter (CellHover (xy -1 -1))
                                     , S.textAlignRight
                                     , S.widthRem 0.001
                                     , S.whiteSpaceNowrap
@@ -921,7 +924,7 @@ view ({ sheet } as model) =
                                             [ A.onClick CellMouseClick
                                             , A.onMouseDown CellMouseDown
                                             , A.onMouseUp CellMouseUp
-                                            , A.onMouseEnter (CellHovering (xy i -1))
+                                            , A.onMouseEnter (CellHover (xy i -1))
                                             , S.textAlignLeft
                                             , S.verticalAlignBottom
                                             ]
@@ -931,7 +934,7 @@ view ({ sheet } as model) =
                                     )
                                 <|
                                     Array.toList <|
-                                        Result.withDefault Array.empty sheet.cols
+                                        Result.withDefault Array.empty (Err "TODO")
                         ]
                     , H.tbody [] <|
                         Array.toList <|
@@ -940,8 +943,8 @@ view ({ sheet } as model) =
                                     H.tr [] <|
                                         (::)
                                             (H.th
-                                                [ A.onClick (SheetEditing (SheetRowPush n))
-                                                , A.onMouseEnter (CellHovering (xy -1 n))
+                                                [ A.onClick (TableMsg (DocMsg (SheetRowPush n)))
+                                                , A.onMouseEnter (CellHover (xy -1 n))
                                                 , S.textAlignRight
                                                 , S.widthRem 0.001
                                                 , S.whiteSpaceNowrap
@@ -957,7 +960,7 @@ view ({ sheet } as model) =
                                                         [ A.onClick CellMouseClick
                                                         , A.onMouseDown CellMouseDown
                                                         , A.onMouseUp CellMouseUp
-                                                        , A.onMouseEnter (CellHovering (xy i n))
+                                                        , A.onMouseEnter (CellHover (xy i n))
                                                         , S.heightRem 1.25
                                                         , A.classList <|
                                                             let
@@ -991,24 +994,19 @@ view ({ sheet } as model) =
                                                                 |> Result.withDefault (text "TODO: parse error")
                                                             ]
                                                         <|
-                                                            case sheet.source of
-                                                                Ok (Data { write }) ->
-                                                                    if write /= Nothing && sheet.select == rect i n i n then
-                                                                        Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" write), A.onInput (InputChanging CellWrite), A.onBlur (SheetEditing (SheetWrite sheet.select.a)), S.width "100%" ] [] ]
+                                                            if sheet.write /= Nothing && sheet.select == rect i n i n then
+                                                                Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (TableMsg (DocMsg (SheetWrite sheet.select.a))), S.width "100%" ] [] ]
 
-                                                                    else
-                                                                        Nothing
-
-                                                                _ ->
-                                                                    Nothing
+                                                            else
+                                                                Nothing
                                                 )
                                             <|
                                                 Array.toList <|
-                                                    Result.withDefault Array.empty sheet.cols
+                                                    Result.withDefault Array.empty (Err "TODO")
                                 )
                             <|
                                 -- TODO: Better error.
-                                Result.withDefault Array.empty sheet.rows
+                                Result.withDefault Array.empty (Err "TODO")
                     ]
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ] <|
@@ -1021,7 +1019,7 @@ view ({ sheet } as model) =
                             -- TODO:
                             [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ]
                                 -- TODO: Link to the column configs.
-                                [ text (Debug.toString sheet.source)
+                                [ text (Debug.toString sheet.table)
                                 ]
                             , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd ]
                                 [ H.button [ A.onClick NoOp ] [ text "new column (C)" ]
