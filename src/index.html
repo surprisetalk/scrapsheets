@@ -240,10 +240,30 @@
             }
           }, 100);
 
+          let ws;
           app.ports.selectSheet.subscribe(async id => {
             if (id === sheet?.documentId) return;
+            ws?.close();
             // TODO: Remove existing listeners.
             sheet = (await find(id)) || { documentId: id };
+            const doc = await sheet?.doc?.();
+            ws = doc?.feed === "websocket" ? new WebSocket(doc?.url) : null;
+            if (ws) {
+              const rows = [];
+              ws.onmessage = event => {
+                if (rows.length >= 1000) return;
+                rows.unshift(JSON.parse(event.data));
+                app.ports.sheetChanged.send({
+                  id,
+                  data: {
+                    doc: { ...doc, rows },
+                    handle: null,
+                    patchInfo: null,
+                    patches: [],
+                  },
+                });
+              };
+            }
             if (!sheet?.doc) return;
             sheet.on("change", data => {
               app.ports.sheetChanged.send({
@@ -254,7 +274,7 @@
             app.ports.sheetChanged.send({
               id,
               data: {
-                doc: await sheet.doc(),
+                doc: doc,
                 handle: null,
                 patchInfo: null,
                 patches: [],
@@ -315,35 +335,6 @@
               data: await sheet.doc(),
             });
         }
-
-        /*
-        const ws = new WebSocket("wss://api.manifold.markets/ws");
-        let txid = 0;
-        ws.onopen = () => {
-          // Subscribe to global bets
-          ws.send(
-            JSON.stringify({
-              type: "subscribe",
-              txid: txid++,
-              topics: ["global/new-bet"],
-            }),
-          );
-        };
-        ws.onmessage = event => {
-          const msg = JSON.parse(event.data);
-          if (msg.type === "broadcast") {
-            console.log("Received broadcast:", msg.data);
-          }
-        };
-        setInterval(() => {
-          ws.send(
-            JSON.stringify({
-              type: "ping",
-              txid: txid++,
-            }),
-          );
-        }, 30000);
-        */
       } catch (error) {
         console.error(error);
       }

@@ -281,6 +281,7 @@ type
     -- | Link
     = Text
     | Number
+    | Boolean
     | Many Type
     | Link
     | Json
@@ -326,6 +327,9 @@ string =
         , D.map String.fromInt D.int
         , D.map String.fromFloat D.float
         , D.null "NULL"
+        , D.map (String.join ", ") (D.list (D.lazy (\_ -> string)))
+        , D.map (String.join ", " << List.map (\( k, v ) -> k ++ ": " ++ v) << Dict.toList) (D.dict (D.lazy (\_ -> string)))
+        , D.map (\c -> iif c "true" "false") D.bool
         ]
 
 
@@ -357,7 +361,20 @@ tableDecoder =
                                         (D.map3 Col
                                             (D.field "key" D.int)
                                             (D.field "name" D.string)
-                                            (D.field "type" (D.succeed Text))
+                                            (D.field "type" D.string
+                                                |> D.map
+                                                    (\typ_ ->
+                                                        case typ_ of
+                                                            "bool" ->
+                                                                Boolean
+
+                                                            "link" ->
+                                                                Link
+
+                                                            _ ->
+                                                                Text
+                                                    )
+                                            )
                                         )
                                     )
                                 )
@@ -370,8 +387,9 @@ tableDecoder =
                                 (\feed ->
                                     case feed of
                                         "websocket" ->
-                                            D.map (\url -> TableFeed (Websocket { url = url, rows = Array.empty }))
+                                            D.map2 (\url rows -> TableFeed (Websocket { url = url, rows = Maybe.withDefault Array.empty rows }))
                                                 (D.field "url" D.string)
+                                                (D.maybe (D.field "rows" (D.array D.value)))
 
                                         feed_ ->
                                             D.fail ("Bad feed type: " ++ feed_)
@@ -972,6 +990,12 @@ view ({ sheet } as model) =
                                                                             (case col.typ of
                                                                                 Link ->
                                                                                     D.string |> D.map (\href -> H.a [ A.href href, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock, S.maxWidthRem 12 ] [ text href ])
+
+                                                                                Text ->
+                                                                                    D.map text string
+
+                                                                                Boolean ->
+                                                                                    D.map (\c -> H.input [ A.type_ "checkbox", A.checked c ] []) D.bool
 
                                                                                 _ ->
                                                                                     D.map text string
