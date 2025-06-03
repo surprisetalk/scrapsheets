@@ -31,182 +31,138 @@
           // network: [new AM.BrowserWebSocketClientAdapter("wss://sync.automerge.org")],
         });
 
-        const libraryDoc = await repo
-          .find(localStorage.getItem("scrapsheets-library-id"))
-          .catch(async () => await repo.create({ books: [] }));
-        localStorage.setItem("scrapsheets-library-id", libraryDoc.documentId);
+        const find = id => repo.find(id).catch(() => null);
 
-        const bookDocs = {};
-        for (const id of (await libraryDoc.doc()).books)
-          bookDocs[id] = await repo.find(id).catch(() => null);
-
-        const library = async () =>
-          Object.fromEntries(
-            await Promise.all(
-              (await libraryDoc.doc()).books.map(async id => [
-                id,
-                await bookDocs[id].doc(),
-              ]),
-            ),
-          );
+        const library = await repo
+          .find(localStorage.getItem("scrapsheets"))
+          .catch(async () => await repo.create({ sheets: [] }));
+        localStorage.setItem("scrapsheets", library.documentId);
 
         const hash = window.location.hash.slice(1) || null;
-
-        const sheetDocs = {};
-        sheetDocs[hash] = await repo.find(hash).catch(() => null);
-
         const app = Elm.Main.init({
           node: document.getElementById("elm"),
           flags: {
-            sheet: (await sheetDocs[hash]?.doc()) ?? null,
-            library: await library(),
+            sheet: (await find(hash))?.doc() ?? null,
           },
         });
 
-        sheetDocs[hash]?.on("change", data => {
-          const payload = { sheetId: sheetDocs[hash]?.documentId, data };
-          app.ports.sheetChanged.send(payload);
-        });
+        {
+          let sheet;
 
-        for (const id in bookDocs)
-          bookDocs[id].on("change", async data =>
-            app.ports.libraryChanged.send(await library()),
-          );
-
-        libraryDoc.on("change", async data => {
-          // TODO: Update books based on patch.
-          // TODO: Listen to new books and remove listeners on deleting books.
-          app.ports.libraryChanged.send(await library());
-        });
-
-        app.ports.selectSheet.subscribe(async sheetId => {
-          const sheetDoc = await repo.find(sheetId).catch(() => null);
-          if (!sheetDocs[sheetId]) sheetDocs[sheetId] = sheetDoc;
-          if (sheetDoc) {
-            sheetDoc.on("change", data => {
+          app.ports.selectSheet.subscribe(async id => {
+            if (id === sheet?.documentId) return;
+            // TODO: Remove existing listeners.
+            sheet = await find(id);
+            if (!sheet) return;
+            sheet.on("change", data => {
               app.ports.sheetChanged.send({
-                sheetId: data.handle.documentId,
+                id: data.handle.documentId,
                 data,
               });
             });
             app.ports.sheetChanged.send({
-              sheetId,
+              id,
               data: {
-                doc: await sheetDoc.doc(),
+                doc: await sheet.doc(),
                 handle: null,
                 patchInfo: null,
                 patches: [],
               },
             });
-          }
+          });
+
+          app?.ports?.changeSheet?.subscribe(
+            // TODO: Use custom patches for now.
+            ({ id, data: patches }) => {
+              if (!id || id !== sheet?.documentId) return;
+              for (const patch of patches) {
+                sheet?.change(d => {
+                  if (!d.cols) d.cols = [];
+                  if (!d.rows) d.rows = [];
+                  switch (patch.action) {
+                    case "cell-put":
+                      const [_, y, x] = patch.path;
+                      if (!d.rows[y]) d.rows[y] = {};
+                      d.rows[y][x] = patch.value;
+                      break;
+                    case "row-insert":
+                      d.rows.insertAt(1 + patch.path[1], patch.value);
+                      break;
+                    case "col-insert":
+                      // TODO: Intelligently pick a column based on existing columns and rows.
+                      d.cols.push({
+                        key: Math.random().toString().slice(2),
+                        label: Math.random().toString().slice(2),
+                        type: "same",
+                      });
+                      break;
+                    case "row-del":
+                      d.rows.deleteAt(patch.path[1]);
+                      break;
+                    case "col-del":
+                      d.cols.deleteAt(patch.path[1]);
+                      break;
+                    default:
+                      throw new Error("TODO");
+                  }
+                });
+              }
+            },
+          );
+        }
+
+        library.on("change", async data => {
+          // TODO: Update books based on patch.
+          // const sheetDoc = TODO
+          // app.ports.libraryChanged.send({ id: sheetDoc.documentId, data: await sheetDoc.doc() });
         });
+        for (const id of (await library.doc()).sheets) {
+          const sheet = await find(id);
+          if (sheet)
+            app.ports.libraryChanged.send({
+              id: sheet.documentId,
+              data: await sheet.doc(),
+            });
+        }
 
-        app.ports.changeSheet.subscribe(
-          // TODO: Use custom patches for now.
-          ({ sheetId, data: patches }) => {
-            for (const patch of patches) {
-              sheetDocs[sheetId]?.change(d => {
-                if (!d.cols) d.cols = [];
-                if (!d.rows) d.rows = [];
-                switch (patch.action) {
-                  case "cell-put":
-                    const [_, y, x] = patch.path;
-                    if (!d.rows[y]) d.rows[y] = {};
-                    d.rows[y][x] = patch.value;
-                    break;
-                  case "row-insert":
-                    d.rows.insertAt(1 + patch.path[1], patch.value);
-                    break;
-                  case "col-insert":
-                    // TODO: Intelligently pick a column based on existing columns and rows.
-                    d.cols.push({
-                      key: Math.random().toString().slice(2),
-                      label: Math.random().toString().slice(2),
-                      type: "same",
-                    });
-                    break;
-                  case "row-del":
-                    d.rows.deleteAt(patch.path[1]);
-                    break;
-                  case "col-del":
-                    d.cols.deleteAt(patch.path[1]);
-                    break;
-                  default:
-                    throw new Error("TODO");
-                }
-              });
-            }
-          },
-        );
-
-        if (!(await libraryDoc.doc()).books.length) {
-          const demoSheet = repo.create({
-            cols: [
-              { key: "A", label: "Task", type: "text" },
-              { key: "B", label: "Status", type: "text" },
-            ],
-            rows: [
-              { A: "Setup project", B: "Done" },
-              { A: "Create demo", B: "In Progress" },
-            ],
-          });
-          const budgetSheet = repo.create({
-            cols: [
-              { key: "A", label: "Item", type: "text" },
-              { key: "B", label: "Amount", type: "number" },
-            ],
-            rows: [
-              { A: "Groceries", B: "150" },
-              { A: "Gas", B: "80" },
-            ],
-          });
-          const taskSheet = repo.create({
-            cols: [
-              { key: "A", label: "Project", type: "text" },
-              { key: "B", label: "Priority", type: "text" },
-            ],
-            rows: [
-              { A: "Website redesign", B: "High" },
-              { A: "Documentation", B: "Medium" },
-            ],
-          });
-
-          const personalBook = repo.create({
-            dir: "taylor",
-            sheets: {
-              [demoSheet.documentId]: {
-                name: "Demo Sheet",
-                tags: ["demo", "example"],
-                thumb: null,
-              },
-              [budgetSheet.documentId]: {
-                name: "Budget Tracker",
-                tags: ["finance", "personal"],
-                thumb: null,
-              },
-            },
-          });
-          const workBook = repo.create({
-            dir: "work",
-            sheets: {
-              [taskSheet.documentId]: {
-                name: "Project Tasks",
-                tags: ["project", "tasks"],
-                thumb: null,
-              },
-            },
-          });
-          const recipesBook = repo.create({
-            dir: "recipes",
-            sheets: {},
-          });
-
-          libraryDoc.change(d =>
-            d.books.push(
-              personalBook.documentId,
-              workBook.documentId,
-              recipesBook.documentId,
-            ),
+        if (!(await library.doc()).sheets.length) {
+          const sheets = [
+            repo.create({
+              type: "doc",
+              cols: [
+                { key: 0, name: "Task", type: "text" },
+                { key: 1, name: "Status", type: "text" },
+              ],
+              rows: [
+                { 0: "Setup project", 1: "Done" },
+                { 0: "Create demo", 1: "In Progress" },
+              ],
+            }),
+            repo.create({
+              type: "doc",
+              cols: [
+                { key: 0, name: "Item", type: "text" },
+                { key: 1, name: "Amount", type: "number" },
+              ],
+              rows: [
+                { 0: "Groceries", 1: "150" },
+                { 0: "Gas", 1: "80" },
+              ],
+            }),
+            repo.create({
+              type: "doc",
+              cols: [
+                { key: 0, name: "Project", type: "text" },
+                { key: 1, name: "Priority", type: "text" },
+              ],
+              rows: [
+                { 0: "Website redesign", 1: "High" },
+                { 0: "Documentation", 1: "Medium" },
+              ],
+            }),
+          ];
+          library.change(d =>
+            d.sheets.push(...sheets.map(doc => doc.documentId)),
           );
         }
       } catch (error) {

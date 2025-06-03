@@ -46,7 +46,7 @@ iif c a b =
 ---- PORTS --------------------------------------------------------------------
 
 
-port libraryChanged : (D.Value -> msg) -> Sub msg
+port libraryChanged : (SheetMsg D.Value -> msg) -> Sub msg
 
 
 port changeSheet : SheetMsg (List Patch) -> Cmd msg
@@ -285,8 +285,8 @@ type
 type Tool
     = Settings
     | Hints
-    | Stats { following : Maybe () }
-    | Share
+    | Stats
+    | Share { following : Maybe () }
     | History
 
 
@@ -294,8 +294,8 @@ tools : Dict String Tool
 tools =
     Dict.fromList
         [ ( "settings", Settings )
-        , ( "stats", Stats { following = Nothing } )
-        , ( "share", Share )
+        , ( "stats", Stats )
+        , ( "share", Share { following = Nothing } )
         , ( "hints", Hints )
         , ( "history", History )
         ]
@@ -333,17 +333,6 @@ number =
         ]
 
 
-libraryDecoder : D.Decoder (Dict Id SheetInfo)
-libraryDecoder =
-    D.dict
-        (D.map4 SheetInfo
-            (D.field "name" D.string)
-            (D.field "tags" (D.list D.string))
-            (D.succeed ())
-            (D.succeed [])
-        )
-
-
 tableDecoder : D.Decoder Table
 tableDecoder =
     D.field "type" D.string
@@ -363,7 +352,7 @@ tableDecoder =
                                         )
                                     )
                                 )
-                                (D.field "rows" (D.array (D.map (Dict.fromList << Array.toIndexedList) (D.array D.value))))
+                                (D.field "rows" (D.array (D.map (Dict.fromList << List.filterMap (\( k, v ) -> Maybe.map (flip Tuple.pair v) (String.toInt k)) << Dict.toList) (D.dict D.value))))
                             )
 
                     "feed" ->
@@ -383,7 +372,6 @@ tableDecoder =
 
 type alias Flags =
     { sheet : D.Value
-    , library : D.Value
     }
 
 
@@ -397,36 +385,24 @@ route url ({ sheet } as model) =
     in
     ( { model
         | sheet =
-            case id of
-                "" ->
-                    catalog model.library
-
-                id_ ->
-                    tools
-                        |> Dict.get id_
-                        |> Maybe.map (\tool -> { sheet | tool = tool })
-                        |> Maybe.withDefault sheet
+            tools
+                |> Dict.get id
+                |> Maybe.map (\tool -> { sheet | tool = tool })
+                |> Maybe.withDefault sheet
       }
-    , if id == "" || Dict.member id tools then
-        Nav.pushUrl model.nav (Url.toString url)
+    , if Dict.member id tools then
+        Cmd.none
 
       else
-        Cmd.none
+        Nav.pushUrl model.nav (Url.toString url)
     )
 
 
 init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
 init flags url nav =
-    let
-        library : Dict Id SheetInfo
-        library =
-            flags.library
-                |> D.decodeValue libraryDecoder
-                |> Result.withDefault Dict.empty
-    in
     route url
         { nav = nav
-        , library = library
+        , library = Dict.empty
         , sheet = { default | table = flags.sheet |> D.decodeValue tableDecoder |> Result.mapError D.errorToString }
         }
 
@@ -448,43 +424,9 @@ default =
     }
 
 
-catalog : Dict Id SheetInfo -> Sheet
-catalog library =
-    { default
-        | id = ""
-        , table =
-            { cols =
-                [ ( "sheet_id", Link )
-                , ( "name", Text )
-                , ( "tags", Many Text )
-                ]
-                    |> List.indexedMap (\i ( k, t ) -> Col i k t)
-                    |> Array.fromList
-            , rows =
-                library
-                    |> Dict.toList
-                    |> List.map
-                        (\( id, sheet ) ->
-                            Dict.fromList <|
-                                List.indexedMap Tuple.pair
-                                    [ E.string ("#" ++ id)
-                                    , E.string sheet.name
-                                    , E.list E.string sheet.tags
-                                    ]
-                        )
-                    |> (::)
-                        (Dict.fromList <|
-                            List.indexedMap Tuple.pair
-                                [ E.string "/"
-                                , E.string "library"
-                                , E.list E.string []
-                                ]
-                        )
-                    |> Array.fromList
-            }
-                |> TableDoc
-                |> Ok
-    }
+catalog : Sheet
+catalog =
+    { default | id = "", table = Ok (TableFeed Library) }
 
 
 
@@ -495,7 +437,7 @@ type Msg
     = NoOp
     | UrlChange Url
     | LinkClick Browser.UrlRequest
-    | LibraryChange D.Value
+    | LibraryChange (SheetMsg D.Value)
     | DocChange (SheetMsg SheetChange)
     | TableMsg TableMsg
     | KeyPress String
@@ -558,7 +500,7 @@ update msg ({ sheet } as model) =
                     ( model, selectSheet sheetId )
 
                 Nothing ->
-                    ( { model | sheet = catalog model.library }, selectSheet "" )
+                    ( { model | sheet = catalog }, selectSheet "" )
 
         LinkClick (Browser.Internal url) ->
             -- TODO: ?q=+any ?q=-any ?q==any
@@ -566,6 +508,35 @@ update msg ({ sheet } as model) =
 
         LinkClick (Browser.External url) ->
             ( model, Nav.load url )
+
+        LibraryChange data ->
+            ( { model
+                | library =
+                    data.data
+                        |> D.decodeValue
+                            (D.map4 SheetInfo
+                                (D.oneOf [ D.field "name" D.string, D.succeed "" ])
+                                (D.oneOf [ D.field "tags" (D.list D.string), D.succeed [] ])
+                                (D.succeed ())
+                                (D.succeed [])
+                            )
+                        |> Result.withDefault (SheetInfo "" [] () [])
+                        |> flip (Dict.insert data.id) model.library
+              }
+            , Cmd.none
+            )
+
+        DocChange data ->
+            -- TODO:
+            ( { model
+                | sheet =
+                    { default
+                        | id = data.id
+                        , table = data.data.doc |> D.decodeValue tableDecoder |> Result.mapError D.errorToString
+                    }
+              }
+            , Cmd.none
+            )
 
         _ ->
             -- TODO:
@@ -702,20 +673,6 @@ update msg ({ sheet } as model) =
 --             in
 --             ( { model | sheet = { sheet | hover = hover, select = select_ } }, Cmd.none )
 --
---         DocChanged change ->
---             -- TODO:
---             ( { model | sheet = decodeSheet model.library change.sheetId change.data.doc }, Cmd.none )
---
---         LibraryChanged libraryData ->
---             ( { model
---                 | library =
---                     libraryData
---                         |> D.decodeValue libraryDecoder
---                         |> Result.withDefault model.library
---               }
---             , Cmd.none
---             )
---
 --         KeyPressed "Enter" ->
 --             ( model, Task.attempt (always NoOp) (Dom.blur "new-cell") )
 --
@@ -789,6 +746,50 @@ view ({ sheet } as model) =
             model.library
                 |> Dict.get sheet.id
                 |> Maybe.withDefault { name = "", tags = [], thumb = (), peers = [] }
+
+        table : Result String Doc
+        table =
+            case sheet.table of
+                Err err ->
+                    Err err
+
+                Ok (TableDoc doc) ->
+                    Ok doc
+
+                Ok (TableFeed Library) ->
+                    Ok
+                        { cols =
+                            [ ( "sheet_id", Link )
+                            , ( "name", Text )
+                            , ( "tags", Many Text )
+                            ]
+                                |> List.indexedMap (\i ( k, t ) -> Col i k t)
+                                |> Array.fromList
+                        , rows =
+                            model.library
+                                |> Dict.toList
+                                |> List.map
+                                    (\( id, s ) ->
+                                        Dict.fromList <|
+                                            List.indexedMap Tuple.pair
+                                                [ E.string ("#" ++ id)
+                                                , E.string s.name
+                                                , E.list E.string s.tags
+                                                ]
+                                    )
+                                |> (::)
+                                    (Dict.fromList <|
+                                        List.indexedMap Tuple.pair
+                                            [ E.string "/"
+                                            , E.string "library"
+                                            , E.list E.string []
+                                            ]
+                                    )
+                                |> Array.fromList
+                        }
+
+                _ ->
+                    Err "TODO"
     in
     { title = "scrapsheets"
     , body =
@@ -846,11 +847,11 @@ view ({ sheet } as model) =
                 , H.input [ A.value sheet.search, A.onInput (InputChange SheetSearch), S.width "100%" ] []
 
                 -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
-                , case sheet.table of
+                , case table of
                     Err err ->
                         H.p [] [ text err ]
 
-                    Ok (TableDoc doc) ->
+                    Ok doc ->
                         H.table [ S.borderCollapseCollapse, A.onMouseLeave (CellHover (xy -1 -1)) ]
                             [ H.thead []
                                 [ H.tr [] <|
@@ -952,9 +953,6 @@ view ({ sheet } as model) =
                                         )
                                         doc.rows
                             ]
-
-                    Ok _ ->
-                        H.p [] [ text "TODO" ]
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ] <|
                 List.concat
@@ -977,11 +975,11 @@ view ({ sheet } as model) =
                             -- TODO: problems (linting), ideas, related (sources/backlinks)
                             []
 
-                        Stats stats ->
+                        Stats ->
                             -- TODO:
                             []
 
-                        Share ->
+                        Share share ->
                             -- TODO:
                             []
 
