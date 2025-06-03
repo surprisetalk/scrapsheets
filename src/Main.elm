@@ -1,63 +1,5 @@
 port module Main exposing (main)
 
----- NOTES --------------------------------------------------------------------
---
--- New architecture:
---
---   dict id sheet
---   ; sheet :
---       { name : text
---       , tags : set text
---       , peers :
---           | #private (dict id peer)
---           | #public
---       , table :
---           | #doc doc      -- synced to server via automerge
---           | #feed feed    -- data materialized on server, configs synced via automerge
---           | #query query  -- data materialized on server, query synced via automerge
---       }
---   ; peer :
---       { write : bool
---       , read : bool
---       , share : bool
---       }
---   ; doc :
---       { cols : list { name : text, key : int, type }
---       , rows : list (list json)
---       }
---   ; feed :
---       | #library
---       | #shop
---       | #files
---       | #email {}
---       | #database {} -- the table displays the SCHEMA not a table
---       | #oauth {} -- the table display the SCHEMA not an endpoint
---       | #form {}
---       | #webhook {}
---       | #kv {}
---       | #webdav {}
---       | #crawler {}
---       | #rss { query }
---       | #box { query }
---   ; query :
---       -- queries fail if any sources not shared with you
---       -- row actions/abilities (e.g. delete) are cells/columns too
---       | #from { source }
---       | #join { source }
---       | #filter {}
---       | #select select
---   ; source :
---       | #hole
---       | #doc { id }
---       | #feed { id }
---       | #query { id }
---   ; select :
---       | #columns {}
---       | #chart {}
---       | #app {}
---
---
---
 ---- IMPORTS ------------------------------------------------------------------
 
 import Array exposing (Array)
@@ -84,6 +26,11 @@ import Url exposing (Url)
 
 
 ---- HELPERS ------------------------------------------------------------------
+
+
+flip : (a -> b -> c) -> (b -> a -> c)
+flip f a b =
+    f b a
 
 
 iif : Bool -> a -> a -> a
@@ -440,51 +387,48 @@ type alias Flags =
     }
 
 
-type alias Route =
-    { id : Id
-    , tool : Tool
-    , query : ()
-    }
-
-
-route : Url -> Route
-route url =
+route : Url -> Model -> ( Model, Cmd Msg )
+route url ({ sheet } as model) =
     -- TODO: Store the ID in the path instead and serve from local server.
-    { id = Maybe.withDefault "" url.fragment
-    , tool = Settings
-    , query = ()
-    }
+    let
+        id : Id
+        id =
+            Maybe.withDefault "" url.fragment
+    in
+    ( { model
+        | sheet =
+            case id of
+                "" ->
+                    catalog model.library
+
+                id_ ->
+                    tools
+                        |> Dict.get id_
+                        |> Maybe.map (\tool -> { sheet | tool = tool })
+                        |> Maybe.withDefault sheet
+      }
+    , if id == "" || Dict.member id tools then
+        Nav.pushUrl model.nav (Url.toString url)
+
+      else
+        Cmd.none
+    )
 
 
 init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
 init flags url nav =
     let
-        loc : Route
-        loc =
-            route url
-
         library : Dict Id SheetInfo
         library =
             flags.library
                 |> D.decodeValue libraryDecoder
                 |> Result.withDefault Dict.empty
     in
-    ( { nav = nav
-      , library = library
-      , sheet =
-            case loc.id of
-                "" ->
-                    catalog library
-
-                _ ->
-                    { default
-                        | id = loc.id
-                        , tool = loc.tool
-                        , table = flags.sheet |> D.decodeValue tableDecoder |> Result.mapError D.errorToString
-                    }
-      }
-    , Cmd.none
-    )
+    route url
+        { nav = nav
+        , library = library
+        , sheet = { default | table = flags.sheet |> D.decodeValue tableDecoder |> Result.mapError D.errorToString }
+        }
 
 
 default : Sheet
@@ -568,8 +512,8 @@ type TableMsg
 
 type DocMsg
     = SheetWrite Index
-    | SheetColumnPush
     | SheetRowPush Int
+    | SheetColumnPush
 
 
 type Input
@@ -604,6 +548,22 @@ update msg ({ sheet } as model) =
     case msg of
         NoOp ->
             ( model, Cmd.none )
+
+        UrlChange url ->
+            -- TODO: We should eventually change #:sheetId to /:sheetId, but for now it confuses stupid local webserver.
+            case url.fragment of
+                Just sheetId ->
+                    ( model, selectSheet sheetId )
+
+                Nothing ->
+                    ( { model | sheet = catalog model.library }, selectSheet "" )
+
+        LinkClick (Browser.Internal url) ->
+            -- TODO: ?q=+any ?q=-any ?q==any
+            route url model
+
+        LinkClick (Browser.External url) ->
+            ( model, Nav.load url )
 
         _ ->
             -- TODO:
@@ -753,27 +713,6 @@ update msg ({ sheet } as model) =
 --               }
 --             , Cmd.none
 --             )
---
---         UrlChanged url ->
---             -- TODO: We should eventually change #:sheetId to /:sheetId, but for now it confuses stupid local webserver.
---             case url.fragment of
---                 Just sheetId ->
---                     ( model, selectSheet sheetId )
---
---                 Nothing ->
---                     ( { model | sheet = libSheet model.library }, selectSheet "" )
---
---         LinkClicked (Browser.Internal url) ->
---             -- TODO: ?q=+any ?q=-any ?q==any
---             case url.fragment |> Maybe.andThen (flip Dict.get tools) of
---                 Just tool ->
---                     ( { model | sheet = { sheet | tool = tool } }, Cmd.none )
---
---                 _ ->
---                     ( model, Nav.pushUrl model.nav (Url.toString url) )
---
---         LinkClicked (Browser.External url) ->
---             ( model, Nav.load url )
 --
 --         KeyPressed "Enter" ->
 --             ( model, Task.attempt (always NoOp) (Dom.blur "new-cell") )
