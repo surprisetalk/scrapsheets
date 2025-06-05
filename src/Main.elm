@@ -374,11 +374,20 @@ tableDecoder =
                                 "bool" ->
                                     Boolean
 
+                                "number" ->
+                                    Number
+
                                 "link" ->
                                     Link
 
                                 "image" ->
                                     Image
+
+                                "timestamp" ->
+                                    Timestamp
+
+                                "json" ->
+                                    Json
 
                                 _ ->
                                     Text
@@ -898,14 +907,14 @@ view ({ sheet } as model) =
                                 { cols =
                                     Array.fromList
                                         [ Col 0 "outcome" Text
-                                        , Col 1 "total_bets" Text
-                                        , Col 2 "total_amount" Text
-                                        , Col 3 "avg_amount" Text
-                                        , Col 4 "max_amount" Text
-                                        , Col 5 "unique_users" Text
-                                        , Col 6 "avg_prob_change" Text
-                                        , Col 7 "filled_rate" Text
-                                        , Col 8 "api_bets" Text
+                                        , Col 1 "total_bets" Number
+                                        , Col 2 "total_amount" Number
+                                        , Col 3 "avg_amount" Number
+                                        , Col 4 "max_amount" Number
+                                        , Col 5 "unique_users" Number
+                                        , Col 6 "avg_prob_change" Number
+                                        , Col 7 "filled_rate" Number
+                                        , Col 8 "api_bets" Number
                                         ]
                                 , rows =
                                     let
@@ -1022,11 +1031,11 @@ view ({ sheet } as model) =
                                 { cols =
                                     Array.fromList
                                         [ Col 0 "userId" Text
-                                        , Col 1 "amount" Text
+                                        , Col 1 "amount" Number
                                         , Col 2 "outcome" Text
-                                        , Col 3 "shares" Text
-                                        , Col 4 "probBefore" Text
-                                        , Col 5 "probAfter" Text
+                                        , Col 3 "shares" Number
+                                        , Col 4 "probBefore" Number
+                                        , Col 5 "probAfter" Number
                                         , Col 6 "contractId" Text
                                         , Col 7 "createdTime" Timestamp
                                         , Col 8 "isFilled" Text
@@ -1096,10 +1105,10 @@ view ({ sheet } as model) =
                                         , Col 14 "url" Link
                                         , Col 4 "probability" Text
                                         , Col 5 "isResolved" Text
-                                        , Col 6 "volume" Text
-                                        , Col 7 "volume24Hours" Text
-                                        , Col 8 "uniqueBettorCount" Text
-                                        , Col 9 "totalLiquidity" Text
+                                        , Col 6 "volume" Number
+                                        , Col 7 "volume24Hours" Number
+                                        , Col 8 "uniqueBettorCount" Number
+                                        , Col 9 "totalLiquidity" Number
 
                                         -- , Col 10 "createdTime" Timestamp
                                         -- , Col 11 "closeTime" Timestamp
@@ -1151,13 +1160,13 @@ view ({ sheet } as model) =
                                 { cols =
                                     Array.fromList
                                         [ Col 0 "collection" Text
-                                        , Col 1 "count" Text
-                                        , Col 2 "creates" Text
-                                        , Col 3 "deletes" Text
-                                        , Col 4 "unique_users" Text
-                                        , Col 5 "avg_per_minute" Text
-                                        , Col 6 "has_text_content" Text
-                                        , Col 7 "has_embeds" Text
+                                        , Col 1 "count" Number
+                                        , Col 2 "creates" Number
+                                        , Col 3 "deletes" Number
+                                        , Col 4 "unique_users" Number
+                                        , Col 5 "avg_per_minute" Number
+                                        , Col 6 "has_text_content" Number
+                                        , Col 7 "has_embeds" Number
                                         ]
                                 , rows =
                                     let
@@ -1261,12 +1270,12 @@ view ({ sheet } as model) =
                                 { cols =
                                     Array.fromList
                                         [ Col 0 "author" Text
-                                        , Col 1 "commit_count" Text
-                                        , Col 4 "days_active" Text
-                                        , Col 5 "avg_commits_per_day" Text
-                                        , Col 6 "avg_message_length" Text
-                                        , Col 7 "merge_commits" Text
-                                        , Col 8 "fix_commits" Text
+                                        , Col 1 "commit_count" Number
+                                        , Col 4 "days_active" Number
+                                        , Col 5 "avg_commits_per_day" Number
+                                        , Col 6 "avg_message_length" Number
+                                        , Col 7 "merge_commits" Number
+                                        , Col 8 "fix_commits" Number
                                         , Col 2 "first_commit" Text
                                         , Col 3 "last_commit" Text
                                         ]
@@ -1608,8 +1617,145 @@ view ({ sheet } as model) =
                             []
 
                         Stats ->
-                            -- TODO:
-                            []
+                            case table of
+                                Err _ ->
+                                    [ H.p [] [ text "No data available" ] ]
+
+                                Ok doc ->
+                                    doc.cols
+                                        |> Array.toList
+                                        |> List.map
+                                            (\col ->
+                                                let
+                                                    values =
+                                                        doc.rows
+                                                            |> Array.toList
+                                                            |> List.filterMap (Dict.get col.key)
+
+                                                    stats =
+                                                        case col.typ of
+                                                            Number ->
+                                                                let
+                                                                    numbers =
+                                                                        values
+                                                                            |> List.filterMap (D.decodeValue number >> Result.toMaybe)
+
+                                                                    count =
+                                                                        List.length numbers
+
+                                                                    min_ =
+                                                                        List.minimum numbers
+
+                                                                    max_ =
+                                                                        List.maximum numbers
+
+                                                                    mean =
+                                                                        if count > 0 then
+                                                                            Just (List.sum numbers / toFloat count)
+
+                                                                        else
+                                                                            Nothing
+                                                                in
+                                                                [ ( "Count", String.fromInt count )
+                                                                , ( "Min", min_ |> Maybe.map String.fromFloat |> Maybe.withDefault "-" )
+                                                                , ( "Max", max_ |> Maybe.map String.fromFloat |> Maybe.withDefault "-" )
+                                                                , ( "Mean", mean |> Maybe.map (\m -> String.fromFloat (toFloat (round (m * 100)) / 100)) |> Maybe.withDefault "-" )
+                                                                ]
+
+                                                            Text ->
+                                                                let
+                                                                    strings =
+                                                                        values
+                                                                            |> List.filterMap (D.decodeValue string >> Result.toMaybe)
+
+                                                                    count =
+                                                                        List.length strings
+
+                                                                    avgLength =
+                                                                        if count > 0 then
+                                                                            List.sum (List.map String.length strings) // count
+
+                                                                        else
+                                                                            0
+
+                                                                    -- Count occurrences of each value
+                                                                    valueCounts =
+                                                                        strings
+                                                                            |> List.foldr
+                                                                                (\str acc ->
+                                                                                    Dict.update str
+                                                                                        (\maybeCount ->
+                                                                                            case maybeCount of
+                                                                                                Nothing ->
+                                                                                                    Just 1
+
+                                                                                                Just n ->
+                                                                                                    Just (n + 1)
+                                                                                        )
+                                                                                        acc
+                                                                                )
+                                                                                Dict.empty
+
+                                                                    -- Get top 3 most frequent values
+                                                                    topValues =
+                                                                        valueCounts
+                                                                            |> Dict.toList
+                                                                            |> List.sortBy (Tuple.second >> negate)
+                                                                            |> List.take 3
+                                                                            |> List.map
+                                                                                (\( val, cnt ) ->
+                                                                                    if String.length val > 20 then
+                                                                                        String.left 17 val ++ "... (" ++ String.fromInt cnt ++ ")"
+
+                                                                                    else
+                                                                                        val ++ " (" ++ String.fromInt cnt ++ ")"
+                                                                                )
+                                                                in
+                                                                List.concat
+                                                                    [ [ ( "Count", String.fromInt count )
+                                                                      , ( "Avg length", String.fromInt avgLength )
+                                                                      ]
+                                                                    , if List.isEmpty topValues then
+                                                                        []
+
+                                                                      else
+                                                                        [ ( "Top values", String.join ", " topValues ) ]
+                                                                    ]
+
+                                                            Boolean ->
+                                                                let
+                                                                    bools =
+                                                                        values
+                                                                            |> List.filterMap (D.decodeValue D.bool >> Result.toMaybe)
+
+                                                                    count =
+                                                                        List.length bools
+
+                                                                    trueCount =
+                                                                        bools |> List.filter identity |> List.length
+
+                                                                    falseCount =
+                                                                        count - trueCount
+                                                                in
+                                                                [ ( "Count", String.fromInt count )
+                                                                , ( "True", String.fromInt trueCount )
+                                                                , ( "False", String.fromInt falseCount )
+                                                                ]
+
+                                                            _ ->
+                                                                [ ( "Count", String.fromInt (List.length values) ) ]
+                                                in
+                                                H.div [ S.marginBottomRem 1 ]
+                                                    [ H.div [ S.fontWeightBold ] [ text col.name ]
+                                                    , H.div [ S.fontSize "0.9em", S.opacity "0.7" ]
+                                                        (stats
+                                                            |> List.map
+                                                                (\( label, value ) ->
+                                                                    H.div [] [ text (label ++ ": " ++ value) ]
+                                                                )
+                                                        )
+                                                    ]
+                                            )
 
                         Share share ->
                             -- TODO:
