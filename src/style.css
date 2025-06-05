@@ -74,6 +74,11 @@ table {
   border-spacing: 0;
 }
 
+td {
+  word-wrap: break-word;
+  hyphens: auto;
+}
+
 textarea {
   white-space: revert;
 }
