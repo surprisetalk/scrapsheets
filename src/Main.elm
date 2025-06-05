@@ -1463,7 +1463,7 @@ view ({ sheet } as model) =
                             ]
                     , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.alignItemsBaseline, S.gapRem 0.5 ]
                         -- TODO: If we need to, we can collapse the tools into a dropdown that only shows the current one.
-                        [ H.a [ A.href "#settings" ] [ text "settings" ]
+                        [ H.a [ A.href "#settings" ] [ text "settings", H.sup [] [ text "" ] ]
                         , H.a [ A.href "#history" ] [ text "history", H.sup [] [ text "4" ] ]
                         , H.a [ A.href "#hints" ] [ text "hints", H.sup [] [ text "3" ] ]
                         , H.a [ A.href "#stats" ] [ text "stats", H.sup [] [ text "2" ] ]
