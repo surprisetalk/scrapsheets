@@ -14,6 +14,7 @@ import Html.Attributes as A
 import Html.Events as A
 import Html.Lazy as H
 import Html.Style as S
+import Http
 import Json.Decode as D
 import Json.Encode as E
 import Parser as P exposing ((|.), (|=), Parser)
@@ -181,6 +182,15 @@ type alias Row =
     Dict Int D.Value
 
 
+type alias Commit =
+    { hash : String
+    , author : String
+    , email : String
+    , date : String
+    , message : String
+    }
+
+
 type
     Feed
     -- TODO: Move some of these to the shop as free templates.
@@ -198,6 +208,7 @@ type
     | Kv {}
     | Webdav {}
     | Http {}
+    | Git { url : String, commits : Array Commit }
     | Crawler {}
     | Code { lang : Lang, code : String }
     | Rss { query : Query }
@@ -342,6 +353,21 @@ number =
         ]
 
 
+commitDecoder : D.Decoder Commit
+commitDecoder =
+    D.map5 Commit
+        (D.field "hash" D.string)
+        (D.field "author" D.string)
+        (D.field "email" D.string)
+        (D.field "date" D.string)
+        (D.field "message" D.string)
+
+
+commitArrayDecoder : D.Decoder (Array Commit)
+commitArrayDecoder =
+    D.array commitDecoder
+
+
 tableDecoder : D.Decoder Table
 tableDecoder =
     let
@@ -390,6 +416,21 @@ tableDecoder =
                                             D.map2 (\url rows -> TableFeed (Websocket { url = url, rows = Maybe.withDefault Array.empty rows }))
                                                 (D.field "url" D.string)
                                                 (D.maybe (D.field "rows" (D.array D.value)))
+
+                                        "git" ->
+                                            D.map2 (\url commits -> TableFeed (Git { url = url, commits = commits }))
+                                                (D.field "url" D.string)
+                                                (D.field "commits"
+                                                    (D.array
+                                                        (D.map5 Commit
+                                                            (D.field "hash" D.string)
+                                                            (D.field "author" D.string)
+                                                            (D.field "email" D.string)
+                                                            (D.field "date" D.string)
+                                                            (D.field "message" D.string)
+                                                        )
+                                                    )
+                                                )
 
                                         feed_ ->
                                             D.fail ("Bad feed type: " ++ feed_)
@@ -476,6 +517,7 @@ type Msg
     | CellMouseUp
     | CellHover Index
     | InputChange Input String
+    | RepoFetch (Result Http.Error (Array Commit))
 
 
 type TableMsg
@@ -841,6 +883,30 @@ view ({ sheet } as model) =
                     Ok
                         { cols = Array.fromList [ Col 0 "Payload" Json ]
                         , rows = ws.rows |> Array.map (Dict.singleton 0)
+                        }
+
+                Ok (TableFeed (Git git)) ->
+                    Ok
+                        { cols =
+                            Array.fromList
+                                [ Col 0 "hash" Text
+                                , Col 1 "author" Text
+                                , Col 2 "email" Text
+                                , Col 3 "date" Text
+                                , Col 4 "message" Text
+                                ]
+                        , rows =
+                            git.commits
+                                |> Array.map
+                                    (\commit ->
+                                        Dict.fromList
+                                            [ ( 0, E.string commit.hash )
+                                            , ( 1, E.string commit.author )
+                                            , ( 2, E.string commit.email )
+                                            , ( 3, E.string commit.date )
+                                            , ( 4, E.string commit.message )
+                                            ]
+                                    )
                         }
 
                 error ->

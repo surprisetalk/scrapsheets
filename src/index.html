@@ -264,6 +264,28 @@
                 });
               };
             }
+            if (doc?.feed === "git") {
+              const url = new URL(doc?.url);
+              const [owner, repo] = url.pathname
+                .slice(1)
+                .replace(".git", "")
+                .split("/");
+              doc.commits = await fetch(
+                `https://api.github.com/repos/${owner}/${repo}/commits`,
+              )
+                .then(res => res.json())
+                .then(commits =>
+                  commits.map(c => ({
+                    hash: c.sha,
+                    message: c.commit.message,
+                    author: c.commit.author.name,
+                    email: c.commit.author.email,
+                    date: c.commit.author.date,
+                    url: c.html_url,
+                  })),
+                )
+                .catch(() => []);
+            }
             if (!sheet?.doc) return;
             sheet.on("change", data => {
               app.ports.sheetChanged.send({
