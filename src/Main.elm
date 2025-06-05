@@ -215,15 +215,15 @@ type
     | Box { query : Query }
 
 
-type
-    Query
-    -- TODO: queries fail if any sources not shared with you
-    -- TODO: row actions/abilities (e.g. delete) are cells/columns too
-    -- TODO: use PRQL AST?
-    = From { source : Source }
-    | Join { source : Source }
-    | Filter {}
-    | Select Select
+type alias Query =
+    -- -- TODO: queries fail if any sources not shared with you
+    -- -- TODO: row actions/abilities (e.g. delete) are cells/columns too
+    -- -- TODO: use PRQL AST?
+    -- = From { source : Source }
+    -- | Join { source : Source }
+    -- | Filter {}
+    -- | Select Select
+    { query : String, rows : Array D.Value }
 
 
 type Source
@@ -296,6 +296,8 @@ type
     | Many Type
     | Link
     | Json
+    | Timestamp
+    | Image
 
 
 type Tool
@@ -353,27 +355,32 @@ number =
         ]
 
 
-commitDecoder : D.Decoder Commit
-commitDecoder =
-    D.map5 Commit
-        (D.field "hash" D.string)
-        (D.field "author" D.string)
-        (D.field "email" D.string)
-        (D.field "date" D.string)
-        (D.field "message" D.string)
-
-
-commitArrayDecoder : D.Decoder (Array Commit)
-commitArrayDecoder =
-    D.array commitDecoder
-
-
 tableDecoder : D.Decoder Table
 tableDecoder =
     let
         intKeys : Dict String a -> Dict Int a
         intKeys =
             Dict.toList >> List.map (Tuple.mapFirst (Maybe.withDefault -1 << String.toInt)) >> Dict.fromList
+
+        col : D.Decoder Col
+        col =
+            D.map3 Col
+                (D.field "key" D.int)
+                (D.field "name" D.string)
+                (D.field "type" D.string
+                    |> D.map
+                        (\typ_ ->
+                            case typ_ of
+                                "bool" ->
+                                    Boolean
+
+                                "link" ->
+                                    Link
+
+                                _ ->
+                                    Text
+                        )
+                )
     in
     D.field "type" D.string
         |> D.andThen
@@ -382,28 +389,7 @@ tableDecoder =
                     "doc" ->
                         D.map TableDoc
                             (D.map2 Doc
-                                (D.field "cols"
-                                    (D.array
-                                        (D.map3 Col
-                                            (D.field "key" D.int)
-                                            (D.field "name" D.string)
-                                            (D.field "type" D.string
-                                                |> D.map
-                                                    (\typ_ ->
-                                                        case typ_ of
-                                                            "bool" ->
-                                                                Boolean
-
-                                                            "link" ->
-                                                                Link
-
-                                                            _ ->
-                                                                Text
-                                                    )
-                                            )
-                                        )
-                                    )
-                                )
+                                (D.field "cols" (D.array col))
                                 (D.field "rows" (D.array (D.map intKeys (D.dict D.value))))
                             )
 
@@ -442,7 +428,11 @@ tableDecoder =
                                 )
 
                     "query" ->
-                        D.fail "TODO: query"
+                        D.map TableQuery
+                            (D.map2 Query
+                                (D.field "query" D.string)
+                                (D.map (Maybe.withDefault Array.empty) (D.maybe (D.field "rows" (D.array D.value))))
+                            )
 
                     typ_ ->
                         D.fail ("Bad table type: " ++ typ_)
@@ -501,7 +491,7 @@ default =
     , drag = False
     , write = Nothing
     , table = Err "TODO: not loaded"
-    , tool = Settings
+    , tool = Stats
     }
 
 
@@ -856,6 +846,7 @@ view ({ sheet } as model) =
                         , rows =
                             model.library
                                 |> Dict.toList
+                                |> List.sortBy (Tuple.second >> .tags >> String.join ", ")
                                 |> List.map
                                     (\( id, s ) ->
                                         Dict.fromList <|
@@ -895,6 +886,169 @@ view ({ sheet } as model) =
                         { cols = Array.fromList [ Col 0 "Payload" Json ]
                         , rows = ws.rows |> Array.map (Dict.singleton 0)
                         }
+
+                Ok (TableQuery query) ->
+                    -- TODO: Derive this from the query structure instead of the hardcoded name.
+                    case info.name of
+                        "Manifold Bet Stats" ->
+                            Ok
+                                { cols =
+                                    Array.fromList
+                                        [ Col 0 "outcome" Text
+                                        , Col 1 "amount" Text
+                                        ]
+                                , rows =
+                                    let
+                                        bets : List ( String, Float )
+                                        bets =
+                                            query.rows |> Array.map (D.decodeValue (D.map2 Tuple.pair (D.at [ "data", "bets", "0", "outcome" ] D.string) (D.at [ "data", "bets", "0", "amount" ] D.float)) >> Result.withDefault ( "", 0 )) |> Array.toList
+                                    in
+                                    Array.fromList
+                                        [ Dict.fromList
+                                            [ ( 0, E.string "YES" )
+                                            , ( 1, bets |> List.filter (Tuple.first >> (==) "YES") |> List.map Tuple.second |> List.head |> Maybe.withDefault 0 |> E.float )
+                                            ]
+                                        , Dict.fromList
+                                            [ ( 0, E.string "NO" )
+                                            , ( 1, bets |> List.filter (Tuple.first >> (==) "NO") |> List.map Tuple.second |> List.head |> Maybe.withDefault 0 |> E.float )
+                                            ]
+                                        ]
+                                }
+
+                        "Manifold Bet Latest" ->
+                            Ok
+                                { cols =
+                                    Array.fromList
+                                        [ Col 0 "userId" Text
+                                        , Col 1 "amount" Text
+                                        , Col 2 "outcome" Text
+                                        , Col 3 "shares" Text
+                                        , Col 4 "probBefore" Text
+                                        , Col 5 "probAfter" Text
+                                        , Col 6 "contractId" Text
+                                        , Col 7 "createdTime" Timestamp
+                                        , Col 8 "isFilled" Text
+                                        , Col 9 "isRedemption" Text
+                                        , Col 10 "isCancelled" Text
+                                        , Col 11 "orderAmount" Text
+                                        , Col 12 "loanAmount" Text
+                                        , Col 13 "limitProb" Text
+                                        , Col 14 "expiresAt" Timestamp
+                                        , Col 15 "id" Text
+                                        , Col 16 "isApi" Text
+                                        , Col 17 "silent" Text
+                                        , Col 18 "visibility" Text
+                                        , Col 19 "matchedBetId" Text
+                                        , Col 20 "timestamp" Timestamp
+                                        , Col 21 "topic" Text
+                                        , Col 22 "type" Text
+                                        , Col 23 "creatorFee" Text
+                                        , Col 24 "liquidityFee" Text
+                                        , Col 25 "platformFee" Text
+                                        ]
+                                , rows =
+                                    query.rows
+                                        |> Array.map
+                                            (\row ->
+                                                Dict.fromList
+                                                    [ ( 0, row |> D.decodeValue (D.at [ "data", "bets", "0", "userId" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 1, row |> D.decodeValue (D.at [ "data", "bets", "0", "amount" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 2, row |> D.decodeValue (D.at [ "data", "bets", "0", "outcome" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 3, row |> D.decodeValue (D.at [ "data", "bets", "0", "shares" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 4, row |> D.decodeValue (D.at [ "data", "bets", "0", "probBefore" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 5, row |> D.decodeValue (D.at [ "data", "bets", "0", "probAfter" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 6, row |> D.decodeValue (D.at [ "data", "bets", "0", "contractId" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 7, row |> D.decodeValue (D.at [ "data", "bets", "0", "createdTime" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 8, row |> D.decodeValue (D.at [ "data", "bets", "0", "isFilled" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 9, row |> D.decodeValue (D.at [ "data", "bets", "0", "isRedemption" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 10, row |> D.decodeValue (D.at [ "data", "bets", "0", "isCancelled" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 11, row |> D.decodeValue (D.at [ "data", "bets", "0", "orderAmount" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 12, row |> D.decodeValue (D.at [ "data", "bets", "0", "loanAmount" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 13, row |> D.decodeValue (D.at [ "data", "bets", "0", "limitProb" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 14, row |> D.decodeValue (D.at [ "data", "bets", "0", "expiresAt" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 15, row |> D.decodeValue (D.at [ "data", "bets", "0", "id" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 16, row |> D.decodeValue (D.at [ "data", "bets", "0", "isApi" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 17, row |> D.decodeValue (D.at [ "data", "bets", "0", "silent" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 18, row |> D.decodeValue (D.at [ "data", "bets", "0", "visibility" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 19, row |> D.decodeValue (D.at [ "data", "bets", "0", "fills", "matchedBetId" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 20, row |> D.decodeValue (D.at [ "data", "bets", "0", "fills", "timestamp" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 21, row |> D.decodeValue (D.field "topic" D.value) |> Result.withDefault E.null )
+                                                    , ( 22, row |> D.decodeValue (D.field "type" D.value) |> Result.withDefault E.null )
+                                                    , ( 23, row |> D.decodeValue (D.at [ "data", "bets", "0", "fees", "creatorFee" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 24, row |> D.decodeValue (D.at [ "data", "bets", "0", "fees", "liquidityFee" ] D.value) |> Result.withDefault E.null )
+                                                    , ( 25, row |> D.decodeValue (D.at [ "data", "bets", "0", "fees", "platformFee" ] D.value) |> Result.withDefault E.null )
+                                                    ]
+                                            )
+                                }
+
+                        "Manifold Market Latest" ->
+                            Ok
+                                { cols =
+                                    Array.fromList
+                                        [ Col 0 "creatorAvatarUrl" Image
+
+                                        -- , Col 3 "question" Text
+                                        , Col 1 "creatorName" Text
+
+                                        -- , Col 2 "creatorUsername" Text
+                                        , Col 14 "url" Link
+                                        , Col 4 "probability" Text
+                                        , Col 5 "isResolved" Text
+                                        , Col 6 "volume" Text
+                                        , Col 7 "volume24Hours" Text
+                                        , Col 8 "uniqueBettorCount" Text
+                                        , Col 9 "totalLiquidity" Text
+
+                                        -- , Col 10 "createdTime" Timestamp
+                                        -- , Col 11 "closeTime" Timestamp
+                                        -- , Col 12 "lastBetTime" Timestamp
+                                        -- , Col 13 "lastUpdatedTime" Timestamp
+                                        , Col 15 "id" Text
+                                        , Col 16 "creatorId" Text
+
+                                        -- , Col 17 "slug" Text
+                                        , Col 18 "mechanism" Text
+                                        , Col 19 "outcomeType" Text
+                                        , Col 20 "p" Text
+
+                                        -- , Col 21 "pool" Text
+                                        ]
+                                , rows =
+                                    query.rows
+                                        |> Array.map
+                                            (\row ->
+                                                Dict.fromList
+                                                    [ ( 0, row |> D.decodeValue (D.field "creatorAvatarUrl" D.value) |> Result.withDefault E.null )
+                                                    , ( 1, row |> D.decodeValue (D.field "creatorName" D.value) |> Result.withDefault E.null )
+                                                    , ( 2, row |> D.decodeValue (D.field "creatorUsername" D.value) |> Result.withDefault E.null )
+                                                    , ( 3, row |> D.decodeValue (D.field "question" D.value) |> Result.withDefault E.null )
+                                                    , ( 4, row |> D.decodeValue (D.field "probability" D.value) |> Result.withDefault E.null )
+                                                    , ( 5, row |> D.decodeValue (D.field "isResolved" D.value) |> Result.withDefault E.null )
+                                                    , ( 6, row |> D.decodeValue (D.field "volume" D.value) |> Result.withDefault E.null )
+                                                    , ( 7, row |> D.decodeValue (D.field "volume24Hours" D.value) |> Result.withDefault E.null )
+                                                    , ( 8, row |> D.decodeValue (D.field "uniqueBettorCount" D.value) |> Result.withDefault E.null )
+                                                    , ( 9, row |> D.decodeValue (D.field "totalLiquidity" D.value) |> Result.withDefault E.null )
+                                                    , ( 10, row |> D.decodeValue (D.field "createdTime" D.value) |> Result.withDefault E.null )
+                                                    , ( 11, row |> D.decodeValue (D.field "closeTime" D.value) |> Result.withDefault E.null )
+                                                    , ( 12, row |> D.decodeValue (D.field "lastBetTime" D.value) |> Result.withDefault E.null )
+                                                    , ( 13, row |> D.decodeValue (D.field "lastUpdatedTime" D.value) |> Result.withDefault E.null )
+                                                    , ( 14, row |> D.decodeValue (D.field "url" D.value) |> Result.withDefault E.null )
+                                                    , ( 15, row |> D.decodeValue (D.field "id" D.value) |> Result.withDefault E.null )
+                                                    , ( 16, row |> D.decodeValue (D.field "creatorId" D.value) |> Result.withDefault E.null )
+                                                    , ( 17, row |> D.decodeValue (D.field "slug" D.value) |> Result.withDefault E.null )
+                                                    , ( 18, row |> D.decodeValue (D.field "mechanism" D.value) |> Result.withDefault E.null )
+                                                    , ( 19, row |> D.decodeValue (D.field "outcomeType" D.value) |> Result.withDefault E.null )
+                                                    , ( 20, row |> D.decodeValue (D.field "p" D.value) |> Result.withDefault E.null )
+                                                    , ( 21, row |> D.decodeValue (D.field "pool" D.value) |> Result.withDefault E.null )
+                                                    ]
+                                            )
+                                }
+
+                        _ ->
+                            Ok
+                                { cols = Array.fromList [ Col 0 "Row" Json ]
+                                , rows = query.rows |> Array.map (Dict.singleton 0)
+                                }
 
                 Ok (TableFeed (Git git)) ->
                     Ok
@@ -1067,6 +1221,9 @@ view ({ sheet } as model) =
                                                                             (case col.typ of
                                                                                 Link ->
                                                                                     D.string |> D.map (\href -> H.a [ A.href href, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock, S.maxWidthRem 12 ] [ text href ])
+
+                                                                                Image ->
+                                                                                    D.string |> D.map (\src -> H.img [ A.src src, S.width "100%", S.objectFitCover ] [])
 
                                                                                 Text ->
                                                                                     D.map text string

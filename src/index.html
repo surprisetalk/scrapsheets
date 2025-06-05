@@ -40,24 +40,28 @@
               name: "Bluesky Firehose",
               type: "feed",
               feed: "websocket",
-              url: "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post",
+              tags: ["bluesky", "feed"],
+              url: "wss://jetstream2.us-east.bsky.network/subscribe",
             });
             const bets = repo.create({
               name: "Manifold Bets Firehose",
               type: "feed",
               feed: "websocket",
+              tags: ["manifold", "feed"],
               url: "wss://api.manifold.markets/ws",
             });
             const markets = repo.create({
               name: "Manifold Markets",
               type: "feed",
               feed: "http",
+              tags: ["manifold", "feed"],
               url: "https://api.manifold.markets/v0/markets?limit=50",
             });
             const git = repo.create({
-              name: "tekknolagy/scrapscript",
+              name: "Scrapscript Commits",
               type: "feed",
               feed: "git",
+              tags: ["git", "feed"],
               url: "https://github.com/tekknolagi/scrapscript.git",
             });
             const sheets = [
@@ -68,6 +72,7 @@
               repo.create({
                 name: "Tasks",
                 type: "doc",
+                tags: ["doc"],
                 cols: [
                   { key: 2, name: "", type: "bool" },
                   { key: 0, name: "Task", type: "text" },
@@ -89,6 +94,7 @@
               repo.create({
                 name: "Budget",
                 type: "doc",
+                tags: ["doc"],
                 cols: [
                   { key: 1, name: "Item", type: "text" },
                   { key: 2, name: "Amount", type: "number" },
@@ -101,6 +107,7 @@
               repo.create({
                 name: "Sprint",
                 type: "doc",
+                tags: ["doc"],
                 cols: [
                   { key: 0, name: "Project", type: "text" },
                   { key: 1, name: "Priority", type: "text" },
@@ -113,77 +120,63 @@
               repo.create({
                 name: "Bluesky Stats",
                 type: "query",
-                query: [
-                  { type: "from", data: bsky.url },
-                  {
-                    type: "derive",
-                    data: {
-                      l: { type: "len", data: { type: "col", data: "text" } },
-                    },
-                  },
-                  {
-                    type: "group",
-                    data: {
-                      by: { type: "col", data: "l" },
-                      agg: { c: { type: "count", data: null } },
-                    },
-                  },
-                  { type: "select", data: ["l", "c"] },
-                  { type: "take", data: 100 },
-                ],
+                tags: ["bluesky", "query"],
+                query: `
+                  from (scrapsheet ${bsky.url})
+                  join (unnest s.res.body) true
+                  group collection {
+                    n = count collection,
+                  }
+                `,
               }),
               repo.create({
                 name: "Employees",
                 type: "feed",
                 feed: "code",
+                tags: ["postgres", "feed"],
                 url: "postgresql://localhost",
                 lang: "sql",
                 code: "select * from employees",
               }),
               repo.create({
-                name: "Contributors",
+                name: "Scrapscript Contributors",
                 type: "query",
-                query: [
-                  { type: "from", data: git.url },
-                  {
-                    type: "group",
-                    data: {
-                      by: { type: "col", data: "email" },
-                      agg: { c: { type: "count", data: null } },
-                    },
-                  },
-                  { type: "select", data: ["author", "c"] },
-                ],
+                tags: ["git", "query"],
+                query: `
+                  from (scrapsheet ${git.url})
+                  group email {
+                    n = count email,
+                  }
+                  select {
+                    author, n
+                  }
+                `,
               }),
               repo.create({
                 name: "Manifold Bet Stats",
                 type: "query",
-                query: [
-                  { type: "from", data: bets.url },
-                  {
-                    type: "group",
-                    data: {
-                      by: { type: "col", data: "creatorId" },
-                      agg: {
-                        c: { type: "count", data: null },
-                        avg: {
-                          type: "average",
-                          data: { type: "col", data: "TODO" },
-                        },
-                      },
-                    },
-                  },
-                  { type: "select", data: ["author", "c"] },
-                ],
+                tags: ["manifold", "query"],
+                query: `
+                  from s = (scrapsheet ${bets.url})
+                  join (unnest s.res.body) true
+                  group creatorId {
+                    n = count creatorId,
+                    avg = average TODO,
+                  }
+                  select {
+                    creatorId, n, avg
+                  }
+                `,
               }),
               repo.create({
                 name: "Manifold Market Latest",
                 type: "query",
-                query: [
-                  { type: "from", data: markets.url },
-                  { type: "take", data: 1 },
-                  { type: "join", data: "TODO" }, // TODO: self-join on JSON recordset
-                ],
+                tags: ["manifold", "query"],
+                query: `
+                  from (scrapsheet ${markets.url})
+                  take 1
+                  join (unnest s.res.body) true
+                `,
               }),
             ];
             return await repo.create({
@@ -249,7 +242,15 @@
             ws?.close();
             // TODO: Remove existing listeners.
             sheet = (await find(id)) || { documentId: id };
-            const doc = await sheet?.doc?.();
+            let doc = await sheet?.doc?.();
+            const top = { ...doc };
+            if (doc?.type === "query") {
+              const [_, id] = doc?.query?.match(
+                /\(scrapsheet automerge:([^\)]*)\)/,
+              );
+              const sheet_ = (await find(id)) || { documentId: id };
+              doc = await sheet_?.doc?.();
+            }
             ws = doc?.feed === "websocket" ? new WebSocket(doc?.url) : null;
             if (ws) {
               const rows = [];
@@ -259,7 +260,7 @@
                 app.ports.sheetChanged.send({
                   id,
                   data: {
-                    doc: { ...doc, rows },
+                    doc: { ...top, rows },
                     handle: null,
                     patchInfo: null,
                     patches: [],
@@ -277,14 +278,14 @@
                   );
             }
             if (doc?.feed === "http")
-              doc.rows = await fetch(doc?.url).then(res => res.json());
+              top.rows = await fetch(doc?.url).then(res => res.json());
             if (doc?.feed === "git") {
               const url = new URL(doc?.url);
               const [owner, repo] = url.pathname
                 .slice(1)
                 .replace(".git", "")
                 .split("/");
-              doc.commits = await fetch(
+              top.commits = await fetch(
                 `https://api.github.com/repos/${owner}/${repo}/commits`,
               )
                 .then(res => res.json())
@@ -300,7 +301,7 @@
                 )
                 .catch(() => []);
             }
-            if (!sheet?.doc) return;
+            if (!sheet || !top) return;
             sheet.on("change", data => {
               app.ports.sheetChanged.send({
                 id: data.handle.documentId,
@@ -310,7 +311,7 @@
             app.ports.sheetChanged.send({
               id,
               data: {
-                doc: doc,
+                doc: top,
                 handle: null,
                 patchInfo: null,
                 patches: [],
