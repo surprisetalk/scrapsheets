@@ -121,11 +121,11 @@ type alias SheetInfo =
     { name : String
     , tags : List String
     , thumb : Svg
-    , peers : List Peer
+    , peers : Peers
     }
 
 
-type Peer
+type Peers
     = Private (Dict Id Perm)
     | Public
 
@@ -608,9 +608,9 @@ update msg ({ sheet } as model) =
                                 (D.oneOf [ D.field "name" D.string, D.succeed "" ])
                                 (D.oneOf [ D.field "tags" (D.list D.string), D.succeed [] ])
                                 (D.succeed ())
-                                (D.succeed [])
+                                (D.succeed Public)
                             )
-                        |> Result.withDefault (SheetInfo "" [] () [])
+                        |> Result.withDefault (SheetInfo "" [] () Public)
                         |> flip (Dict.insert data.id) model.library
               }
             , Cmd.none
@@ -835,7 +835,7 @@ view ({ sheet } as model) =
         info =
             model.library
                 |> Dict.get sheet.id
-                |> Maybe.withDefault { name = "", tags = [], thumb = (), peers = [] }
+                |> Maybe.withDefault { name = "", tags = [], thumb = (), peers = Public }
 
         table : Result String Doc
         table =
@@ -1400,9 +1400,10 @@ view ({ sheet } as model) =
                     Ok
                         { cols =
                             Array.fromList
-                                [ Col 0 "hash" Text
-                                , Col 1 "author" Text
-                                , Col 2 "email" Text
+                                -- [ Col 0 "hash" Text
+                                [ Col 1 "author" Text
+
+                                -- , Col 2 "email" Text
                                 , Col 3 "date" Text
                                 , Col 4 "message" Text
                                 ]
@@ -1434,8 +1435,8 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { td:hover { background: rgba(255,255,255,0.15); } }" ]
         , H.node "style" [] [ text ".selected { background: rgba(0,0,0,0.1); }" ]
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { .selected { background: rgba(255,255,255,0.1); } }" ]
-        , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none" ]
-            [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%" ]
+        , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh" ]
+            [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%", S.maxWidth "80vw", S.maxHeight "100vh" ]
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.alignItemsBaseline ]
                     [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.gapRem 0.5 ] <|
                         -- Badges indicate scrapscript news, book notifs, etc.
@@ -1467,10 +1468,17 @@ view ({ sheet } as model) =
                         , H.a [ A.href "#hints" ] [ text "hints", H.sup [] [ text "3" ] ]
                         , H.a [ A.href "#stats" ] [ text "stats", H.sup [] [ text "2" ] ]
                         , H.a [ A.href "#share" ] [ text "share", H.sup [] [ text "4" ] ]
-                        , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ]
-                            [ H.a [ A.href "?following=" ] [ text "@tt" ]
-                            , H.a [ A.href "?following=123" ] [ text "@sa" ]
-                            ]
+
+                        -- TODO: This doesn't make sense.
+                        , case info.peers of
+                            Public ->
+                                text ""
+
+                            Private peers ->
+                                H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ] <|
+                                    List.map (\peer -> H.a [ A.href "?following=" ] [ text peer ]) <|
+                                        Dict.keys <|
+                                            peers
                         ]
                     ]
 
@@ -1479,123 +1487,125 @@ view ({ sheet } as model) =
                 , H.input [ A.value sheet.search, A.onInput (InputChange SheetSearch), S.width "100%" ] []
 
                 -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
-                , case table of
-                    Err err ->
-                        H.p [] [ text err ]
+                , H.div [ S.overflowAuto ]
+                    [ case table of
+                        Err err ->
+                            H.p [] [ text err ]
 
-                    Ok doc ->
-                        H.table [ S.borderCollapseCollapse, A.onMouseLeave (CellHover (xy -1 -1)) ]
-                            [ H.thead []
-                                [ H.tr [] <|
-                                    -- TODO: Add additional header rows for stats and column def.
-                                    (::)
-                                        (H.th
-                                            [ A.onClick (TableMsg (DocMsg (SheetRowPush -1)))
-                                            , A.onMouseEnter (CellHover (xy -1 -1))
-                                            , S.textAlignRight
-                                            , S.widthRem 0.001
-                                            , S.whiteSpaceNowrap
-                                            ]
-                                            [ text "0" ]
-                                        )
-                                    <|
-                                        List.indexedMap
-                                            (\i col ->
-                                                H.th
-                                                    [ A.onClick CellMouseClick
-                                                    , A.onMouseDown CellMouseDown
-                                                    , A.onMouseUp CellMouseUp
-                                                    , A.onMouseEnter (CellHover (xy i -1))
-                                                    , S.textAlignLeft
-                                                    , S.verticalAlignBottom
-                                                    ]
-                                                    [ H.a [ A.href "#settings", S.displayInlineBlock, S.width "100%" ]
-                                                        [ text col.name ]
-                                                    ]
+                        Ok doc ->
+                            H.table [ S.borderCollapseCollapse, S.width "100%", A.onMouseLeave (CellHover (xy -1 -1)) ]
+                                [ H.thead []
+                                    [ H.tr [] <|
+                                        -- TODO: Add additional header rows for stats and column def.
+                                        (::)
+                                            (H.th
+                                                [ A.onClick (TableMsg (DocMsg (SheetRowPush -1)))
+                                                , A.onMouseEnter (CellHover (xy -1 -1))
+                                                , S.textAlignRight
+                                                , S.widthRem 0.001
+                                                , S.whiteSpaceNowrap
+                                                ]
+                                                [ text "0" ]
                                             )
                                         <|
-                                            Array.toList doc.cols
-                                ]
-                            , H.tbody [] <|
-                                Array.toList <|
-                                    Array.indexedMap
-                                        (\n row ->
-                                            H.tr [] <|
-                                                (::)
-                                                    (H.th
-                                                        [ A.onClick (TableMsg (DocMsg (SheetRowPush n)))
-                                                        , A.onMouseEnter (CellHover (xy -1 n))
-                                                        , S.textAlignRight
-                                                        , S.widthRem 0.001
-                                                        , S.whiteSpaceNowrap
+                                            List.indexedMap
+                                                (\i col ->
+                                                    H.th
+                                                        [ A.onClick CellMouseClick
+                                                        , A.onMouseDown CellMouseDown
+                                                        , A.onMouseUp CellMouseUp
+                                                        , A.onMouseEnter (CellHover (xy i -1))
+                                                        , S.textAlignLeft
+                                                        , S.verticalAlignBottom
                                                         ]
-                                                        -- TODO: The row number needs to be pre-filter.
-                                                        [ text (String.fromInt (n + 1)) ]
-                                                    )
-                                                <|
-                                                    List.indexedMap
-                                                        (\i col ->
-                                                            -- TODO: Don't allow editing if Virtual column.
-                                                            H.td
-                                                                [ A.onClick CellMouseClick
-                                                                , A.onMouseDown CellMouseDown
-                                                                , A.onMouseUp CellMouseUp
-                                                                , A.onMouseEnter (CellHover (xy i n))
-                                                                , S.heightRem 1.25
-                                                                , A.classList <|
-                                                                    let
-                                                                        { a, b } =
-                                                                            sheet.select
-
-                                                                        between : number -> number -> number -> Bool
-                                                                        between a_ b_ i_ =
-                                                                            min a_ b_ <= i_ && i_ <= max a_ b_
-
-                                                                        eq : number -> number -> number -> Bool
-                                                                        eq a_ b_ i_ =
-                                                                            a_ == i_ && i_ == b_
-                                                                    in
-                                                                    [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
-                                                                    ]
-                                                                ]
-                                                            <|
-                                                                Maybe.withDefault
-                                                                    [ row
-                                                                        |> Dict.get col.key
-                                                                        |> Maybe.withDefault (E.string "")
-                                                                        |> D.decodeValue
-                                                                            (case col.typ of
-                                                                                Link ->
-                                                                                    D.string |> D.map (\href -> H.a [ A.href href, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock, S.maxWidthRem 12 ] [ text href ])
-
-                                                                                Image ->
-                                                                                    D.string |> D.map (\src -> H.img [ A.src src, S.width "100%", S.objectFitCover ] [])
-
-                                                                                Text ->
-                                                                                    D.map text string
-
-                                                                                Boolean ->
-                                                                                    D.map (\c -> H.input [ A.type_ "checkbox", A.checked c ] []) D.bool
-
-                                                                                _ ->
-                                                                                    D.map text string
-                                                                            )
-                                                                        |> Result.withDefault (text "TODO: parse error")
-                                                                    ]
-                                                                <|
-                                                                    if sheet.write /= Nothing && sheet.select == rect i n i n then
-                                                                        Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (TableMsg (DocMsg (SheetWrite sheet.select.a))), S.width "100%" ] [] ]
-
-                                                                    else
-                                                                        Nothing
+                                                        [ H.a [ A.href "#settings", S.displayInlineBlock, S.width "100%" ]
+                                                            [ text col.name ]
+                                                        ]
+                                                )
+                                            <|
+                                                Array.toList doc.cols
+                                    ]
+                                , H.tbody [] <|
+                                    Array.toList <|
+                                        Array.indexedMap
+                                            (\n row ->
+                                                H.tr [] <|
+                                                    (::)
+                                                        (H.th
+                                                            [ A.onClick (TableMsg (DocMsg (SheetRowPush n)))
+                                                            , A.onMouseEnter (CellHover (xy -1 n))
+                                                            , S.textAlignRight
+                                                            , S.widthRem 0.001
+                                                            , S.whiteSpaceNowrap
+                                                            ]
+                                                            -- TODO: The row number needs to be pre-filter.
+                                                            [ text (String.fromInt (n + 1)) ]
                                                         )
                                                     <|
-                                                        Array.toList doc.cols
-                                        )
-                                        doc.rows
-                            ]
+                                                        List.indexedMap
+                                                            (\i col ->
+                                                                -- TODO: Don't allow editing if Virtual column.
+                                                                H.td
+                                                                    [ A.onClick CellMouseClick
+                                                                    , A.onMouseDown CellMouseDown
+                                                                    , A.onMouseUp CellMouseUp
+                                                                    , A.onMouseEnter (CellHover (xy i n))
+                                                                    , S.heightRem 1.25
+                                                                    , A.classList <|
+                                                                        let
+                                                                            { a, b } =
+                                                                                sheet.select
+
+                                                                            between : number -> number -> number -> Bool
+                                                                            between a_ b_ i_ =
+                                                                                min a_ b_ <= i_ && i_ <= max a_ b_
+
+                                                                            eq : number -> number -> number -> Bool
+                                                                            eq a_ b_ i_ =
+                                                                                a_ == i_ && i_ == b_
+                                                                        in
+                                                                        [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
+                                                                        ]
+                                                                    ]
+                                                                <|
+                                                                    Maybe.withDefault
+                                                                        [ row
+                                                                            |> Dict.get col.key
+                                                                            |> Maybe.withDefault (E.string "")
+                                                                            |> D.decodeValue
+                                                                                (case col.typ of
+                                                                                    Link ->
+                                                                                        D.string |> D.map (\href -> H.a [ A.href href, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock, S.maxWidthRem 12 ] [ text href ])
+
+                                                                                    Image ->
+                                                                                        D.string |> D.map (\src -> H.img [ A.src src, S.width "100%", S.objectFitCover ] [])
+
+                                                                                    Text ->
+                                                                                        D.map text string
+
+                                                                                    Boolean ->
+                                                                                        D.map (\c -> H.input [ A.type_ "checkbox", A.checked c ] []) D.bool
+
+                                                                                    _ ->
+                                                                                        D.map text string
+                                                                                )
+                                                                            |> Result.withDefault (text "TODO: parse error")
+                                                                        ]
+                                                                    <|
+                                                                        if sheet.write /= Nothing && sheet.select == rect i n i n then
+                                                                            Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (TableMsg (DocMsg (SheetWrite sheet.select.a))), S.width "100%" ] [] ]
+
+                                                                        else
+                                                                            Nothing
+                                                            )
+                                                        <|
+                                                            Array.toList doc.cols
+                                            )
+                                            doc.rows
+                                ]
+                    ]
                 ]
-            , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ] <|
+            , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 12, S.maxWidthRem 18, S.maxHeight "100vh", S.overflowHidden, S.overflowYAuto ] <|
                 List.concat
                     [ [ H.span [] [ text (String.toLower (Debug.toString sheet.tool)), H.sup [] [ text "" ] ]
                       ]
@@ -1713,13 +1723,13 @@ view ({ sheet } as model) =
                                                                 in
                                                                 List.concat
                                                                     [ [ ( "Count", String.fromInt count )
-                                                                      , ( "Avg length", String.fromInt avgLength )
+                                                                      , ( "Length", String.fromInt avgLength )
                                                                       ]
                                                                     , if List.isEmpty topValues then
                                                                         []
 
                                                                       else
-                                                                        [ ( "Top values", String.join ", " topValues ) ]
+                                                                        [ ( "Frequent", String.join " " topValues ) ]
                                                                     ]
 
                                                             Boolean ->
@@ -1745,16 +1755,14 @@ view ({ sheet } as model) =
                                                             _ ->
                                                                 [ ( "Count", String.fromInt (List.length values) ) ]
                                                 in
-                                                H.div [ S.marginBottomRem 1 ]
-                                                    [ H.div [ S.fontWeightBold ] [ text col.name ]
-                                                    , H.div [ S.fontSize "0.9em", S.opacity "0.7" ]
-                                                        (stats
-                                                            |> List.map
-                                                                (\( label, value ) ->
-                                                                    H.div [] [ text (label ++ ": " ++ value) ]
-                                                                )
-                                                        )
-                                                    ]
+                                                H.div [ S.displayFlex, S.flexWrapWrap, S.alignItemsBaseline, S.gapRem 0.5, S.fontSizeRem 0.65, S.opacity "0.8" ] <|
+                                                    H.span [ S.fontWeightBold ] [ text col.name ]
+                                                        :: (stats
+                                                                |> List.map
+                                                                    (\( label, value ) ->
+                                                                        H.div [ S.opacity "0.8" ] [ text (label ++ ": " ++ value) ]
+                                                                    )
+                                                           )
                                             )
 
                         Share share ->
