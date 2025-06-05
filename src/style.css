@@ -80,6 +80,10 @@ td {
   hyphens: auto;
 }
 
+sup {
+  opacity: 0.65;
+}
+
 textarea {
   white-space: revert;
 }

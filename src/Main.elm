@@ -1427,11 +1427,11 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { .selected { background: rgba(255,255,255,0.1); } }" ]
         , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%" ]
-                [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween ]
-                    [ H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <|
+                [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.alignItemsBaseline ]
+                    [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.gapRem 0.5 ] <|
                         -- Badges indicate scrapscript news, book notifs, etc.
                         List.concat
-                            [ [ H.a [ A.href "/", S.fontWeightBold ] [ text "scrapsheets (2)" ]
+                            [ [ H.a [ A.href "/", S.fontWeightBold ] [ text "scrapsheets", H.sup [] [ text "" ] ]
                               ]
                             , iif (sheet.id == "")
                                 [ text "/"
@@ -1451,13 +1451,13 @@ view ({ sheet } as model) =
                                         ]
                                 ]
                             ]
-                    , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ]
+                    , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.alignItemsBaseline, S.gapRem 0.5 ]
                         -- TODO: If we need to, we can collapse the tools into a dropdown that only shows the current one.
                         [ H.a [ A.href "#settings" ] [ text "settings" ]
-                        , H.a [ A.href "#history" ] [ text "history (2)" ]
-                        , H.a [ A.href "#hints" ] [ text "hints (3)" ]
-                        , H.a [ A.href "#stats" ] [ text "stats (2)" ]
-                        , H.a [ A.href "#share" ] [ text "share (4)" ]
+                        , H.a [ A.href "#history" ] [ text "history", H.sup [] [ text "4" ] ]
+                        , H.a [ A.href "#hints" ] [ text "hints", H.sup [] [ text "3" ] ]
+                        , H.a [ A.href "#stats" ] [ text "stats", H.sup [] [ text "2" ] ]
+                        , H.a [ A.href "#share" ] [ text "share", H.sup [] [ text "4" ] ]
                         , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ]
                             [ H.a [ A.href "?following=" ] [ text "@tt" ]
                             , H.a [ A.href "?following=123" ] [ text "@sa" ]
@@ -1588,7 +1588,7 @@ view ({ sheet } as model) =
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 15 ] <|
                 List.concat
-                    [ [ H.span [] [ text (String.toLower (Debug.toString sheet.tool)) ]
+                    [ [ H.span [] [ text (String.toLower (Debug.toString sheet.tool)), H.sup [] [ text "" ] ]
                       ]
                     , case sheet.tool of
                         -- TODO: Hovering over columns/etc should highlight relevant cells, and vice versa.
@@ -1598,7 +1598,7 @@ view ({ sheet } as model) =
                                 -- TODO: Link to the column configs.
                                 [ text (Debug.toString sheet.table)
                                 ]
-                            , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd ]
+                            , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd, S.alignItemsBaseline ]
                                 [ H.button [ A.onClick NoOp ] [ text "new column (C)" ]
                                 ]
                             ]
