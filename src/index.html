@@ -65,7 +65,7 @@
               url: "https://github.com/tekknolagi/scrapscript.git",
             });
             const sheets = [
-              bsky,
+              // bsky,
               bets,
               markets,
               git,
@@ -178,6 +178,17 @@
                   join (unnest s.res.body) true
                 `,
               }),
+              repo.create({
+                name: "Slides",
+                type: "doc",
+                tags: ["doc"],
+                cols: [{ key: 0, name: "", type: "image" }],
+                rows: [
+                  {
+                    0: "https://taylor.town/fancy-rat.png",
+                  },
+                ],
+              }),
             ];
             return await repo.create({
               sheets: sheets.map(doc => doc.documentId),
@@ -255,7 +266,6 @@
             if (ws) {
               const rows = [];
               ws.onmessage = event => {
-                if (rows.length >= 1000) return;
                 rows.unshift(JSON.parse(event.data));
                 app.ports.sheetChanged.send({
                   id,
@@ -285,7 +295,7 @@
                 .slice(1)
                 .replace(".git", "")
                 .split("/");
-              top.commits = await fetch(
+              top.rows = await fetch(
                 `https://api.github.com/repos/${owner}/${repo}/commits`,
               )
                 .then(res => res.json())

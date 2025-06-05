@@ -208,7 +208,7 @@ type
     | Kv {}
     | Webdav {}
     | Http { url : String, rows : Array D.Value }
-    | Git { url : String, commits : Array Commit }
+    | Git { url : String, rows : Array Commit }
     | Crawler {}
     | Code { lang : Lang, code : String }
     | Rss { query : Query }
@@ -377,6 +377,9 @@ tableDecoder =
                                 "link" ->
                                     Link
 
+                                "image" ->
+                                    Image
+
                                 _ ->
                                     Text
                         )
@@ -409,9 +412,9 @@ tableDecoder =
                                                 (D.maybe (D.field "rows" (D.array D.value)))
 
                                         "git" ->
-                                            D.map2 (\url commits -> TableFeed (Git { url = url, commits = commits }))
+                                            D.map2 (\url rows -> TableFeed (Git { url = url, rows = rows }))
                                                 (D.field "url" D.string)
-                                                (D.field "commits"
+                                                (D.field "rows"
                                                     (D.array
                                                         (D.map5 Commit
                                                             (D.field "hash" D.string)
@@ -895,24 +898,123 @@ view ({ sheet } as model) =
                                 { cols =
                                     Array.fromList
                                         [ Col 0 "outcome" Text
-                                        , Col 1 "amount" Text
+                                        , Col 1 "total_bets" Text
+                                        , Col 2 "total_amount" Text
+                                        , Col 3 "avg_amount" Text
+                                        , Col 4 "max_amount" Text
+                                        , Col 5 "unique_users" Text
+                                        , Col 6 "avg_prob_change" Text
+                                        , Col 7 "filled_rate" Text
+                                        , Col 8 "api_bets" Text
                                         ]
                                 , rows =
                                     let
-                                        bets : List ( String, Float )
+                                        bets : List { outcome : String, amount : Float, userId : String, probBefore : Float, probAfter : Float, isFilled : Bool, isApi : Bool }
                                         bets =
-                                            query.rows |> Array.map (D.decodeValue (D.map2 Tuple.pair (D.at [ "data", "bets", "0", "outcome" ] D.string) (D.at [ "data", "bets", "0", "amount" ] D.float)) >> Result.withDefault ( "", 0 )) |> Array.toList
+                                            query.rows
+                                                |> Array.map
+                                                    (\row ->
+                                                        { outcome = row |> D.decodeValue (D.at [ "data", "bets", "0", "outcome" ] D.string) |> Result.withDefault ""
+                                                        , amount = row |> D.decodeValue (D.at [ "data", "bets", "0", "amount" ] D.float) |> Result.withDefault 0
+                                                        , userId = row |> D.decodeValue (D.at [ "data", "bets", "0", "userId" ] D.string) |> Result.withDefault ""
+                                                        , probBefore = row |> D.decodeValue (D.at [ "data", "bets", "0", "probBefore" ] D.float) |> Result.withDefault 0
+                                                        , probAfter = row |> D.decodeValue (D.at [ "data", "bets", "0", "probAfter" ] D.float) |> Result.withDefault 0
+                                                        , isFilled = row |> D.decodeValue (D.at [ "data", "bets", "0", "isFilled" ] D.bool) |> Result.withDefault False
+                                                        , isApi = row |> D.decodeValue (D.at [ "data", "bets", "0", "isApi" ] D.bool) |> Result.withDefault False
+                                                        }
+                                                    )
+                                                |> Array.toList
+
+                                        groupedByOutcome : List ( String, List { outcome : String, amount : Float, userId : String, probBefore : Float, probAfter : Float, isFilled : Bool, isApi : Bool } )
+                                        groupedByOutcome =
+                                            bets
+                                                |> List.foldr
+                                                    (\bet acc ->
+                                                        case acc |> List.filter (Tuple.first >> (==) bet.outcome) |> List.head of
+                                                            Just ( outcome, existing ) ->
+                                                                acc
+                                                                    |> List.filter (Tuple.first >> (/=) bet.outcome)
+                                                                    |> (::) ( outcome, bet :: existing )
+
+                                                            Nothing ->
+                                                                ( bet.outcome, [ bet ] ) :: acc
+                                                    )
+                                                    []
                                     in
-                                    Array.fromList
-                                        [ Dict.fromList
-                                            [ ( 0, E.string "YES" )
-                                            , ( 1, bets |> List.filter (Tuple.first >> (==) "YES") |> List.map Tuple.second |> List.head |> Maybe.withDefault 0 |> E.float )
-                                            ]
-                                        , Dict.fromList
-                                            [ ( 0, E.string "NO" )
-                                            , ( 1, bets |> List.filter (Tuple.first >> (==) "NO") |> List.map Tuple.second |> List.head |> Maybe.withDefault 0 |> E.float )
-                                            ]
-                                        ]
+                                    groupedByOutcome
+                                        |> List.map
+                                            (\( outcome, outcomeBets ) ->
+                                                let
+                                                    totalBets =
+                                                        List.length outcomeBets
+
+                                                    totalAmount =
+                                                        outcomeBets |> List.map .amount |> List.sum
+
+                                                    avgAmount =
+                                                        if totalBets > 0 then
+                                                            totalAmount / toFloat totalBets
+
+                                                        else
+                                                            0
+
+                                                    maxAmount =
+                                                        outcomeBets |> List.map .amount |> List.maximum |> Maybe.withDefault 0
+
+                                                    uniqueUsers =
+                                                        outcomeBets
+                                                            |> List.map .userId
+                                                            |> List.foldr
+                                                                (\user acc ->
+                                                                    if List.member user acc then
+                                                                        acc
+
+                                                                    else
+                                                                        user :: acc
+                                                                )
+                                                                []
+                                                            |> List.length
+
+                                                    avgProbChange =
+                                                        let
+                                                            probChanges =
+                                                                outcomeBets |> List.map (\bet -> abs (bet.probAfter - bet.probBefore))
+
+                                                            totalChange =
+                                                                List.sum probChanges
+                                                        in
+                                                        if totalBets > 0 then
+                                                            totalChange / toFloat totalBets
+
+                                                        else
+                                                            0
+
+                                                    filledCount =
+                                                        outcomeBets |> List.filter .isFilled |> List.length
+
+                                                    filledRate =
+                                                        if totalBets > 0 then
+                                                            toFloat filledCount / toFloat totalBets
+
+                                                        else
+                                                            0
+
+                                                    apiCount =
+                                                        outcomeBets |> List.filter .isApi |> List.length
+                                                in
+                                                Dict.fromList
+                                                    [ ( 0, E.string outcome )
+                                                    , ( 1, E.int totalBets )
+                                                    , ( 2, E.float (round (totalAmount * 100) |> toFloat |> (\x -> x / 100)) )
+                                                    , ( 3, E.float (round (avgAmount * 100) |> toFloat |> (\x -> x / 100)) )
+                                                    , ( 4, E.float maxAmount )
+                                                    , ( 5, E.int uniqueUsers )
+                                                    , ( 6, E.float (round (avgProbChange * 10000) |> toFloat |> (\x -> x / 10000)) )
+                                                    , ( 7, E.float (round (filledRate * 100) |> toFloat |> (\x -> x / 100)) )
+                                                    , ( 8, E.int apiCount )
+                                                    ]
+                                            )
+                                        |> Array.fromList
                                 }
 
                         "Manifold Bet Latest" ->
@@ -1044,6 +1146,241 @@ view ({ sheet } as model) =
                                             )
                                 }
 
+                        "Bluesky Stats" ->
+                            Ok
+                                { cols =
+                                    Array.fromList
+                                        [ Col 0 "collection" Text
+                                        , Col 1 "count" Text
+                                        , Col 2 "creates" Text
+                                        , Col 3 "deletes" Text
+                                        , Col 4 "unique_users" Text
+                                        , Col 5 "avg_per_minute" Text
+                                        , Col 6 "has_text_content" Text
+                                        , Col 7 "has_embeds" Text
+                                        ]
+                                , rows =
+                                    let
+                                        commits : List { collection : String, operation : String, did : String, hasText : Bool, hasEmbed : Bool, timeUs : Float }
+                                        commits =
+                                            query.rows
+                                                |> Array.map
+                                                    (\row ->
+                                                        { collection = row |> D.decodeValue (D.at [ "commit", "collection" ] D.string) |> Result.withDefault ""
+                                                        , operation = row |> D.decodeValue (D.at [ "commit", "operation" ] D.string) |> Result.withDefault ""
+                                                        , did = row |> D.decodeValue (D.at [ "commit", "did" ] D.string) |> Result.withDefault ""
+                                                        , hasText = row |> D.decodeValue (D.at [ "commit", "record", "text" ] D.string) |> Result.toMaybe |> Maybe.map (String.isEmpty >> not) |> Maybe.withDefault False
+                                                        , hasEmbed = row |> D.decodeValue (D.at [ "commit", "record", "embed" ] D.value) |> Result.toMaybe |> Maybe.map (\_ -> True) |> Maybe.withDefault False
+                                                        , timeUs = row |> D.decodeValue (D.field "time_us" D.float) |> Result.withDefault 0
+                                                        }
+                                                    )
+                                                |> Array.toList
+
+                                        groupedByCollection : List ( String, List { collection : String, operation : String, did : String, hasText : Bool, hasEmbed : Bool, timeUs : Float } )
+                                        groupedByCollection =
+                                            commits
+                                                |> List.foldr
+                                                    (\commit acc ->
+                                                        case acc |> List.filter (Tuple.first >> (==) commit.collection) |> List.head of
+                                                            Just ( collection, existing ) ->
+                                                                acc
+                                                                    |> List.filter (Tuple.first >> (/=) commit.collection)
+                                                                    |> (::) ( collection, commit :: existing )
+
+                                                            Nothing ->
+                                                                ( commit.collection, [ commit ] ) :: acc
+                                                    )
+                                                    []
+
+                                        timeRange : { min : Float, max : Float }
+                                        timeRange =
+                                            let
+                                                times =
+                                                    commits |> List.map .timeUs |> List.filter ((/=) 0)
+                                            in
+                                            { min = times |> List.minimum |> Maybe.withDefault 0
+                                            , max = times |> List.maximum |> Maybe.withDefault 0
+                                            }
+
+                                        minutesSpan : Float
+                                        minutesSpan =
+                                            max 1 ((timeRange.max - timeRange.min) / 1000000 / 60)
+                                    in
+                                    groupedByCollection
+                                        |> List.map
+                                            (\( collection, items ) ->
+                                                let
+                                                    totalCount =
+                                                        List.length items
+
+                                                    createCount =
+                                                        items |> List.filter (.operation >> (==) "create") |> List.length
+
+                                                    deleteCount =
+                                                        items |> List.filter (.operation >> (==) "delete") |> List.length
+
+                                                    uniqueUsers =
+                                                        items
+                                                            |> List.map .did
+                                                            |> List.foldr
+                                                                (\did acc ->
+                                                                    if List.member did acc then
+                                                                        acc
+
+                                                                    else
+                                                                        did :: acc
+                                                                )
+                                                                []
+                                                            |> List.length
+
+                                                    avgPerMinute =
+                                                        toFloat totalCount / minutesSpan
+
+                                                    textContentCount =
+                                                        items |> List.filter .hasText |> List.length
+
+                                                    embedCount =
+                                                        items |> List.filter .hasEmbed |> List.length
+                                                in
+                                                Dict.fromList
+                                                    [ ( 0, E.string collection )
+                                                    , ( 1, E.int totalCount )
+                                                    , ( 2, E.int createCount )
+                                                    , ( 3, E.int deleteCount )
+                                                    , ( 4, E.int uniqueUsers )
+                                                    , ( 5, E.float (round (avgPerMinute * 100) |> toFloat |> (\x -> x / 100)) )
+                                                    , ( 6, E.int textContentCount )
+                                                    , ( 7, E.int embedCount )
+                                                    ]
+                                            )
+                                        |> Array.fromList
+                                }
+
+                        "Scrapscript Contributors" ->
+                            Ok
+                                { cols =
+                                    Array.fromList
+                                        [ Col 0 "author" Text
+                                        , Col 1 "commit_count" Text
+                                        , Col 4 "days_active" Text
+                                        , Col 5 "avg_commits_per_day" Text
+                                        , Col 6 "avg_message_length" Text
+                                        , Col 7 "merge_commits" Text
+                                        , Col 8 "fix_commits" Text
+                                        , Col 2 "first_commit" Text
+                                        , Col 3 "last_commit" Text
+                                        ]
+                                , rows =
+                                    let
+                                        commits : List Commit
+                                        commits =
+                                            query.rows
+                                                |> Array.map
+                                                    (D.decodeValue
+                                                        (D.map5 Commit
+                                                            (D.field "hash" D.string)
+                                                            (D.field "author" D.string)
+                                                            (D.field "email" D.string)
+                                                            (D.field "date" D.string)
+                                                            (D.field "message" D.string)
+                                                        )
+                                                    )
+                                                |> Array.toList
+                                                |> List.filterMap Result.toMaybe
+
+                                        groupedByAuthor : List ( String, List { author : String, email : String, date : String, message : String, hash : String } )
+                                        groupedByAuthor =
+                                            commits
+                                                |> List.foldr
+                                                    (\commit acc ->
+                                                        case acc |> List.filter (Tuple.first >> (==) commit.author) |> List.head of
+                                                            Just ( author, existing ) ->
+                                                                acc
+                                                                    |> List.filter (Tuple.first >> (/=) commit.author)
+                                                                    |> (::) ( author, commit :: existing )
+
+                                                            Nothing ->
+                                                                ( commit.author, [ commit ] ) :: acc
+                                                    )
+                                                    []
+
+                                        parseDate : String -> Int
+                                        parseDate dateStr =
+                                            -- Simple date parsing - assumes ISO format, convert to days since epoch
+                                            dateStr
+                                                |> String.left 10
+                                                |> String.split "-"
+                                                |> List.map (String.toInt >> Maybe.withDefault 0)
+                                                |> (\parts ->
+                                                        case parts of
+                                                            year :: month :: day :: _ ->
+                                                                -- Rough approximation: days since year 2000
+                                                                (year - 2000) * 365 + month * 30 + day
+
+                                                            _ ->
+                                                                0
+                                                   )
+                                    in
+                                    groupedByAuthor
+                                        |> List.map
+                                            (\( author, authorCommits ) ->
+                                                let
+                                                    commitCount =
+                                                        List.length authorCommits
+
+                                                    dates =
+                                                        authorCommits |> List.map (.date >> parseDate) |> List.sort
+
+                                                    firstCommitDate =
+                                                        dates |> List.head |> Maybe.withDefault 0
+
+                                                    lastCommitDate =
+                                                        dates |> List.reverse |> List.head |> Maybe.withDefault 0
+
+                                                    daysActive =
+                                                        max 1 (lastCommitDate - firstCommitDate + 1)
+
+                                                    avgCommitsPerDay =
+                                                        toFloat commitCount / toFloat daysActive
+
+                                                    avgMessageLength =
+                                                        let
+                                                            totalLength =
+                                                                authorCommits |> List.map (.message >> String.length) |> List.sum
+                                                        in
+                                                        if commitCount > 0 then
+                                                            toFloat totalLength / toFloat commitCount
+
+                                                        else
+                                                            0
+
+                                                    mergeCommits =
+                                                        authorCommits |> List.filter (.message >> String.toLower >> String.contains "merge") |> List.length
+
+                                                    fixCommits =
+                                                        authorCommits |> List.filter (.message >> String.toLower >> (\msg -> String.contains "fix" msg || String.contains "bug" msg)) |> List.length
+
+                                                    firstCommitStr =
+                                                        authorCommits |> List.sortBy (.date >> parseDate) |> List.head |> Maybe.map .date |> Maybe.withDefault ""
+
+                                                    lastCommitStr =
+                                                        authorCommits |> List.sortBy (.date >> parseDate) |> List.reverse |> List.head |> Maybe.map .date |> Maybe.withDefault ""
+                                                in
+                                                Dict.fromList
+                                                    [ ( 0, E.string author )
+                                                    , ( 1, E.int commitCount )
+                                                    , ( 2, E.string firstCommitStr )
+                                                    , ( 3, E.string lastCommitStr )
+                                                    , ( 4, E.int daysActive )
+                                                    , ( 5, E.float (round (avgCommitsPerDay * 100) |> toFloat |> (\x -> x / 100)) )
+                                                    , ( 6, E.float (round (avgMessageLength * 10) |> toFloat |> (\x -> x / 10)) )
+                                                    , ( 7, E.int mergeCommits )
+                                                    , ( 8, E.int fixCommits )
+                                                    ]
+                                            )
+                                        |> Array.fromList
+                                }
+
                         _ ->
                             Ok
                                 { cols = Array.fromList [ Col 0 "Row" Json ]
@@ -1061,7 +1398,7 @@ view ({ sheet } as model) =
                                 , Col 4 "message" Text
                                 ]
                         , rows =
-                            git.commits
+                            git.rows
                                 |> Array.map
                                     (\commit ->
                                         Dict.fromList

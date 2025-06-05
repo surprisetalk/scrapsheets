@@ -74,6 +74,7 @@ table {
   border-spacing: 0;
 }
 
+th,
 td {
   word-wrap: break-word;
   hyphens: auto;
