@@ -1449,7 +1449,7 @@ view ({ sheet } as model) =
                                 ]
                                 [ text "/"
                                 , H.a [ A.href "#settings" ] [ text info.name ]
-                                , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <|
+                                , H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.gapRem 0.5 ] <|
                                     List.concat
                                         [ case sheet.tag of
                                             Nothing ->
@@ -1457,7 +1457,7 @@ view ({ sheet } as model) =
 
                                             Just value ->
                                                 [ H.input [ A.value value, A.onInput (InputChange SheetTag) ] [] ]
-                                        , List.map (\tag -> H.a [ A.href ("?q=+tag:" ++ tag) ] [ text ("#" ++ tag) ]) info.tags
+                                        , List.map (\tag -> H.a [ A.href ("?q=+tag:" ++ tag), S.fontSizeRem 0.7, S.opacity "0.8" ] [ text ("#" ++ tag) ]) info.tags
                                         ]
                                 ]
                             ]
