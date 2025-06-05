@@ -207,7 +207,7 @@ type
     | Webhook {}
     | Kv {}
     | Webdav {}
-    | Http {}
+    | Http { url : String, rows : Array D.Value }
     | Git { url : String, commits : Array Commit }
     | Crawler {}
     | Code { lang : Lang, code : String }
@@ -414,6 +414,11 @@ tableDecoder =
                                     case feed of
                                         "websocket" ->
                                             D.map2 (\url rows -> TableFeed (Websocket { url = url, rows = Maybe.withDefault Array.empty rows }))
+                                                (D.field "url" D.string)
+                                                (D.maybe (D.field "rows" (D.array D.value)))
+
+                                        "http" ->
+                                            D.map2 (\url rows -> TableFeed (Http { url = url, rows = Maybe.withDefault Array.empty rows }))
                                                 (D.field "url" D.string)
                                                 (D.maybe (D.field "rows" (D.array D.value)))
 
@@ -880,6 +885,12 @@ view ({ sheet } as model) =
                         }
 
                 Ok (TableFeed (Websocket ws)) ->
+                    Ok
+                        { cols = Array.fromList [ Col 0 "Payload" Json ]
+                        , rows = ws.rows |> Array.map (Dict.singleton 0)
+                        }
+
+                Ok (TableFeed (Http ws)) ->
                     Ok
                         { cols = Array.fromList [ Col 0 "Payload" Json ]
                         , rows = ws.rows |> Array.map (Dict.singleton 0)

@@ -52,7 +52,7 @@
               name: "Manifold Markets",
               type: "feed",
               feed: "http",
-              url: "TODO",
+              url: "https://api.manifold.markets/v0/markets?limit=50",
             });
             const git = repo.create({
               name: "tekknolagy/scrapscript",
@@ -61,6 +61,10 @@
               url: "https://github.com/tekknolagi/scrapscript.git",
             });
             const sheets = [
+              bsky,
+              bets,
+              markets,
+              git,
               repo.create({
                 name: "Tasks",
                 type: "doc",
@@ -106,7 +110,6 @@
                   { 0: "Documentation", 1: "Medium" },
                 ],
               }),
-              bsky,
               repo.create({
                 name: "Bluesky Stats",
                 type: "query",
@@ -137,7 +140,6 @@
                 lang: "sql",
                 code: "select * from employees",
               }),
-              git,
               repo.create({
                 name: "Contributors",
                 type: "query",
@@ -240,6 +242,7 @@
             }
           }, 100);
 
+          // TODO: Figure out how to remove API-specific code.
           let ws;
           app.ports.selectSheet.subscribe(async id => {
             if (id === sheet?.documentId) return;
@@ -263,7 +266,18 @@
                   },
                 });
               };
+              if (doc?.url === "wss://api.manifold.markets/ws")
+                ws.onopen = () =>
+                  ws.send(
+                    JSON.stringify({
+                      type: "subscribe",
+                      txid: 0,
+                      topics: ["global/new-bet"],
+                    }),
+                  );
             }
+            if (doc?.feed === "http")
+              doc.rows = await fetch(doc?.url).then(res => res.json());
             if (doc?.feed === "git") {
               const url = new URL(doc?.url);
               const [owner, repo] = url.pathname
