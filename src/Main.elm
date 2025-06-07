@@ -43,6 +43,16 @@ iif c a b =
         b
 
 
+result : Result a a -> a
+result res =
+    case res of
+        Ok x ->
+            x
+
+        Err x ->
+            x
+
+
 
 ---- PORTS --------------------------------------------------------------------
 
@@ -358,10 +368,6 @@ number =
 tableDecoder : D.Decoder Table
 tableDecoder =
     let
-        intKeys : Dict String a -> Dict Int a
-        intKeys =
-            Dict.toList >> List.map (Tuple.mapFirst (Maybe.withDefault -1 << String.toInt)) >> Dict.fromList
-
         col : D.Decoder Col
         col =
             D.map3 Col
@@ -402,7 +408,15 @@ tableDecoder =
                         D.map TableDoc
                             (D.map2 Doc
                                 (D.field "cols" (D.array col))
-                                (D.field "rows" (D.array (D.map intKeys (D.dict D.value))))
+                                (D.field "rows"
+                                    (D.array
+                                        (D.oneOf
+                                            [ D.map (Dict.toList >> List.map (Tuple.mapFirst (Maybe.withDefault -1 << String.toInt)) >> Dict.fromList) (D.dict D.value)
+                                            , D.map (Dict.fromList << Array.toIndexedList) (D.array D.value)
+                                            ]
+                                        )
+                                    )
+                                )
                             )
 
                     "feed" ->
@@ -583,6 +597,7 @@ update msg ({ sheet } as model) =
                 | sheet =
                     [ { default | id = "", name = "library", table = Ok Library }
                     , { default | id = "device", name = "device", table = Ok (TableFeed Device) }
+                    , { default | id = "shop", name = "shop", table = Ok (TableFeed Shop) }
                     ]
                         |> List.map (\s -> ( s.id, s ))
                         |> Dict.fromList
@@ -868,22 +883,68 @@ view ({ sheet } as model) =
                                                 , E.list E.string s.tags
                                                 ]
                                     )
-                                |> (::)
-                                    (Dict.fromList <|
-                                        List.indexedMap Tuple.pair
-                                            [ E.string "#device"
-                                            , E.string "device"
-                                            , E.list E.string []
-                                            ]
-                                    )
-                                |> (::)
-                                    (Dict.fromList <|
+                                |> (++)
+                                    [ Dict.fromList <|
                                         List.indexedMap Tuple.pair
                                             [ E.string "/"
                                             , E.string "library"
                                             , E.list E.string []
                                             ]
-                                    )
+                                    , Dict.fromList <|
+                                        List.indexedMap Tuple.pair
+                                            [ E.string "#shop"
+                                            , E.string "shop"
+                                            , E.list E.string []
+                                            ]
+                                    , Dict.fromList <|
+                                        List.indexedMap Tuple.pair
+                                            [ E.string "#device"
+                                            , E.string "device"
+                                            , E.list E.string []
+                                            ]
+                                    ]
+                                |> Array.fromList
+                        }
+
+                Ok (TableFeed Shop) ->
+                    Ok
+                        -- TODO:
+                        { cols =
+                            Array.fromList
+                                [ Col 6 "Buy" Text, Col 0 "Type" Text, Col 1 "Publisher" Text, Col 2 "Name" Text, Col 3 "Downloads" Number, Col 4 "Rating" Number, Col 5 "Price" Number ]
+                        , rows =
+                            [ [ E.string "data", E.string "scrapsheets", E.string "used-cars", E.int 15420, E.float 4.7, E.float 4.2, E.string "Buy" ]
+                            , [ E.string "code", E.string "scrapsheets", E.string "sales-tax", E.int 8932, E.float 4.2, E.float 1.01, E.string "Buy" ]
+                            , [ E.string "data", E.string "officetools", E.string "invoice-generator", E.int 23150, E.float 4.8, E.float 12.99, E.string "Buy" ]
+                            , [ E.string "data", E.string "marketdata", E.string "stock-prices", E.int 45670, E.float 4.3, E.float 29.99, E.string "Buy" ]
+                            , [ E.string "code", E.string "devutils", E.string "form-validator", E.int 7832, E.float 4.5, E.float 0.99, E.string "Buy" ]
+                            , [ E.string "data", E.string "scrapsheets", E.string "budget-tracker", E.int 18924, E.float 4.6, E.float 7.5, E.string "Buy" ]
+                            , [ E.string "data", E.string "geotools", E.string "world-cities", E.int 12456, E.float 4.1, E.float 15.0, E.string "Buy" ]
+                            , [ E.string "code", E.string "webdev", E.string "color-picker", E.int 34521, E.float 4.9, E.float 2.99, E.string "Buy" ]
+                            , [ E.string "data", E.string "officepro", E.string "expense-report", E.int 19823, E.float 4.4, E.float 5.99, E.string "Buy" ]
+                            , [ E.string "data", E.string "financedata", E.string "crypto-prices", E.int 67891, E.float 4.2, E.float 19.99, E.string "Buy" ]
+                            , [ E.string "code", E.string "scrapsheets", E.string "date-formatter", E.int 11234, E.float 4.6, E.float 0.5, E.string "Buy" ]
+                            , [ E.string "data", E.string "biztools", E.string "project-planner", E.int 28456, E.float 4.7, E.float 8.99, E.string "Buy" ]
+                            , [ E.string "data", E.string "weatherapi", E.string "climate-data", E.int 14567, E.float 4.0, E.float 24.99, E.string "Buy" ]
+                            , [ E.string "code", E.string "mathtools", E.string "statistics-calc", E.int 9876, E.float 4.8, E.float 3.49, E.string "Buy" ]
+                            , [ E.string "data", E.string "scrapsheets", E.string "timesheet", E.int 22334, E.float 4.5, E.float 4.99, E.string "Buy" ]
+                            , [ E.string "data", E.string "socialmedia", E.string "trend-analytics", E.int 33445, E.float 3.9, E.float 49.99, E.string "Buy" ]
+                            , [ E.string "code", E.string "texttools", E.string "string-parser", E.int 6543, E.float 4.3, E.float 1.99, E.string "Buy" ]
+                            , [ E.string "data", E.string "hrtools", E.string "employee-tracker", E.int 17889, E.float 4.6, E.float 12.5, E.string "Buy" ]
+                            , [ E.string "data", E.string "retaildata", E.string "product-catalog", E.int 41234, E.float 4.1, E.float 35.0, E.string "Buy" ]
+                            , [ E.string "code", E.string "devutils", E.string "json-validator", E.int 15678, E.float 4.7, E.float 2.49, E.string "Buy" ]
+                            , [ E.string "data", E.string "eventtools", E.string "wedding-planner", E.int 8765, E.float 4.9, E.float 15.99, E.string "Buy" ]
+                            , [ E.string "data", E.string "geotools", E.string "zip-codes", E.int 26543, E.float 4.2, E.float 9.99, E.string "Buy" ]
+                            , [ E.string "code", E.string "webdev", E.string "css-generator", E.int 19876, E.float 4.4, E.float 1.75, E.string "Buy" ]
+                            , [ E.string "data", E.string "academics", E.string "grade-tracker", E.int 12987, E.float 4.8, E.float 6.99, E.string "Buy" ]
+                            , [ E.string "data", E.string "sportsdata", E.string "nfl-stats", E.int 38764, E.float 4.0, E.float 22.99, E.string "Buy" ]
+                            , [ E.string "code", E.string "scrapsheets", E.string "email-validator", E.int 21456, E.float 4.5, E.float 0.75, E.string "Buy" ]
+                            , [ E.string "data", E.string "fitness", E.string "workout-log", E.int 16789, E.float 4.7, E.float 7.49, E.string "Buy" ]
+                            , [ E.string "data", E.string "healthdata", E.string "nutrition-facts", E.int 29876, E.float 4.3, E.float 18.99, E.string "Buy" ]
+                            , [ E.string "code", E.string "filetools", E.string "pdf-merger", E.int 44321, E.float 4.6, E.float 4.99, E.string "Buy" ]
+                            , [ E.string "data", E.string "realestate", E.string "property-listing", E.int 13654, E.float 4.1, E.float 11.99, E.string "Buy" ]
+                            ]
+                                |> List.map (List.indexedMap Tuple.pair >> Dict.fromList)
                                 |> Array.fromList
                         }
 
@@ -1515,7 +1576,12 @@ view ({ sheet } as model) =
                                                         , A.onMouseDown CellMouseDown
                                                         , A.onMouseUp CellMouseUp
                                                         , A.onMouseEnter (CellHover (xy i -1))
-                                                        , S.textAlignLeft
+                                                        , case col.typ of
+                                                            Number ->
+                                                                S.textAlignRight
+
+                                                            _ ->
+                                                                S.textAlignLeft
                                                         , S.verticalAlignBottom
                                                         ]
                                                         [ H.a [ A.href "#settings", S.displayInlineBlock, S.width "100%" ]
@@ -1586,10 +1652,14 @@ view ({ sheet } as model) =
                                                                                     Boolean ->
                                                                                         D.map (\c -> H.input [ A.type_ "checkbox", A.checked c ] []) D.bool
 
+                                                                                    Number ->
+                                                                                        D.map (H.span [ S.textAlignRight ] << List.singleton << text) string
+
                                                                                     _ ->
                                                                                         D.map text string
                                                                                 )
-                                                                            |> Result.withDefault (text "TODO: parse error")
+                                                                            |> Result.mapError (D.errorToString >> text)
+                                                                            |> result
                                                                         ]
                                                                     <|
                                                                         if sheet.write /= Nothing && sheet.select == rect i n i n then
