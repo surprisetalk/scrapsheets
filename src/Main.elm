@@ -1694,15 +1694,23 @@ view ({ sheet } as model) =
                     , case sheet.tool of
                         -- TODO: Hovering over columns/etc should highlight relevant cells, and vice versa.
                         Settings ->
-                            -- TODO:
-                            [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10 ]
-                                -- TODO: Link to the column configs.
-                                [ text (Debug.toString sheet.table)
-                                ]
-                            , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd, S.alignItemsBaseline ]
-                                [ H.button [ A.onClick NoOp ] [ text "new column (C)" ]
-                                ]
-                            ]
+                            case sheet.table of
+                                Ok (TableQuery query) ->
+                                    [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
+                                        [ text (String.trim query.query)
+                                        ]
+                                    ]
+
+                                _ ->
+                                    -- TODO:
+                                    [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%" ]
+                                        -- TODO: Link to the column configs.
+                                        [ text (Debug.toString sheet.table)
+                                        ]
+                                    , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd, S.alignItemsBaseline ]
+                                        [ H.button [ A.onClick NoOp ] [ text "new column (C)" ]
+                                        ]
+                                    ]
 
                         Hints ->
                             -- TODO: problems (linting), ideas, related (sources/backlinks)
