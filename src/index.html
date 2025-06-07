@@ -379,7 +379,7 @@
                 .catch(() => []);
             }
             if (!sheet || !top) return;
-            sheet.on("change", data => {
+            sheet?.on("change", data => {
               app.ports.sheetChanged.send({
                 id: data.handle.documentId,
                 data,
