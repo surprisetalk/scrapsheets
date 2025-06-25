@@ -1,119 +1,222 @@
-// TODO: hono
+import { HTTPException } from "jsr:@hono/hono/http-exception";
+import { Hono } from "jsr:@hono/hono";
+import { logger } from "jsr:@hono/hono/logger";
+import { cors } from "jsr:@hono/hono/cors";
+import { jwt, sign } from "jsr:@hono/hono/jwt";
+import type { JwtVariables } from "jsr:@hono/hono/jwt";
+import sg from "npm:@sendgrid/mail";
+import pg from "https://deno.land/x/postgresjs@v3.4.5/mod.js";
+import { upgradeWebSocket } from "jsr:@hono/hono/deno";
 
-app.post("/signup", async c => {
-  const usr = {
-    name: (await form(c)).name,
-    email: (await form(c)).email,
-    password: null,
-  };
-  const [{ email = undefined, token = undefined } = {}] = await sql`
-    with usr_ as (insert into usr ${sql(usr)} on conflict do nothing returning *)
-    select uid, email, email_token(now(), email) as token from usr_
-  `;
-  if (email && token) await sendVerificationEmail(email, token);
-  return c.redirect("/");
+const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
+const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
+
+export const createJwt = async (usr_id: string) =>
+  await sign(
+    {
+      sub: usr_id,
+      exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7,
+    },
+    JWT_SECRET,
+  );
+
+const createToken = async (
+  email: string,
+  ts: Date = new Date(),
+): Promise<string> => {
+  const epoch = Math.floor(ts.getTime() / 1000);
+  const hash = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(`${epoch}:${email}:${TOKEN_SECRET}`),
+  );
+  return `${epoch}:${Array.from(new Uint8Array(hash))
+    .map(b => b.toString(16).padStart(2, "0"))
+    .join("")}`;
+};
+
+const sendVerificationEmail = async (email: string) => {
+  if (!Deno.env.get(`SENDGRID_API_KEY`)) return;
+  const token = await createToken(email);
+  await sg
+    .send({
+      to: email,
+      from: "hello@scrap.land",
+      subject: "Verify your email",
+      text:
+        `` +
+        `Welcome to scrap.land` +
+        `\n\n` +
+        `Please verify your email: ` +
+        `https://scrap.land/password` +
+        `?email=${encodeURIComponent(email)}` +
+        `&token=${encodeURIComponent(token)}`,
+    })
+    .catch(err => {
+      console.log(`/password?email=${email}&token=${token}`);
+      console.error(
+        `Could not send verification email to ${email}:`,
+        err?.response?.body || err,
+      );
+    });
+};
+
+export const sql = pg({
+  host: "127.0.0.1",
+  port: 5434,
+  database: "postgres",
+  username: "postgres",
+  password: "",
+  ssl: false,
+  prepare: false,
+  fetch_types: true,
+  onnotice: msg => msg.severity !== "DEBUG" && console.log(msg),
 });
 
-app.post("/password", async c => {
-  const { email, token, password } = await form(c);
-  const [usr] = await sql`
-    update usr
-    set password = crypt(${password}, gen_salt('bf', 8)), email_verified_at = coalesce(email_verified_at, now())
-    where true
-      and to_timestamp(split_part(${token},':',1)::bigint) > now() - interval '2 days'
-      and ${email} = email
-      and ${token} = email_token(to_timestamp(split_part(${token},':',1)::bigint), email)
-    returning uid
+// TODO: Add rate-limiting middleware everywhere.
+export const app = new Hono<{
+  Variables: JwtVariables & { usr_id: string };
+}>();
+
+app.use("*", logger());
+
+app.use("*", cors());
+
+app.use(async (c, next) => {
+  await next();
+  if (c.res.headers.get("Content-Type")?.startsWith("application/json")) {
+    const obj = await c.res.json();
+    c.res = new Response(JSON.stringify(obj, null, 2), c.res);
+  }
+});
+
+app.notFound(() => {
+  throw new HTTPException(404, { message: "Not found." });
+});
+
+app.onError((err, c) => {
+  // if (err?.code === "23505") return c.json({ error: "Already exists" }, 409);
+  if (err instanceof HTTPException) return err.getResponse();
+  if (err) console.error(err);
+  return c.json({ error: "Sorry, something went wrong." }, 500);
+});
+
+app.post("/signup", async c => {
+  const { email } = c.req.query();
+  await sendVerificationEmail(email);
+  return c.json(null, 200);
+});
+
+app.post("/signup/:token{.+}", async c => {
+  const token = c.req.param("token");
+  const { email, password } = await c.req.json();
+  if (!token || !email || !password) return c.json(null, 400);
+  const [ts, _hash] = token.split(":");
+  const epoch = parseInt(ts);
+  if (Date.now() / 1000 - epoch > 86400) return c.json(null, 401);
+  if (token !== (await createToken(email, new Date(epoch * 1000))))
+    return c.json(null, 401);
+  await sql`
+    insert into usr ${sql({ email, password: sql`crypt(${password}, gen_salt('bf', 8))` as unknown as string })} 
+    on conflict do update set password = excluded.password
   `;
-  if (usr) await setSignedCookie(c, "uid", usr.uid, cookieSecret);
-  return ok(c);
+  return c.json(null, 204);
 });
 
 app.post("/login", async c => {
-  const { email, password } = await form(c);
-  const [usr] = await sql`
-    select *, password = crypt(${password}, password) AS is_password_correct
-    from usr where email = ${email}
-  `;
-  if (!usr || !usr.is_password_correct)
-    throw new HTTPException(401, { message: "Wrong credentials." });
-  await setSignedCookie(c, "uid", usr.uid, cookieSecret);
-  return c.redirect("/u");
+  const { email, password } = await c.req.json();
+  const [usr] =
+    await sql`select usr_id from usr where email = ${email} and crypt(${password}, password)`;
+  if (!usr) return c.json(null, 401);
+  return c.json(
+    { data: { usr_id: usr.usr_id, jwt: await createJwt(usr.usr_id) } },
+    200,
+  );
 });
 
 app.get("/shop/sheet", async c => {
-  // TODO: Query params.
-  const rows = await sql`select * from sheet where price >= 0 limit 100`;
-  return c.json(rows, 200);
+  // TODO:
+  return c.json(null, 500);
 });
 
 app.get("/shop/tool", async c => {
   // TODO:
-  return c.json(rows, 200);
+  return c.json(null, 500);
 });
 
-// TODO: https://hono.dev/docs/helpers/websocket
 app.get(
   "/library/:id/sync",
   upgradeWebSocket(c => {
     // TODO: https://docs.yjs.dev/api/document-updates
+    return {
+      onMessage(event, ws) {
+        console.log(`Message from client: ${event.data}`);
+        ws.send("Hello from server!");
+      },
+      onClose: () => {},
+    };
   }),
 );
 
-app.use(async (c, next) => {
-  const uid = await getSignedCookie(c, cookieSecret, "uid");
-  if (!uid) throw new HTTPException(401, { message: "Not authorized." });
-  c.set("uid", uid);
+app.use("*", jwt({ secret: JWT_SECRET }));
+
+app.use("*", async (c, next) => {
+  c.set("usr_id", c.get("jwtPayload")?.sub);
   await next();
 });
 
 app.post("/shop/sheet/:id", async c => {
-  await sql`
-    insert into sheet_usr (sheet_id, usr_id, role, price, subscription) 
-    select sheet_id, ${c.get("uid")}, 'readonly', price, subscription
-    from sheet 
-    where sheet_id = ${c.req.param("id")}
-  `;
-  return c.json(null, 204);
+  // TODO: Share sheet as a portal.
+  return c.json(null, 500);
 });
 
 app.post("/shop/tool/:id", async c => {
-  // TODO::
-  return c.json(null, 204);
+  // TODO:
+  return c.json(null, 500);
 });
 
 app.get("/ledger", async c => {
   // TODO:
-  return c.json(rows, 200);
+  return c.json(null, 500);
 });
 
 app.get("/library", async c => {
   const rows =
-    await sql`select * from sheet s left join sheet_usr su using (usr_id) where su.id = ${c.get("uid")}`;
+    await sql`select * from sheet s left join sheet_usr su using (usr_id) where su.id = ${c.get("usr_id")}`;
   return c.json(rows, 200);
 });
 
 app.post("/library", async c => {
-  const [{ sheet_id, usr_id }] = await sql`
-    with s as (insert into sheet (created_by) values (${c.get("uid")}) returning *)
-    insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s returning *
+  const [{ sheet_id }] = await sql`
+    with s as (insert into sheet ${sql({ created_by: c.get("usr_id") })} returning *)
+    insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s returning sheet_id
   `;
   return c.json(sheet_id, 201);
 });
 
 app.patch("/library/:id", async c => {
-  await sql`update sheet set ${todo} where sheet_id = ${c.req.param("id")}`;
+  await sql`
+    update sheet 
+    set ${sql(await c.req.json(), "name", "tags")} 
+    where true
+    and created_by = ${c.get("usr_id")}
+    and sheet_id = ${c.req.param("id")}
+  `;
   return c.json(null, 204);
 });
 
 app.post("/portal/connect/:type", async c => {
   // TODO: oauth
+  return c.json(null, 500);
 });
 
-app.all("/portal/proxy/:id", async c => {
-  // TODO: oauth proxy
+app.all("/portal/proxy/:id/:route{.*\\.png}", async c => {
+  // TODO: https://hono.dev/docs/helpers/proxy
+  return c.json(null, 500);
 });
 
 app.all("/mcp/sheet/:id", async c => {
   // TODO: mcp server
+  return c.json(null, 500);
 });
+
+Deno.serve(app.fetch).finished.then(() => sql.end());
