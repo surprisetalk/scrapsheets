@@ -3,6 +3,9 @@ import { PGlite } from "npm:@electric-sql/pglite";
 import { PostgresConnection } from "npm:pg-gateway";
 import { citext } from "npm:@electric-sql/pglite/contrib/citext";
 import { app, sql, createJwt } from "./main.ts";
+import type { LibraryItem } from "./main.ts";
+import * as Y from "npm:yjs";
+import { WebsocketProvider } from "npm:y-websocket";
 
 const request = async (jwt: string, route: string, options?: object) => {
   const res = await app.request(route, {
@@ -100,18 +103,69 @@ Deno.test(async function allTests(t) {
     await sql`insert into usr (email) values ('taylor@example.com') returning *`;
   const jwt = await createJwt(usr_id);
 
+  await t.step(async function createSheet(t) {
+    await post(jwt, `/library`, {});
+  });
+
   await t.step(async function viewLibrary(t) {
-    post(jwt, `/library`, {});
-    const sheets = await get<[]>(jwt, `/library`);
+    await post(jwt, `/library`, {});
+    const sheets = await get<LibraryItem[]>(jwt, `/library`);
     assert(sheets.length);
   });
 
   await t.step(async function editSheetMetadata(t) {
-    // TODO: /library/:id
+    const { data: id } = await post(jwt, `/library`, {});
+    const meta = { name: "Example", tags: ["tag1", "tag2"] };
+    await patch(jwt, `/library/${id}`, meta);
+    const sheets = await get<LibraryItem[]>(jwt, `/library`, { sheet_id: id });
+    assertEquals(sheets?.[0]?.sheet_id, id);
+    assertEquals(sheets?.[0]?.name, meta.name);
+    assertEquals(sheets?.[0]?.tags, meta.tags);
   });
 
   await t.step(async function editSheetContent(t) {
-    // TODO: /library/:id
+    const { data: id } = await post(jwt, `/library`, {});
+    {
+      const ydoc = new Y.Doc();
+      const provider = new WebsocketProvider(
+        `wss://localhost:8080/library/sync`,
+        id,
+        ydoc,
+        { connect: true },
+      );
+      await new Promise<void>(resolve => {
+        provider.on(
+          "status",
+          event => event.status === "connecting" && resolve(),
+        );
+      });
+      const ytext = ydoc.getText("sheet");
+      ytext.insert(0, "Hello from test!");
+      assertEquals(ytext.toString(), "Hello from test!");
+      provider.awareness.destroy();
+      provider.disconnect();
+      provider.destroy();
+    }
+    {
+      const ydoc = new Y.Doc();
+      const provider = new WebsocketProvider(
+        `wss://localhost:8080/library/sync`,
+        id,
+        ydoc,
+        { connect: true },
+      );
+      await new Promise<void>(resolve => {
+        provider.on(
+          "status",
+          event => event.status === "connecting" && resolve(),
+        );
+      });
+      const ytext = ydoc.getText("sheet");
+      assertEquals(ytext.toString(), "Hello from test!");
+      provider.awareness.destroy();
+      provider.disconnect();
+      provider.destroy();
+    }
   });
 
   await t.step(async function purchaseSheet(t) {
@@ -129,4 +183,7 @@ Deno.test(async function allTests(t) {
   await sql.end();
   listener.close();
   await pglite.close();
+
+  // Give time for all resources to clean up
+  await new Promise(resolve => setTimeout(resolve, 500));
 });

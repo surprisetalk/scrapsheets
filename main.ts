@@ -7,6 +7,22 @@ import type { JwtVariables } from "jsr:@hono/hono/jwt";
 import sg from "npm:@sendgrid/mail";
 import pg from "https://deno.land/x/postgresjs@v3.4.5/mod.js";
 import { upgradeWebSocket } from "jsr:@hono/hono/deno";
+import * as Y from "npm:yjs";
+import { WebsocketProvider } from "npm:y-websocket";
+
+export type Col = { type: "string" };
+export type Row = Record<string, any>;
+export type Sheet =
+  | { type: "template"; template: Sheet }
+  | { type: "page"; cols: Col[]; Row: Row[] }
+  | { type: "portal" }
+  | { type: "agent"; agent: unknown }
+  | { type: "query"; db: string; lang: "prql" | "sql"; code: string };
+export interface LibraryItem {
+  sheet_id: string;
+  name: string;
+  tags: string[];
+}
 
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
 const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
@@ -72,6 +88,30 @@ export const sql = pg({
   onnotice: msg => msg.severity !== "DEBUG" && console.log(msg),
 });
 
+const cselect = async ({
+  select,
+  from,
+  where,
+  order,
+  limit = "50",
+  offset = "0",
+}: {
+  select: any;
+  from: any;
+  where: any[];
+  order?: any;
+  limit: string;
+  offset: string;
+}) => {
+  const where_ = where.filter(x => x).length
+    ? sql`where true ${where.filter(x => x).map((x: any) => sql`and ${x}`)}`
+    : sql``;
+  const data =
+    await sql`${select} ${from} ${where_} ${order ?? sql``} limit ${limit} offset ${offset}`;
+  const [{ count }] = await sql`select count(*) ${from} ${where_}`;
+  return { data, count };
+};
+
 // TODO: Add rate-limiting middleware everywhere.
 export const app = new Hono<{
   Variables: JwtVariables & { usr_id: string };
@@ -119,7 +159,7 @@ app.post("/signup/:token{.+}", async c => {
     insert into usr ${sql({ email, password: sql`crypt(${password}, gen_salt('bf', 8))` as unknown as string })} 
     on conflict do update set password = excluded.password
   `;
-  return c.json(null, 204);
+  return c.json(null, 200);
 });
 
 app.post("/login", async c => {
@@ -143,16 +183,24 @@ app.get("/shop/tool", async c => {
   return c.json(null, 500);
 });
 
+const rooms: Record<string, WebsocketProvider> = {};
 app.get(
   "/library/:id/sync",
   upgradeWebSocket(c => {
-    // TODO: https://docs.yjs.dev/api/document-updates
+    rooms[c.req.param("id")] =
+      rooms[c.req.param("id")] ??
+      new WebsocketProvider(
+        // TODO: proper listener url
+        `wss://localhost:8080`,
+        c.req.param("id"),
+        new Y.Doc(),
+      );
+    const provider = rooms[c.req.param("id")];
     return {
-      onMessage(event, ws) {
-        console.log(`Message from client: ${event.data}`);
-        ws.send("Hello from server!");
-      },
-      onClose: () => {},
+      onOpen: provider.ws?.onopen ?? undefined,
+      onMessage: provider.ws?.onmessage ?? undefined,
+      onClose: provider.ws?.onclose ?? undefined,
+      onError: provider.ws?.onerror ?? undefined,
     };
   }),
 );
@@ -190,9 +238,22 @@ app.put("/db/:id", async c => {
 });
 
 app.get("/library", async c => {
-  const data =
-    await sql`select * from sheet s left join sheet_usr su using (sheet_id) where su.usr_id = ${c.get("usr_id")}`;
-  return c.json({ data }, 200);
+  const { limit, offset, ...qs } = c.req.query();
+  const res = await cselect({
+    select: sql`select s.*`,
+    from: sql`
+      from sheet s 
+      left join sheet_usr su using (sheet_id) 
+    `,
+    where: [
+      sql`su.usr_id = ${c.get("usr_id")}`,
+      qs.sheet_id && sql`sheet_id = ${qs.sheet_id}`,
+    ],
+    order: undefined,
+    limit,
+    offset,
+  });
+  return c.json(res);
 });
 
 app.post("/library", async c => {
@@ -211,7 +272,7 @@ app.patch("/library/:id", async c => {
     and created_by = ${c.get("usr_id")}
     and sheet_id = ${c.req.param("id")}
   `;
-  return c.json(null, 204);
+  return c.json(null, 200);
 });
 
 app.post("/query", async c => {
@@ -239,4 +300,7 @@ app.all("/mcp/sheet/:id", async c => {
   return c.json(null, 500);
 });
 
-Deno.serve(app.fetch).finished.then(() => sql.end());
+// Deno.serve(app.fetch).finished.then(async () => {
+//   await sql.end();
+//   for (const room of Object.values(rooms)) await room.destroy();
+// });
