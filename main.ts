@@ -119,13 +119,13 @@ export const app = new Hono<{
 
 app.use("*", logger());
 
-// TODO: Add a storage adapter.
+// TODO: Add a storage adapter. Persist somewhere -- doesn't really matter where.
 // TODO: Connect the network adapetr to the websocket.
 // TODO: https://github.com/automerge/automerge-repo-sync-server/blob/main/src/server.js
 // TODO: Configure the port.
 export const automerge = new Repo({
   network: [],
-  /** @ts-ignore @type {(import("@automerge/automerge-repo").PeerId)}  */
+  // @ts-ignore @type
   peerId: `server-${Deno.hostname()}`,
   sharePolicy: () => Promise.resolve(false),
 });
