@@ -7,8 +7,8 @@ import type { JwtVariables } from "jsr:@hono/hono/jwt";
 import sg from "npm:@sendgrid/mail";
 import pg from "https://deno.land/x/postgresjs@v3.4.5/mod.js";
 import { upgradeWebSocket } from "jsr:@hono/hono/deno";
-import * as Y from "npm:yjs";
-import { WebsocketProvider } from "npm:y-websocket";
+import { Repo } from "npm:@automerge/automerge-repo";
+import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-websocket";
 
 export type Col = { type: "string" };
 export type Row = Record<string, any>;
@@ -119,6 +119,30 @@ export const app = new Hono<{
 
 app.use("*", logger());
 
+// TODO: Add a storage adapter.
+// TODO: Connect the network adapetr to the websocket.
+// TODO: https://github.com/automerge/automerge-repo-sync-server/blob/main/src/server.js
+// TODO: Configure the port.
+export const automerge = new Repo({
+  network: [],
+  /** @ts-ignore @type {(import("@automerge/automerge-repo").PeerId)}  */
+  peerId: `server-${Deno.hostname()}`,
+  sharePolicy: () => Promise.resolve(false),
+});
+
+app.get(
+  "/library/sync",
+  upgradeWebSocket(c => {
+    const { auth } = c.req.query(); // TODO: Verify Bearer token on auth.
+    return {
+      onOpen: undefined,
+      onMessage: undefined,
+      onClose: undefined,
+      onError: undefined,
+    };
+  }),
+);
+
 app.use("*", cors());
 
 app.use(async (c, next) => {
@@ -183,28 +207,6 @@ app.get("/shop/tool", async c => {
   return c.json(null, 500);
 });
 
-const rooms: Record<string, WebsocketProvider> = {};
-app.get(
-  "/library/:id/sync",
-  upgradeWebSocket(c => {
-    rooms[c.req.param("id")] =
-      rooms[c.req.param("id")] ??
-      new WebsocketProvider(
-        // TODO: proper listener url
-        `wss://localhost:8080`,
-        c.req.param("id"),
-        new Y.Doc(),
-      );
-    const provider = rooms[c.req.param("id")];
-    return {
-      onOpen: provider.ws?.onopen ?? undefined,
-      onMessage: provider.ws?.onmessage ?? undefined,
-      onClose: provider.ws?.onclose ?? undefined,
-      onError: provider.ws?.onerror ?? undefined,
-    };
-  }),
-);
-
 app.use("*", jwt({ secret: JWT_SECRET }));
 
 app.use("*", async (c, next) => {
@@ -257,8 +259,9 @@ app.get("/library", async c => {
 });
 
 app.post("/library", async c => {
+  const hand = automerge.create({});
   const [{ sheet_id }] = await sql`
-    with s as (insert into sheet ${sql({ created_by: c.get("usr_id") })} returning *)
+    with s as (insert into sheet ${sql({ sheet_id: hand.documentId, created_by: c.get("usr_id") })} returning *)
     insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s returning sheet_id
   `;
   return c.json({ data: sheet_id }, 201);
@@ -304,3 +307,5 @@ app.all("/mcp/sheet/:id", async c => {
 //   await sql.end();
 //   for (const room of Object.values(rooms)) await room.destroy();
 // });
+
+export default app;

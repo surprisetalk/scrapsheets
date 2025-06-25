@@ -1,5 +1,7 @@
 {
   "imports": {
+    "@automerge/automerge-repo": "npm:@automerge/automerge-repo@^2.0.5",
+    "@automerge/automerge-repo-network-websocket": "npm:@automerge/automerge-repo-network-websocket@^2.0.5",
     "@electric-sql/pglite": "npm:@electric-sql/pglite@^0.3.3",
     "@sendgrid/mail": "npm:@sendgrid/mail@^8.1.5",
     "@std/assert": "jsr:@std/assert@^1.0.13",

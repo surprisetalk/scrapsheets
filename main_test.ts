@@ -2,10 +2,8 @@ import { assert, assertEquals } from "jsr:@std/assert";
 import { PGlite } from "npm:@electric-sql/pglite";
 import { PostgresConnection } from "npm:pg-gateway";
 import { citext } from "npm:@electric-sql/pglite/contrib/citext";
-import { app, sql, createJwt } from "./main.ts";
+import { app, sql, createJwt, automerge } from "./main.ts";
 import type { LibraryItem } from "./main.ts";
-import * as Y from "npm:yjs";
-import { WebsocketProvider } from "npm:y-websocket";
 
 const request = async (jwt: string, route: string, options?: object) => {
   const res = await app.request(route, {
@@ -124,47 +122,16 @@ Deno.test(async function allTests(t) {
   });
 
   await t.step(async function editSheetContent(t) {
-    const { data: id } = await post(jwt, `/library`, {});
+    const { data: sheet_id } = await post(jwt, `/library`, {});
+    assert(sheet_id);
     {
-      const ydoc = new Y.Doc();
-      const provider = new WebsocketProvider(
-        `wss://localhost:8080/library/sync`,
-        id,
-        ydoc,
-        { connect: true },
-      );
-      await new Promise<void>(resolve => {
-        provider.on(
-          "status",
-          event => event.status === "connecting" && resolve(),
-        );
-      });
-      const ytext = ydoc.getText("sheet");
-      ytext.insert(0, "Hello from test!");
-      assertEquals(ytext.toString(), "Hello from test!");
-      provider.awareness.destroy();
-      provider.disconnect();
-      provider.destroy();
+      const hand = await automerge.find<{ foo?: string }>(sheet_id);
+      assert(!hand.doc().foo);
+      hand.change(doc => (doc.foo = "bar"));
     }
     {
-      const ydoc = new Y.Doc();
-      const provider = new WebsocketProvider(
-        `wss://localhost:8080/library/sync`,
-        id,
-        ydoc,
-        { connect: true },
-      );
-      await new Promise<void>(resolve => {
-        provider.on(
-          "status",
-          event => event.status === "connecting" && resolve(),
-        );
-      });
-      const ytext = ydoc.getText("sheet");
-      assertEquals(ytext.toString(), "Hello from test!");
-      provider.awareness.destroy();
-      provider.disconnect();
-      provider.destroy();
+      const hand = await automerge.find<{ foo?: string }>(sheet_id);
+      assertEquals(hand.doc().foo, "bar");
     }
   });
 
