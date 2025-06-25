@@ -85,7 +85,6 @@ Deno.test(async function allTests(t) {
         },
       });
   })();
-
   await pglite.waitReady;
   await pglite.exec(await Deno.readTextFile("./db.sql"));
 

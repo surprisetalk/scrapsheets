@@ -179,6 +179,16 @@ app.get("/ledger", async c => {
   return c.json(null, 500);
 });
 
+app.get("/db", async c => {
+  // TODO:
+  return c.json(null, 500);
+});
+
+app.put("/db/:id", async c => {
+  // TODO:
+  return c.json(null, 500);
+});
+
 app.get("/library", async c => {
   const data =
     await sql`select * from sheet s left join sheet_usr su using (sheet_id) where su.usr_id = ${c.get("usr_id")}`;
@@ -204,13 +214,23 @@ app.patch("/library/:id", async c => {
   return c.json(null, 204);
 });
 
-app.post("/portal/connect/:type", async c => {
-  // TODO: oauth
+app.post("/query", async c => {
+  // TODO:
   return c.json(null, 500);
 });
 
-app.all("/portal/proxy/:id/:route{.*\\.png}", async c => {
-  // TODO: https://hono.dev/docs/helpers/proxy
+app.get("/agent/:id", async c => {
+  // TODO:
+  return c.json(null, 500);
+});
+
+app.get("/portal/:id", async c => {
+  // TODO:
+  return c.json(null, 500);
+});
+
+app.post("/portal/connect/:type", async c => {
+  // TODO: oauth
   return c.json(null, 500);
 });
 
