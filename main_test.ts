@@ -71,22 +71,23 @@ const del = (jwt: string, route: string, body: object) =>
   request(jwt, route, { method: "DELETE", body: JSON.stringify(body) });
 
 Deno.test(async function allTests(t) {
-  const pglite = new PGlite({ extensions: { citext } });
   const listener = Deno.listen({ port: 5434 });
+  const pglite = new PGlite({ extensions: { citext } });
   (async () => {
-    for await (const conn of listener) {
+    for await (const conn of listener)
       new PostgresConnection(conn, {
         async onStartup() {
           await pglite.waitReady;
-          await pglite.exec(await Deno.readTextFile("./db.sql"));
         },
         async onMessage(data, { isAuthenticated }) {
           if (!isAuthenticated) return;
           return await pglite.execProtocolRaw(data);
         },
       });
-    }
   })();
+
+  await pglite.waitReady;
+  await pglite.exec(await Deno.readTextFile("./db.sql"));
 
   await t.step(async function viewShopSheets(t) {
     // TODO: /shop/sheet

@@ -180,9 +180,9 @@ app.get("/ledger", async c => {
 });
 
 app.get("/library", async c => {
-  const rows =
-    await sql`select * from sheet s left join sheet_usr su using (usr_id) where su.id = ${c.get("usr_id")}`;
-  return c.json(rows, 200);
+  const data =
+    await sql`select * from sheet s left join sheet_usr su using (sheet_id) where su.usr_id = ${c.get("usr_id")}`;
+  return c.json({ data }, 200);
 });
 
 app.post("/library", async c => {
@@ -190,7 +190,7 @@ app.post("/library", async c => {
     with s as (insert into sheet ${sql({ created_by: c.get("usr_id") })} returning *)
     insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s returning sheet_id
   `;
-  return c.json(sheet_id, 201);
+  return c.json({ data: sheet_id }, 201);
 });
 
 app.patch("/library/:id", async c => {
