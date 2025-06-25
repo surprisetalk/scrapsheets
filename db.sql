@@ -1,9 +1,10 @@
 create extension if not exists citext;
-create extension if not exists pgcrypto;
 
-create or replace function email_token(ts timestamp, email text) returns text language sql immutable as $$
-  select extract(epoch from ts)::text || ':' || encode(digest(extract(epoch from ts)::text || ':' || email || ':' || current_setting('app.secret', true), 'sha256'), 'hex')
-$$;
+-- create extension if not exists pgcrypto;
+-- 
+-- create or replace function email_token(ts timestamp, email text) returns text language sql immutable as $$
+--   select extract(epoch from ts)::text || ':' || encode(digest(extract(epoch from ts)::text || ':' || email || ':' || current_setting('app.secret', true), 'sha256'), 'hex')
+-- $$;
 
 create table usr
 ( uid bigint generated always as identity primary key
