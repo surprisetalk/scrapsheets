@@ -14,7 +14,7 @@ export type Col = { type: "string" };
 export type Row = Record<string, any>;
 export type Sheet =
   | { type: "template"; template: Sheet }
-  | { type: "page"; cols: Col[]; Row: Row[] }
+  | { type: "page"; cols: Col[]; rows: Row[] }
   | { type: "portal" }
   | { type: "agent"; agent: unknown }
   | { type: "query"; db: string; lang: "prql" | "sql"; code: string };
@@ -259,7 +259,11 @@ app.get("/library", async c => {
 });
 
 app.post("/library", async c => {
-  const hand = automerge.create({});
+  const sheet = await c.req.json();
+  // TODO: Validate to ensure it matches Sheet.
+  if (!["template", "page", "portal", "agent", "query"].includes(sheet?.type))
+    return c.json({ error: "Invalid initial sheet." }, 400);
+  const hand = automerge.create(sheet);
   const [{ sheet_id }] = await sql`
     with s as (insert into sheet ${sql({ sheet_id: hand.documentId, created_by: c.get("usr_id") })} returning *)
     insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s returning sheet_id

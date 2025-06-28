@@ -3,7 +3,9 @@ import { PGlite } from "npm:@electric-sql/pglite";
 import { PostgresConnection } from "npm:pg-gateway";
 import { citext } from "npm:@electric-sql/pglite/contrib/citext";
 import { app, sql, createJwt, automerge } from "./main.ts";
-import type { LibraryItem } from "./main.ts";
+import type { Sheet, Row, LibraryItem } from "./main.ts";
+
+const emptySheet: Sheet = { type: "page", cols: [], rows: [] };
 
 const request = async (jwt: string, route: string, options?: object) => {
   const res = await app.request(route, {
@@ -102,17 +104,17 @@ Deno.test(async function allTests(t) {
   const jwt = await createJwt(usr_id);
 
   await t.step(async function createSheet(t) {
-    await post(jwt, `/library`, {});
+    await post(jwt, `/library`, emptySheet);
   });
 
   await t.step(async function viewLibrary(t) {
-    await post(jwt, `/library`, {});
+    await post(jwt, `/library`, emptySheet);
     const sheets = await get<LibraryItem[]>(jwt, `/library`);
     assert(sheets.length);
   });
 
   await t.step(async function editSheetMetadata(t) {
-    const { data: id } = await post(jwt, `/library`, {});
+    const { data: id } = await post(jwt, `/library`, emptySheet);
     const meta = { name: "Example", tags: ["tag1", "tag2"] };
     await patch(jwt, `/library/${id}`, meta);
     const sheets = await get<LibraryItem[]>(jwt, `/library`, { sheet_id: id });
@@ -122,16 +124,21 @@ Deno.test(async function allTests(t) {
   });
 
   await t.step(async function editSheetContent(t) {
-    const { data: sheet_id } = await post(jwt, `/library`, {});
+    const { data: sheet_id } = await post(jwt, `/library`, emptySheet);
     assert(sheet_id);
+    const row: Row = { a: 1 };
     {
-      const hand = await automerge.find<{ foo?: string }>(sheet_id);
-      assert(!hand.doc().foo);
-      hand.change(doc => (doc.foo = "bar"));
+      const hand = await automerge.find<Sheet>(sheet_id);
+      const sheet = hand.doc();
+      assertEquals(sheet.type, "page");
+      assert(sheet.type === "page" && sheet.rows.length === 0);
+      hand.change(doc => doc.type === "page" && doc.rows.push(row));
     }
     {
-      const hand = await automerge.find<{ foo?: string }>(sheet_id);
-      assertEquals(hand.doc().foo, "bar");
+      const hand = await automerge.find<Sheet>(sheet_id);
+      const sheet = hand.doc();
+      assertEquals(sheet.type, "page");
+      assertEquals(sheet.type === "page" && sheet.rows?.[0], row);
     }
   });
 
