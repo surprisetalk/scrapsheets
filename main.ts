@@ -10,14 +10,14 @@ import { upgradeWebSocket } from "jsr:@hono/hono/deno";
 import { Repo } from "npm:@automerge/automerge-repo";
 import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-websocket";
 
-export type Col = { type: "string" };
+export type Col = { name: string; type: "string" | "int" };
 export type Row = Record<string, any>;
 export type Sheet =
   | { type: "template"; template: Sheet }
   | { type: "page"; cols: Col[]; rows: Row[] }
   | { type: "portal" }
   | { type: "agent"; agent: unknown }
-  | { type: "query"; db: string; lang: "prql" | "sql"; code: string };
+  | { type: "query"; db: string | null; lang: "prql" | "sql"; code: string };
 export interface LibraryItem {
   sheet_id: string;
   name: string;

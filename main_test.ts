@@ -5,7 +5,7 @@ import { citext } from "npm:@electric-sql/pglite/contrib/citext";
 import { app, sql, createJwt, automerge } from "./main.ts";
 import type { Sheet, Row, LibraryItem } from "./main.ts";
 
-const emptySheet: Sheet = { type: "page", cols: [], rows: [] };
+const emptyPage: Sheet = { type: "page", cols: [], rows: [] };
 
 const request = async (jwt: string, route: string, options?: object) => {
   const res = await app.request(route, {
@@ -104,17 +104,17 @@ Deno.test(async function allTests(t) {
   const jwt = await createJwt(usr_id);
 
   await t.step(async function createSheet(t) {
-    await post(jwt, `/library`, emptySheet);
+    await post(jwt, `/library`, emptyPage);
   });
 
   await t.step(async function viewLibrary(t) {
-    await post(jwt, `/library`, emptySheet);
+    await post(jwt, `/library`, emptyPage);
     const sheets = await get<LibraryItem[]>(jwt, `/library`);
     assert(sheets.length);
   });
 
   await t.step(async function editSheetMetadata(t) {
-    const { data: id } = await post(jwt, `/library`, emptySheet);
+    const { data: id } = await post(jwt, `/library`, emptyPage);
     const meta = { name: "Example", tags: ["tag1", "tag2"] };
     await patch(jwt, `/library/${id}`, meta);
     const sheets = await get<LibraryItem[]>(jwt, `/library`, { sheet_id: id });
@@ -123,8 +123,8 @@ Deno.test(async function allTests(t) {
     assertEquals(sheets?.[0]?.tags, meta.tags);
   });
 
-  await t.step(async function editSheetContent(t) {
-    const { data: sheet_id } = await post(jwt, `/library`, emptySheet);
+  await t.step(async function editPage(t) {
+    const { data: sheet_id } = await post(jwt, `/library`, emptyPage);
     assert(sheet_id);
     const row: Row = { a: 1 };
     {
@@ -140,6 +140,36 @@ Deno.test(async function allTests(t) {
       assertEquals(sheet.type, "page");
       assertEquals(sheet.type === "page" && sheet.rows?.[0], row);
     }
+  });
+
+  await t.step(async function runPortal(t) {
+    // TODO: /portal/:id  -- make portal indirectly grabs from /library? easy to test locally. how are portals created though?
+  });
+
+  await t.step(async function runAgent(t) {
+    // TODO: /agent/:id  -- crawler? timer?
+    // TODO: /agent/:id/webform
+    // TODO: /agent/:id/webhook
+  });
+
+  // TODO: Add more complexity, like referencing other tables or actually querying a DB.
+  await t.step(async function runQuery(t) {
+    const sheet_: Sheet = {
+      type: "query",
+      db: null,
+      lang: "sql",
+      code: "select 1 as a",
+    };
+    const { data: sheet_id } = await post(jwt, `/library`, sheet_);
+    assert(sheet_id);
+    const hand = await automerge.find<Sheet>(sheet_id);
+    const sheet = hand.doc();
+    assertEquals(sheet.type, "query");
+    const { data }: { data: Sheet } = await post(jwt, `/query`, sheet);
+    assertEquals(data.type, "page");
+    assertEquals(data.type === "page" && data.cols?.[0]?.type, "int");
+    assertEquals(data.type === "page" && data.cols?.[0]?.name, "a");
+    assertEquals(data.type === "page" && data.rows?.[0]?.a, 1);
   });
 
   await t.step(async function purchaseSheet(t) {
