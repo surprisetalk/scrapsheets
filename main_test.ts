@@ -143,7 +143,20 @@ Deno.test(async function allTests(t) {
   });
 
   await t.step(async function runPortal(t) {
-    // TODO: /portal/:id  -- make portal indirectly grabs from /library? easy to test locally. how are portals created though?
+    const sheet_: Sheet = {
+      type: "query",
+      db: null,
+      lang: "sql",
+      code: "select 1 as a",
+    };
+    const { data: sheet_id_ } = await post(jwt, `library`, sheet_);
+    const { data: sheet_id } = await post(jwt, `/shop/sheet`, sheet_id_);
+    await post(jwt, `/shop/sheet/${sheet_id}`);
+    const { data: sheet } = await get<Sheet>(jwt, `/portal/${sheet_id}`);
+    assertEquals(sheet.type, "page");
+    assertEquals(sheet.type === "page" && data.cols?.[0]?.type, "int");
+    assertEquals(sheet.type === "page" && data.cols?.[0]?.name, "a");
+    assertEquals(sheet.type === "page" && data.rows?.[0]?.a, 1);
   });
 
   await t.step(async function runAgent(t) {
