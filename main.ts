@@ -31,7 +31,6 @@ export interface LibraryItem {
 
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
 const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
-const PORTAL_SECRET = Deno.env.get("PORTAL_SECRET") ?? Math.random().toString();
 
 export const createJwt = async (usr_id: string) =>
   await sign(
@@ -354,10 +353,5 @@ app.all("/mcp/sheet/:id", async c => {
   // TODO: mcp server
   return c.json(null, 500);
 });
-
-// Deno.serve(app.fetch).finished.then(async () => {
-//   await sql.end();
-//   for (const room of Object.values(rooms)) await room.destroy();
-// });
 
 export default app;
