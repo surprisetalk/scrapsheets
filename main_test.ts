@@ -145,7 +145,6 @@ Deno.test(async function allTests(t) {
   });
 
   await t.step(async function runPortal(t) {
-    let sheet_id = "";
     await t.step(async function sellSheet(t) {
       const [{ usr_id }] =
         await sql`insert into usr (email) values ('bob@example.com') returning *`;
@@ -160,18 +159,21 @@ Deno.test(async function allTests(t) {
       };
       const { data: sheet_id_ } = await post(jwt, `library`, sheet_);
       assert(sheet_id_);
-      const { data } = await post(jwt, `/shop/sheet`, sheet_id_);
-      sheet_id = data;
-      assert(sheet_id);
+      const { data } = await post(jwt, `/shop/sheet/sell/${sheet_id_}`, {});
+      assert(data);
     });
+    const shop = await get<LibraryItem[]>(jwt, `/shop/sheet`);
+    assert(shop);
+    assert(shop.length);
+    const sheet_id = shop?.[0]?.sheet_id;
     assert(sheet_id);
     const [type, doc_id] = sheet_id.split(":");
     assert(doc_id);
-    assertEquals(type, "query");
+    assertEquals(type, "portal");
     assert(!AM.isValidDocumentId(doc_id));
-    await reject(jwt, `/portal/${sheet_id}`);
-    await post(jwt, `/shop/sheet/${sheet_id}`, {});
-    const sheet = await get<Sheet>(jwt, `/portal/${sheet_id}`);
+    await reject(jwt, `/portal/${doc_id}`);
+    await post(jwt, `/shop/sheet/buy/${sheet_id}`, {});
+    const sheet = await get<Sheet>(jwt, `/portal/${doc_id}`);
     assertEquals(sheet.type, "page");
     assertEquals(sheet.type === "page" && sheet.doc.cols?.[0]?.type, "int");
     assertEquals(sheet.type === "page" && sheet.doc.cols?.[0]?.name, "a");
@@ -209,7 +211,7 @@ Deno.test(async function allTests(t) {
   });
 
   await t.step(async function purchaseTool(t) {
-    // TODO: /shop/tool/:id
+    // TODO: /shop/tool
   });
 
   await t.step(async function viewLedger(t) {

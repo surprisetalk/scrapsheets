@@ -31,6 +31,7 @@ export interface LibraryItem {
 
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
 const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
+const PORTAL_SECRET = Deno.env.get("PORTAL_SECRET") ?? Math.random().toString();
 
 export const createJwt = async (usr_id: string) =>
   await sign(
@@ -202,9 +203,10 @@ app.post("/login", async c => {
   );
 });
 
+// TODO: This is totally not correct.
 app.get("/shop/sheet", async c => {
-  // TODO:
-  return c.json(null, 500);
+  const data = await sql`select * from sheet s where type = 'portal' limit 25`;
+  return c.json({ data }, 200);
 });
 
 app.get("/shop/tool", async c => {
@@ -219,12 +221,31 @@ app.use("*", async (c, next) => {
   await next();
 });
 
-app.post("/shop/sheet/:id", async c => {
-  // TODO: Share sheet as a portal.
+app.post("/shop/sheet/buy/:id", async c => {
+  const sheet_id = c.req.param("id");
+  if (!sheet_id.startsWith("portal:"))
+    throw new HTTPException(400, { message: "Cannot purchase this sheet." });
+  await sql`insert into sheet_usr ${sql({ sheet_id, usr_id: c.get("usr_id") })}`;
+  return c.json(null, 201);
+});
+
+app.post("/shop/tool/buy/:id", async c => {
+  // TODO:
   return c.json(null, 500);
 });
 
-app.post("/shop/tool/:id", async c => {
+app.post("/shop/sheet/sell/:id", async c => {
+  const [type, doc_id] = c.req.param("id").split(":");
+  if (type === "portal")
+    throw new HTTPException(400, { message: "Cannot sell this sheet." });
+  const [{ sheet_id }] = await sql`
+    with s as (insert into sheet ${sql({ doc_id: sql`md5(${doc_id})` as unknown as string, type: "portal", created_by: c.get("usr_id") })} returning *)
+    insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s returning sheet_id
+  `;
+  return c.json({ data: sheet_id }, 201);
+});
+
+app.post("/shop/tool/sell/:id", async c => {
   // TODO:
   return c.json(null, 500);
 });
@@ -298,8 +319,30 @@ app.get("/agent/:id", async c => {
 });
 
 app.get("/portal/:id", async c => {
-  // TODO:
-  return c.json(null, 500);
+  const portal_id = c.req.param("id");
+  const [sheet] = await sql`
+    select type, doc_id, exists(select true from sheet_usr su where (su.sheet_id,su.usr_id) = ('portal:'||portal_id,${c.get("usr_id")})) as is_purchased
+    from sheet s
+    where portal_id = ${portal_id}
+  `;
+  if (!sheet) throw new HTTPException(404, { message: "Not found." });
+  if (!sheet.is_purchased)
+    throw new HTTPException(402, { message: "Not purchased." });
+  const hand = await automerge.find(sheet.doc_id);
+  switch (sheet.type) {
+    case "page": {
+      return c.json({ data: { type: "page", doc: hand.doc() } }, 200);
+    }
+    case "query": {
+      // TODO: Run query and return results as page.
+      return c.json(
+        { data: { type: "page", doc: { cols: [], rows: [] } } },
+        200,
+      );
+    }
+    default:
+      throw new HTTPException(500, { message: "Unknown sheet type." });
+  }
 });
 
 app.post("/portal/connect/:type", async c => {

@@ -13,6 +13,7 @@ create table sheet
 , created_by bigint not null references usr(usr_id)
 , type text not null check (type in ('template','page','portal','agent','query'))
 , doc_id text not null unique
+, portal_id text not null unique generated always as (md5(doc_id)) stored
 , name text
 , tags text[]
 , created_at timestamp default now()
