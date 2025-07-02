@@ -12,14 +12,19 @@ import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-webso
 
 export type Col = { name: string; type: "string" | "int" };
 export type Row = Record<string, any>;
+export type Template = { template: Sheet };
+export type Page = { cols: Col[]; rows: Row[] };
+export type Query = { db: string | null; lang: "prql" | "sql"; code: string };
 export type Sheet =
-  | { type: "template"; template: Sheet }
-  | { type: "page"; cols: Col[]; rows: Row[] }
-  | { type: "portal" }
-  | { type: "agent"; agent: unknown }
-  | { type: "query"; db: string | null; lang: "prql" | "sql"; code: string };
+  | { type: "template"; doc: Template }
+  | { type: "page"; doc: Page }
+  | { type: "portal"; doc: undefined }
+  | { type: "agent"; doc: unknown }
+  | { type: "query"; doc: Query };
 export interface LibraryItem {
   sheet_id: string;
+  type: Sheet["type"];
+  doc_id: string;
   name: string;
   tags: string[];
 }
@@ -259,13 +264,13 @@ app.get("/library", async c => {
 });
 
 app.post("/library", async c => {
-  const sheet = await c.req.json();
+  const { type, doc } = await c.req.json();
   // TODO: Validate to ensure it matches Sheet.
-  if (!["template", "page", "portal", "agent", "query"].includes(sheet?.type))
+  if (!["template", "page", "agent", "query"].includes(type))
     return c.json({ error: "Invalid initial sheet." }, 400);
-  const hand = automerge.create(sheet);
+  const hand = automerge.create(doc);
   const [{ sheet_id }] = await sql`
-    with s as (insert into sheet ${sql({ sheet_id: hand.documentId, created_by: c.get("usr_id") })} returning *)
+    with s as (insert into sheet ${sql({ doc_id: hand.documentId, type, created_by: c.get("usr_id") })} returning *)
     insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s returning sheet_id
   `;
   return c.json({ data: sheet_id }, 201);

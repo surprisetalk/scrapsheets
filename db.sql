@@ -9,8 +9,10 @@ create table usr
 );
 
 create table sheet
-( sheet_id text not null primary key
+( sheet_id text primary key generated always as (type||':'||doc_id) stored
 , created_by bigint not null references usr(usr_id)
+, type text not null check (type in ('template','page','portal','agent','query'))
+, doc_id text not null unique
 , name text
 , tags text[]
 , created_at timestamp default now()
