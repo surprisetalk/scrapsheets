@@ -329,8 +329,9 @@ app.get("/portal/:id", async c => {
     throw new HTTPException(402, { message: "Not purchased." });
   const hand = await automerge.find(sheet.doc_id);
   switch (sheet.type) {
+    case "template":
     case "page": {
-      return c.json({ data: { type: "page", doc: hand.doc() } }, 200);
+      return c.json({ data: { type: sheet.type, doc: hand.doc() } }, 200);
     }
     case "query": {
       // TODO: Run query and return results as page.
@@ -339,6 +340,12 @@ app.get("/portal/:id", async c => {
         200,
       );
     }
+    case "agent": {
+      // TODO:
+      return c.json(null, 500);
+    }
+    case "portal":
+      throw new HTTPException(500, { message: "Bad sheet recursion." });
     default:
       throw new HTTPException(500, { message: "Unknown sheet type." });
   }

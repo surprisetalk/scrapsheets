@@ -144,6 +144,7 @@ Deno.test(async function allTests(t) {
     }
   });
 
+  // TODO: Purchase and fetch one of every type.
   await t.step(async function runPortal(t) {
     await t.step(async function sellSheet(t) {
       const [{ usr_id }] =
