@@ -1,4 +1,4 @@
-import { assert, assertEquals } from "jsr:@std/assert";
+import { assert, assertEquals, assertObjectMatch } from "jsr:@std/assert";
 import { PGlite } from "npm:@electric-sql/pglite";
 import { PostgresConnection } from "npm:pg-gateway";
 import { citext } from "npm:@electric-sql/pglite/contrib/citext";
@@ -210,8 +210,7 @@ Deno.test(async function allTests(t) {
     // TODO: /agent/:id/webhook
   });
 
-  // TODO: Add more complexity, like referencing other tables or actually querying a DB.
-  await t.step(async function runQuery(t) {
+  await t.step(async function saveQuery(t) {
     const sheet_: Sheet = {
       type: "query",
       doc: {
@@ -232,6 +231,21 @@ Deno.test(async function allTests(t) {
     assertEquals(data.type === "page" && data.doc.cols?.[0]?.type, "int");
     assertEquals(data.type === "page" && data.doc.cols?.[0]?.name, "a");
     assertEquals(data.type === "page" && data.doc.rows?.[0]?.a, 1);
+  });
+
+  // TODO: Add more complexity, like referencing other tables or actually querying a DB.
+  await t.step(async function runQuery(t) {
+    const queries: { query: Query; page: Page }[] = [
+      {
+        query: { db: null, lang: "sql", code: "select 1 as a" },
+        page: { cols: [{ name: "a", type: "int" }], rows: [{ a: 1 }] },
+      },
+    ];
+    for (const { query, page } of queries)
+      await t.step(async function execQuery(t) {
+        const { data } = await post(jwt, `/query`, query);
+        assertObjectMatch(page, data);
+      });
   });
 
   await t.step(async function purchaseTool(t) {
