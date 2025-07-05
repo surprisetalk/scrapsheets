@@ -67,11 +67,11 @@ async function get1<T>(
     );
 }
 
-const post = (jwt: string, route: string, body: object) =>
+const post = (jwt: string, route: string, body: unknown) =>
   request(jwt, route, { method: "POST", body: JSON.stringify(body) });
-const patch = (jwt: string, route: string, body: object) =>
+const patch = (jwt: string, route: string, body: unknown) =>
   request(jwt, route, { method: "PATCH", body: JSON.stringify(body) });
-const del = (jwt: string, route: string, body: object) =>
+const del = (jwt: string, route: string, body: unknown) =>
   request(jwt, route, { method: "DELETE", body: JSON.stringify(body) });
 
 Deno.test(async function allTests(t) {
@@ -166,7 +166,7 @@ Deno.test(async function allTests(t) {
       // TODO: {
       // TODO:   type: "query",
       // TODO:   doc: {
-      // TODO:     db: null,
+      // TODO:     db_id: null,
       // TODO:     lang: "sql",
       // TODO:     code: "select 1 as a",
       // TODO:   },
@@ -204,17 +204,34 @@ Deno.test(async function allTests(t) {
     }
   });
 
+  // TODO: /agent/:id  -- crawler? timer?
+  // TODO: /agent/:id/webform
   await t.step(async function runAgent(t) {
-    // TODO: /agent/:id  -- crawler? timer?
-    // TODO: /agent/:id/webform
-    // TODO: /agent/:id/webhook
+    const sheet_: Sheet = {
+      type: "agent",
+      doc: {
+        type: "webhook",
+      },
+    };
+    const { data: sheet_id } = await post(jwt, `/library`, sheet_);
+    assert(sheet_id);
+    const [type, doc_id] = sheet_id.split(":");
+    assert(doc_id);
+    assertEquals(type, sheet_.type);
+    await post("", `/agent/${sheet_id}/webhook`, "hello world");
+    const sheet = await get<Sheet>(jwt, `/agent/${sheet_id}`);
+    assertEquals(sheet.type, "page");
+    assertEquals(
+      sheet.type === "page" && sheet.doc.rows?.[0]?.body,
+      "hello world",
+    );
   });
 
   await t.step(async function saveQuery(t) {
     const sheet_: Sheet = {
       type: "query",
       doc: {
-        db: null,
+        db_id: null,
         lang: "sql",
         code: "select 1 as a",
       },
@@ -233,11 +250,38 @@ Deno.test(async function allTests(t) {
     assertEquals(data.type === "page" && data.doc.rows?.[0]?.a, 1);
   });
 
-  // TODO: Add more complexity, like referencing other tables or actually querying a DB.
   await t.step(async function runQuery(t) {
+    const { data: sheet_id } = await post(jwt, `/library`, {
+      type: "page",
+      doc: {
+        cols: [{ name: "a", type: "int" }],
+        rows: [{ a: 1 }],
+      },
+    });
+    const { data: db_id } = await post(
+      jwt,
+      `/db`,
+      "postgresql://127.0.0.1:5434/postgres",
+    );
     const queries: { query: Query; page: Page }[] = [
       {
-        query: { db: null, lang: "sql", code: "select 1 as a" },
+        query: { db_id: null, lang: "sql", code: "select 1 as a" },
+        page: { cols: [{ name: "a", type: "int" }], rows: [{ a: 1 }] },
+      },
+      {
+        query: {
+          db_id: null,
+          lang: "sql",
+          code: `select a from sheet('${sheet_id}')`,
+        },
+        page: { cols: [{ name: "a", type: "int" }], rows: [{ a: 1 }] },
+      },
+      {
+        query: {
+          db_id: db_id,
+          lang: "sql",
+          code: `select a from sheet('${sheet_id}')`,
+        },
         page: { cols: [{ name: "a", type: "int" }], rows: [{ a: 1 }] },
       },
     ];

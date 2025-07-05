@@ -13,7 +13,11 @@ import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-webso
 export type Col = { name: string; type: "string" | "int" };
 export type Row = Record<string, any>;
 export type Page = { cols: Col[]; rows: Row[] };
-export type Query = { db: string | null; lang: "prql" | "sql"; code: string };
+export type Query = {
+  db_id: string | null;
+  lang: "prql" | "sql";
+  code: string;
+};
 export type Sheet =
   | { type: "template"; doc: Sheet }
   | { type: "page"; doc: Page }
