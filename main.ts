@@ -211,11 +211,6 @@ app.get("/shop/sheet", async c => {
   return c.json({ data }, 200);
 });
 
-app.get("/shop/tool", async c => {
-  // TODO:
-  return c.json(null, 500);
-});
-
 app.use("*", jwt({ secret: JWT_SECRET }));
 
 app.use("*", async (c, next) => {
@@ -231,11 +226,6 @@ app.post("/shop/sheet/buy/:id", async c => {
   return c.json(null, 201);
 });
 
-app.post("/shop/tool/buy/:id", async c => {
-  // TODO:
-  return c.json(null, 500);
-});
-
 app.post("/shop/sheet/sell/:id", async c => {
   const [type, doc_id] = c.req.param("id").split(":");
   if (type === "portal")
@@ -247,22 +237,7 @@ app.post("/shop/sheet/sell/:id", async c => {
   return c.json({ data: sheet_id }, 201);
 });
 
-app.post("/shop/tool/sell/:id", async c => {
-  // TODO:
-  return c.json(null, 500);
-});
-
-app.get("/ledger", async c => {
-  // TODO:
-  return c.json(null, 500);
-});
-
-app.get("/db", async c => {
-  // TODO:
-  return c.json(null, 500);
-});
-
-app.put("/db/:id", async c => {
+app.post("/db", async c => {
   // TODO:
   return c.json(null, 500);
 });

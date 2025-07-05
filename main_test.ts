@@ -123,10 +123,6 @@ Deno.test(async function allTests(t) {
     // TODO: /shop/sheet
   });
 
-  await t.step(async function viewShopTools(t) {
-    // TODO: /shop/tool
-  });
-
   const { jwt } = await createTestUser("alice@example.com");
 
   await t.step(async function createSheet(t) {
@@ -305,14 +301,6 @@ Deno.test(async function allTests(t) {
         const { data } = await post(jwt, `/query`, query);
         assertObjectMatch(data, page);
       });
-  });
-
-  await t.step(async function purchaseTool(t) {
-    // TODO: /shop/tool
-  });
-
-  await t.step(async function viewLedger(t) {
-    // TODO: /ledger
   });
 
   await sql.end();
