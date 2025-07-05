@@ -285,11 +285,17 @@ app.patch("/library/:id", async c => {
   return c.json(null, 200);
 });
 
+// TODO: https://github.com/AlaSQL/alasql
+// TODO: https://github.com/alasql/alasql/wiki/Google-Spreadsheets
+// TODO: https://github.com/jsoma/tabletop
 app.post("/query", async c => {
   // TODO:
   return c.json(null, 500);
 });
 
+// TODO: crawler
+// TODO: webform
+// TODO: webhook
 app.get("/agent/:id", async c => {
   // TODO:
   return c.json(null, 500);
