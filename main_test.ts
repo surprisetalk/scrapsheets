@@ -74,9 +74,12 @@ const patch = (jwt: string, route: string, body: unknown) =>
 const del = (jwt: string, route: string, body: unknown) =>
   request(jwt, route, { method: "DELETE", body: JSON.stringify(body) });
 
-Deno.test(async function allTests(t) {
+// Test setup helpers
+const setupTestDb = async () => {
   const listener = Deno.listen({ port: 5434 });
   const pglite = new PGlite({ extensions: { citext } });
+
+  // Start postgres connection handler
   (async () => {
     for await (const conn of listener)
       new PostgresConnection(conn, {
@@ -89,8 +92,32 @@ Deno.test(async function allTests(t) {
         },
       });
   })();
+
   await pglite.waitReady;
   await pglite.exec(await Deno.readTextFile("./db.sql"));
+
+  return { listener, pglite };
+};
+
+const createTestUser = async (email: string) => {
+  const [{ usr_id }] = await sql`
+    insert into usr (email) values (${email}) 
+    on conflict (email) do update set email = excluded.email 
+    returning *
+  `;
+  return { usr_id, jwt: await createJwt(usr_id) };
+};
+
+const createTestSheet = async (jwt: string, sheet: Sheet) => {
+  const { data: sheet_id } = await post(jwt, `/library`, sheet);
+  assert(sheet_id);
+  const [type, doc_id] = sheet_id.split(":");
+  assert(doc_id);
+  return { sheet_id, type, doc_id };
+};
+
+Deno.test(async function allTests(t) {
+  const { listener, pglite } = await setupTestDb();
 
   await t.step(async function viewShopSheets(t) {
     // TODO: /shop/sheet
@@ -100,9 +127,7 @@ Deno.test(async function allTests(t) {
     // TODO: /shop/tool
   });
 
-  const [{ usr_id }] =
-    await sql`insert into usr (email) values ('alice@example.com') returning *`;
-  const jwt = await createJwt(usr_id);
+  const { jwt } = await createTestUser("alice@example.com");
 
   await t.step(async function createSheet(t) {
     await post(jwt, `/library`, emptyPage);
@@ -125,10 +150,7 @@ Deno.test(async function allTests(t) {
   });
 
   await t.step(async function editPage(t) {
-    const { data: sheet_id } = await post(jwt, `/library`, emptyPage);
-    assert(sheet_id);
-    const [type, doc_id] = sheet_id.split(":");
-    assert(doc_id);
+    const { sheet_id, type, doc_id } = await createTestSheet(jwt, emptyPage);
     assertEquals(type, emptyPage.type);
     const row: Row = { a: 1 };
     {
@@ -179,9 +201,7 @@ Deno.test(async function allTests(t) {
     for (const sheet_ of sheets) {
       let sheet_id = "";
       await t.step(async function sellSheet(t) {
-        const [{ usr_id }] =
-          await sql`insert into usr (email) values ('bob@example.com') on conflict (email) do update set email = excluded.email returning *`;
-        const jwt = await createJwt(usr_id);
+        const { jwt } = await createTestUser("bob@example.com");
         const { data: sheet_id_ } = await post(jwt, `library`, sheet_);
         assert(sheet_id_);
         const { data } = await post(jwt, `/shop/sheet/sell/${sheet_id_}`, {});
@@ -197,10 +217,13 @@ Deno.test(async function allTests(t) {
       await post(jwt, `/shop/sheet/buy/${sheet_id}`, {});
       let sheet: Sheet = await get<Sheet>(jwt, `/portal/${doc_id}`);
       if (sheet.type === "template") sheet = sheet.doc;
-      assertEquals(sheet.type, "page");
-      assertEquals(sheet.type === "page" && sheet.doc.cols?.[0]?.type, "int");
-      assertEquals(sheet.type === "page" && sheet.doc.cols?.[0]?.name, "a");
-      assertEquals(sheet.type === "page" && sheet.doc.rows?.[0]?.a, 1);
+      assertObjectMatch(sheet, {
+        type: "page",
+        doc: {
+          cols: [{ type: "int", name: "a" }],
+          rows: [{ a: 1 }],
+        },
+      });
     }
   });
 
@@ -213,18 +236,13 @@ Deno.test(async function allTests(t) {
         type: "webhook",
       },
     };
-    const { data: sheet_id } = await post(jwt, `/library`, sheet_);
-    assert(sheet_id);
-    const [type, doc_id] = sheet_id.split(":");
-    assert(doc_id);
+    const { sheet_id, type, doc_id } = await createTestSheet(jwt, sheet_);
     assertEquals(type, sheet_.type);
     await post("", `/agent/${sheet_id}/webhook`, "hello world");
     const sheet = await get<Sheet>(jwt, `/agent/${sheet_id}`);
-    assertEquals(sheet.type, "page");
-    assertEquals(
-      sheet.type === "page" && sheet.doc.rows?.[0]?.body,
-      "hello world",
-    );
+    assertObjectMatch(sheet, {
+      rows: [{ body: "hello world" }],
+    });
   });
 
   await t.step(async function saveQuery(t) {
@@ -236,18 +254,15 @@ Deno.test(async function allTests(t) {
         code: "select 1 as a",
       },
     };
-    const { data: sheet_id } = await post(jwt, `/library`, sheet_);
-    assert(sheet_id);
-    const [type, doc_id] = sheet_id.split(":");
-    assert(doc_id);
+    const { sheet_id, type, doc_id } = await createTestSheet(jwt, sheet_);
     assertEquals(type, sheet_.type);
     const hand = await automerge.find<Query>(doc_id);
     const sheet = hand.doc();
     const { data }: { data: Sheet } = await post(jwt, `/query`, sheet);
-    assertEquals(data.type, "page");
-    assertEquals(data.type === "page" && data.doc.cols?.[0]?.type, "int");
-    assertEquals(data.type === "page" && data.doc.cols?.[0]?.name, "a");
-    assertEquals(data.type === "page" && data.doc.rows?.[0]?.a, 1);
+    assertObjectMatch(data, {
+      cols: [{ type: "int", name: "a" }],
+      rows: [{ a: 1 }],
+    });
   });
 
   await t.step(async function runQuery(t) {
@@ -288,7 +303,7 @@ Deno.test(async function allTests(t) {
     for (const { query, page } of queries)
       await t.step(async function execQuery(t) {
         const { data } = await post(jwt, `/query`, query);
-        assertObjectMatch(page, data);
+        assertObjectMatch(data, page);
       });
   });
 
