@@ -26,18 +26,12 @@ export type Query = {
   lang: "prql" | "sql";
   code: string;
 };
-export type Trigger = {
-  sheet_id: string;
-  lang: "prql" | "sql" | "ts";
-  code: string;
-};
 export type Sheet =
   | { type: "template"; doc: Sheet }
   | { type: "page"; doc: Page }
   | { type: "portal"; doc: undefined }
   | { type: "net"; doc: undefined }
-  | { type: "query"; doc: Query }
-  | { type: "trigger"; doc: Trigger };
+  | { type: "query"; doc: Query };
 export interface LibraryItem {
   sheet_id: string;
   type: Sheet["type"];
