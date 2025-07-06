@@ -8,13 +8,16 @@ import sg from "npm:@sendgrid/mail";
 import pg from "https://deno.land/x/postgresjs@v3.4.5/mod.js";
 import { upgradeWebSocket } from "jsr:@hono/hono/deno";
 import { Repo } from "npm:@automerge/automerge-repo";
-import type { AnyDocumentId } from "npm:@automerge/automerge-repo";
+import type { AnyDocumentId, DocHandle } from "npm:@automerge/automerge-repo";
 import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-websocket";
 import ala from "npm:alasql";
 
-ala.options.modifier = "RECORDSET";
-type Recordset = { columns: Col[]; data: Row[] };
+const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
+const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
 
+ala.options.modifier = "RECORDSET";
+
+export type Recordset = { columns: Col[]; data: Row[] };
 export type Col = { columnid: string; type?: "string" | "int" }; // { name: string; type: "string" | "int" };
 export type Row = Record<string, any>;
 export type Page = { cols: Col[]; rows: Row[] };
@@ -38,8 +41,20 @@ export interface LibraryItem {
   tags: string[];
 }
 
-const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
-const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
+const pagify = async (sheet_id: string): Promise<Page> => {
+  const [type, doc_id] = sheet_id.split(":");
+  const hand = await automerge.find(doc_id as AnyDocumentId);
+  switch (type) {
+    case "template":
+    case "page": {
+      return hand.doc() as Page;
+    }
+    case "portal":
+      throw new HTTPException(500, { message: "Bad sheet recursion." });
+    default:
+      throw new HTTPException(500, { message: "Unknown sheet type." });
+  }
+};
 
 export const createJwt = async (usr_id: string) =>
   await sign(
@@ -306,19 +321,8 @@ app.post("/query", async c => {
       ref => (sheet_ids.push(ref.slice(1)), "?"),
     );
     const pages: Record<string, Page> = {};
-    for (const sheet_id of sheet_ids) {
-      if (pages[sheet_id]) return;
-      const [type, doc_id] = sheet_id.split(":");
-      const hand = await automerge.find(doc_id as AnyDocumentId);
-      switch (type) {
-        case "page": {
-          pages[sheet_id] = hand.doc() as Page;
-          break;
-        }
-        default:
-          throw new Error("TODO");
-      }
-    }
+    for (const sheet_id of sheet_ids)
+      pages[sheet_id] = pages[sheet_id] ?? (await pagify(sheet_id));
     const { columns: cols, data: rows }: Recordset = await ala(
       code_,
       sheet_ids.map(id => pages[id].rows),
@@ -360,7 +364,7 @@ app.get("/agent/:id", async c => {
 
 app.get("/portal/:id", async c => {
   const [sheet] = await sql`
-    select s_.type, s_.doc_id, su.sheet_id is not null as is_purchased
+    select s_.sheet_id, s_.type, s_.doc_id, su.sheet_id is not null as is_purchased
     from sheet s
     inner join sheet s_ on s_.sheet_id = s.data->>'sheet_id'
     left join sheet_usr su on (su.sheet_id,su.usr_id) = (s.sheet_id,${c.get("usr_id")})
@@ -371,25 +375,15 @@ app.get("/portal/:id", async c => {
     throw new HTTPException(402, { message: "Not purchased." });
   const hand = await automerge.find(sheet.doc_id);
   switch (sheet.type) {
-    case "template":
-    case "page": {
-      return c.json({ data: { type: sheet.type, doc: hand.doc() } }, 200);
-    }
-    case "query": {
-      // TODO: Run query and return results as page.
-      return c.json(
-        { data: { type: "page", doc: { cols: [], rows: [] } } },
-        200,
-      );
-    }
-    case "agent": {
-      // TODO:
-      return c.json(null, 500);
-    }
     case "portal":
       throw new HTTPException(500, { message: "Bad sheet recursion." });
+    case "template":
+      return c.json({ data: { type: sheet.type, doc: hand.doc() } }, 200);
     default:
-      throw new HTTPException(500, { message: "Unknown sheet type." });
+      return c.json(
+        { data: { type: "page", doc: await pagify(sheet.sheet_id) } },
+        200,
+      );
   }
 });
 
