@@ -8,6 +8,7 @@ import sg from "npm:@sendgrid/mail";
 import pg from "https://deno.land/x/postgresjs@v3.4.5/mod.js";
 import { upgradeWebSocket } from "jsr:@hono/hono/deno";
 import { Repo } from "npm:@automerge/automerge-repo";
+import type { AnyDocumentId } from "npm:@automerge/automerge-repo";
 import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-websocket";
 import ala from "npm:alasql";
 
@@ -286,14 +287,26 @@ app.patch("/library/:id", async c => {
   return c.json(null, 200);
 });
 
-// TODO: https://github.com/AlaSQL/alasql
 app.post("/query", async c => {
   const { db_id, lang, code }: Query = await c.req.json();
   if (lang === "sql" && !db_id) {
-    const tables = [];
-    // TODO: For each match like @table, replace with "?" and push automerge doc rows to tables.
-    const rows = ala(code, tables);
-    const cols = []; // TODO
+    const sheet_ids: string[] = [];
+    const code_ = code.replace(
+      /@[^ ]+/g,
+      ref => (sheet_ids.push(ref.slice(1)), "?"),
+    );
+    const docs: Record<string, Sheet["doc"]> = {};
+    for (const sheet_id of sheet_ids) {
+      if (docs[sheet_id]) return;
+      const [type, doc_id] = sheet_id;
+      const hand = await automerge.find(doc_id as AnyDocumentId);
+      docs[sheet_id] = hand.doc();
+    }
+    const rows = await ala(
+      code_,
+      sheet_ids.map(id => docs[id]),
+    );
+    const cols: Col[] = []; // TODO:: Infer column types?
     return c.json({ type: "page", doc: { cols, rows } }, 200);
   }
   return c.json(null, 500);
@@ -321,7 +334,7 @@ app.get("/portal/:id", async c => {
   const [sheet] = await sql`
     select s_.type, s_.doc_id, su.sheet_id is not null as is_purchased
     from sheet s
-    inner join sheet s_ on s_.sheet_id = s.data->'sheet_id'
+    inner join sheet s_ on s_.sheet_id = s.data->>'sheet_id'
     left join sheet_usr su on (su.sheet_id,su.usr_id) = (s.sheet_id,${c.get("usr_id")})
     where s.sheet_id = ${portal_id}
   `;

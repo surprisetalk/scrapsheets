@@ -14,6 +14,7 @@
     "npm:@sendgrid/mail@*": "8.1.5",
     "npm:@sendgrid/mail@^8.1.5": "8.1.5",
     "npm:@types/node@*": "22.10.2",
+    "npm:alasql@*": "4.6.6",
     "npm:alasql@^4.6.6": "4.6.6",
     "npm:elm-format@~0.8.8": "0.8.8",
     "npm:elm-review@^2.13.2": "2.13.2",

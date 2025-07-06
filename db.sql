@@ -16,7 +16,7 @@ create table sheet
 , doc_id text not null unique
 , name text
 , tags text[]
-, data jsonb not null
+, data jsonb check (data <> '{}'::jsonb)
 , price numeric
 );
 
