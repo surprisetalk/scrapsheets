@@ -205,9 +205,8 @@ app.post("/login", async c => {
   );
 });
 
-// TODO: This is totally not correct.
 app.get("/shop/sheet", async c => {
-  const data = await sql`select * from sheet s where type = 'portal' limit 25`;
+  const data = await sql`select * from sheet s where price >= 0 limit 25`;
   return c.json({ data }, 200);
 });
 
@@ -285,6 +284,7 @@ app.patch("/library/:id", async c => {
   return c.json(null, 200);
 });
 
+// TODO: refer to other sheets with @sheet
 // TODO: https://github.com/AlaSQL/alasql
 // TODO: https://github.com/alasql/alasql/wiki/Google-Spreadsheets
 // TODO: https://github.com/jsoma/tabletop
@@ -293,9 +293,18 @@ app.post("/query", async c => {
   return c.json(null, 500);
 });
 
-// TODO: crawler
+app.get("/journal/:id", async c => {
+  // TODO:
+  return c.json(null, 500);
+});
+
 // TODO: webform
 // TODO: webhook
+app.post("/journal/:id", async c => {
+  // TODO:
+  return c.json(null, 500);
+});
+
 app.get("/agent/:id", async c => {
   // TODO:
   return c.json(null, 500);
@@ -304,9 +313,11 @@ app.get("/agent/:id", async c => {
 app.get("/portal/:id", async c => {
   const portal_id = c.req.param("id");
   const [sheet] = await sql`
-    select type, doc_id, exists(select true from sheet_usr su where (su.sheet_id,su.usr_id) = ('portal:'||portal_id,${c.get("usr_id")})) as is_purchased
+    select s_.type, s_.doc_id, su.sheet_id is not null as is_purchased
     from sheet s
-    where portal_id = ${portal_id}
+    inner join sheet s_ on s_.sheet_id = s.data->'sheet_id'
+    left join sheet_usr su on (su.sheet_id,su.usr_id) = (s.sheet_id,${c.get("usr_id")})
+    where s.sheet_id = ${portal_id}
   `;
   if (!sheet) throw new HTTPException(404, { message: "Not found." });
   if (!sheet.is_purchased)
