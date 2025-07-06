@@ -223,22 +223,21 @@ Deno.test(async function allTests(t) {
     }
   });
 
-  // TODO: /agent/:id  -- crawler? timer?
-  // TODO: /agent/:id/webform
-  await t.step(async function runAgent(t) {
-    const sheet_: Sheet = {
-      type: "agent",
-      doc: {
-        type: "webhook",
-      },
-    };
-    const { sheet_id, type, doc_id } = await createTestSheet(jwt, sheet_);
+  await t.step(async function runJournal(t) {
+    const sheet_: Sheet = { type: "journal", doc: undefined };
+    const { type, doc_id } = await createTestSheet(jwt, sheet_);
     assertEquals(type, sheet_.type);
-    await post("", `/agent/${sheet_id}/webhook`, "hello world");
-    const sheet = await get<Sheet>(jwt, `/agent/${sheet_id}`);
-    assertObjectMatch(sheet, {
-      rows: [{ body: "hello world" }],
-    });
+    await post("", `/journal/${doc_id}`, { foo: "bar" });
+    const sheet = await get<Sheet>(jwt, `/journal/${doc_id}`);
+    assertEquals(sheet.type, "page");
+    assertEquals(
+      sheet.type === "page" && sheet.doc.rows?.[0]?.body,
+      '{"foo":"bar"}',
+    );
+  });
+
+  await t.step(async function runAgent(t) {
+    // TODO:
   });
 
   await t.step(async function saveQuery(t) {

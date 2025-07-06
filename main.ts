@@ -24,6 +24,7 @@ export type Sheet =
   | { type: "template"; doc: Sheet }
   | { type: "page"; doc: Page }
   | { type: "portal"; doc: undefined }
+  | { type: "journal"; doc: undefined }
   | { type: "agent"; doc: unknown }
   | { type: "query"; doc: Query };
 export interface LibraryItem {
@@ -212,6 +213,11 @@ app.get("/shop/sheet", async c => {
   return c.json({ data }, 200);
 });
 
+app.post("/journal/:id", async c => {
+  await sql`insert into journal ${sql({ sheet_id: `journal:${c.req.param("id")}`, body: await c.req.text() })}`;
+  return c.json(null, 200);
+});
+
 app.use("*", jwt({ secret: JWT_SECRET }));
 
 app.use("*", async (c, next) => {
@@ -228,11 +234,12 @@ app.post("/shop/sheet/buy/:id", async c => {
 });
 
 app.post("/shop/sheet/sell/:id", async c => {
-  const [type, doc_id] = c.req.param("id").split(":");
+  const sheet_id_ = c.req.param("id");
+  const [type, doc_id] = sheet_id_.split(":");
   if (type === "portal")
     throw new HTTPException(400, { message: "Cannot sell this sheet." });
   const [{ sheet_id }] = await sql`
-    with s as (insert into sheet ${sql({ doc_id: sql`md5(${doc_id})` as unknown as string, type: "portal", created_by: c.get("usr_id") })} returning *)
+    with s as (insert into sheet ${sql({ doc_id: sql`md5(${doc_id})` as unknown as string, type: "portal", created_by: c.get("usr_id"), data: { sheet_id: sheet_id_ } })} returning *)
     insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s returning sheet_id
   `;
   return c.json({ data: sheet_id }, 201);
@@ -266,7 +273,7 @@ app.get("/library", async c => {
 app.post("/library", async c => {
   const { type, doc } = await c.req.json();
   // TODO: Validate to ensure it matches Sheet.
-  if (!["template", "page", "agent", "query"].includes(type))
+  if (!["template", "page", "agent", "query", "journal"].includes(type))
     return c.json({ error: "Invalid initial sheet." }, 400);
   const hand = automerge.create(doc);
   const [{ sheet_id }] = await sql`
@@ -289,7 +296,7 @@ app.patch("/library/:id", async c => {
 
 app.post("/query", async c => {
   const { db_id, lang, code }: Query = await c.req.json();
-  if (lang === "sql" && !db_id) {
+  if (lang === "sql" && db_id === null) {
     const sheet_ids: string[] = [];
     const code_ = code.replace(
       /@[^ ]+/g,
@@ -306,22 +313,35 @@ app.post("/query", async c => {
       code_,
       sheet_ids.map(id => docs[id]),
     );
-    const cols: Col[] = []; // TODO:: Infer column types?
-    return c.json({ type: "page", doc: { cols, rows } }, 200);
+    const cols: Col[] = []; // TODO:: Infer column types from query?
+    return c.json({ data: { type: "page", doc: { cols, rows } } }, 200);
   }
   return c.json(null, 500);
 });
 
 app.get("/journal/:id", async c => {
-  // TODO:
-  return c.json(null, 500);
-});
-
-// TODO: webform
-// TODO: webhook
-app.post("/journal/:id", async c => {
-  // TODO:
-  return c.json(null, 500);
+  const rows = await sql`
+    select j.created_at, j.body
+    from sheet s
+    inner join journal j using (sheet_id)
+    inner join sheet_usr su on (su.sheet_id,su.usr_id) = (s.sheet_id,${c.get("usr_id")})
+    where s.sheet_id = 'journal:'||${c.req.param("id")}
+  `;
+  return c.json(
+    {
+      data: {
+        type: "page",
+        doc: {
+          cols: [
+            { name: "created_at", type: "string" },
+            { name: "body", type: "text" },
+          ],
+          rows,
+        },
+      },
+    },
+    200,
+  );
 });
 
 app.get("/agent/:id", async c => {
@@ -330,13 +350,12 @@ app.get("/agent/:id", async c => {
 });
 
 app.get("/portal/:id", async c => {
-  const portal_id = c.req.param("id");
   const [sheet] = await sql`
     select s_.type, s_.doc_id, su.sheet_id is not null as is_purchased
     from sheet s
     inner join sheet s_ on s_.sheet_id = s.data->>'sheet_id'
     left join sheet_usr su on (su.sheet_id,su.usr_id) = (s.sheet_id,${c.get("usr_id")})
-    where s.sheet_id = ${portal_id}
+    where s.sheet_id = 'portal:'||${c.req.param("id")}
   `;
   if (!sheet) throw new HTTPException(404, { message: "Not found." });
   if (!sheet.is_purchased)
