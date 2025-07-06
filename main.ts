@@ -9,6 +9,7 @@ import pg from "https://deno.land/x/postgresjs@v3.4.5/mod.js";
 import { upgradeWebSocket } from "jsr:@hono/hono/deno";
 import { Repo } from "npm:@automerge/automerge-repo";
 import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-websocket";
+import ala from "npm:alasql";
 
 export type Col = { name: string; type: "string" | "int" };
 export type Row = Record<string, any>;
@@ -237,7 +238,8 @@ app.post("/shop/sheet/sell/:id", async c => {
 });
 
 app.post("/db", async c => {
-  // TODO:
+  // TODO:: Insert into db table.
+  // TODO:: e.g. { name: "Staging", url: "postgresql://postgres:postgres@localhost:5432/postgres" }
   return c.json(null, 500);
 });
 
@@ -284,12 +286,16 @@ app.patch("/library/:id", async c => {
   return c.json(null, 200);
 });
 
-// TODO: refer to other sheets with @sheet
 // TODO: https://github.com/AlaSQL/alasql
-// TODO: https://github.com/alasql/alasql/wiki/Google-Spreadsheets
-// TODO: https://github.com/jsoma/tabletop
 app.post("/query", async c => {
-  // TODO:
+  const { db_id, lang, code }: Query = await c.req.json();
+  if (lang === "sql" && !db_id) {
+    const tables = [];
+    // TODO: For each match like @table, replace with "?" and push automerge doc rows to tables.
+    const rows = ala(code, tables);
+    const cols = []; // TODO
+    return c.json({ type: "page", doc: { cols, rows } }, 200);
+  }
   return c.json(null, 500);
 });
 
