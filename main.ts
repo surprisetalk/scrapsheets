@@ -26,12 +26,18 @@ export type Query = {
   lang: "prql" | "sql";
   code: string;
 };
+export type Trigger = {
+  sheet_id: string;
+  lang: "prql" | "sql" | "ts";
+  code: string;
+};
 export type Sheet =
   | { type: "template"; doc: Sheet }
   | { type: "page"; doc: Page }
   | { type: "portal"; doc: undefined }
-  | { type: "journal"; doc: undefined }
-  | { type: "query"; doc: Query };
+  | { type: "net"; doc: undefined }
+  | { type: "query"; doc: Query }
+  | { type: "trigger"; doc: Trigger };
 export interface LibraryItem {
   sheet_id: string;
   type: Sheet["type"];
@@ -71,6 +77,7 @@ const pagify = async (sheet_id: string): Promise<Page> => {
   const hand = await automerge.find(doc_id as AnyDocumentId);
   switch (type) {
     case "template":
+      throw new HTTPException(500, { message: "TODO" });
     case "page":
       return hand.doc() as Page;
     case "query":
@@ -257,8 +264,8 @@ app.get("/shop/sheet", async c => {
   return c.json({ data }, 200);
 });
 
-app.post("/journal/:id", async c => {
-  await sql`insert into journal ${sql({ sheet_id: `journal:${c.req.param("id")}`, body: await c.req.text() })}`;
+app.post("/net/:id", async c => {
+  await sql`insert into net ${sql({ sheet_id: `net:${c.req.param("id")}`, body: await c.req.text() })}`;
   return c.json(null, 200);
 });
 
@@ -317,7 +324,7 @@ app.get("/library", async c => {
 app.post("/library", async c => {
   const { type, doc } = await c.req.json();
   // TODO: Validate to ensure it matches Sheet.
-  if (!["template", "page", "agent", "query", "journal"].includes(type))
+  if (!["template", "page", "agent", "query", "net"].includes(type))
     return c.json({ error: "Invalid initial sheet." }, 400);
   const hand = automerge.create(doc);
   const [{ sheet_id }] = await sql`
@@ -345,13 +352,13 @@ app.post("/query", async c => {
   );
 });
 
-app.get("/journal/:id", async c => {
+app.get("/net/:id", async c => {
   const rows = await sql`
     select j.created_at, j.body
     from sheet s
-    inner join journal j using (sheet_id)
+    inner join net j using (sheet_id)
     inner join sheet_usr su on (su.sheet_id,su.usr_id) = (s.sheet_id,${c.get("usr_id")})
-    where s.sheet_id = 'journal:'||${c.req.param("id")}
+    where s.sheet_id = 'net:'||${c.req.param("id")}
   `;
   return c.json(
     {
@@ -370,11 +377,6 @@ app.get("/journal/:id", async c => {
   );
 });
 
-app.get("/agent/:id", async c => {
-  // TODO:
-  return c.json(null, 500);
-});
-
 app.get("/portal/:id", async c => {
   const [sheet] = await sql`
     select s_.sheet_id, s_.type, s_.doc_id, su.sheet_id is not null as is_allowed
@@ -386,12 +388,13 @@ app.get("/portal/:id", async c => {
   if (!sheet) throw new HTTPException(404, { message: "Not found." });
   if (!sheet.is_allowed)
     throw new HTTPException(403, { message: "Forbidden." });
-  const hand = await automerge.find(sheet.doc_id);
   switch (sheet.type) {
     case "portal":
       throw new HTTPException(500, { message: "Bad sheet recursion." });
-    case "template":
-      return c.json({ data: { type: sheet.type, doc: hand.doc() } }, 200);
+    case "template": {
+      const hand = await automerge.find(sheet.doc_id);
+      return c.json({ data: { type: "template", doc: hand.doc() } }, 200);
+    }
     default:
       return c.json(
         { data: { type: "page", doc: await pagify(sheet.sheet_id) } },

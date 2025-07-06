@@ -219,21 +219,17 @@ Deno.test(async function allTests(t) {
     }
   });
 
-  await t.step(async function runJournal(t) {
-    const sheet_: Sheet = { type: "journal", doc: undefined };
+  await t.step(async function runNet(t) {
+    const sheet_: Sheet = { type: "net", doc: undefined };
     const { type, doc_id } = await createTestSheet(jwt, sheet_);
     assertEquals(type, sheet_.type);
-    await post("", `/journal/${doc_id}`, { foo: "bar" });
-    const sheet = await get<Sheet>(jwt, `/journal/${doc_id}`);
+    await post("", `/net/${doc_id}`, { foo: "bar" });
+    const sheet = await get<Sheet>(jwt, `/net/${doc_id}`);
     assertEquals(sheet.type, "page");
     assertEquals(
       sheet.type === "page" && sheet.doc.rows?.[0]?.body,
       '{"foo":"bar"}',
     );
-  });
-
-  await t.step(async function runAgent(t) {
-    // TODO:
   });
 
   await t.step(async function saveQuery(t) {

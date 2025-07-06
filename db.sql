@@ -12,7 +12,7 @@ create table sheet
 ( sheet_id text primary key generated always as (type||':'||doc_id) stored
 , created_at timestamp default now()
 , created_by bigint not null references usr(usr_id)
-, type text not null check (type in ('template','page','portal','journal','agent','query'))
+, type text not null check (type in ('template','page','portal','net','query'))
 , doc_id text not null unique
 , name text
 , tags text[]
@@ -37,8 +37,8 @@ create table db
 );
 
 -- TODO: Add req/res data, headers, etc.
-create table journal
-( sheet_id text not null references sheet(sheet_id) check (sheet_id ilike 'journal:%')
+create table net
+( sheet_id text not null references sheet(sheet_id) check (sheet_id ilike 'net:%')
 , created_at timestamp default now()
 , body text not null
 );
