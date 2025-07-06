@@ -21,6 +21,7 @@ export type Recordset = { columns: Col[]; data: Row[] };
 export type Col = { columnid: string; type?: "string" | "int" }; // { name: string; type: "string" | "int" };
 export type Row = Record<string, any>;
 export type Page = { cols: Col[]; rows: Row[] };
+export type Net = null | { cron: string; url: string };
 export type Query = {
   db_id: string | null;
   lang: "prql" | "sql";
@@ -29,8 +30,8 @@ export type Query = {
 export type Sheet =
   | { type: "template"; doc: Sheet }
   | { type: "page"; doc: Page }
-  | { type: "portal"; doc: undefined }
-  | { type: "net"; doc: undefined }
+  | { type: "portal"; doc: null }
+  | { type: "net"; doc: Net }
   | { type: "query"; doc: Query };
 export interface LibraryItem {
   sheet_id: string;

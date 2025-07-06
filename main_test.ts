@@ -220,7 +220,7 @@ Deno.test(async function allTests(t) {
   });
 
   await t.step(async function runNet(t) {
-    const sheet_: Sheet = { type: "net", doc: undefined };
+    const sheet_: Sheet = { type: "net", doc: null };
     const { type, doc_id } = await createTestSheet(jwt, sheet_);
     assertEquals(type, sheet_.type);
     await post("", `/net/${doc_id}`, { foo: "bar" });
@@ -230,6 +230,10 @@ Deno.test(async function allTests(t) {
       sheet.type === "page" && sheet.doc.rows?.[0]?.body,
       '{"foo":"bar"}',
     );
+  });
+
+  await t.step(async function runNetCron(t) {
+    // TODO:
   });
 
   await t.step(async function saveQuery(t) {
