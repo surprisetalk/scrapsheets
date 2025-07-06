@@ -31,7 +31,6 @@ export type Sheet =
   | { type: "page"; doc: Page }
   | { type: "portal"; doc: undefined }
   | { type: "journal"; doc: undefined }
-  | { type: "agent"; doc: unknown }
   | { type: "query"; doc: Query };
 export interface LibraryItem {
   sheet_id: string;
@@ -41,14 +40,41 @@ export interface LibraryItem {
   tags: string[];
 }
 
+const querify = async ({ db_id, lang, code }: Query): Promise<Page> => {
+  if (lang === "sql" && db_id === null) {
+    const sheet_ids: string[] = [];
+    const code_ = code.replace(
+      /@[^ ]+/g,
+      ref => (sheet_ids.push(ref.slice(1)), "?"),
+    );
+    const pages: Record<string, Page> = {};
+    for (const sheet_id of sheet_ids)
+      pages[sheet_id] = pages[sheet_id] ?? (await pagify(sheet_id));
+    const { columns: cols, data: rows }: Recordset = await ala(
+      code_,
+      sheet_ids.map(id => pages[id].rows),
+    );
+    return { cols, rows };
+  } else if (lang === "sql") {
+    throw new Error("TODO");
+  } else if (lang === "prql" && db_id === null) {
+    throw new Error("TODO");
+  } else if (lang === "prql") {
+    throw new Error("TODO");
+  } else {
+    throw new Error("TODO");
+  }
+};
+
 const pagify = async (sheet_id: string): Promise<Page> => {
   const [type, doc_id] = sheet_id.split(":");
   const hand = await automerge.find(doc_id as AnyDocumentId);
   switch (type) {
     case "template":
-    case "page": {
+    case "page":
       return hand.doc() as Page;
-    }
+    case "query":
+      return await querify(hand.doc() as Query);
     case "portal":
       throw new HTTPException(500, { message: "Bad sheet recursion." });
     default:
@@ -313,23 +339,10 @@ app.patch("/library/:id", async c => {
 });
 
 app.post("/query", async c => {
-  const { db_id, lang, code }: Query = await c.req.json();
-  if (lang === "sql" && db_id === null) {
-    const sheet_ids: string[] = [];
-    const code_ = code.replace(
-      /@[^ ]+/g,
-      ref => (sheet_ids.push(ref.slice(1)), "?"),
-    );
-    const pages: Record<string, Page> = {};
-    for (const sheet_id of sheet_ids)
-      pages[sheet_id] = pages[sheet_id] ?? (await pagify(sheet_id));
-    const { columns: cols, data: rows }: Recordset = await ala(
-      code_,
-      sheet_ids.map(id => pages[id].rows),
-    );
-    return c.json({ data: { type: "page", doc: { cols, rows } } }, 200);
-  }
-  return c.json(null, 500);
+  return c.json(
+    { data: { type: "page", doc: await querify(await c.req.json()) } },
+    200,
+  );
 });
 
 app.get("/journal/:id", async c => {
@@ -364,15 +377,15 @@ app.get("/agent/:id", async c => {
 
 app.get("/portal/:id", async c => {
   const [sheet] = await sql`
-    select s_.sheet_id, s_.type, s_.doc_id, su.sheet_id is not null as is_purchased
+    select s_.sheet_id, s_.type, s_.doc_id, su.sheet_id is not null as is_allowed
     from sheet s
     inner join sheet s_ on s_.sheet_id = s.data->>'sheet_id'
     left join sheet_usr su on (su.sheet_id,su.usr_id) = (s.sheet_id,${c.get("usr_id")})
     where s.sheet_id = 'portal:'||${c.req.param("id")}
   `;
   if (!sheet) throw new HTTPException(404, { message: "Not found." });
-  if (!sheet.is_purchased)
-    throw new HTTPException(402, { message: "Not purchased." });
+  if (!sheet.is_allowed)
+    throw new HTTPException(403, { message: "Forbidden." });
   const hand = await automerge.find(sheet.doc_id);
   switch (sheet.type) {
     case "portal":

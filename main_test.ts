@@ -181,18 +181,14 @@ Deno.test(async function allTests(t) {
           rows: [{ a: 1 }],
         },
       },
-      // TODO: {
-      // TODO:   type: "query",
-      // TODO:   doc: {
-      // TODO:     db_id: null,
-      // TODO:     lang: "sql",
-      // TODO:     code: "select 1 as a",
-      // TODO:   },
-      // TODO: },
-      // TODO: {
-      // TODO:   type: "agent",
-      // TODO:   doc: {},
-      // TODO: },
+      {
+        type: "query",
+        doc: {
+          db_id: null,
+          lang: "sql",
+          code: "select 1 as a",
+        },
+      },
     ];
     for (const sheet_ of sheets) {
       let sheet_id = "";
