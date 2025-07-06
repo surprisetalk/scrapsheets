@@ -169,7 +169,7 @@ Deno.test(async function allTests(t) {
         doc: {
           type: "page",
           doc: {
-            cols: [{ name: "a", type: "int" }],
+            cols: [{ columnid: "a" }],
             rows: [{ a: 1 }],
           },
         },
@@ -177,7 +177,7 @@ Deno.test(async function allTests(t) {
       {
         type: "page",
         doc: {
-          cols: [{ name: "a", type: "int" }],
+          cols: [{ columnid: "a" }],
           rows: [{ a: 1 }],
         },
       },
@@ -216,7 +216,7 @@ Deno.test(async function allTests(t) {
       assertObjectMatch(sheet, {
         type: "page",
         doc: {
-          cols: [{ type: "int", name: "a" }],
+          cols: [{ columnid: "a" }],
           rows: [{ a: 1 }],
         },
       });
@@ -255,8 +255,11 @@ Deno.test(async function allTests(t) {
     const sheet = hand.doc();
     const { data }: { data: Sheet } = await post(jwt, `/query`, sheet);
     assertObjectMatch(data, {
-      cols: [{ type: "int", name: "a" }],
-      rows: [{ a: 1 }],
+      type: "page",
+      doc: {
+        cols: [{ columnid: "a" }],
+        rows: [{ a: 1 }],
+      },
     });
   });
 
@@ -264,45 +267,47 @@ Deno.test(async function allTests(t) {
     const { data: sheet_id } = await post(jwt, `/library`, {
       type: "page",
       doc: {
-        cols: [{ name: "a", type: "int" }],
+        cols: [{ columnid: "a" }],
         rows: [{ a: 1 }],
       },
     });
-    const { data: db_id } = await post(
-      jwt,
-      `/db`,
-      "postgresql://127.0.0.1:5434/postgres",
-    );
+    const { data: db_id } = await post(jwt, `/db`, {
+      name: "example",
+      url: "postgresql://127.0.0.1:5434/postgres",
+    });
     const queries: { query: Query; page: Page }[] = [
       {
         query: { db_id: null, lang: "sql", code: "select 1 as a" },
-        page: { cols: [{ name: "a", type: "int" }], rows: [{ a: 1 }] },
+        page: { cols: [{ columnid: "a" }], rows: [{ a: 1 }] },
       },
       {
         query: {
           db_id: null,
           lang: "sql",
-          code: `select a from sheet('${sheet_id}')`,
+          code: `select a from @${sheet_id}`,
         },
-        page: { cols: [{ name: "a", type: "int" }], rows: [{ a: 1 }] },
+        page: { cols: [{ columnid: "a" }], rows: [{ a: 1 }] },
       },
-      {
-        query: {
-          db_id: db_id,
-          lang: "sql",
-          code: `select a from sheet('${sheet_id}')`,
-        },
-        page: { cols: [{ name: "a", type: "int" }], rows: [{ a: 1 }] },
-      },
+      // // TODO: Open up another pglite DB at :5435 and use it to test.
+      // {
+      //   query: {
+      //     db_id: db_id,
+      //     lang: "sql",
+      //     code: `select a from example`,
+      //   },
+      //   page: { cols: [{ columnid: "a" }], rows: [{ a: 1 }] },
+      // },
     ];
     for (const { query, page } of queries)
       await t.step(async function execQuery(t) {
         const { data } = await post(jwt, `/query`, query);
-        assertObjectMatch(data, page);
+        assertObjectMatch(data, { type: "page", doc: page });
       });
   });
 
   await sql.end();
   listener.close();
   await pglite.close();
+
+  await new Promise(res => setTimeout(res, 100));
 });

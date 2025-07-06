@@ -12,7 +12,10 @@ import type { AnyDocumentId } from "npm:@automerge/automerge-repo";
 import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-websocket";
 import ala from "npm:alasql";
 
-export type Col = { name: string; type: "string" | "int" };
+ala.options.modifier = "RECORDSET";
+type Recordset = { columns: Col[]; data: Row[] };
+
+export type Col = { columnid: string; type?: "string" | "int" }; // { name: string; type: "string" | "int" };
 export type Row = Record<string, any>;
 export type Page = { cols: Col[]; rows: Row[] };
 export type Query = {
@@ -246,9 +249,9 @@ app.post("/shop/sheet/sell/:id", async c => {
 });
 
 app.post("/db", async c => {
-  // TODO:: Insert into db table.
-  // TODO:: e.g. { name: "Staging", url: "postgresql://postgres:postgres@localhost:5432/postgres" }
-  return c.json(null, 500);
+  const [{ db_id }] =
+    await sql`insert into db ${sql({ ...(await c.req.json()), usr_id: c.get("usr_id") })} returning *`;
+  return c.json({ data: db_id }, 201);
 });
 
 app.get("/library", async c => {
@@ -302,18 +305,24 @@ app.post("/query", async c => {
       /@[^ ]+/g,
       ref => (sheet_ids.push(ref.slice(1)), "?"),
     );
-    const docs: Record<string, Sheet["doc"]> = {};
+    const pages: Record<string, Page> = {};
     for (const sheet_id of sheet_ids) {
-      if (docs[sheet_id]) return;
-      const [type, doc_id] = sheet_id;
+      if (pages[sheet_id]) return;
+      const [type, doc_id] = sheet_id.split(":");
       const hand = await automerge.find(doc_id as AnyDocumentId);
-      docs[sheet_id] = hand.doc();
+      switch (type) {
+        case "page": {
+          pages[sheet_id] = hand.doc() as Page;
+          break;
+        }
+        default:
+          throw new Error("TODO");
+      }
     }
-    const rows = await ala(
+    const { columns: cols, data: rows }: Recordset = await ala(
       code_,
-      sheet_ids.map(id => docs[id]),
+      sheet_ids.map(id => pages[id].rows),
     );
-    const cols: Col[] = []; // TODO:: Infer column types from query?
     return c.json({ data: { type: "page", doc: { cols, rows } } }, 200);
   }
   return c.json(null, 500);
