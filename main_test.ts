@@ -233,7 +233,11 @@ Deno.test(async function allTests(t) {
   });
 
   await t.step(async function runNetCron(t) {
-    // TODO:
+    // TODO: spin up temp http server and test locally
+  });
+
+  await t.step(async function runNetWebsocket(t) {
+    // TODO: spin up temp socket server and test locally
   });
 
   await t.step(async function saveQuery(t) {

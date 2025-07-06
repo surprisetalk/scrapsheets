@@ -21,7 +21,10 @@ export type Recordset = { columns: Col[]; data: Row[] };
 export type Col = { columnid: string; type?: "string" | "int" }; // { name: string; type: "string" | "int" };
 export type Row = Record<string, any>;
 export type Page = { cols: Col[]; rows: Row[] };
-export type Net = null | { cron: string; url: string };
+export type Net =
+  | null
+  | { type: "http"; cron: string; url: string }
+  | { type: "websocket"; url: string };
 export type Query = {
   db_id: string | null;
   lang: "prql" | "sql";
