@@ -9,16 +9,19 @@ create table usr
 );
 
 create table sheet
-( sheet_id text primary key generated always as (type||':'||doc_id) stored
+( sheet_id text not null primary key
 , created_at timestamp default now()
 , created_by bigint not null references usr(usr_id)
+, supertype text not null generated always as (case when type in ('codex','portal') then 'remote' when type in ('template','page','net','query') then 'local' end)
 , type text not null check (type in ('template','page','net','query','portal','codex'))
-, merch_id text not null unique
-, name text not null default ""
+, sell_id text not null unique
+, sell_type text not null check (case when type in ('codex','portal') then sell_type is null when type = 'template' then sell_type in ('template','page','query','net') when type in ('page','query','net') then sell_type = 'portal' end)
+, buy_id text references sheet(buy_id) check (not (buy_id is null and type in ('codex','portal')))
+, name text not null default ''
 , tags text[] not null default '{}'::text[]
 , params jsonb[] not null default '{}'::jsonb[]
 , args jsonb not null default '{}'::jsonb
-, price numeric
+, price numeric check (not (price is not null and sell_type is null) and not (price is null and buy_id is not null))
 );
 
 create table sheet_usr
@@ -29,14 +32,7 @@ create table sheet_usr
 );
 
 create view shop as
-select s.*, 
-  null as sheet_id, 
-  null as args, 
-  case type 
-    when 'codex' then 'codex' 
-    when 'template' then args->>'type' 
-    else 'portal' 
-  end as type
+select todo
 from sheet s
 where price >= 0;
 

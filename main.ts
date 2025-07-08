@@ -315,15 +315,16 @@ app.use("*", async (c, next) => {
   await next();
 });
 
-/*
-
-app.post("/shop/sheet/buy/:id", async c => {
-  const sheet_id = c.req.param("id");
-  if (!sheet_id.startsWith("portal:"))
-    throw new HTTPException(400, { message: "Cannot purchase this sheet." });
-  await sql`insert into sheet_usr ${sql({ sheet_id, usr_id: c.get("usr_id") })}`;
+app.post("/buy/:id", async c => {
+  const merch_id = c.req.param("id");
+  await sql`
+    insert into sheet
+    insert into sheet_usr ${sql({ sheet_id, usr_id: c.get("usr_id") })}
+  `;
   return c.json(null, 201);
 });
+
+/*
 
 app.post("/shop/sheet/sell/:id", async c => {
   const sheet_id_ = c.req.param("id");
