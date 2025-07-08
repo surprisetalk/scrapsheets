@@ -14,14 +14,16 @@ create table sheet
 , created_by bigint not null references usr(usr_id)
 , supertype text not null generated always as (case when type in ('codex','portal') then 'remote' when type in ('template','page','net','query') then 'local' end)
 , type text not null check (type in ('template','page','net','query','portal','codex'))
-, sell_id text not null unique
-, sell_type text not null check (case when type in ('codex','portal') then sell_type is null when type = 'template' then sell_type in ('template','page','query','net') when type in ('page','query','net') then sell_type = 'portal' end)
-, buy_id text references sheet(buy_id) check (not (buy_id is null and type in ('codex','portal')))
 , name text not null default ''
 , tags text[] not null default '{}'::text[]
 , params jsonb[] not null default '{}'::jsonb[]
 , args jsonb not null default '{}'::jsonb
-, price numeric check (not (price is not null and sell_type is null) and not (price is null and buy_id is not null))
+, sell_id text not null unique
+, sell_type text not null check (case when type in ('codex','portal') then sell_type is null when type = 'template' then sell_type in ('template','page','query','net') when type in ('page','query','net') then sell_type = 'portal' end)
+, sell_price numeric check (sell_price >= 0 and not (sell_price is not null and sell_type is null))
+, buy_id text references sheet(sell_id) check (case type when 'codex' then buy_id is null when 'portal' then buy_id is not null else true end)
+, buy_price numeric check (buy_price >= 0 and not (buy_price is not null and buy_id is null))
+, check (not (sell_price is not null and buy_price is not null))
 );
 
 create table sheet_usr
@@ -34,7 +36,7 @@ create table sheet_usr
 create view shop as
 select todo
 from sheet s
-where price >= 0;
+where sell_price >= 0;
 
 -- TODO: Add req/res data, headers, etc.
 create table net
