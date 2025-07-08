@@ -128,7 +128,7 @@ Deno.test(async function allTests(t) {
         }
       }
 
-      const sheets = await get<LibraryItem[]>(jwt, `/sheet/portal:library`);
+      const sheets = await get<LibraryItem[]>(jwt, `/library`);
       // TODO: Update rows.
       for (const { sheet_id, type } of sheets)
         switch (type) {
@@ -136,7 +136,7 @@ Deno.test(async function allTests(t) {
     }
 
     {
-      const sheets = await get<LibraryItem[]>(jwt, `/sheet/portal:library`);
+      const sheets = await get<LibraryItem[]>(jwt, `/library`);
       for (const { sheet_id, type } of sheets) {
         const meta = { name: `Example ${type}`, tags: ["tag1", "tag2"] };
         await put(jwt, `/sheet/${sheet_id}`, meta);
@@ -146,16 +146,15 @@ Deno.test(async function allTests(t) {
     }
   }
 
-  await get<ShopItem[]>("", `/sheet/portal:shop`);
+  await get<ShopItem[]>("", `/shop`);
 
   {
     const { jwt } = await usr("bob@example.com");
 
-    const shop = await get<ShopItem[]>(jwt, `/sheet/portal:shop`);
+    const shop = await get<ShopItem[]>(jwt, `/shop`);
     for (const { merch_id } of shop) {
       const { sheet_id, type } = await post<Sheet>(jwt, `/buy/${merch_id}`, {});
       assertEquals(type, "portal");
-      await get<Sheet>(jwt, `/sheet/${sheet_id}`, {});
       switch (type) {
         case "template":
           await t.step(async function template(t) {

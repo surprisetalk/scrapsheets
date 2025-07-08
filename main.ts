@@ -17,35 +17,49 @@ const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
 
 ala.options.modifier = "RECORDSET";
 
-export type Template = "TODO";
 export type Recordset = { columns: Col[]; data: Row[] };
 export type Col = { columnid: string; type?: "string" | "int" }; // { name: string; type: "string" | "int" };
-export type Row = Record<string, any>;
-export type Page = { cols: Col[]; rows: Row[] };
+export type Row = Record<string, unknown>;
+
+export type Tag<T extends string, X> = { type: T; data: X };
+
+export type Doc =
+  | Tag<"template", Template>
+  | Tag<"page", Page>
+  | Tag<"net", Net>
+  | Tag<"query", Query>;
+export type Template =
+  | Tag<"template", null>
+  | Tag<"page", Page<null>>
+  | Tag<"net", Net>
+  | Tag<"query", Query>;
 export type Net =
-  | null
-  | { type: "http"; cron: string; url: string }
-  | { type: "websocket"; url: string };
-export type Query = {
-  db_id: string | null; // TODO: Get rid of this and reference tables directly.
-  lang: "prql" | "sql";
-  code: string;
-};
-export type Sheet =
-  | { type: "template"; doc: Template }
-  | { type: "page"; doc: Page }
-  | { type: "portal"; doc: null }
-  | { type: "net"; doc: Net }
-  | { type: "query"; doc: Query };
-export interface LibraryItem {
-  sheet_id: string;
-  type: Sheet["type"];
-  doc_id: string;
+  | Tag<"hook", null>
+  | Tag<"http", { cron: string; url: string }>
+  | Tag<"socket", { url: string }>;
+export type Page<T = Row[]> = { cols: Col[]; rows: T };
+export type Query = { lang: "sql" | "prql"; code: string };
+
+export type Sheet<sheet_id, price> = {
+  sheet_id: sheet_id;
+  merch_id: string;
+  type: Doc["type"] | "portal" | "codex";
+  params: Page<null> | null;
   name: string;
   tags: string[];
-}
+  price: price;
+  created_by: string;
+  created_at: string;
+};
+export type ShopItem = Sheet<null, number> & {
+  args: null;
+};
+export type LibraryItem = Sheet<string, number | null> & {
+  args: Record<string, Cell>;
+};
+export type Cell = unknown;
 
-// TODO: template,page,net,query are now doc:123 which sync literally, and portal/db are different?
+/*
 
 const querify = async ({ db_id, lang, code }: Query): Promise<Page> => {
   if (lang === "sql" && db_id === null) {
@@ -413,5 +427,6 @@ app.all("/mcp/sheet/:id", async c => {
   // TODO: mcp server
   return c.json(null, 500);
 });
+*/
 
 export default app;
