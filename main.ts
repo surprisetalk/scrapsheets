@@ -18,7 +18,14 @@ const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
 ala.options.modifier = "RECORDSET";
 
 export type Recordset = { columns: Col[]; data: Row[] };
-export type Col = { columnid: string; type?: "string" | "int" }; // { name: string; type: "string" | "int" };
+export type Type =
+  | "type"
+  | "string"
+  | "int"
+  | ["array", Type]
+  | ["tuple", Type[]]
+  | { [k: string]: Type };
+export type Col = { name: string; type: Type };
 export type Row = Record<string, unknown>;
 
 export type Tag<T extends string, X> = { type: T; data: X };
@@ -48,7 +55,11 @@ export type Query = { lang: "sql" | "prql"; code: string };
 
 export type Codex = Page<
   { sheet_id: string; name: string; cols: Col[] }[],
-  [{ columnid: "sheet_id" }, { columnid: "name" }, { columnid: "cols" }]
+  [
+    { name: "sheet_id"; type: "string" },
+    { name: "name"; type: "string" },
+    { name: "cols"; type: ["array", { name: "string"; type: "type" }] },
+  ]
 >;
 
 export type Sheet<sheet_id, price> = {
