@@ -17,6 +17,7 @@ const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
 
 ala.options.modifier = "RECORDSET";
 
+export type Template = "TODO";
 export type Recordset = { columns: Col[]; data: Row[] };
 export type Col = { columnid: string; type?: "string" | "int" }; // { name: string; type: "string" | "int" };
 export type Row = Record<string, any>;
@@ -26,12 +27,12 @@ export type Net =
   | { type: "http"; cron: string; url: string }
   | { type: "websocket"; url: string };
 export type Query = {
-  db_id: string | null;
+  db_id: string | null; // TODO: Get rid of this and reference tables directly.
   lang: "prql" | "sql";
   code: string;
 };
 export type Sheet =
-  | { type: "template"; doc: Sheet }
+  | { type: "template"; doc: Template }
   | { type: "page"; doc: Page }
   | { type: "portal"; doc: null }
   | { type: "net"; doc: Net }
@@ -43,6 +44,8 @@ export interface LibraryItem {
   name: string;
   tags: string[];
 }
+
+// TODO: template,page,net,query are now doc:123 which sync literally, and portal/db are different?
 
 const querify = async ({ db_id, lang, code }: Query): Promise<Page> => {
   if (lang === "sql" && db_id === null) {

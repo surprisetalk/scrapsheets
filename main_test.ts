@@ -4,9 +4,6 @@ import { PostgresConnection } from "npm:pg-gateway";
 import { citext } from "npm:@electric-sql/pglite/contrib/citext";
 import { app, sql, createJwt, automerge } from "./main.ts";
 import type { Sheet, Row, Page, Query, LibraryItem } from "./main.ts";
-import * as AM from "npm:@automerge/automerge-repo";
-
-const emptyPage: Sheet = { type: "page", doc: { cols: [], rows: [] } };
 
 const request = async (jwt: string, route: string, options?: object) => {
   const res = await app.request(route, {
@@ -69,17 +66,26 @@ async function get1<T>(
 
 const post = (jwt: string, route: string, body: unknown) =>
   request(jwt, route, { method: "POST", body: JSON.stringify(body) });
+const put = (jwt: string, route: string, body: unknown) =>
+  request(jwt, route, { method: "PUT", body: JSON.stringify(body) });
 const patch = (jwt: string, route: string, body: unknown) =>
   request(jwt, route, { method: "PATCH", body: JSON.stringify(body) });
 const del = (jwt: string, route: string, body: unknown) =>
   request(jwt, route, { method: "DELETE", body: JSON.stringify(body) });
 
-// Test setup helpers
-const setupTestDb = async () => {
+const usr = async (email: string) => {
+  const [{ usr_id }] = await sql`
+    insert into usr (email) values (${email}) 
+    on conflict (email) do update set email = excluded.email 
+    returning *
+  `;
+  return { usr_id, jwt: await createJwt(usr_id) };
+};
+
+Deno.test(async function allTests(t) {
   const listener = Deno.listen({ port: 5434 });
   const pglite = new PGlite({ extensions: { citext } });
 
-  // Start postgres connection handler
   (async () => {
     for await (const conn of listener)
       new PostgresConnection(conn, {
@@ -96,34 +102,75 @@ const setupTestDb = async () => {
   await pglite.waitReady;
   await pglite.exec(await Deno.readTextFile("./db.sql"));
 
-  return { listener, pglite };
-};
+  {
+    const { jwt } = await usr("alice@example.com");
 
-const createTestUser = async (email: string) => {
-  const [{ usr_id }] = await sql`
-    insert into usr (email) values (${email}) 
-    on conflict (email) do update set email = excluded.email 
-    returning *
-  `;
-  return { usr_id, jwt: await createJwt(usr_id) };
-};
+    {
+      const templates: Template[] = [
+        { type: "template", doc: { type: "net", doc: { type: null } } },
+        { type: "page", doc: { cols: [{ name: "a" }], rows: [] } },
+        { type: "net", doc: { type: null } },
+        { type: "net", doc: { type: "http", cron: "", url: "" } },
+        { type: "net", doc: { type: "websocket", url: "" } },
+        { type: "query", doc: { lang: "sql", code: "" } },
+      ];
+      for (const template of templates) {
+        {
+          const hand = await automerge.create<Doc>({
+            type: "template",
+            template,
+          });
+          await post(jwt, `/sheet/doc:${hand.documentId}`, {});
+        }
+        {
+          const hand = await automerge.create<Doc>(template);
+          await post(jwt, `/sheet/doc:${hand.documentId}`, {});
+        }
+      }
 
-const createTestSheet = async (jwt: string, sheet: Sheet) => {
-  const { data: sheet_id } = await post(jwt, `/library`, sheet);
-  assert(sheet_id);
-  const [type, doc_id] = sheet_id.split(":");
-  assert(doc_id);
-  return { sheet_id, type, doc_id };
-};
+      const sheets = await get<LibraryItem[]>(jwt, `/sheet/portal:library`);
+      // TODO: Update rows.
+      for (const { sheet_id, type } of sheets)
+        switch (type) {
+        }
+    }
 
-Deno.test(async function allTests(t) {
-  const { listener, pglite } = await setupTestDb();
+    {
+      const sheets = await get<LibraryItem[]>(jwt, `/sheet/portal:library`);
+      for (const { sheet_id, type } of sheets) {
+        const meta = { name: `Example ${type}`, tags: ["tag1", "tag2"] };
+        await put(jwt, `/sheet/${sheet_id}`, meta);
+        await post(jwt, `/sell/${sheet_id}`, {});
+        await put(jwt, `/sell/${sheet_id}`, {});
+      }
+    }
+  }
 
-  await t.step(async function viewShopSheets(t) {
-    // TODO: /shop/sheet
-  });
+  await get<ShopItem[]>("", `/sheet/portal:shop`);
 
-  const { jwt } = await createTestUser("alice@example.com");
+  {
+    const { jwt } = await usr("bob@example.com");
+
+    const shop = await get<ShopItem[]>(jwt, `/sheet/portal:shop`);
+    for (const { merch_id } of shop) {
+      const { sheet_id, type } = await post<Sheet>(jwt, `/buy/${merch_id}`, {});
+      assertEquals(type, "portal");
+      await get<Sheet>(jwt, `/sheet/${sheet_id}`, {});
+      switch (type) {
+        case "template":
+          await t.step(async function template(t) {
+            // TODO
+          });
+          break;
+      }
+      {
+        const { jwt } = await usr("charlie@example.com");
+        await reject(jwt, `/sheet/${sheet_id}`, {});
+      }
+    }
+  }
+
+  /*
 
   await t.step(async function createSheet(t) {
     await post(jwt, `/library`, emptyPage);
@@ -304,6 +351,8 @@ Deno.test(async function allTests(t) {
         assertObjectMatch(data, { type: "page", doc: page });
       });
   });
+
+  */
 
   await sql.end();
   listener.close();
