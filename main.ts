@@ -19,6 +19,7 @@ ala.options.modifier = "RECORDSET";
 
 export type Recordset = { columns: Col[]; data: Row[] };
 export type Type =
+  // TODO: Consider using JSONSchema?
   | "type"
   | "string"
   | "int"
@@ -82,7 +83,6 @@ export type LibraryItem = Sheet<string, number | null> & {
 export type Cell = unknown;
 
 /*
-
 const querify = async ({ db_id, lang, code }: Query): Promise<Page> => {
   if (lang === "sql" && db_id === null) {
     const sheet_ids: string[] = [];
@@ -125,6 +125,7 @@ const pagify = async (sheet_id: string): Promise<Page> => {
       throw new HTTPException(500, { message: "Unknown sheet type." });
   }
 };
+*/
 
 export const createJwt = async (usr_id: string) =>
   await sign(
@@ -296,10 +297,13 @@ app.post("/login", async c => {
   );
 });
 
-app.get("/shop/sheet", async c => {
-  const data = await sql`select * from sheet s where price >= 0 limit 25`;
+app.get("/shop", async c => {
+  // TODO: cselect
+  const data = await sql`select * from shop s where price >= 0 limit 25`;
   return c.json({ data }, 200);
 });
+
+/*
 
 app.post("/net/:id", async c => {
   await sql`insert into net ${sql({ sheet_id: `net:${c.req.param("id")}`, body: await c.req.text() })}`;
