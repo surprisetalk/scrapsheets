@@ -37,14 +37,25 @@ export type Net =
   | Tag<"hook", null>
   | Tag<"http", { cron: string; url: string }>
   | Tag<"socket", { url: string }>;
-export type Page<T = Row[]> = { cols: Col[]; rows: T };
+export type Page<
+  Rows extends Row[] | null = Row[],
+  Cols extends Col[] = Col[],
+> = {
+  cols: Cols;
+  rows: Rows;
+};
 export type Query = { lang: "sql" | "prql"; code: string };
+
+export type Codex = Page<
+  { sheet_id: string; name: string; cols: Col[] }[],
+  [{ columnid: "sheet_id" }, { columnid: "name" }, { columnid: "cols" }]
+>;
 
 export type Sheet<sheet_id, price> = {
   sheet_id: sheet_id;
   merch_id: string;
   type: Doc["type"] | "portal" | "codex";
-  params: Page<null> | null;
+  params: Col[] | null;
   name: string;
   tags: string[];
   price: price;
