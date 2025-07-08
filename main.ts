@@ -303,10 +303,8 @@ app.get("/shop", async c => {
   return c.json({ data }, 200);
 });
 
-/*
-
 app.post("/net/:id", async c => {
-  await sql`insert into net ${sql({ sheet_id: `net:${c.req.param("id")}`, body: await c.req.text() })}`;
+  await sql`insert into net ${sql({ sheet_id: c.req.param("id"), body: await c.req.text() })}`;
   return c.json(null, 200);
 });
 
@@ -316,6 +314,8 @@ app.use("*", async (c, next) => {
   c.set("usr_id", c.get("jwtPayload")?.sub);
   await next();
 });
+
+/*
 
 app.post("/shop/sheet/buy/:id", async c => {
   const sheet_id = c.req.param("id");
