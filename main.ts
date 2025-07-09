@@ -299,7 +299,8 @@ app.post("/login", async c => {
 
 app.get("/shop", async c => {
   // TODO: cselect
-  const data = await sql`select * from shop s where price >= 0 limit 25`;
+  const data =
+    await sql`select todo from sheet s where sell_price >= 0 limit 25`;
   return c.json({ data }, 200);
 });
 
@@ -316,34 +317,38 @@ app.use("*", async (c, next) => {
 });
 
 app.post("/buy/:id", async c => {
-  const merch_id = c.req.param("id");
-  await sql`
-    insert into sheet
-    insert into sheet_usr ${sql({ sheet_id, usr_id: c.get("usr_id") })}
-  `;
-  return c.json(null, 201);
-});
-
-/*
-
-app.post("/shop/sheet/sell/:id", async c => {
-  const sheet_id_ = c.req.param("id");
-  const [type, doc_id] = sheet_id_.split(":");
-  if (type === "portal")
-    throw new HTTPException(400, { message: "Cannot sell this sheet." });
-  const [{ sheet_id }] = await sql`
-    with s as (insert into sheet ${sql({ doc_id: sql`md5(${doc_id})` as unknown as string, type: "portal", created_by: c.get("usr_id"), data: { sheet_id: sheet_id_ } })} returning *)
-    insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s returning sheet_id
-  `;
+  const sheet_id = await sql.begin(async sql => {
+    const [{ sheet_id }] = await sql`
+      with sell as (
+        select * from sheet where sell_id = ${c.req.param("id")} and price >= 0
+      ), buy as (
+        insert into sheet s (sheet_id, created_by, type, name, params, buy_id, buy_price) 
+        select md5(sell_id||now()::text), ${c.get("usr_id")}, sell_type, name, params, sell_id, sell_price
+        from sell
+        returning sheet_id
+      ), buy_usr as (
+        insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from buy
+      )
+      select sheet_id from buy
+    `;
+    // TODO: Charge usr on stripe.
+    return sheet_id;
+  });
   return c.json({ data: sheet_id }, 201);
 });
 
-app.post("/db", async c => {
-  const [{ db_id }] =
-    await sql`insert into db ${sql({ ...(await c.req.json()), usr_id: c.get("usr_id") })} returning *`;
-  return c.json({ data: db_id }, 201);
+app.post("/sell/:id", async c => {
+  const { price } = await c.req.json();
+  await sql`
+    update sheet set sell_price = ${price} 
+    where true
+      and sheet_id = ${c.req.param("id")} 
+      and created_at = ${c.get("usr_id")}
+  `;
+  return c.json(null, 200);
 });
 
+/*
 app.get("/library", async c => {
   const { limit, offset, ...qs } = c.req.query();
   const res = await cselect({
