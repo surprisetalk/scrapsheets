@@ -8,6 +8,7 @@ import sg from "npm:@sendgrid/mail";
 import pg from "https://deno.land/x/postgresjs@v3.4.5/mod.js";
 import { upgradeWebSocket } from "jsr:@hono/hono/deno";
 import { Repo } from "npm:@automerge/automerge-repo";
+import * as AM from "npm:@automerge/automerge-repo";
 import type { AnyDocumentId, DocHandle } from "npm:@automerge/automerge-repo";
 import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-websocket";
 import ala from "npm:alasql";
@@ -348,10 +349,9 @@ app.post("/sell/:id", async c => {
   return c.json(null, 200);
 });
 
-/*
 app.get("/library", async c => {
   const { limit, offset, ...qs } = c.req.query();
-  const res = await cselect({
+  const rows = await cselect({
     select: sql`select s.*`,
     from: sql`
       from sheet s 
@@ -365,31 +365,64 @@ app.get("/library", async c => {
     limit,
     offset,
   });
-  return c.json(res);
+  return c.json({
+    type: "page",
+    doc: {
+      cols: [
+        { name: "sheet_id", type: "string" },
+        { name: "created_at", type: "string" },
+        { name: "created_by", type: "string" },
+        { name: "type", type: "string" },
+        { name: "name", type: "string" },
+        { name: "tags", type: "string" },
+        { name: "params", type: "string" },
+        { name: "args", type: "string" },
+        { name: "sell_id", type: "string" },
+        { name: "sell_price", type: "string" },
+        { name: "buy_id", type: "string" },
+      ],
+      rows,
+    },
+  });
 });
 
-app.post("/library", async c => {
-  const { type, doc } = await c.req.json();
-  // TODO: Validate to ensure it matches Sheet.
-  if (!["template", "page", "agent", "query", "net"].includes(type))
-    return c.json({ error: "Invalid initial sheet." }, 400);
-  const hand = automerge.create(doc);
-  const [{ sheet_id }] = await sql`
-    with s as (insert into sheet ${sql({ doc_id: hand.documentId, type, created_by: c.get("usr_id") })} returning *)
-    insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s returning sheet_id
-  `;
-  return c.json({ data: sheet_id }, 201);
+app.post("/library/:id", async c => {
+  const sheet_id = c.req.param("id");
+  if (!AM.isValidDocumentId(sheet_id))
+    throw new HTTPException(400, {
+      message: "Cannot add non-document to library.",
+    });
+  await sql`insert into sheet_usr ${sql({ sheet_id, usr_id: c.get("usr_id") })}`;
+  return c.json(null, 200);
 });
 
-app.patch("/library/:id", async c => {
+app.put("/library/:id", async c => {
   await sql`
     update sheet 
     set ${sql(await c.req.json(), "name", "tags")} 
     where true
-    and created_by = ${c.get("usr_id")}
     and sheet_id = ${c.req.param("id")}
+    and created_by = ${c.get("usr_id")}
   `;
   return c.json(null, 200);
+});
+
+app.get("/net/:id", async c => {
+  const rows = await sql`
+    select j.created_at, j.body
+    from sheet s
+    inner join net j using (sheet_id)
+    inner join sheet_usr su on (su.sheet_id,su.usr_id) = (s.sheet_id,${c.get("usr_id")})
+    where s.sheet_id = ${c.req.param("id")}
+  `;
+  const doc: Page = {
+    cols: [
+      { name: "created_at", type: "string" },
+      { name: "body", type: "string" },
+    ],
+    rows,
+  };
+  return c.json({ data: { type: "page", doc } }, 200);
 });
 
 app.post("/query", async c => {
@@ -399,66 +432,35 @@ app.post("/query", async c => {
   );
 });
 
-app.get("/net/:id", async c => {
-  const rows = await sql`
-    select j.created_at, j.body
-    from sheet s
-    inner join net j using (sheet_id)
-    inner join sheet_usr su on (su.sheet_id,su.usr_id) = (s.sheet_id,${c.get("usr_id")})
-    where s.sheet_id = 'net:'||${c.req.param("id")}
-  `;
-  return c.json(
-    {
-      data: {
-        type: "page",
-        doc: {
-          cols: [
-            { name: "created_at", type: "string" },
-            { name: "body", type: "text" },
-          ],
-          rows,
-        },
-      },
-    },
-    200,
-  );
+app.get("/codex/:id", async c => {
+  // TODO:
+  return c.json(null, 500);
+});
+
+app.get("/codex/:id/connect", async c => {
+  // TODO:
+  return c.json(null, 500);
+});
+
+app.get("/codex/:id/callback", async c => {
+  // TODO:
+  return c.json(null, 500);
 });
 
 app.get("/portal/:id", async c => {
   const [sheet] = await sql`
-    select s_.sheet_id, s_.type, s_.doc_id, su.sheet_id is not null as is_allowed
+    select s.*
     from sheet s
-    inner join sheet s_ on s_.sheet_id = s.data->>'sheet_id'
-    left join sheet_usr su on (su.sheet_id,su.usr_id) = (s.sheet_id,${c.get("usr_id")})
-    where s.sheet_id = 'portal:'||${c.req.param("id")}
+    inner join sheet_usr using (sheet_id)
+    where usr_id = ${c.get("usr_id")}
   `;
   if (!sheet) throw new HTTPException(404, { message: "Not found." });
-  if (!sheet.is_allowed)
-    throw new HTTPException(403, { message: "Forbidden." });
-  switch (sheet.type) {
-    case "portal":
-      throw new HTTPException(500, { message: "Bad sheet recursion." });
-    case "template": {
-      const hand = await automerge.find(sheet.doc_id);
-      return c.json({ data: { type: "template", doc: hand.doc() } }, 200);
-    }
-    default:
-      return c.json(
-        { data: { type: "page", doc: await pagify(sheet.sheet_id) } },
-        200,
-      );
-  }
-});
-
-app.post("/portal/connect/:type", async c => {
-  // TODO: oauth
-  return c.json(null, 500);
+  return c.json({ data: { type: "page", doc: await pagify(sheet) } }, 200);
 });
 
 app.all("/mcp/sheet/:id", async c => {
   // TODO: mcp server
   return c.json(null, 500);
 });
-*/
 
 export default app;

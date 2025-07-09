@@ -16,10 +16,10 @@ create table sheet
 , type text not null check (type in ('template','page','net','query','portal','codex'))
 , name text not null default ''
 , tags text[] not null default '{}'::text[]
-, params jsonb[] not null default '{}'::jsonb[]
-, args jsonb not null default '{}'::jsonb
+, params jsonb[] check (case when params is null then type in ('template','page','net','portal') else type in ('query','codex') end)
+, args jsonb check (case when args is null then type in ('template','page','net') else type in ('query','codex','portal') end)
 , sell_id text not null unique check (sell_id <> sheet_id)
-, sell_type text not null check (case when buy_id is not null then sell_type is null when type in ('codex','portal') then sell_type is null when type = 'template' then sell_type in ('template','page','query','net') when type in ('page','query','net') then sell_type = 'portal' end)
+, sell_type text not null check (case when buy_id is not null then sell_type is null when type in ('codex','portal') then sell_type is null when type = 'template' then sell_type in ('template','page','query','net','codex') when type in ('page','query','net') then sell_type = 'portal' end)
 , sell_price numeric check (sell_price >= 0 and not (sell_price is not null and sell_type is null))
 , buy_id text references sheet(sell_id) check (case type when 'codex' then buy_id is null when 'portal' then buy_id is not null else true end)
 , buy_price numeric check (buy_price >= 0 and not (buy_price is not null and buy_id is null))
