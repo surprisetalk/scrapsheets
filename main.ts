@@ -1,5 +1,5 @@
 import { HTTPException } from "jsr:@hono/hono/http-exception";
-import { Hono } from "jsr:@hono/hono";
+import { Context, Hono } from "jsr:@hono/hono";
 import { logger } from "jsr:@hono/hono/logger";
 import { cors } from "jsr:@hono/hono/cors";
 import { jwt, sign } from "jsr:@hono/hono/jwt";
@@ -16,7 +16,7 @@ import ala from "npm:alasql";
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
 const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
 
-ala.options.modifier = "RECORDSET";
+// ala.options.modifier = "RECORDSET";
 
 export type Tag<T extends string, X extends Table> = {
   type: T;
@@ -55,45 +55,46 @@ export type Sheet =
   | Tag<"portal", Args>
   | Tag<"codex", []>;
 
-///////////////////////////////////////////////////////////////////////////////
-
-/*
-const querify = async ({ db_id, lang, code }: Query): Promise<Doc> => {
-  if (lang === "sql" && db_id === null) {
-    const sheet_ids: string[] = [];
-    const code_ = code.replace(
-      /@[^ ]+/g,
-      ref => (sheet_ids.push(ref.slice(1)), "?"),
-    );
-    const docs: Record<string, Doc> = {};
-    for (const sheet_id of sheet_ids)
-      docs[sheet_id] = docs[sheet_id] ?? (await pagify(sheet_id));
-    const { columns: cols, data: rows }: Recordset = await ala(
-      code_,
-      sheet_ids.map(id => docs[id].rows),
-    );
-    return { cols, rows };
-  } else if (lang === "sql") {
-    throw new Error("TODO");
-  } else if (lang === "prql" && db_id === null) {
-    throw new Error("TODO");
-  } else if (lang === "prql") {
-    throw new Error("TODO");
-  } else {
-    throw new Error("TODO");
-  }
+export type Page = {
+  data: Doc;
+  count: number;
+  offset: number;
 };
 
-const pagify = async (sheet_id: string): Promise<Doc> => {
+///////////////////////////////////////////////////////////////////////////////
+
+const sheet = async (
+  sheet_id: string,
+  { limit, offset, ...qs }: Record<string, string>,
+): Promise<Page> => {
   const [type, doc_id] = sheet_id.split(":");
-  const hand = await automerge.find(doc_id as AnyDocumentId);
+  const hand = await automerge.find(doc_id as AnyDocumentId).catch(() => ({
+    doc: () => {
+      throw new HTTPException(404, { message: "Sheet not found." });
+    },
+  }));
   switch (type) {
-    case "template":
-      throw new HTTPException(500, { message: "TODO" });
-    case "doc":
-      return hand.doc() as Doc;
+    case "doc": {
+      const doc = hand.doc() as Doc;
+      return { data: doc, count: doc.length - 1, offset: 0 };
+    }
+    case "net-hook":
+    case "net-http":
+    case "net-socket":
+      return await cselect({
+        select: sql`select n.created_at, n.body`,
+        from: sql`from sheet_usr su inner join net n using (sheet_id)`,
+        where: [
+          sql`(su.sheet_id,su.usr_id) = (${c.req.param("id")},${c.get("usr_id")})`,
+        ],
+        order: undefined,
+        limit,
+        offset,
+      });
     case "query":
-      return await querify(hand.doc() as Query);
+      return await querify(hand.doc() as Query, { limit, offset, ...qs });
+    case "template":
+      throw new HTTPException(500, { message: "Bad template." });
     case "portal":
       throw new HTTPException(500, { message: "Bad sheet recursion." });
     default:
@@ -101,7 +102,28 @@ const pagify = async (sheet_id: string): Promise<Doc> => {
   }
 };
 
-*/
+const querify = async (
+  [[lang, code, args]]: Query,
+  reqQuery: Record<string, string>,
+): Promise<Page> => {
+  if (lang === "sql") {
+    const sheet_ids: string[] = [];
+    const code_ = code.replace(
+      /@[^ ]+/g,
+      ref => (sheet_ids.push(ref.slice(1)), "?"),
+    );
+    const docs: Record<string, Doc> = {};
+    for (const sheet_id of sheet_ids)
+      docs[sheet_id] = docs[sheet_id] ?? (await sheet(sheet_id, {})).data;
+    const { columns: cols, data: rows }: any = await ala(
+      code_,
+      sheet_ids.map(id => docs[id]),
+    );
+    return { data: [cols, ...rows], count: -1, offset: -1 }; // TODO:
+  } else {
+    throw new HTTPException(500, { message: "TODO" });
+  }
+};
 
 export const createJwt = async (usr_id: string) =>
   await sign(
@@ -164,7 +186,6 @@ export const sql = pg({
   onnotice: msg => msg.severity !== "DEBUG" && console.log(msg),
 });
 
-// TODO: This should set the Content-Range header like 0-100/230494?
 const cselect = async ({
   select,
   from,
@@ -179,7 +200,7 @@ const cselect = async ({
   order?: any;
   limit: string;
   offset: string;
-}): Promise<{ data: Doc; count: number }> => {
+}): Promise<Page> => {
   const where_ = where.filter(x => x).length
     ? sql`where true ${where.filter(x => x).map((x: any) => sql`and ${x}`)}`
     : sql``;
@@ -189,8 +210,15 @@ const cselect = async ({
   const rows: Row[] =
     await sql`${select} ${from} ${where_} ${order ?? sql``} limit ${limit} offset ${offset}`.values();
   const [{ count }] = await sql`select count(*) ${from} ${where_}`;
-  return { data: [cols, ...rows], count };
+  return { data: [cols, ...rows], count, offset: parseInt(offset) };
 };
+
+const page =
+  (c: Context) =>
+  ({ data, offset, count }: Page) => {
+    c.header("Content-Range", `${offset}-${offset + data.length - 1}/${count}`);
+    return c.json({ data }, 200);
+  };
 
 // TODO: Add rate-limiting middleware everywhere.
 export const app = new Hono<{
@@ -278,10 +306,23 @@ app.post("/login", async c => {
 });
 
 app.get("/shop", async c => {
-  // TODO: cselect
-  const data =
-    await sql`select sell_id, sell_type, sell_price, name from sheet s where sell_price >= 0 limit 25`;
-  return c.json({ data }, 200);
+  const { limit, offset, ...qs } = c.req.query();
+  return page(c)(
+    await cselect({
+      select: sql`select sell_id, sell_type, sell_price, name`,
+      from: sql`from sheet s`,
+      where: [
+        sql`sell_price >= 0`,
+        qs.name && sql`name ilike ${qs.name + "%"}`,
+        qs.sell_type && sql`sell_type = ${qs.sell_type}`,
+        qs.sell_price &&
+          sql`sell_price between ${qs.sell_type.split("-")[0]}::numeric and ${qs.sell_type.split("-")[1]}::numeric`,
+      ],
+      order: undefined,
+      limit,
+      offset,
+    }),
+  );
 });
 
 app.post("/net/:id", async c => {
@@ -336,21 +377,22 @@ app.post("/sell/:id", async c => {
 
 app.get("/library", async c => {
   const { limit, offset, ...qs } = c.req.query();
-  const { data, count } = await cselect({
-    select: sql`select s.*`,
-    from: sql`
-      from sheet s 
-      left join sheet_usr su using (sheet_id) 
-    `,
-    where: [
-      sql`su.usr_id = ${c.get("usr_id")}`,
-      qs.sheet_id && sql`sheet_id = ${qs.sheet_id}`,
-    ],
-    order: undefined,
-    limit,
-    offset,
-  });
-  return c.json({ data });
+  return page(c)(
+    await cselect({
+      select: sql`select s.*`,
+      from: sql`
+        from sheet s 
+        left join sheet_usr su using (sheet_id) 
+      `,
+      where: [
+        sql`su.usr_id = ${c.get("usr_id")}`,
+        qs.sheet_id && sql`sheet_id = ${qs.sheet_id}`,
+      ],
+      order: undefined,
+      limit,
+      offset,
+    }),
+  );
 });
 
 app.put("/library/:id", async c => {
@@ -365,19 +407,12 @@ app.put("/library/:id", async c => {
 });
 
 app.get("/net/:id", async c => {
-  // TODO: cselect
-  const data = await sql`
-    select j.created_at, j.body
-    from sheet s
-    inner join net j using (sheet_id)
-    inner join sheet_usr su on (su.sheet_id,su.usr_id) = (s.sheet_id,${c.get("usr_id")})
-    where s.sheet_id = ${c.req.param("id")}
-  `;
-  return c.json({ data }, 200);
+  return page(c)(await sheet(c.req.param("id"), c.req.query()));
 });
 
 app.post("/query", async c => {
-  return c.json({ data: await querify(await c.req.json()) }, 200);
+  const { lang, code, args } = await c.req.json();
+  return page(c)(await querify([[lang, code, args]], c.req.query()));
 });
 
 app.get("/codex/:id", async c => {
@@ -396,14 +431,15 @@ app.get("/codex/:id/callback", async c => {
 });
 
 app.get("/portal/:id", async c => {
-  const [sheet] = await sql`
-    select s.*
-    from sheet s
-    inner join sheet_usr using (sheet_id)
-    where usr_id = ${c.get("usr_id")}
+  const [sheet_] = await sql`
+    select s_.*
+    from sheet_usr su
+    inner join sheet s using (sheet_id)
+    inner join sheet s_ on s_.sell_id = s.buy_id
+    where s.type = 'portal' and su.usr_id = ${c.get("usr_id")}
   `;
-  if (!sheet) throw new HTTPException(404, { message: "Not found." });
-  return c.json({ data }, 200);
+  if (!sheet_) throw new HTTPException(404, { message: "Not found." });
+  return page(c)(await sheet(sheet_.sheet_id, c.req.query()));
 });
 
 app.all("/mcp/sheet/:id", async c => {
