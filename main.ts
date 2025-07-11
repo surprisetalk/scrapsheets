@@ -61,8 +61,6 @@ export type Page = {
   offset: number;
 };
 
-///////////////////////////////////////////////////////////////////////////////
-
 const sheet = async (
   sheet_id: string,
   { limit, offset, ...qs }: Record<string, string>,
@@ -107,6 +105,7 @@ const querify = async (
   reqQuery: Record<string, string>,
 ): Promise<Page> => {
   if (lang === "sql") {
+    // TODO: Use psql/etc if all sheets are from the same codex.
     const sheet_ids: string[] = [];
     const code_ = code.replace(
       /@[^ ]+/g,
