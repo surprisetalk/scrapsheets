@@ -18,7 +18,12 @@ const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
 
 ala.options.modifier = "RECORDSET";
 
-export type Recordset = { columns: Col[]; data: Row[] };
+export type Tag<T extends string, X extends Table> = {
+  type: T;
+  doc_id: string;
+  data: X;
+};
+
 export type Type =
   // TODO: Consider using JSONSchema?
   | "type"
@@ -27,76 +32,45 @@ export type Type =
   | ["array", Type]
   | ["tuple", Type[]]
   | { [k: string]: Type };
-export type Col = { name: string; type: Type };
-export type Row = Record<string, unknown>;
-
-export type Tag<T extends string, X> = { type: T; data: X };
-
-export type Doc =
-  | Tag<"template", Template>
-  | Tag<"page", Page>
-  | Tag<"net", Net>
-  | Tag<"query", Query>;
+export type Row = unknown[];
+export type Col = [string, Type, number];
+export type Table = Row[];
+export type Doc = [Col[], ...Row[]];
+export type Args = [string, unknown][];
 export type Template =
-  | Tag<"template", null>
-  | Tag<"page", Page<null>>
-  | Tag<"net", Net>
-  | Tag<"query", Query>;
-export type Net =
-  | Tag<"hook", null>
-  | Tag<"http", { cron: string; url: string }>
-  | Tag<"socket", { url: string }>;
-export type Page<
-  Rows extends Row[] | null = Row[],
-  Cols extends Col[] = Col[],
-> = {
-  cols: Cols;
-  rows: Rows;
-};
-export type Query = { lang: "sql" | "prql"; code: string };
+  | [["doc", Col[]]]
+  | [["query", Query]]
+  | [["net-hook", []]]
+  | [["net-http", [string, number]]]
+  | [["net-socket", [string]]]
+  | [[`codex-${string}`, []]];
+export type Query = [["sql" | "prql", string, Args]];
+export type Sheet =
+  | Tag<"template", Template>
+  | Tag<"doc", Doc>
+  | Tag<"net-hook", []>
+  | Tag<"net-http", [[string, number]]>
+  | Tag<"net-socket", [[string]]>
+  | Tag<"query", Query>
+  | Tag<"portal", Args>
+  | Tag<"codex", []>;
 
-export type Codex = Page<
-  { sheet_id: string; name: string; cols: Col[] }[],
-  [
-    { name: "sheet_id"; type: "string" },
-    { name: "name"; type: "string" },
-    { name: "cols"; type: ["array", { name: "string"; type: "type" }] },
-  ]
->;
-
-export type Sheet<sheet_id, price> = {
-  sheet_id: sheet_id;
-  merch_id: string;
-  type: Doc["type"] | "portal" | "codex";
-  params: Col[] | null;
-  name: string;
-  tags: string[];
-  price: price;
-  created_by: string;
-  created_at: string;
-};
-export type ShopItem = Sheet<null, number> & {
-  args: null;
-};
-export type LibraryItem = Sheet<string, number | null> & {
-  args: Record<string, Cell>;
-};
-export type Cell = unknown;
+///////////////////////////////////////////////////////////////////////////////
 
 /*
-const querify = async ({ db_id, lang, code }: Query): Promise<Page> => {
+const querify = async ({ db_id, lang, code }: Query): Promise<Doc> => {
   if (lang === "sql" && db_id === null) {
     const sheet_ids: string[] = [];
     const code_ = code.replace(
       /@[^ ]+/g,
       ref => (sheet_ids.push(ref.slice(1)), "?"),
     );
-    const pages: Record<string, Page> = {};
+    const docs: Record<string, Doc> = {};
     for (const sheet_id of sheet_ids)
-      pages[sheet_id] = pages[sheet_id] ?? (await pagify(sheet_id));
+      docs[sheet_id] = docs[sheet_id] ?? (await pagify(sheet_id));
     const { columns: cols, data: rows }: Recordset = await ala(
       code_,
-      sheet_ids.map(id => pages[id].rows),
+      sheet_ids.map(id => docs[id].rows),
     );
     return { cols, rows };
   } else if (lang === "sql") {
@@ -110,14 +84,14 @@ const querify = async ({ db_id, lang, code }: Query): Promise<Page> => {
   }
 };
 
-const pagify = async (sheet_id: string): Promise<Page> => {
+const pagify = async (sheet_id: string): Promise<Doc> => {
   const [type, doc_id] = sheet_id.split(":");
   const hand = await automerge.find(doc_id as AnyDocumentId);
   switch (type) {
     case "template":
       throw new HTTPException(500, { message: "TODO" });
-    case "page":
-      return hand.doc() as Page;
+    case "doc":
+      return hand.doc() as Doc;
     case "query":
       return await querify(hand.doc() as Query);
     case "portal":
@@ -126,6 +100,7 @@ const pagify = async (sheet_id: string): Promise<Page> => {
       throw new HTTPException(500, { message: "Unknown sheet type." });
   }
 };
+
 */
 
 export const createJwt = async (usr_id: string) =>
@@ -189,6 +164,7 @@ export const sql = pg({
   onnotice: msg => msg.severity !== "DEBUG" && console.log(msg),
 });
 
+// TODO: This should set the Content-Range header like 0-100/230494?
 const cselect = async ({
   select,
   from,
@@ -203,14 +179,17 @@ const cselect = async ({
   order?: any;
   limit: string;
   offset: string;
-}) => {
+}): Promise<{ data: Doc; count: number }> => {
   const where_ = where.filter(x => x).length
     ? sql`where true ${where.filter(x => x).map((x: any) => sql`and ${x}`)}`
     : sql``;
-  const data =
-    await sql`${select} ${from} ${where_} ${order ?? sql``} limit ${limit} offset ${offset}`;
+  const cols: Col[] = (
+    await sql`${select} ${from} ${where_}`.describe()
+  ).columns.map((col, i) => [col.name, "string", i]); // TODO: col.type
+  const rows: Row[] =
+    await sql`${select} ${from} ${where_} ${order ?? sql``} limit ${limit} offset ${offset}`.values();
   const [{ count }] = await sql`select count(*) ${from} ${where_}`;
-  return { data, count };
+  return { data: [cols, ...rows], count };
 };
 
 // TODO: Add rate-limiting middleware everywhere.
@@ -301,7 +280,7 @@ app.post("/login", async c => {
 app.get("/shop", async c => {
   // TODO: cselect
   const data =
-    await sql`select todo from sheet s where sell_price >= 0 limit 25`;
+    await sql`select sell_id, sell_type, sell_price, name from sheet s where sell_price >= 0 limit 25`;
   return c.json({ data }, 200);
 });
 
@@ -319,12 +298,18 @@ app.use("*", async (c, next) => {
 
 app.post("/buy/:id", async c => {
   const sheet_id = await sql.begin(async sql => {
+    const [sheet] =
+      await sql`select * from sheet where sell_id = ${c.req.param("id")} and price >= 0`;
+    const row_0 = sheet.type === "template" ? sheet.row_0[1] : [];
+    const doc_id = sheet.sell_type.startsWith("codex-")
+      ? Math.random().toString().slice(2)
+      : automerge.create([row_0]).documentId;
     const [{ sheet_id }] = await sql`
       with sell as (
         select * from sheet where sell_id = ${c.req.param("id")} and price >= 0
       ), buy as (
-        insert into sheet s (sheet_id, created_by, type, name, params, buy_id, buy_price) 
-        select md5(sell_id||now()::text), ${c.get("usr_id")}, sell_type, name, params, sell_id, sell_price
+        insert into sheet s (created_by, type, doc_id, name, buy_id, buy_price, row_0) 
+        select ${c.get("usr_id")}, sell_type, ${doc_id}, name, sell_id, sell_price, ${row_0}
         from sell
         returning sheet_id
       ), buy_usr as (
@@ -332,7 +317,7 @@ app.post("/buy/:id", async c => {
       )
       select sheet_id from buy
     `;
-    // TODO: Charge usr on stripe.
+    // TODO: Charge usr on stripe, etc.
     return sheet_id;
   });
   return c.json({ data: sheet_id }, 201);
@@ -344,14 +329,14 @@ app.post("/sell/:id", async c => {
     update sheet set sell_price = ${price} 
     where true
       and sheet_id = ${c.req.param("id")} 
-      and created_at = ${c.get("usr_id")}
+      and created_by = ${c.get("usr_id")}
   `;
   return c.json(null, 200);
 });
 
 app.get("/library", async c => {
   const { limit, offset, ...qs } = c.req.query();
-  const rows = await cselect({
+  const { data, count } = await cselect({
     select: sql`select s.*`,
     from: sql`
       from sheet s 
@@ -365,35 +350,7 @@ app.get("/library", async c => {
     limit,
     offset,
   });
-  return c.json({
-    type: "page",
-    doc: {
-      cols: [
-        { name: "sheet_id", type: "string" },
-        { name: "created_at", type: "string" },
-        { name: "created_by", type: "string" },
-        { name: "type", type: "string" },
-        { name: "name", type: "string" },
-        { name: "tags", type: "string" },
-        { name: "params", type: "string" },
-        { name: "args", type: "string" },
-        { name: "sell_id", type: "string" },
-        { name: "sell_price", type: "string" },
-        { name: "buy_id", type: "string" },
-      ],
-      rows,
-    },
-  });
-});
-
-app.post("/library/:id", async c => {
-  const sheet_id = c.req.param("id");
-  if (!AM.isValidDocumentId(sheet_id))
-    throw new HTTPException(400, {
-      message: "Cannot add non-document to library.",
-    });
-  await sql`insert into sheet_usr ${sql({ sheet_id, usr_id: c.get("usr_id") })}`;
-  return c.json(null, 200);
+  return c.json({ data });
 });
 
 app.put("/library/:id", async c => {
@@ -408,28 +365,19 @@ app.put("/library/:id", async c => {
 });
 
 app.get("/net/:id", async c => {
-  const rows = await sql`
+  // TODO: cselect
+  const data = await sql`
     select j.created_at, j.body
     from sheet s
     inner join net j using (sheet_id)
     inner join sheet_usr su on (su.sheet_id,su.usr_id) = (s.sheet_id,${c.get("usr_id")})
     where s.sheet_id = ${c.req.param("id")}
   `;
-  const doc: Page = {
-    cols: [
-      { name: "created_at", type: "string" },
-      { name: "body", type: "string" },
-    ],
-    rows,
-  };
-  return c.json({ data: { type: "page", doc } }, 200);
+  return c.json({ data }, 200);
 });
 
 app.post("/query", async c => {
-  return c.json(
-    { data: { type: "page", doc: await querify(await c.req.json()) } },
-    200,
-  );
+  return c.json({ data: await querify(await c.req.json()) }, 200);
 });
 
 app.get("/codex/:id", async c => {
@@ -455,7 +403,7 @@ app.get("/portal/:id", async c => {
     where usr_id = ${c.get("usr_id")}
   `;
   if (!sheet) throw new HTTPException(404, { message: "Not found." });
-  return c.json({ data: { type: "page", doc: await pagify(sheet) } }, 200);
+  return c.json({ data }, 200);
 });
 
 app.all("/mcp/sheet/:id", async c => {

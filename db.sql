@@ -1,7 +1,7 @@
 create extension if not exists citext;
 
 create table usr
-( usr_id bigint generated always as identity primary key
+( usr_id bigint not null generated always as identity primary key
 , created_at timestamp default now()
 , name text
 , email citext unique not null
@@ -9,21 +9,25 @@ create table usr
 );
 
 create table sheet
-( sheet_id text not null primary key
+( sheet_id text not null primary key generated always as (type || ':' || doc_id) stored
 , created_at timestamp default now()
 , created_by bigint not null references usr(usr_id)
-, supertype text not null generated always as (case when type in ('codex','portal') then 'remote' when type in ('template','page','net','query') then 'local' end)
-, type text not null check (type in ('template','page','net','query','portal','codex'))
+, type text not null check (subtype in ('template','doc','net-hook','net-http','net-socket','query','portal') or subtype like 'codex-%')
+, doc_id text not null unique
 , name text not null default ''
 , tags text[] not null default '{}'::text[]
-, params jsonb[] check (case when params is null then type in ('template','page','net','portal') else type in ('query','codex') end)
-, args jsonb check (case when args is null then type in ('template','page','net') else type in ('query','codex','portal') end)
-, sell_id text not null unique check (sell_id <> sheet_id)
-, sell_type text not null check (case when buy_id is not null then sell_type is null when type in ('codex','portal') then sell_type is null when type = 'template' then sell_type in ('template','page','query','net','codex') when type in ('page','query','net') then sell_type = 'portal' end)
-, sell_price numeric check (sell_price >= 0 and not (sell_price is not null and sell_type is null))
-, buy_id text references sheet(sell_id) check (case type when 'codex' then buy_id is null when 'portal' then buy_id is not null else true end)
-, buy_price numeric check (buy_price >= 0 and not (buy_price is not null and buy_id is null))
+, sell_id text not null unique generated always as (md5(sheet_id||created_by::text||created_at::text)) stored
+, sell_type text not null generated always as (case when type = 'template' then row_0->>0 when type in ('doc','net-hook','net-http','net-socket','query') then 'portal' end) stored
+, sell_price numeric check (sell_price >= 0)
+, buy_id text references sheet(sell_id)
+, buy_price numeric check (buy_price >= 0)
+, row_0 jsonb[] not null default '{}'::text[]
 , check (not (sell_price is not null and buy_price is not null))
+);
+
+create table db
+( db_id bigint not null generated always as identity primary key
+, dsn not null text -- TODO: Encrypt this.
 );
 
 create table sheet_usr
@@ -35,7 +39,7 @@ create table sheet_usr
 
 -- TODO: Add req/res data, headers, etc.
 create table net
-( sheet_id text not null references sheet(sheet_id) check (sheet_id ilike 'net:%')
+( sheet_id text not null references sheet(sheet_id) check (sheet_id ilike 'net-%')
 , created_at timestamp default now()
 , body text not null
 );
