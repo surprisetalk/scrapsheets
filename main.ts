@@ -119,23 +119,30 @@ const querify = async (
       /@[^ ]+/g,
       ref => (sheet_ids.push(ref.slice(1)), "?"),
     );
-    const docs: Record<string, Doc> = {};
-    for (const sheet_id of sheet_ids)
-      docs[sheet_id] = docs[sheet_id] ?? (await sheet(c, sheet_id, {})).data;
-    console.log(
-      // TODO: We need to "hydrate" the column names on each row and remove the header row.
-      code_,
-      docs,
+    const docs: Record<string, Record<string, any>[]> = {};
+    for (const sheet_id of sheet_ids) {
+      if (docs[sheet_id]) continue;
+      const [cols, ...rows] = (await sheet(c, sheet_id, {})).data;
+      docs[sheet_id] = rows.map(row =>
+        Object.fromEntries(row.map((x, i) => [cols[i][0], x])),
+      );
+    }
+    const {
+      columns: cols,
+      data: rows,
+    }: { columns: { columnid: string }[]; data: Record<string, unknown>[] } =
       await ala(
         code_,
         sheet_ids.map(id => docs[id]),
-      ),
-    );
-    const { columns: cols, data: rows }: any = await ala(
-      code_,
-      sheet_ids.map(id => docs[id]),
-    );
-    return { data: [cols, ...rows], count: -1, offset: -1 }; // TODO:
+      );
+    return {
+      data: [
+        cols.map((col, i) => [col.columnid, "string", i]),
+        ...rows.map(row => cols.map(col => row[col.columnid])),
+      ],
+      count: -1, // TODO:
+      offset: -1, // TODO:
+    };
   } else {
     throw new HTTPException(500, { message: "TODO" });
   }
