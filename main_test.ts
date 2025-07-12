@@ -52,10 +52,6 @@ const post = (jwt: string, route: string, body: unknown) =>
   request(jwt, route, { method: "POST", body: JSON.stringify(body) });
 const put = (jwt: string, route: string, body: unknown) =>
   request(jwt, route, { method: "PUT", body: JSON.stringify(body) });
-const patch = (jwt: string, route: string, body: unknown) =>
-  request(jwt, route, { method: "PATCH", body: JSON.stringify(body) });
-const del = (jwt: string, route: string, body: unknown) =>
-  request(jwt, route, { method: "DELETE", body: JSON.stringify(body) });
 
 const usr = async (email: string) => {
   const [{ usr_id }] = await sql`
