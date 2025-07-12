@@ -26,38 +26,7 @@ import Url exposing (Url)
 
 
 
----- HELPERS ------------------------------------------------------------------
-
-
-flip : (a -> b -> c) -> (b -> a -> c)
-flip f a b =
-    f b a
-
-
-iif : Bool -> a -> a -> a
-iif c a b =
-    if c then
-        a
-
-    else
-        b
-
-
-result : Result a a -> a
-result res =
-    case res of
-        Ok x ->
-            x
-
-        Err x ->
-            x
-
-
-
 ---- PORTS --------------------------------------------------------------------
-
-
-port libraryChanged : (SheetMsg D.Value -> msg) -> Sub msg
 
 
 port changeSheet : SheetMsg (List Patch) -> Cmd msg
@@ -70,9 +39,6 @@ port sheetChanged : (SheetMsg SheetChange -> msg) -> Sub msg
 
 
 port sheetNotified : (SheetMsg D.Value -> msg) -> Sub msg
-
-
-port selectSheet : Id -> Cmd msg
 
 
 type alias SheetChange =
