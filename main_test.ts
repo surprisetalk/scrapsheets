@@ -95,6 +95,7 @@ Deno.test(async function allTests(t) {
         ["net-http", ["http://127.0.0.1:5049/test", 1000]],
         ["net-socket", ["ws://127.0.0.1:5051/test"]],
         ["query", ["sql", "select 123 as a, 456 as b, 789 as c", []]],
+        // TODO: codex-db
       ];
       for (const template of templates) {
         const hand = automerge.create<{ data: Sheet["data"] }>({
