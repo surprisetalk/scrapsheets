@@ -229,11 +229,9 @@ const cselect = async ({
   const where_ = where.filter(x => x).length
     ? sql`where true ${where.filter(x => x).map((x: any) => sql`and ${x}`)}`
     : sql``;
-  const cols: Col[] = (
-    await sql`${select} ${from} ${where_}`.describe()
-  ).columns.map((col, i) => [col.name, "string", i]); // TODO: col.type
-  const rows: Row[] =
+  const rows =
     await sql`${select} ${from} ${where_} ${order ?? sql``} limit ${limit} offset ${offset}`.values();
+  const cols: Col[] = rows.columns.map((col, i) => [col.name, "string", i]); // TODO: col.type
   const [{ count }] = await sql`select count(*) ${from} ${where_}`;
   return { data: [cols, ...rows], count, offset: parseInt(offset) };
 };
@@ -470,11 +468,83 @@ app.post("/query", async c => {
 });
 
 app.get("/codex/:id", async c => {
-  const [type, doc_id] = c.req.param("id").split(":");
+  const sheet_id = c.req.param("id");
+  const [type, doc_id] = sheet_id.split(":");
   switch (type) {
-    case "codex-db":
-      // TODO:
-      return c.json(null, 500);
+    case "codex-db": {
+      const [db] = await sql`select dsn from db where sheet_id = ${sheet_id}`;
+      if (!db)
+        throw new HTTPException(400, {
+          message: `No DSN found.`,
+        });
+      // TODO: Be really careful about arbitrary DB access! Don't let them access our DB haha
+      const sql_ = pg(db.dsn, {
+        onnotice: msg => msg.severity !== "DEBUG" && console.log(msg),
+      });
+      const rows = await sql_`
+        select 
+          table_name as name,
+          array[]::jsonb[]
+            || array[${[
+              ["name", "string", 0],
+              ["type", "string", 1],
+              ["i", "int", 2],
+            ]}::jsonb]::jsonb[]
+            || array_agg(to_jsonb(array[column_name,data_type,ordinal_position::text]::text[]))::jsonb[] 
+            as columns
+        from information_schema.tables t
+        inner join information_schema.columns c using (table_catalog,table_schema,table_name)
+        where table_schema = 'public'
+        group by table_name, table_type
+      `.values();
+      const cols = rows.columns.map((col, i) => [col.name, "string", i]); // TODO:
+      await sql_.end();
+      return c.json({ data: [cols, ...rows] }, 200);
+    }
+    case "codex-scrapsheets": {
+      return c.json(
+        {
+          data: [
+            [
+              ["name", "string", 0],
+              ["columns", "todo", 1],
+            ],
+            [
+              "shop",
+              [
+                [
+                  ["name", "string", 0],
+                  ["type", "string", 1],
+                  ["i", "int", 2],
+                ],
+                ["created_at", "string", 0],
+                ["sell_id", "string", 1],
+                ["sell_type", "string", 2],
+                ["sell_price", "string", 3],
+                ["name", "string", 4],
+              ],
+            ],
+            [
+              "library",
+              [
+                [
+                  ["name", "string", 0],
+                  ["type", "string", 1],
+                  ["i", "int", 2],
+                ],
+                ["s.created_at", "string", 0],
+                ["s.type", "string", 1],
+                ["s.doc_id", "string", 2],
+                ["s.name", "string", 3],
+                ["s.tags", "string", 4],
+                ["s.sell_price", "string", 5],
+              ],
+            ],
+          ],
+        },
+        200,
+      );
+    }
     default:
       throw new HTTPException(400, {
         message: `Unrecognized codex type: ${type}`,

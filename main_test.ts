@@ -220,13 +220,42 @@ Deno.test(async function allTests(t) {
             await post(
               jwt,
               `/codex-db/${doc_id}`,
-              "postgresql://localhost:5434",
+              "postgresql://postgres:postgres@127.0.0.1:5434/postgres",
             );
             const [cols, ...rows] = await get<Doc>(
               jwt,
               `/codex/codex-db:${doc_id}`,
             );
-            // TODO:
+            assert(cols.length);
+            assertEquals(cols.map(col => col[0]).join(), "name,columns");
+            assert(rows.length);
+            assertEquals(
+              rows.map(col => col[0]).join(),
+              "db,net,sheet,sheet_usr,usr",
+            );
+            assertEquals(
+              rows
+                .map((col: any) => col[1][0].map((c: any) => c[0]).join())
+                .join(""),
+              "name,type,i".repeat(rows.length),
+            );
+            break;
+          }
+          case "codex-scrapsheets": {
+            const [cols, ...rows] = await get<Doc>(
+              jwt,
+              `/codex/codex-scrapsheets:${doc_id}`,
+            );
+            assert(cols.length);
+            assertEquals(cols.map(col => col[0]).join(), "name,columns");
+            assert(rows.length);
+            assertEquals(rows.map(col => col[0]).join(), "shop,library");
+            assertEquals(
+              rows
+                .map((col: any) => col[1][0].map((c: any) => c[0]).join())
+                .join(""),
+              "name,type,i".repeat(rows.length),
+            );
             break;
           }
           default:
