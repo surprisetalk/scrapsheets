@@ -3,7 +3,7 @@ import { PGlite } from "npm:@electric-sql/pglite";
 import { PostgresConnection } from "npm:pg-gateway";
 import { citext } from "npm:@electric-sql/pglite/contrib/citext";
 import { app, sql, createJwt, automerge } from "./main.ts";
-import type { Sheet, Row, Page, Query, LibraryItem } from "./main.ts";
+import type { Sheet, Template, Doc, Table } from "./main.ts";
 
 const request = async (jwt: string, route: string, options?: object) => {
   const res = await app.request(route, {
@@ -107,54 +107,56 @@ Deno.test(async function allTests(t) {
 
     {
       const templates: Template[] = [
-        { type: "template", doc: { type: "net", doc: { type: null } } },
-        { type: "page", doc: { cols: [{ name: "a" }], rows: [] } },
-        { type: "net", doc: { type: null } },
-        { type: "net", doc: { type: "http", cron: "", url: "" } },
-        { type: "net", doc: { type: "websocket", url: "" } },
-        { type: "query", doc: { lang: "sql", code: "" } },
+        ["template", ["net-hook"]],
+        ["doc", [["a", "string", 0]]],
+        ["net-hook", []],
+        ["net-http", ["http://127.0.0.1:5049/test", 1000]],
+        ["net-socket", ["ws://127.0.0.1:5051/test"]],
+        ["query", ["sql", "select 1 as a", []]],
       ];
       for (const template of templates) {
-        {
-          const hand = await automerge.create<Doc>({
-            type: "template",
-            template,
-          });
-          await post(jwt, `/sheet/doc:${hand.documentId}`, {});
-        }
-        {
-          const hand = await automerge.create<Doc>(template);
-          await post(jwt, `/sheet/doc:${hand.documentId}`, {});
-        }
+        const hand = automerge.create<Sheet["data"]>([template]);
+        await put(jwt, `/library/template:${hand.documentId}`, {});
       }
 
-      const sheets = await get<LibraryItem[]>(jwt, `/library`);
+      const sheets = await get<Doc>(jwt, `/library`);
+      const header = sheets.shift();
+      // TODO: Assert header.
       // TODO: Update rows.
-      for (const { sheet_id, type } of sheets)
+      // TODO: Assert.
+      assert(sheets.length);
+      for (const [type, doc_id] of sheets)
         switch (type) {
         }
     }
 
     {
-      const sheets = await get<LibraryItem[]>(jwt, `/library`);
-      for (const { sheet_id, type } of sheets) {
+      const sheets = await get<Doc>(jwt, `/library`);
+      const header = sheets.shift();
+      // TODO: Assert header.
+      assert(sheets.length);
+      for (const [type, doc_id] of sheets) {
+        const sheet_id = type + ":" + doc_id;
         const meta = { name: `Example ${type}`, tags: ["tag1", "tag2"] };
-        await put(jwt, `/sheet/${sheet_id}`, meta);
+        await put(jwt, `/library/${sheet_id}`, meta);
         await post(jwt, `/sell/${sheet_id}`, {});
         await put(jwt, `/sell/${sheet_id}`, {});
       }
     }
   }
 
-  await get<ShopItem[]>("", `/shop`);
+  await get<Doc>("", `/shop`);
 
   {
     const { jwt } = await usr("bob@example.com");
 
-    const shop = await get<ShopItem[]>(jwt, `/shop`);
-    for (const { merch_id } of shop) {
-      const { sheet_id, type } = await post<Sheet>(jwt, `/buy/${merch_id}`, {});
-      assertEquals(type, "portal");
+    const shop = await get<Doc>(jwt, `/shop`);
+    const header = shop.shift();
+    // TODO: Assert header.
+    assert(shop.length);
+    for (const [sell_id] of shop) {
+      const { data: sheet_id } = await post(jwt, `/buy/${sell_id}`, {});
+      const [type, _doc_id] = sheet_id.split(":");
       switch (type) {
         case "template":
           await t.step(async function template(t) {
@@ -164,7 +166,7 @@ Deno.test(async function allTests(t) {
       }
       {
         const { jwt } = await usr("charlie@example.com");
-        await reject(jwt, `/sheet/${sheet_id}`, {});
+        await reject(jwt, `/${type}/${sheet_id}`, {});
       }
     }
   }

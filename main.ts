@@ -20,7 +20,6 @@ const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
 
 export type Tag<T extends string, X extends Table> = {
   type: T;
-  doc_id: string;
   data: X;
 };
 
@@ -38,20 +37,21 @@ export type Table = Row[];
 export type Doc = [Col[], ...Row[]];
 export type Args = [string, unknown][];
 export type Template =
-  | [["doc", Col[]]]
-  | [["query", Query]]
-  | [["net-hook", []]]
-  | [["net-http", [string, number]]]
-  | [["net-socket", [string]]]
-  | [[`codex-${string}`, []]];
-export type Query = [["sql" | "prql", string, Args]];
+  | ["template", [Template[0]]]
+  | ["doc", Col[]]
+  | ["query", Query]
+  | ["net-hook", []]
+  | ["net-http", [string, number]]
+  | ["net-socket", [string]]
+  | [`codex-${string}`, []];
+export type Query = ["sql" | "prql", string, Args];
 export type Sheet =
-  | Tag<"template", Template>
+  | Tag<"template", [Template]>
   | Tag<"doc", Doc>
   | Tag<"net-hook", []>
   | Tag<"net-http", [[string, number]]>
   | Tag<"net-socket", [[string]]>
-  | Tag<"query", Query>
+  | Tag<"query", [Query]>
   | Tag<"portal", Args>
   | Tag<"codex", []>;
 
@@ -62,6 +62,7 @@ export type Page = {
 };
 
 const sheet = async (
+  c: Context,
   sheet_id: string,
   { limit, offset, ...qs }: Record<string, string>,
 ): Promise<Page> => {
@@ -83,14 +84,14 @@ const sheet = async (
         select: sql`select n.created_at, n.body`,
         from: sql`from sheet_usr su inner join net n using (sheet_id)`,
         where: [
-          sql`(su.sheet_id,su.usr_id) = (${c.req.param("id")},${c.get("usr_id")})`,
+          sql`(su.sheet_id,su.usr_id) = (${sheet_id},${c.get("usr_id")})`,
         ],
         order: undefined,
         limit,
         offset,
       });
     case "query":
-      return await querify(hand.doc() as Query, { limit, offset, ...qs });
+      return await querify(c, hand.doc() as Query, { limit, offset, ...qs });
     case "template":
       throw new HTTPException(500, { message: "Bad template." });
     case "portal":
@@ -101,6 +102,7 @@ const sheet = async (
 };
 
 const querify = async (
+  c: Context,
   [[lang, code, args]]: Query,
   reqQuery: Record<string, string>,
 ): Promise<Page> => {
@@ -113,7 +115,7 @@ const querify = async (
     );
     const docs: Record<string, Doc> = {};
     for (const sheet_id of sheet_ids)
-      docs[sheet_id] = docs[sheet_id] ?? (await sheet(sheet_id, {})).data;
+      docs[sheet_id] = docs[sheet_id] ?? (await sheet(c, sheet_id, {})).data;
     const { columns: cols, data: rows }: any = await ala(
       code_,
       sheet_ids.map(id => docs[id]),
@@ -365,6 +367,8 @@ app.post("/buy/:id", async c => {
 
 app.post("/sell/:id", async c => {
   const { price } = await c.req.json();
+  if (price === undefined)
+    throw new HTTPException(400, { message: "Price required." });
   await sql`
     update sheet set sell_price = ${price} 
     where true
@@ -397,7 +401,7 @@ app.get("/library", async c => {
 app.put("/library/:id", async c => {
   await sql`
     update sheet 
-    set ${sql(await c.req.json(), "name", "tags")} 
+    set ${sql({ name: null, tags: [], ...(await c.req.json()) }, "name", "tags")} 
     where true
     and sheet_id = ${c.req.param("id")}
     and created_by = ${c.get("usr_id")}
@@ -406,12 +410,12 @@ app.put("/library/:id", async c => {
 });
 
 app.get("/net/:id", async c => {
-  return page(c)(await sheet(c.req.param("id"), c.req.query()));
+  return page(c)(await sheet(c, c.req.param("id"), c.req.query()));
 });
 
 app.post("/query", async c => {
   const { lang, code, args } = await c.req.json();
-  return page(c)(await querify([[lang, code, args]], c.req.query()));
+  return page(c)(await querify(c, [lang, code, args], c.req.query()));
 });
 
 app.get("/codex/:id", async c => {
@@ -438,10 +442,10 @@ app.get("/portal/:id", async c => {
     where s.type = 'portal' and su.usr_id = ${c.get("usr_id")}
   `;
   if (!sheet_) throw new HTTPException(404, { message: "Not found." });
-  return page(c)(await sheet(sheet_.sheet_id, c.req.query()));
+  return page(c)(await sheet(c, sheet_.sheet_id, c.req.query()));
 });
 
-app.all("/mcp/sheet/:id", async c => {
+app.all("/mcp/:id", async c => {
   // TODO: mcp server
   return c.json(null, 500);
 });

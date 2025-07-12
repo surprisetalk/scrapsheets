@@ -12,22 +12,22 @@ create table sheet
 ( sheet_id text not null primary key generated always as (type || ':' || doc_id) stored
 , created_at timestamp default now()
 , created_by bigint not null references usr(usr_id)
-, type text not null check (subtype in ('template','doc','net-hook','net-http','net-socket','query','portal') or subtype like 'codex-%')
+, type text not null check (type in ('template','doc','net-hook','net-http','net-socket','query','portal') or type like 'codex-%')
 , doc_id text not null unique
 , name text not null default ''
 , tags text[] not null default '{}'::text[]
-, sell_id text not null unique generated always as (md5(sheet_id||created_by::text||created_at::text)) stored
-, sell_type text not null generated always as (case when type = 'template' then row_0->>0 when type in ('doc','net-hook','net-http','net-socket','query') then 'portal' end) stored
+, sell_id text not null unique generated always as (md5(doc_id||created_by::text)) stored
+, sell_type text not null generated always as (case when type = 'template' then row_0[1]::text when type in ('doc','net-hook','net-http','net-socket','query') then 'portal' end) stored
 , sell_price numeric check (sell_price >= 0)
 , buy_id text references sheet(sell_id)
 , buy_price numeric check (buy_price >= 0)
-, row_0 jsonb[] not null default '{}'::text[]
+, row_0 jsonb[] not null default '{}'::jsonb[]
 , check (not (sell_price is not null and buy_price is not null))
 );
 
 create table db
 ( db_id bigint not null generated always as identity primary key
-, dsn not null text -- TODO: Encrypt this.
+, dsn text not null -- TODO: Encrypt this.
 );
 
 create table sheet_usr
