@@ -37,7 +37,7 @@ export type Table = Row[];
 export type Doc = [Col[], ...Row[]];
 export type Args = [string, unknown][];
 export type Template =
-  | ["template", [Template[0]]]
+  | ["template", Template]
   | ["doc", Col[]]
   | ["query", Query]
   | ["net-hook", []]
@@ -341,19 +341,19 @@ app.use("*", async (c, next) => {
 app.post("/buy/:id", async c => {
   const sheet_id = await sql.begin(async sql => {
     const [sheet] =
-      await sql`select * from sheet where sell_id = ${c.req.param("id")} and price >= 0`;
+      await sql`select * from sheet where sell_id = ${c.req.param("id")} and sell_price >= 0`;
     const row_0 = sheet.type === "template" ? sheet.row_0[1] : [];
     const doc_id = sheet.sell_type.startsWith("codex-")
       ? Math.random().toString().slice(2)
       : automerge.create([row_0]).documentId;
     const [{ sheet_id }] = await sql`
       with sell as (
-        select * from sheet where sell_id = ${c.req.param("id")} and price >= 0
+        select * from sheet where sell_id = ${c.req.param("id")} and sell_price >= 0
       ), buy as (
-        insert into sheet s (created_by, type, doc_id, name, buy_id, buy_price, row_0) 
+        insert into sheet (created_by, type, doc_id, name, buy_id, buy_price, row_0) 
         select ${c.get("usr_id")}, sell_type, ${doc_id}, name, sell_id, sell_price, ${row_0}
         from sell
-        returning sheet_id
+        returning sheet_id, created_by
       ), buy_usr as (
         insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from buy
       )
@@ -382,10 +382,10 @@ app.get("/library", async c => {
   const { limit, offset, ...qs } = c.req.query();
   return page(c)(
     await cselect({
-      select: sql`select s.*`,
+      select: sql`select s.type, s.doc_id, s.name, s.tags, s.created_at`,
       from: sql`
-        from sheet s 
-        left join sheet_usr su using (sheet_id) 
+        from sheet_usr su 
+        inner join sheet s using (sheet_id) 
       `,
       where: [
         sql`su.usr_id = ${c.get("usr_id")}`,
@@ -398,14 +398,34 @@ app.get("/library", async c => {
   );
 });
 
+// TODO: This is not correct.
 app.put("/library/:id", async c => {
-  await sql`
+  const [sheet] = await sql`
     update sheet 
     set ${sql({ name: null, tags: [], ...(await c.req.json()) }, "name", "tags")} 
     where true
     and sheet_id = ${c.req.param("id")}
     and created_by = ${c.get("usr_id")}
+    returning sheet_id
   `;
+  if (!sheet) {
+    const [type, doc_id] = c.req.param("id").split(":");
+    const sheet = {
+      name: "",
+      tags: [],
+      ...(await c.req.json()),
+      type,
+      doc_id,
+      row_0: await automerge
+        .find<Doc>(doc_id as AnyDocumentId)
+        .then(hand => hand.doc()[0]),
+      created_by: c.get("usr_id"),
+    };
+    await sql`
+      with s as (insert into sheet ${sql(sheet, "type", "doc_id", "name", "tags", "created_by", "row_0")} on conflict (sheet_id) do nothing returning *)
+      insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s
+    `;
+  }
   return c.json(null, 200);
 });
 

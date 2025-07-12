@@ -17,11 +17,11 @@ create table sheet
 , name text not null default ''
 , tags text[] not null default '{}'::text[]
 , sell_id text not null unique generated always as (md5(doc_id||created_by::text)) stored
-, sell_type text not null generated always as (case when type = 'template' then row_0[1]::text when type in ('doc','net-hook','net-http','net-socket','query') then 'portal' end) stored
+, sell_type text generated always as (case when type = 'template' then row_0->>0 when type in ('doc','net-hook','net-http','net-socket','query') then 'portal' end) stored
 , sell_price numeric check (sell_price >= 0)
 , buy_id text references sheet(sell_id)
 , buy_price numeric check (buy_price >= 0)
-, row_0 jsonb[] not null default '{}'::jsonb[]
+, row_0 jsonb not null default '[]'::jsonb -- TODO: check is array
 , check (not (sell_price is not null and buy_price is not null))
 );
 

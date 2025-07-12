@@ -107,7 +107,7 @@ Deno.test(async function allTests(t) {
 
     {
       const templates: Template[] = [
-        ["template", ["net-hook"]],
+        ["template", ["net-hook", []]],
         ["doc", [["a", "string", 0]]],
         ["net-hook", []],
         ["net-http", ["http://127.0.0.1:5049/test", 1000]],
@@ -119,42 +119,53 @@ Deno.test(async function allTests(t) {
         await put(jwt, `/library/template:${hand.documentId}`, {});
       }
 
-      const sheets = await get<Doc>(jwt, `/library`);
-      const header = sheets.shift();
-      // TODO: Assert header.
+      const [cols, ...rows] = await get<Doc>(jwt, `/library`);
+      assert(cols.length);
+      assertEquals(
+        cols.map(col => col[0]).join(),
+        "type,doc_id,name,tags,created_at",
+      );
+      assert(rows.length);
       // TODO: Update rows.
-      // TODO: Assert.
-      assert(sheets.length);
-      for (const [type, doc_id] of sheets)
+      for (const [type, doc_id] of rows)
         switch (type) {
         }
     }
 
     {
-      const sheets = await get<Doc>(jwt, `/library`);
-      const header = sheets.shift();
-      // TODO: Assert header.
-      assert(sheets.length);
-      for (const [type, doc_id] of sheets) {
+      const [cols, ...rows] = await get<Doc>(jwt, `/library`);
+      assert(cols.length);
+      assertEquals(
+        cols.map(col => col[0]).join(),
+        "type,doc_id,name,tags,created_at",
+      );
+      assert(rows.length);
+      for (const [type, doc_id] of rows) {
         const sheet_id = type + ":" + doc_id;
         const meta = { name: `Example ${type}`, tags: ["tag1", "tag2"] };
         await put(jwt, `/library/${sheet_id}`, meta);
-        await post(jwt, `/sell/${sheet_id}`, {});
-        await put(jwt, `/sell/${sheet_id}`, {});
+        await post(jwt, `/sell/${sheet_id}`, { price: 0 });
       }
     }
   }
 
-  await get<Doc>("", `/shop`);
+  {
+    const [cols, ...rows] = await get<Doc>("", `/shop`);
+    assert(cols.length);
+    assert(rows.length);
+  }
 
   {
     const { jwt } = await usr("bob@example.com");
 
-    const shop = await get<Doc>(jwt, `/shop`);
-    const header = shop.shift();
-    // TODO: Assert header.
-    assert(shop.length);
-    for (const [sell_id] of shop) {
+    const [cols, ...rows] = await get<Doc>(jwt, `/shop`);
+    assert(cols.length);
+    assertEquals(
+      cols.map(col => col[0]).join(),
+      "sell_id,sell_type,sell_price,name",
+    );
+    assert(rows.length);
+    for (const [sell_id] of rows) {
       const { data: sheet_id } = await post(jwt, `/buy/${sell_id}`, {});
       const [type, _doc_id] = sheet_id.split(":");
       switch (type) {
@@ -359,5 +370,5 @@ Deno.test(async function allTests(t) {
   listener.close();
   await pglite.close();
 
-  await new Promise(res => setTimeout(res, 100));
+  await new Promise(res => setTimeout(res, 250));
 });
