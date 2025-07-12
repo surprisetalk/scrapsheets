@@ -102,7 +102,8 @@ Deno.test(async function allTests(t) {
         ["net-http", ["http://127.0.0.1:5049/test", 1000]],
         ["net-socket", ["ws://127.0.0.1:5051/test"]],
         ["query", ["sql", "select 123 as a, 456 as b, 789 as c", []]],
-        // TODO: codex-db
+        ["codex-db", []],
+        ["codex-scrapsheets", []],
       ];
       for (const template of templates) {
         const hand = automerge.create<{ data: Sheet["data"] }>({
@@ -174,7 +175,6 @@ Deno.test(async function allTests(t) {
       for (const [, sell_id] of rows) {
         const { data: sheet_id } = await post(jwt, `/buy/${sell_id}`, {});
         const [type, doc_id] = sheet_id.split(":");
-        // TODO: Ensure that all doc types are represented.
         switch (type) {
           case "doc": {
             const hand = await automerge.find<{ data: Doc }>(
@@ -183,6 +183,54 @@ Deno.test(async function allTests(t) {
             hand.change(d => d.data.push([1, 2, 3], [4, 5, 6], [7, 8, 9]));
             break;
           }
+          case "portal": {
+            const [cols, ...rows] = await get<Doc>(jwt, `/portal/${doc_id}`);
+            assert(cols.length);
+            // TODO:
+            break;
+          }
+          case "net-socket":
+          // TODO: Send socket message.
+          case "net-http":
+          case "net-hook": {
+            await post(jwt, `/net/${type}:${doc_id}`, { foo: "bar" });
+            const [cols, ...rows] = await get<Doc>(
+              jwt,
+              `/net/${type}:${doc_id}`,
+            );
+            assert(cols.length);
+            assertEquals(cols.map(col => col[0]).join(), "created_at,body");
+            assert(rows.length);
+            break;
+          }
+          case "query": {
+            const hand = await automerge.find<{ data: Doc }>(
+              doc_id as AM.AnyDocumentId,
+            );
+            const [[lang, code, args]] = hand.doc().data;
+            const {
+              data: [cols, ...rows],
+            }: { data: Doc } = await post(jwt, `/query`, { lang, code, args });
+            assert(cols.length);
+            assertEquals(cols.map(col => col[0]).join(), "a,b,c");
+            assert(rows.length);
+            break;
+          }
+          case "codex-db": {
+            await post(
+              jwt,
+              `/codex-db/${doc_id}`,
+              "postgresql://localhost:5434",
+            );
+            const [cols, ...rows] = await get<Doc>(
+              jwt,
+              `/codex/codex-db:${doc_id}`,
+            );
+            // TODO:
+            break;
+          }
+          default:
+            throw new Error(`Not implemented: ${type}`);
         }
 
         // Charlie does not have access to the purchased sheets.

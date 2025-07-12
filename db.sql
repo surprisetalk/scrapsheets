@@ -26,7 +26,7 @@ create table sheet
 );
 
 create table db
-( db_id bigint not null generated always as identity primary key
+( sheet_id text not null primary key references sheet (sheet_id)
 , dsn text not null -- TODO: Encrypt this.
 );
 

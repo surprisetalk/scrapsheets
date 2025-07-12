@@ -338,6 +338,7 @@ app.get("/shop", async c => {
       from: sql`from sheet s`,
       where: [
         sql`sell_price >= 0`,
+        sql`sell_type is not null`,
         qs.name && sql`name ilike ${qs.name + "%"}`,
         qs.sell_type && sql`sell_type = ${qs.sell_type}`,
         qs.sell_price &&
@@ -458,6 +459,7 @@ app.put("/library/:id", async c => {
   return c.json(null, 200);
 });
 
+// TODO: This currently takes sheet_id, but we want it to take doc_id.
 app.get("/net/:id", async c => {
   return page(c)(await sheet(c, c.req.param("id"), c.req.query()));
 });
@@ -468,8 +470,27 @@ app.post("/query", async c => {
 });
 
 app.get("/codex/:id", async c => {
-  // TODO:
-  return c.json(null, 500);
+  const [type, doc_id] = c.req.param("id").split(":");
+  switch (type) {
+    case "codex-db":
+      // TODO:
+      return c.json(null, 500);
+    default:
+      throw new HTTPException(400, {
+        message: `Unrecognized codex type: ${type}`,
+      });
+  }
+});
+
+app.post("/codex-db/:id", async c => {
+  const sheet_id = `codex-db:${c.req.param("id")}`;
+  await sql`
+    insert into db (sheet_id, dsn) 
+    select ${sheet_id}, ${await c.req.json()}
+    where exists (select true from sheet_usr su where (su.sheet_id,su.usr_id) = (${sheet_id},${c.get("usr_id")}))
+    on conflict (sheet_id) do update set dsn = excluded.dsn
+  `;
+  return c.json(null, 200);
 });
 
 app.get("/codex/:id/connect", async c => {
@@ -488,7 +509,9 @@ app.get("/portal/:id", async c => {
     from sheet_usr su
     inner join sheet s using (sheet_id)
     inner join sheet s_ on s_.sell_id = s.buy_id
-    where s.type = 'portal' and su.usr_id = ${c.get("usr_id")}
+    where true
+      and su.usr_id = ${c.get("usr_id")} 
+      and su.sheet_id = ${"portal:" + c.req.param("id")}
   `;
   if (!sheet_) throw new HTTPException(404, { message: "Not found." });
   return page(c)(await sheet(c, sheet_.sheet_id, c.req.query()));
