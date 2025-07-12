@@ -4,6 +4,7 @@ import { PostgresConnection } from "npm:pg-gateway";
 import { citext } from "npm:@electric-sql/pglite/contrib/citext";
 import { app, sql, createJwt, automerge } from "./main.ts";
 import type { Sheet, Template, Doc, Table } from "./main.ts";
+import * as AM from "npm:@automerge/automerge-repo";
 
 const request = async (jwt: string, route: string, options?: object) => {
   const res = await app.request(route, {
@@ -106,6 +107,7 @@ Deno.test(async function allTests(t) {
     const { jwt } = await usr("alice@example.com");
 
     {
+      // TODO: Even more complicated queries, etc.
       const templates: Template[] = [
         ["template", ["net-hook", []]],
         ["doc", [["a", "string", 0]]],
@@ -179,6 +181,17 @@ Deno.test(async function allTests(t) {
         const { jwt } = await usr("charlie@example.com");
         await reject(jwt, `/${type}/${sheet_id}`, {});
       }
+    }
+
+    {
+      const [_, row] = await get<Doc>(jwt, `/library?type=page`);
+      assertEquals(row[0], "page");
+      assert(AM.isValidDocumentId(row[1]));
+      await post(jwt, `/query`, {
+        lang: "sql",
+        code: `select * from @page:${row[1]}`,
+        args: [],
+      });
     }
   }
 

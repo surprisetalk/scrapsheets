@@ -390,6 +390,7 @@ app.get("/library", async c => {
       where: [
         sql`su.usr_id = ${c.get("usr_id")}`,
         qs.sheet_id && sql`sheet_id = ${qs.sheet_id}`,
+        qs.type && sql`type = ${qs.type}`,
       ],
       order: undefined,
       limit,
@@ -434,7 +435,7 @@ app.get("/net/:id", async c => {
 });
 
 app.post("/query", async c => {
-  const { lang, code, args } = await c.req.json();
+  const { lang, code, args = [] } = await c.req.json();
   return page(c)(await querify(c, [lang, code, args], c.req.query()));
 });
 
