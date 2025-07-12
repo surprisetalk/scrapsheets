@@ -47,23 +47,6 @@ async function get<T>(
       new URLSearchParams(query as Record<string, string>).toString(),
   ).then(res => res.data);
 }
-async function get1<T>(
-  jwt: string,
-  route: string,
-  query: Record<string, string | number>,
-): Promise<T> {
-  return await get<T[]>(jwt, route, query as Record<string, string>)
-    .then(xs => xs?.[0])
-    .then(
-      x => (
-        assert(
-          x,
-          `Expected one but got none: ${route} ${JSON.stringify(query)}`,
-        ),
-        x
-      ),
-    );
-}
 
 const post = (jwt: string, route: string, body: unknown) =>
   request(jwt, route, { method: "POST", body: JSON.stringify(body) });
