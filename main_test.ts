@@ -133,13 +133,9 @@ Deno.test(async function allTests(t) {
       assert(cols.length);
       assertEquals(
         cols.map(col => col[0]).join(),
-        "type,doc_id,name,tags,created_at",
+        "created_at,type,doc_id,name,tags,sell_price",
       );
-      assert(rows.length);
-      // TODO: Update rows.
-      for (const [type, doc_id] of rows)
-        switch (type) {
-        }
+      assertEquals(rows.length, templates.length);
     }
 
     {
@@ -147,7 +143,7 @@ Deno.test(async function allTests(t) {
       assert(cols.length);
       assertEquals(
         cols.map(col => col[0]).join(),
-        "type,doc_id,name,tags,created_at",
+        "created_at,type,doc_id,name,tags,sell_price",
       );
       assert(rows.length);
       for (const [type, doc_id] of rows) {
@@ -155,6 +151,13 @@ Deno.test(async function allTests(t) {
         const meta = { name: `Example ${type}`, tags: ["tag1", "tag2"] };
         await put(jwt, `/library/${sheet_id}`, meta);
         await post(jwt, `/sell/${sheet_id}`, { price: 0 });
+        const [, [, , , name, tags, sell_price]] = await get<Doc>(
+          jwt,
+          `/library`,
+        );
+        assertEquals(name, meta.name);
+        assertEquals(tags, meta.tags);
+        assertEquals(sell_price, 0);
       }
     }
   }
@@ -200,7 +203,7 @@ Deno.test(async function allTests(t) {
     }
 
     {
-      const [_, row] = await get<Doc>(jwt, `/library`, { type: "doc" });
+      const [, row] = await get<Doc>(jwt, `/library`, { type: "doc" });
       assert(row);
       assertEquals(row[0], "doc");
       assert(AM.isValidDocumentId(row[1]));

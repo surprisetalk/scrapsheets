@@ -407,7 +407,7 @@ app.get("/library", async c => {
   const { limit, offset, ...qs } = c.req.query();
   return page(c)(
     await cselect({
-      select: sql`select s.type, s.doc_id, s.name, s.tags, s.created_at`,
+      select: sql`select s.created_at, s.type, s.doc_id, s.name, s.tags, s.sell_price`,
       from: sql`
         from sheet_usr su 
         inner join sheet s using (sheet_id) 
