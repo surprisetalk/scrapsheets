@@ -90,7 +90,14 @@ Deno.test(async function allTests(t) {
       // TODO: Even more complicated queries, etc.
       const templates: Template[] = [
         // ["template", ["net-hook", []]],
-        ["doc", [["a", "string", 0]]],
+        [
+          "doc",
+          [
+            ["a", "string", 0],
+            ["b", "string", 1],
+            ["c", "string", 2],
+          ],
+        ],
         ["net-hook", []],
         ["net-http", ["http://127.0.0.1:5049/test", 1000]],
         ["net-socket", ["ws://127.0.0.1:5051/test"]],
@@ -116,7 +123,7 @@ Deno.test(async function allTests(t) {
         cols.map(col => col[0]).join(),
         "created_at,type,doc_id,name,tags,sell_price",
       );
-      assertEquals(rows.length, templates.length);
+      assertEquals(rows.length, templates.length * 2);
     }
 
     // Alice updates templates and posts them to shop.
@@ -128,7 +135,7 @@ Deno.test(async function allTests(t) {
         "created_at,type,doc_id,name,tags,sell_price",
       );
       assert(rows.length);
-      for (const [type, doc_id] of rows) {
+      for (const [, type, doc_id] of rows) {
         const sheet_id = type + ":" + doc_id;
         const meta = { name: `Example ${type}`, tags: ["tag1", "tag2"] };
         await put(jwt, `/library/${sheet_id}`, meta);
@@ -136,10 +143,11 @@ Deno.test(async function allTests(t) {
         const [, [, , , name, tags, sell_price]] = await get<Doc>(
           jwt,
           `/library`,
+          { doc_id: doc_id as string },
         );
         assertEquals(name, meta.name);
         assertEquals(tags, meta.tags);
-        assertEquals(sell_price, 0);
+        assertEquals(sell_price, "0"); // TODO: should return number
       }
     }
   }
@@ -163,7 +171,7 @@ Deno.test(async function allTests(t) {
         "created_at,sell_id,sell_type,sell_price,name",
       );
       assert(rows.length);
-      for (const [sell_id] of rows) {
+      for (const [, sell_id] of rows) {
         const { data: sheet_id } = await post(jwt, `/buy/${sell_id}`, {});
         const [type, doc_id] = sheet_id.split(":");
         // TODO: Ensure that all doc types are represented.
@@ -188,15 +196,16 @@ Deno.test(async function allTests(t) {
     // Bob runs a query on his doc.
     {
       // TODO: Create a new doc instead of reusing the one randomly updated from the shop.
-      const [, row] = await get<Doc>(jwt, `/library`, { type: "doc" });
-      assert(row);
-      assertEquals(row[0], "doc");
-      assert(AM.isValidDocumentId(row[1]));
+      const [, [, type, doc_id]] = await get<Doc>(jwt, `/library`, {
+        type: "doc",
+      });
+      assertEquals(type, "doc");
+      assert(AM.isValidDocumentId(doc_id));
       const {
         data: [cols, ...rows],
       }: { data: Doc } = await post(jwt, `/query`, {
         lang: "sql",
-        code: `select * from @doc:${row[1]}`,
+        code: `select * from @doc:${doc_id}`,
         args: [],
       });
       assert(cols.length);

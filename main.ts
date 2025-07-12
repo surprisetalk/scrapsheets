@@ -124,7 +124,9 @@ const querify = async (
       if (docs[sheet_id]) continue;
       const [cols, ...rows] = (await sheet(c, sheet_id, {})).data;
       docs[sheet_id] = rows.map(row =>
-        Object.fromEntries(row.map((x, i) => [cols[i][0], x])),
+        Object.fromEntries(
+          row.map((x, i) => [cols[i]?.[0] ?? i.toString(), x]),
+        ),
       );
     }
     const {
@@ -415,6 +417,7 @@ app.get("/library", async c => {
       where: [
         sql`su.usr_id = ${c.get("usr_id")}`,
         qs.sheet_id && sql`sheet_id = ${qs.sheet_id}`,
+        qs.doc_id && sql`doc_id = ${qs.doc_id}`,
         qs.type && sql`type = ${qs.type}`,
       ],
       order: undefined,
