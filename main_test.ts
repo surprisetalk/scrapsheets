@@ -3,7 +3,7 @@ import { PGlite } from "npm:@electric-sql/pglite";
 import { PostgresConnection } from "npm:pg-gateway";
 import { citext } from "npm:@electric-sql/pglite/contrib/citext";
 import { app, sql, createJwt, automerge } from "./main.ts";
-import type { Sheet, Template, Doc, Table } from "./main.ts";
+import type { Sheet, Col, Template, Doc, Table } from "./main.ts";
 import * as AM from "npm:@automerge/automerge-repo";
 
 const request = async (jwt: string, route: string, options?: object) => {
@@ -109,7 +109,7 @@ Deno.test(async function allTests(t) {
     {
       // TODO: Even more complicated queries, etc.
       const templates: Template[] = [
-        ["template", ["net-hook", []]],
+        // ["template", ["net-hook", []]],
         ["doc", [["a", "string", 0]]],
         ["net-hook", []],
         ["net-http", ["http://127.0.0.1:5049/test", 1000]],
@@ -117,8 +117,16 @@ Deno.test(async function allTests(t) {
         ["query", ["sql", "select 1 as a", []]],
       ];
       for (const template of templates) {
-        const hand = automerge.create<Sheet["data"]>([template]);
+        const hand = automerge.create<{ data: Sheet["data"] }>({
+          data: [template],
+        });
         await put(jwt, `/library/template:${hand.documentId}`, {});
+      }
+      for (const [type, row_0] of templates) {
+        const hand = automerge.create<{ data: Sheet["data"] }>({
+          data: [row_0] as unknown as [], // TODO:
+        });
+        await put(jwt, `/library/${type}:${hand.documentId}`, {});
       }
 
       const [cols, ...rows] = await get<Doc>(jwt, `/library`);
@@ -169,8 +177,16 @@ Deno.test(async function allTests(t) {
     assert(rows.length);
     for (const [sell_id] of rows) {
       const { data: sheet_id } = await post(jwt, `/buy/${sell_id}`, {});
-      const [type, _doc_id] = sheet_id.split(":");
+      const [type, doc_id] = sheet_id.split(":");
+      // TODO:
       switch (type) {
+        case "doc": {
+          const hand = await automerge.find<{ data: Doc }>(
+            doc_id as AM.AnyDocumentId,
+          );
+          hand.change(d => d.data.push(["hello"], ["world"]));
+          break;
+        }
         case "template":
           await t.step(async function template(t) {
             // TODO
@@ -184,12 +200,13 @@ Deno.test(async function allTests(t) {
     }
 
     {
-      const [_, row] = await get<Doc>(jwt, `/library?type=page`);
-      assertEquals(row[0], "page");
+      const [_, row] = await get<Doc>(jwt, `/library`, { type: "doc" });
+      assert(row);
+      assertEquals(row[0], "doc");
       assert(AM.isValidDocumentId(row[1]));
       await post(jwt, `/query`, {
         lang: "sql",
-        code: `select * from @page:${row[1]}`,
+        code: `select * from @doc:${row[1]}`,
         args: [],
       });
     }

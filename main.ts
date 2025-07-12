@@ -16,7 +16,7 @@ import ala from "npm:alasql";
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
 const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
 
-// ala.options.modifier = "RECORDSET";
+ala.options.modifier = "RECORDSET";
 
 export type Tag<T extends string, X extends Table> = {
   type: T;
@@ -67,14 +67,16 @@ const sheet = async (
   { limit, offset, ...qs }: Record<string, string>,
 ): Promise<Page> => {
   const [type, doc_id] = sheet_id.split(":");
-  const hand = await automerge.find(doc_id as AnyDocumentId).catch(() => ({
-    doc: () => {
-      throw new HTTPException(404, { message: "Sheet not found." });
-    },
-  }));
+  const hand = await automerge
+    .find<{ data: Sheet["data"] }>(doc_id as AnyDocumentId)
+    .catch(() => ({
+      doc: () => {
+        throw new HTTPException(404, { message: "Sheet not found." });
+      },
+    }));
   switch (type) {
     case "doc": {
-      const doc = hand.doc() as Doc;
+      const doc = hand.doc().data as Doc;
       return { data: doc, count: doc.length - 1, offset: 0 };
     }
     case "net-hook":
@@ -91,7 +93,11 @@ const sheet = async (
         offset,
       });
     case "query":
-      return await querify(c, hand.doc() as Query, { limit, offset, ...qs });
+      return await querify(c, hand.doc().data[0] as Query, {
+        limit,
+        offset,
+        ...qs,
+      });
     case "template":
       throw new HTTPException(500, { message: "Bad template." });
     case "portal":
@@ -103,7 +109,7 @@ const sheet = async (
 
 const querify = async (
   c: Context,
-  [[lang, code, args]]: Query,
+  [lang, code, args]: Query,
   reqQuery: Record<string, string>,
 ): Promise<Page> => {
   if (lang === "sql") {
@@ -116,6 +122,15 @@ const querify = async (
     const docs: Record<string, Doc> = {};
     for (const sheet_id of sheet_ids)
       docs[sheet_id] = docs[sheet_id] ?? (await sheet(c, sheet_id, {})).data;
+    console.log(
+      // TODO: We need to "hydrate" the column names on each row and remove the header row.
+      code_,
+      docs,
+      await ala(
+        code_,
+        sheet_ids.map(id => docs[id]),
+      ),
+    );
     const { columns: cols, data: rows }: any = await ala(
       code_,
       sheet_ids.map(id => docs[id]),
@@ -342,10 +357,13 @@ app.post("/buy/:id", async c => {
   const sheet_id = await sql.begin(async sql => {
     const [sheet] =
       await sql`select * from sheet where sell_id = ${c.req.param("id")} and sell_price >= 0`;
+    if (!sheet) throw new HTTPException(404, { message: "Not found." });
     const row_0 = sheet.type === "template" ? sheet.row_0[1] : [];
+    if (!sheet.sell_type)
+      throw new HTTPException(400, { message: "Not for sale." });
     const doc_id = sheet.sell_type.startsWith("codex-")
       ? Math.random().toString().slice(2)
-      : automerge.create([row_0]).documentId;
+      : automerge.create({ data: [row_0] }).documentId;
     const [{ sheet_id }] = await sql`
       with sell as (
         select * from sheet where sell_id = ${c.req.param("id")} and sell_price >= 0
@@ -418,8 +436,8 @@ app.put("/library/:id", async c => {
       type,
       doc_id,
       row_0: await automerge
-        .find<Doc>(doc_id as AnyDocumentId)
-        .then(hand => hand.doc()[0]),
+        .find<{ data: Doc }>(doc_id as AnyDocumentId)
+        .then(hand => hand.doc().data[0]),
       created_by: c.get("usr_id"),
     };
     await sql`
