@@ -106,6 +106,7 @@ Deno.test(async function allTests(t) {
   {
     const { jwt } = await usr("alice@example.com");
 
+    // Alice creates templates.
     {
       // TODO: Even more complicated queries, etc.
       const templates: Template[] = [
@@ -114,7 +115,7 @@ Deno.test(async function allTests(t) {
         ["net-hook", []],
         ["net-http", ["http://127.0.0.1:5049/test", 1000]],
         ["net-socket", ["ws://127.0.0.1:5051/test"]],
-        ["query", ["sql", "select 1 as a", []]],
+        ["query", ["sql", "select 123 as a, 456 as b, 789 as c", []]],
       ];
       for (const template of templates) {
         const hand = automerge.create<{ data: Sheet["data"] }>({
@@ -138,6 +139,7 @@ Deno.test(async function allTests(t) {
       assertEquals(rows.length, templates.length);
     }
 
+    // Alice updates templates and posts them to shop.
     {
       const [cols, ...rows] = await get<Doc>(jwt, `/library`);
       assert(cols.length);
@@ -162,6 +164,7 @@ Deno.test(async function allTests(t) {
     }
   }
 
+  // The shop is publicly viewable.
   {
     const [cols, ...rows] = await get<Doc>("", `/shop`);
     assert(cols.length);
@@ -171,233 +174,56 @@ Deno.test(async function allTests(t) {
   {
     const { jwt } = await usr("bob@example.com");
 
-    const [cols, ...rows] = await get<Doc>(jwt, `/shop`);
-    assert(cols.length);
-    assertEquals(
-      cols.map(col => col[0]).join(),
-      "sell_id,sell_type,sell_price,name",
-    );
-    assert(rows.length);
-    for (const [sell_id] of rows) {
-      const { data: sheet_id } = await post(jwt, `/buy/${sell_id}`, {});
-      const [type, doc_id] = sheet_id.split(":");
-      // TODO:
-      switch (type) {
-        case "doc": {
-          const hand = await automerge.find<{ data: Doc }>(
-            doc_id as AM.AnyDocumentId,
-          );
-          hand.change(d => d.data.push(["hello"], ["world"]));
-          break;
+    // Bob purchases everything in the shop.
+    {
+      const [cols, ...rows] = await get<Doc>(jwt, `/shop`);
+      assert(cols.length);
+      assertEquals(
+        cols.map(col => col[0]).join(),
+        "created_at,sell_id,sell_type,sell_price,name",
+      );
+      assert(rows.length);
+      for (const [sell_id] of rows) {
+        const { data: sheet_id } = await post(jwt, `/buy/${sell_id}`, {});
+        const [type, doc_id] = sheet_id.split(":");
+        // TODO: Ensure that all doc types are represented.
+        switch (type) {
+          case "doc": {
+            const hand = await automerge.find<{ data: Doc }>(
+              doc_id as AM.AnyDocumentId,
+            );
+            hand.change(d => d.data.push([1, 2, 3], [4, 5, 6], [7, 8, 9]));
+            break;
+          }
         }
-        case "template":
-          await t.step(async function template(t) {
-            // TODO
-          });
-          break;
-      }
-      {
-        const { jwt } = await usr("charlie@example.com");
-        await reject(jwt, `/${type}/${sheet_id}`, {});
+
+        // Charlie does not have access to the purchased sheets.
+        {
+          const { jwt } = await usr("charlie@example.com");
+          await reject(jwt, `/${type}/${sheet_id}`, {});
+        }
       }
     }
 
+    // Bob runs a query on his doc.
     {
+      // TODO: Create a new doc instead of reusing the one randomly updated from the shop.
       const [, row] = await get<Doc>(jwt, `/library`, { type: "doc" });
       assert(row);
       assertEquals(row[0], "doc");
       assert(AM.isValidDocumentId(row[1]));
-      await post(jwt, `/query`, {
+      const {
+        data: [cols, ...rows],
+      }: { data: Doc } = await post(jwt, `/query`, {
         lang: "sql",
         code: `select * from @doc:${row[1]}`,
         args: [],
       });
+      assert(cols.length);
+      assertEquals(cols.map(col => col[0]).join(), "a,b,c");
+      assert(rows.length);
     }
   }
-
-  /*
-
-  await t.step(async function createSheet(t) {
-    await post(jwt, `/library`, emptyPage);
-  });
-
-  await t.step(async function viewLibrary(t) {
-    await post(jwt, `/library`, emptyPage);
-    const sheets = await get<LibraryItem[]>(jwt, `/library`);
-    assert(sheets.length);
-  });
-
-  await t.step(async function editSheetMetadata(t) {
-    const { data: id } = await post(jwt, `/library`, emptyPage);
-    const meta = { name: "Example", tags: ["tag1", "tag2"] };
-    await patch(jwt, `/library/${id}`, meta);
-    const sheets = await get<LibraryItem[]>(jwt, `/library`, { sheet_id: id });
-    assertEquals(sheets?.[0]?.sheet_id, id);
-    assertEquals(sheets?.[0]?.name, meta.name);
-    assertEquals(sheets?.[0]?.tags, meta.tags);
-  });
-
-  await t.step(async function editPage(t) {
-    const { sheet_id, type, doc_id } = await createTestSheet(jwt, emptyPage);
-    assertEquals(type, emptyPage.type);
-    const row: Row = { a: 1 };
-    {
-      const hand = await automerge.find<Page>(doc_id);
-      const sheet = hand.doc();
-      assert(sheet.rows.length === 0);
-      hand.change(doc => doc.rows.push(row));
-    }
-    {
-      const hand = await automerge.find<Page>(doc_id);
-      const sheet = hand.doc();
-      assertEquals(sheet.rows?.[0], row);
-    }
-  });
-
-  await t.step(async function runPortal(t) {
-    const sheets: Sheet[] = [
-      {
-        type: "template",
-        doc: {
-          type: "page",
-          doc: {
-            cols: [{ columnid: "a" }],
-            rows: [{ a: 1 }],
-          },
-        },
-      },
-      {
-        type: "page",
-        doc: {
-          cols: [{ columnid: "a" }],
-          rows: [{ a: 1 }],
-        },
-      },
-      {
-        type: "query",
-        doc: {
-          db_id: null,
-          lang: "sql",
-          code: "select 1 as a",
-        },
-      },
-    ];
-    for (const sheet_ of sheets) {
-      let sheet_id = "";
-      await t.step(async function sellSheet(t) {
-        const { jwt } = await createTestUser("bob@example.com");
-        const { data: sheet_id_ } = await post(jwt, `library`, sheet_);
-        assert(sheet_id_);
-        const { data } = await post(jwt, `/shop/sheet/sell/${sheet_id_}`, {});
-        assert(data);
-        sheet_id = data;
-      });
-      assert(sheet_id);
-      const [type, doc_id] = sheet_id.split(":");
-      assert(doc_id);
-      assertEquals(type, "portal");
-      assert(!AM.isValidDocumentId(doc_id));
-      await reject(jwt, `/portal/${doc_id}`);
-      await post(jwt, `/shop/sheet/buy/${sheet_id}`, {});
-      let sheet: Sheet = await get<Sheet>(jwt, `/portal/${doc_id}`);
-      if (sheet.type === "template") sheet = sheet.doc;
-      assertObjectMatch(sheet, {
-        type: "page",
-        doc: {
-          cols: [{ columnid: "a" }],
-          rows: [{ a: 1 }],
-        },
-      });
-    }
-  });
-
-  await t.step(async function runNet(t) {
-    const sheet_: Sheet = { type: "net", doc: null };
-    const { type, doc_id } = await createTestSheet(jwt, sheet_);
-    assertEquals(type, sheet_.type);
-    await post("", `/net/${doc_id}`, { foo: "bar" });
-    const sheet = await get<Sheet>(jwt, `/net/${doc_id}`);
-    assertEquals(sheet.type, "page");
-    assertEquals(
-      sheet.type === "page" && sheet.doc.rows?.[0]?.body,
-      '{"foo":"bar"}',
-    );
-  });
-
-  await t.step(async function runNetCron(t) {
-    // TODO: spin up temp http server and test locally
-  });
-
-  await t.step(async function runNetWebsocket(t) {
-    // TODO: spin up temp socket server and test locally
-  });
-
-  await t.step(async function saveQuery(t) {
-    const sheet_: Sheet = {
-      type: "query",
-      doc: {
-        db_id: null,
-        lang: "sql",
-        code: "select 1 as a",
-      },
-    };
-    const { sheet_id, type, doc_id } = await createTestSheet(jwt, sheet_);
-    assertEquals(type, sheet_.type);
-    const hand = await automerge.find<Query>(doc_id);
-    const sheet = hand.doc();
-    const { data }: { data: Sheet } = await post(jwt, `/query`, sheet);
-    assertObjectMatch(data, {
-      type: "page",
-      doc: {
-        cols: [{ columnid: "a" }],
-        rows: [{ a: 1 }],
-      },
-    });
-  });
-
-  await t.step(async function runQuery(t) {
-    const { data: sheet_id } = await post(jwt, `/library`, {
-      type: "page",
-      doc: {
-        cols: [{ columnid: "a" }],
-        rows: [{ a: 1 }],
-      },
-    });
-    const { data: db_id } = await post(jwt, `/db`, {
-      name: "example",
-      url: "postgresql://127.0.0.1:5434/postgres",
-    });
-    const queries: { query: Query; page: Page }[] = [
-      {
-        query: { db_id: null, lang: "sql", code: "select 1 as a" },
-        page: { cols: [{ columnid: "a" }], rows: [{ a: 1 }] },
-      },
-      {
-        query: {
-          db_id: null,
-          lang: "sql",
-          code: `select a from @${sheet_id}`,
-        },
-        page: { cols: [{ columnid: "a" }], rows: [{ a: 1 }] },
-      },
-      // // TODO: Open up another pglite DB at :5435 and use it to test.
-      // {
-      //   query: {
-      //     db_id: db_id,
-      //     lang: "sql",
-      //     code: `select a from example`,
-      //   },
-      //   page: { cols: [{ columnid: "a" }], rows: [{ a: 1 }] },
-      // },
-    ];
-    for (const { query, page } of queries)
-      await t.step(async function execQuery(t) {
-        const { data } = await post(jwt, `/query`, query);
-        assertObjectMatch(data, { type: "page", doc: page });
-      });
-  });
-
-  */
 
   await sql.end();
   listener.close();

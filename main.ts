@@ -332,7 +332,7 @@ app.get("/shop", async c => {
   const { limit, offset, ...qs } = c.req.query();
   return page(c)(
     await cselect({
-      select: sql`select sell_id, sell_type, sell_price, name`,
+      select: sql`select created_at, sell_id, sell_type, sell_price, name`,
       from: sql`from sheet s`,
       where: [
         sql`sell_price >= 0`,
