@@ -133,6 +133,7 @@ const querify = async (
       columns: cols,
       data: rows,
     }: { columns: { columnid: string }[]; data: Record<string, unknown>[] } =
+      // TODO: Consider just using postgresjs and passing in tables as ${sql([...])}
       await ala(
         code_,
         sheet_ids.map(id => docs[id]),
