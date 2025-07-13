@@ -135,6 +135,7 @@ type Peers
 
 
 type alias Sheet =
+    -- TODO: Add stats here? Or do they go down a level?
     { id : Id
     , name : String
     , tags : List String
@@ -145,7 +146,8 @@ type alias Sheet =
     , hover : Index
     , drag : Bool
     , write : Maybe String
-    , table : Result String Table
+    , schema : Result String Schema
+    , rows : Result String (Array Row)
     , tool : Tool
     }
 
@@ -153,13 +155,6 @@ type alias Sheet =
 type alias Svg =
     -- TODO: Generate nice preview Svg based on sheet contents.
     ()
-
-
-type alias Table =
-    -- TODO: Add stats here? Or do they go down a level?
-    { schema : Schema
-    , rows : Result String (Array Row)
-    }
 
 
 type Schema
@@ -289,15 +284,15 @@ number =
         ]
 
 
-tableDecoder : D.Decoder Table
-tableDecoder =
+schemaDecoder : D.Decoder Schema
+schemaDecoder =
     let
         col : D.Decoder Col
         col =
             D.map3 Col
-                (D.field "key" D.int)
-                (D.field "name" D.string)
-                (D.field "type" D.string
+                (D.index 2 D.int)
+                (D.index 0 D.string)
+                (D.index 1 D.string
                     |> D.map
                         (\typ_ ->
                             case typ_ of
@@ -327,50 +322,52 @@ tableDecoder =
     D.field "type" D.string
         |> D.andThen
             (\typ ->
-                case typ of
-                    "doc" ->
-                        D.map Doc
-                            (D.map2 Doc
-                                (D.field "cols" (D.array col))
-                                (D.field "rows"
-                                    (D.array
-                                        (D.oneOf
-                                            [ D.map (Dict.toList >> List.map (Tuple.mapFirst (Maybe.withDefault -1 << String.toInt)) >> Dict.fromList) (D.dict D.value)
-                                            , D.map (Dict.fromList << Array.toIndexedList) (D.array D.value)
-                                            ]
-                                        )
-                                    )
-                                )
-                            )
+                D.field "data" <|
+                    case typ of
+                        "doc" ->
+                            D.map Doc (D.index 0 (D.array col))
 
-                    "net" ->
-                        D.field "net" D.string
-                            |> D.andThen
-                                (\feed ->
-                                    case feed of
-                                        "websocket" ->
-                                            D.map2 (\url rows -> Net (Socket { url = url, rows = Maybe.withDefault Array.empty rows }))
-                                                (D.field "url" D.string)
-                                                (D.maybe (D.field "rows" (D.array D.value)))
+                        "net-hook" ->
+                            D.succeed (Net Hook)
 
-                                        "http" ->
-                                            D.map2 (\url rows -> Net (Http { url = url, rows = Maybe.withDefault Array.empty rows }))
-                                                (D.field "url" D.string)
-                                                (D.maybe (D.field "rows" (D.array D.value)))
-
-                                        feed_ ->
-                                            D.fail ("Bad feed type: " ++ feed_)
+                        "net-socket" ->
+                            D.index 0
+                                (D.map (\url -> Net (Socket { url = url }))
+                                    (D.index 0 D.string)
                                 )
 
-                    "query" ->
-                        D.map Query
-                            (D.map2 Query_
-                                (D.field "query" D.string)
-                                (D.map (Maybe.withDefault Array.empty) (D.maybe (D.field "rows" (D.array D.value))))
-                            )
+                        "net-http" ->
+                            D.index 0
+                                (D.map2 (\url interval -> Net (Http { url = url, interval = interval }))
+                                    (D.index 0 D.string)
+                                    (D.index 1 D.int)
+                                )
 
-                    typ_ ->
-                        D.fail ("Bad table type: " ++ typ_)
+                        "query" ->
+                            D.map Query
+                                (D.map3 Query_
+                                    (D.index 0 D.string)
+                                    (D.index 1 D.string)
+                                    (D.index 2 (D.dict D.value))
+                                )
+
+                        typ_ ->
+                            D.fail ("Bad table type: " ++ typ_)
+            )
+
+
+rowsDecoder : D.Decoder (Result String (Array Row))
+rowsDecoder =
+    D.field "type" D.string
+        |> D.andThen
+            (\typ ->
+                D.field "data" <|
+                    case typ of
+                        "doc" ->
+                            D.map (Ok << Array.slice 1 0) (D.array (D.array D.value))
+
+                        _ ->
+                            D.succeed (Err "Loading...")
             )
 
 
@@ -409,7 +406,7 @@ init flags url nav =
     route url
         { nav = nav
         , library = Dict.empty
-        , sheet = { default | table = flags.sheet |> D.decodeValue tableDecoder |> Result.mapError D.errorToString }
+        , sheet = default
         }
 
 
@@ -425,7 +422,8 @@ default =
     , hover = xy -1 -1
     , drag = False
     , write = Nothing
-    , table = Err "TODO: not loaded"
+    , schema = Err "Loading..."
+    , rows = Err "Loading..."
     , tool = Stats
     }
 
@@ -440,7 +438,7 @@ type Msg
     | LinkClick Browser.UrlRequest
     | LibraryChange (SheetMsg D.Value)
     | DocChange (SheetMsg SheetChange)
-    | TableMsg TableMsg
+    | SchemaMsg SchemaMsg
     | KeyPress String
     | CellMouseClick
     | CellMouseDown
@@ -449,7 +447,7 @@ type Msg
     | InputChange Input String
 
 
-type TableMsg
+type SchemaMsg
     = DocMsg DocMsg
     | QueryMsg ()
 
@@ -501,9 +499,8 @@ update msg ({ sheet } as model) =
             in
             ( { model
                 | sheet =
-                    [ { default | id = "", name = "library", table = Ok Library }
-                    , { default | id = "device", name = "device", table = Ok (Feed Device) }
-                    , { default | id = "shop", name = "shop", table = Ok (Feed Shop) }
+                    [ { default | id = "", name = "library", schema = Ok Library, rows = Err "TODO" }
+                    , { default | id = "shop", name = "shop", schema = Err "TODO", rows = Err "TODO" }
                     ]
                         |> List.map (\s -> ( s.id, s ))
                         |> Dict.fromList
@@ -543,7 +540,8 @@ update msg ({ sheet } as model) =
                 | sheet =
                     { default
                         | id = data.id
-                        , table = data.data.doc |> D.decodeValue tableDecoder |> Result.mapError D.errorToString
+                        , schema = data.data.doc |> D.decodeValue schemaDecoder |> Result.mapError D.errorToString
+                        , rows = data.data.doc |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString |> Result.andThen identity
                     }
               }
             , Cmd.none
@@ -758,97 +756,35 @@ view ({ sheet } as model) =
                 |> Dict.get sheet.id
                 |> Maybe.withDefault { name = "", tags = [], thumb = (), peers = Public }
 
-        table : Result String Doc
-        table =
-            case sheet.table of
-                Err err ->
-                    Err err
-
+        cols : Result String (Array Col)
+        cols =
+            case sheet.schema of
                 Ok (Doc doc) ->
                     Ok doc
 
                 Ok Library ->
-                    Ok
-                        { cols =
-                            [ ( "sheet_id", Link )
-                            , ( "name", Text )
-                            , ( "tags", Many Text )
-                            ]
-                                |> List.indexedMap (\i ( k, t ) -> Col i k t)
-                                |> Array.fromList
-                        , rows =
-                            model.library
-                                |> Dict.toList
-                                |> List.sortBy (Tuple.second >> .tags >> String.join ", ")
-                                |> List.map
-                                    (\( id, s ) ->
-                                        Dict.fromList <|
-                                            List.indexedMap Tuple.pair
-                                                [ E.string ("#" ++ id)
-                                                , E.string s.name
-                                                , E.list E.string s.tags
-                                                ]
-                                    )
-                                |> (++)
-                                    [ Dict.fromList <|
-                                        List.indexedMap Tuple.pair
-                                            [ E.string "/"
-                                            , E.string "library"
-                                            , E.list E.string []
-                                            ]
-                                    , Dict.fromList <|
-                                        List.indexedMap Tuple.pair
-                                            [ E.string "#shop"
-                                            , E.string "shop"
-                                            , E.list E.string []
-                                            ]
-                                    , Dict.fromList <|
-                                        List.indexedMap Tuple.pair
-                                            [ E.string "#device"
-                                            , E.string "device"
-                                            , E.list E.string []
-                                            ]
-                                    ]
-                                |> Array.fromList
-                        }
+                    [ ( "sheet_id", Link )
+                    , ( "name", Text )
+                    , ( "tags", Many Text )
+                    ]
+                        |> List.indexedMap (\i ( k, t ) -> Col i k t)
+                        |> Array.fromList
+                        |> Ok
 
-                Ok (Feed Shop) ->
-                    Ok
-                        -- TODO:
-                        { cols =
-                            Array.fromList
-                                [ Col 6 "Buy" Text, Col 0 "Type" Text, Col 1 "Publisher" Text, Col 2 "Name" Text, Col 3 "Downloads" Number, Col 4 "Rating" Number, Col 5 "Price" Number ]
-                        , rows =
-                            [ [ E.string "data", E.string "ScrapeSheets", E.string "Used Car Database", E.int 15420, E.float 4.7, E.float 4.2, E.string "Buy" ]
-                            , [ E.string "data", E.string "DataBroker", E.string "Social Network Connections", E.int 34567, E.float 3.5, E.float 179.99, E.string "Buy" ]
-                            , [ E.string "data", E.string "BizTools", E.string "Project Planning Suite", E.int 28456, E.float 4.7, E.float 8.99, E.string "Buy" ]
-                            , [ E.string "code", E.string "ScrapeSheets", E.string "Email Validator Pro", E.int 21456, E.float 4.5, E.float 0.75, E.string "Buy" ]
-                            , [ E.string "data", E.string "WeatherAPI", E.string "Historical Climate Data", E.int 14567, E.float 4.0, E.float 24.99, E.string "Buy" ]
-                            ]
-                                |> List.map (List.indexedMap Tuple.pair >> Dict.fromList)
-                                |> Array.fromList
-                        }
+                Ok (Net (Socket ws)) ->
+                    Ok (Array.fromList [ Col 0 "Payload" Json ])
 
-                Ok (Feed (Websocket ws)) ->
-                    Ok
-                        { cols = Array.fromList [ Col 0 "Payload" Json ]
-                        , rows = ws.rows |> Array.map (Dict.singleton 0)
-                        }
-
-                Ok (Feed (Http ws)) ->
-                    Ok
-                        { cols = Array.fromList [ Col 0 "Payload" Json ]
-                        , rows = ws.rows |> Array.map (Dict.singleton 0)
-                        }
+                Ok (Net (Http ws)) ->
+                    Ok (Array.fromList [ Col 0 "Payload" Json ])
 
                 Ok (Query query) ->
-                    Ok
-                        { cols = Array.fromList [ Col 0 "Row" Json ]
-                        , rows = query.rows |> Array.map (Dict.singleton 0)
-                        }
+                    Ok (Array.fromList [ Col 0 "Row" Json ])
 
-                error ->
-                    Err ("Unimplemented: " ++ Debug.toString error)
+                Err err ->
+                    Err err
+
+                _ ->
+                    Err "TODO: unimplemented"
     in
     { title = "scrapsheets"
     , body =
@@ -903,7 +839,7 @@ view ({ sheet } as model) =
                             Private peers ->
                                 H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ] <|
                                     List.map (\peer -> H.a [ A.href "?following=" ] [ text peer ]) <|
-                                        Dict.keys <|
+                                        Set.toList <|
                                             peers
                         ]
                     ]
@@ -914,18 +850,18 @@ view ({ sheet } as model) =
 
                 -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
                 , H.div [ S.overflowAuto ]
-                    [ case table of
+                    [ case cols of
                         Err err ->
                             H.p [] [ text err ]
 
-                        Ok doc ->
+                        Ok cols_ ->
                             H.table [ S.borderCollapseCollapse, S.width "100%", A.onMouseLeave (CellHover (xy -1 -1)) ]
                                 [ H.thead []
                                     [ H.tr [] <|
                                         -- TODO: Add additional header rows for stats and column def.
                                         (::)
                                             (H.th
-                                                [ A.onClick (TableMsg (DocMsg (SheetRowPush -1)))
+                                                [ A.onClick (SchemaMsg (DocMsg (SheetRowPush -1)))
                                                 , A.onMouseEnter (CellHover (xy -1 -1))
                                                 , S.textAlignRight
                                                 , S.widthRem 0.001
@@ -954,7 +890,7 @@ view ({ sheet } as model) =
                                                         ]
                                                 )
                                             <|
-                                                Array.toList doc.cols
+                                                Array.toList cols_
                                     ]
                                 , H.tbody [] <|
                                     Array.toList <|
@@ -963,7 +899,7 @@ view ({ sheet } as model) =
                                                 H.tr [] <|
                                                     (::)
                                                         (H.th
-                                                            [ A.onClick (TableMsg (DocMsg (SheetRowPush n)))
+                                                            [ A.onClick (SchemaMsg (DocMsg (SheetRowPush n)))
                                                             , A.onMouseEnter (CellHover (xy -1 n))
                                                             , S.textAlignRight
                                                             , S.widthRem 0.001
@@ -1001,7 +937,7 @@ view ({ sheet } as model) =
                                                                 <|
                                                                     Maybe.withDefault
                                                                         [ row
-                                                                            |> Dict.get col.key
+                                                                            |> Array.get col.key
                                                                             |> Maybe.withDefault (E.string "")
                                                                             |> D.decodeValue
                                                                                 (case col.typ of
@@ -1028,15 +964,19 @@ view ({ sheet } as model) =
                                                                         ]
                                                                     <|
                                                                         if sheet.write /= Nothing && sheet.select == rect i n i n then
-                                                                            Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (TableMsg (DocMsg (SheetWrite sheet.select.a))), S.width "100%" ] [] ]
+                                                                            Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (SchemaMsg (DocMsg (SheetWrite sheet.select.a))), S.width "100%" ] [] ]
 
                                                                         else
                                                                             Nothing
                                                             )
                                                         <|
-                                                            Array.toList doc.cols
+                                                            Array.toList cols_
                                             )
-                                            doc.rows
+                                        <|
+                                            -- TODO: Proper error handling.
+                                            Result.withDefault Array.empty
+                                            <|
+                                                sheet.rows
                                 ]
                     ]
                 ]
@@ -1047,7 +987,7 @@ view ({ sheet } as model) =
                     , case sheet.tool of
                         -- TODO: Hovering over columns/etc should highlight relevant cells, and vice versa.
                         Settings ->
-                            case sheet.table of
+                            case sheet.schema of
                                 Ok (Query query) ->
                                     [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
                                         [ text (String.trim query.query)
@@ -1058,7 +998,7 @@ view ({ sheet } as model) =
                                     -- TODO:
                                     [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%" ]
                                         -- TODO: Link to the column configs.
-                                        [ text (Debug.toString sheet.table)
+                                        [ text (Debug.toString sheet.schema)
                                         ]
                                     , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd, S.alignItemsBaseline ]
                                         [ H.button [ A.onClick NoOp ] [ text "new column (C)" ]
@@ -1070,20 +1010,22 @@ view ({ sheet } as model) =
                             []
 
                         Stats ->
-                            case table of
+                            case cols of
                                 Err _ ->
                                     [ H.p [] [ text "No data available" ] ]
 
-                                Ok doc ->
-                                    doc.cols
+                                Ok cols_ ->
+                                    cols_
                                         |> Array.toList
                                         |> List.map
                                             (\col ->
                                                 let
                                                     values =
-                                                        doc.rows
+                                                        sheet.rows
+                                                            -- TODO: Proper error handling.
+                                                            |> Result.withDefault Array.empty
                                                             |> Array.toList
-                                                            |> List.filterMap (Dict.get col.key)
+                                                            |> List.filterMap (Array.get col.key)
 
                                                     stats =
                                                         case col.typ of
