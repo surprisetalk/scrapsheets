@@ -156,6 +156,7 @@ type alias Svg =
 
 
 type alias Table =
+    -- TODO: Add stats here? Or do they go down a level?
     { schema : Schema
     , rows : Result String (Array Row)
     }
