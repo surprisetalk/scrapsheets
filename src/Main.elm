@@ -23,6 +23,7 @@ import Set exposing (Set)
 import Task exposing (Task)
 import Time exposing (Month(..))
 import Url exposing (Url)
+import Url.Parser as UrlP exposing ((</>))
 
 
 
@@ -114,9 +115,13 @@ type alias Id =
     String
 
 
+type alias Library =
+    Dict Id SheetInfo
+
+
 type alias Model =
     { nav : Nav.Key
-    , library : Dict Id SheetInfo
+    , library : Library
     , sheet : Sheet
     }
 
@@ -148,6 +153,8 @@ type alias Sheet =
     , write : Maybe String
     , schema : Result String Schema
     , rows : Result String (Array Row)
+
+    -- TODO: Move tool up a level.
     , tool : Tool
     }
 
@@ -287,72 +294,56 @@ number =
 schemaDecoder : D.Decoder Schema
 schemaDecoder =
     let
+        types : Dict String Type
+        types =
+            Dict.fromList
+                [ ( "bool", Boolean )
+                , ( "number", Number )
+                , ( "link", Link )
+                , ( "image", Image )
+                , ( "timestamp", Timestamp )
+                , ( "json", Json )
+                , ( "text", Text )
+                ]
+
         col : D.Decoder Col
         col =
             D.map3 Col
                 (D.index 2 D.int)
                 (D.index 0 D.string)
-                (D.index 1 D.string
-                    |> D.map
-                        (\typ_ ->
-                            case typ_ of
-                                "bool" ->
-                                    Boolean
-
-                                "number" ->
-                                    Number
-
-                                "link" ->
-                                    Link
-
-                                "image" ->
-                                    Image
-
-                                "timestamp" ->
-                                    Timestamp
-
-                                "json" ->
-                                    Json
-
-                                _ ->
-                                    Text
-                        )
-                )
+                (D.index 1 D.string |> D.map (flip Dict.get types >> Maybe.withDefault Text))
     in
     D.field "type" D.string
         |> D.andThen
             (\typ ->
                 D.field "data" <|
-                    case typ of
-                        "doc" ->
-                            D.map Doc (D.index 0 (D.array col))
+                    D.index 0 <|
+                        case typ of
+                            "doc" ->
+                                D.map Doc (D.array col)
 
-                        "net-hook" ->
-                            D.succeed (Net Hook)
+                            "net-hook" ->
+                                D.succeed (Net Hook)
 
-                        "net-socket" ->
-                            D.index 0
-                                (D.map (\url -> Net (Socket { url = url }))
+                            "net-socket" ->
+                                D.map (\url -> Net (Socket { url = url }))
                                     (D.index 0 D.string)
-                                )
 
-                        "net-http" ->
-                            D.index 0
-                                (D.map2 (\url interval -> Net (Http { url = url, interval = interval }))
+                            "net-http" ->
+                                D.map2 (\url interval -> Net (Http { url = url, interval = interval }))
                                     (D.index 0 D.string)
                                     (D.index 1 D.int)
-                                )
 
-                        "query" ->
-                            D.map Query
-                                (D.map3 Query_
-                                    (D.index 0 D.string)
-                                    (D.index 1 D.string)
-                                    (D.index 2 (D.dict D.value))
-                                )
+                            "query" ->
+                                D.map Query
+                                    (D.map3 Query_
+                                        (D.index 0 D.string)
+                                        (D.index 1 D.string)
+                                        (D.index 2 (D.dict D.value))
+                                    )
 
-                        typ_ ->
-                            D.fail ("Bad table type: " ++ typ_)
+                            typ_ ->
+                                D.fail ("Bad table type: " ++ typ_)
             )
 
 
@@ -376,42 +367,71 @@ rowsDecoder =
 
 
 type alias Flags =
-    { sheet : D.Value
+    -- TODO: Use D.Value and a decoder instead.
+    { library :
+        List
+            { id : String
+            , name : String
+            , tags : List String
+            , peers : List Id
+            }
     }
 
 
 route : Url -> Model -> ( Model, Cmd Msg )
 route url ({ sheet } as model) =
-    -- TODO: Store the ID in the path instead and serve from local server.
     let
         id : Id
         id =
-            url.fragment |> Maybe.withDefault ""
+            UrlP.parse (UrlP.top </> UrlP.string) url |> Maybe.withDefault ""
 
         tool : Tool
         tool =
-            tools |> Dict.get id |> Maybe.withDefault sheet.tool
+            tools |> Dict.get (url.fragment |> Maybe.withDefault "") |> Maybe.withDefault Stats
     in
-    ( { model | sheet = { sheet | tool = tool } }
-    , if Dict.member id tools then
-        Cmd.none
-
-      else
-        Nav.pushUrl model.nav (Url.toString url)
-    )
+    model.library
+        |> Dict.get id
+        |> Maybe.map
+            (\info ->
+                ( { model
+                    | sheet =
+                        -- TODO: Set the schema based on the ID type.
+                        { id = id
+                        , name = info.name
+                        , tags = info.tags
+                        , thumb = info.thumb
+                        , search = ""
+                        , tag = Nothing
+                        , select = Rect (xy -1 -1) (xy -1 -1)
+                        , hover = xy -1 -1
+                        , drag = False
+                        , write = Nothing
+                        , schema = Err "Loading..."
+                        , rows = Err "Loading..."
+                        , tool = tool
+                        }
+                  }
+                , Cmd.none
+                )
+            )
+        |> Maybe.withDefault ( { model | sheet = { sheet | tool = tool } }, Nav.pushUrl model.nav "/" )
+        |> iif (id == model.sheet.id) ( { model | sheet = { sheet | tool = tool } }, Cmd.none )
 
 
 init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
 init flags url nav =
-    route url
-        { nav = nav
-        , library = Dict.empty
-        , sheet = default
-        }
+    let
+        library : Library
+        library =
+            flags.library
+                |> List.map (\{ id, name, tags, peers } -> ( id, SheetInfo name tags () (Private (Set.fromList peers)) ))
+                |> Dict.fromList
+    in
+    route url { nav = nav, library = library, sheet = librarySheet library }
 
 
-default : Sheet
-default =
+librarySheet : Library -> Sheet
+librarySheet library =
     { id = ""
     , name = ""
     , tags = []
@@ -422,8 +442,8 @@ default =
     , hover = xy -1 -1
     , drag = False
     , write = Nothing
-    , schema = Err "Loading..."
-    , rows = Err "Loading..."
+    , schema = Ok Library
+    , rows = Err "TODO: list everything in library"
     , tool = Stats
     }
 
@@ -491,28 +511,11 @@ update msg ({ sheet } as model) =
             ( model, Cmd.none )
 
         UrlChange url ->
-            -- TODO: We should eventually change #:sheetId to /:sheetId, but for now it confuses stupid local webserver.
-            let
-                id : String
-                id =
-                    url.fragment |> Maybe.withDefault ""
-            in
-            ( { model
-                | sheet =
-                    [ { default | id = "", name = "library", schema = Ok Library, rows = Err "TODO" }
-                    , { default | id = "shop", name = "shop", schema = Err "TODO", rows = Err "TODO" }
-                    ]
-                        |> List.map (\s -> ( s.id, s ))
-                        |> Dict.fromList
-                        |> Dict.get id
-                        |> Maybe.withDefault model.sheet
-              }
-            , Cmd.none
-            )
+            route url model
 
         LinkClick (Browser.Internal url) ->
             -- TODO: ?q=+any ?q=-any ?q==any
-            route url model
+            ( model, Nav.pushUrl model.nav (Url.toString url) )
 
         LinkClick (Browser.External url) ->
             ( model, Nav.load url )
@@ -535,14 +538,14 @@ update msg ({ sheet } as model) =
             )
 
         DocChange data ->
-            -- TODO:
             ( { model
                 | sheet =
-                    { default
-                        | id = data.id
-                        , schema = data.data.doc |> D.decodeValue schemaDecoder |> Result.mapError D.errorToString
-                        , rows = data.data.doc |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString |> Result.andThen identity
-                    }
+                    iif (data.id /= sheet.id)
+                        sheet
+                        { sheet
+                            | schema = data.data.doc |> D.decodeValue schemaDecoder |> Result.mapError D.errorToString
+                            , rows = data.data.doc |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString |> Result.andThen identity
+                        }
               }
             , Cmd.none
             )
