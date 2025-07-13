@@ -102,15 +102,8 @@ type alias SheetInfo =
 
 
 type Peers
-    = Private (Dict Id Perm)
+    = Private (Set Id)
     | Public
-
-
-type alias Perm =
-    { read : Bool
-    , write : Bool
-    , share : Bool
-    }
 
 
 type alias Sheet =
@@ -134,17 +127,19 @@ type alias Svg =
     ()
 
 
-type Table
-    = Library
-    | TableDoc Doc
-    | TableFeed Feed
-    | TableQuery Query
-
-
-type alias Doc =
-    { cols : Array Col
-    , rows : Array Row
+type alias Table =
+    { schema : Schema
+    , rows : Result String (Array Row)
     }
+
+
+type Schema
+    = Library
+    | Doc (Array Col)
+    | Net Net
+    | Query Query
+    | Codex
+    | Portal Args
 
 
 type alias Col =
@@ -155,80 +150,24 @@ type alias Col =
 
 
 type alias Row =
-    Dict Int D.Value
+    Array D.Value
 
 
-type alias Commit =
-    { hash : String
-    , author : String
-    , email : String
-    , date : String
-    , message : String
-    }
-
-
-type
-    Feed
-    -- TODO: Move some of these to the shop as free templates.
-    -- TODO:   email, settings, databases, git, github, stripe, logs, sheets, tests, code stats, social media keywords
-    -- TODO: When you add feeds, it automatically adds some queries to your library, which you can hide?
-    = Device
-    | Shop
-    | Files
-    | Email {}
-    | Database {}
-    | OAuth {}
-    | Form {}
-    | Websocket { url : String, rows : Array D.Value }
-    | Webhook {}
-    | Kv {}
-    | Webdav {}
-    | Http { url : String, rows : Array D.Value }
-    | Git { url : String, rows : Array Commit }
-    | Crawler {}
-    | Code { lang : Lang, code : String }
-    | Rss { query : Query }
-    | Box { query : Query }
+type Net
+    = Hook
+    | Http { url : String, interval : Int }
+    | Socket { url : String }
 
 
 type alias Query =
-    -- -- TODO: queries fail if any sources not shared with you
-    -- -- TODO: row actions/abilities (e.g. delete) are cells/columns too
-    -- -- TODO: use PRQL AST?
-    -- = From { source : Source }
-    -- | Join { source : Source }
-    -- | Filter {}
-    -- | Select Select
-    { query : String, rows : Array D.Value }
+    { code : String
+    , query : String
+    , args : Args
+    }
 
 
-type Source
-    = Hole
-    | DocId Id
-    | FeedId Id
-    | QueryId Id
-
-
-type Select
-    = Columns {}
-    | Chart {}
-    | App {}
-
-
-type Lang
-    = Sql
-    | Prql
-    | Fql
-    | Gql
-    | Jq
-    | Scrapscript
-    | Js
-    | Python
-    | R
-    | Julia
-    | J
-    | K
-    | Apl
+type alias Args =
+    Dict String D.Value
 
 
 type alias Rect =
@@ -297,16 +236,6 @@ tools =
 
 
 ---- PARSER -------------------------------------------------------------------
-
-
-json : D.Decoder (Array Row)
-json =
-    D.oneOf
-        [ D.fail "array of column arrays" -- TODO
-        , D.fail "array of row arrays" -- TODO
-        , D.fail "array of objects" -- TODO
-        , D.fail "object of arrays" -- TODO
-        ]
 
 
 string : D.Decoder String
@@ -504,12 +433,10 @@ type Msg
     | CellMouseUp
     | CellHover Index
     | InputChange Input String
-    | RepoFetch (Result Http.Error (Array Commit))
 
 
 type TableMsg
     = DocMsg DocMsg
-    | FeedMsg ()
     | QueryMsg ()
 
 
