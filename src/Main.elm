@@ -121,6 +121,8 @@ type alias Library =
 
 type alias Model =
     { nav : Nav.Key
+    , id : String
+    , tool : Tool
     , library : Library
     , sheet : Sheet
     }
@@ -153,9 +155,6 @@ type alias Sheet =
     , write : Maybe String
     , schema : Result String Schema
     , rows : Result String (Array Row)
-
-    -- TODO: Move tool up a level.
-    , tool : Tool
     }
 
 
@@ -291,6 +290,11 @@ number =
         ]
 
 
+sheetDecoder : D.Decoder Sheet
+sheetDecoder =
+    D.fail "TODO"
+
+
 schemaDecoder : D.Decoder Schema
 schemaDecoder =
     let
@@ -367,84 +371,40 @@ rowsDecoder =
 
 
 type alias Flags =
-    -- TODO: Use D.Value and a decoder instead.
-    { library :
-        List
-            { id : String
-            , name : String
-            , tags : List String
-            , peers : List Id
-            }
-    }
-
-
-route : Url -> Model -> ( Model, Cmd Msg )
-route url ({ sheet } as model) =
-    let
-        id : Id
-        id =
-            UrlP.parse (UrlP.top </> UrlP.string) url |> Maybe.withDefault ""
-
-        tool : Tool
-        tool =
-            tools |> Dict.get (url.fragment |> Maybe.withDefault "") |> Maybe.withDefault Stats
-    in
-    model.library
-        |> Dict.get id
-        |> Maybe.map
-            (\info ->
-                ( { model
-                    | sheet =
-                        -- TODO: Set the schema based on the ID type.
-                        { id = id
-                        , name = info.name
-                        , tags = info.tags
-                        , thumb = info.thumb
-                        , search = ""
-                        , tag = Nothing
-                        , select = Rect (xy -1 -1) (xy -1 -1)
-                        , hover = xy -1 -1
-                        , drag = False
-                        , write = Nothing
-                        , schema = Err "Loading..."
-                        , rows = Err "Loading..."
-                        , tool = tool
-                        }
-                  }
-                , Cmd.none
-                )
-            )
-        |> Maybe.withDefault ( { model | sheet = { sheet | tool = tool } }, Nav.pushUrl model.nav "/" )
-        |> iif (id == model.sheet.id) ( { model | sheet = { sheet | tool = tool } }, Cmd.none )
+    {}
 
 
 init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
-init flags url nav =
-    let
-        library : Library
-        library =
-            flags.library
-                |> List.map (\{ id, name, tags, peers } -> ( id, SheetInfo name tags () (Private (Set.fromList peers)) ))
-                |> Dict.fromList
-    in
-    route url { nav = nav, library = library, sheet = librarySheet library }
+init _ url nav =
+    ( route url
+        { nav = nav
+        , id = ""
+        , tool = Stats
+        , library = Dict.empty
+        , sheet =
+            { id = ""
+            , name = ""
+            , tags = []
+            , thumb = ()
+            , search = ""
+            , tag = Nothing
+            , select = Rect (xy -1 -1) (xy -1 -1)
+            , hover = xy -1 -1
+            , drag = False
+            , write = Nothing
+            , schema = Err "Loading..."
+            , rows = Err "Loading..."
+            }
+        }
+    , Cmd.none
+    )
 
 
-librarySheet : Library -> Sheet
-librarySheet library =
-    { id = ""
-    , name = ""
-    , tags = []
-    , thumb = ()
-    , search = ""
-    , tag = Nothing
-    , select = Rect (xy -1 -1) (xy -1 -1)
-    , hover = xy -1 -1
-    , drag = False
-    , write = Nothing
-    , schema = Ok Library
-    , rows = Err "TODO: list everything in library"
-    , tool = Stats
+route : Url -> Model -> Model
+route url model =
+    { model
+        | id = UrlP.parse (UrlP.top </> UrlP.string) url |> Maybe.withDefault ""
+        , tool = tools |> Dict.get (url.fragment |> Maybe.withDefault "") |> Maybe.withDefault model.tool
     }
 
 
@@ -511,7 +471,9 @@ update msg ({ sheet } as model) =
             ( model, Cmd.none )
 
         UrlChange url ->
-            route url model
+            ( route url model
+            , Cmd.none
+            )
 
         LinkClick (Browser.Internal url) ->
             -- TODO: ?q=+any ?q=-any ?q==any
@@ -540,12 +502,10 @@ update msg ({ sheet } as model) =
         DocChange data ->
             ( { model
                 | sheet =
-                    iif (data.id /= sheet.id)
-                        sheet
-                        { sheet
-                            | schema = data.data.doc |> D.decodeValue schemaDecoder |> Result.mapError D.errorToString
-                            , rows = data.data.doc |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString |> Result.andThen identity
-                        }
+                    { sheet
+                        | schema = data.data.doc |> D.decodeValue schemaDecoder |> Result.mapError D.errorToString
+                        , rows = data.data.doc |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString |> Result.andThen identity
+                    }
               }
             , Cmd.none
             )
@@ -752,6 +712,7 @@ update msg ({ sheet } as model) =
 
 view : Model -> Browser.Document Msg
 view ({ sheet } as model) =
+    -- TODO: Show library sheet if (id == ""), otherwise show loading if (model.id /= model.sheet.id).
     let
         info : SheetInfo
         info =
@@ -985,9 +946,9 @@ view ({ sheet } as model) =
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 12, S.maxWidthRem 18, S.maxHeight "100vh", S.overflowHidden, S.overflowYAuto ] <|
                 List.concat
-                    [ [ H.span [] [ text (String.toLower (Debug.toString sheet.tool)), H.sup [] [ text "" ] ]
+                    [ [ H.span [] [ text (String.toLower (Debug.toString model.tool)), H.sup [] [ text "" ] ]
                       ]
-                    , case sheet.tool of
+                    , case model.tool of
                         -- TODO: Hovering over columns/etc should highlight relevant cells, and vice versa.
                         Settings ->
                             case sheet.schema of
