@@ -349,6 +349,9 @@ docDecoder =
                     "portal" ->
                         D.succeed (Portal Dict.empty)
 
+                    "template" ->
+                        D.fail "TODO: template"
+
                     typ_ ->
                         D.fail ("Bad table type: " ++ typ_)
             )
