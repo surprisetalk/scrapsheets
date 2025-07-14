@@ -35,7 +35,21 @@
         let library = {
           "": { name: "library", doc: { type: "library" } },
           "portal:shop": { name: "shop" },
-          "template:table": { name: "table", doc: { type: "template" } },
+          "template:table": {
+            name: "table",
+            doc: {
+              type: "template",
+              data: [
+                "table",
+                [
+                  ["a", "int", 0],
+                  ["b", "int", 1],
+                  ["c", "int", 2],
+                ],
+              ],
+            },
+          },
+          ...JSON.parse(localStorage.getItem("scrapsheets-library") ?? "{}"),
         };
         app.ports.librarySynced.send(library);
 
@@ -48,23 +62,51 @@
           let sheet;
 
           app?.ports?.changeId?.subscribe(async id => {
-            if (id === sheet?.documentId) return;
+            const [type, doc_id = ""] = id.split(":");
+            if (doc_id === sheet?.documentId) return;
             // TODO: Remove existing listeners.
-            sheet = await repo.find(id).catch(() => null);
+            sheet = await repo.find(doc_id).catch(() => null);
             const doc = library[id]?.doc ?? (await sheet?.doc?.());
             app.ports.docSelected.send({
               id,
               data: { doc: doc && { ...doc } },
             });
             sheet?.on?.("change", data => {
-              app.ports.docChanged.send({ id: data.handle.documentId, data });
+              app.ports.docChanged.send({
+                id: type + ":" + data.handle.documentId,
+                data,
+              });
+            });
+          });
+
+          app?.ports?.newDoc?.subscribe(async ({ type_: type, data }) => {
+            sheet = repo.create({ type, data: [data] });
+            const id = `${type}:${sheet.documentId}`;
+            localStorage.setItem(
+              "scrapsheets-library",
+              JSON.stringify({
+                ...JSON.parse(
+                  localStorage.getItem("scrapsheets-library") ?? "{}",
+                ),
+                [id]: { name: "", tags: [] },
+              }),
+            );
+            library = JSON.parse(
+              localStorage.getItem("scrapsheets-library") ?? "{}",
+            );
+            app.ports.librarySynced.send(library);
+            const doc = library[id]?.doc ?? (await sheet?.doc?.());
+            app.ports.docSelected.send({
+              id,
+              data: { doc: doc && { ...doc } },
             });
           });
 
           app?.ports?.changeDoc?.subscribe(
             // TODO: Use custom patches for now.
             ({ id, data: patches }) => {
-              if (!id || id !== sheet?.documentId) return;
+              const [type, doc_id] = id.split(":");
+              if (!doc_id || doc_id !== sheet?.documentId) return;
               for (const patch of patches) {
                 sheet?.change(d => {
                   if (!d.cols) d.cols = [];

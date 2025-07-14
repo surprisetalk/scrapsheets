@@ -64,6 +64,9 @@ port librarySynced : (D.Value -> msg) -> Sub msg
 port changeId : Id -> Cmd msg
 
 
+port newDoc : { type_ : String, data : Array Row } -> Cmd msg
+
+
 port changeDoc : Idd (List Patch) -> Cmd msg
 
 
@@ -177,6 +180,7 @@ type Doc
     | Query Query_
     | Codex
     | Portal Args
+    | Template ( String, Array Row )
 
 
 type alias Stats =
@@ -323,6 +327,11 @@ docDecoder =
                     "net-hook" ->
                         D.succeed (Net Hook)
 
+                    "portal" ->
+                        D.field "data" <|
+                            D.map Portal <|
+                                D.fail "TODO: args"
+
                     "net-socket" ->
                         D.field "data" <|
                             D.index 0 <|
@@ -346,11 +355,12 @@ docDecoder =
                                         (D.index 2 (D.dict D.value))
                                     )
 
-                    "portal" ->
-                        D.succeed (Portal Dict.empty)
-
                     "template" ->
-                        D.fail "TODO: template"
+                        D.field "data" <|
+                            D.map Template <|
+                                D.map2 Tuple.pair
+                                    (D.index 0 D.string)
+                                    (D.index 1 (D.array (D.array D.value)))
 
                     typ_ ->
                         D.fail ("Bad table type: " ++ typ_)
@@ -359,6 +369,13 @@ docDecoder =
 
 tableDecoder : D.Decoder Table
 tableDecoder =
+    D.map2 Table
+        (D.index 0 (D.array colDecoder))
+        (D.map (Array.slice 1 0) (D.array (D.array D.value)))
+
+
+colDecoder : D.Decoder Col
+colDecoder =
     let
         types : Dict String Type
         types =
@@ -371,17 +388,11 @@ tableDecoder =
                 , ( "json", Json )
                 , ( "text", Text )
                 ]
-
-        col : D.Decoder Col
-        col =
-            D.map3 Col
-                (D.index 2 D.int)
-                (D.index 0 D.string)
-                (D.index 1 D.string |> D.map (flip Dict.get types >> Maybe.withDefault Text))
     in
-    D.map2 Table
-        (D.index 0 (D.array col))
-        (D.map (Array.slice 1 0) (D.array (D.array D.value)))
+    D.map3 Col
+        (D.index 2 D.int)
+        (D.index 0 D.string)
+        (D.index 1 D.string |> D.map (flip Dict.get types >> Maybe.withDefault Text))
 
 
 
@@ -440,6 +451,7 @@ type Msg
     | DocChange (Idd DocDelta)
     | DocNotify (Idd D.Value)
     | DocMsg DocMsg
+    | DocNew
     | KeyPress String
     | CellMouseClick
     | CellMouseDown
@@ -598,6 +610,16 @@ update msg ({ sheet } as model) =
             -- TODO:
             ( model, Cmd.none )
 
+        DocNew ->
+            ( model
+            , case sheet.doc of
+                Ok (Template ( type_, data )) ->
+                    newDoc { type_ = type_, data = data }
+
+                _ ->
+                    Cmd.none
+            )
+
         InputChange SheetName x ->
             -- TODO:
             ( model, Cmd.none )
@@ -716,6 +738,15 @@ view ({ sheet } as model) =
             case ( sheet.doc, sheet.table ) of
                 ( Ok (Tab tbl), _ ) ->
                     Ok tbl
+
+                ( Ok (Template ( "table", params )), _ ) ->
+                    Ok
+                        { cols = Array.fromList [ Col 0 "name" Text, Col 1 "type" Text, Col 2 "key" Number ]
+                        , rows = params
+                        }
+
+                ( Ok (Template ( type_, params )), _ ) ->
+                    Err "TODO: template"
 
                 ( Ok Library, _ ) ->
                     Ok
@@ -941,6 +972,10 @@ view ({ sheet } as model) =
                                     [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
                                         [ text (String.trim query.query)
                                         ]
+                                    ]
+
+                                Ok (Template ( "table", _ )) ->
+                                    [ H.button [ A.onClick DocNew ] [ text "new sheet (N)" ]
                                     ]
 
                                 _ ->
