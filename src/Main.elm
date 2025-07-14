@@ -694,36 +694,33 @@ view ({ sheet } as model) =
                 |> Dict.get sheet.id
                 |> Maybe.withDefault { name = "", tags = [], thumb = (), peers = Public }
 
-        cols : Result String (Array Col)
-        cols =
-            -- TODO: Get rid of this and always render cols from table table.
-            case sheet.doc of
-                Ok (Tab doc) ->
-                    Ok doc.cols
+        table : Result String Table
+        table =
+            case ( sheet.doc, sheet.table ) of
+                ( Ok (Tab tbl), _ ) ->
+                    Ok tbl
 
-                Ok Library ->
-                    [ ( "sheet_id", Link )
-                    , ( "name", Text )
-                    , ( "tags", Many Text )
-                    ]
-                        |> List.indexedMap (\i ( k, t ) -> Col i k t)
-                        |> Array.fromList
-                        |> Ok
+                ( Ok Library, _ ) ->
+                    Ok
+                        { cols =
+                            [ ( "sheet_id", Link ), ( "name", Text ), ( "tags", Many Text ) ]
+                                |> List.indexedMap (\i ( k, t ) -> Col i k t)
+                                |> Array.fromList
+                        , rows =
+                            model.library
+                                |> Dict.toList
+                                |> List.map (\( k, v ) -> Array.fromList [ E.string k, E.string v.name, E.list E.string v.tags ])
+                                |> Array.fromList
+                        }
 
-                Ok (Net (Socket ws)) ->
-                    Ok (Array.fromList [ Col 0 "Payload" Json ])
+                ( _, Ok tbl ) ->
+                    Ok tbl
 
-                Ok (Net (Http ws)) ->
-                    Ok (Array.fromList [ Col 0 "Payload" Json ])
+                ( Err err1, Err err2 ) ->
+                    Err (err1 ++ " " ++ err2)
 
-                Ok (Query query) ->
-                    Ok (Array.fromList [ Col 0 "Row" Json ])
-
-                Err err ->
+                ( _, Err err ) ->
                     Err err
-
-                _ ->
-                    Err "TODO: unimplemented"
     in
     { title = "scrapsheets"
     , body =
@@ -789,11 +786,11 @@ view ({ sheet } as model) =
 
                 -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
                 , H.div [ S.overflowAuto ]
-                    [ case cols of
+                    [ case table of
                         Err err ->
                             H.p [] [ text err ]
 
-                        Ok cols_ ->
+                        Ok { cols, rows } ->
                             H.table [ S.borderCollapseCollapse, S.width "100%", A.onMouseLeave (CellHover (xy -1 -1)) ]
                                 [ H.thead []
                                     [ H.tr [] <|
@@ -829,7 +826,7 @@ view ({ sheet } as model) =
                                                         ]
                                                 )
                                             <|
-                                                Array.toList cols_
+                                                Array.toList cols
                                     ]
                                 , H.tbody [] <|
                                     Array.toList <|
@@ -909,14 +906,9 @@ view ({ sheet } as model) =
                                                                             Nothing
                                                             )
                                                         <|
-                                                            Array.toList cols_
+                                                            Array.toList cols
                                             )
-                                        <|
-                                            -- TODO: Proper error handling.
-                                            Result.withDefault Array.empty
-                                            <|
-                                                Result.map .rows <|
-                                                    sheet.table
+                                            rows
                                 ]
                     ]
                 ]
@@ -950,146 +942,8 @@ view ({ sheet } as model) =
                             []
 
                         Stats ->
-                            case cols of
-                                Err _ ->
-                                    [ H.p [] [ text "No data available" ] ]
-
-                                Ok cols_ ->
-                                    cols_
-                                        |> Array.toList
-                                        |> List.map
-                                            (\col ->
-                                                let
-                                                    values =
-                                                        sheet.table
-                                                            |> Result.map .rows
-                                                            -- TODO: Proper error handling.
-                                                            |> Result.withDefault Array.empty
-                                                            |> Array.toList
-                                                            |> List.filterMap (Array.get col.key)
-
-                                                    stats =
-                                                        case col.typ of
-                                                            Number ->
-                                                                let
-                                                                    numbers =
-                                                                        values
-                                                                            |> List.filterMap (D.decodeValue number >> Result.toMaybe)
-
-                                                                    count =
-                                                                        List.length numbers
-
-                                                                    min_ =
-                                                                        List.minimum numbers
-
-                                                                    max_ =
-                                                                        List.maximum numbers
-
-                                                                    mean =
-                                                                        if count > 0 then
-                                                                            Just (List.sum numbers / toFloat count)
-
-                                                                        else
-                                                                            Nothing
-                                                                in
-                                                                [ ( "Count", String.fromInt count )
-                                                                , ( "Min", min_ |> Maybe.map String.fromFloat |> Maybe.withDefault "-" )
-                                                                , ( "Max", max_ |> Maybe.map String.fromFloat |> Maybe.withDefault "-" )
-                                                                , ( "Mean", mean |> Maybe.map (\m -> String.fromFloat (toFloat (round (m * 100)) / 100)) |> Maybe.withDefault "-" )
-                                                                ]
-
-                                                            Text ->
-                                                                let
-                                                                    strings =
-                                                                        values
-                                                                            |> List.filterMap (D.decodeValue string >> Result.toMaybe)
-
-                                                                    count =
-                                                                        List.length strings
-
-                                                                    avgLength =
-                                                                        if count > 0 then
-                                                                            List.sum (List.map String.length strings) // count
-
-                                                                        else
-                                                                            0
-
-                                                                    -- Count occurrences of each value
-                                                                    valueCounts =
-                                                                        strings
-                                                                            |> List.foldr
-                                                                                (\str acc ->
-                                                                                    Dict.update str
-                                                                                        (\maybeCount ->
-                                                                                            case maybeCount of
-                                                                                                Nothing ->
-                                                                                                    Just 1
-
-                                                                                                Just n ->
-                                                                                                    Just (n + 1)
-                                                                                        )
-                                                                                        acc
-                                                                                )
-                                                                                Dict.empty
-
-                                                                    -- Get top 3 most frequent values
-                                                                    topValues =
-                                                                        valueCounts
-                                                                            |> Dict.toList
-                                                                            |> List.sortBy (Tuple.second >> negate)
-                                                                            |> List.take 3
-                                                                            |> List.map
-                                                                                (\( val, cnt ) ->
-                                                                                    if String.length val > 20 then
-                                                                                        String.left 17 val ++ "... (" ++ String.fromInt cnt ++ ")"
-
-                                                                                    else
-                                                                                        val ++ " (" ++ String.fromInt cnt ++ ")"
-                                                                                )
-                                                                in
-                                                                List.concat
-                                                                    [ [ ( "Count", String.fromInt count )
-                                                                      , ( "Length", String.fromInt avgLength )
-                                                                      ]
-                                                                    , if List.isEmpty topValues then
-                                                                        []
-
-                                                                      else
-                                                                        [ ( "Frequent", String.join " " topValues ) ]
-                                                                    ]
-
-                                                            Boolean ->
-                                                                let
-                                                                    bools =
-                                                                        values
-                                                                            |> List.filterMap (D.decodeValue D.bool >> Result.toMaybe)
-
-                                                                    count =
-                                                                        List.length bools
-
-                                                                    trueCount =
-                                                                        bools |> List.filter identity |> List.length
-
-                                                                    falseCount =
-                                                                        count - trueCount
-                                                                in
-                                                                [ ( "Count", String.fromInt count )
-                                                                , ( "True", String.fromInt trueCount )
-                                                                , ( "False", String.fromInt falseCount )
-                                                                ]
-
-                                                            _ ->
-                                                                [ ( "Count", String.fromInt (List.length values) ) ]
-                                                in
-                                                H.div [ S.displayFlex, S.flexWrapWrap, S.alignItemsBaseline, S.gapRem 0.5, S.fontSizeRem 0.65, S.opacity "0.8" ] <|
-                                                    H.span [ S.fontWeightBold ] [ text col.name ]
-                                                        :: (stats
-                                                                |> List.map
-                                                                    (\( label, value ) ->
-                                                                        H.div [ S.opacity "0.8" ] [ text (label ++ ": " ++ value) ]
-                                                                    )
-                                                           )
-                                            )
+                            -- TODO:
+                            []
 
                         Share share ->
                             -- TODO:
