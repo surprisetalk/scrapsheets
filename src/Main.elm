@@ -61,6 +61,9 @@ result x =
 port librarySynced : (D.Value -> msg) -> Sub msg
 
 
+port updateLibrary : Idd { name : Maybe String, tags : Maybe (List String) } -> Cmd msg
+
+
 port changeId : Id -> Cmd msg
 
 
@@ -621,21 +624,18 @@ update msg ({ sheet } as model) =
             )
 
         InputChange SheetName x ->
-            -- TODO:
-            ( model, Cmd.none )
+            ( model, updateLibrary (Idd sheet.id { name = Just x, tags = Nothing }) )
 
         InputChange SheetTag x ->
             -- TODO:
-            ( model, Cmd.none )
+            ( model, updateLibrary (Idd sheet.id { name = Nothing, tags = Nothing }) )
 
         InputChange SheetSearch x ->
             -- TODO:
             ( model, Cmd.none )
 
         InputChange CellWrite x ->
-            ( { model | sheet = { sheet | write = Just x } }
-            , Cmd.none
-            )
+            ( { model | sheet = { sheet | write = Just x } }, Cmd.none )
 
         InputChange (ColumnType i) x ->
             -- TODO:
@@ -756,6 +756,7 @@ view ({ sheet } as model) =
                                 |> Array.fromList
                         , rows =
                             model.library
+                                |> Dict.filter (\k _ -> k /= "")
                                 |> Dict.toList
                                 |> List.map (\( k, v ) -> Array.fromList [ E.string k, E.string v.name, E.list E.string v.tags ])
                                 |> Array.fromList
@@ -794,7 +795,7 @@ view ({ sheet } as model) =
                                 , H.span [] [ text "library" ]
                                 ]
                                 [ text "/"
-                                , H.a [ A.href "#settings" ] [ text info.name ]
+                                , H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ]
                                 , H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.gapRem 0.5 ] <|
                                     List.concat
                                         [ case sheet.tag of
@@ -963,6 +964,9 @@ view ({ sheet } as model) =
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 12, S.maxWidthRem 18, S.maxHeight "100vh", S.overflowHidden, S.overflowYAuto ] <|
                 List.concat
                     [ [ H.span [] [ text (String.toLower (Debug.toString model.tool)), H.sup [] [ text "" ] ]
+                      ]
+                    , [ H.label [] [ text "name" ]
+                      , H.input [ A.value info.name, A.onInput (InputChange SheetName) ] []
                       ]
                     , case model.tool of
                         -- TODO: Hovering over columns/etc should highlight relevant cells, and vice versa.
