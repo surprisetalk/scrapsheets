@@ -160,7 +160,6 @@ type Peers
 type alias Sheet =
     { id : Id
     , search : String
-    , tag : Maybe String
     , select : Rect
     , hover : Index
     , drag : Bool
@@ -419,7 +418,6 @@ init _ url nav =
                 , sheet =
                     { id = ""
                     , search = ""
-                    , tag = Nothing
                     , select = Rect (xy -1 -1) (xy -1 -1)
                     , hover = xy -1 -1
                     , drag = False
@@ -476,7 +474,7 @@ type TabMsg
 
 type Input
     = SheetName
-    | SheetTag
+    | SheetTags
     | SheetSearch
     | CellWrite
     | ColumnType Int
@@ -544,7 +542,6 @@ update msg ({ sheet } as model) =
                 | sheet =
                     { id = data.id
                     , search = ""
-                    , tag = Nothing
                     , select = Rect (xy -1 -1) (xy -1 -1)
                     , hover = xy -1 -1
                     , drag = False
@@ -626,9 +623,8 @@ update msg ({ sheet } as model) =
         InputChange SheetName x ->
             ( model, updateLibrary (Idd sheet.id { name = Just x, tags = Nothing }) )
 
-        InputChange SheetTag x ->
-            -- TODO:
-            ( model, updateLibrary (Idd sheet.id { name = Nothing, tags = Nothing }) )
+        InputChange SheetTags x ->
+            ( model, updateLibrary (Idd sheet.id { name = Nothing, tags = x |> String.split ", " |> List.map String.trim |> Just }) )
 
         InputChange SheetSearch x ->
             -- TODO:
@@ -797,15 +793,7 @@ view ({ sheet } as model) =
                                 [ text "/"
                                 , H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ]
                                 , H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.gapRem 0.5 ] <|
-                                    List.concat
-                                        [ case sheet.tag of
-                                            Nothing ->
-                                                [ H.button [ A.onClick (InputChange SheetTag "") ] [ text "#" ] ]
-
-                                            Just value ->
-                                                [ H.input [ A.value value, A.onInput (InputChange SheetTag) ] [] ]
-                                        , List.map (\tag -> H.a [ A.href ("?q=+tag:" ++ tag), S.fontSizeRem 0.7, S.opacity "0.8" ] [ text ("#" ++ tag) ]) info.tags
-                                        ]
+                                    List.map (\tag -> H.a [ A.href ("/?q=tag:" ++ tag), S.fontSizeRem 0.7, S.opacity "0.8" ] [ text ("#" ++ tag) ]) info.tags
                                 ]
                             ]
                     , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.alignItemsBaseline, S.gapRem 0.5 ]
@@ -965,33 +953,37 @@ view ({ sheet } as model) =
                 List.concat
                     [ [ H.span [] [ text (String.toLower (Debug.toString model.tool)), H.sup [] [ text "" ] ]
                       ]
-                    , [ H.label [] [ text "name" ]
-                      , H.input [ A.value info.name, A.onInput (InputChange SheetName) ] []
-                      ]
                     , case model.tool of
                         -- TODO: Hovering over columns/etc should highlight relevant cells, and vice versa.
                         Settings ->
-                            case sheet.doc of
-                                Ok (Query query) ->
-                                    [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
-                                        [ text (String.trim query.query)
+                            List.concat
+                                [ [ H.label [] [ text "name" ]
+                                  , H.input [ A.value info.name, A.onInput (InputChange SheetName) ] []
+                                  , H.label [] [ text "tags" ]
+                                  , H.input [ A.value (String.join ", " info.tags), A.onInput (InputChange SheetTags) ] []
+                                  ]
+                                , case sheet.doc of
+                                    Ok (Query query) ->
+                                        [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
+                                            [ text (String.trim query.query)
+                                            ]
                                         ]
-                                    ]
 
-                                Ok (Template ( "table", _ )) ->
-                                    [ H.button [ A.onClick DocNew ] [ text "new sheet (N)" ]
-                                    ]
+                                    Ok (Template ( "table", _ )) ->
+                                        [ H.button [ A.onClick DocNew ] [ text "new sheet (N)" ]
+                                        ]
 
-                                _ ->
-                                    -- TODO:
-                                    [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%" ]
-                                        -- TODO: Link to the column configs.
-                                        [ text (Debug.toString sheet.doc)
+                                    _ ->
+                                        -- TODO:
+                                        [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%" ]
+                                            -- TODO: Link to the column configs.
+                                            [ text (Debug.toString sheet.doc)
+                                            ]
+                                        , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd, S.alignItemsBaseline ]
+                                            [ H.button [ A.onClick NoOp ] [ text "new column (C)" ]
+                                            ]
                                         ]
-                                    , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd, S.alignItemsBaseline ]
-                                        [ H.button [ A.onClick NoOp ] [ text "new column (C)" ]
-                                        ]
-                                    ]
+                                ]
 
                         Hints ->
                             -- TODO: problems (linting), ideas, related (sources/backlinks)

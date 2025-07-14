@@ -34,6 +34,9 @@
         const Library = {
           get: () => {
             return {
+              ...JSON.parse(
+                localStorage.getItem("scrapsheets-library") ?? "{}",
+              ),
               "": { name: "library", doc: { type: "library" } },
               "portal:shop": { name: "shop" },
               "template:table": {
@@ -50,20 +53,16 @@
                   ],
                 },
               },
-              ...JSON.parse(
-                localStorage.getItem("scrapsheets-library") ?? "{}",
-              ),
             };
           },
           set: (id, info) => {
+            for (const i in info) if (info[i] === null) delete info[i];
+            const library = JSON.parse(
+              localStorage.getItem("scrapsheets-library") ?? "{}",
+            );
             localStorage.setItem(
               "scrapsheets-library",
-              JSON.stringify({
-                ...JSON.parse(
-                  localStorage.getItem("scrapsheets-library") ?? "{}",
-                ),
-                [id]: info,
-              }),
+              JSON.stringify({ ...library, [id]: { ...library[id], ...info } }),
             );
             app.ports.librarySynced.send(Library.get());
           },
