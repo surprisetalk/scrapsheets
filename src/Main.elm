@@ -74,6 +74,7 @@ port sheetNotified : (SheetMsg D.Value -> msg) -> Sub msg
 
 
 type alias SheetChange =
+    -- TODO: This should only include the deltas and not the full doc.
     { doc : D.Value
     , handle : D.Value
     , patchInfo : D.Value
@@ -153,8 +154,8 @@ type alias Sheet =
     , hover : Index
     , drag : Bool
     , write : Maybe String
-    , schema : Result String Schema
-    , rows : Result String (Array Row)
+    , local : Result String Schema
+    , table : Result String Table
     }
 
 
@@ -163,13 +164,21 @@ type alias Svg =
     ()
 
 
-type Schema
+type
+    Schema
+    -- TODO: Change name from Schema to Doc...
     = Library
-    | Doc (Array Col)
+    | Doc Table
     | Net Net
     | Query Query_
     | Codex
     | Portal Args
+
+
+type alias Table =
+    { cols : Array Col
+    , rows : Array Row
+    }
 
 
 type alias Query_ =
@@ -290,33 +299,8 @@ number =
         ]
 
 
-sheetDecoder : D.Decoder Sheet
-sheetDecoder =
-    D.fail "TODO"
-
-
-schemaDecoder : D.Decoder Schema
-schemaDecoder =
-    let
-        types : Dict String Type
-        types =
-            Dict.fromList
-                [ ( "bool", Boolean )
-                , ( "number", Number )
-                , ( "link", Link )
-                , ( "image", Image )
-                , ( "timestamp", Timestamp )
-                , ( "json", Json )
-                , ( "text", Text )
-                ]
-
-        col : D.Decoder Col
-        col =
-            D.map3 Col
-                (D.index 2 D.int)
-                (D.index 0 D.string)
-                (D.index 1 D.string |> D.map (flip Dict.get types >> Maybe.withDefault Text))
-    in
+localDecoder : D.Decoder Schema
+localDecoder =
     D.field "type" D.string
         |> D.andThen
             (\typ ->
@@ -324,7 +308,7 @@ schemaDecoder =
                     D.index 0 <|
                         case typ of
                             "doc" ->
-                                D.map Doc (D.array col)
+                                D.map Doc tableDecoder
 
                             "net-hook" ->
                                 D.succeed (Net Hook)
@@ -351,19 +335,31 @@ schemaDecoder =
             )
 
 
-rowsDecoder : D.Decoder (Result String (Array Row))
-rowsDecoder =
-    D.field "type" D.string
-        |> D.andThen
-            (\typ ->
-                D.field "data" <|
-                    case typ of
-                        "doc" ->
-                            D.map (Ok << Array.slice 1 0) (D.array (D.array D.value))
+tableDecoder : D.Decoder Table
+tableDecoder =
+    let
+        types : Dict String Type
+        types =
+            Dict.fromList
+                [ ( "bool", Boolean )
+                , ( "number", Number )
+                , ( "link", Link )
+                , ( "image", Image )
+                , ( "timestamp", Timestamp )
+                , ( "json", Json )
+                , ( "text", Text )
+                ]
 
-                        _ ->
-                            D.succeed (Err "Loading...")
-            )
+        col : D.Decoder Col
+        col =
+            D.map3 Col
+                (D.index 2 D.int)
+                (D.index 0 D.string)
+                (D.index 1 D.string |> D.map (flip Dict.get types >> Maybe.withDefault Text))
+    in
+    D.map2 Table
+        (D.index 0 (D.array col))
+        (D.map (Array.slice 1 0) (D.array (D.array D.value)))
 
 
 
@@ -389,8 +385,8 @@ init _ url nav =
             , hover = xy -1 -1
             , drag = False
             , write = Nothing
-            , schema = Err "Loading..."
-            , rows = Err "Loading..."
+            , local = Err "Loading..."
+            , table = Err "Loading..."
             }
         }
     , Cmd.none
@@ -507,23 +503,17 @@ update msg ({ sheet } as model) =
                     , hover = xy -1 -1
                     , drag = False
                     , write = Nothing
-                    , schema = data.data.doc |> D.decodeValue schemaDecoder |> Result.mapError D.errorToString
-                    , rows = data.data.doc |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString |> Result.andThen identity
+                    , local = data.data.doc |> D.decodeValue localDecoder |> Result.mapError D.errorToString
+
+                    -- TODO: Put rows in here if we have them? e.g. local table or library.
+                    , table = Err "Loading..."
                     }
               }
             , Cmd.none
             )
 
         DocChange data ->
-            ( iif (data.id /= model.sheet.id)
-                model
-                { model
-                    | sheet =
-                        { sheet
-                            | schema = data.data.doc |> D.decodeValue schemaDecoder |> Result.mapError D.errorToString
-                            , rows = data.data.doc |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString |> Result.andThen identity
-                        }
-                }
+            ( iif (data.id /= model.sheet.id) model { model | sheet = { sheet | local = data.data.doc |> D.decodeValue localDecoder |> Result.mapError D.errorToString } }
             , Cmd.none
             )
 
@@ -739,9 +729,10 @@ view ({ sheet } as model) =
 
         cols : Result String (Array Col)
         cols =
-            case sheet.schema of
+            -- TODO: Get rid of this and always render cols from table table.
+            case sheet.local of
                 Ok (Doc doc) ->
-                    Ok doc
+                    Ok doc.cols
 
                 Ok Library ->
                     [ ( "sheet_id", Link )
@@ -957,7 +948,8 @@ view ({ sheet } as model) =
                                             -- TODO: Proper error handling.
                                             Result.withDefault Array.empty
                                             <|
-                                                sheet.rows
+                                                Result.map .rows <|
+                                                    sheet.table
                                 ]
                     ]
                 ]
@@ -968,7 +960,7 @@ view ({ sheet } as model) =
                     , case model.tool of
                         -- TODO: Hovering over columns/etc should highlight relevant cells, and vice versa.
                         Settings ->
-                            case sheet.schema of
+                            case sheet.local of
                                 Ok (Query query) ->
                                     [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
                                         [ text (String.trim query.query)
@@ -979,7 +971,7 @@ view ({ sheet } as model) =
                                     -- TODO:
                                     [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%" ]
                                         -- TODO: Link to the column configs.
-                                        [ text (Debug.toString sheet.schema)
+                                        [ text (Debug.toString sheet.local)
                                         ]
                                     , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd, S.alignItemsBaseline ]
                                         [ H.button [ A.onClick NoOp ] [ text "new column (C)" ]
@@ -1002,7 +994,8 @@ view ({ sheet } as model) =
                                             (\col ->
                                                 let
                                                     values =
-                                                        sheet.rows
+                                                        sheet.table
+                                                            |> Result.map .rows
                                                             -- TODO: Proper error handling.
                                                             |> Result.withDefault Array.empty
                                                             |> Array.toList
