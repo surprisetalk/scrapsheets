@@ -64,6 +64,9 @@ port changeSheet : SheetMsg (List Patch) -> Cmd msg
 port notifySheet : SheetMsg E.Value -> Cmd msg
 
 
+port sheetSelected : (SheetMsg { doc : D.Value } -> msg) -> Sub msg
+
+
 port sheetChanged : (SheetMsg SheetChange -> msg) -> Sub msg
 
 
@@ -144,9 +147,6 @@ type Peers
 type alias Sheet =
     -- TODO: Add stats here? Or do they go down a level?
     { id : Id
-    , name : String
-    , tags : List String
-    , thumb : Svg
     , search : String
     , tag : Maybe String
     , select : Rect
@@ -383,9 +383,6 @@ init _ url nav =
         , library = Dict.empty
         , sheet =
             { id = ""
-            , name = ""
-            , tags = []
-            , thumb = ()
             , search = ""
             , tag = Nothing
             , select = Rect (xy -1 -1) (xy -1 -1)
@@ -417,6 +414,7 @@ type Msg
     | UrlChange Url
     | LinkClick Browser.UrlRequest
     | LibraryChange (SheetMsg D.Value)
+    | DocSelect (SheetMsg { doc : D.Value })
     | DocChange (SheetMsg SheetChange)
     | SchemaMsg SchemaMsg
     | KeyPress String
@@ -499,14 +497,33 @@ update msg ({ sheet } as model) =
             , Cmd.none
             )
 
-        DocChange data ->
+        DocSelect data ->
             ( { model
                 | sheet =
-                    { sheet
-                        | schema = data.data.doc |> D.decodeValue schemaDecoder |> Result.mapError D.errorToString
-                        , rows = data.data.doc |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString |> Result.andThen identity
+                    { id = data.id
+                    , search = ""
+                    , tag = Nothing
+                    , select = Rect (xy -1 -1) (xy -1 -1)
+                    , hover = xy -1 -1
+                    , drag = False
+                    , write = Nothing
+                    , schema = data.data.doc |> D.decodeValue schemaDecoder |> Result.mapError D.errorToString
+                    , rows = data.data.doc |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString |> Result.andThen identity
                     }
               }
+            , Cmd.none
+            )
+
+        DocChange data ->
+            ( iif (data.id /= model.sheet.id)
+                model
+                { model
+                    | sheet =
+                        { sheet
+                            | schema = data.data.doc |> D.decodeValue schemaDecoder |> Result.mapError D.errorToString
+                            , rows = data.data.doc |> D.decodeValue rowsDecoder |> Result.mapError D.errorToString |> Result.andThen identity
+                        }
+                }
             , Cmd.none
             )
 
