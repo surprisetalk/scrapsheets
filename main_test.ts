@@ -3,7 +3,7 @@ import { PGlite } from "npm:@electric-sql/pglite";
 import { PostgresConnection } from "npm:pg-gateway";
 import { citext } from "npm:@electric-sql/pglite/contrib/citext";
 import { app, sql, createJwt, automerge } from "./main.ts";
-import type { Sheet, Col, Template, Doc, Table } from "./main.ts";
+import type { Sheet, Col, Template, Table } from "./main.ts";
 import * as AM from "npm:@automerge/automerge-repo";
 
 const request = async (jwt: string, route: string, options?: object) => {
@@ -91,7 +91,7 @@ Deno.test(async function allTests(t) {
       const templates: Template[] = [
         // ["template", ["net-hook", []]],
         [
-          "doc",
+          "table",
           [
             ["a", "string", 0],
             ["b", "string", 1],
@@ -118,7 +118,7 @@ Deno.test(async function allTests(t) {
         await put(jwt, `/library/${type}:${hand.documentId}`, {});
       }
 
-      const [cols, ...rows] = await get<Doc>(jwt, `/library`);
+      const [cols, ...rows] = await get<Table>(jwt, `/library`);
       assert(cols.length);
       assertEquals(
         cols.map(col => col[0]).join(),
@@ -129,7 +129,7 @@ Deno.test(async function allTests(t) {
 
     // Alice updates templates and posts them to shop.
     {
-      const [cols, ...rows] = await get<Doc>(jwt, `/library`);
+      const [cols, ...rows] = await get<Table>(jwt, `/library`);
       assert(cols.length);
       assertEquals(
         cols.map(col => col[0]).join(),
@@ -141,7 +141,7 @@ Deno.test(async function allTests(t) {
         const meta = { name: `Example ${type}`, tags: ["tag1", "tag2"] };
         await put(jwt, `/library/${sheet_id}`, meta);
         await post(jwt, `/sell/${sheet_id}`, { price: 0 });
-        const [, [, , , name, tags, sell_price]] = await get<Doc>(
+        const [, [, , , name, tags, sell_price]] = await get<Table>(
           jwt,
           `/library`,
           { doc_id: doc_id as string },
@@ -155,7 +155,7 @@ Deno.test(async function allTests(t) {
 
   // The shop is publicly viewable.
   {
-    const [cols, ...rows] = await get<Doc>("", `/shop`);
+    const [cols, ...rows] = await get<Table>("", `/shop`);
     assert(cols.length);
     assert(rows.length);
   }
@@ -165,7 +165,7 @@ Deno.test(async function allTests(t) {
 
     // Bob purchases everything in the shop.
     {
-      const [cols, ...rows] = await get<Doc>(jwt, `/shop`);
+      const [cols, ...rows] = await get<Table>(jwt, `/shop`);
       assert(cols.length);
       assertEquals(
         cols.map(col => col[0]).join(),
@@ -176,15 +176,15 @@ Deno.test(async function allTests(t) {
         const { data: sheet_id } = await post(jwt, `/buy/${sell_id}`, {});
         const [type, doc_id] = sheet_id.split(":");
         switch (type) {
-          case "doc": {
-            const hand = await automerge.find<{ data: Doc }>(
+          case "table": {
+            const hand = await automerge.find<{ data: Table }>(
               doc_id as AM.AnyDocumentId,
             );
             hand.change(d => d.data.push([1, 2, 3], [4, 5, 6], [7, 8, 9]));
             break;
           }
           case "portal": {
-            const [cols, ...rows] = await get<Doc>(jwt, `/portal/${doc_id}`);
+            const [cols, ...rows] = await get<Table>(jwt, `/portal/${doc_id}`);
             assert(cols.length);
             // TODO:
             break;
@@ -194,7 +194,7 @@ Deno.test(async function allTests(t) {
           case "net-http":
           case "net-hook": {
             await post(jwt, `/net/${type}:${doc_id}`, { foo: "bar" });
-            const [cols, ...rows] = await get<Doc>(
+            const [cols, ...rows] = await get<Table>(
               jwt,
               `/net/${type}:${doc_id}`,
             );
@@ -204,13 +204,17 @@ Deno.test(async function allTests(t) {
             break;
           }
           case "query": {
-            const hand = await automerge.find<{ data: Doc }>(
+            const hand = await automerge.find<{ data: Table }>(
               doc_id as AM.AnyDocumentId,
             );
             const [[lang, code, args]] = hand.doc().data;
             const {
               data: [cols, ...rows],
-            }: { data: Doc } = await post(jwt, `/query`, { lang, code, args });
+            }: { data: Table } = await post(jwt, `/query`, {
+              lang,
+              code,
+              args,
+            });
             assert(cols.length);
             assertEquals(cols.map(col => col[0]).join(), "a,b,c");
             assert(rows.length);
@@ -222,7 +226,7 @@ Deno.test(async function allTests(t) {
               `/codex-db/${doc_id}`,
               "postgresql://postgres:postgres@127.0.0.1:5434/postgres",
             );
-            const [cols, ...rows] = await get<Doc>(
+            const [cols, ...rows] = await get<Table>(
               jwt,
               `/codex/codex-db:${doc_id}`,
             );
@@ -242,7 +246,7 @@ Deno.test(async function allTests(t) {
             break;
           }
           case "codex-scrapsheets": {
-            const [cols, ...rows] = await get<Doc>(
+            const [cols, ...rows] = await get<Table>(
               jwt,
               `/codex/codex-scrapsheets:${doc_id}`,
             );
@@ -273,16 +277,16 @@ Deno.test(async function allTests(t) {
     // Bob runs a query on his doc.
     {
       // TODO: Create a new doc instead of reusing the one randomly updated from the shop.
-      const [, [, type, doc_id]] = await get<Doc>(jwt, `/library`, {
-        type: "doc",
+      const [, [, type, doc_id]] = await get<Table>(jwt, `/library`, {
+        type: "table",
       });
-      assertEquals(type, "doc");
+      assertEquals(type, "table");
       assert(AM.isValidDocumentId(doc_id));
       const {
         data: [cols, ...rows],
-      }: { data: Doc } = await post(jwt, `/query`, {
+      }: { data: Table } = await post(jwt, `/query`, {
         lang: "sql",
-        code: `select * from @doc:${doc_id}`,
+        code: `select * from @table:${doc_id}`,
         args: [],
       });
       assert(cols.length);

@@ -12,12 +12,12 @@ create table sheet
 ( sheet_id text not null primary key generated always as (type || ':' || doc_id) stored
 , created_at timestamp default now()
 , created_by bigint not null references usr(usr_id)
-, type text not null check (type in ('template','doc','net-hook','net-http','net-socket','query','portal') or type like 'codex-%')
+, type text not null check (type in ('template','table','net-hook','net-http','net-socket','query','portal') or type like 'codex-%')
 , doc_id text not null unique
 , name text not null default ''
 , tags text[] not null default '{}'::text[]
 , sell_id text not null unique generated always as (md5(doc_id||created_by::text)) stored
-, sell_type text generated always as (case when type = 'template' then row_0->>0 when type in ('doc','net-hook','net-http','net-socket','query') then 'portal' end) stored
+, sell_type text generated always as (case when type = 'template' then row_0->>0 when type in ('table','net-hook','net-http','net-socket','query') then 'portal' end) stored
 , sell_price numeric check (sell_price >= 0)
 , buy_id text references sheet(sell_id)
 , buy_price numeric check (buy_price >= 0)

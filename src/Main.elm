@@ -58,6 +58,9 @@ result x =
 ---- PORTS --------------------------------------------------------------------
 
 
+port librarySynced : (List { name : String, tags : List String } -> msg) -> Sub msg
+
+
 port changeSheet : SheetMsg (List Patch) -> Cmd msg
 
 
@@ -146,7 +149,6 @@ type Peers
 
 
 type alias Sheet =
-    -- TODO: Add stats here? Or do they go down a level?
     { id : Id
     , search : String
     , tag : Maybe String
@@ -154,8 +156,9 @@ type alias Sheet =
     , hover : Index
     , drag : Bool
     , write : Maybe String
-    , local : Result String Schema
+    , doc : Result String Doc
     , table : Result String Table
+    , stats : Result String Stats
     }
 
 
@@ -164,15 +167,17 @@ type alias Svg =
     ()
 
 
-type
-    Schema
-    -- TODO: Change name from Schema to Doc...
+type Doc
     = Library
-    | Doc Table
+    | Tab Table
     | Net Net
     | Query Query_
     | Codex
     | Portal Args
+
+
+type alias Stats =
+    ()
 
 
 type alias Table =
@@ -299,16 +304,16 @@ number =
         ]
 
 
-localDecoder : D.Decoder Schema
-localDecoder =
+docDecoder : D.Decoder Doc
+docDecoder =
     D.field "type" D.string
         |> D.andThen
             (\typ ->
                 D.field "data" <|
                     D.index 0 <|
                         case typ of
-                            "doc" ->
-                                D.map Doc tableDecoder
+                            "table" ->
+                                D.map Tab tableDecoder
 
                             "net-hook" ->
                                 D.succeed (Net Hook)
@@ -329,6 +334,9 @@ localDecoder =
                                         (D.index 1 D.string)
                                         (D.index 2 (D.dict D.value))
                                     )
+
+                            "portal" ->
+                                D.succeed (Portal Dict.empty)
 
                             typ_ ->
                                 D.fail ("Bad table type: " ++ typ_)
@@ -385,8 +393,9 @@ init _ url nav =
             , hover = xy -1 -1
             , drag = False
             , write = Nothing
-            , local = Err "Loading..."
-            , table = Err "Loading..."
+            , doc = Err ""
+            , table = Err ""
+            , stats = Err ""
             }
         }
     , Cmd.none
@@ -422,11 +431,11 @@ type Msg
 
 
 type SchemaMsg
-    = DocMsg DocMsg
+    = TabMsg TabMsg
     | QueryMsg ()
 
 
-type DocMsg
+type TabMsg
     = SheetWrite Index
     | SheetRowPush Int
     | SheetColumnPush
@@ -503,17 +512,20 @@ update msg ({ sheet } as model) =
                     , hover = xy -1 -1
                     , drag = False
                     , write = Nothing
-                    , local = data.data.doc |> D.decodeValue localDecoder |> Result.mapError D.errorToString
-
-                    -- TODO: Put rows in here if we have them? e.g. local table or library.
-                    , table = Err "Loading..."
+                    , doc = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString
+                    , table = Err ""
+                    , stats = Err ""
                     }
               }
+              -- TODO: Fetch table rows depending on type, e.g. portal:123
             , Cmd.none
             )
 
         DocChange data ->
-            ( iif (data.id /= model.sheet.id) model { model | sheet = { sheet | local = data.data.doc |> D.decodeValue localDecoder |> Result.mapError D.errorToString } }
+            ( iif (data.id /= model.sheet.id)
+                model
+                { model | sheet = { sheet | doc = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString } }
+              -- TODO: Fetch table rows depending on type, e.g. portal:123
             , Cmd.none
             )
 
@@ -577,7 +589,7 @@ update msg ({ sheet } as model) =
 --                     }
 --               }
 --             , changeSheet <|
---                 DocMsg sheet.sheetId <|
+--                 TabMsg sheet.sheetId <|
 --                     case sheet.source of
 --                         Ok (Data rows) ->
 --                             case edit of
@@ -669,7 +681,7 @@ update msg ({ sheet } as model) =
 --                     }
 --               }
 --             , changeSheet <|
---                 DocMsg sheet.sheetId <|
+--                 TabMsg sheet.sheetId <|
 --                     case sheet.source of
 --                         Ok (Data rows) ->
 --                             -- TODO: Do multiple patches when ranges are selected.
@@ -730,8 +742,8 @@ view ({ sheet } as model) =
         cols : Result String (Array Col)
         cols =
             -- TODO: Get rid of this and always render cols from table table.
-            case sheet.local of
-                Ok (Doc doc) ->
+            case sheet.doc of
+                Ok (Tab doc) ->
                     Ok doc.cols
 
                 Ok Library ->
@@ -833,7 +845,7 @@ view ({ sheet } as model) =
                                         -- TODO: Add additional header rows for stats and column def.
                                         (::)
                                             (H.th
-                                                [ A.onClick (SchemaMsg (DocMsg (SheetRowPush -1)))
+                                                [ A.onClick (SchemaMsg (TabMsg (SheetRowPush -1)))
                                                 , A.onMouseEnter (CellHover (xy -1 -1))
                                                 , S.textAlignRight
                                                 , S.widthRem 0.001
@@ -871,7 +883,7 @@ view ({ sheet } as model) =
                                                 H.tr [] <|
                                                     (::)
                                                         (H.th
-                                                            [ A.onClick (SchemaMsg (DocMsg (SheetRowPush n)))
+                                                            [ A.onClick (SchemaMsg (TabMsg (SheetRowPush n)))
                                                             , A.onMouseEnter (CellHover (xy -1 n))
                                                             , S.textAlignRight
                                                             , S.widthRem 0.001
@@ -936,7 +948,7 @@ view ({ sheet } as model) =
                                                                         ]
                                                                     <|
                                                                         if sheet.write /= Nothing && sheet.select == rect i n i n then
-                                                                            Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (SchemaMsg (DocMsg (SheetWrite sheet.select.a))), S.width "100%" ] [] ]
+                                                                            Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (SchemaMsg (TabMsg (SheetWrite sheet.select.a))), S.width "100%" ] [] ]
 
                                                                         else
                                                                             Nothing
@@ -960,7 +972,7 @@ view ({ sheet } as model) =
                     , case model.tool of
                         -- TODO: Hovering over columns/etc should highlight relevant cells, and vice versa.
                         Settings ->
-                            case sheet.local of
+                            case sheet.doc of
                                 Ok (Query query) ->
                                     [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
                                         [ text (String.trim query.query)
@@ -971,7 +983,7 @@ view ({ sheet } as model) =
                                     -- TODO:
                                     [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%" ]
                                         -- TODO: Link to the column configs.
-                                        [ text (Debug.toString sheet.local)
+                                        [ text (Debug.toString sheet.doc)
                                         ]
                                     , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd, S.alignItemsBaseline ]
                                         [ H.button [ A.onClick NoOp ] [ text "new column (C)" ]

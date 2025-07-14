@@ -18,7 +18,7 @@ const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
 
 ala.options.modifier = "RECORDSET";
 
-export type Tag<T extends string, X extends Table> = {
+export type Tag<T extends string, X extends Row[]> = {
   type: T;
   data: X;
 };
@@ -33,12 +33,11 @@ export type Type =
   | { [k: string]: Type };
 export type Row = unknown[];
 export type Col = [string, Type, number];
-export type Table = Row[];
-export type Doc = [Col[], ...Row[]];
+export type Table = [Col[], ...Row[]];
 export type Args = [string, unknown][];
 export type Template =
   | ["template", Template]
-  | ["doc", Col[]]
+  | ["table", Col[]]
   | ["query", Query]
   | ["net-hook", []]
   | ["net-http", [string, number]]
@@ -47,7 +46,7 @@ export type Template =
 export type Query = ["sql" | "prql", string, Args];
 export type Sheet =
   | Tag<"template", [Template]>
-  | Tag<"doc", Doc>
+  | Tag<"table", Table>
   | Tag<"net-hook", []>
   | Tag<"net-http", [[string, number]]>
   | Tag<"net-socket", [[string]]>
@@ -56,7 +55,7 @@ export type Sheet =
   | Tag<"codex", []>;
 
 export type Page = {
-  data: Doc;
+  data: Table;
   count: number;
   offset: number;
 };
@@ -75,8 +74,8 @@ const sheet = async (
       },
     }));
   switch (type) {
-    case "doc": {
-      const doc = hand.doc().data as Doc;
+    case "table": {
+      const doc = hand.doc().data as Table;
       return { data: doc, count: doc.length - 1, offset: 0 };
     }
     case "net-hook":
@@ -446,7 +445,7 @@ app.put("/library/:id", async c => {
       type,
       doc_id,
       row_0: await automerge
-        .find<{ data: Doc }>(doc_id as AnyDocumentId)
+        .find<{ data: Table }>(doc_id as AnyDocumentId)
         .then(hand => hand.doc().data[0]),
       created_by: c.get("usr_id"),
     };
@@ -586,6 +585,11 @@ app.get("/portal/:id", async c => {
   `;
   if (!sheet_) throw new HTTPException(404, { message: "Not found." });
   return page(c)(await sheet(c, sheet_.sheet_id, c.req.query()));
+});
+
+app.get("/stats/:id", async c => {
+  // TODO: Get column/table stats about any sheet as a table.
+  return c.json(null, 500);
 });
 
 app.all("/mcp/:id", async c => {
