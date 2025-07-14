@@ -61,6 +61,9 @@ result x =
 port librarySynced : (D.Value -> msg) -> Sub msg
 
 
+port changeId : Id -> Cmd msg
+
+
 port changeDoc : Idd (List Patch) -> Cmd msg
 
 
@@ -309,25 +312,33 @@ docDecoder =
     D.field "type" D.string
         |> D.andThen
             (\typ ->
-                D.field "data" <|
-                    D.index 0 <|
-                        case typ of
-                            "table" ->
-                                D.map Tab tableDecoder
+                case typ of
+                    "library" ->
+                        D.succeed Library
 
-                            "net-hook" ->
-                                D.succeed (Net Hook)
+                    "table" ->
+                        D.field "data" <|
+                            D.map Tab tableDecoder
 
-                            "net-socket" ->
+                    "net-hook" ->
+                        D.succeed (Net Hook)
+
+                    "net-socket" ->
+                        D.field "data" <|
+                            D.index 0 <|
                                 D.map (\url -> Net (Socket { url = url }))
                                     (D.index 0 D.string)
 
-                            "net-http" ->
+                    "net-http" ->
+                        D.field "data" <|
+                            D.index 0 <|
                                 D.map2 (\url interval -> Net (Http { url = url, interval = interval }))
                                     (D.index 0 D.string)
                                     (D.index 1 D.int)
 
-                            "query" ->
+                    "query" ->
+                        D.field "data" <|
+                            D.index 0 <|
                                 D.map Query
                                     (D.map3 Query_
                                         (D.index 0 D.string)
@@ -335,11 +346,11 @@ docDecoder =
                                         (D.index 2 (D.dict D.value))
                                     )
 
-                            "portal" ->
-                                D.succeed (Portal Dict.empty)
+                    "portal" ->
+                        D.succeed (Portal Dict.empty)
 
-                            typ_ ->
-                                D.fail ("Bad table type: " ++ typ_)
+                    typ_ ->
+                        D.fail ("Bad table type: " ++ typ_)
             )
 
 
@@ -380,26 +391,29 @@ type alias Flags =
 
 init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
 init _ url nav =
-    ( route url
-        { nav = nav
-        , id = ""
-        , tool = Stats
-        , library = Dict.empty
-        , sheet =
-            { id = ""
-            , search = ""
-            , tag = Nothing
-            , select = Rect (xy -1 -1) (xy -1 -1)
-            , hover = xy -1 -1
-            , drag = False
-            , write = Nothing
-            , doc = Err ""
-            , table = Err ""
-            , stats = Err ""
-            }
-        }
-    , Cmd.none
-    )
+    let
+        model : Model
+        model =
+            route url
+                { nav = nav
+                , id = ""
+                , tool = Stats
+                , library = Dict.empty
+                , sheet =
+                    { id = ""
+                    , search = ""
+                    , tag = Nothing
+                    , select = Rect (xy -1 -1) (xy -1 -1)
+                    , hover = xy -1 -1
+                    , drag = False
+                    , write = Nothing
+                    , doc = Err ""
+                    , table = Err ""
+                    , stats = Err ""
+                    }
+                }
+    in
+    ( model, changeId model.id )
 
 
 route : Url -> Model -> Model
@@ -479,7 +493,7 @@ update msg ({ sheet } as model) =
 
         UrlChange url ->
             ( route url model
-            , Cmd.none
+            , changeId (route url model).id
             )
 
         LinkClick (Browser.Internal url) ->
@@ -878,7 +892,7 @@ view ({ sheet } as model) =
                                                                             |> D.decodeValue
                                                                                 (case col.typ of
                                                                                     Link ->
-                                                                                        D.string |> D.map (\href -> H.a [ A.href href, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock, S.maxWidthRem 12 ] [ text href ])
+                                                                                        D.string |> D.map (\href -> H.a [ A.href ("/" ++ href), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock, S.maxWidthRem 12 ] [ text href ])
 
                                                                                     Image ->
                                                                                         D.string |> D.map (\src -> H.img [ A.src src, S.width "100%", S.objectFitCover ] [])
