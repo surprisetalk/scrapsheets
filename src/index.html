@@ -113,7 +113,7 @@
           let sheet;
 
           const queryDoc = async (id, { code, lang, args }) => {
-            // TODO: Run alasql
+            // TODO: Run alasql if possible, otherwise post to /query.
             app.ports.docQueried.send({
               id,
               data: [[{ name: "a", type: "int", key: "a" }], { a: 1 }],
