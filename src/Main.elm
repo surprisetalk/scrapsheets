@@ -67,7 +67,7 @@ port updateLibrary : Idd { name : Maybe String, tags : Maybe (List String) } -> 
 port changeId : Id -> Cmd msg
 
 
-port newDoc : { type_ : String, data : Array Row } -> Cmd msg
+port newDoc : E.Value -> Cmd msg
 
 
 port changeDoc : Idd (List Patch) -> Cmd msg
@@ -203,14 +203,14 @@ type alias Query_ =
 
 
 type alias Col =
-    { key : Int
+    { key : String
     , name : String
     , typ : Type
     }
 
 
 type alias Row =
-    Array D.Value
+    Dict String D.Value
 
 
 type Net
@@ -338,31 +338,33 @@ docDecoder =
                         D.field "data" <|
                             D.index 0 <|
                                 D.map (\url -> Net (Socket { url = url }))
-                                    (D.index 0 D.string)
+                                    (D.field "url" D.string)
 
                     "net-http" ->
                         D.field "data" <|
                             D.index 0 <|
                                 D.map2 (\url interval -> Net (Http { url = url, interval = interval }))
-                                    (D.index 0 D.string)
-                                    (D.index 1 D.int)
+                                    (D.field "url" D.string)
+                                    (D.field "interval" D.int)
 
                     "query" ->
                         D.field "data" <|
                             D.index 0 <|
                                 D.map Query
                                     (D.map3 Query_
-                                        (D.index 0 D.string)
-                                        (D.index 1 D.string)
-                                        (D.index 2 (D.dict D.value))
+                                        (D.field "lang" D.string)
+                                        (D.field "code" D.string)
+                                        -- TODO
+                                        (D.field "args" (D.succeed Dict.empty))
                                     )
 
                     "template" ->
                         D.field "data" <|
-                            D.map Template <|
-                                D.map2 Tuple.pair
-                                    (D.index 0 D.string)
-                                    (D.index 1 (D.array (D.array D.value)))
+                            D.index 0 <|
+                                D.map Template <|
+                                    D.map2 Tuple.pair
+                                        (D.field "type" D.string)
+                                        (D.field "data" (D.array rowDecoder))
 
                     typ_ ->
                         D.fail ("Bad table type: " ++ typ_)
@@ -373,7 +375,15 @@ tableDecoder : D.Decoder Table
 tableDecoder =
     D.map2 Table
         (D.index 0 (D.array colDecoder))
-        (D.map (Array.slice 1 -1 << Array.push Array.empty) (D.array (D.array D.value)))
+        (D.map (Array.slice 1 -1 << Array.push Dict.empty) (D.array rowDecoder))
+
+
+rowDecoder : D.Decoder Row
+rowDecoder =
+    D.oneOf
+        [ D.array D.value |> D.map (Array.toIndexedList >> List.map (\( k, v ) -> ( String.fromInt k, v )) >> Dict.fromList)
+        , D.dict D.value
+        ]
 
 
 colDecoder : D.Decoder Col
@@ -392,9 +402,9 @@ colDecoder =
                 ]
     in
     D.map3 Col
-        (D.index 2 D.int)
-        (D.index 0 D.string)
-        (D.index 1 D.string |> D.map (flip Dict.get types >> Maybe.withDefault Text))
+        (D.field "key" string)
+        (D.field "name" D.string)
+        (D.field "type" D.string |> D.map (flip Dict.get types >> Maybe.withDefault Text))
 
 
 
@@ -580,9 +590,9 @@ update msg ({ sheet } as model) =
                                         |> Array.get x
                                         |> Maybe.map
                                             (\col ->
-                                                [ { action = "splice"
-                                                  , path = [ E.int (y + 1) ]
-                                                  , value = E.list identity [ E.int col.key, E.int 1, sheet.write |> Maybe.withDefault "" |> E.string ]
+                                                [ { action = "set"
+                                                  , path = [ E.int (y + 1), E.string col.key ]
+                                                  , value = sheet.write |> Maybe.withDefault "" |> E.string
                                                   }
                                                 ]
                                             )
@@ -591,14 +601,14 @@ update msg ({ sheet } as model) =
                                 SheetRowPush i ->
                                     [ { action = "push"
                                       , path = []
-                                      , value = E.list identity [ E.list identity [] ]
+                                      , value = E.list identity [ E.object [] ]
                                       }
                                     ]
 
                                 SheetColumnPush ->
                                     [ { action = "push"
                                       , path = [ E.int 0 ]
-                                      , value = E.list identity [ E.list identity [ E.string "", E.string "text", E.int (Array.length table.cols) ] ]
+                                      , value = E.list identity [ E.object [ ( "name", E.string "" ), ( "type", E.string "text" ), ( "key", E.string (String.fromInt (Array.length table.cols)) ) ] ]
                                       }
                                     ]
 
@@ -614,7 +624,7 @@ update msg ({ sheet } as model) =
             ( model
             , case sheet.doc of
                 Ok (Template ( type_, data )) ->
-                    newDoc { type_ = type_, data = data }
+                    newDoc <| E.object [ ( "type", E.string type_ ), ( "data", E.list identity [ E.array (E.dict identity identity) data ] ) ]
 
                 _ ->
                     Cmd.none
@@ -732,7 +742,7 @@ view ({ sheet } as model) =
 
                 ( Ok (Template ( "table", params )), _ ) ->
                     Ok
-                        { cols = Array.fromList [ Col 0 "name" Text, Col 1 "type" Text, Col 2 "key" Number ]
+                        { cols = Array.fromList [ Col "name" "name" Text, Col "type" "type" Text, Col "key" "key" Text ]
                         , rows = params
                         }
 
@@ -743,13 +753,13 @@ view ({ sheet } as model) =
                     Ok
                         { cols =
                             [ ( "sheet_id", Link ), ( "name", Text ), ( "tags", Many Text ) ]
-                                |> List.indexedMap (\i ( k, t ) -> Col i k t)
+                                |> List.map (\( k, t ) -> Col k k t)
                                 |> Array.fromList
                         , rows =
                             model.library
                                 |> Dict.filter (\k _ -> k /= "")
                                 |> Dict.toList
-                                |> List.map (\( k, v ) -> Array.fromList [ E.string k, E.string v.name, E.list E.string v.tags ])
+                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ) ])
                                 |> Array.fromList
                         }
 
@@ -905,7 +915,7 @@ view ({ sheet } as model) =
                                                                 <|
                                                                     Maybe.withDefault
                                                                         [ row
-                                                                            |> Array.get col.key
+                                                                            |> Dict.get col.key
                                                                             |> Maybe.withDefault (E.string "")
                                                                             |> D.decodeValue
                                                                                 (case col.typ of

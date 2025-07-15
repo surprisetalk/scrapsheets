@@ -41,12 +41,14 @@
                 doc: {
                   type: "template",
                   data: [
-                    "table",
-                    [
-                      ["a", "int", 0],
-                      ["b", "int", 1],
-                      ["c", "int", 2],
-                    ],
+                    {
+                      type: "table",
+                      data: [
+                        { name: "a", type: "int", key: "0" },
+                        { name: "b", type: "int", key: "1" },
+                        { name: "c", type: "int", key: "2" },
+                      ],
+                    },
                   ],
                 },
               },
@@ -100,8 +102,8 @@
           app.ports.changeId.subscribe(changeId);
           changeId(window.location.pathname.slice(1));
 
-          app.ports.newDoc.subscribe(async ({ type_: type, data }) => {
-            sheet = repo?.create({ type, data: [data] });
+          app.ports.newDoc.subscribe(async ({ type, data }) => {
+            sheet = repo?.create({ type, data });
             const id = `${type}:${sheet.documentId}`;
             Library.set(id, { name: "", tags: [] });
             const doc = Library.get()[id]?.doc ?? (await sheet?.doc?.());
@@ -124,19 +126,15 @@
                   }
                   case 1: {
                     const [y] = path;
-                    if (action === "splice")
-                      d.data[y].push(
-                        ...new Array(
-                          Math.max(0, value[0] - d.data[y].length + 1),
-                        ).fill(null),
-                      );
-                    d.data[y][action](...value);
+                    if (action === "set") d.data[y] = value;
+                    else d.data[y][action](...value);
                     break;
                   }
                   case 2: {
                     const [y, x] = path;
-                    if (!d.data[y]) d.data[y] = [];
-                    d.data[y][x][action](...value);
+                    if (!d.data[y]) d.data[y] = {};
+                    if (action === "set") d.data[y][x] = value;
+                    else d.data[y][x][action](...value);
                     break;
                   }
                   default:
