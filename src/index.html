@@ -96,6 +96,8 @@
         };
         app.ports.librarySynced.send(Library.get());
 
+        app.ports.deleteDoc.subscribe(async id => Library.delete(id));
+
         app.ports.updateLibrary.subscribe(({ id, data }) =>
           Library.set(id, data),
         );
@@ -110,37 +112,47 @@
 
           let sheet;
 
-          const changeId = async id => {
-            const [type, doc_id = ""] = id.split(":");
-            if (doc_id === sheet?.documentId) return;
-            // TODO: Remove existing listeners.
-            sheet = await repo?.find(doc_id).catch(() => null);
+          const queryDoc = async (id, { code, lang, args }) => {
+            // TODO: Run alasql
+            app.ports.docQueried.send({
+              id,
+              data: [[{ name: "a", type: "int", key: "a" }], { a: 1 }],
+            });
+          };
+
+          const selectDoc = async (id, sheet) => {
+            const [type] = id.split(":");
             const doc = Library.get()[id]?.doc ?? (await sheet?.doc?.());
             app.ports.docSelected.send({
               id,
               data: { doc: doc && { ...doc } },
             });
+            if (type === "query") queryDoc(id, doc.data);
             sheet?.on?.("change", data => {
               app.ports.docChanged.send({
                 id: type + ":" + data.handle.documentId,
                 data,
               });
+              if (type === "query") queryDoc(id, data.data);
             });
+          };
+
+          const changeId = async id => {
+            const [, doc_id = ""] = id.split(":");
+            if (doc_id === sheet?.documentId) return;
+            // TODO: Remove existing listeners.
+            sheet = await repo?.find(doc_id).catch(() => null);
+            await selectDoc(id, sheet);
           };
           app.ports.changeId.subscribe(changeId);
           changeId(window.location.pathname.slice(1));
 
-          app.ports.deleteDoc.subscribe(async id => Library.delete(id));
-
           app.ports.newDoc.subscribe(async ({ type, data }) => {
+            // TODO: Remove existing listeners.
             sheet = repo?.create({ type, data });
             const id = `${type}:${sheet.documentId}`;
             Library.set(id, { name: "", tags: [] });
-            const doc = Library.get()[id]?.doc ?? (await sheet?.doc?.());
-            app.ports.docSelected.send({
-              id,
-              data: { doc: doc && { ...doc } },
-            });
+            await selectDoc(id, sheet);
           });
 
           app.ports.changeDoc.subscribe(({ id, data: patches }) => {

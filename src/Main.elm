@@ -88,6 +88,9 @@ port docChanged : (Idd DocDelta -> msg) -> Sub msg
 port docNotified : (Idd D.Value -> msg) -> Sub msg
 
 
+port docQueried : (Idd D.Value -> msg) -> Sub msg
+
+
 type alias DocDelta =
     -- TODO: This should only include the deltas and not the full doc.
     { doc : D.Value
@@ -465,6 +468,7 @@ type Msg
     | DocSelect (Idd { doc : D.Value })
     | DocChange (Idd DocDelta)
     | DocNotify (Idd D.Value)
+    | DocQuery (Idd D.Value)
     | DocMsg DocMsg
     | DocNew
     | DocDelete Id
@@ -509,6 +513,7 @@ subs model =
         , docSelected DocSelect
         , docChanged DocChange
         , docNotified DocNotify
+        , docQueried DocQuery
         , Browser.onKeyPress (D.map KeyPress (D.field "key" D.string))
         ]
 
@@ -582,6 +587,13 @@ update msg ({ sheet } as model) =
         DocNotify data ->
             -- TODO:
             ( model, Cmd.none )
+
+        DocQuery data ->
+            ( iif (data.id /= model.sheet.id)
+                model
+                { model | sheet = { sheet | table = data.data |> D.decodeValue tableDecoder |> Result.mapError D.errorToString } }
+            , Cmd.none
+            )
 
         DocMsg (TabMsg edit) ->
             ( { model | sheet = { sheet | write = Nothing } }
