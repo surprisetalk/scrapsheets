@@ -28,6 +28,11 @@
           flags: {},
         });
 
+        const template = (name, type, data) => ({
+          name,
+          doc: { type: "template", data: [{ type, data }] },
+        });
+
         const Library = {
           get: () => {
             return {
@@ -36,40 +41,14 @@
               ),
               "": { name: "library", doc: { type: "library" } },
               "portal:shop": { name: "shop" },
-              "template:table": {
-                name: "table",
-                doc: {
-                  type: "template",
-                  data: [
-                    {
-                      type: "table",
-                      data: [
-                        { name: "a", type: "int", key: "0" },
-                        { name: "b", type: "int", key: "1" },
-                        { name: "c", type: "int", key: "2" },
-                      ],
-                    },
-                  ],
-                },
-              },
-              "template:query": {
-                name: "query",
-                doc: {
-                  type: "template",
-                  data: [
-                    {
-                      type: "query",
-                      data: [
-                        {
-                          lang: "sql",
-                          code: "select 1 as a",
-                          args: [],
-                        },
-                      ],
-                    },
-                  ],
-                },
-              },
+              "template:table": template("table", "table", [
+                { name: "a", type: "int", key: "0" },
+                { name: "b", type: "int", key: "1" },
+                { name: "c", type: "int", key: "2" },
+              ]),
+              "template:query": template("query", "query", [
+                { lang: "sql", code: "select 1 as a", args: [] },
+              ]),
             };
           },
           set: (id, info) => {
