@@ -765,14 +765,14 @@ view ({ sheet } as model) =
                 ( Ok Library, _ ) ->
                     Ok
                         { cols =
-                            [ ( "sheet_id", Link ), ( "name", Text ), ( "tags", Many Text ), ( "delete", Delete ) ]
+                            [ ( "sheet_id", Link ), ( "name", Text ), ( "tags", Many Text ), ( "del", Delete ) ]
                                 |> List.map (\( k, t ) -> Col k k t)
                                 |> Array.fromList
                         , rows =
                             model.library
                                 |> Dict.filter (\k _ -> k /= "")
                                 |> Dict.toList
-                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "delete", E.string k ) ])
+                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "╳", E.string k ) ])
                                 |> Array.fromList
                         }
 
