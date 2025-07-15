@@ -49,6 +49,18 @@
               "template:query": template("query", "query", [
                 { lang: "sql", code: "select 1 as a", args: [] },
               ]),
+              "portal:tutorial": {
+                name: "tutorial",
+                doc: {
+                  type: "portal",
+                  data: [
+                    [{ name: "tutorial", type: "text", key: "body" }],
+                    { body: "chapter 1" },
+                    { body: "chapter 2" },
+                    { body: "chapter 3" },
+                  ],
+                },
+              },
             };
           },
           set: (id, info) => {
