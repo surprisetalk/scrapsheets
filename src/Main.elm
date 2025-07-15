@@ -70,6 +70,9 @@ port changeId : Id -> Cmd msg
 port newDoc : E.Value -> Cmd msg
 
 
+port deleteDoc : String -> Cmd msg
+
+
 port changeDoc : Idd (List Patch) -> Cmd msg
 
 
@@ -266,6 +269,7 @@ type
     | Json
     | Timestamp
     | Image
+    | Delete
 
 
 type Tool
@@ -463,6 +467,7 @@ type Msg
     | DocNotify (Idd D.Value)
     | DocMsg DocMsg
     | DocNew
+    | DocDelete Id
     | KeyPress String
     | CellMouseClick
     | CellMouseDown
@@ -620,6 +625,9 @@ update msg ({ sheet } as model) =
             -- TODO:
             ( model, Cmd.none )
 
+        DocDelete id ->
+            ( model, deleteDoc id )
+
         DocNew ->
             ( model
             , case sheet.doc of
@@ -656,9 +664,14 @@ update msg ({ sheet } as model) =
             ( model, Cmd.none )
 
         CellMouseClick ->
-            ( { model | sheet = { sheet | write = Just "" } }
-            , Task.attempt (always NoOp) (Dom.focus "new-cell")
-            )
+            case sheet.doc of
+                Ok (Tab _) ->
+                    ( { model | sheet = { sheet | write = Just "" } }
+                    , Task.attempt (always NoOp) (Dom.focus "new-cell")
+                    )
+
+                _ ->
+                    ( model, Cmd.none )
 
         CellMouseDown ->
             ( { model | sheet = { sheet | drag = True, select = Rect sheet.hover sheet.select.b } }, Cmd.none )
@@ -752,14 +765,14 @@ view ({ sheet } as model) =
                 ( Ok Library, _ ) ->
                     Ok
                         { cols =
-                            [ ( "sheet_id", Link ), ( "name", Text ), ( "tags", Many Text ) ]
+                            [ ( "sheet_id", Link ), ( "name", Text ), ( "tags", Many Text ), ( "delete", Delete ) ]
                                 |> List.map (\( k, t ) -> Col k k t)
                                 |> Array.fromList
                         , rows =
                             model.library
                                 |> Dict.filter (\k _ -> k /= "")
                                 |> Dict.toList
-                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ) ])
+                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "delete", E.string k ) ])
                                 |> Array.fromList
                         }
 
@@ -933,6 +946,9 @@ view ({ sheet } as model) =
 
                                                                                     Number ->
                                                                                         D.map (H.span [ S.textAlignRight ] << List.singleton << text) string
+
+                                                                                    Delete ->
+                                                                                        D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "X" ])
 
                                                                                     _ ->
                                                                                         D.map text string

@@ -65,6 +65,16 @@
             );
             app.ports.librarySynced.send(Library.get());
           },
+          delete: id => {
+            const library = JSON.parse(
+              localStorage.getItem("scrapsheets-library") ?? "{}",
+            );
+            localStorage.setItem(
+              "scrapsheets-library",
+              JSON.stringify({ ...library, [id]: undefined }),
+            );
+            app.ports.librarySynced.send(Library.get());
+          },
         };
         app.ports.librarySynced.send(Library.get());
 
@@ -101,6 +111,8 @@
           };
           app.ports.changeId.subscribe(changeId);
           changeId(window.location.pathname.slice(1));
+
+          app.ports.deleteDoc.subscribe(async id => Library.delete(id));
 
           app.ports.newDoc.subscribe(async ({ type, data }) => {
             sheet = repo?.create({ type, data });
