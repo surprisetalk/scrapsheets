@@ -28,9 +28,23 @@
           flags: {},
         });
 
-        const template = (name, type, data) => ({
-          name,
-          doc: { type: "template", data: [{ type, data }] },
+        const Col = (val, key) => {
+          const [name, type] = val.split("::");
+          return {
+            name: name,
+            type: type ?? "string",
+            key: key.toString(),
+          };
+        };
+
+        const Template = (name, type, data) => ({
+          type: "template",
+          data: [{ type, data }],
+        });
+
+        const Table = (cols, ...rows) => ({
+          type: "table",
+          data: [cols, ...rows],
         });
 
         const Library = {
@@ -41,25 +55,24 @@
               ),
               "": { name: "library", doc: { type: "library" } },
               "portal:shop": { name: "shop" },
-              "template:table": template("table", "table", [
-                { name: "a", type: "int", key: "0" },
-                { name: "b", type: "int", key: "1" },
-                { name: "c", type: "int", key: "2" },
-              ]),
-              "template:query": template("query", "query", [
-                { lang: "sql", code: "select 1 as a", args: [] },
-              ]),
-              "portal:tutorial": {
+              "template:table": {
+                name: "table",
+                doc: Template("table", "table", ["a", "b", "c"].map(Col)),
+              },
+              "template:query": {
+                name: "template",
+                doc: Template("query", "query", [
+                  { lang: "sql", code: "select 1 as a", args: [] },
+                ]),
+              },
+              "table:tutorial": {
                 name: "tutorial",
-                doc: {
-                  type: "portal",
-                  data: [
-                    [{ name: "tutorial", type: "text", key: "body" }],
-                    { body: "chapter 1" },
-                    { body: "chapter 2" },
-                    { body: "chapter 3" },
-                  ],
-                },
+                doc: Table(
+                  ["text::text", "examples::text"].map(Col),
+                  ["chapter 1", []],
+                  ["chapter 2", []],
+                  ["chapter 3", []],
+                ),
               },
             };
           },
