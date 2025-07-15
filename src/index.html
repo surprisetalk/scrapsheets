@@ -20,10 +20,7 @@
   <body>
     <div id="elm"></div>
     <script type="module">
-      import * as AM from "https://esm.sh/@automerge/react@2.0.0/slim?bundle-deps";
-      await AM.initializeWasm(
-        fetch("https://esm.sh/@automerge/automerge/dist/automerge.wasm"),
-      );
+      import * as AM from "https://esm.sh/@automerge/react@2/slim?bundle-deps";
 
       try {
         const app = Elm.Main.init({
@@ -69,23 +66,27 @@
         };
         app.ports.librarySynced.send(Library.get());
 
-        app?.ports?.updateLibrary?.subscribe(({ id, data }) =>
+        app.ports.updateLibrary.subscribe(({ id, data }) =>
           Library.set(id, data),
         );
 
-        const repo = new AM.Repo({
-          storage: new AM.IndexedDBStorageAdapter(),
-          // network: [new AM.BrowserWebSocketClientAdapter("wss://sync.automerge.org")],
-        });
-
         {
+          await AM.initializeWasm(
+            fetch("https://esm.sh/@automerge/automerge@3/dist/automerge.wasm"),
+          );
+
+          const repo = new AM.Repo({
+            storage: new AM.IndexedDBStorageAdapter(),
+            // network: [new AM.BrowserWebSocketClientAdapter("wss://sync.automerge.org")],
+          });
+
           let sheet;
 
-          app?.ports?.changeId?.subscribe(async id => {
+          const changeId = async id => {
             const [type, doc_id = ""] = id.split(":");
             if (doc_id === sheet?.documentId) return;
             // TODO: Remove existing listeners.
-            sheet = await repo.find(doc_id).catch(() => null);
+            sheet = await repo?.find(doc_id).catch(() => null);
             const doc = Library.get()[id]?.doc ?? (await sheet?.doc?.());
             app.ports.docSelected.send({
               id,
@@ -97,10 +98,12 @@
                 data,
               });
             });
-          });
+          };
+          app.ports.changeId.subscribe(changeId);
+          changeId(window.location.pathname.slice(1));
 
-          app?.ports?.newDoc?.subscribe(async ({ type_: type, data }) => {
-            sheet = repo.create({ type, data: [data] });
+          app.ports.newDoc.subscribe(async ({ type_: type, data }) => {
+            sheet = repo?.create({ type, data: [data] });
             const id = `${type}:${sheet.documentId}`;
             Library.set(id, { name: "", tags: [] });
             const doc = Library.get()[id]?.doc ?? (await sheet?.doc?.());
@@ -110,45 +113,39 @@
             });
           });
 
-          app?.ports?.changeDoc?.subscribe(
-            // TODO: Use custom patches for now.
-            ({ id, data: patches }) => {
-              const [type, doc_id] = id.split(":");
-              if (!doc_id || doc_id !== sheet?.documentId) return;
-              for (const patch of patches) {
-                sheet?.change(d => {
-                  if (!d.cols) d.cols = [];
-                  if (!d.rows) d.rows = [];
-                  switch (patch.action) {
-                    case "cell-put":
-                      const [_, y, x] = patch.path;
-                      if (!d.rows[y]) d.rows[y] = {};
-                      d.rows[y][x] = patch.value;
-                      break;
-                    case "row-insert":
-                      d.rows.insertAt(1 + patch.path[1], patch.value);
-                      break;
-                    case "col-insert":
-                      // TODO: Intelligently pick a column based on existing columns and rows.
-                      d.cols.push({
-                        key: Math.random().toString().slice(2),
-                        label: Math.random().toString().slice(2),
-                        type: "same",
-                      });
-                      break;
-                    case "row-del":
-                      d.rows.deleteAt(patch.path[1]);
-                      break;
-                    case "col-del":
-                      d.cols.deleteAt(patch.path[1]);
-                      break;
-                    default:
-                      throw new Error("TODO");
+          app.ports.changeDoc.subscribe(({ id, data: patches }) => {
+            const [type, doc_id] = id.split(":");
+            if (!doc_id || doc_id !== sheet?.documentId) return;
+            console.log(id, patches, sheet.doc());
+            for (const { path, action, value } of patches)
+              sheet?.change(d => {
+                switch (path.length) {
+                  case 0: {
+                    d.data[action](...value);
+                    break;
                   }
-                });
-              }
-            },
-          );
+                  case 1: {
+                    const [y] = path;
+                    if (action === "splice")
+                      d.data[y].push(
+                        ...new Array(
+                          Math.max(0, value[0] - d.data[y].length + 1),
+                        ).fill(null),
+                      );
+                    d.data[y][action](...value);
+                    break;
+                  }
+                  case 2: {
+                    const [y, x] = path;
+                    if (!d.data[y]) d.data[y] = [];
+                    d.data[y][x][action](...value);
+                    break;
+                  }
+                  default:
+                    throw new Error("TODO: path");
+                }
+              });
+          });
         }
       } catch (error) {
         console.error(error);

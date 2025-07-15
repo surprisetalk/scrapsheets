@@ -373,7 +373,7 @@ tableDecoder : D.Decoder Table
 tableDecoder =
     D.map2 Table
         (D.index 0 (D.array colDecoder))
-        (D.map (Array.slice 1 0) (D.array (D.array D.value)))
+        (D.map (Array.slice 1 -1 << Array.push Array.empty) (D.array (D.array D.value)))
 
 
 colDecoder : D.Decoder Col
@@ -580,25 +580,25 @@ update msg ({ sheet } as model) =
                                         |> Array.get x
                                         |> Maybe.map
                                             (\col ->
-                                                [ { action = "cell-put"
-                                                  , path = [ E.string "rows", E.int y, E.int col.key ]
-                                                  , value = sheet.write |> Maybe.withDefault "" |> E.string
+                                                [ { action = "splice"
+                                                  , path = [ E.int (y + 1) ]
+                                                  , value = E.list identity [ E.int col.key, E.int 1, sheet.write |> Maybe.withDefault "" |> E.string ]
                                                   }
                                                 ]
                                             )
                                         |> Maybe.withDefault []
 
                                 SheetRowPush i ->
-                                    [ { action = "row-insert"
-                                      , path = [ E.string "rows", E.int i ]
-                                      , value = E.object []
+                                    [ { action = "push"
+                                      , path = []
+                                      , value = E.list identity [ E.list identity [] ]
                                       }
                                     ]
 
                                 SheetColumnPush ->
-                                    [ { action = "col-insert"
-                                      , path = [ E.string "cols", E.int (Array.length table.cols) ]
-                                      , value = E.object [ ( "key", E.string "" ), ( "label", E.string "" ), ( "type", E.string "same" ) ]
+                                    [ { action = "push"
+                                      , path = [ E.int 0 ]
+                                      , value = E.list identity [ E.list identity [ E.string "", E.string "text", E.int (Array.length table.cols) ] ]
                                       }
                                     ]
 
@@ -669,48 +669,43 @@ update msg ({ sheet } as model) =
         KeyPress "Enter" ->
             ( model, Task.attempt (always NoOp) (Dom.blur "new-cell") )
 
-        KeyPress "Backspace" ->
-            ( { model | sheet = { sheet | write = Nothing } }
-            , changeDoc <|
-                Idd sheet.id <|
-                    case sheet.doc of
-                        Ok (Tab table) ->
-                            -- TODO: Do multiple patches when ranges are selected.
-                            case ( negate sheet.select.a.y, negate sheet.select.a.x ) of
-                                ( 1, 1 ) ->
-                                    []
-
-                                ( 1, i ) ->
-                                    [ { action = "col-del"
-                                      , path = [ E.string "cols", E.int (negate i) ]
-                                      , value = E.object []
-                                      }
-                                    ]
-
-                                ( i, 1 ) ->
-                                    [ { action = "row-del"
-                                      , path = [ E.string "rows", E.int (negate i) ]
-                                      , value = E.object []
-                                      }
-                                    ]
-
-                                ( y, x ) ->
-                                    table.cols
-                                        |> Array.get (negate x)
-                                        |> Maybe.map
-                                            (\col ->
-                                                [ { action = "cell-put"
-                                                  , path = [ E.string "rows", E.int (negate y), E.int col.key ]
-                                                  , value = sheet.write |> Maybe.withDefault "" |> E.string
-                                                  }
-                                                ]
-                                            )
-                                        |> Maybe.withDefault []
-
-                        _ ->
-                            []
-            )
-
+        -- KeyPress "Backspace" ->
+        --     ( { model | sheet = { sheet | write = Nothing } }
+        --     , changeDoc <|
+        --         Idd sheet.id <|
+        --             case sheet.doc of
+        --                 Ok (Tab table) ->
+        --                     -- TODO: Do multiple patches when ranges are selected.
+        --                     case ( negate sheet.select.a.y, negate sheet.select.a.x ) of
+        --                         ( 1, 1 ) ->
+        --                             []
+        --                         ( 1, i ) ->
+        --                             [ { action = "col-del"
+        --                               , path = [ E.string "cols", E.int (negate i) ]
+        --                               , value = E.object []
+        --                               }
+        --                             ]
+        --                         ( i, 1 ) ->
+        --                             [ { action = "row-del"
+        --                               , path = [ E.string "rows", E.int (negate i) ]
+        --                               , value = E.object []
+        --                               }
+        --                             ]
+        --                         ( y, x ) ->
+        --                             table.cols
+        --                                 |> Array.get (negate x)
+        --                                 |> Maybe.map
+        --                                     (\col ->
+        --                                         [ { action = "cell-put"
+        --                                           , path = [ E.string "rows", E.int (negate y), E.int col.key ]
+        --                                           , value = sheet.write |> Maybe.withDefault "" |> E.string
+        --                                           }
+        --                                         ]
+        --                                     )
+        --                                 |> Maybe.withDefault []
+        --                 _ ->
+        --                     []
+        --     )
         KeyPress _ ->
             ( model, Cmd.none )
 
@@ -859,7 +854,7 @@ view ({ sheet } as model) =
                                                         , S.verticalAlignBottom
                                                         ]
                                                         [ H.a [ A.href "#settings", S.displayInlineBlock, S.width "100%" ]
-                                                            [ text col.name ]
+                                                            [ text (iif (col.name == "") "untitled" col.name) ]
                                                         ]
                                                 )
                                             <|
@@ -980,7 +975,7 @@ view ({ sheet } as model) =
                                             [ text (Debug.toString sheet.doc)
                                             ]
                                         , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd, S.alignItemsBaseline ]
-                                            [ H.button [ A.onClick NoOp ] [ text "new column (C)" ]
+                                            [ H.button [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "new column (C)" ]
                                             ]
                                         ]
                                 ]
