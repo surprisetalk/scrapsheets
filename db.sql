@@ -17,7 +17,7 @@ create table sheet
 , name text not null default ''
 , tags text[] not null default '{}'::text[]
 , sell_id text not null unique generated always as (md5(doc_id||created_by::text)) stored
-, sell_type text generated always as (case when type = 'template' then row_0->>0 when type in ('table','net-hook','net-http','net-socket','query') then 'portal' end) stored
+, sell_type text generated always as (case when type = 'template' then row_0->>'type' when type in ('table','net-hook','net-http','net-socket','query') then 'portal' end) stored
 , sell_price numeric check (sell_price >= 0)
 , buy_id text references sheet(sell_id)
 , buy_price numeric check (buy_price >= 0)

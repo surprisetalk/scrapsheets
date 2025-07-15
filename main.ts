@@ -31,25 +31,27 @@ export type Type =
   | ["array", Type]
   | ["tuple", Type[]]
   | { [k: string]: Type };
-export type Row = unknown[];
-export type Col = [string, Type, number];
-export type Table = [Col[], ...Row[]];
-export type Args = [string, unknown][];
+export type Row<T = unknown> = Record<string | number, T>;
+export type Col = { name: string; type: Type; key: string | number };
+export type Table = [Row<Col>, ...Row[]];
+export type Args = { key: string; value: unknown }[];
 export type Template =
-  | ["template", Template]
-  | ["table", Col[]]
-  | ["query", Query]
-  | ["net-hook", []]
-  | ["net-http", [string, number]]
-  | ["net-socket", [string]]
-  | [`codex-${string}`, []];
-export type Query = ["sql" | "prql", string, Args];
+  | Tag<"template", [Template]>
+  | Tag<"table", [Row<Col>]>
+  | Tag<"query", [Query]>
+  | Tag<"net-hook", []>
+  | Tag<"net-http", [NetHttp]>
+  | Tag<"net-socket", [NetSocket]>
+  | Tag<`codex-${string}`, []>;
+export type Query = { lang: "sql" | "prql"; code: string; args: Args };
+export type NetHttp = { url: string; interval: number };
+export type NetSocket = { url: string };
 export type Sheet =
   | Tag<"template", [Template]>
   | Tag<"table", Table>
   | Tag<"net-hook", []>
-  | Tag<"net-http", [[string, number]]>
-  | Tag<"net-socket", [[string]]>
+  | Tag<"net-http", [NetHttp]>
+  | Tag<"net-socket", [NetSocket]>
   | Tag<"query", [Query]>
   | Tag<"portal", Args>
   | Tag<"codex", []>;
@@ -58,6 +60,12 @@ export type Page = {
   data: Table;
   count: number;
   offset: number;
+};
+
+export const arrayify = <T>(arr: Array<T>): Record<number, T> => {
+  const obj: Record<number, T> = {};
+  for (const i in arr) obj[i] = arr[i];
+  return obj;
 };
 
 const sheet = async (
@@ -108,7 +116,7 @@ const sheet = async (
 
 const querify = async (
   c: Context,
-  [lang, code, args]: Query,
+  { lang, code, args = [] }: Query,
   reqQuery: Record<string, string>,
 ): Promise<Page> => {
   if (lang === "sql") {
@@ -124,14 +132,17 @@ const querify = async (
       const [cols, ...rows] = (await sheet(c, sheet_id, {})).data;
       docs[sheet_id] = rows.map(row =>
         Object.fromEntries(
-          row.map((x, i) => [cols[i]?.[0] ?? i.toString(), x]),
+          Object.values(cols).map(col => [col.name, row[col.key]]),
         ),
       );
     }
     const {
       columns: cols,
       data: rows,
-    }: { columns: { columnid: string }[]; data: Record<string, unknown>[] } =
+    }: {
+      columns: { columnid: string }[];
+      data: Record<string, unknown>[];
+    } =
       // TODO: Consider just using postgresjs and passing in tables as ${sql([...])}
       await ala(
         code_,
@@ -139,8 +150,17 @@ const querify = async (
       );
     return {
       data: [
-        cols.map((col, i) => [col.columnid, "string", i]),
-        ...rows.map(row => cols.map(col => row[col.columnid])),
+        Object.fromEntries(
+          cols.map((col, i) => [
+            i,
+            {
+              name: col.columnid,
+              type: "string",
+              key: col.columnid,
+            },
+          ]),
+        ),
+        ...rows,
       ],
       count: -1, // TODO:
       offset: -1, // TODO:
@@ -230,8 +250,14 @@ const cselect = async ({
     ? sql`where true ${where.filter(x => x).map((x: any) => sql`and ${x}`)}`
     : sql``;
   const rows =
-    await sql`${select} ${from} ${where_} ${order ?? sql``} limit ${limit} offset ${offset}`.values();
-  const cols: Col[] = rows.columns.map((col, i) => [col.name, "string", i]); // TODO: col.type
+    await sql`${select} ${from} ${where_} ${order ?? sql``} limit ${limit} offset ${offset}`;
+  const cols: Row<Col> = arrayify(
+    rows.columns.map((col, i) => ({
+      name: col.name,
+      type: "string", // TODO: col.type
+      key: col.name,
+    })),
+  );
   const [{ count }] = await sql`select count(*) ${from} ${where_}`;
   return { data: [cols, ...rows], count, offset: parseInt(offset) };
 };
@@ -366,12 +392,12 @@ app.post("/buy/:id", async c => {
     const [sheet] =
       await sql`select * from sheet where sell_id = ${c.req.param("id")} and sell_price >= 0`;
     if (!sheet) throw new HTTPException(404, { message: "Not found." });
-    const row_0 = sheet.type === "template" ? sheet.row_0[1] : [];
     if (!sheet.sell_type)
       throw new HTTPException(400, { message: "Not for sale." });
+    const row_0 = sheet.type === "template" ? sheet.row_0.data : {};
     const doc_id = sheet.sell_type.startsWith("codex-")
       ? Math.random().toString().slice(2)
-      : automerge.create({ data: [row_0] }).documentId;
+      : automerge.create({ data: row_0 }).documentId;
     const [{ sheet_id }] = await sql`
       with sell as (
         select * from sheet where sell_id = ${c.req.param("id")} and sell_price >= 0
@@ -385,6 +411,7 @@ app.post("/buy/:id", async c => {
       )
       select sheet_id from buy
     `;
+    if (!sheet_id) throw new HTTPException(500, { message: "Not purchased." });
     // TODO: Charge usr on stripe, etc.
     return sheet_id;
   });
@@ -446,7 +473,7 @@ app.put("/library/:id", async c => {
       doc_id,
       row_0: await automerge
         .find<{ data: Table }>(doc_id as AnyDocumentId)
-        .then(hand => hand.doc().data[0]),
+        .then(hand => hand.doc().data[0] ?? {}),
       created_by: c.get("usr_id"),
     };
     await sql`
@@ -463,8 +490,7 @@ app.get("/net/:id", async c => {
 });
 
 app.post("/query", async c => {
-  const { lang, code, args = [] } = await c.req.json();
-  return page(c)(await querify(c, [lang, code, args], c.req.query()));
+  return page(c)(await querify(c, await c.req.json(), c.req.query()));
 });
 
 app.get("/codex/:id", async c => {
@@ -484,20 +510,17 @@ app.get("/codex/:id", async c => {
       const rows = await sql_`
         select 
           table_name as name,
-          array[]::jsonb[]
-            || array[${[
-              ["name", "string", 0],
-              ["type", "string", 1],
-              ["i", "int", 2],
-            ]}::jsonb]::jsonb[]
-            || array_agg(to_jsonb(array[column_name,data_type,ordinal_position::text]::text[]))::jsonb[] 
-            as columns
+          '[[{"name":"name","type":"string","key":"column_name"},{"name":"type","type":"string","key":"data_type"},{"name":"key","type":"int","key":"ordinal_position"}]]'::jsonb || jsonb_agg(t)::jsonb as columns
         from information_schema.tables t
         inner join information_schema.columns c using (table_catalog,table_schema,table_name)
         where table_schema = 'public'
         group by table_name, table_type
-      `.values();
-      const cols = rows.columns.map((col, i) => [col.name, "string", i]); // TODO:
+      `;
+      const cols = rows.columns.map((col, i) => ({
+        name: col.name,
+        type: "string",
+        key: col.name,
+      })); // TODO:
       await sql_.end();
       return c.json({ data: [cols, ...rows] }, 200);
     }
@@ -506,16 +529,16 @@ app.get("/codex/:id", async c => {
         {
           data: [
             [
-              ["name", "string", 0],
-              ["columns", "todo", 1],
+              { name: "name", type: "string", key: "name" },
+              { name: "columns", type: "table", key: "columns" },
             ],
-            [
-              "shop",
-              [
+            {
+              name: "shop",
+              columns: [
                 [
-                  ["name", "string", 0],
-                  ["type", "string", 1],
-                  ["i", "int", 2],
+                  { name: "name", type: "string", key: 0 },
+                  { name: "type", type: "string", key: 1 },
+                  { name: "key", type: "int", key: 2 },
                 ],
                 ["created_at", "string", 0],
                 ["sell_id", "string", 1],
@@ -523,14 +546,14 @@ app.get("/codex/:id", async c => {
                 ["sell_price", "string", 3],
                 ["name", "string", 4],
               ],
-            ],
-            [
-              "library",
-              [
+            },
+            {
+              name: "library",
+              columns: [
                 [
-                  ["name", "string", 0],
-                  ["type", "string", 1],
-                  ["i", "int", 2],
+                  { name: "name", type: "string", key: 0 },
+                  { name: "type", type: "string", key: 1 },
+                  { name: "key", type: "int", key: 2 },
                 ],
                 ["s.created_at", "string", 0],
                 ["s.type", "string", 1],
@@ -539,7 +562,7 @@ app.get("/codex/:id", async c => {
                 ["s.tags", "string", 4],
                 ["s.sell_price", "string", 5],
               ],
-            ],
+            },
           ],
         },
         200,
