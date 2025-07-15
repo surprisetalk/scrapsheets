@@ -273,6 +273,7 @@ type
     | Timestamp
     | Image
     | Delete
+    | Form (Dict String String)
 
 
 type Tool
@@ -403,6 +404,7 @@ colDecoder =
                 , ( "number", Number )
                 , ( "link", Link )
                 , ( "image", Image )
+                , ( "form", Form Dict.empty )
                 , ( "timestamp", Timestamp )
                 , ( "json", Json )
                 , ( "text", Text )
@@ -985,6 +987,34 @@ view ({ sheet } as model) =
 
                                                                                     Delete ->
                                                                                         D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "╳" ])
+
+                                                                                    Form form ->
+                                                                                        D.map3
+                                                                                            (\method action fields ->
+                                                                                                -- TODO: Change this to displayGrid
+                                                                                                H.form [ A.onSubmit NoOp, S.displayGrid, S.gridTemplateColumns "auto 1fr", S.paddingRem 1 ] <|
+                                                                                                    List.concat
+                                                                                                        [ List.concatMap
+                                                                                                            (\field ->
+                                                                                                                [ H.label [] [ text field.label ]
+                                                                                                                , H.input [] []
+                                                                                                                ]
+                                                                                                            )
+                                                                                                            fields
+                                                                                                        , [ H.span [] []
+                                                                                                          , H.button [ A.type_ "submit" ] [ text method ]
+                                                                                                          ]
+                                                                                                        ]
+                                                                                            )
+                                                                                            (D.field "method" D.string)
+                                                                                            (D.field "action" D.string)
+                                                                                            (D.field "fields"
+                                                                                                (D.list
+                                                                                                    (D.map (\label -> { label = label })
+                                                                                                        (D.field "label" D.string)
+                                                                                                    )
+                                                                                                )
+                                                                                            )
 
                                                                                     _ ->
                                                                                         D.map text string

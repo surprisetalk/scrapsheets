@@ -47,6 +47,12 @@
           data: [cols, ...rows],
         });
 
+        const Form = (method, action, fields) => ({
+          method,
+          action,
+          fields,
+        });
+
         const Library = {
           get: () => {
             return {
@@ -72,6 +78,40 @@
                   ["chapter 1", []],
                   ["chapter 2", []],
                   ["chapter 3", []],
+                ),
+              },
+              "table:rest-api": {
+                name: "rest api",
+                tags: ["example"],
+                // TODO:
+                doc: Table(
+                  ["method:text", "url::text", "form::form"].map(Col),
+                  ...[
+                    [
+                      "GET",
+                      "example.com/foo",
+                      [
+                        { label: "hello", type: "text" },
+                        { label: "world", type: "date" },
+                      ],
+                    ],
+                    [
+                      "POST",
+                      "example.com/bar",
+                      [
+                        {
+                          label: "my dropdown",
+                          key: "my_dropdown",
+                          type: { 1: "label a", 2: "label b" },
+                          default: 2,
+                        },
+                      ],
+                    ],
+                  ].map(([method, action, fields]) => [
+                    method,
+                    action,
+                    Form(method, action, fields),
+                  ]),
                 ),
               },
             };
