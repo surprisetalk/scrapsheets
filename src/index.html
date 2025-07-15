@@ -52,6 +52,24 @@
                   ],
                 },
               },
+              "template:query": {
+                name: "query",
+                doc: {
+                  type: "template",
+                  data: [
+                    {
+                      type: "query",
+                      data: [
+                        {
+                          lang: "sql",
+                          code: "select 1 as a",
+                          args: [],
+                        },
+                      ],
+                    },
+                  ],
+                },
+              },
             };
           },
           set: (id, info) => {

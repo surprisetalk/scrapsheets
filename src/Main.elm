@@ -495,6 +495,7 @@ type Input
     | ColumnType Int
     | ColumnKey Int
     | ColumnLabel Int
+    | QueryCode
 
 
 
@@ -631,8 +632,12 @@ update msg ({ sheet } as model) =
         DocNew ->
             ( model
             , case sheet.doc of
+                Ok (Template ( "table", data )) ->
+                    -- TODO: Make this consistent?
+                    newDoc <| E.object [ ( "type", E.string "table" ), ( "data", E.list identity [ E.array (E.dict identity identity) data ] ) ]
+
                 Ok (Template ( type_, data )) ->
-                    newDoc <| E.object [ ( "type", E.string type_ ), ( "data", E.list identity [ E.array (E.dict identity identity) data ] ) ]
+                    newDoc <| E.object [ ( "type", E.string type_ ), ( "data", E.array (E.dict identity identity) data ) ]
 
                 _ ->
                     Cmd.none
@@ -650,6 +655,19 @@ update msg ({ sheet } as model) =
 
         InputChange CellWrite x ->
             ( { model | sheet = { sheet | write = Just x } }, Cmd.none )
+
+        InputChange QueryCode x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data =
+                    [ { action = "set"
+                      , path = [ E.int 0, E.string "code" ]
+                      , value = E.string x
+                      }
+                    ]
+                }
+            )
 
         InputChange (ColumnType i) x ->
             -- TODO:
@@ -759,6 +777,12 @@ view ({ sheet } as model) =
                         , rows = params
                         }
 
+                ( Ok (Template ( "query", params )), _ ) ->
+                    Ok
+                        { cols = Array.fromList [ Col "lang" "lang" Text, Col "code" "code" Text, Col "args" "args" Text ]
+                        , rows = params
+                        }
+
                 ( Ok (Template ( type_, params )), _ ) ->
                     Err "TODO: template"
 
@@ -772,7 +796,7 @@ view ({ sheet } as model) =
                             model.library
                                 |> Dict.filter (\k _ -> k /= "")
                                 |> Dict.toList
-                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "╳", E.string k ) ])
+                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "del", E.string k ) ])
                                 |> Array.fromList
                         }
 
@@ -948,7 +972,7 @@ view ({ sheet } as model) =
                                                                                         D.map (H.span [ S.textAlignRight ] << List.singleton << text) string
 
                                                                                     Delete ->
-                                                                                        D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "X" ])
+                                                                                        D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "╳" ])
 
                                                                                     _ ->
                                                                                         D.map text string
@@ -985,12 +1009,12 @@ view ({ sheet } as model) =
                                   ]
                                 , case sheet.doc of
                                     Ok (Query query) ->
-                                        [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
+                                        [ H.textarea [ A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
                                             [ text (String.trim query.query)
                                             ]
                                         ]
 
-                                    Ok (Template ( "table", _ )) ->
+                                    Ok (Template ( _, _ )) ->
                                         [ H.button [ A.onClick DocNew ] [ text "new sheet (N)" ]
                                         ]
 
