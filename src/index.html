@@ -128,7 +128,6 @@
           app.ports.changeDoc.subscribe(({ id, data: patches }) => {
             const [type, doc_id] = id.split(":");
             if (!doc_id || doc_id !== sheet?.documentId) return;
-            console.log(id, patches, sheet.doc());
             for (const { path, action, value } of patches)
               sheet?.change(d => {
                 switch (path.length) {
