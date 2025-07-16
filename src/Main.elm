@@ -202,9 +202,26 @@ type alias Table =
     }
 
 
+type Lang
+    = Prql
+    | Sql
+    | Formula
+    | Scrapscript
+
+
+langs : Dict String Lang
+langs =
+    Dict.fromList
+        [ ( "prql", Prql )
+        , ( "sql", Sql )
+        , ( "formula", Formula )
+        , ( "scrapscript", Scrapscript )
+        ]
+
+
 type alias Query_ =
-    { code : String
-    , query : String
+    { lang : Lang
+    , code : String
     , args : Args
     }
 
@@ -275,6 +292,7 @@ type
     | Image
     | Delete
     | Form (Dict String String)
+    | ColQuery Query_
 
 
 type Tool
@@ -366,7 +384,7 @@ docDecoder =
                             D.index 0 <|
                                 D.map Query
                                     (D.map3 Query_
-                                        (D.field "lang" D.string)
+                                        (D.field "lang" langDecoder)
                                         (D.field "code" D.string)
                                         -- TODO
                                         (D.field "args" (D.succeed Dict.empty))
@@ -419,7 +437,24 @@ colDecoder =
     D.map3 Col
         (D.field "key" string)
         (D.field "name" D.string)
-        (D.field "type" D.string |> D.map (flip Dict.get types >> Maybe.withDefault Text))
+        (D.field "type"
+            (D.oneOf
+                [ D.map ColQuery
+                    (D.map3 Query_
+                        (D.field "lang" langDecoder)
+                        (D.field "code" D.string)
+                        (D.succeed Dict.empty)
+                    )
+                , D.string
+                    |> D.map (flip Dict.get types >> Maybe.withDefault Text)
+                ]
+            )
+        )
+
+
+langDecoder : D.Decoder Lang
+langDecoder =
+    D.string |> D.andThen (flip Dict.get langs >> Maybe.map D.succeed >> Maybe.withDefault (D.fail "Invalid query language."))
 
 
 
@@ -843,7 +878,7 @@ view ({ sheet } as model) =
                                 |> Array.fromList
                         , rows =
                             model.library
-                                |> Dict.filter (\k _ -> k /= "")
+                                |> Dict.filter (\k _ -> k /= "" && not (String.startsWith "scratch:" k))
                                 |> Dict.toList
                                 |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "del", E.string k ) ])
                                 |> Array.fromList
@@ -1030,6 +1065,20 @@ view ({ sheet } as model) =
                                                                                     Delete ->
                                                                                         D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "╳" ])
 
+                                                                                    ColQuery query ->
+                                                                                        case query.lang of
+                                                                                            Prql ->
+                                                                                                D.succeed (text "TODO: prql")
+
+                                                                                            Sql ->
+                                                                                                D.succeed (text "TODO: sql")
+
+                                                                                            Formula ->
+                                                                                                D.succeed (text "TODO: formula")
+
+                                                                                            Scrapscript ->
+                                                                                                D.succeed (text "TODO: scrapscript")
+
                                                                                     Form form ->
                                                                                         D.map3
                                                                                             (\method action fields ->
@@ -1094,7 +1143,7 @@ view ({ sheet } as model) =
                                 , case sheet.doc of
                                     Ok (Query query) ->
                                         [ H.textarea [ A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
-                                            [ text (String.trim query.query)
+                                            [ text (String.trim query.code)
                                             ]
                                         ]
 
