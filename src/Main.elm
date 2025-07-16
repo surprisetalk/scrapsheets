@@ -712,7 +712,6 @@ update msg ({ sheet } as model) =
             ( model
             , case sheet.doc of
                 Ok (Template ( "table", data )) ->
-                    -- TODO: Make this consistent?
                     newDoc <| E.object [ ( "type", E.string "table" ), ( "data", E.list identity [ E.array (E.dict identity identity) data ] ) ]
 
                 Ok (Template ( type_, data )) ->

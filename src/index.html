@@ -23,6 +23,17 @@
     <script type="module">
       import * as AM from "/automerge.js";
 
+      function debounce(func, timeout = 300) {
+        let timer;
+        return (...args) => {
+          if (!timer) func.apply(this, args);
+          clearTimeout(timer);
+          timer = setTimeout(() => {
+            timer = undefined;
+          }, timeout);
+        };
+      }
+
       try {
         const app = Elm.Main.init({
           node: document.getElementById("elm"),
@@ -205,7 +216,7 @@
                     data: [
                       {
                         lang: "sql",
-                        code: "select * from unnest(http_get('https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors?q='++@q)->res->actors)",
+                        code: "select * from unnest(http_get('https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors', @{q:coalesce(@params->q,'taylor.town')})->res->actors)",
                         args: {},
                       },
                     ],
@@ -255,27 +266,36 @@
           let sheet;
 
           alasql.from.UNNEST = objs => objs;
-          alasql.fn.http_get = url => {
+          alasql.fn.http_get = (url, qs = {}) => {
+            if (!url) return;
             const request = new XMLHttpRequest();
-            request.open("GET", url, false); // `false` makes the request synchronous
-            request.send(null);
-            return {
-              status: request.status,
-              res: JSON.parse(request.responseText),
-            };
+            try {
+              const qs_ = new URLSearchParams(qs);
+              request.open("GET", url + (qs_ ? "?" + qs_ : ""), false); // `false` makes the request synchronous
+              request.send(null);
+              return {
+                status: request.status,
+                res: JSON.parse(request.responseText),
+              };
+            } catch (error) {
+              console.error(url, qs, request.status, request.responseText);
+              console.error(error);
+            }
           };
-          const queryDoc = async (id, { code, lang, args }) => {
+          const queryDoc = debounce(async (id, { code, lang, args }) => {
             switch (lang) {
               case "sql":
                 // TODO: Run alasql if possible, otherwise post to /query.
-                const [, rows] =
-                  alasql(`set @q = $1; ${code}`, [
-                    new URLSearchParams(window.location.search).get("q"),
+                const [, rows = []] =
+                  alasql(`set @params = ?; ${code}`, [
+                    Object.fromEntries(
+                      new URLSearchParams(window.location.search).entries(),
+                    ),
                   ]) || [];
                 app.ports.docQueried.send({
                   id,
                   data: [
-                    Object.keys(rows[0] || {}).map(col => ({
+                    Object.keys(rows?.[0] || {}).map(col => ({
                       name: col,
                       key: col,
                       type: "text",
@@ -287,11 +307,11 @@
               default:
                 throw new Error(`TODO: ${lang}`);
             }
-          };
+          }, 1000);
 
           const selectDoc = async (id, sheet) => {
-            const [type] = id.split(":");
-            const doc = Library.get()[id]?.doc ?? (await sheet?.doc?.());
+            const [type, doc_id] = id.split(":");
+            const doc = Library.get()[id]?.doc ?? sheet?.doc?.();
             app.ports.docSelected.send({
               id,
               data: { doc: doc && { ...doc } },
@@ -302,7 +322,7 @@
                 id: type + ":" + data.handle.documentId,
                 data,
               });
-              if (type === "query") queryDoc(id, data.data);
+              if (type === "query") queryDoc(id, data.doc.data[0]);
             });
           };
 
@@ -324,11 +344,11 @@
             await selectDoc(id, sheet);
           });
 
-          app.ports.changeDoc.subscribe(({ id, data: patches }) => {
+          app.ports.changeDoc.subscribe(async ({ id, data: patches }) => {
             const [type, doc_id] = id.split(":");
             if (!doc_id || doc_id !== sheet?.documentId) return;
-            for (const { path, action, value } of patches)
-              sheet?.change(d => {
+            sheet?.change(d => {
+              for (const { path, action, value } of patches)
                 switch (path.length) {
                   case 0: {
                     d.data[action](...value);
@@ -350,7 +370,7 @@
                   default:
                     throw new Error("TODO: path");
                 }
-              });
+            });
           });
         }
       } catch (error) {
