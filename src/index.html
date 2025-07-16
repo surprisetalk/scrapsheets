@@ -42,6 +42,11 @@
           data: [{ type, data }],
         });
 
+        const Scratch = data => ({
+          type: "scratch",
+          data: [data],
+        });
+
         const Table = (cols, ...rows) => ({
           type: "table",
           data: [cols, ...rows],
@@ -80,38 +85,40 @@
                   ["chapter 3", []],
                 ),
               },
-              "table:rest-api": {
+              "scratch:rest-api": {
                 name: "rest api",
                 tags: ["example"],
                 // TODO:
-                doc: Table(
-                  ["method:text", "url::text", "form::form"].map(Col),
-                  ...[
-                    [
-                      "GET",
-                      "example.com/foo",
+                doc: Scratch(
+                  Table(
+                    ["method:text", "url::text", "form::form"].map(Col),
+                    ...[
                       [
-                        { label: "hello", type: "text" },
-                        { label: "world", type: "date" },
+                        "GET",
+                        "example.com/foo",
+                        [
+                          { label: "hello", type: "text" },
+                          { label: "world", type: "date" },
+                        ],
                       ],
-                    ],
-                    [
-                      "POST",
-                      "example.com/bar",
                       [
-                        {
-                          label: "my dropdown",
-                          key: "my_dropdown",
-                          type: { 1: "label a", 2: "label b" },
-                          default: 2,
-                        },
+                        "POST",
+                        "example.com/bar",
+                        [
+                          {
+                            label: "my dropdown",
+                            key: "my_dropdown",
+                            type: { 1: "label a", 2: "label b" },
+                            default: 2,
+                          },
+                        ],
                       ],
-                    ],
-                  ].map(([method, action, fields]) => [
-                    method,
-                    action,
-                    Form(method, action, fields),
-                  ]),
+                    ].map(([method, action, fields]) => [
+                      method,
+                      action,
+                      Form(method, action, fields),
+                    ]),
+                  ),
                 ),
               },
             };

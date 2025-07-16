@@ -183,6 +183,7 @@ type alias Svg =
 
 type Doc
     = Library
+    | Scratch Doc
     | Tab Table
     | Net Net
     | Query Query_
@@ -329,6 +330,11 @@ docDecoder =
                 case typ of
                     "library" ->
                         D.succeed Library
+
+                    "scratch" ->
+                        D.field "data" <|
+                            D.index 0 <|
+                                D.map Scratch (D.lazy (\_ -> docDecoder))
 
                     "table" ->
                         D.field "data" <|
@@ -598,7 +604,29 @@ update msg ({ sheet } as model) =
             )
 
         DocMsg (TabMsg edit) ->
-            ( { model | sheet = { sheet | write = Nothing } }
+            ( { model
+                | sheet =
+                    { sheet
+                        | write = Nothing
+                        , doc =
+                            case sheet.doc of
+                                Ok (Scratch (Tab ({ cols, rows } as table))) ->
+                                    (Ok << Scratch << Tab) <|
+                                        case edit of
+                                            SheetWrite { x, y } ->
+                                                table.cols
+                                                    |> Array.get x
+                                                    |> Maybe.map (\col -> { table | rows = rows |> Array.set y (rows |> Array.get y |> Maybe.withDefault Dict.empty |> Dict.insert col.key (sheet.write |> Maybe.map E.string |> Maybe.withDefault E.null)) })
+                                                    |> Maybe.withDefault table
+
+                                            _ ->
+                                                -- TODO:
+                                                table
+
+                                _ ->
+                                    sheet.doc
+                    }
+              }
             , changeDoc <|
                 Idd sheet.id <|
                     case sheet.doc of
@@ -612,7 +640,7 @@ update msg ({ sheet } as model) =
                                             (\col ->
                                                 [ { action = "set"
                                                   , path = [ E.int (y + 1), E.string col.key ]
-                                                  , value = sheet.write |> Maybe.withDefault "" |> E.string
+                                                  , value = sheet.write |> Maybe.map E.string |> Maybe.withDefault E.null
                                                   }
                                                 ]
                                             )
@@ -696,11 +724,18 @@ update msg ({ sheet } as model) =
             ( model, Cmd.none )
 
         CellMouseClick ->
-            case sheet.doc of
-                Ok (Tab _) ->
+            let
+                x =
                     ( { model | sheet = { sheet | write = Just "" } }
                     , Task.attempt (always NoOp) (Dom.focus "new-cell")
                     )
+            in
+            case sheet.doc of
+                Ok (Scratch _) ->
+                    x
+
+                Ok (Tab _) ->
+                    x
 
                 _ ->
                     ( model, Cmd.none )
@@ -779,9 +814,9 @@ view ({ sheet } as model) =
                 |> Dict.get sheet.id
                 |> Maybe.withDefault { name = "", tags = [], thumb = (), peers = Public }
 
-        table : Result String Table
-        table =
-            case ( sheet.doc, sheet.table ) of
+        tableHelper : Result String Doc -> Result String Table
+        tableHelper doc =
+            case ( doc, sheet.table ) of
                 ( Ok (Tab tbl), _ ) ->
                     Ok tbl
 
@@ -814,6 +849,9 @@ view ({ sheet } as model) =
                                 |> Array.fromList
                         }
 
+                ( Ok (Scratch doc_), _ ) ->
+                    tableHelper (Ok doc_)
+
                 ( _, Ok tbl ) ->
                     Ok tbl
 
@@ -822,6 +860,10 @@ view ({ sheet } as model) =
 
                 ( _, Err err ) ->
                     Err err
+
+        table : Result String Table
+        table =
+            tableHelper sheet.doc
     in
     { title = "scrapsheets"
     , body =
