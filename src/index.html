@@ -133,6 +133,38 @@
                   },
                 ],
               },
+              "scratch:query:python": {
+                type: "query",
+                data: [
+                  {
+                    lang: "python",
+                    code: "return [[{'name':'a','type':'text','key':'a'}], {'a':1}, {'a':2}, {'a':3}]",
+                    args: {},
+                  },
+                ],
+              },
+              "scratch:query:stonks": {
+                type: "query",
+                data: [
+                  {
+                    lang: "sql",
+                    code: "select stonks->>'id', stonks->>'price' from http('https://taylor.town/stonks'), unnest(res) stonks",
+                    args: {},
+                  },
+                ],
+              },
+              // "scratch:table:trello": Table(
+              //   [
+              //     { key: 0, name: "todo", type: "list text" },
+              //     { key: 1, name: "doing", type: "list text" },
+              //     { key: 2, name: "done", type: "list text" },
+              //   ],
+              //   [
+              //     ["dishes", "laundry", "garbage"],
+              //     ["lawn"],
+              //     ["mealprep", "windows"],
+              //   ],
+              // ),
             };
             return {
               ...Object.fromEntries(

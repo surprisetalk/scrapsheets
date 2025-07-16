@@ -207,6 +207,7 @@ type Lang
     | Sql
     | Formula
     | Scrapscript
+    | Python
 
 
 langs : Dict String Lang
@@ -216,6 +217,7 @@ langs =
         , ( "sql", Sql )
         , ( "formula", Formula )
         , ( "scrapscript", Scrapscript )
+        , ( "python", Python )
         ]
 
 
@@ -1078,6 +1080,9 @@ view ({ sheet } as model) =
 
                                                                                             Scrapscript ->
                                                                                                 D.succeed (text "TODO: scrapscript")
+
+                                                                                            Python ->
+                                                                                                D.succeed (text "TODO: python")
 
                                                                                     Form form ->
                                                                                         D.map3
