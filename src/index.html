@@ -16,6 +16,7 @@
       media="(prefers-color-scheme: dark)" />
     <link href="/style.css" rel="stylesheet" />
     <script src="/index.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/alasql@4"></script>
   </head>
   <body>
     <div id="elm"></div>
@@ -195,6 +196,22 @@
                   ]),
                 ),
               },
+              // TODO: Move these to the shop.
+              ...{
+                "query:bluesky-actors": {
+                  name: "bluesky actors",
+                  doc: {
+                    type: "query",
+                    data: [
+                      {
+                        lang: "sql",
+                        code: "select * from unnest(http_get('https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors?q='++@q)->res->actors)",
+                        args: {},
+                      },
+                    ],
+                  },
+                },
+              },
             };
           },
           set: (id, info) => {
@@ -237,12 +254,39 @@
 
           let sheet;
 
+          alasql.from.UNNEST = objs => objs;
+          alasql.fn.http_get = url => {
+            const request = new XMLHttpRequest();
+            request.open("GET", url, false); // `false` makes the request synchronous
+            request.send(null);
+            return {
+              status: request.status,
+              res: JSON.parse(request.responseText),
+            };
+          };
           const queryDoc = async (id, { code, lang, args }) => {
-            // TODO: Run alasql if possible, otherwise post to /query.
-            app.ports.docQueried.send({
-              id,
-              data: [[{ name: "a", type: "int", key: "a" }], { a: 1 }],
-            });
+            switch (lang) {
+              case "sql":
+                // TODO: Run alasql if possible, otherwise post to /query.
+                const [, rows] =
+                  alasql(`set @q = $1; ${code}`, [
+                    new URLSearchParams(window.location.search).get("q"),
+                  ]) || [];
+                app.ports.docQueried.send({
+                  id,
+                  data: [
+                    Object.keys(rows[0] || {}).map(col => ({
+                      name: col,
+                      key: col,
+                      type: "text",
+                    })),
+                    ...rows,
+                  ],
+                });
+                break;
+              default:
+                throw new Error(`TODO: ${lang}`);
+            }
           };
 
           const selectDoc = async (id, sheet) => {
@@ -252,7 +296,7 @@
               id,
               data: { doc: doc && { ...doc } },
             });
-            if (type === "query") queryDoc(id, doc.data);
+            if (type === "query") queryDoc(id, doc.data[0]);
             sheet?.on?.("change", data => {
               app.ports.docChanged.send({
                 id: type + ":" + data.handle.documentId,
