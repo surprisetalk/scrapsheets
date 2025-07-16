@@ -1140,27 +1140,34 @@ view ({ sheet } as model) =
                                   , H.label [] [ text "tags" ]
                                   , H.input [ A.value (String.join ", " info.tags), A.onInput (InputChange SheetTags) ] []
                                   ]
-                                , case sheet.doc of
-                                    Ok (Query query) ->
-                                        [ H.textarea [ A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
-                                            [ text (String.trim query.code)
-                                            ]
-                                        ]
+                                , let
+                                    docHelper doc =
+                                        case doc of
+                                            Ok (Scratch doc_) ->
+                                                docHelper (Ok doc_)
 
-                                    Ok (Template ( _, _ )) ->
-                                        [ H.button [ A.onClick DocNew ] [ text "new sheet (N)" ]
-                                        ]
+                                            Ok (Query query) ->
+                                                [ H.textarea [ A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
+                                                    [ text (String.trim query.code)
+                                                    ]
+                                                ]
 
-                                    _ ->
-                                        -- TODO:
-                                        [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%" ]
-                                            -- TODO: Link to the column configs.
-                                            [ text (Debug.toString sheet.doc)
-                                            ]
-                                        , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd, S.alignItemsBaseline ]
-                                            [ H.button [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "new column (C)" ]
-                                            ]
-                                        ]
+                                            Ok (Template ( _, _ )) ->
+                                                [ H.button [ A.onClick DocNew ] [ text "new sheet (N)" ]
+                                                ]
+
+                                            _ ->
+                                                -- TODO:
+                                                [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%" ]
+                                                    -- TODO: Link to the column configs.
+                                                    [ text (Debug.toString sheet.doc)
+                                                    ]
+                                                , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd, S.alignItemsBaseline ]
+                                                    [ H.button [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "new column (C)" ]
+                                                    ]
+                                                ]
+                                  in
+                                  docHelper sheet.doc
                                 ]
 
                         Hints ->

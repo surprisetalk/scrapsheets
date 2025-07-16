@@ -55,72 +55,92 @@
         const Library = {
           get: () => {
             const examples = {
-              "scratch:table:calculated-columns": {
-                name: "calculated columns",
-                doc: Scratch(
-                  Table(
+              "scratch:table:calculated-columns": Table(
+                [
+                  { key: 0, name: "a", type: "int" },
+                  { key: 1, name: "b", type: "int" },
+                  {
+                    key: 2,
+                    name: "c",
+                    type: { lang: "formula", code: "a + b" },
+                  },
+                ],
+                ...[
+                  [1, 2],
+                  [2, 4],
+                  [3, 6],
+                ],
+              ),
+              "scratch:table:postman": Table(
+                [
+                  { key: 0, name: "method", type: "text" },
+                  { key: 1, name: "url", type: "text" },
+                  { key: 2, name: "fields", type: "list field" },
+                  {
+                    key: 3,
+                    name: "form",
+                    type: {
+                      lang: "scrapscript",
+                      code: "form {method,url,fields}",
+                    },
+                  },
+                ],
+                ...[
+                  [
+                    "GET",
+                    "example.com/foo",
                     [
-                      { key: 0, name: "a", type: "int" },
-                      { key: 1, name: "b", type: "int" },
+                      { label: "hello", type: "text" },
+                      { label: "world", type: "date" },
+                    ],
+                  ],
+                  [
+                    "POST",
+                    "example.com/bar",
+                    [
                       {
-                        key: 2,
-                        name: "c",
-                        type: { lang: "formula", code: "a + b" },
+                        label: "my dropdown",
+                        key: "my_dropdown",
+                        type: { 1: "label a", 2: "label b" },
+                        default: 2,
                       },
                     ],
-                    ...[
-                      [1, 2],
-                      [2, 4],
-                      [3, 6],
-                    ],
-                  ),
-                ),
-              },
-              "scratch:table:postman": {
-                name: "rest api",
-                doc: Scratch(
-                  Table(
-                    [
-                      { key: 0, name: "method", type: "text" },
-                      { key: 1, name: "url", type: "text" },
-                      { key: 2, name: "fields", type: "list field" },
-                      {
-                        key: 3,
-                        name: "form",
-                        type: {
-                          lang: "scrapscript",
-                          code: "form {method,url,fields}",
-                        },
-                      },
-                    ],
-                    ...[
-                      [
-                        "GET",
-                        "example.com/foo",
-                        [
-                          { label: "hello", type: "text" },
-                          { label: "world", type: "date" },
-                        ],
-                      ],
-                      [
-                        "POST",
-                        "example.com/bar",
-                        [
-                          {
-                            label: "my dropdown",
-                            key: "my_dropdown",
-                            type: { 1: "label a", 2: "label b" },
-                            default: 2,
-                          },
-                        ],
-                      ],
-                    ],
-                  ),
-                ),
+                  ],
+                ],
+              ),
+              "scratch:table:nested": Table(
+                [
+                  { key: 0, name: "a", type: "list string" },
+                  { key: 1, name: "b", type: "dict string string" },
+                  { key: 1, name: "c", type: "dict string (list string)" },
+                ],
+                ...[
+                  [
+                    ["a", "b"],
+                    { c: "d", e: "f" },
+                    { g: ["h", "i"], j: ["k", "l", "m"] },
+                  ],
+                  [["n"], { o: "p" }, { q: [], r: ["s", "t"] }],
+                ],
+              ),
+              "scratch:query:http-get": {
+                type: "query",
+                data: [
+                  {
+                    lang: "sql",
+                    code: "select * from http('https://taylor.town/random')",
+                    args: {},
+                  },
+                ],
               },
             };
             return {
-              ...examples,
+              ...Object.fromEntries(
+                Object.entries(examples).map(([k, v]) => [
+                  k,
+                  { name: k.split(":").pop(), doc: Scratch(v) },
+                ]),
+              ),
               ...JSON.parse(
                 localStorage.getItem("scrapsheets-library") ?? "{}",
               ),
@@ -149,7 +169,10 @@
                 name: "examples",
                 doc: Table(
                   ["sheet_id::link", "name::text"].map(Col),
-                  ...Object.entries(examples).map(([k, v]) => [k, v.name]),
+                  ...Object.entries(examples).map(([k, v]) => [
+                    k,
+                    k.split(":").pop(),
+                  ]),
                 ),
               },
             };
