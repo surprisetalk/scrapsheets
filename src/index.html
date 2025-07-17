@@ -222,6 +222,19 @@
                     ],
                   },
                 },
+                "query:github-repos": {
+                  name: "github repos",
+                  doc: {
+                    type: "query",
+                    data: [
+                      {
+                        lang: "sql",
+                        code: "select * from unnest(http_get('https://api.github.com/search/repositories', @{q:coalesce(@params->q,'surprisetalk')})->res->items)",
+                        args: {},
+                      },
+                    ],
+                  },
+                },
               },
             };
           },
