@@ -626,7 +626,8 @@ update msg ({ sheet } as model) =
 
         DocSelect data ->
             ( { model
-                | sheet =
+                | error = ""
+                , sheet =
                     { id = data.id
                     , select = Rect (xy -1 -1) (xy -1 -1)
                     , hover = xy -1 -1
@@ -656,7 +657,7 @@ update msg ({ sheet } as model) =
         DocQuery data ->
             ( iif (data.id /= model.sheet.id)
                 model
-                { model | sheet = { sheet | table = data.data |> D.decodeValue tableDecoder |> Result.mapError D.errorToString } }
+                { model | error = "", sheet = { sheet | table = data.data |> D.decodeValue tableDecoder |> Result.mapError D.errorToString } }
             , Cmd.none
             )
 
