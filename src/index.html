@@ -67,7 +67,7 @@
         const Library = {
           get: () => {
             const examples = {
-              "scratch:table:calculated-columns": Table(
+              "scratch-table:calculated-columns": Table(
                 [
                   { key: 0, name: "a", type: "int" },
                   { key: 1, name: "b", type: "int" },
@@ -83,7 +83,7 @@
                   [3, 6],
                 ],
               ),
-              "scratch:table:postman": Table(
+              "scratch-table:postman": Table(
                 [
                   { key: 0, name: "method", type: "text" },
                   { key: 1, name: "url", type: "text" },
@@ -120,7 +120,7 @@
                   ],
                 ],
               ),
-              "scratch:table:nested": Table(
+              "scratch-table:nested": Table(
                 [
                   { key: 0, name: "a", type: "list string" },
                   { key: 1, name: "b", type: "dict string string" },
@@ -135,63 +135,67 @@
                   [["n"], { o: "p" }, { q: [], r: ["s", "t"] }],
                 ],
               ),
-              "scratch:query:http-get": {
+              "scratch-query:http-get": {
                 type: "query",
                 data: [
                   {
                     lang: "sql",
                     code: "select * from http('https://taylor.town/random')",
                     args: {},
+                    examples: [],
                   },
                 ],
               },
-              "scratch:query:python": {
+              "scratch-query:python": {
                 type: "query",
                 data: [
                   {
                     lang: "python",
                     code: "return [[{'name':'a','type':'text','key':'a'}], {'a':1}, {'a':2}, {'a':3}]",
                     args: {},
+                    examples: [],
                   },
                 ],
               },
-              "scratch:query:stonks": {
+              "scratch-query:stonks": {
                 type: "query",
                 data: [
                   {
                     lang: "sql",
                     code: "select stonks->>'id', stonks->>'price' from http('https://taylor.town/stonks'), unnest(res) stonks",
                     args: {},
+                    examples: [],
                   },
                 ],
               },
               // TODO: Move these to the shop.
               ...{
-                "scratch:query:bluesky-actors": {
-                  name: "bluesky actors",
-                  doc: {
-                    type: "query",
-                    data: [
-                      {
-                        lang: "sql",
-                        code: "select * from unnest(http_get('https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors', @{q:coalesce(@params->q,'taylor.town')})->res->actors)",
-                        args: {},
+                "scratch-query:bluesky-actors": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select * from unnest(http_get('https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors', @{q:coalesce(@params->q->0,'taylor.town')})->res->actors)",
+                      args: {
+                        q: "text",
                       },
-                    ],
-                  },
+                      examples: [{ q: ["taylor.town"] }, { q: ["memes"] }],
+                    },
+                  ],
                 },
-                "scratch:query:github-repos": {
-                  name: "github repos",
-                  doc: {
-                    type: "query",
-                    data: [
-                      {
-                        lang: "sql",
-                        code: "select * from unnest(http_get('https://api.github.com/search/repositories', @{q:coalesce(@params->q,'surprisetalk')})->res->items)",
-                        args: {},
-                      },
-                    ],
-                  },
+                "scratch-query:github-repos": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select * from unnest(http_get('https://api.github.com/search/repositories', @{q:coalesce(@params->q->0,'surprisetalk')})->res->items)",
+                      args: { q: "text" },
+                      examples: [
+                        { q: ["author\\:surprisetalk"] },
+                        { q: ["scrapscript"] },
+                      ],
+                    },
+                  ],
                 },
               },
             };
@@ -214,7 +218,12 @@
               "template:query": {
                 name: "template",
                 doc: Template("query", "query", [
-                  { lang: "sql", code: "select 1 as a", args: [] },
+                  {
+                    lang: "sql",
+                    code: "select 1 as a",
+                    args: [],
+                    examples: [],
+                  },
                 ]),
               },
               "table:tutorial": {
@@ -231,17 +240,22 @@
                 name: "roadmap",
                 doc: Table(
                   ["-::bool", "task::text"].map(Col),
-                  [false, "filters/search/sort/params/args"],
+                  [true, "fix scratch queries"],
+                  [false, "search args"],
+                  [false, "nice errors"],
+                  [false, "fix ala from selection"],
                   [false, "tons of examples"],
                   [false, "sidebar: share"],
                   [false, "sidebar: stats"],
                   [false, "sidebar: hints"],
                   [false, "sidebar: history"],
                   [false, "sidebar: settings"],
+                  [false, "run query button"],
                   [false, "code todos"],
                   [false, "crude styling"],
                   [false, "deploy"],
                   [false, "demo"],
+                  [false, "column sorting (update search bar)"],
                 ),
               },
               "table:examples": {
@@ -352,6 +366,7 @@
               data: { doc: doc && { ...doc } },
             });
             if (type === "query") queryDoc(id, doc.data[0]);
+            if (type === "scratch-query") queryDoc(id, doc.data[0].data[0]);
             sheet?.on?.("change", data => {
               app.ports.docChanged.send({
                 id: type + ":" + data.handle.documentId,

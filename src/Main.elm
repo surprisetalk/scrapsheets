@@ -740,7 +740,19 @@ update msg ({ sheet } as model) =
             ( { model | sheet = { sheet | write = Just x } }, Cmd.none )
 
         InputChange QueryCode x ->
-            ( model
+            ( { model
+                | sheet =
+                    { sheet
+                        | doc =
+                            case sheet.doc of
+                                Ok (Scratch (Query query)) ->
+                                    (Ok << Scratch << Query) <|
+                                        { query | code = x }
+
+                                _ ->
+                                    sheet.doc
+                    }
+              }
             , changeDoc
                 { id = sheet.id
                 , data =
@@ -884,7 +896,7 @@ view ({ sheet } as model) =
                                 |> Array.fromList
                         , rows =
                             model.library
-                                |> Dict.filter (\k _ -> k /= "" && not (String.startsWith "scratch:" k))
+                                |> Dict.filter (\k _ -> k /= "" && not (String.startsWith "scratch-" k))
                                 |> Dict.toList
                                 |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "del", E.string k ) ])
                                 |> Array.fromList
@@ -958,6 +970,7 @@ view ({ sheet } as model) =
 
                 -- All current filters should be rendered as text in the searchbar.
                 -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
+                -- TODO: Put args examples in placeholder.
                 , H.input [ A.value sheet.search, A.onInput (InputChange SheetSearch), S.width "100%" ] []
 
                 -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
