@@ -494,10 +494,11 @@ init _ url nav =
 
 
 route : Url -> Model -> Model
-route url model =
+route url ({ sheet } as model) =
     { model
         | id = UrlP.parse (UrlP.top </> UrlP.string) url |> Maybe.withDefault ""
         , tool = tools |> Dict.get (url.fragment |> Maybe.withDefault "") |> Maybe.withDefault model.tool
+        , sheet = { sheet | search = url.query |> Maybe.withDefault "" }
     }
 
 
@@ -728,8 +729,12 @@ update msg ({ sheet } as model) =
             ( model, updateLibrary (Idd sheet.id { name = Nothing, tags = x |> String.split ", " |> List.map String.trim |> Just }) )
 
         InputChange SheetSearch x ->
-            -- TODO:
-            ( model, Cmd.none )
+            ( { model
+                | sheet = { sheet | search = x }
+              }
+            , -- TODO: Parse url.
+              Cmd.none
+            )
 
         InputChange CellWrite x ->
             ( { model | sheet = { sheet | write = Just x } }, Cmd.none )
