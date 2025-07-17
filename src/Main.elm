@@ -23,7 +23,8 @@ import Set exposing (Set)
 import Task exposing (Task)
 import Time exposing (Month(..))
 import Url exposing (Url)
-import Url.Parser as UrlP exposing ((</>))
+import Url.Parser as UrlP exposing ((</>), (<?>))
+import Url.Parser.Query as UrlQ
 
 
 
@@ -77,6 +78,9 @@ port changeDoc : Idd (List Patch) -> Cmd msg
 
 
 port notifyDoc : Idd E.Value -> Cmd msg
+
+
+port queryDoc : Idd { lang : String, code : String } -> Cmd msg
 
 
 port docSelected : (Idd { doc : D.Value } -> msg) -> Sub msg
@@ -144,7 +148,8 @@ type alias Library =
 type alias Model =
     { nav : Nav.Key
     , id : String
-    , tool : Tool
+    , search : String
+    , tool : Maybe Tool
     , library : Library
     , sheet : Sheet
     }
@@ -165,7 +170,6 @@ type Peers
 
 type alias Sheet =
     { id : Id
-    , search : String
     , select : Rect
     , hover : Index
     , drag : Bool
@@ -475,11 +479,11 @@ init _ url nav =
             route url
                 { nav = nav
                 , id = ""
-                , tool = Stats
+                , search = ""
+                , tool = Nothing
                 , library = Dict.empty
                 , sheet =
                     { id = ""
-                    , search = ""
                     , select = Rect (xy -1 -1) (xy -1 -1)
                     , hover = xy -1 -1
                     , drag = False
@@ -494,12 +498,18 @@ init _ url nav =
 
 
 route : Url -> Model -> Model
-route url ({ sheet } as model) =
-    { model
-        | id = UrlP.parse (UrlP.top </> UrlP.string) url |> Maybe.withDefault ""
-        , tool = tools |> Dict.get (url.fragment |> Maybe.withDefault "") |> Maybe.withDefault model.tool
-        , sheet = { sheet | search = url.query |> Maybe.withDefault "" }
-    }
+route url model =
+    url
+        |> UrlP.parse
+            (UrlP.map
+                (\id search tool -> { model | id = id, search = Maybe.withDefault "" search, tool = tool })
+                (UrlP.top
+                    </> UrlP.oneOf [ UrlP.string, UrlP.map "" UrlP.top ]
+                    <?> UrlQ.string "q"
+                    </> UrlP.fragment (Maybe.andThen (flip Dict.get tools))
+                )
+            )
+        |> Maybe.withDefault model
 
 
 
@@ -608,7 +618,6 @@ update msg ({ sheet } as model) =
             ( { model
                 | sheet =
                     { id = data.id
-                    , search = ""
                     , select = Rect (xy -1 -1) (xy -1 -1)
                     , hover = xy -1 -1
                     , drag = False
@@ -729,11 +738,21 @@ update msg ({ sheet } as model) =
             ( model, updateLibrary (Idd sheet.id { name = Nothing, tags = x |> String.split ", " |> List.map String.trim |> Just }) )
 
         InputChange SheetSearch x ->
-            ( { model
-                | sheet = { sheet | search = x }
-              }
-            , -- TODO: Parse url.
-              Cmd.none
+            ( { model | search = x }
+            , Cmd.batch
+                [ Nav.pushUrl model.nav ("?q=" ++ Url.percentEncode x)
+                , case sheet.doc of
+                    Ok (Scratch (Query query)) ->
+                        -- TODO: Lang to string.
+                        queryDoc (Idd sheet.id { lang = "sql", code = query.code })
+
+                    Ok (Query query) ->
+                        -- TODO: Lang to string.
+                        queryDoc (Idd sheet.id { lang = "sql", code = query.code })
+
+                    _ ->
+                        Cmd.none
+                ]
             )
 
         InputChange CellWrite x ->
@@ -971,7 +990,7 @@ view ({ sheet } as model) =
                 -- All current filters should be rendered as text in the searchbar.
                 -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                 -- TODO: Put args examples in placeholder.
-                , H.input [ A.value sheet.search, A.onInput (InputChange SheetSearch), S.width "100%" ] []
+                , H.input [ A.value model.search, A.onInput (InputChange SheetSearch), S.width "100%" ] []
 
                 -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
                 , H.div [ S.overflowAuto ]
@@ -1155,7 +1174,7 @@ view ({ sheet } as model) =
                       ]
                     , case model.tool of
                         -- TODO: Hovering over columns/etc should highlight relevant cells, and vice versa.
-                        Settings ->
+                        Just Settings ->
                             List.concat
                                 [ [ H.label [] [ text "name" ]
                                   , H.input [ A.value info.name, A.onInput (InputChange SheetName) ] []
@@ -1192,21 +1211,25 @@ view ({ sheet } as model) =
                                   docHelper sheet.doc
                                 ]
 
-                        Hints ->
+                        Just Hints ->
                             -- TODO: problems (linting), ideas, related (sources/backlinks)
                             []
 
-                        Stats ->
+                        Just Stats ->
                             -- TODO:
                             []
 
-                        Share share ->
+                        Just (Share share) ->
                             -- TODO:
                             []
 
-                        History ->
+                        Just History ->
                             -- TODO: contextual history
                             -- TODO: I like the idea of also linking to /:sheetId/history as another sheet from the tool.
+                            []
+
+                        Nothing ->
+                            -- TODO:
                             []
                     ]
             ]
