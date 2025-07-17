@@ -89,7 +89,7 @@ textarea {
 }
 
 ::placeholder {
-  color: unset;
+  /* color: unset; */
 }
 
 ::marker {

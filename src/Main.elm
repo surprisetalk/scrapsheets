@@ -229,6 +229,7 @@ type alias Query_ =
     { lang : Lang
     , code : String
     , args : Args
+    , examples : List String
     }
 
 
@@ -250,7 +251,7 @@ type Net
 
 
 type alias Args =
-    Dict String D.Value
+    Dict String Type
 
 
 type alias Rect =
@@ -389,11 +390,12 @@ docDecoder =
                         D.field "data" <|
                             D.index 0 <|
                                 D.map Query
-                                    (D.map3 Query_
+                                    (D.map4 Query_
                                         (D.field "lang" langDecoder)
                                         (D.field "code" D.string)
                                         -- TODO
                                         (D.field "args" (D.succeed Dict.empty))
+                                        (D.maybe (D.field "examples" (D.list D.string)) |> D.map (Maybe.withDefault []))
                                     )
 
                     "template" ->
@@ -446,10 +448,11 @@ colDecoder =
         (D.field "type"
             (D.oneOf
                 [ D.map ColQuery
-                    (D.map3 Query_
+                    (D.map4 Query_
                         (D.field "lang" langDecoder)
                         (D.field "code" D.string)
                         (D.succeed Dict.empty)
+                        (D.succeed [])
                     )
                 , D.string
                     |> D.map (flip Dict.get types >> Maybe.withDefault Text)
@@ -936,6 +939,18 @@ view ({ sheet } as model) =
         table : Result String Table
         table =
             tableHelper sheet.doc
+
+        examples : List String
+        examples =
+            case sheet.doc of
+                Ok (Query query) ->
+                    query.examples
+
+                Ok (Scratch (Query query)) ->
+                    query.examples
+
+                _ ->
+                    []
     in
     { title = "scrapsheets"
     , body =
@@ -989,8 +1004,8 @@ view ({ sheet } as model) =
 
                 -- All current filters should be rendered as text in the searchbar.
                 -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
-                -- TODO: Put args examples in placeholder.
-                , H.input [ A.value model.search, A.onInput (InputChange SheetSearch), S.width "100%" ] []
+                , H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder (examples |> List.head |> Maybe.withDefault ""), S.width "100%" ] []
+                , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <| List.map (\x -> H.button [ A.onClick (InputChange SheetSearch x) ] [ text x ]) <| examples
 
                 -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
                 , H.div [ S.overflowAuto ]
