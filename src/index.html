@@ -281,6 +281,7 @@
           alasql.from.UNNEST = objs => objs;
           alasql.from.SHEET = (id, params = {}) => {
             // TODO: Grab sheet (e.g. portal) with given params.
+            throw new Error("TODO");
           };
           alasql.fn.http_get = (url, qs = {}) => {
             if (!url) return;
