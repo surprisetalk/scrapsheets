@@ -39,6 +39,24 @@
           flags: {},
         });
 
+        function catchy(func) {
+          return (...args) => {
+            try {
+              return func.apply(this, args)?.catch(error => {
+                console.error(error);
+                app.ports.docErrored.send(
+                  error?.message ?? "Something went wrong.",
+                );
+              });
+            } catch (error) {
+              console.error(error);
+              app.ports.docErrored.send(
+                error?.message ?? "Something went wrong.",
+              );
+            }
+          };
+        }
+
         const Col = (val, key) => {
           const [name, type] = val.split("::");
           return {
@@ -326,37 +344,40 @@
               console.error(error);
             }
           };
-          const queryDoc = debounce(async (id, { code, lang, args }) => {
-            switch (lang) {
-              case "sql":
-                // TODO: Run alasql if possible, otherwise post to /query.
-                const params = {
-                  // TODO: Split key=value and then accumulate as object keys.
-                  "":
-                    new URLSearchParams(window.location.search).get("q") ||
-                    null,
-                };
-                const [, rows = []] =
-                  alasql(`set @params = ?; ${code}`, [params]) || [];
-                app.ports.docQueried.send({
-                  id,
-                  data: [
-                    Object.keys(rows?.[0] || {}).map(col => ({
-                      name: col,
-                      key: col,
-                      type: "text",
-                    })),
-                    ...rows,
-                  ],
-                });
-                break;
-              default:
-                throw new Error(`TODO: ${lang}`);
-            }
-          }, 300);
+          const queryDoc = debounce(
+            catchy(async (id, { code, lang, args }) => {
+              switch (lang) {
+                case "sql":
+                  // TODO: Run alasql if possible, otherwise post to /query.
+                  const params = {
+                    // TODO: Split key=value and then accumulate as object keys.
+                    "":
+                      new URLSearchParams(window.location.search).get("q") ||
+                      null,
+                  };
+                  const [, rows = []] =
+                    alasql(`set @params = ?; ${code}`, [params]) || [];
+                  app.ports.docQueried.send({
+                    id,
+                    data: [
+                      Object.keys(rows?.[0] || {}).map(col => ({
+                        name: col,
+                        key: col,
+                        type: "text",
+                      })),
+                      ...rows,
+                    ],
+                  });
+                  break;
+                default:
+                  throw new Error(`TODO: ${lang}`);
+              }
+            }),
+            300,
+          );
           app.ports.queryDoc.subscribe(({ id, data }) => queryDoc(id, data));
 
-          const selectDoc = async (id, sheet) => {
+          const selectDoc = catchy(async (id, sheet) => {
             const [type, doc_id] = id.split(":");
             const doc = Library.get()[id]?.doc ?? sheet?.doc?.();
             app.ports.docSelected.send({
@@ -372,57 +393,62 @@
               });
               if (type === "query") queryDoc(id, data.doc.data[0]);
             });
-          };
+          });
 
-          const changeId = async id => {
+          const changeId = catchy(async id => {
             const [, doc_id = ""] = id.split(":");
             if (doc_id === sheet?.documentId) return;
             // TODO: Remove existing listeners.
             sheet = await repo?.find(doc_id).catch(() => null);
             await selectDoc(id, sheet);
-          };
+          });
           app.ports.changeId.subscribe(changeId);
           changeId(window.location.pathname.slice(1));
 
-          app.ports.newDoc.subscribe(async ({ type, data }) => {
-            // TODO: Remove existing listeners.
-            sheet = repo?.create({ type, data });
-            const id = `${type}:${sheet.documentId}`;
-            Library.set(id, { name: "", tags: [] });
-            await selectDoc(id, sheet);
-          });
+          app.ports.newDoc.subscribe(
+            catchy(async ({ type, data }) => {
+              // TODO: Remove existing listeners.
+              sheet = repo?.create({ type, data });
+              const id = `${type}:${sheet.documentId}`;
+              Library.set(id, { name: "", tags: [] });
+              await selectDoc(id, sheet);
+            }),
+          );
 
-          app.ports.changeDoc.subscribe(async ({ id, data: patches }) => {
-            const [type, doc_id] = id.split(":");
-            if (!doc_id || doc_id !== sheet?.documentId) return;
-            sheet?.change(d => {
-              for (const { path, action, value } of patches)
-                switch (path.length) {
-                  case 0: {
-                    d.data[action](...value);
-                    break;
+          app.ports.changeDoc.subscribe(
+            catchy(async ({ id, data: patches }) => {
+              const [type, doc_id] = id.split(":");
+              if (!doc_id || doc_id !== sheet?.documentId) return;
+              sheet?.change(d => {
+                for (const { path, action, value } of patches)
+                  switch (path.length) {
+                    case 0: {
+                      d.data[action](...value);
+                      break;
+                    }
+                    case 1: {
+                      const [y] = path;
+                      if (action === "set") d.data[y] = value;
+                      else d.data[y][action](...value);
+                      break;
+                    }
+                    case 2: {
+                      const [y, x] = path;
+                      if (!d.data[y]) d.data[y] = {};
+                      if (action === "set") d.data[y][x] = value;
+                      else d.data[y][x][action](...value);
+                      break;
+                    }
+                    default:
+                      throw new Error("TODO: path");
                   }
-                  case 1: {
-                    const [y] = path;
-                    if (action === "set") d.data[y] = value;
-                    else d.data[y][action](...value);
-                    break;
-                  }
-                  case 2: {
-                    const [y, x] = path;
-                    if (!d.data[y]) d.data[y] = {};
-                    if (action === "set") d.data[y][x] = value;
-                    else d.data[y][x][action](...value);
-                    break;
-                  }
-                  default:
-                    throw new Error("TODO: path");
-                }
-            });
-          });
+              });
+            }),
+          );
         }
       } catch (error) {
         console.error(error);
+        app.ports.docErrored.send(error?.message ?? "Something went wrong.");
       }
     </script>
   </body>

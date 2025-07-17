@@ -95,6 +95,9 @@ port docNotified : (Idd D.Value -> msg) -> Sub msg
 port docQueried : (Idd D.Value -> msg) -> Sub msg
 
 
+port docErrored : (String -> msg) -> Sub msg
+
+
 type alias DocDelta =
     -- TODO: This should only include the deltas and not the full doc.
     { doc : D.Value
@@ -149,6 +152,7 @@ type alias Model =
     { nav : Nav.Key
     , id : String
     , search : String
+    , error : String
     , tool : Maybe Tool
     , library : Library
     , sheet : Sheet
@@ -483,6 +487,7 @@ init _ url nav =
                 { nav = nav
                 , id = ""
                 , search = ""
+                , error = ""
                 , tool = Nothing
                 , library = Dict.empty
                 , sheet =
@@ -528,6 +533,7 @@ type Msg
     | DocChange (Idd DocDelta)
     | DocNotify (Idd D.Value)
     | DocQuery (Idd D.Value)
+    | DocError String
     | DocMsg DocMsg
     | DocNew
     | DocDelete Id
@@ -573,6 +579,7 @@ subs model =
         , docChanged DocChange
         , docNotified DocNotify
         , docQueried DocQuery
+        , docErrored DocError
         , Browser.onKeyPress (D.map KeyPress (D.field "key" D.string))
         ]
 
@@ -650,6 +657,11 @@ update msg ({ sheet } as model) =
             ( iif (data.id /= model.sheet.id)
                 model
                 { model | sheet = { sheet | table = data.data |> D.decodeValue tableDecoder |> Result.mapError D.errorToString } }
+            , Cmd.none
+            )
+
+        DocError error ->
+            ( { model | error = error }
             , Cmd.none
             )
 
@@ -1006,6 +1018,12 @@ view ({ sheet } as model) =
                 -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                 , H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder (examples |> List.head |> Maybe.withDefault ""), S.width "100%" ] []
                 , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <| List.map (\x -> H.button [ A.onClick (InputChange SheetSearch x) ] [ text x ]) <| examples
+                , case model.error of
+                    "" ->
+                        text ""
+
+                    error ->
+                        H.span [] [ H.button [ A.onClick (DocError "") ] [ text "╳" ], text " ", text error ]
 
                 -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
                 , H.div [ S.overflowAuto ]
