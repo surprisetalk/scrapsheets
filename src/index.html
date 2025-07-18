@@ -205,7 +205,105 @@
                       lang: "sql",
                       code: "select full_name, description, stargazers_count, language, open_issues_count, license from @(http_get('https://api.github.com/search/repositories', @{q:coalesce(@params->(''),'surprisetalk')})->res->items)",
                       args: { q: "text" },
-                      examples: ["author\\:surprisetalk", "scrapscript"],
+                      examples: [
+                        "scrapscript sort=stars",
+                        "surprisetalk sort=updated",
+                        "jquery in:name,description",
+                        "jquery in:readme ",
+                        "repo:octocat/hello-world",
+                        "user:surprisetalk forks:>100 ",
+                        "org:scrapscript",
+                        "size:>=30000",
+                        "size:<50",
+                        "size:50..120",
+                        "node followers:>=10000",
+                        "stars:>=500 language:php",
+                        "css pushed:>2013-02-01",
+                        "webos created:<2011-01-01",
+                        "rails language:javascript",
+                        "license:apache-2.0",
+                        "archived:true GNOME",
+                        "help-wanted-issues:>n",
+                        "good-first-issues:>n",
+                        "is:sponsorable",
+                      ],
+                    },
+                  ],
+                },
+                "scratch-query:github-users": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select * from @(http_get('https://api.github.com/search/users', @{q:(@params->(''))})->res->items)",
+                      args: { q: "text" },
+                      examples: [
+                        "surprisetalk sort=followers",
+                        "foo sort=joined",
+                        "mike in:name created:<2011-01-01 type:user",
+                        "data in:email type:org",
+                        "user:octocat",
+                        "org:electron type:user",
+                        "kenya in:login",
+                        "bolton in:name",
+                        "fullname:nat friedman",
+                        "data in:email",
+                        "repos:>9000",
+                        "repos:1 location:iceland",
+                        "language:javascript location:russia",
+                        "jenny language:javascript in:fullname",
+                        "created:2010-01-01..2011-01-01 john in:login",
+                        "followers:>=1000",
+                        "is:sponsorable",
+                      ],
+                    },
+                  ],
+                },
+                "scratch-query:github-commits": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select * from @(http_get('https://api.github.com/search/commits', @{q:(@params->(''))})->res->items)",
+                      args: { q: "text" },
+                      examples: ["repo:tekknolagi/scrapscript", "surprisetalk"],
+                    },
+                  ],
+                },
+                "scratch-query:github-prs-issues": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select * from @(http_get('https://api.github.com/search/issues', @{q:(@params->(''))})->res->items)",
+                      args: { q: "text" },
+                      examples: [
+                        "repo:tekknolagi/scrapscript",
+                        "user:surprisetalk",
+                        "author:surprisetalk",
+                        "assignee:surprisetalk",
+                        "commenter:surprisetalk",
+                        "language:ruby",
+                        "state:closed comments:>100",
+                        "draft:true",
+                        "interactions:>2000",
+                        "reactions:>1000",
+                        "archived:false gnome",
+                        "gnome is:unmerged",
+                        "language:javascript merged:<2011-01-01",
+                        "language:c# created:<2011-01-01 state:open",
+                        "type:pr review-requested:benbalter",
+                        "type:pr reviewed-by:gjtorikian",
+                        "type:pr review:changes_requested",
+                        "mentions:surprisetalk",
+                        "team:example/example",
+                        "bug type:issue sort=reactions-+1",
+                        "type:pr sort=comments",
+                        "oops in:title,body,comments",
+                        "state:open",
+                        "sort=reactions-smile",
+                        "sort=updated",
+                      ],
                     },
                   ],
                 },
@@ -257,7 +355,7 @@
                   [true, "search arg examples"],
                   [true, "nicer errors"],
                   [true, "fix select * from"],
-                  [false, "move name/tags edit to library page"],
+                  [true, "move name/tags edit to library page"],
                   [false, "tons of examples"],
                   [false, "sidebar: share"],
                   [false, "sidebar: stats"],
@@ -270,6 +368,7 @@
                   [false, "deploy"],
                   [false, "demo"],
                   [false, "column sorting (update search bar)"],
+                  [false, "make editable cells more obvious"],
                 ),
               },
               "table:examples": {
@@ -342,6 +441,7 @@
             } catch (error) {
               console.error(url, qs, request.status, request.responseText);
               console.error(error);
+              return { status: request.status, res: null };
             }
           };
           const queryDoc = debounce(
@@ -349,12 +449,19 @@
               switch (lang) {
                 case "sql":
                   // TODO: Run alasql if possible, otherwise post to /query.
-                  const params = {
-                    // TODO: Split key=value and then accumulate as object keys.
-                    "":
-                      new URLSearchParams(window.location.search).get("q") ||
-                      null,
-                  };
+                  const params =
+                    new URLSearchParams(window.location.search)
+                      .get("q")
+                      ?.split(/\s+(?=\w+=)/)
+                      .reduce(
+                        (r, p) => {
+                          const [k, v] = p.includes("=")
+                            ? p.split("=")
+                            : ["", p];
+                          return ((r[k] ||= []).push(v), r);
+                        },
+                        { "": [].join(" ") },
+                      ) ?? {};
                   const [, { columns: cols, data: rows } = {}] =
                     alasql(`set @params = ?; ${code}`, [params]) || [];
                   app.ports.docQueried.send({

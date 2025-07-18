@@ -1039,7 +1039,7 @@ view ({ sheet } as model) =
                 -- All current filters should be rendered as text in the searchbar.
                 -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                 , H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder (examples |> List.head |> Maybe.withDefault ""), S.width "100%" ] []
-                , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5 ] <| List.map (\x -> H.button [ A.onClick (InputChange SheetSearch x) ] [ text x ]) <| examples
+                , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5, S.flexWrapWrap ] <| List.map (\x -> H.span [ A.onClick (InputChange SheetSearch x), S.textDecorationUnderline, S.opacity "0.5", S.fontSizeRem 0.6 ] [ text x ]) <| examples
                 , case model.error of
                     "" ->
                         text ""
@@ -1139,73 +1139,76 @@ view ({ sheet } as model) =
                                                                             |> Dict.get col.key
                                                                             |> Maybe.withDefault (E.string "")
                                                                             |> D.decodeValue
-                                                                                (case col.typ of
-                                                                                    Link ->
-                                                                                        D.string |> D.map (\href -> H.a [ A.href ("/" ++ href), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock, S.maxWidthRem 12 ] [ text href ])
+                                                                                (D.maybe
+                                                                                    (case col.typ of
+                                                                                        Link ->
+                                                                                            D.string |> D.map (\href -> H.a [ A.href ("/" ++ href), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock, S.maxWidthRem 12 ] [ text href ])
 
-                                                                                    Image ->
-                                                                                        D.string |> D.map (\src -> H.img [ A.src src, S.width "100%", S.objectFitCover ] [])
+                                                                                        Image ->
+                                                                                            D.string |> D.map (\src -> H.img [ A.src src, S.width "100%", S.objectFitCover ] [])
 
-                                                                                    Text ->
-                                                                                        D.map text string
+                                                                                        Text ->
+                                                                                            D.map text string
 
-                                                                                    Boolean ->
-                                                                                        D.map (\c -> H.input [ A.type_ "checkbox", A.checked c ] []) D.bool
+                                                                                        Boolean ->
+                                                                                            D.map (\c -> H.input [ A.type_ "checkbox", A.checked c ] []) D.bool
 
-                                                                                    Number ->
-                                                                                        D.map (H.span [ S.textAlignRight ] << List.singleton << text) string
+                                                                                        Number ->
+                                                                                            D.map (H.span [ S.textAlignRight ] << List.singleton << text) string
 
-                                                                                    Delete ->
-                                                                                        D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "╳" ])
+                                                                                        Delete ->
+                                                                                            D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "╳" ])
 
-                                                                                    ColQuery query ->
-                                                                                        case query.lang of
-                                                                                            Prql ->
-                                                                                                D.succeed (text "TODO: prql")
+                                                                                        ColQuery query ->
+                                                                                            case query.lang of
+                                                                                                Prql ->
+                                                                                                    D.succeed (text "TODO: prql")
 
-                                                                                            Sql ->
-                                                                                                D.succeed (text "TODO: sql")
+                                                                                                Sql ->
+                                                                                                    D.succeed (text "TODO: sql")
 
-                                                                                            Formula ->
-                                                                                                D.succeed (text "TODO: formula")
+                                                                                                Formula ->
+                                                                                                    D.succeed (text "TODO: formula")
 
-                                                                                            Scrapscript ->
-                                                                                                D.succeed (text "TODO: scrapscript")
+                                                                                                Scrapscript ->
+                                                                                                    D.succeed (text "TODO: scrapscript")
 
-                                                                                            Python ->
-                                                                                                D.succeed (text "TODO: python")
+                                                                                                Python ->
+                                                                                                    D.succeed (text "TODO: python")
 
-                                                                                    Form form ->
-                                                                                        D.map3
-                                                                                            (\method action fields ->
-                                                                                                -- TODO: Change this to displayGrid
-                                                                                                H.form [ A.onSubmit NoOp, S.displayGrid, S.gridTemplateColumns "auto 1fr", S.paddingRem 1 ] <|
-                                                                                                    List.concat
-                                                                                                        [ List.concatMap
-                                                                                                            (\field ->
-                                                                                                                [ H.label [] [ text field.label ]
-                                                                                                                , H.input [] []
-                                                                                                                ]
-                                                                                                            )
-                                                                                                            fields
-                                                                                                        , [ H.span [] []
-                                                                                                          , H.button [ A.type_ "submit" ] [ text method ]
-                                                                                                          ]
-                                                                                                        ]
-                                                                                            )
-                                                                                            (D.field "method" D.string)
-                                                                                            (D.field "action" D.string)
-                                                                                            (D.field "fields"
-                                                                                                (D.list
-                                                                                                    (D.map (\label -> { label = label })
-                                                                                                        (D.field "label" D.string)
+                                                                                        Form form ->
+                                                                                            D.map3
+                                                                                                (\method action fields ->
+                                                                                                    -- TODO: Change this to displayGrid
+                                                                                                    H.form [ A.onSubmit NoOp, S.displayGrid, S.gridTemplateColumns "auto 1fr", S.paddingRem 1 ] <|
+                                                                                                        List.concat
+                                                                                                            [ List.concatMap
+                                                                                                                (\field ->
+                                                                                                                    [ H.label [] [ text field.label ]
+                                                                                                                    , H.input [] []
+                                                                                                                    ]
+                                                                                                                )
+                                                                                                                fields
+                                                                                                            , [ H.span [] []
+                                                                                                              , H.button [ A.type_ "submit" ] [ text method ]
+                                                                                                              ]
+                                                                                                            ]
+                                                                                                )
+                                                                                                (D.field "method" D.string)
+                                                                                                (D.field "action" D.string)
+                                                                                                (D.field "fields"
+                                                                                                    (D.list
+                                                                                                        (D.map (\label -> { label = label })
+                                                                                                            (D.field "label" D.string)
+                                                                                                        )
                                                                                                     )
                                                                                                 )
-                                                                                            )
 
-                                                                                    _ ->
-                                                                                        D.map text string
+                                                                                        _ ->
+                                                                                            D.map text string
+                                                                                    )
                                                                                 )
+                                                                            |> Result.map (Maybe.withDefault (text ""))
                                                                             |> Result.mapError (D.errorToString >> text)
                                                                             |> result
                                                                         ]
