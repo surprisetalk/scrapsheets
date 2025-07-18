@@ -153,7 +153,6 @@ type alias Model =
     , id : String
     , search : String
     , error : String
-    , tool : Maybe Tool
     , library : Library
     , sheet : Sheet
     }
@@ -180,12 +179,16 @@ type alias Sheet =
     , write : Maybe String
     , doc : Result String Doc
     , table : Result String Table
-    , stats : Result String Stats
+    , stats : Result String (Dict String Stat)
     }
 
 
 type alias Svg =
     -- TODO: Generate nice preview Svg based on sheet contents.
+    ()
+
+
+type alias Stat =
     ()
 
 
@@ -198,10 +201,6 @@ type Doc
     | Codex
     | Portal Args
     | Template ( String, Array Row )
-
-
-type alias Stats =
-    ()
 
 
 type alias Table =
@@ -304,25 +303,6 @@ type
     | Delete
     | Form (Dict String String)
     | ColQuery Query_
-
-
-type Tool
-    = Settings
-    | Hints
-    | Stats
-    | Share { following : Maybe () }
-    | History
-
-
-tools : Dict String Tool
-tools =
-    Dict.fromList
-        [ ( "settings", Settings )
-        , ( "stats", Stats )
-        , ( "share", Share { following = Nothing } )
-        , ( "hints", Hints )
-        , ( "history", History )
-        ]
 
 
 
@@ -488,7 +468,6 @@ init _ url nav =
                 , id = ""
                 , search = ""
                 , error = ""
-                , tool = Nothing
                 , library = Dict.empty
                 , sheet =
                     { id = ""
@@ -510,11 +489,11 @@ route url model =
     url
         |> UrlP.parse
             (UrlP.map
-                (\id search tool -> { model | id = id, search = Maybe.withDefault "" search, tool = tool })
+                (\id search -> { model | id = id, search = Maybe.withDefault "" search })
                 (UrlP.top
                     </> UrlP.oneOf [ UrlP.string, UrlP.map "" UrlP.top ]
                     <?> UrlQ.string "q"
-                    </> UrlP.fragment (Maybe.andThen (flip Dict.get tools))
+                 -- </> UrlP.fragment (Maybe.andThen (flip Dict.get tools))
                 )
             )
         |> Maybe.withDefault model
@@ -1000,7 +979,7 @@ view ({ sheet } as model) =
         , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%", S.maxHeight "100vh" ]
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.alignItemsBaseline ]
-                    [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.gapRem 0.5 ] <|
+                    [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.gapRem 0.5, S.whiteSpaceNowrap ] <|
                         -- Badges indicate scrapscript news, library notifs, etc.
                         List.concat
                             [ [ H.a [ A.href "/", S.fontWeightBold ] [ text "scrapsheets", H.sup [] [ text "" ] ]
@@ -1011,29 +990,35 @@ view ({ sheet } as model) =
                                 ]
                                 [ text "/"
                                 , H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ]
-                                , H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.gapRem 0.5 ] <|
-                                    List.map (\tag -> H.a [ A.href ("/?q=tag:" ++ tag), S.fontSizeRem 0.7, S.opacity "0.8" ] [ text ("#" ++ tag) ]) info.tags
                                 ]
+                            , [ H.span [] [ text "/" ]
+                              , H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.gapRem 0.5, S.opacity "0.8", S.fontSizeRem 0.7 ] <|
+                                    List.concat
+                                        [ List.map (\tag -> H.a [ A.href ("/?q=tag:" ++ tag) ] [ text ("#" ++ tag) ]) info.tags
+                                        , List.map (\id -> H.a [ A.href ("/" ++ id) ] [ text ("$" ++ id) ]) [ "backlink" ]
+                                        , List.map (\id -> H.a [ A.href ("/?following=" ++ id) ] [ text ("@" ++ id) ]) [ "anon" ]
+                                        ]
+                              ]
                             ]
-                    , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.alignItemsBaseline, S.gapRem 0.5 ]
-                        -- TODO: If we need to, we can collapse the tools into a dropdown that only shows the current one.
-                        [ H.a [ A.href "#settings", S.opacity (iif (model.tool == Just Settings) "1" "0.5") ] [ text "settings", H.sup [] [ text "" ] ]
-                        , H.a [ A.href "#history", S.opacity (iif (model.tool == Just History) "1" "0.5") ] [ text "history", H.sup [] [ text "4" ] ]
-                        , H.a [ A.href "#hints", S.opacity (iif (model.tool == Just Hints) "1" "0.5") ] [ text "hints", H.sup [] [ text "3" ] ]
-                        , H.a [ A.href "#stats", S.opacity (iif (model.tool == Just Stats) "1" "0.5") ] [ text "stats", H.sup [] [ text "2" ] ]
-                        , H.a [ A.href "#share", S.opacity (iif (String.startsWith "Just (Share" (Debug.toString model.tool)) "1" "0.5") ] [ text "share", H.sup [] [ text "4" ] ]
+                    , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.alignItemsBaseline, S.gapRem 0.5 ] <|
+                        let
+                            docHelper doc =
+                                case doc of
+                                    Ok (Scratch doc_) ->
+                                        docHelper (Ok doc_)
 
-                        -- TODO: This doesn't make sense.
-                        , case info.peers of
-                            Public ->
-                                text ""
+                                    Ok (Template ( _, _ )) ->
+                                        [ H.button [ A.onClick DocNew ] [ text "⌘N new sheet" ]
+                                        ]
 
-                            Private peers ->
-                                H.div [ S.displayFlex, S.flexDirectionRowReverse, S.gapRem 0.5 ] <|
-                                    List.map (\peer -> H.a [ A.href "?following=" ] [ text peer ]) <|
-                                        Set.toList <|
-                                            peers
-                        ]
+                                    _ ->
+                                        [ H.button [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "⌘C new column" ]
+                                        ]
+                        in
+                        List.concat
+                            [ docHelper sheet.doc
+                            , List.map (\tag -> H.button [] [ text "⌘F find" ]) [ () ]
+                            ]
                     ]
 
                 -- All current filters should be rendered as text in the searchbar.
@@ -1057,9 +1042,14 @@ view ({ sheet } as model) =
                             H.table [ S.borderCollapseCollapse, S.width "100%", A.onMouseLeave (CellHover (xy -1 -1)) ]
                                 [ H.thead []
                                     [ H.tr [] <|
-                                        -- TODO: Add additional header rows for stats and column def.
+                                        H.th [] []
+                                            :: List.indexedMap
+                                                (\i col -> H.th [ S.textAlignLeft ] [ text "TODO: stat" ])
+                                                (Array.toList cols)
+                                    , H.tr [] <|
                                         (::)
                                             (H.th
+                                                -- TODO: Clicking should allow you to edit the column name and typedef.
                                                 [ A.onClick (DocMsg (TabMsg (SheetRowPush -1)))
                                                 , A.onMouseEnter (CellHover (xy -1 -1))
                                                 , S.textAlignRight
@@ -1085,7 +1075,8 @@ view ({ sheet } as model) =
                                                         , S.verticalAlignBottom
                                                         ]
                                                         [ H.a [ A.href "#settings", S.displayInlineBlock, S.width "100%" ]
-                                                            [ text (iif (col.name == "") "untitled" col.name) ]
+                                                            -- TODO: show type
+                                                            [ text (iif (col.name == "") "untitled" col.name), H.span [ S.opacity "0.5" ] [ text "::text" ] ]
                                                         ]
                                                 )
                                             <|
@@ -1227,83 +1218,22 @@ view ({ sheet } as model) =
                     ]
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.maxWidth "30vw", S.maxHeight "100vh", S.overflowHidden, S.overflowYAuto ] <|
-                List.concat
-                    [ model.tool
-                        |> Maybe.map
-                            (\tool ->
-                                case tool of
-                                    Share _ ->
-                                        "share"
+                let
+                    docHelper doc =
+                        case doc of
+                            Ok (Scratch doc_) ->
+                                docHelper (Ok doc_)
 
-                                    Settings ->
-                                        "settings"
+                            Ok (Query query) ->
+                                [ H.textarea [ A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75, S.minWidth "20vw" ]
+                                    [ text (String.trim query.code)
+                                    ]
+                                ]
 
-                                    Hints ->
-                                        "hints"
-
-                                    Stats ->
-                                        "stats"
-
-                                    History ->
-                                        "history"
-                            )
-                        |> Maybe.map (\tool -> [ H.span [] [ text (String.toLower tool), H.sup [] [ text "" ] ] ])
-                        |> Maybe.withDefault []
-                    , case model.tool of
-                        -- TODO: Hovering over columns/etc should highlight relevant cells, and vice versa.
-                        Just Settings ->
-                            let
-                                docHelper doc =
-                                    case doc of
-                                        Ok (Scratch doc_) ->
-                                            docHelper (Ok doc_)
-
-                                        Ok (Query query) ->
-                                            [ H.textarea [ A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
-                                                [ text (String.trim query.code)
-                                                ]
-                                            ]
-
-                                        Ok (Template ( _, _ )) ->
-                                            [ H.button [ A.onClick DocNew ] [ text "new sheet (N)" ]
-                                            ]
-
-                                        _ ->
-                                            -- TODO:
-                                            [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%" ]
-                                                -- TODO: Link to the column configs.
-                                                [ text (Debug.toString sheet.doc)
-                                                ]
-                                            , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd, S.alignItemsBaseline ]
-                                                [ H.button [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "new column (C)" ]
-                                                ]
-                                            ]
-                            in
-                            docHelper sheet.doc
-
-                        Just Hints ->
-                            -- TODO: problems (linting), ideas, related (sources/backlinks)
-                            []
-
-                        Just Stats ->
-                            -- TODO:
-                            []
-
-                        Just (Share share) ->
-                            [ H.input [ A.value ("https://sheets.scrap.land/" ++ sheet.id), A.disabled True ] []
-
-                            -- TODO:
-                            , H.ul [] [ H.li [] [ text "- anonymous (you)" ] ]
-                            ]
-
-                        Just History ->
-                            -- TODO: contextual history
-                            -- TODO: I like the idea of also linking to /:sheetId/history as another sheet from the tool.
-                            []
-
-                        Nothing ->
-                            []
-                    ]
+                            _ ->
+                                []
+                in
+                docHelper sheet.doc
             ]
         ]
     }
