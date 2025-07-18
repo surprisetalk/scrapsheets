@@ -362,13 +362,13 @@
                     },
                   ],
                 },
-                /*
                 "scratch-query:wikipedia-search": {
                   type: "query",
                   data: [
                     {
+                      // https://github.com/mudroljub/wikipedia-api-docs?tab=readme-ov-file#search-articles
                       lang: "sql",
-                      code: "select * from @(http('https://en.wikipedia.org/w/api.php', @{action:'opensearch', search:(@params->('')), limit:10, format:'json'})->res)",
+                      code: "search / from @(http('https://en.wikipedia.org/w/api.php', @{action:'query', generator:'search', prop:'pageimages|url', exintro:'', explaintext:'', `gsrsearch`:(@params->('')), limit:25, format:'json', origin:'*'})->res->`query`->`pages`)",
                       args: {},
                       examples: [],
                     },
@@ -379,7 +379,7 @@
                   data: [
                     {
                       lang: "sql",
-                      code: "select title, author, score, num_comments, subreddit, url from @(http('https://www.reddit.com/search.json', @{q:(@params->('')), limit:25})->res->data->children->data)",
+                      code: "search /data from @(http('https://www.reddit.com/search.json', @{q:(@params->('')), limit:25})->res->data->children)",
                       args: {},
                       examples: [],
                     },
@@ -390,9 +390,9 @@
                   data: [
                     {
                       lang: "sql",
-                      code: "select title, author, score, num_comments, url from @(http('https://www.reddit.com/r/programming.json', @{limit:25})->res->data->children->data)",
+                      code: "search /data from @(http('https://www.reddit.com/r/'||(@params->r->(0))||'.json', @{limit:25})->res->data->children)",
                       args: {},
-                      examples: [],
+                      examples: ["r=hmmm"],
                     },
                   ],
                 },
@@ -401,102 +401,115 @@
                   data: [
                     {
                       lang: "sql",
-                      code: "select question, creatorName, probability, volume24Hours, totalLiquidity from @(http('https://api.manifold.markets/v0/search-markets', @{term:(@params->('')), limit:20})->res)",
+                      code: "select * from @(http('https://api.manifold.markets/v0/search-markets', @{term:(@params->('')), limit:20})->res)",
                       args: {},
                       examples: [],
                     },
                   ],
                 },
-
                 "scratch-query:manifold-trending": {
                   type: "query",
                   data: [
                     {
                       lang: "sql",
-                      code: "select question, creatorName, probability, volume24Hours from @(http('https://api.manifold.markets/v0/markets', @{limit:20, sort:'24-hour-vol'})->res)",
+                      code: "select * from @(http('https://api.manifold.markets/v0/markets', @{limit:20})->res)",
                       args: {},
                       examples: [],
                     },
                   ],
                 },
-                "scratch-query:fred-search": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select id, title, units, frequency, popularity from @(http('https://api.stlouisfed.org/fred/series/search', @{search_text:(@params->('')), api_key:'YOUR_KEY', file_type:'json'})->res->seriess)",
-                      args: {},
-                      examples: [],
-                    },
-                  ],
-                },
+                // "scratch-query:fred-search": {
+                //   type: "query",
+                //   data: [
+                //     {
+                //       lang: "sql",
+                //       code: "select * from @(http('https://corsproxy.io/?url=https://api.stlouisfed.org/fred/series/search', @{search_text:(@params->('')), file_type:'json'})->res)",
+                //       args: {},
+                //       examples: [],
+                //     },
+                //   ],
+                // },
                 "scratch-query:stocks-search": {
                   type: "query",
                   data: [
                     {
                       lang: "sql",
-                      code: "select symbol, shortname, quoteType, exchange from @(http('https://query1.finance.yahoo.com/v1/finance/search', @{q:(@params->(''))})->res->quotes)",
+                      code: "select * from @(http('https://corsproxy.io/?url=https://query1.finance.yahoo.com/v1/finance/search', @{q:(@params->(''))})->res->news)",
                       args: {},
-                      examples: [],
+                      examples: ["AAPL"],
                     },
                   ],
                 },
-                "scratch-query:discogs-search": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select title, year, country, genre, style from @(http('https://api.discogs.com/database/search', @{q:(@params->('')), type:'release'})->res->results)",
-                      args: {},
-                      examples: [],
-                    },
-                  ],
-                },
+                // "scratch-query:discogs-search": {
+                //   type: "query",
+                //   data: [
+                //     {
+                //       lang: "sql",
+                //       code: "select * from @(http('https://api.discogs.com/database/search', @{q:(@params->('')), type:'release'})->res)",
+                //       args: {},
+                //       examples: [],
+                //     },
+                //   ],
+                // },
                 "scratch-query:speedrun-games": {
                   type: "query",
                   data: [
                     {
                       lang: "sql",
-                      code: "select names->international as name, abbreviation, released from @(http('https://www.speedrun.com/api/v1/games', @{name:(@params->(''))})->res->data)",
+                      code: "select * from @(http('https://www.speedrun.com/api/v1/games', @{name:(@params->(''))})->res->data)",
                       args: {},
-                      examples: [],
+                      examples: ["mario"],
                     },
                   ],
                 },
-                "scratch-query:youtube-search": {
+                "scratch-query:speedrun-users": {
                   type: "query",
                   data: [
                     {
                       lang: "sql",
-                      code: "select snippet->title as title, snippet->channelTitle as channel, snippet->description from @(http('https://www.googleapis.com/youtube/v3/search', @{part:'snippet', q:(@params->('')), key:'YOUR_API_KEY', maxResults:25})->res->items)",
+                      code: "select * from @(http('https://www.speedrun.com/api/v1/users', @{name:(@params->(''))})->res->data)",
                       args: {},
-                      examples: [],
+                      examples: ["mario"],
                     },
                   ],
                 },
+                // "scratch-query:youtube-search": {
+                //   type: "query",
+                //   data: [
+                //     {
+                //       lang: "sql",
+                //       code: "select * from @(http('https://www.googleapis.com/youtube/v3/search', @{part:'snippet', q:(@params->('')), key:'YOUR_API_KEY', maxResults:25})->res->items)",
+                //       args: {},
+                //       examples: ["videogamedunkey"],
+                //     },
+                //   ],
+                // },
                 "scratch-query:podcast-search": {
                   type: "query",
                   data: [
                     {
                       lang: "sql",
-                      code: "select collectionName, artistName, feedUrl, trackCount, primaryGenreName from @(http('https://itunes.apple.com/search', @{term:(@params->('')), media:'podcast', limit:25})->res->results)",
+                      code: "select * from @(http('https://itunes.apple.com/search', @{term:(@params->('')), media:'podcast', limit:25})->res->results)",
                       args: {},
-                      examples: [],
+                      examples: ["articles of interest"],
                     },
                   ],
                 },
-                "scratch-query:ossinsight-search": {
+                "scratch-query:ossinsight-trends": {
                   type: "query",
                   data: [
                     {
                       lang: "sql",
-                      code: "select repo_name, stars, forks, issues, language from @(http('https://api.ossinsight.io/v1/repos/search', @{keyword:(@params->(''))})->res->data)",
+                      code: "select * from @(http('https://api.ossinsight.io/v1/trends/repos', @{keyword:(@params->(''))})->res->data->`rows`)",
                       args: {},
-                      examples: [],
+                      examples: [
+                        "language=All period=past_24_hours",
+                        "language=JavaScript period=past_3_months",
+                        "language=Erlang",
+                      ],
                     },
                   ],
                 },
-                */
               },
             };
             return {
@@ -654,32 +667,22 @@
             };
             const parsers = {
               "application/atom+xml": atomToJson,
-              "application/json": JSON.parse,
             };
             if (!url) return;
             const request = new XMLHttpRequest();
-            try {
-              request.open("GET", url + "?" + new URLSearchParams(qs), false); // `false` makes the request synchronous
-              request.send(null);
-              console.log(
-                request
-                  .getResponseHeader("Content-Type")
-                  ?.replace(/;.*$/, "") || "application/json",
-              );
-              return {
-                status: request.status,
-                res:
+            request.open("GET", url + "?" + new URLSearchParams(qs), false); // `false` makes the request synchronous
+            request.send(null);
+            return {
+              status: request.status,
+              res:
+                (
                   parsers?.[
                     request
                       .getResponseHeader("Content-Type")
                       ?.replace(/;.*$/, "") || "application/json"
-                  ]?.(request.responseText) || null,
-              };
-            } catch (error) {
-              console.error(url, qs, request.status, request.responseText);
-              console.error(error);
-              return { status: request.status, res: null };
-            }
+                  ] ?? JSON.parse
+                )?.(request.responseText) || null,
+            };
           };
           const queryDoc = debounce(
             catchy(async (id, { code, lang, args }) => {
@@ -699,8 +702,10 @@
                         },
                         { "": [].join(" ") },
                       ) ?? {};
-                  const [, { columns: cols, data: rows } = {}] =
-                    alasql(`set @params = ?; ${code}`, [params]) || [];
+                  const [, { columns: cols, data: rows } = {}] = await alasql([
+                    [`set @params = ?`, [params]],
+                    code,
+                  ]);
                   app.ports.docQueried.send({
                     id,
                     data: [

@@ -1142,7 +1142,7 @@ view ({ sheet } as model) =
                                                                                 (D.maybe
                                                                                     (case col.typ of
                                                                                         Link ->
-                                                                                            D.string |> D.map (\href -> H.a [ A.href ("/" ++ href), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock, S.maxWidthRem 12 ] [ text href ])
+                                                                                            D.string |> D.map (\href -> H.a [ A.href ("/" ++ href), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text href ])
 
                                                                                         Image ->
                                                                                             D.string |> D.map (\src -> H.img [ A.src src, S.width "100%", S.objectFitCover ] [])
