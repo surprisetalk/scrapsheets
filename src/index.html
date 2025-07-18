@@ -81,6 +81,18 @@
           data: [cols, ...rows],
         });
 
+        const QuerySql = (code, ...examples) => ({
+          type: "query",
+          data: [
+            {
+              lang: "sql",
+              code,
+              args: {},
+              examples,
+            },
+          ],
+        });
+
         const Library = {
           get: () => {
             const examples = {
@@ -152,364 +164,165 @@
                   [["n"], { o: "p" }, { q: [], r: ["s", "t"] }],
                 ],
               ),
-              "scratch-query:http-get": {
-                type: "query",
-                data: [
-                  {
-                    lang: "sql",
-                    code: "select * from http('https://taylor.town/random')",
-                    args: {},
-                    examples: [],
-                  },
-                ],
-              },
-              "scratch-query:python": {
-                type: "query",
-                data: [
-                  {
-                    lang: "python",
-                    code: "return [[{'name':'a','type':'text','key':'a'}], {'a':1}, {'a':2}, {'a':3}]",
-                    args: {},
-                    examples: [],
-                  },
-                ],
-              },
-              "scratch-query:stonks": {
-                type: "query",
-                data: [
-                  {
-                    lang: "sql",
-                    code: "select stonks->>'id', stonks->>'price' from http('https://taylor.town/stonks'), json(res) stonks",
-                    args: {},
-                    examples: [],
-                  },
-                ],
-              },
+              "scratch-query:http-get": QuerySql(
+                "select * from http('https://taylor.town/random')",
+              ),
+              "scratch-query:python": QuerySql(
+                "return [[{'name':'a','type':'text','key':'a'}], {'a':1}, {'a':2}, {'a':3}]",
+              ),
+              "scratch-query:stonks": QuerySql(
+                "select stonks->>'id', stonks->>'price' from http('https://taylor.town/stonks'), json(res) stonks",
+              ),
               // TODO: Move these to the shop.
               ...{
-                "scratch-query:bluesky-actors": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors', @{q:coalesce(@params->(''),'taylor.town')})->res->actors)",
-                      args: {},
-                      examples: ["taylor.town", "memes"],
-                    },
-                  ],
-                },
-                "scratch-query:github-repos": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select full_name, description, stargazers_count, language, open_issues_count, license from @(http('https://api.github.com/search/repositories', @{q:coalesce(@params->(''),'surprisetalk')})->res->items)",
-                      args: { q: "text" },
-                      examples: [
-                        "scrapscript sort=stars",
-                        "surprisetalk sort=updated",
-                        "jquery in:name,description",
-                        "jquery in:readme ",
-                        "repo:octocat/hello-world",
-                        "user:surprisetalk forks:>100 ",
-                        "org:scrapscript",
-                        "size:>=30000",
-                        "size:<50",
-                        "size:50..120",
-                        "node followers:>=10000",
-                        "stars:>=500 language:php",
-                        "css pushed:>2013-02-01",
-                        "webos created:<2011-01-01",
-                        "rails language:javascript",
-                        "license:apache-2.0",
-                        "archived:true GNOME",
-                        "help-wanted-issues:>n",
-                        "good-first-issues:>n",
-                        "is:sponsorable",
-                      ],
-                    },
-                  ],
-                },
-                "scratch-query:github-users": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://api.github.com/search/users', @{q:(@params->(''))})->res->items)",
-                      args: { q: "text" },
-                      examples: [
-                        "surprisetalk sort=followers",
-                        "foo sort=joined",
-                        "mike in:name created:<2011-01-01 type:user",
-                        "data in:email type:org",
-                        "user:octocat",
-                        "org:electron type:user",
-                        "kenya in:login",
-                        "bolton in:name",
-                        "fullname:nat friedman",
-                        "data in:email",
-                        "repos:>9000",
-                        "repos:1 location:iceland",
-                        "language:javascript location:russia",
-                        "jenny language:javascript in:fullname",
-                        "created:2010-01-01..2011-01-01 john in:login",
-                        "followers:>=1000",
-                        "is:sponsorable",
-                      ],
-                    },
-                  ],
-                },
-                "scratch-query:github-commits": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://api.github.com/search/commits', @{q:(@params->(''))})->res->items)",
-                      args: { q: "text" },
-                      examples: ["repo:tekknolagi/scrapscript", "surprisetalk"],
-                    },
-                  ],
-                },
-                "scratch-query:github-prs-issues": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://api.github.com/search/issues', @{q:(@params->(''))})->res->items)",
-                      args: { q: "text" },
-                      examples: [
-                        "repo:tekknolagi/scrapscript",
-                        "user:surprisetalk",
-                        "author:surprisetalk",
-                        "assignee:surprisetalk",
-                        "commenter:surprisetalk",
-                        "language:ruby",
-                        "state:closed comments:>100",
-                        "draft:true",
-                        "interactions:>2000",
-                        "reactions:>1000",
-                        "archived:false gnome",
-                        "gnome is:unmerged",
-                        "language:javascript merged:<2011-01-01",
-                        "language:c# created:<2011-01-01 state:open",
-                        "type:pr review-requested:benbalter",
-                        "type:pr reviewed-by:gjtorikian",
-                        "type:pr review:changes_requested",
-                        "mentions:surprisetalk",
-                        "team:example/example",
-                        "bug type:issue sort=reactions-+1",
-                        "type:pr sort=comments",
-                        "oops in:title,body,comments",
-                        "state:open",
-                        "sort=reactions-smile",
-                        "sort=updated",
-                      ],
-                    },
-                  ],
-                },
-                "scratch-query:crypto-markets": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://api.coingecko.com/api/v3/coins/markets', @{vs_currency:'usd', `order`:'market_cap_desc', per_page:100})->res)",
-                      args: {},
-                      examples: [],
-                    },
-                  ],
-                },
-                "scratch-query:crypto-search": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select thumb::img as thumb, symbol, name, market_cap_rank from @(http('https://api.coingecko.com/api/v3/search', @{`query`:(@params->(''))})->res->coins)",
-                      args: {},
-                      examples: ["bitcoin", "ethereum", "doge"],
-                    },
-                  ],
-                },
-                "scratch-query:hackernews-search": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://hn.algolia.com/api/v1/search', @{`query`:(@params->(''))})->res->hits)",
-                      args: {},
-                      examples: ["taylor.town"],
-                    },
-                  ],
-                },
-                "scratch-query:hackernews-top": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://corsproxy.io/?url=https://hnrss.org/frontpage.jsonfeed')->res->items)",
-                      args: {},
-                      examples: [],
-                    },
-                  ],
-                },
-                "scratch-query:arxiv-search": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://export.arxiv.org/api/query', @{search_query:('all:' || (@params->(''))), max_results:25})->res->entries)",
-                      args: {},
-                      examples: [],
-                    },
-                  ],
-                },
-                "scratch-query:wikipedia-search": {
-                  type: "query",
-                  data: [
-                    {
-                      // https://github.com/mudroljub/wikipedia-api-docs?tab=readme-ov-file#search-articles
-                      lang: "sql",
-                      code: "search / from @(http('https://en.wikipedia.org/w/api.php', @{action:'query', generator:'search', prop:'pageimages|url', exintro:'', explaintext:'', `gsrsearch`:(@params->('')), limit:25, format:'json', origin:'*'})->res->`query`->`pages`)",
-                      args: {},
-                      examples: [],
-                    },
-                  ],
-                },
-                "scratch-query:reddit-search": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "search /data from @(http('https://www.reddit.com/search.json', @{q:(@params->('')), limit:25})->res->data->children)",
-                      args: {},
-                      examples: [],
-                    },
-                  ],
-                },
-                "scratch-query:reddit-subreddit": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "search /data from @(http('https://www.reddit.com/r/'||(@params->r->(0))||'.json', @{limit:25})->res->data->children)",
-                      args: {},
-                      examples: ["r=hmmm"],
-                    },
-                  ],
-                },
-                "scratch-query:manifold-search": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://api.manifold.markets/v0/search-markets', @{term:(@params->('')), limit:20})->res)",
-                      args: {},
-                      examples: [],
-                    },
-                  ],
-                },
-                "scratch-query:manifold-trending": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://api.manifold.markets/v0/markets', @{limit:20})->res)",
-                      args: {},
-                      examples: [],
-                    },
-                  ],
-                },
-                // "scratch-query:fred-search": {
-                //   type: "query",
-                //   data: [
-                //     {
-                //       lang: "sql",
-                //       code: "select * from @(http('https://corsproxy.io/?url=https://api.stlouisfed.org/fred/series/search', @{search_text:(@params->('')), file_type:'json'})->res)",
-                //       args: {},
-                //       examples: [],
-                //     },
-                //   ],
-                // },
-                "scratch-query:stocks-search": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://corsproxy.io/?url=https://query1.finance.yahoo.com/v1/finance/search', @{q:(@params->(''))})->res->news)",
-                      args: {},
-                      examples: ["AAPL"],
-                    },
-                  ],
-                },
-                // "scratch-query:discogs-search": {
-                //   type: "query",
-                //   data: [
-                //     {
-                //       lang: "sql",
-                //       code: "select * from @(http('https://api.discogs.com/database/search', @{q:(@params->('')), type:'release'})->res)",
-                //       args: {},
-                //       examples: [],
-                //     },
-                //   ],
-                // },
-                "scratch-query:speedrun-games": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://www.speedrun.com/api/v1/games', @{name:(@params->(''))})->res->data)",
-                      args: {},
-                      examples: ["mario"],
-                    },
-                  ],
-                },
-                "scratch-query:speedrun-users": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://www.speedrun.com/api/v1/users', @{name:(@params->(''))})->res->data)",
-                      args: {},
-                      examples: ["mario"],
-                    },
-                  ],
-                },
-                // "scratch-query:youtube-search": {
-                //   type: "query",
-                //   data: [
-                //     {
-                //       lang: "sql",
-                //       code: "select * from @(http('https://www.googleapis.com/youtube/v3/search', @{part:'snippet', q:(@params->('')), key:'YOUR_API_KEY', maxResults:25})->res->items)",
-                //       args: {},
-                //       examples: ["videogamedunkey"],
-                //     },
-                //   ],
-                // },
-                "scratch-query:podcast-search": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://itunes.apple.com/search', @{term:(@params->('')), media:'podcast', limit:25})->res->results)",
-                      args: {},
-                      examples: ["articles of interest"],
-                    },
-                  ],
-                },
-                "scratch-query:ossinsight-trends": {
-                  type: "query",
-                  data: [
-                    {
-                      lang: "sql",
-                      code: "select * from @(http('https://api.ossinsight.io/v1/trends/repos', @{keyword:(@params->(''))})->res->data->`rows`)",
-                      args: {},
-                      examples: [
-                        "language=All period=past_24_hours",
-                        "language=JavaScript period=past_3_months",
-                        "language=Erlang",
-                      ],
-                    },
-                  ],
-                },
+                "scratch-query:bluesky-actors": QuerySql(
+                  "select * from @(http('https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors', @{q:coalesce(@params->(''),'taylor.town')})->res->actors)",
+                  "taylor.town",
+                  "memes",
+                ),
+                "scratch-query:github-repos": QuerySql(
+                  "select full_name, description, stargazers_count, language, open_issues_count, license from @(http('https://api.github.com/search/repositories', @{q:coalesce(@params->(''),'surprisetalk')})->res->items)",
+                  "scrapscript sort=stars",
+                  "surprisetalk sort=updated",
+                  "jquery in:name,description",
+                  "jquery in:readme ",
+                  "repo:octocat/hello-world",
+                  "user:surprisetalk forks:>100 ",
+                  "org:scrapscript",
+                  "size:>=30000",
+                  "size:<50",
+                  "size:50..120",
+                  "node followers:>=10000",
+                  "stars:>=500 language:php",
+                  "css pushed:>2013-02-01",
+                  "webos created:<2011-01-01",
+                  "rails language:javascript",
+                  "license:apache-2.0",
+                  "archived:true GNOME",
+                  "help-wanted-issues:>n",
+                  "good-first-issues:>n",
+                  "is:sponsorable",
+                ),
+                "scratch-query:github-users": QuerySql(
+                  "select * from @(http('https://api.github.com/search/users', @{q:(@params->(''))})->res->items)",
+                  "surprisetalk sort=followers",
+                  "foo sort=joined",
+                  "mike in:name created:<2011-01-01 type:user",
+                  "data in:email type:org",
+                  "user:octocat",
+                  "org:electron type:user",
+                  "kenya in:login",
+                  "bolton in:name",
+                  "fullname:nat friedman",
+                  "data in:email",
+                  "repos:>9000",
+                  "repos:1 location:iceland",
+                  "language:javascript location:russia",
+                  "jenny language:javascript in:fullname",
+                  "created:2010-01-01..2011-01-01 john in:login",
+                  "followers:>=1000",
+                  "is:sponsorable",
+                ),
+                "scratch-query:github-commits": QuerySql(
+                  "select * from @(http('https://api.github.com/search/commits', @{q:(@params->(''))})->res->items)",
+                  "repo:tekknolagi/scrapscript",
+                  "surprisetalk",
+                ),
+                "scratch-query:github-prs-issues": QuerySql(
+                  "select * from @(http('https://api.github.com/search/issues', @{q:(@params->(''))})->res->items)",
+                  "repo:tekknolagi/scrapscript",
+                  "user:surprisetalk",
+                  "author:surprisetalk",
+                  "assignee:surprisetalk",
+                  "commenter:surprisetalk",
+                  "language:ruby",
+                  "state:closed comments:>100",
+                  "draft:true",
+                  "interactions:>2000",
+                  "reactions:>1000",
+                  "archived:false gnome",
+                  "gnome is:unmerged",
+                  "language:javascript merged:<2011-01-01",
+                  "language:c# created:<2011-01-01 state:open",
+                  "type:pr review-requested:benbalter",
+                  "type:pr reviewed-by:gjtorikian",
+                  "type:pr review:changes_requested",
+                  "mentions:surprisetalk",
+                  "team:example/example",
+                  "bug type:issue sort=reactions-+1",
+                  "type:pr sort=comments",
+                  "oops in:title,body,comments",
+                  "state:open",
+                  "sort=reactions-smile",
+                  "sort=updated",
+                ),
+                "scratch-query:crypto-markets": QuerySql(
+                  "select * from @(http('https://api.coingecko.com/api/v3/coins/markets', @{vs_currency:'usd', `order`:'market_cap_desc', per_page:100})->res)",
+                ),
+                "scratch-query:crypto-search": QuerySql(
+                  "select thumb::img as thumb, symbol, name, market_cap_rank from @(http('https://api.coingecko.com/api/v3/search', @{`query`:(@params->(''))})->res->coins)",
+                  "bitcoin",
+                  "ethereum",
+                  "doge",
+                ),
+                "scratch-query:hackernews-search": QuerySql(
+                  "select * from @(http('https://hn.algolia.com/api/v1/search', @{`query`:(@params->(''))})->res->hits)",
+                  "taylor.town",
+                ),
+                "scratch-query:hackernews-top": QuerySql(
+                  "select * from @(http('https://corsproxy.io/?url=https://hnrss.org/frontpage.jsonfeed')->res->items)",
+                ),
+                "scratch-query:arxiv-search": QuerySql(
+                  "select * from @(http('https://export.arxiv.org/api/query', @{search_query:('all:' || (@params->(''))), max_results:25})->res->entries)",
+                ),
+                "scratch-query:wikipedia-search": QuerySql(
+                  "search / from @(http('https://en.wikipedia.org/w/api.php', @{action:'query', generator:'search', prop:'pageimages|url', exintro:'', explaintext:'', `gsrsearch`:(@params->('')), limit:25, format:'json', origin:'*'})->res->`query`->`pages`)",
+                ),
+                "scratch-query:reddit-search": QuerySql(
+                  "search /data from @(http('https://www.reddit.com/search.json', @{q:(@params->('')), limit:25})->res->data->children)",
+                ),
+                "scratch-query:reddit-subreddit": QuerySql(
+                  "search /data from @(http('https://www.reddit.com/r/'||(@params->r->(0))||'.json', @{limit:25})->res->data->children)",
+                  "r=hmmm",
+                ),
+                "scratch-query:manifold-search": QuerySql(
+                  "select * from @(http('https://api.manifold.markets/v0/search-markets', @{term:(@params->('')), limit:20})->res)",
+                ),
+                "scratch-query:manifold-trending": QuerySql(
+                  "select * from @(http('https://api.manifold.markets/v0/markets', @{limit:20})->res)",
+                ),
+                // "scratch-query:fred-search": QuerySql(
+                //   "select * from @(http('https://corsproxy.io/?url=https://api.stlouisfed.org/fred/series/search', @{search_text:(@params->('')), file_type:'json'})->res)"
+                // ),
+                "scratch-query:stocks-search": QuerySql(
+                  "select * from @(http('https://corsproxy.io/?url=https://query1.finance.yahoo.com/v1/finance/search', @{q:(@params->(''))})->res->news)",
+                  "AAPL",
+                ),
+                // "scratch-query:discogs-search": QuerySql(
+                //   "select * from @(http('https://api.discogs.com/database/search', @{q:(@params->('')), type:'release'})->res)"
+                // ),
+                "scratch-query:speedrun-games": QuerySql(
+                  "select * from @(http('https://www.speedrun.com/api/v1/games', @{name:(@params->(''))})->res->data)",
+                  "mario",
+                ),
+                "scratch-query:speedrun-users": QuerySql(
+                  "select * from @(http('https://www.speedrun.com/api/v1/users', @{name:(@params->(''))})->res->data)",
+                  "mario",
+                ),
+                // "scratch-query:youtube-search": QuerySql(
+                //   "select * from @(http('https://www.googleapis.com/youtube/v3/search', @{part:'snippet', q:(@params->('')), key:'YOUR_API_KEY', maxResults:25})->res->items)",
+                //   "videogamedunkey"
+                // ),
+                "scratch-query:podcast-search": QuerySql(
+                  "select * from @(http('https://itunes.apple.com/search', @{term:(@params->('')), media:'podcast', limit:25})->res->results)",
+                  "articles of interest",
+                ),
+                "scratch-query:ossinsight-trends": QuerySql(
+                  "select * from @(http('https://api.ossinsight.io/v1/trends/repos', @{keyword:(@params->(''))})->res->data->`rows`)",
+                  "language=All period=past_24_hours",
+                  "language=JavaScript period=past_3_months",
+                  "language=Erlang",
+                ),
               },
             };
             return {
@@ -559,7 +372,7 @@
                   [true, "nicer errors"],
                   [true, "fix select * from"],
                   [true, "move name/tags edit to library page"],
-                  [false, "tons of examples"],
+                  [true, "tons of examples"],
                   [false, "sidebar: share"],
                   [false, "sidebar: stats"],
                   [false, "sidebar: hints"],
