@@ -192,7 +192,7 @@
                   data: [
                     {
                       lang: "sql",
-                      code: "select * from @(http_get('https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors', @{q:coalesce(@params->(''),'taylor.town')})->res->actors)",
+                      code: "select * from @(http('https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors', @{q:coalesce(@params->(''),'taylor.town')})->res->actors)",
                       args: {},
                       examples: ["taylor.town", "memes"],
                     },
@@ -203,7 +203,7 @@
                   data: [
                     {
                       lang: "sql",
-                      code: "select full_name, description, stargazers_count, language, open_issues_count, license from @(http_get('https://api.github.com/search/repositories', @{q:coalesce(@params->(''),'surprisetalk')})->res->items)",
+                      code: "select full_name, description, stargazers_count, language, open_issues_count, license from @(http('https://api.github.com/search/repositories', @{q:coalesce(@params->(''),'surprisetalk')})->res->items)",
                       args: { q: "text" },
                       examples: [
                         "scrapscript sort=stars",
@@ -235,7 +235,7 @@
                   data: [
                     {
                       lang: "sql",
-                      code: "select * from @(http_get('https://api.github.com/search/users', @{q:(@params->(''))})->res->items)",
+                      code: "select * from @(http('https://api.github.com/search/users', @{q:(@params->(''))})->res->items)",
                       args: { q: "text" },
                       examples: [
                         "surprisetalk sort=followers",
@@ -264,7 +264,7 @@
                   data: [
                     {
                       lang: "sql",
-                      code: "select * from @(http_get('https://api.github.com/search/commits', @{q:(@params->(''))})->res->items)",
+                      code: "select * from @(http('https://api.github.com/search/commits', @{q:(@params->(''))})->res->items)",
                       args: { q: "text" },
                       examples: ["repo:tekknolagi/scrapscript", "surprisetalk"],
                     },
@@ -275,7 +275,7 @@
                   data: [
                     {
                       lang: "sql",
-                      code: "select * from @(http_get('https://api.github.com/search/issues', @{q:(@params->(''))})->res->items)",
+                      code: "select * from @(http('https://api.github.com/search/issues', @{q:(@params->(''))})->res->items)",
                       args: { q: "text" },
                       examples: [
                         "repo:tekknolagi/scrapscript",
@@ -307,6 +307,196 @@
                     },
                   ],
                 },
+                "scratch-query:crypto-markets": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select * from @(http('https://api.coingecko.com/api/v3/coins/markets', @{vs_currency:'usd', `order`:'market_cap_desc', per_page:100})->res)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+                "scratch-query:crypto-search": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select thumb::img as thumb, symbol, name, market_cap_rank from @(http('https://api.coingecko.com/api/v3/search', @{`query`:(@params->(''))})->res->coins)",
+                      args: {},
+                      examples: ["bitcoin", "ethereum", "doge"],
+                    },
+                  ],
+                },
+                "scratch-query:hackernews-search": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select * from @(http('https://hn.algolia.com/api/v1/search', @{`query`:(@params->(''))})->res->hits)",
+                      args: {},
+                      examples: ["taylor.town"],
+                    },
+                  ],
+                },
+                "scratch-query:hackernews-top": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select * from @(http('https://corsproxy.io/?url=https://hnrss.org/frontpage.jsonfeed')->res->items)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+                "scratch-query:arxiv-search": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select * from @(http('https://export.arxiv.org/api/query', @{search_query:('all:' || (@params->(''))), max_results:25})->res->entries)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+                /*
+                "scratch-query:wikipedia-search": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select * from @(http('https://en.wikipedia.org/w/api.php', @{action:'opensearch', search:(@params->('')), limit:10, format:'json'})->res)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+                "scratch-query:reddit-search": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select title, author, score, num_comments, subreddit, url from @(http('https://www.reddit.com/search.json', @{q:(@params->('')), limit:25})->res->data->children->data)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+                "scratch-query:reddit-subreddit": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select title, author, score, num_comments, url from @(http('https://www.reddit.com/r/programming.json', @{limit:25})->res->data->children->data)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+                "scratch-query:manifold-search": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select question, creatorName, probability, volume24Hours, totalLiquidity from @(http('https://api.manifold.markets/v0/search-markets', @{term:(@params->('')), limit:20})->res)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+
+                "scratch-query:manifold-trending": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select question, creatorName, probability, volume24Hours from @(http('https://api.manifold.markets/v0/markets', @{limit:20, sort:'24-hour-vol'})->res)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+                "scratch-query:fred-search": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select id, title, units, frequency, popularity from @(http('https://api.stlouisfed.org/fred/series/search', @{search_text:(@params->('')), api_key:'YOUR_KEY', file_type:'json'})->res->seriess)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+                "scratch-query:stocks-search": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select symbol, shortname, quoteType, exchange from @(http('https://query1.finance.yahoo.com/v1/finance/search', @{q:(@params->(''))})->res->quotes)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+                "scratch-query:discogs-search": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select title, year, country, genre, style from @(http('https://api.discogs.com/database/search', @{q:(@params->('')), type:'release'})->res->results)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+                "scratch-query:speedrun-games": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select names->international as name, abbreviation, released from @(http('https://www.speedrun.com/api/v1/games', @{name:(@params->(''))})->res->data)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+                "scratch-query:youtube-search": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select snippet->title as title, snippet->channelTitle as channel, snippet->description from @(http('https://www.googleapis.com/youtube/v3/search', @{part:'snippet', q:(@params->('')), key:'YOUR_API_KEY', maxResults:25})->res->items)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+                "scratch-query:podcast-search": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select collectionName, artistName, feedUrl, trackCount, primaryGenreName from @(http('https://itunes.apple.com/search', @{term:(@params->('')), media:'podcast', limit:25})->res->results)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+                "scratch-query:ossinsight-search": {
+                  type: "query",
+                  data: [
+                    {
+                      lang: "sql",
+                      code: "select repo_name, stars, forks, issues, language from @(http('https://api.ossinsight.io/v1/repos/search', @{keyword:(@params->(''))})->res->data)",
+                      args: {},
+                      examples: [],
+                    },
+                  ],
+                },
+                */
               },
             };
             return {
@@ -428,15 +618,62 @@
             // TODO: Grab sheet (e.g. portal) with given params.
             throw new Error("TODO");
           };
-          alasql.fn.http_get = (url, qs = {}) => {
+          alasql.fn.http = (url, qs = {}) => {
+            const atomToJson = xmlString => {
+              const parser = new DOMParser();
+              const doc = parser.parseFromString(xmlString, "text/xml");
+              const feed = {
+                title: doc.querySelector("feed > title")?.textContent,
+                updated: doc.querySelector("feed > updated")?.textContent,
+                totalResults: parseInt(
+                  doc.querySelector("totalResults")?.textContent || "0",
+                ),
+                entries: [],
+              };
+              doc.querySelectorAll("entry").forEach(entry => {
+                feed.entries.push({
+                  id: entry.querySelector("id")?.textContent,
+                  title: entry.querySelector("title")?.textContent?.trim(),
+                  summary: entry.querySelector("summary")?.textContent?.trim(),
+                  published: entry.querySelector("published")?.textContent,
+                  updated: entry.querySelector("updated")?.textContent,
+                  authors: Array.from(
+                    entry.querySelectorAll("author name"),
+                  ).map(a => a.textContent),
+                  links: Array.from(entry.querySelectorAll("link")).map(l => ({
+                    href: l.getAttribute("href"),
+                    rel: l.getAttribute("rel"),
+                    type: l.getAttribute("type"),
+                  })),
+                  categories: Array.from(
+                    entry.querySelectorAll("category"),
+                  ).map(c => c.getAttribute("term")),
+                });
+              });
+              return feed;
+            };
+            const parsers = {
+              "application/atom+xml": atomToJson,
+              "application/json": JSON.parse,
+            };
             if (!url) return;
             const request = new XMLHttpRequest();
             try {
               request.open("GET", url + "?" + new URLSearchParams(qs), false); // `false` makes the request synchronous
               request.send(null);
+              console.log(
+                request
+                  .getResponseHeader("Content-Type")
+                  ?.replace(/;.*$/, "") || "application/json",
+              );
               return {
                 status: request.status,
-                res: JSON.parse(request.responseText),
+                res:
+                  parsers?.[
+                    request
+                      .getResponseHeader("Content-Type")
+                      ?.replace(/;.*$/, "") || "application/json"
+                  ]?.(request.responseText) || null,
               };
             } catch (error) {
               console.error(url, qs, request.status, request.responseText);
