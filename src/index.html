@@ -179,7 +179,7 @@
                 data: [
                   {
                     lang: "sql",
-                    code: "select stonks->>'id', stonks->>'price' from http('https://taylor.town/stonks'), unnest(res) stonks",
+                    code: "select stonks->>'id', stonks->>'price' from http('https://taylor.town/stonks'), json(res) stonks",
                     args: {},
                     examples: [],
                   },
@@ -192,7 +192,7 @@
                   data: [
                     {
                       lang: "sql",
-                      code: "select * from unnest(http_get('https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors', @{q:coalesce(@params->(''),'taylor.town')})->res->actors)",
+                      code: "select * from @(http_get('https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors', @{q:coalesce(@params->(''),'taylor.town')})->res->actors)",
                       args: {},
                       examples: ["taylor.town", "memes"],
                     },
@@ -203,7 +203,7 @@
                   data: [
                     {
                       lang: "sql",
-                      code: "select * from unnest(http_get('https://api.github.com/search/repositories', @{q:coalesce(@params->(''),'surprisetalk')})->res->items)",
+                      code: "select full_name, description, stargazers_count, language, open_issues_count, license from @(http_get('https://api.github.com/search/repositories', @{q:coalesce(@params->(''),'surprisetalk')})->res->items)",
                       args: { q: "text" },
                       examples: ["author\\:surprisetalk", "scrapscript"],
                     },
@@ -256,7 +256,7 @@
                   [true, "search args"],
                   [true, "search arg examples"],
                   [true, "nicer errors"],
-                  [false, "fix select * from unnest/http_get"],
+                  [true, "fix select * from"],
                   [false, "move name/tags edit to library page"],
                   [false, "tons of examples"],
                   [false, "sidebar: share"],
@@ -264,7 +264,7 @@
                   [false, "sidebar: hints"],
                   [false, "sidebar: history"],
                   [false, "sidebar: settings"],
-                  [false, "run query button"],
+                  [false, "run query button; no debounce?"],
                   [false, "code todos"],
                   [false, "crude styling"],
                   [false, "deploy"],
@@ -324,7 +324,7 @@
 
           let sheet;
 
-          alasql.from.UNNEST = objs => objs;
+          alasql.options.modifier = "RECORDSET";
           alasql.from.SHEET = (id, params = {}) => {
             // TODO: Grab sheet (e.g. portal) with given params.
             throw new Error("TODO");
@@ -355,14 +355,14 @@
                       new URLSearchParams(window.location.search).get("q") ||
                       null,
                   };
-                  const [, rows = []] =
+                  const [, { columns: cols, data: rows } = {}] =
                     alasql(`set @params = ?; ${code}`, [params]) || [];
                   app.ports.docQueried.send({
                     id,
                     data: [
-                      Object.keys(rows?.[0] || {}).map(col => ({
-                        name: col,
-                        key: col,
+                      cols.map(col => ({
+                        name: col.columnid,
+                        key: col.columnid,
                         type: "text",
                       })),
                       ...rows,
