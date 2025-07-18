@@ -998,7 +998,7 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text ".selected { background: rgba(0,0,0,0.1); }" ]
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { .selected { background: rgba(255,255,255,0.1); } }" ]
         , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh" ]
-            [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%", S.maxWidth "80vw", S.maxHeight "100vh" ]
+            [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%", S.maxHeight "100vh" ]
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.alignItemsBaseline ]
                     [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.gapRem 0.5 ] <|
                         -- Badges indicate scrapscript news, library notifs, etc.
@@ -1226,10 +1226,29 @@ view ({ sheet } as model) =
                                 ]
                     ]
                 ]
-            , H.aside [ S.displayFlex, S.flexDirectionColumn, S.minWidthRem 12, S.maxWidthRem 18, S.maxHeight "100vh", S.overflowHidden, S.overflowYAuto ] <|
+            , H.aside [ S.displayFlex, S.flexDirectionColumn, S.maxWidth "30vw", S.maxHeight "100vh", S.overflowHidden, S.overflowYAuto ] <|
                 List.concat
-                    [ [ H.span [] [ text (String.toLower (Debug.toString model.tool)), H.sup [] [ text "" ] ]
-                      ]
+                    [ model.tool
+                        |> Maybe.map
+                            (\tool ->
+                                case tool of
+                                    Share _ ->
+                                        "share"
+
+                                    Settings ->
+                                        "settings"
+
+                                    Hints ->
+                                        "hints"
+
+                                    Stats ->
+                                        "stats"
+
+                                    History ->
+                                        "history"
+                            )
+                        |> Maybe.map (\tool -> [ H.span [] [ text (String.toLower tool), H.sup [] [ text "" ] ] ])
+                        |> Maybe.withDefault []
                     , case model.tool of
                         -- TODO: Hovering over columns/etc should highlight relevant cells, and vice versa.
                         Just Settings ->
@@ -1271,8 +1290,11 @@ view ({ sheet } as model) =
                             []
 
                         Just (Share share) ->
+                            [ H.input [ A.value ("https://sheets.scrap.land/" ++ sheet.id), A.disabled True ] []
+
                             -- TODO:
-                            []
+                            , H.ul [] [ H.li [] [ text "- anonymous (you)" ] ]
+                            ]
 
                         Just History ->
                             -- TODO: contextual history
@@ -1280,7 +1302,6 @@ view ({ sheet } as model) =
                             []
 
                         Nothing ->
-                            -- TODO:
                             []
                     ]
             ]
