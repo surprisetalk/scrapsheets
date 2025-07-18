@@ -538,7 +538,7 @@ type Msg
     | DocNew
     | DocDelete Id
     | KeyPress String
-    | CellMouseClick
+    | CellMouseClick String
     | CellMouseDown
     | CellMouseUp
     | CellHover Index
@@ -557,9 +557,7 @@ type TabMsg
 
 
 type Input
-    = SheetName
-    | SheetTags
-    | SheetSearch
+    = SheetSearch
     | CellWrite
     | ColumnType Int
     | ColumnKey Int
@@ -690,10 +688,31 @@ update msg ({ sheet } as model) =
                                     sheet.doc
                     }
               }
-            , changeDoc <|
-                Idd sheet.id <|
-                    case sheet.doc of
-                        Ok (Tab table) ->
+            , case sheet.doc of
+                Ok Library ->
+                    case edit of
+                        SheetWrite { x, y } ->
+                            let
+                                id : String
+                                id =
+                                    model.library |> Dict.keys |> List.drop (y + 1) |> List.head |> Maybe.withDefault ""
+                            in
+                            case Maybe.map .name (Array.get x libraryCols) of
+                                Just "name" ->
+                                    updateLibrary (Idd id { name = sheet.write, tags = Nothing })
+
+                                Just "tags" ->
+                                    updateLibrary (Idd id { name = Nothing, tags = sheet.write |> Maybe.map (String.split ", " >> List.map String.trim) })
+
+                                _ ->
+                                    Cmd.none
+
+                        _ ->
+                            Cmd.none
+
+                Ok (Tab table) ->
+                    changeDoc <|
+                        Idd sheet.id <|
                             case edit of
                                 SheetWrite { x, y } ->
                                     -- TODO: what if we have no columns?
@@ -723,8 +742,8 @@ update msg ({ sheet } as model) =
                                       }
                                     ]
 
-                        _ ->
-                            []
+                _ ->
+                    Cmd.none
             )
 
         DocMsg (QueryMsg _) ->
@@ -746,12 +765,6 @@ update msg ({ sheet } as model) =
                 _ ->
                     Cmd.none
             )
-
-        InputChange SheetName x ->
-            ( model, updateLibrary (Idd sheet.id { name = Just x, tags = Nothing }) )
-
-        InputChange SheetTags x ->
-            ( model, updateLibrary (Idd sheet.id { name = Nothing, tags = x |> String.split ", " |> List.map String.trim |> Just }) )
 
         InputChange SheetSearch x ->
             ( { model | search = x }
@@ -811,19 +824,22 @@ update msg ({ sheet } as model) =
             -- TODO:
             ( model, Cmd.none )
 
-        CellMouseClick ->
+        CellMouseClick write ->
             let
-                x =
-                    ( { model | sheet = { sheet | write = Just "" } }
+                a =
+                    ( { model | sheet = { sheet | write = Just write } }
                     , Task.attempt (always NoOp) (Dom.focus "new-cell")
                     )
             in
             case sheet.doc of
+                Ok Library ->
+                    a
+
                 Ok (Scratch _) ->
-                    x
+                    a
 
                 Ok (Tab _) ->
-                    x
+                    a
 
                 _ ->
                     ( model, Cmd.none )
@@ -892,6 +908,13 @@ update msg ({ sheet } as model) =
 ---- VIEW ---------------------------------------------------------------------
 
 
+libraryCols : Array Col
+libraryCols =
+    [ ( "sheet_id", Link ), ( "name", Text ), ( "tags", Many Text ), ( "del", Delete ) ]
+        |> List.map (\( k, t ) -> Col k k t)
+        |> Array.fromList
+
+
 view : Model -> Browser.Document Msg
 view ({ sheet } as model) =
     -- TODO: Show library sheet if (id == ""), otherwise show loading if (model.id /= model.sheet.id).
@@ -926,9 +949,7 @@ view ({ sheet } as model) =
                 ( Ok Library, _ ) ->
                     Ok
                         { cols =
-                            [ ( "sheet_id", Link ), ( "name", Text ), ( "tags", Many Text ), ( "del", Delete ) ]
-                                |> List.map (\( k, t ) -> Col k k t)
-                                |> Array.fromList
+                            libraryCols
                         , rows =
                             model.library
                                 |> Dict.filter (\k _ -> k /= "" && not (String.startsWith "scratch-" k))
@@ -996,11 +1017,11 @@ view ({ sheet } as model) =
                             ]
                     , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.alignItemsBaseline, S.gapRem 0.5 ]
                         -- TODO: If we need to, we can collapse the tools into a dropdown that only shows the current one.
-                        [ H.a [ A.href "#settings" ] [ text "settings", H.sup [] [ text "" ] ]
-                        , H.a [ A.href "#history" ] [ text "history", H.sup [] [ text "4" ] ]
-                        , H.a [ A.href "#hints" ] [ text "hints", H.sup [] [ text "3" ] ]
-                        , H.a [ A.href "#stats" ] [ text "stats", H.sup [] [ text "2" ] ]
-                        , H.a [ A.href "#share" ] [ text "share", H.sup [] [ text "4" ] ]
+                        [ H.a [ A.href "#settings", S.opacity (iif (model.tool == Just Settings) "1" "0.5") ] [ text "settings", H.sup [] [ text "" ] ]
+                        , H.a [ A.href "#history", S.opacity (iif (model.tool == Just History) "1" "0.5") ] [ text "history", H.sup [] [ text "4" ] ]
+                        , H.a [ A.href "#hints", S.opacity (iif (model.tool == Just Hints) "1" "0.5") ] [ text "hints", H.sup [] [ text "3" ] ]
+                        , H.a [ A.href "#stats", S.opacity (iif (model.tool == Just Stats) "1" "0.5") ] [ text "stats", H.sup [] [ text "2" ] ]
+                        , H.a [ A.href "#share", S.opacity (iif (String.startsWith "Just (Share" (Debug.toString model.tool)) "1" "0.5") ] [ text "share", H.sup [] [ text "4" ] ]
 
                         -- TODO: This doesn't make sense.
                         , case info.peers of
@@ -1051,7 +1072,7 @@ view ({ sheet } as model) =
                                             List.indexedMap
                                                 (\i col ->
                                                     H.th
-                                                        [ A.onClick CellMouseClick
+                                                        [ A.onClick (CellMouseClick "")
                                                         , A.onMouseDown CellMouseDown
                                                         , A.onMouseUp CellMouseUp
                                                         , A.onMouseEnter (CellHover (xy i -1))
@@ -1091,7 +1112,7 @@ view ({ sheet } as model) =
                                                             (\i col ->
                                                                 -- TODO: Don't allow editing if Virtual column.
                                                                 H.td
-                                                                    [ A.onClick CellMouseClick
+                                                                    [ A.onClick (CellMouseClick (row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""))
                                                                     , A.onMouseDown CellMouseDown
                                                                     , A.onMouseUp CellMouseUp
                                                                     , A.onMouseEnter (CellHover (xy i n))
@@ -1209,41 +1230,34 @@ view ({ sheet } as model) =
                     , case model.tool of
                         -- TODO: Hovering over columns/etc should highlight relevant cells, and vice versa.
                         Just Settings ->
-                            List.concat
-                                [ [ H.label [] [ text "name" ]
-                                  , H.input [ A.value info.name, A.onInput (InputChange SheetName) ] []
-                                  , H.label [] [ text "tags" ]
-                                  , H.input [ A.value (String.join ", " info.tags), A.onInput (InputChange SheetTags) ] []
-                                  ]
-                                , let
-                                    docHelper doc =
-                                        case doc of
-                                            Ok (Scratch doc_) ->
-                                                docHelper (Ok doc_)
+                            let
+                                docHelper doc =
+                                    case doc of
+                                        Ok (Scratch doc_) ->
+                                            docHelper (Ok doc_)
 
-                                            Ok (Query query) ->
-                                                [ H.textarea [ A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
-                                                    [ text (String.trim query.code)
-                                                    ]
+                                        Ok (Query query) ->
+                                            [ H.textarea [ A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75 ]
+                                                [ text (String.trim query.code)
                                                 ]
+                                            ]
 
-                                            Ok (Template ( _, _ )) ->
-                                                [ H.button [ A.onClick DocNew ] [ text "new sheet (N)" ]
-                                                ]
+                                        Ok (Template ( _, _ )) ->
+                                            [ H.button [ A.onClick DocNew ] [ text "new sheet (N)" ]
+                                            ]
 
-                                            _ ->
-                                                -- TODO:
-                                                [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%" ]
-                                                    -- TODO: Link to the column configs.
-                                                    [ text (Debug.toString sheet.doc)
-                                                    ]
-                                                , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd, S.alignItemsBaseline ]
-                                                    [ H.button [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "new column (C)" ]
-                                                    ]
+                                        _ ->
+                                            -- TODO:
+                                            [ H.textarea [ A.onInput (always NoOp), S.minHeightRem 10, S.height "100%" ]
+                                                -- TODO: Link to the column configs.
+                                                [ text (Debug.toString sheet.doc)
                                                 ]
-                                  in
-                                  docHelper sheet.doc
-                                ]
+                                            , H.div [ S.displayFlex, S.flexWrapWrap, S.justifyContentEnd, S.alignItemsBaseline ]
+                                                [ H.button [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "new column (C)" ]
+                                                ]
+                                            ]
+                            in
+                            docHelper sheet.doc
 
                         Just Hints ->
                             -- TODO: problems (linting), ideas, related (sources/backlinks)
