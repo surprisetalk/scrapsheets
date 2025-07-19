@@ -417,23 +417,26 @@ colDecoder =
                 , ( "text", Text )
                 ]
     in
-    D.map3 Col
-        (D.field "key" string)
-        (D.field "name" D.string)
-        (D.field "type"
-            (D.oneOf
-                [ D.map ColQuery
-                    (D.map4 Query_
-                        (D.field "lang" langDecoder)
-                        (D.field "code" D.string)
-                        (D.succeed Dict.empty)
-                        (D.succeed [])
-                    )
-                , D.string
-                    |> D.map (flip Dict.get types >> Maybe.withDefault Text)
-                ]
+    D.oneOf
+        [ D.map3 Col
+            (D.field "key" string)
+            (D.field "name" D.string)
+            (D.field "type"
+                (D.oneOf
+                    [ D.map ColQuery
+                        (D.map4 Query_
+                            (D.field "lang" langDecoder)
+                            (D.field "code" D.string)
+                            (D.succeed Dict.empty)
+                            (D.succeed [])
+                        )
+                    , D.string
+                        |> D.map (flip Dict.get types >> Maybe.withDefault Text)
+                    ]
+                )
             )
-        )
+        , D.succeed (Col "" "" Text)
+        ]
 
 
 langDecoder : D.Decoder Lang
@@ -665,14 +668,18 @@ update msg ({ sheet } as model) =
                         Idd sheet.id <|
                             case edit of
                                 SheetWrite { x, y } ->
-                                    -- TODO: what if we have no columns?
-                                    case x of
+                                    case y of
                                         0 ->
-                                            [ { action = "set"
-                                              , path = [ E.int y, E.int x, E.string "name" ]
-                                              , value = sheet.write |> Maybe.withDefault "" |> E.string
-                                              }
-                                            ]
+                                            Maybe.map2 Tuple.pair sheet.write (Array.get x table.cols)
+                                                |> Maybe.map
+                                                    (\( write, col ) ->
+                                                        [ { action = "set"
+                                                          , path = [ E.int y, E.string (String.fromInt x) ]
+                                                          , value = E.object [ ( "name", E.string write ), ( "type", E.string "text" ), ( "key", E.string col.key ) ]
+                                                          }
+                                                        ]
+                                                    )
+                                                |> Maybe.withDefault []
 
                                         _ ->
                                             table.cols
@@ -697,7 +704,7 @@ update msg ({ sheet } as model) =
                                 SheetColumnPush ->
                                     [ { action = "push"
                                       , path = [ E.int 0 ]
-                                      , value = E.list identity [ E.object [ ( "name", E.string "" ), ( "type", E.string "text" ), ( "key", E.string (String.fromInt (Array.length table.cols)) ) ] ]
+                                      , value = E.list identity [ E.object [ ( "name", E.string "" ), ( "type", E.string "text" ), ( "key", E.int (Array.length table.cols) ) ] ]
                                       }
                                     ]
 
@@ -899,6 +906,7 @@ view ({ sheet } as model) =
     , body =
         [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
         , H.node "style" [] [ text "body { font-family: monospace; }" ]
+        , H.node "style" [] [ text "tr th:first-child { opacity: 0.5; }" ]
         , H.node "style" [] [ text "th, td { padding: 0 0.25rem; font-weight: normal; }" ]
         , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { td { background: rgba(255,255,255,0.05); } }" ]
@@ -1120,8 +1128,8 @@ view ({ sheet } as model) =
 
                                             Ok (Tab _) ->
                                                 [ H.tr [] <|
-                                                    (::) (H.th [] [ text "+" ]) <|
-                                                        List.indexedMap (\i col -> H.td [ A.colspan (Array.length cols - 2), S.opacity "0.25" ] []) <|
+                                                    (::) (H.th [ A.onClick (DocMsg (TabMsg (SheetRowPush (Array.length rows)))) ] [ text "+" ]) <|
+                                                        List.indexedMap (\i col -> H.td [ S.opacity "0.25" ] [ text (String.toLower (Debug.toString col.typ)) ]) <|
                                                             Array.toList cols
                                                 ]
 
