@@ -161,6 +161,7 @@ type alias Model =
 type alias SheetInfo =
     { name : String
     , tags : List String
+    , hidden : Bool
     , thumb : Svg
     , peers : Peers
     }
@@ -194,13 +195,11 @@ type alias Stat =
 
 type Doc
     = Library
-    | Scratch Doc
     | Tab Table
     | Net Net
     | Query Query_
     | Codex
     | Portal Args
-    | Template ( String, Array Row )
 
 
 type alias Table =
@@ -340,11 +339,6 @@ docDecoder =
                     "library" ->
                         D.succeed Library
 
-                    "scratch" ->
-                        D.field "data" <|
-                            D.index 0 <|
-                                D.map Scratch (D.lazy (\_ -> docDecoder))
-
                     "table" ->
                         D.field "data" <|
                             D.map Tab tableDecoder
@@ -378,17 +372,9 @@ docDecoder =
                                         (D.field "lang" langDecoder)
                                         (D.field "code" D.string)
                                         -- TODO
-                                        (D.field "args" (D.succeed Dict.empty))
+                                        (D.maybe (D.field "args" (D.succeed Dict.empty)) |> D.map (Maybe.withDefault Dict.empty))
                                         (D.maybe (D.field "examples" (D.list D.string)) |> D.map (Maybe.withDefault []))
                                     )
-
-                    "template" ->
-                        D.field "data" <|
-                            D.index 0 <|
-                                D.map Template <|
-                                    D.map2 Tuple.pair
-                                        (D.field "type" D.string)
-                                        (D.field "data" (D.array rowDecoder))
 
                     typ_ ->
                         D.fail ("Bad table type: " ++ typ_)
@@ -514,7 +500,8 @@ type Msg
     | DocQuery (Idd D.Value)
     | DocError String
     | DocMsg DocMsg
-    | DocNew
+    | DocNewQuery
+    | DocNewTable
     | DocDelete Id
     | KeyPress String
     | CellMouseClick String
@@ -589,9 +576,10 @@ update msg ({ sheet } as model) =
                     data
                         |> D.decodeValue
                             (D.dict
-                                (D.map4 SheetInfo
+                                (D.map5 SheetInfo
                                     (D.oneOf [ D.field "name" D.string, D.succeed "" ])
                                     (D.oneOf [ D.field "tags" (D.list D.string), D.succeed [] ])
+                                    (D.oneOf [ D.field "hidden" D.bool, D.succeed False ])
                                     (D.succeed ())
                                     (D.succeed Public)
                                 )
@@ -644,29 +632,7 @@ update msg ({ sheet } as model) =
             )
 
         DocMsg (TabMsg edit) ->
-            ( { model
-                | sheet =
-                    { sheet
-                        | write = Nothing
-                        , doc =
-                            case sheet.doc of
-                                Ok (Scratch (Tab ({ cols, rows } as table))) ->
-                                    (Ok << Scratch << Tab) <|
-                                        case edit of
-                                            SheetWrite { x, y } ->
-                                                table.cols
-                                                    |> Array.get x
-                                                    |> Maybe.map (\col -> { table | rows = rows |> Array.set y (rows |> Array.get y |> Maybe.withDefault Dict.empty |> Dict.insert col.key (sheet.write |> Maybe.map E.string |> Maybe.withDefault E.null)) })
-                                                    |> Maybe.withDefault table
-
-                                            _ ->
-                                                -- TODO:
-                                                table
-
-                                _ ->
-                                    sheet.doc
-                    }
-              }
+            ( { model | sheet = { sheet | write = Nothing } }
             , case sheet.doc of
                 Ok Library ->
                     case edit of
@@ -732,28 +698,17 @@ update msg ({ sheet } as model) =
         DocDelete id ->
             ( model, deleteDoc id )
 
-        DocNew ->
-            ( model
-            , case sheet.doc of
-                Ok (Template ( "table", data )) ->
-                    newDoc <| E.object [ ( "type", E.string "table" ), ( "data", E.list identity [ E.array (E.dict identity identity) data ] ) ]
+        DocNewTable ->
+            ( model, newDoc <| E.object [ ( "type", E.string "table" ), ( "data", E.list identity [ E.list identity [ E.object [ ( "name", E.string "a" ), ( "type", E.string "text" ), ( "key", E.string "a" ) ] ] ] ) ] )
 
-                Ok (Template ( type_, data )) ->
-                    newDoc <| E.object [ ( "type", E.string type_ ), ( "data", E.array (E.dict identity identity) data ) ]
-
-                _ ->
-                    Cmd.none
-            )
+        DocNewQuery ->
+            ( model, newDoc <| E.object [ ( "type", E.string "query" ), ( "data", E.list identity [ E.object [ ( "lang", E.string "sql" ), ( "code", E.string "select 1" ) ] ] ) ] )
 
         InputChange SheetSearch x ->
             ( { model | search = x }
             , Cmd.batch
                 [ Nav.pushUrl model.nav ("?q=" ++ Url.percentEncode x)
                 , case sheet.doc of
-                    Ok (Scratch (Query query)) ->
-                        -- TODO: Lang to string.
-                        queryDoc (Idd sheet.id { lang = "sql", code = query.code })
-
                     Ok (Query query) ->
                         -- TODO: Lang to string.
                         queryDoc (Idd sheet.id { lang = "sql", code = query.code })
@@ -767,19 +722,7 @@ update msg ({ sheet } as model) =
             ( { model | sheet = { sheet | write = Just x } }, Cmd.none )
 
         InputChange QueryCode x ->
-            ( { model
-                | sheet =
-                    { sheet
-                        | doc =
-                            case sheet.doc of
-                                Ok (Scratch (Query query)) ->
-                                    (Ok << Scratch << Query) <|
-                                        { query | code = x }
-
-                                _ ->
-                                    sheet.doc
-                    }
-              }
+            ( model
             , changeDoc
                 { id = sheet.id
                 , data =
@@ -812,9 +755,6 @@ update msg ({ sheet } as model) =
             in
             case sheet.doc of
                 Ok Library ->
-                    a
-
-                Ok (Scratch _) ->
                     a
 
                 Ok (Tab _) ->
@@ -902,28 +842,13 @@ view ({ sheet } as model) =
         info =
             model.library
                 |> Dict.get sheet.id
-                |> Maybe.withDefault { name = "", tags = [], thumb = (), peers = Public }
+                |> Maybe.withDefault { name = "", tags = [], hidden = False, thumb = (), peers = Public }
 
-        tableHelper : Result String Doc -> Result String Table
-        tableHelper doc =
-            case ( doc, sheet.table ) of
+        table : Result String Table
+        table =
+            case ( sheet.doc, sheet.table ) of
                 ( Ok (Tab tbl), _ ) ->
                     Ok tbl
-
-                ( Ok (Template ( "table", params )), _ ) ->
-                    Ok
-                        { cols = Array.fromList [ Col "name" "name" Text, Col "type" "type" Text, Col "key" "key" Text ]
-                        , rows = params
-                        }
-
-                ( Ok (Template ( "query", params )), _ ) ->
-                    Ok
-                        { cols = Array.fromList [ Col "lang" "lang" Text, Col "code" "code" Text, Col "args" "args" Text ]
-                        , rows = params
-                        }
-
-                ( Ok (Template ( type_, params )), _ ) ->
-                    Err "TODO: template"
 
                 ( Ok Library, _ ) ->
                     Ok
@@ -931,14 +856,12 @@ view ({ sheet } as model) =
                             libraryCols
                         , rows =
                             model.library
-                                |> Dict.filter (\k _ -> k /= "" && not (String.startsWith "scratch-" k))
+                                -- TODO: Kludge! We shouldn't omit all examples.
+                                |> Dict.filter (\k v -> k /= "" && not v.hidden)
                                 |> Dict.toList
                                 |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "del", E.string k ) ])
                                 |> Array.fromList
                         }
-
-                ( Ok (Scratch doc_), _ ) ->
-                    tableHelper (Ok doc_)
 
                 ( _, Ok tbl ) ->
                     Ok tbl
@@ -949,17 +872,10 @@ view ({ sheet } as model) =
                 ( _, Err err ) ->
                     Err err
 
-        table : Result String Table
-        table =
-            tableHelper sheet.doc
-
         examples : List String
         examples =
             case sheet.doc of
                 Ok (Query query) ->
-                    query.examples
-
-                Ok (Scratch (Query query)) ->
                     query.examples
 
                 _ ->
@@ -1001,22 +917,16 @@ view ({ sheet } as model) =
                               ]
                             ]
                     , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.alignItemsBaseline, S.gapRem 0.5 ] <|
-                        let
-                            docHelper doc =
-                                case doc of
-                                    Ok (Scratch doc_) ->
-                                        docHelper (Ok doc_)
-
-                                    Ok (Template ( _, _ )) ->
-                                        [ H.button [ A.onClick DocNew ] [ text "⌘N new sheet" ]
-                                        ]
-
-                                    _ ->
-                                        [ H.button [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "⌘C new column" ]
-                                        ]
-                        in
                         List.concat
-                            [ docHelper sheet.doc
+                            [ case sheet.doc of
+                                Ok Library ->
+                                    [ H.button [ A.onClick DocNewQuery ] [ text "new query" ]
+                                    , H.button [ A.onClick DocNewTable ] [ text "new table" ]
+                                    ]
+
+                                _ ->
+                                    [ H.button [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "⌘C new column" ]
+                                    ]
                             , List.map (\tag -> H.button [] [ text "⌘F find" ]) [ () ]
                             ]
                     ]
@@ -1083,157 +993,164 @@ view ({ sheet } as model) =
                                                 Array.toList cols
                                     ]
                                 , H.tbody [] <|
-                                    Array.toList <|
-                                        Array.indexedMap
-                                            (\n row ->
-                                                H.tr [] <|
-                                                    (::)
-                                                        (H.th
-                                                            [ A.onClick (DocMsg (TabMsg (SheetRowPush n)))
-                                                            , A.onMouseEnter (CellHover (xy -1 n))
-                                                            , S.textAlignRight
-                                                            , S.widthRem 0.001
-                                                            , S.whiteSpaceNowrap
-                                                            ]
-                                                            -- TODO: The row number needs to be pre-filter.
-                                                            [ text (String.fromInt (n + 1)) ]
-                                                        )
-                                                    <|
-                                                        List.indexedMap
-                                                            (\i col ->
-                                                                -- TODO: Don't allow editing if Virtual column.
-                                                                H.td
-                                                                    [ A.onClick (CellMouseClick (row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""))
-                                                                    , A.onMouseDown CellMouseDown
-                                                                    , A.onMouseUp CellMouseUp
-                                                                    , A.onMouseEnter (CellHover (xy i n))
-                                                                    , S.heightRem 1.25
-                                                                    , A.classList <|
-                                                                        let
-                                                                            { a, b } =
-                                                                                sheet.select
-
-                                                                            between : number -> number -> number -> Bool
-                                                                            between a_ b_ i_ =
-                                                                                min a_ b_ <= i_ && i_ <= max a_ b_
-
-                                                                            eq : number -> number -> number -> Bool
-                                                                            eq a_ b_ i_ =
-                                                                                a_ == i_ && i_ == b_
-                                                                        in
-                                                                        [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
-                                                                        ]
-                                                                    ]
-                                                                <|
-                                                                    Maybe.withDefault
-                                                                        [ row
-                                                                            |> Dict.get col.key
-                                                                            |> Maybe.withDefault (E.string "")
-                                                                            |> D.decodeValue
-                                                                                (D.maybe
-                                                                                    (case col.typ of
-                                                                                        Link ->
-                                                                                            D.string |> D.map (\href -> H.a [ A.href ("/" ++ href), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text href ])
-
-                                                                                        Image ->
-                                                                                            D.string |> D.map (\src -> H.img [ A.src src, S.width "100%", S.objectFitCover ] [])
-
-                                                                                        Text ->
-                                                                                            D.map text string
-
-                                                                                        Boolean ->
-                                                                                            D.map (\c -> H.input [ A.type_ "checkbox", A.checked c ] []) D.bool
-
-                                                                                        Number ->
-                                                                                            D.map (H.span [ S.textAlignRight ] << List.singleton << text) string
-
-                                                                                        Delete ->
-                                                                                            D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "╳" ])
-
-                                                                                        ColQuery query ->
-                                                                                            case query.lang of
-                                                                                                Prql ->
-                                                                                                    D.succeed (text "TODO: prql")
-
-                                                                                                Sql ->
-                                                                                                    D.succeed (text "TODO: sql")
-
-                                                                                                Formula ->
-                                                                                                    D.succeed (text "TODO: formula")
-
-                                                                                                Scrapscript ->
-                                                                                                    D.succeed (text "TODO: scrapscript")
-
-                                                                                                Python ->
-                                                                                                    D.succeed (text "TODO: python")
-
-                                                                                        Form form ->
-                                                                                            D.map3
-                                                                                                (\method action fields ->
-                                                                                                    -- TODO: Change this to displayGrid
-                                                                                                    H.form [ A.onSubmit NoOp, S.displayGrid, S.gridTemplateColumns "auto 1fr", S.paddingRem 1 ] <|
-                                                                                                        List.concat
-                                                                                                            [ List.concatMap
-                                                                                                                (\field ->
-                                                                                                                    [ H.label [] [ text field.label ]
-                                                                                                                    , H.input [] []
-                                                                                                                    ]
-                                                                                                                )
-                                                                                                                fields
-                                                                                                            , [ H.span [] []
-                                                                                                              , H.button [ A.type_ "submit" ] [ text method ]
-                                                                                                              ]
-                                                                                                            ]
-                                                                                                )
-                                                                                                (D.field "method" D.string)
-                                                                                                (D.field "action" D.string)
-                                                                                                (D.field "fields"
-                                                                                                    (D.list
-                                                                                                        (D.map (\label -> { label = label })
-                                                                                                            (D.field "label" D.string)
-                                                                                                        )
-                                                                                                    )
-                                                                                                )
-
-                                                                                        _ ->
-                                                                                            D.map text string
-                                                                                    )
-                                                                                )
-                                                                            |> Result.map (Maybe.withDefault (text ""))
-                                                                            |> Result.mapError (D.errorToString >> text)
-                                                                            |> result
-                                                                        ]
-                                                                    <|
-                                                                        if sheet.write /= Nothing && sheet.select == rect i n i n then
-                                                                            Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (TabMsg (SheetWrite sheet.select.a))), S.width "100%" ] [] ]
-
-                                                                        else
-                                                                            Nothing
+                                    List.concat
+                                        [ Array.toList <|
+                                            Array.indexedMap
+                                                (\n row ->
+                                                    H.tr [] <|
+                                                        (::)
+                                                            (H.th
+                                                                [ A.onClick (DocMsg (TabMsg (SheetRowPush n)))
+                                                                , A.onMouseEnter (CellHover (xy -1 n))
+                                                                , S.textAlignRight
+                                                                , S.widthRem 0.001
+                                                                , S.whiteSpaceNowrap
+                                                                ]
+                                                                -- TODO: The row number needs to be pre-filter.
+                                                                [ text (String.fromInt (n + 1)) ]
                                                             )
                                                         <|
+                                                            List.indexedMap
+                                                                (\i col ->
+                                                                    -- TODO: Don't allow editing if Virtual column.
+                                                                    H.td
+                                                                        [ A.onClick (CellMouseClick (row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""))
+                                                                        , A.onMouseDown CellMouseDown
+                                                                        , A.onMouseUp CellMouseUp
+                                                                        , A.onMouseEnter (CellHover (xy i n))
+                                                                        , S.heightRem 1.25
+                                                                        , A.classList <|
+                                                                            let
+                                                                                { a, b } =
+                                                                                    sheet.select
+
+                                                                                between : number -> number -> number -> Bool
+                                                                                between a_ b_ i_ =
+                                                                                    min a_ b_ <= i_ && i_ <= max a_ b_
+
+                                                                                eq : number -> number -> number -> Bool
+                                                                                eq a_ b_ i_ =
+                                                                                    a_ == i_ && i_ == b_
+                                                                            in
+                                                                            [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
+                                                                            ]
+                                                                        ]
+                                                                    <|
+                                                                        Maybe.withDefault
+                                                                            [ row
+                                                                                |> Dict.get col.key
+                                                                                |> Maybe.withDefault (E.string "")
+                                                                                |> D.decodeValue
+                                                                                    (D.maybe
+                                                                                        (case col.typ of
+                                                                                            Link ->
+                                                                                                D.string |> D.map (\href -> H.a [ A.href ("/" ++ href), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text href ])
+
+                                                                                            Image ->
+                                                                                                D.string |> D.map (\src -> H.img [ A.src src, S.width "100%", S.objectFitCover ] [])
+
+                                                                                            Text ->
+                                                                                                D.map text string
+
+                                                                                            Boolean ->
+                                                                                                D.map (\c -> H.input [ A.type_ "checkbox", A.checked c ] []) D.bool
+
+                                                                                            Number ->
+                                                                                                D.map (H.span [ S.textAlignRight ] << List.singleton << text) string
+
+                                                                                            Delete ->
+                                                                                                D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "╳" ])
+
+                                                                                            ColQuery query ->
+                                                                                                case query.lang of
+                                                                                                    Prql ->
+                                                                                                        D.succeed (text "TODO: prql")
+
+                                                                                                    Sql ->
+                                                                                                        D.succeed (text "TODO: sql")
+
+                                                                                                    Formula ->
+                                                                                                        D.succeed (text "TODO: formula")
+
+                                                                                                    Scrapscript ->
+                                                                                                        D.succeed (text "TODO: scrapscript")
+
+                                                                                                    Python ->
+                                                                                                        D.succeed (text "TODO: python")
+
+                                                                                            Form form ->
+                                                                                                D.map3
+                                                                                                    (\method action fields ->
+                                                                                                        -- TODO: Change this to displayGrid
+                                                                                                        H.form [ A.onSubmit NoOp, S.displayGrid, S.gridTemplateColumns "auto 1fr", S.paddingRem 1 ] <|
+                                                                                                            List.concat
+                                                                                                                [ List.concatMap
+                                                                                                                    (\field ->
+                                                                                                                        [ H.label [] [ text field.label ]
+                                                                                                                        , H.input [] []
+                                                                                                                        ]
+                                                                                                                    )
+                                                                                                                    fields
+                                                                                                                , [ H.span [] []
+                                                                                                                  , H.button [ A.type_ "submit" ] [ text method ]
+                                                                                                                  ]
+                                                                                                                ]
+                                                                                                    )
+                                                                                                    (D.field "method" D.string)
+                                                                                                    (D.field "action" D.string)
+                                                                                                    (D.field "fields"
+                                                                                                        (D.list
+                                                                                                            (D.map (\label -> { label = label })
+                                                                                                                (D.field "label" D.string)
+                                                                                                            )
+                                                                                                        )
+                                                                                                    )
+
+                                                                                            _ ->
+                                                                                                D.map text string
+                                                                                        )
+                                                                                    )
+                                                                                |> Result.map (Maybe.withDefault (text ""))
+                                                                                |> Result.mapError (D.errorToString >> text)
+                                                                                |> result
+                                                                            ]
+                                                                        <|
+                                                                            if sheet.write /= Nothing && sheet.select == rect i n i n then
+                                                                                Just [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (TabMsg (SheetWrite sheet.select.a))), S.width "100%" ] [] ]
+
+                                                                            else
+                                                                                Nothing
+                                                                )
+                                                            <|
+                                                                Array.toList cols
+                                                )
+                                                rows
+
+                                        -- TODO:
+                                        , case sheet.doc of
+                                            Ok (Tab _) ->
+                                                [ H.tr [] <|
+                                                    (::) (H.th [] [ text "+" ]) <|
+                                                        List.indexedMap (\i col -> H.th [] []) <|
                                                             Array.toList cols
-                                            )
-                                            rows
+                                                ]
+
+                                            _ ->
+                                                []
+                                        ]
                                 ]
                     ]
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.maxWidth "30vw", S.maxHeight "100vh", S.overflowHidden, S.overflowYAuto ] <|
-                let
-                    docHelper doc =
-                        case doc of
-                            Ok (Scratch doc_) ->
-                                docHelper (Ok doc_)
+                case sheet.doc of
+                    Ok (Query query) ->
+                        [ H.textarea [ A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75, S.minWidth "20vw" ]
+                            [ text (String.trim query.code)
+                            ]
+                        ]
 
-                            Ok (Query query) ->
-                                [ H.textarea [ A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75, S.minWidth "20vw" ]
-                                    [ text (String.trim query.code)
-                                    ]
-                                ]
-
-                            _ ->
-                                []
-                in
-                docHelper sheet.doc
+                    _ ->
+                        []
             ]
         ]
     }

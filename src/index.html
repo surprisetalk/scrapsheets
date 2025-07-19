@@ -66,16 +66,6 @@
           };
         };
 
-        const Template = (name, type, data) => ({
-          type: "template",
-          data: [{ type, data }],
-        });
-
-        const Scratch = data => ({
-          type: "scratch",
-          data: [data],
-        });
-
         const Table = (cols, ...rows) => ({
           type: "table",
           data: [cols, ...rows],
@@ -96,7 +86,7 @@
         const Library = {
           get: () => {
             const examples = {
-              "scratch-table:calculated-columns": Table(
+              "table:calculated-columns": Table(
                 [
                   { key: 0, name: "a", type: "int" },
                   { key: 1, name: "b", type: "int" },
@@ -112,7 +102,7 @@
                   [3, 6],
                 ],
               ),
-              "scratch-table:postman": Table(
+              "table:postman": Table(
                 [
                   { key: 0, name: "method", type: "text" },
                   { key: 1, name: "url", type: "text" },
@@ -149,7 +139,7 @@
                   ],
                 ],
               ),
-              "scratch-table:nested": Table(
+              "table:nested": Table(
                 [
                   { key: 0, name: "a", type: "list string" },
                   { key: 1, name: "b", type: "dict string string" },
@@ -164,23 +154,23 @@
                   [["n"], { o: "p" }, { q: [], r: ["s", "t"] }],
                 ],
               ),
-              "scratch-query:http-get": QuerySql(
+              "query:http-get": QuerySql(
                 "select * from http('https://taylor.town/random')",
               ),
-              "scratch-query:python": QuerySql(
+              "query:python": QuerySql(
                 "return [[{'name':'a','type':'text','key':'a'}], {'a':1}, {'a':2}, {'a':3}]",
               ),
-              "scratch-query:stonks": QuerySql(
+              "query:stonks": QuerySql(
                 "select stonks->>'id', stonks->>'price' from http('https://taylor.town/stonks'), json(res) stonks",
               ),
               // TODO: Move these to the shop.
               ...{
-                "scratch-query:bluesky-actors": QuerySql(
+                "query:bluesky-actors": QuerySql(
                   "select * from @(http('https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors', @{q:coalesce(@params->(''),'taylor.town')})->res->actors)",
                   "taylor.town",
                   "memes",
                 ),
-                "scratch-query:github-repos": QuerySql(
+                "query:github-repos": QuerySql(
                   "select full_name, description, stargazers_count, language, open_issues_count, license from @(http('https://api.github.com/search/repositories', @{q:coalesce(@params->(''),'surprisetalk')})->res->items)",
                   "scrapscript sort=stars",
                   "surprisetalk sort=updated",
@@ -203,7 +193,7 @@
                   "good-first-issues:>n",
                   "is:sponsorable",
                 ),
-                "scratch-query:github-users": QuerySql(
+                "query:github-users": QuerySql(
                   "select * from @(http('https://api.github.com/search/users', @{q:(@params->(''))})->res->items)",
                   "surprisetalk sort=followers",
                   "foo sort=joined",
@@ -223,12 +213,12 @@
                   "followers:>=1000",
                   "is:sponsorable",
                 ),
-                "scratch-query:github-commits": QuerySql(
+                "query:github-commits": QuerySql(
                   "select * from @(http('https://api.github.com/search/commits', @{q:(@params->(''))})->res->items)",
                   "repo:tekknolagi/scrapscript",
                   "surprisetalk",
                 ),
-                "scratch-query:github-prs-issues": QuerySql(
+                "query:github-prs-issues": QuerySql(
                   "select * from @(http('https://api.github.com/search/issues', @{q:(@params->(''))})->res->items)",
                   "repo:tekknolagi/scrapscript",
                   "user:surprisetalk",
@@ -256,68 +246,68 @@
                   "sort=reactions-smile",
                   "sort=updated",
                 ),
-                "scratch-query:crypto-markets": QuerySql(
+                "query:crypto-markets": QuerySql(
                   "select * from @(http('https://api.coingecko.com/api/v3/coins/markets', @{vs_currency:'usd', `order`:'market_cap_desc', per_page:100})->res)",
                 ),
-                "scratch-query:crypto-search": QuerySql(
+                "query:crypto-search": QuerySql(
                   "select thumb::img as thumb, symbol, name, market_cap_rank from @(http('https://api.coingecko.com/api/v3/search', @{`query`:(@params->(''))})->res->coins)",
                   "bitcoin",
                   "ethereum",
                   "doge",
                 ),
-                "scratch-query:hackernews-search": QuerySql(
+                "query:hackernews-search": QuerySql(
                   "select * from @(http('https://hn.algolia.com/api/v1/search', @{`query`:(@params->(''))})->res->hits)",
                   "taylor.town",
                 ),
-                "scratch-query:hackernews-top": QuerySql(
+                "query:hackernews-top": QuerySql(
                   "select * from @(http('https://corsproxy.io/?url=https://hnrss.org/frontpage.jsonfeed')->res->items)",
                 ),
-                "scratch-query:arxiv-search": QuerySql(
+                "query:arxiv-search": QuerySql(
                   "select * from @(http('https://export.arxiv.org/api/query', @{search_query:('all:' || (@params->(''))), max_results:25})->res->entries)",
                 ),
-                "scratch-query:wikipedia-search": QuerySql(
+                "query:wikipedia-search": QuerySql(
                   "search / from @(http('https://en.wikipedia.org/w/api.php', @{action:'query', generator:'search', prop:'pageimages|url', exintro:'', explaintext:'', `gsrsearch`:(@params->('')), limit:25, format:'json', origin:'*'})->res->`query`->`pages`)",
                 ),
-                "scratch-query:reddit-search": QuerySql(
+                "query:reddit-search": QuerySql(
                   "search /data from @(http('https://www.reddit.com/search.json', @{q:(@params->('')), limit:25})->res->data->children)",
                 ),
-                "scratch-query:reddit-subreddit": QuerySql(
+                "query:reddit-subreddit": QuerySql(
                   "search /data from @(http('https://www.reddit.com/r/'||(@params->r->(0))||'.json', @{limit:25})->res->data->children)",
                   "r=hmmm",
                 ),
-                "scratch-query:manifold-search": QuerySql(
+                "query:manifold-search": QuerySql(
                   "select * from @(http('https://api.manifold.markets/v0/search-markets', @{term:(@params->('')), limit:20})->res)",
                 ),
-                "scratch-query:manifold-trending": QuerySql(
+                "query:manifold-trending": QuerySql(
                   "select * from @(http('https://api.manifold.markets/v0/markets', @{limit:20})->res)",
                 ),
-                // "scratch-query:fred-search": QuerySql(
+                // "query:fred-search": QuerySql(
                 //   "select * from @(http('https://corsproxy.io/?url=https://api.stlouisfed.org/fred/series/search', @{search_text:(@params->('')), file_type:'json'})->res)"
                 // ),
-                "scratch-query:stocks-search": QuerySql(
+                "query:stocks-search": QuerySql(
                   "select * from @(http('https://corsproxy.io/?url=https://query1.finance.yahoo.com/v1/finance/search', @{q:(@params->(''))})->res->news)",
                   "AAPL",
                 ),
-                // "scratch-query:discogs-search": QuerySql(
+                // "query:discogs-search": QuerySql(
                 //   "select * from @(http('https://api.discogs.com/database/search', @{q:(@params->('')), type:'release'})->res)"
                 // ),
-                "scratch-query:speedrun-games": QuerySql(
+                "query:speedrun-games": QuerySql(
                   "select * from @(http('https://www.speedrun.com/api/v1/games', @{name:(@params->(''))})->res->data)",
                   "mario",
                 ),
-                "scratch-query:speedrun-users": QuerySql(
+                "query:speedrun-users": QuerySql(
                   "select * from @(http('https://www.speedrun.com/api/v1/users', @{name:(@params->(''))})->res->data)",
                   "mario",
                 ),
-                // "scratch-query:youtube-search": QuerySql(
+                // "query:youtube-search": QuerySql(
                 //   "select * from @(http('https://www.googleapis.com/youtube/v3/search', @{part:'snippet', q:(@params->('')), key:'YOUR_API_KEY', maxResults:25})->res->items)",
                 //   "videogamedunkey"
                 // ),
-                "scratch-query:podcast-search": QuerySql(
+                "query:podcast-search": QuerySql(
                   "select * from @(http('https://itunes.apple.com/search', @{term:(@params->('')), media:'podcast', limit:25})->res->results)",
                   "articles of interest",
                 ),
-                "scratch-query:ossinsight-trends": QuerySql(
+                "query:ossinsight-trends": QuerySql(
                   "select * from @(http('https://api.ossinsight.io/v1/trends/repos', @{keyword:(@params->(''))})->res->data->`rows`)",
                   "language=All period=past_24_hours",
                   "language=JavaScript period=past_3_months",
@@ -329,7 +319,7 @@
               ...Object.fromEntries(
                 Object.entries(examples).map(([k, v]) => [
                   k,
-                  { name: k.split(":").pop(), doc: Scratch(v) },
+                  { name: k.split(":").pop(), hidden: true, doc: v },
                 ]),
               ),
               ...JSON.parse(
@@ -337,21 +327,6 @@
               ),
               "": { name: "library", doc: { type: "library" } },
               // "portal:shop": { name: "shop" },
-              "template:table": {
-                name: "table",
-                doc: Template("table", "table", ["a", "b", "c"].map(Col)),
-              },
-              "template:query": {
-                name: "template",
-                doc: Template("query", "query", [
-                  {
-                    lang: "sql",
-                    code: "select 1 as a",
-                    args: [],
-                    examples: [],
-                  },
-                ]),
-              },
               "table:tutorial": {
                 name: "tutorial",
                 doc: Table(
@@ -373,9 +348,10 @@
                   [true, "fix select * from"],
                   [true, "move name/tags edit to library page"],
                   [true, "tons of examples"],
-                  [false, "scratch -> template"],
+                  [true, "get rid of scratch and template"],
+                  [true, "save new row"],
                   [false, "sidebar"],
-                  [false, "table column types"],
+                  [false, "table column types and stats"],
                   [false, "run query button; no debounce?"],
                   [false, "fix code todos"],
                   [false, "crude styling"],
@@ -545,7 +521,6 @@
               data: { doc: doc && { ...doc } },
             });
             if (type === "query") queryDoc(id, doc.data[0]);
-            if (type === "scratch-query") queryDoc(id, doc.data[0].data[0]);
             sheet?.on?.("change", data => {
               app.ports.docChanged.send({
                 id: type + ":" + data.handle.documentId,
