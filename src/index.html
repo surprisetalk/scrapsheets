@@ -349,16 +349,22 @@
                   [true, "move name/tags edit to library page"],
                   [true, "tons of examples"],
                   [true, "get rid of scratch and template"],
-                  [true, "save new row"],
-                  [false, "sidebar"],
+                  [true, "save new row ui"],
+                  [true, "sidebar"],
                   [false, "table column types and stats"],
                   [false, "run query button; no debounce?"],
-                  [false, "fix code todos"],
+                  [false, "msg survey/cleanup"],
+                  [false, "query save/publish"],
+                  [false, "essentual shortcuts"],
+                  [false, "saved filters"],
                   [false, "crude styling"],
+                  [false, "fix code todos"],
                   [false, "deploy"],
                   [false, "demo"],
+                  [false, "beautiful stat filter columns"],
                   [false, "column sorting (update search bar)"],
                   [false, "make editable cells more obvious"],
+                  [false, "advanced shortcuts"],
                 ),
               },
               "table:examples": {
@@ -574,6 +580,13 @@
                       else d.data[y][x][action](...value);
                       break;
                     }
+                    case 3:
+                      const [y, x, k] = path;
+                      if (!d.data[y]) d.data[y] = [];
+                      if (!d.data[y][x]) d.data[y][x] = {};
+                      if (action === "set") d.data[y][x][k] = value;
+                      else d.data[y][x][k][action](...value);
+                      break;
                     default:
                       throw new Error("TODO: path");
                   }
