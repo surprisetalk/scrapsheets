@@ -306,7 +306,6 @@ type
     | Image
     | Delete
     | Form (Dict String String)
-    | ColQuery Query_
 
 
 
@@ -409,12 +408,14 @@ colDecoder =
             Dict.fromList
                 [ ( "bool", Boolean )
                 , ( "number", Number )
+                , ( "num", Number )
                 , ( "link", Link )
                 , ( "image", Image )
                 , ( "form", Form Dict.empty )
                 , ( "timestamp", Timestamp )
                 , ( "json", Json )
                 , ( "text", Text )
+                , ( "string", Text )
                 ]
     in
     D.oneOf
@@ -422,17 +423,8 @@ colDecoder =
             (D.field "key" string)
             (D.field "name" D.string)
             (D.field "type"
-                (D.oneOf
-                    [ D.map ColQuery
-                        (D.map4 Query_
-                            (D.field "lang" langDecoder)
-                            (D.field "code" D.string)
-                            (D.succeed Dict.empty)
-                            (D.succeed [])
-                        )
-                    , D.string
-                        |> D.map (flip Dict.get types >> Maybe.withDefault Text)
-                    ]
+                (D.string
+                    |> D.map (flip Dict.get types >> Maybe.withDefault Text)
                 )
             )
         , D.succeed (Col "" "" Text)
@@ -673,9 +665,21 @@ update msg ({ sheet } as model) =
                                             Maybe.map2 Tuple.pair sheet.write (Array.get x table.cols)
                                                 |> Maybe.map
                                                     (\( write, col ) ->
+                                                        let
+                                                            ( name, typ ) =
+                                                                case String.split ":" write of
+                                                                    [] ->
+                                                                        ( "", "" )
+
+                                                                    name_ :: [] ->
+                                                                        ( name_, String.toLower (Debug.toString col.typ) )
+
+                                                                    name_ :: typ_ ->
+                                                                        ( name_, String.join ":" typ_ )
+                                                        in
                                                         [ { action = "set"
                                                           , path = [ E.int y, E.string (String.fromInt x) ]
-                                                          , value = E.object [ ( "name", E.string write ), ( "type", E.string "text" ), ( "key", E.string col.key ) ]
+                                                          , value = E.object [ ( "name", E.string name ), ( "type", E.string typ ), ( "key", E.string col.key ) ]
                                                           }
                                                         ]
                                                     )
@@ -850,9 +854,12 @@ update msg ({ sheet } as model) =
 
 libraryCols : Array Col
 libraryCols =
-    [ ( "sheet_id", Link ), ( "name", Text ), ( "tags", Many Text ), ( "del", Delete ) ]
-        |> List.map (\( k, t ) -> Col k k t)
-        |> Array.fromList
+    Array.fromList
+        [ Col "sheet_id" "sheet_id" Link
+        , Col "name" "name" Text
+        , Col "tags" "tags" (Many Text)
+        , Col "delete" "" Delete
+        ]
 
 
 view : Model -> Browser.Document Msg
@@ -1002,7 +1009,14 @@ view ({ sheet } as model) =
                                                             List.indexedMap
                                                                 (\i col ->
                                                                     H.td
-                                                                        [ A.onClick (CellMouseClick (row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""))
+                                                                        [ A.onClick <|
+                                                                            CellMouseClick <|
+                                                                                case n of
+                                                                                    0 ->
+                                                                                        col.name ++ ":" ++ String.toLower (Debug.toString col.typ)
+
+                                                                                    _ ->
+                                                                                        row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
                                                                         , A.onMouseDown CellMouseDown
                                                                         , A.onMouseUp CellMouseUp
                                                                         , A.onMouseEnter (CellHover (xy i n))
@@ -1022,16 +1036,50 @@ view ({ sheet } as model) =
                                                                             in
                                                                             [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
                                                                             ]
+                                                                        , case col.typ of
+                                                                            Boolean ->
+                                                                                S.textAlignCenter
+
+                                                                            Number ->
+                                                                                S.textAlignRight
+
+                                                                            Delete ->
+                                                                                S.textAlignCenter
+
+                                                                            Form _ ->
+                                                                                S.textAlignCenter
+
+                                                                            _ ->
+                                                                                S.textAlignLeft
+                                                                        , case col.typ of
+                                                                            Boolean ->
+                                                                                S.widthRem 0.5
+
+                                                                            Number ->
+                                                                                S.widthRem 0.5
+
+                                                                            Delete ->
+                                                                                S.widthRem 0.5
+
+                                                                            _ ->
+                                                                                S.widthAuto
                                                                         ]
                                                                     <|
                                                                         case ( n, sheet.write /= Nothing && sheet.select == rect i n i n ) of
                                                                             ( _, True ) ->
-                                                                                [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (TabMsg (SheetWrite sheet.select.a))), S.width "100%" ] [] ]
+                                                                                [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (TabMsg (SheetWrite sheet.select.a))), S.width "100%", S.minWidthRem 8 ] [] ]
 
                                                                             ( 0, _ ) ->
-                                                                                [ text col.name
-                                                                                , H.span [ S.opacity "0.6" ] [ text ":text" ]
-                                                                                ]
+                                                                                case col.name of
+                                                                                    "" ->
+                                                                                        []
+
+                                                                                    _ ->
+                                                                                        [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap ]
+                                                                                            [ text col.name
+                                                                                            , H.span [ S.opacity "0.6" ] [ text (":" ++ String.toLower (Debug.toString col.typ)) ]
+                                                                                            ]
+                                                                                        ]
 
                                                                             _ ->
                                                                                 [ row
@@ -1053,27 +1101,10 @@ view ({ sheet } as model) =
                                                                                                     D.map (\c -> H.input [ A.type_ "checkbox", A.checked c ] []) D.bool
 
                                                                                                 Number ->
-                                                                                                    D.map (H.span [ S.textAlignRight ] << List.singleton << text) string
+                                                                                                    D.map text string
 
                                                                                                 Delete ->
-                                                                                                    D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "╳" ])
-
-                                                                                                ColQuery query ->
-                                                                                                    case query.lang of
-                                                                                                        Prql ->
-                                                                                                            D.succeed (text "TODO: prql")
-
-                                                                                                        Sql ->
-                                                                                                            D.succeed (text "TODO: sql")
-
-                                                                                                        Formula ->
-                                                                                                            D.succeed (text "TODO: formula")
-
-                                                                                                        Scrapscript ->
-                                                                                                            D.succeed (text "TODO: scrapscript")
-
-                                                                                                        Python ->
-                                                                                                            D.succeed (text "TODO: python")
+                                                                                                    D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])
 
                                                                                                 Form form ->
                                                                                                     D.map3
