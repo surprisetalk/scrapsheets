@@ -1128,6 +1128,11 @@ view ({ sheet } as model) =
 
                                         -- TODO:
                                         , case sheet.doc of
+                                            Ok Library ->
+                                                [ H.tr [] [ H.th [] [ text "+" ], H.td [ A.onClick DocNewQuery, A.colspan 5, S.textAlignLeft ] [ text "table:..." ] ]
+                                                , H.tr [] [ H.th [] [ text "+" ], H.td [ A.onClick DocNewQuery, A.colspan 5, S.textAlignLeft ] [ text "query:..." ] ]
+                                                ]
+
                                             Ok (Tab _) ->
                                                 [ H.tr [] <|
                                                     (::) (H.th [] [ text "+" ]) <|
@@ -1143,6 +1148,18 @@ view ({ sheet } as model) =
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.maxWidth "30vw", S.maxHeight "100vh", S.overflowHidden, S.overflowYAuto ] <|
                 case sheet.doc of
+                    Ok (Tab _) ->
+                        -- TODO: Conversational AI interface.
+                        [ H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 1, S.marginBottomRem 1.5, S.opacity "0.8" ]
+                            [ H.p [ S.textAlignRight ] [ text "Vivamus dapibus porttitor eros, et semper mi ultricies sit amet." ]
+                            , H.p [] [ text "Fusce euismod neque et elit vulputate commodo. Donec tempor eu justo vitae porttitor. Integer eget sem faucibus, ullamcorper turpis a, pretium enim." ]
+                            , H.p [ S.textAlignRight ] [ text "Morbi nec metus pretium, laoreet tortor in, blandit ipsum." ]
+                            , H.p [] [ text "Interdum et malesuada fames ac ante ipsum primis in faucibus. Cras egestas est dolor, vel euismod urna convallis vitae. " ]
+                            ]
+                        , H.textarea [] []
+                        , H.button [] [ text "send (⌘⏎)" ]
+                        ]
+
                     Ok (Query query) ->
                         [ H.textarea [ A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75, S.minWidth "20vw" ]
                             [ text (String.trim query.code)
