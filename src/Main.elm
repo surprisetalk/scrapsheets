@@ -504,7 +504,8 @@ type Msg
     | DocNewTable
     | DocDelete Id
     | KeyPress String
-    | CellMouseClick String
+    | CellMouseClick
+    | CellMouseDoubleClick String
     | CellMouseDown
     | CellMouseUp
     | CellHover Index
@@ -640,7 +641,7 @@ update msg ({ sheet } as model) =
                             let
                                 id : String
                                 id =
-                                    model.library |> Dict.keys |> List.drop (y + 1) |> List.head |> Maybe.withDefault ""
+                                    model.library |> Dict.keys |> List.drop y |> List.head |> Maybe.withDefault ""
                             in
                             case Maybe.map .name (Array.get x libraryCols) of
                                 Just "name" ->
@@ -771,7 +772,7 @@ update msg ({ sheet } as model) =
             -- TODO:
             ( model, Cmd.none )
 
-        CellMouseClick write ->
+        CellMouseDoubleClick write ->
             let
                 a =
                     ( { model | sheet = { sheet | write = Just write } }
@@ -788,8 +789,11 @@ update msg ({ sheet } as model) =
                 _ ->
                     ( model, Cmd.none )
 
+        CellMouseClick ->
+            ( { model | sheet = { sheet | drag = False, select = Rect sheet.hover sheet.hover } }, Cmd.none )
+
         CellMouseDown ->
-            ( { model | sheet = { sheet | drag = True, select = Rect sheet.hover sheet.select.b } }, Cmd.none )
+            ( { model | sheet = { sheet | drag = True, select = Rect sheet.hover sheet.hover } }, Cmd.none )
 
         CellMouseUp ->
             ( { model | sheet = { sheet | drag = False, select = Rect sheet.select.a sheet.hover } }, Cmd.none )
@@ -912,7 +916,8 @@ view ({ sheet } as model) =
     { title = "scrapsheets"
     , body =
         [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
-        , H.node "style" [] [ text "body { font-family: monospace; }" ]
+        , H.node "style" [] [ text "body { font-family: monospace; height: 100vh; }" ]
+        , H.node "style" [] [ text "main > div { padding: 0 1rem; }" ]
         , H.node "style" [] [ text "tr th:first-child { opacity: 0.5; }" ]
         , H.node "style" [] [ text "th, td { padding: 0 0.25rem; font-weight: normal; }" ]
         , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
@@ -921,11 +926,12 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { td:hover { background: rgba(255,255,255,0.15); } }" ]
         , H.node "style" [] [ text ".selected { background: rgba(0,0,0,0.1); }" ]
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { .selected { background: rgba(255,255,255,0.1); } }" ]
-        , H.div [ S.displayFlex, S.flexDirectionRow, S.paddingRem 2, S.paddingTopRem 1, S.gapRem 2, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh" ]
-            [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%", S.maxHeight "100vh" ]
+        , H.node "style" [] [ text ".code { background: black; }" ]
+        , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { .code { background: white; } }" ]
+        , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%" ]
+            [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.paddingTopRem 1 ]
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.alignItemsBaseline ]
                     [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.gapRem 0.5, S.whiteSpaceNowrap ] <|
-                        -- Badges indicate scrapscript news, library notifs, etc.
                         List.concat
                             [ [ H.a [ A.href "/", S.fontWeightBold ] [ text "scrapsheets", H.sup [] [ text "" ] ]
                               ]
@@ -963,17 +969,20 @@ view ({ sheet } as model) =
                 -- All current filters should be rendered as text in the searchbar.
                 -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                 -- TODO: If no results found, show saved searches and recent searches.
-                , H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder (examples |> List.head |> Maybe.withDefault ""), S.width "100%" ] []
-                , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5, S.flexWrapWrap ] <| List.map (\x -> H.span [ A.onClick (InputChange SheetSearch x), S.textDecorationUnderline, S.opacity "0.5", S.fontSizeRem 0.6 ] [ text x ]) <| examples
-                , case model.error of
-                    "" ->
-                        text ""
+                , H.div [ S.displayFlex, S.flexDirectionColumn ]
+                    [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder (examples |> List.head |> Maybe.withDefault "") ] []
 
-                    error ->
-                        H.span [] [ H.button [ A.onClick (DocError "") ] [ text "╳" ], text " ", text error ]
+                    -- , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5, S.flexWrapWrap ] <| List.map (\x -> H.span [ A.onClick (InputChange SheetSearch x), S.textDecorationUnderline, S.opacity "0.5", S.fontSizeRem 0.6 ] [ text x ]) <| examples
+                    , case model.error of
+                        "" ->
+                            text ""
+
+                        error ->
+                            H.span [] [ H.button [ A.onClick (DocError "") ] [ text "╳" ], text " ", text error ]
+                    ]
 
                 -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
-                , H.div [ S.overflowAuto ]
+                , H.div [ S.overflowAuto, S.height "100%", S.backgroundColor "rgba(0,0,0,0.5)", S.paddingTopRem 1, S.paddingBottomRem 2 ]
                     [ case table of
                         Err err ->
                             H.p [] [ text err ]
@@ -987,7 +996,6 @@ view ({ sheet } as model) =
                                     --             -- TODO: Stats.
                                     --             (\i col -> H.th [ S.textAlignLeft, S.paddingBottomRem 1 ] [])
                                     --             (Array.toList cols)
-                                    -- ]
                                     []
                                 , H.tbody [] <|
                                     List.concat
@@ -1009,8 +1017,9 @@ view ({ sheet } as model) =
                                                             List.indexedMap
                                                                 (\i col ->
                                                                     H.td
-                                                                        [ A.onClick <|
-                                                                            CellMouseClick <|
+                                                                        [ A.onClick CellMouseClick
+                                                                        , A.onDoubleClick <|
+                                                                            CellMouseDoubleClick <|
                                                                                 case n of
                                                                                     0 ->
                                                                                         col.name ++ ":" ++ String.toLower (Debug.toString col.typ)
@@ -1067,7 +1076,7 @@ view ({ sheet } as model) =
                                                                     <|
                                                                         case ( n, sheet.write /= Nothing && sheet.select == rect i n i n ) of
                                                                             ( _, True ) ->
-                                                                                [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (TabMsg (SheetWrite sheet.select.a))), S.width "100%", S.minWidthRem 8 ] [] ]
+                                                                                [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (TabMsg (SheetWrite sheet.select.a))), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
 
                                                                             ( 0, _ ) ->
                                                                                 case col.name of
@@ -1077,7 +1086,8 @@ view ({ sheet } as model) =
                                                                                     _ ->
                                                                                         [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap ]
                                                                                             [ text col.name
-                                                                                            , H.span [ S.opacity "0.6" ] [ text (":" ++ String.toLower (Debug.toString col.typ)) ]
+
+                                                                                            -- , H.span [ S.opacity "0.5" ] [ text (":" ++ String.toLower (Debug.toString col.typ)) ]
                                                                                             ]
                                                                                         ]
 
@@ -1170,7 +1180,7 @@ view ({ sheet } as model) =
                                 ]
                     ]
                 ]
-            , H.aside [ S.displayFlex, S.flexDirectionColumn, S.maxWidth "30vw", S.maxHeight "100vh", S.overflowHidden, S.overflowYAuto ] <|
+            , H.aside [ S.displayFlex, S.flexDirectionColumn, S.maxWidth "33vw", S.maxHeight "100vh", S.height "100%", S.backgroundColor "black" ] <|
                 case sheet.doc of
                     Ok (Tab _) ->
                         -- -- TODO: Conversational AI interface.
@@ -1186,7 +1196,7 @@ view ({ sheet } as model) =
                         []
 
                     Ok (Query query) ->
-                        [ H.textarea [ A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75, S.minWidth "20vw" ]
+                        [ H.textarea [ A.id "code", A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75, S.minWidth "25vw", S.width "100%", S.border "none", S.backgroundColor "transparent", S.paddingRem 1 ]
                             [ text (String.trim query.code)
                             ]
                         ]
