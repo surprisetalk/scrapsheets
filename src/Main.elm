@@ -916,8 +916,7 @@ view ({ sheet } as model) =
     { title = "scrapsheets"
     , body =
         [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
-        , H.node "style" [] [ text "body { font-family: monospace; height: 100vh; }" ]
-        , H.node "style" [] [ text "main > div { padding: 0 1rem; }" ]
+        , H.node "style" [] [ text "body { font-family: monospace; height: 100vh; width: 100vw; }" ]
         , H.node "style" [] [ text "tr th:first-child { opacity: 0.5; }" ]
         , H.node "style" [] [ text "th, td { padding: 0 0.25rem; font-weight: normal; }" ]
         , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
@@ -928,10 +927,10 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { .selected { background: rgba(255,255,255,0.1); } }" ]
         , H.node "style" [] [ text ".code { background: black; }" ]
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { .code { background: white; } }" ]
-        , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%" ]
-            [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.paddingTopRem 1 ]
-                [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.alignItemsBaseline ]
-                    [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.gapRem 0.5, S.whiteSpaceNowrap ] <|
+        , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
+            [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
+                [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0 ]
+                    [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.whiteSpaceNowrap, S.gapRem 0.5, S.padding "0.5rem 1rem" ] <|
                         List.concat
                             [ [ H.a [ A.href "/", S.fontWeightBold ] [ text "scrapsheets", H.sup [] [ text "" ] ]
                               ]
@@ -942,48 +941,46 @@ view ({ sheet } as model) =
                                 [ text "/"
                                 , H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ]
                                 ]
-                            , [ H.span [] [ text "/" ]
-                              , H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.gapRem 0.5, S.opacity "0.8", S.fontSizeRem 0.7 ] <|
-                                    List.concat
-                                        [ List.map (\tag -> H.a [ A.href ("/?q=tag:" ++ tag) ] [ text ("#" ++ tag) ]) info.tags
-                                        , List.map (\id -> H.a [ A.href ("/" ++ id) ] [ text ("$" ++ id) ]) [ "backlink" ]
-                                        , List.map (\id -> H.a [ A.href ("/?following=" ++ id) ] [ text ("@" ++ id) ]) [ "anon" ]
-                                        ]
-                              ]
                             ]
-                    , H.div [ S.displayFlex, S.flexDirectionRowReverse, S.alignItemsBaseline, S.gapRem 0.5 ] <|
-                        List.concat
-                            [ case sheet.doc of
-                                Ok Library ->
-                                    [ H.button [ A.onClick DocNewQuery ] [ text "new query" ]
-                                    , H.button [ A.onClick DocNewTable ] [ text "new table" ]
-                                    ]
 
-                                _ ->
-                                    [ H.button [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "⌘C new column" ]
-                                    ]
-                            , List.map (\tag -> H.button [] [ text "⌘F find" ]) [ () ]
-                            ]
+                    -- All current filters should be rendered as text in the searchbar.
+                    -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
+                    -- TODO: If no results found, show saved searches and recent searches.
+                    , H.div [ S.displayFlex, S.width "100%", S.height "100%" ]
+                        [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder (examples |> List.head |> Maybe.withDefault "e.g. search"), S.width "100%", S.border "none", S.backgroundColor "rgba(0,0,0,0.25)", S.paddingLeftRem 1 ] []
+                        ]
                     ]
 
-                -- All current filters should be rendered as text in the searchbar.
-                -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
-                -- TODO: If no results found, show saved searches and recent searches.
-                , H.div [ S.displayFlex, S.flexDirectionColumn ]
-                    [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder (examples |> List.head |> Maybe.withDefault "") ] []
-
-                    -- , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0.5, S.flexWrapWrap ] <| List.map (\x -> H.span [ A.onClick (InputChange SheetSearch x), S.textDecorationUnderline, S.opacity "0.5", S.fontSizeRem 0.6 ] [ text x ]) <| examples
-                    , case model.error of
+                -- , H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.padding "0.5rem 1rem", S.backgroundColor "rgba(0,0,0,0.5)" ] <|
+                --     [ H.div [ S.displayFlex, S.alignItemsBaseline, S.gapRem 1, S.opacity "0.5" ] <|
+                --         List.concat
+                --             [ List.map (\x -> H.span [ A.onClick (InputChange SheetSearch x), S.textDecorationUnderline, S.opacity "0.5", S.fontSizeRem 0.6 ] [ text x ]) <| examples
+                --             , List.map (\tag -> H.a [ A.href ("/?q=tag:" ++ tag) ] [ text ("#" ++ tag) ]) info.tags
+                --             , List.map (\id -> H.a [ A.href ("/" ++ id) ] [ text ("$" ++ id) ]) [ "backlink" ]
+                --             , List.map (\id -> H.a [ A.href ("/?following=" ++ id) ] [ text ("@" ++ id) ]) [ "anon" ]
+                --             ]
+                --     , H.div [ S.displayFlex, S.alignItemsBaseline, S.flexDirectionRowReverse, S.gapRem 1, S.opacity "0.5" ] <|
+                --         List.concat
+                --             [ case sheet.doc of
+                --                 Ok Library ->
+                --                     [ H.span [ A.onClick DocNewQuery ] [ text "new query" ]
+                --                     , H.span [ A.onClick DocNewTable ] [ text "new table" ]
+                --                     ]
+                --                 _ ->
+                --                     [ H.span [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "⌘C new column" ]
+                --                     ]
+                --             , List.map (\tag -> H.span [] [ text "⌘F find" ]) [ () ]
+                --             ]
+                --     ]
+                -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
+                , H.div [ S.overflowAuto, S.height "100%", S.backgroundColor "rgba(0,0,0,0.5)", S.paddingRem 1, S.paddingTopRem 1.5, S.paddingBottomRem 2 ]
+                    [ case model.error of
                         "" ->
                             text ""
 
                         error ->
                             H.span [] [ H.button [ A.onClick (DocError "") ] [ text "╳" ], text " ", text error ]
-                    ]
-
-                -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
-                , H.div [ S.overflowAuto, S.height "100%", S.backgroundColor "rgba(0,0,0,0.5)", S.paddingTopRem 1, S.paddingBottomRem 2 ]
-                    [ case table of
+                    , case table of
                         Err err ->
                             H.p [] [ text err ]
 
