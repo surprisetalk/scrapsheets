@@ -296,7 +296,8 @@ type
     -- | Plot
     -- | Map
     -- | Link
-    = Text
+    = Unknown
+    | Text
     | Number
     | Boolean
     | Many Type
@@ -422,11 +423,7 @@ colDecoder =
         [ D.map3 Col
             (D.field "key" string)
             (D.field "name" D.string)
-            (D.field "type"
-                (D.string
-                    |> D.map (flip Dict.get types >> Maybe.withDefault Text)
-                )
-            )
+            (D.field "type" (D.nullable D.string |> D.map (Maybe.andThen (flip Dict.get types) >> Maybe.withDefault Unknown)))
         , D.succeed (Col "" "" Text)
         ]
 
@@ -918,8 +915,8 @@ view ({ sheet } as model) =
         [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
         , H.node "style" [] [ text "body { font-family: monospace; height: 100vh; width: 100vw; }" ]
         , H.node "style" [] [ text "tr th:first-child { opacity: 0.5; }" ]
-        , H.node "style" [] [ text "th, td { padding: 0 0.25rem; font-weight: normal; }" ]
-        , H.node "style" [] [ text "td { border: 1px solid black; height: 1rem; }" ]
+        , H.node "style" [] [ text "th, td { padding: 0 0.25rem; font-weight: normal; border: 1px solid black; height: 1rem; }" ]
+        , H.node "style" [] [ text "th > *, td > * { max-height: 6rem; }" ]
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { td { background: rgba(255,255,255,0.05); } }" ]
         , H.node "style" [] [ text "td:hover { background: rgba(0,0,0,0.15); }" ]
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { td:hover { background: rgba(255,255,255,0.15); } }" ]
@@ -929,7 +926,7 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { .code { background: white; } }" ]
         , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
-                [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0 ]
+                [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0, S.borderBottom "1px solid rgba(0,0,0,0.5)" ]
                     [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.whiteSpaceNowrap, S.gapRem 0.5, S.padding "0.5rem 1rem" ] <|
                         List.concat
                             [ [ H.a [ A.href "/", S.fontWeightBold ] [ text "scrapsheets", H.sup [] [ text "" ] ]
@@ -947,7 +944,7 @@ view ({ sheet } as model) =
                     -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                     -- TODO: If no results found, show saved searches and recent searches.
                     , H.div [ S.displayFlex, S.width "100%", S.height "100%" ]
-                        [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder (examples |> List.head |> Maybe.withDefault "search"), S.width "100%", S.border "none", S.backgroundColor "rgba(0,0,0,0.25)", S.paddingLeftRem 1 ] []
+                        [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder "search", S.width "100%", S.border "none", S.backgroundColor "rgba(0,0,0,0.25)", S.paddingLeftRem 1 ] []
                         ]
                     ]
 
@@ -973,7 +970,7 @@ view ({ sheet } as model) =
                 --             ]
                 --     ]
                 -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
-                , H.div [ S.overflowAuto, S.height "100%", S.backgroundColor "rgba(0,0,0,0.5)", S.paddingRem 1, S.paddingTopRem 1.5, S.paddingBottomRem 2 ]
+                , H.div [ S.overflowAuto, S.height "100%", S.backgroundColor "rgba(0,0,0,0.5)" ]
                     [ case model.error of
                         "" ->
                             text ""
@@ -1095,6 +1092,25 @@ view ({ sheet } as model) =
                                                                                     |> D.decodeValue
                                                                                         (D.maybe
                                                                                             (case col.typ of
+                                                                                                Unknown ->
+                                                                                                    D.oneOf
+                                                                                                        [ D.field "type" D.string
+                                                                                                            |> D.andThen
+                                                                                                                (\typ ->
+                                                                                                                    D.field "data" <|
+                                                                                                                        case typ of
+                                                                                                                            "link" ->
+                                                                                                                                D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text href ])
+
+                                                                                                                            "image" ->
+                                                                                                                                D.string |> D.map (\src -> H.img [ A.src src ] [])
+
+                                                                                                                            typ_ ->
+                                                                                                                                D.fail ("Unknown type:" ++ typ_)
+                                                                                                                )
+                                                                                                        , D.map text string
+                                                                                                        ]
+
                                                                                                 Link ->
                                                                                                     D.string |> D.map (\href -> H.a [ A.href ("/" ++ href), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text href ])
 
@@ -1179,6 +1195,18 @@ view ({ sheet } as model) =
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.maxWidth "33vw", S.maxHeight "100vh", S.height "100%", S.backgroundColor "black" ] <|
                 case sheet.doc of
+                    Ok Library ->
+                        [ H.div [ S.paddingRem 1, S.displayFlex, S.flexDirectionColumn, S.gapRem 1 ]
+                            [ H.ul [ S.whiteSpaceNowrap, S.lineHeightRem 1.75 ]
+                                -- TODO: [ H.li [] [ H.a [ A.href "#todo" ] [ text "my account" ] ]
+                                -- TODO: [ H.li [] [ H.a [ A.href "/table:tutorial" ] [ text "tutorial" ] ]
+                                [ H.li [] [ H.a [ A.href "/table:examples" ] [ text "examples" ] ]
+                                , H.li [] [ H.a [ A.href "", A.onClick DocNewTable ] [ text "new table" ] ]
+                                , H.li [] [ H.a [ A.href "", A.onClick DocNewQuery ] [ text "new query" ] ]
+                                ]
+                            ]
+                        ]
+
                     Ok (Tab _) ->
                         -- -- TODO: Conversational AI interface.
                         -- [ H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 1, S.marginBottomRem 1.5, S.opacity "0.8" ]
@@ -1193,7 +1221,7 @@ view ({ sheet } as model) =
                         []
 
                     Ok (Query query) ->
-                        [ H.textarea [ A.id "code", A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75, S.minWidth "25vw", S.width "100%", S.border "none", S.backgroundColor "transparent", S.paddingRem 1 ]
+                        [ H.textarea [ A.id "code", A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75, S.minWidth "25vw", S.width "100%", S.border "none", S.backgroundColor "transparent", S.paddingRem 1, S.lineHeightRem 1.5 ]
                             [ text (String.trim query.code)
                             ]
                         ]

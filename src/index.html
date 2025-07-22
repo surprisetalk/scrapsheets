@@ -61,7 +61,7 @@
           const [name, type] = val.split("::");
           return {
             name: name,
-            type: type ?? "string",
+            type: type ?? "text",
             key: key.toString(),
           };
         };
@@ -86,87 +86,97 @@
         const Library = {
           get: () => {
             const examples = {
-              "table:calculated-columns": Table(
-                [
-                  { key: 0, name: "a", type: "int" },
-                  { key: 1, name: "b", type: "int" },
-                  {
-                    key: 2,
-                    name: "c",
-                    type: { lang: "formula", code: "a + b" },
-                  },
-                ],
-                ...[
-                  [1, 2],
-                  [2, 4],
-                  [3, 6],
-                ],
-              ),
-              "table:postman": Table(
-                [
-                  { key: 0, name: "method", type: "text" },
-                  { key: 1, name: "url", type: "text" },
-                  { key: 2, name: "fields", type: "list field" },
-                  {
-                    key: 3,
-                    name: "form",
-                    type: {
-                      lang: "scrapscript",
-                      code: "form {method,url,fields}",
-                    },
-                  },
-                ],
-                ...[
-                  [
-                    "GET",
-                    "example.com/foo",
-                    [
-                      { label: "hello", type: "text" },
-                      { label: "world", type: "date" },
-                    ],
-                  ],
-                  [
-                    "POST",
-                    "example.com/bar",
-                    [
-                      {
-                        label: "my dropdown",
-                        key: "my_dropdown",
-                        type: { 1: "label a", 2: "label b" },
-                        default: 2,
-                      },
-                    ],
-                  ],
-                ],
-              ),
-              "table:nested": Table(
-                [
-                  { key: 0, name: "a", type: "list string" },
-                  { key: 1, name: "b", type: "dict string string" },
-                  { key: 1, name: "c", type: "dict string (list string)" },
-                ],
-                ...[
-                  [
-                    ["a", "b"],
-                    { c: "d", e: "f" },
-                    { g: ["h", "i"], j: ["k", "l", "m"] },
-                  ],
-                  [["n"], { o: "p" }, { q: [], r: ["s", "t"] }],
-                ],
-              ),
+              // "table:calculated-columns": Table(
+              //   [
+              //     { key: 0, name: "a", type: "int" },
+              //     { key: 1, name: "b", type: "int" },
+              //     {
+              //       key: 2,
+              //       name: "c",
+              //       type: { lang: "formula", code: "a + b" },
+              //     },
+              //   ],
+              //   ...[
+              //     [1, 2],
+              //     [2, 4],
+              //     [3, 6],
+              //   ],
+              // ),
+              // "table:postman": Table(
+              //   [
+              //     { key: 0, name: "method", type: "text" },
+              //     { key: 1, name: "url", type: "text" },
+              //     { key: 2, name: "fields", type: "list field" },
+              //     {
+              //       key: 3,
+              //       name: "form",
+              //       type: {
+              //         lang: "scrapscript",
+              //         code: "form {method,url,fields}",
+              //       },
+              //     },
+              //   ],
+              //   ...[
+              //     [
+              //       "GET",
+              //       "example.com/foo",
+              //       [
+              //         { label: "hello", type: "text" },
+              //         { label: "world", type: "date" },
+              //       ],
+              //     ],
+              //     [
+              //       "POST",
+              //       "example.com/bar",
+              //       [
+              //         {
+              //           label: "my dropdown",
+              //           key: "my_dropdown",
+              //           type: { 1: "label a", 2: "label b" },
+              //           default: 2,
+              //         },
+              //       ],
+              //     ],
+              //   ],
+              // ),
+              // "table:nested": Table(
+              //   [
+              //     { key: 0, name: "a", type: "list text" },
+              //     { key: 1, name: "b", type: "dict text text" },
+              //     { key: 1, name: "c", type: "dict text (list text)" },
+              //   ],
+              //   ...[
+              //     [
+              //       ["a", "b"],
+              //       { c: "d", e: "f" },
+              //       { g: ["h", "i"], j: ["k", "l", "m"] },
+              //     ],
+              //     [["n"], { o: "p" }, { q: [], r: ["s", "t"] }],
+              //   ],
+              // ),
               "query:http-get": QuerySql(
-                "select * from http('https://taylor.town/random')",
+                "select http('https://taylor.town/random')->res as random_number",
               ),
-              "query:python": QuerySql(
-                "return [[{'name':'a','type':'text','key':'a'}], {'a':1}, {'a':2}, {'a':3}]",
-              ),
-              "query:stonks": QuerySql(
-                "select stonks->>'id', stonks->>'price' from http('https://taylor.town/stonks'), json(res) stonks",
-              ),
+              // "query:python": QuerySql(
+              //   "return [[{'name':'a','type':'text','key':'a'}], {'a':1}, {'a':2}, {'a':3}]",
+              // ),
+              // "query:stonks": QuerySql(
+              //   "select stonks->>'id', stonks->>'price' from http('https://taylor.town/stonks'), json(res) stonks",
+              // ),
               // TODO: Move these to the shop.
               ...{
                 "query:bluesky-actors": QuerySql(
-                  "select * from @(http('https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors', @{q:coalesce(@params->(''),'taylor.town')})->res->actors)",
+                  "" +
+                    "search actors/ as @a return (" +
+                    "\n  image(@a->avatar) as avatar," +
+                    "\n  link('http://bsky.app/profile/'||(@a->did)) as did," +
+                    "\n  @a->handle as handle," +
+                    "\n  @a->displayName as displayName" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors'," +
+                    "\n  @{q:(coalesce(@params->(''),'example'))}" +
+                    "\n)",
                   "taylor.town",
                   "memes",
                 ),
@@ -250,7 +260,7 @@
                   "select * from @(http('https://api.coingecko.com/api/v3/coins/markets', @{vs_currency:'usd', `order`:'market_cap_desc', per_page:100})->res)",
                 ),
                 "query:crypto-search": QuerySql(
-                  "select thumb::img as thumb, symbol, name, market_cap_rank from @(http('https://api.coingecko.com/api/v3/search', @{`query`:(@params->(''))})->res->coins)",
+                  "select thumb::image as thumb, symbol, name, market_cap_rank from @(http('https://api.coingecko.com/api/v3/search', @{`query`:(@params->(''))})->res->coins)",
                   "bitcoin",
                   "ethereum",
                   "doge",
@@ -329,6 +339,7 @@
               // "portal:shop": { name: "shop" },
               "table:tutorial": {
                 name: "tutorial",
+                hidden: true,
                 doc: Table(
                   ["text::text", "examples::text"].map(Col),
                   ["chapter 1", []],
@@ -336,38 +347,9 @@
                   ["chapter 3", []],
                 ),
               },
-              "table:roadmap": {
-                // TODO: Query this from scrapsheets github.
-                name: "roadmap",
-                doc: Table(
-                  ["-::bool", "task::text"].map(Col),
-                  [true, "fix scratch queries"],
-                  [true, "search args"],
-                  [true, "search arg examples"],
-                  [true, "nicer errors"],
-                  [true, "fix select * from"],
-                  [true, "move name/tags edit to library page"],
-                  [true, "tons of examples"],
-                  [true, "get rid of scratch and template"],
-                  [true, "save new row ui"],
-                  [true, "sidebar"],
-                  [true, "table column types and stats"],
-                  [false, "msg survey/cleanup"],
-                  [false, "improve column types"],
-                  [false, "crude styling"],
-                  [false, "fix code todos"],
-                  [false, "deploy"],
-                  [false, "demo"],
-                  [false, "beautiful stat filter columns"],
-                  [false, "query save/publish"],
-                  [false, "run query button; no query debounce?"],
-                  [false, "column sorting (update search bar)"],
-                  [false, "make editable cells more obvious"],
-                  [false, "keyboard shortcuts"],
-                ),
-              },
               "table:examples": {
                 name: "examples",
+                hidden: true,
                 doc: Table(
                   ["sheet_id::link", "name::text"].map(Col),
                   ...Object.entries(examples).map(([k, v]) => [
@@ -419,6 +401,8 @@
           let sheet;
 
           alasql.options.modifier = "RECORDSET";
+          for (const type of ["image", "link"])
+            alasql.fn[type] = data => ({ type, data });
           alasql.from.SHEET = (id, params = {}) => {
             // TODO: Grab sheet (e.g. portal) with given params.
             throw new Error("TODO");
@@ -476,24 +460,26 @@
                 )?.(request.responseText) || null,
             };
           };
+          alasql.from.HTTP = (url, qs = {}) => {
+            const { status, res } = alasql.fn.http(url, qs);
+            if (status >= 400) throw new Error("Something went wrong.");
+            return res;
+          };
           const queryDoc = debounce(
             catchy(async (id, { code, lang, args }) => {
               switch (lang) {
                 case "sql":
                   // TODO: Run alasql if possible, otherwise post to /query.
-                  const params =
-                    new URLSearchParams(window.location.search)
-                      .get("q")
-                      ?.split(/\s+(?=\w+=)/)
-                      .reduce(
-                        (r, p) => {
-                          const [k, v] = p.includes("=")
-                            ? p.split("=")
-                            : ["", p];
-                          return ((r[k] ||= []).push(v), r);
-                        },
-                        { "": [].join(" ") },
-                      ) ?? {};
+                  const params = new URLSearchParams(window.location.search)
+                    .get("q")
+                    ?.split(/\s+(?=\w+=)/)
+                    .reduce(
+                      (r, p) => {
+                        const [k, v] = p.includes("=") ? p.split("=") : ["", p];
+                        return ((r[k] ||= []).push(v), r);
+                      },
+                      { "": [].join(" ") },
+                    ) ?? { "": null };
                   const [, { columns: cols, data: rows } = {}] = await alasql([
                     [`set @params = ?`, [params]],
                     code,
@@ -504,7 +490,7 @@
                       cols.map(col => ({
                         name: col.columnid,
                         key: col.columnid,
-                        type: "text",
+                        type: null,
                       })),
                       ...rows,
                     ],
