@@ -891,7 +891,7 @@ view ({ sheet } as model) =
                                 -- TODO: Kludge! We shouldn't omit all examples.
                                 |> Dict.filter (\k v -> k /= "" && not v.hidden)
                                 |> Dict.toList
-                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "del", E.string k ) ])
+                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "delete", E.string k ) ])
                                 |> Array.fromList
                         }
 
@@ -947,7 +947,7 @@ view ({ sheet } as model) =
                     -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                     -- TODO: If no results found, show saved searches and recent searches.
                     , H.div [ S.displayFlex, S.width "100%", S.height "100%" ]
-                        [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder (examples |> List.head |> Maybe.withDefault "e.g. search"), S.width "100%", S.border "none", S.backgroundColor "rgba(0,0,0,0.25)", S.paddingLeftRem 1 ] []
+                        [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder (examples |> List.head |> Maybe.withDefault "search"), S.width "100%", S.border "none", S.backgroundColor "rgba(0,0,0,0.25)", S.paddingLeftRem 1 ] []
                         ]
                     ]
 
