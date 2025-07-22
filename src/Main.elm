@@ -302,6 +302,7 @@ type
     | Boolean
     | Many Type
     | Link
+    | SheetId
     | Json
     | Timestamp
     | Image
@@ -410,6 +411,7 @@ colDecoder =
                 [ ( "bool", Boolean )
                 , ( "number", Number )
                 , ( "num", Number )
+                , ( "sheet_id", SheetId )
                 , ( "link", Link )
                 , ( "image", Image )
                 , ( "form", Form Dict.empty )
@@ -856,7 +858,7 @@ update msg ({ sheet } as model) =
 libraryCols : Array Col
 libraryCols =
     Array.fromList
-        [ Col "sheet_id" "sheet_id" Link
+        [ Col "sheet_id" "sheet_id" SheetId
         , Col "name" "name" Text
         , Col "tags" "tags" (Many Text)
         , Col "delete" "" Delete
@@ -1111,8 +1113,11 @@ view ({ sheet } as model) =
                                                                                                         , D.map text string
                                                                                                         ]
 
+                                                                                                SheetId ->
+                                                                                                    D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text id ])
+
                                                                                                 Link ->
-                                                                                                    D.string |> D.map (\href -> H.a [ A.href ("/" ++ href), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text href ])
+                                                                                                    D.string |> D.map (\href -> H.a [ A.href href, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text href ])
 
                                                                                                 Image ->
                                                                                                     D.string |> D.map (\src -> H.img [ A.src src, S.width "100%", S.objectFitCover ] [])

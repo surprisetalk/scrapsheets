@@ -351,7 +351,7 @@
                 name: "examples",
                 hidden: true,
                 doc: Table(
-                  ["sheet_id::link", "name::text"].map(Col),
+                  ["sheet_id::sheet_id", "name::text"].map(Col),
                   ...Object.entries(examples).map(([k, v]) => [
                     k,
                     k.split(":").pop(),
