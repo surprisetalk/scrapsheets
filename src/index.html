@@ -181,7 +181,20 @@
                   "memes",
                 ),
                 "query:github-repos": QuerySql(
-                  "select full_name, description, stargazers_count, language, open_issues_count, license from @(http('https://api.github.com/search/repositories', @{q:coalesce(@params->(''),'surprisetalk')})->res->items)",
+                  "" +
+                    "search items/ as @x return (" +
+                    "\n  link('http://github.com/'||(@x->full_name)) as repo," +
+                    "\n  @x->full_name as name," +
+                    "\n  @x->description as description," +
+                    "\n  @x->language as lang," +
+                    "\n  @x->license->key as license," +
+                    "\n  (@x->stargazers_count)::int as stargazers," +
+                    "\n  (@x->open_issues_count)::int as open_issues" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://api.github.com/search/repositories'," +
+                    "\n  @{q:(coalesce(@params->(''),'example'))}" +
+                    "\n)",
                   "scrapscript sort=stars",
                   "surprisetalk sort=updated",
                   "jquery in:name,description",
@@ -204,7 +217,17 @@
                   "is:sponsorable",
                 ),
                 "query:github-users": QuerySql(
-                  "select * from @(http('https://api.github.com/search/users', @{q:(@params->(''))})->res->items)",
+                  "" +
+                    "search items/ as @x return (" +
+                    "\n  image(@x->avatar_url) as avatar," +
+                    "\n  link(@x->url) as url," +
+                    "\n  @x->login as handle," +
+                    "\n  @x->type as type" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://api.github.com/search/users'," +
+                    "\n  @{q:(coalesce(@params->(''),'example'))}" +
+                    "\n)",
                   "surprisetalk sort=followers",
                   "foo sort=joined",
                   "mike in:name created:<2011-01-01 type:user",

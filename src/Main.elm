@@ -411,6 +411,7 @@ colDecoder =
                 [ ( "bool", Boolean )
                 , ( "number", Number )
                 , ( "num", Number )
+                , ( "int", Number )
                 , ( "sheet_id", SheetId )
                 , ( "link", Link )
                 , ( "image", Image )
@@ -1102,7 +1103,7 @@ view ({ sheet } as model) =
                                                                                                                     D.field "data" <|
                                                                                                                         case typ of
                                                                                                                             "link" ->
-                                                                                                                                D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text href ])
+                                                                                                                                D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayBlock, S.wordBreakKeepAll, S.hyphensNone, S.maxWidthRem 18 ] [ text href ])
 
                                                                                                                             "image" ->
                                                                                                                                 D.string |> D.map (\src -> H.img [ A.src src ] [])
