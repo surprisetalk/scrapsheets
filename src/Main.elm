@@ -1209,6 +1209,9 @@ view ({ sheet } as model) =
                                 [ H.li [] [ H.a [ A.href "/table:examples" ] [ text "examples" ] ]
                                 , H.li [] [ H.a [ A.href "", A.onClick DocNewTable ] [ text "new table" ] ]
                                 , H.li [] [ H.a [ A.href "", A.onClick DocNewQuery ] [ text "new query" ] ]
+
+                                -- TODO: github
+                                -- TODO: support/contact email
                                 ]
                             ]
                         ]
