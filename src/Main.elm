@@ -1154,7 +1154,20 @@ view ({ sheet } as model) =
                                                                 , S.widthRem 0.001
                                                                 , S.whiteSpaceNowrap
                                                                 ]
-                                                                [ text (iif (n <= 0) "" (String.fromInt n)) ]
+                                                                [ text <|
+                                                                    case String.fromInt n of
+                                                                        "-2" ->
+                                                                            ""
+
+                                                                        "-1" ->
+                                                                            ""
+
+                                                                        "0" ->
+                                                                            "+"
+
+                                                                        x ->
+                                                                            x
+                                                                ]
                                                             )
                                                         <|
                                                             List.indexedMap
