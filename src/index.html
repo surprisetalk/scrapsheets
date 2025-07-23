@@ -490,6 +490,7 @@
           };
           const queryDoc = debounce(
             catchy(async (id, { code, lang, args }) => {
+              console.log(id, code, lang, args);
               switch (lang) {
                 case "sql":
                   // TODO: Run alasql if possible, otherwise post to /query.
@@ -566,6 +567,7 @@
 
           app.ports.changeDoc.subscribe(
             catchy(async ({ id, data: patches }) => {
+              const [type, doc_id] = id.split(":");
               {
                 const doc = Library.get()[id]?.doc;
                 if (doc) {
@@ -595,7 +597,6 @@
                   return;
                 }
               }
-              const [type, doc_id] = id.split(":");
               sheet?.change(d => {
                 for (const { path, action, value } of patches)
                   switch (path.length) {
