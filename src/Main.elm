@@ -920,7 +920,7 @@ view ({ sheet } as model) =
     { title = "scrapsheets"
     , body =
         [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
-        , H.node "style" [] [ text "body { font-family: monospace; height: 100vh; width: 100vw; }" ]
+        , H.node "style" [] [ text "body { font-family: \"Source Code Pro\", monospace; font-optical-sizing: auto; height: 100vh; width: 100vw; }" ]
         , H.node "style" [] [ text "tr th:first-child { opacity: 0.5; }" ]
         , H.node "style" [] [ text "th, td { padding: 0 0.25rem; font-weight: normal; border: 1px solid black; height: 1rem; }" ]
         , H.node "style" [] [ text "th > *, td > * { max-height: 6rem; }" ]
