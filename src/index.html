@@ -352,7 +352,7 @@
               ...Object.fromEntries(
                 Object.entries(examples).map(([k, v]) => [
                   k,
-                  { name: k.split(":").pop(), hidden: true, doc: v },
+                  { name: k.split(":").pop(), scratch: true, doc: v },
                 ]),
               ),
               ...JSON.parse(
@@ -362,7 +362,7 @@
               // "portal:shop": { name: "shop" },
               "table:tutorial": {
                 name: "tutorial",
-                hidden: true,
+                scratch: true,
                 doc: Table(
                   ["text::text", "examples::text"].map(Col),
                   ["chapter 1", []],
@@ -372,7 +372,7 @@
               },
               "table:examples": {
                 name: "examples",
-                hidden: true,
+                scratch: true,
                 doc: Table(
                   ["sheet_id::sheet_id", "name::text"].map(Col),
                   ...Object.entries(examples).map(([k, v]) => [
@@ -566,8 +566,36 @@
 
           app.ports.changeDoc.subscribe(
             catchy(async ({ id, data: patches }) => {
+              {
+                const doc = Library.get()[id]?.doc;
+                if (doc) {
+                  const d = { ...doc };
+                  for (const { path, action, value } of patches)
+                    switch (path.length) {
+                      case 2: {
+                        const [y, x] = path;
+                        if (!d.data[y]) d.data[y] = {};
+                        if (action === "set") d.data[y][x] = value;
+                        else d.data[y][x][action](...value);
+                        break;
+                      }
+                      default:
+                        throw new Error("TODO: path");
+                    }
+                  app.ports.docChanged.send({
+                    id,
+                    data: {
+                      doc: d,
+                      handle: null,
+                      patchInfo: null,
+                      patches: [],
+                    },
+                  });
+                  if (type === "query") queryDoc(id, d.data[0]);
+                  return;
+                }
+              }
               const [type, doc_id] = id.split(":");
-              if (!doc_id || doc_id !== sheet?.documentId) return;
               sheet?.change(d => {
                 for (const { path, action, value } of patches)
                   switch (path.length) {

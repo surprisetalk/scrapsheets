@@ -166,7 +166,7 @@ type alias Model =
 type alias SheetInfo =
     { name : String
     , tags : List String
-    , hidden : Bool
+    , scratch : Bool
     , thumb : Svg
     , peers : Peers
     }
@@ -580,7 +580,7 @@ update msg ({ sheet } as model) =
                                 (D.map5 SheetInfo
                                     (D.oneOf [ D.field "name" D.string, D.succeed "" ])
                                     (D.oneOf [ D.field "tags" (D.list D.string), D.succeed [] ])
-                                    (D.oneOf [ D.field "hidden" D.bool, D.succeed False ])
+                                    (D.oneOf [ D.field "scratch" D.bool, D.succeed False ])
                                     (D.succeed ())
                                     (D.succeed Public)
                                 )
@@ -874,7 +874,7 @@ view ({ sheet } as model) =
         info =
             model.library
                 |> Dict.get sheet.id
-                |> Maybe.withDefault { name = "", tags = [], hidden = False, thumb = (), peers = Public }
+                |> Maybe.withDefault { name = "", tags = [], scratch = False, thumb = (), peers = Public }
 
         table : Result String Table
         table =
@@ -889,7 +889,7 @@ view ({ sheet } as model) =
                         , rows =
                             model.library
                                 -- TODO: Kludge! We shouldn't omit all examples.
-                                |> Dict.filter (\k v -> k /= "" && not v.hidden)
+                                |> Dict.filter (\k v -> k /= "" && not v.scratch)
                                 |> Dict.toList
                                 |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "delete", E.string k ) ])
                                 |> Array.fromList
