@@ -249,13 +249,41 @@
                   "followers:>=1000",
                   "is:sponsorable",
                 ),
-                "query:github-commits": QuerySql(
-                  "select * from @(http('https://api.github.com/search/commits', @{q:(@params->(''))})->res->items)",
-                  "repo:tekknolagi/scrapscript",
-                  "surprisetalk",
-                ),
+                // "query:github-commits": QuerySql(
+                //   "select * from @(http('https://api.github.com/search/commits', @{q:(@params->(''))})->res->items)",
+                //   "repo:tekknolagi/scrapscript",
+                //   "surprisetalk",
+                // ),
                 "query:github-prs-issues": QuerySql(
-                  "select * from @(http('https://api.github.com/search/issues', @{q:(@params->(''))})->res->items)",
+                  "" +
+                    "search items/ as @x labels/ as @label return (" +
+                    "\n  @x->id as id," +
+                    "\n  @x->number as number," +
+                    "\n  @x->title as title," +
+                    "\n  link(@x->html_url) as url," +
+                    "\n  image(@x->user->avatar_url) as avatar," +
+                    "\n  @x->user->login as login," +
+                    "\n  @label->name as labels," +
+                    "\n  @x->state as state," +
+                    "\n  @x->locked as locked," +
+                    "\n  image(@x->assignee->avatar_url) as assignee_avatar," +
+                    "\n  @x->assignee->login as assignee_login," +
+                    "\n  @x->milestone as milestone," +
+                    "\n  @x->comments as comments," +
+                    "\n  @x->created_at as created_at," +
+                    "\n  @x->updated_at as updated_at," +
+                    "\n  @x->closed_at as closed_at," +
+                    "\n  @x->author_association as author_association," +
+                    "\n  @x->type as type," +
+                    "\n  @x->draft as draft," +
+                    "\n  @x->pull_request->html_url as html_url," +
+                    "\n  @x->body as body," +
+                    "\n  @x->reactions->total_count as reactions" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://api.github.com/search/issues'," +
+                    "\n  @{q:(coalesce(@params->(''),'example'))}" +
+                    "\n)",
                   "repo:tekknolagi/scrapscript",
                   "user:surprisetalk",
                   "author:surprisetalk",
