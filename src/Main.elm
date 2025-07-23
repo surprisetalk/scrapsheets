@@ -194,8 +194,25 @@ type alias Svg =
     ()
 
 
-type alias Stat =
-    ()
+type Stat
+    = Numeric
+        { histogram : Dict String Int
+        , count : Int
+        , sum : Float
+        , min : Maybe Float
+        , max : Maybe Float
+        }
+    | Enumerative
+        { histogram : Dict String Int
+        }
+    | Descriptive
+        { lengths : Dict Int Int
+        , keywords : Dict String Int
+        , count : Int
+        , sum : Int
+        , min : Maybe Int
+        , max : Int
+        }
 
 
 type Doc
@@ -918,6 +935,78 @@ view ({ sheet } as model) =
                 |> Dict.get sheet.id
                 |> Maybe.withDefault { name = "", tags = [], scratch = False, thumb = (), peers = Public }
 
+        stats : Result String (Array Stat)
+        stats =
+            case sheet.doc of
+                Ok (Tab tbl) ->
+                    Ok <|
+                        Array.map
+                            (\col ->
+                                case col.typ of
+                                    Number ->
+                                        tbl.rows
+                                            |> Array.foldl
+                                                (\row stat ->
+                                                    row
+                                                        |> Dict.get col.key
+                                                        |> Maybe.andThen (D.decodeValue number >> Result.toMaybe)
+                                                        |> Maybe.map
+                                                            (\n ->
+                                                                { histogram = stat.histogram |> Dict.update (String.fromFloat n) (Maybe.withDefault 0 >> (+) 1 >> Just)
+                                                                , count = stat.count + 1
+                                                                , sum = stat.sum + n
+                                                                , min = stat.min |> Maybe.withDefault n |> min n |> Just
+                                                                , max = stat.max |> Maybe.withDefault n |> max n |> Just
+                                                                }
+                                                            )
+                                                        |> Maybe.withDefault stat
+                                                )
+                                                { histogram = Dict.empty
+                                                , count = 0
+                                                , sum = 0
+                                                , min = Nothing
+                                                , max = Nothing
+                                                }
+                                            |> Numeric
+
+                                    Text ->
+                                        tbl.rows
+                                            |> Array.foldl
+                                                (\row stat ->
+                                                    row
+                                                        |> Dict.get col.key
+                                                        |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
+                                                        |> Maybe.map
+                                                            (\s ->
+                                                                { lengths = stat.lengths |> Dict.update (String.length s) (Maybe.withDefault 0 >> (+) 1 >> Just)
+                                                                , keywords = s |> String.split " " |> List.foldl (\k -> Dict.update k (Maybe.withDefault 0 >> (+) 1 >> Just)) stat.keywords
+                                                                , count = stat.count + 1
+                                                                , sum = stat.sum + String.length s
+                                                                , min = min (String.length s) (Maybe.withDefault (String.length s) stat.min) |> Just
+                                                                , max = max (String.length s) stat.max
+                                                                }
+                                                            )
+                                                        |> Maybe.withDefault stat
+                                                )
+                                                { lengths = Dict.empty
+                                                , keywords = Dict.empty
+                                                , count = 0
+                                                , sum = 0
+                                                , min = Nothing
+                                                , max = 0
+                                                }
+                                            |> Descriptive
+
+                                    _ ->
+                                        Enumerative
+                                            { histogram = Dict.empty
+                                            }
+                            )
+                            tbl.cols
+
+                x ->
+                    Err "TODO: table stats"
+
         table : Result String Table
         table =
             case ( sheet.doc, sheet.table ) of
@@ -1049,7 +1138,7 @@ view ({ sheet } as model) =
                                                             n_ - 2
                                                     in
                                                     H.tr
-                                                        [ case ( String.fromInt n, sheet.stats ) of
+                                                        [ case ( String.fromInt n, stats ) of
                                                             ( "-2", Err _ ) ->
                                                                 S.displayNone
 
@@ -1136,8 +1225,41 @@ view ({ sheet } as model) =
                                                                                 [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (TabMsg (SheetWrite sheet.select.a))), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
 
                                                                             ( "-2", _ ) ->
-                                                                                -- TODO: stats
-                                                                                []
+                                                                                case Maybe.andThen (Array.get i) (Result.toMaybe stats) of
+                                                                                    Just (Numeric stat) ->
+                                                                                        [ H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gapRem 0, S.gridColumnGapRem 0.5, S.justifyContentFlexStart, S.opacity "0.5" ]
+                                                                                            [ H.span [] [ text "min" ]
+                                                                                            , H.span [] [ text (Maybe.withDefault "" (Maybe.map String.fromFloat stat.min)) ]
+                                                                                            , H.span [] [ text "max" ]
+                                                                                            , H.span [] [ text (Maybe.withDefault "" (Maybe.map String.fromFloat stat.max)) ]
+                                                                                            , H.span [] [ text "mean" ]
+                                                                                            , H.span [] [ text (iif (stat.count == 0) "" (String.fromInt (round (stat.sum / toFloat stat.count)))) ]
+                                                                                            , H.span [] [ text "count" ]
+                                                                                            , H.span [] [ text (String.fromInt stat.count) ]
+                                                                                            ]
+                                                                                        ]
+
+                                                                                    Just (Descriptive stat) ->
+                                                                                        [ H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gapRem 0, S.gridColumnGapRem 0.5, S.justifyContentFlexStart, S.opacity "0.5" ]
+                                                                                            [ H.span [] [ text "min" ]
+                                                                                            , H.span [] [ text (Maybe.withDefault "" (Maybe.map String.fromInt stat.min)) ]
+                                                                                            , H.span [] [ text "max" ]
+                                                                                            , H.span [] [ text (String.fromInt stat.max) ]
+                                                                                            , H.span [] [ text "mean" ]
+                                                                                            , H.span [] [ text (iif (stat.count == 0) "" (String.fromInt (stat.sum // stat.count))) ]
+                                                                                            , H.span [] [ text "count" ]
+                                                                                            , H.span [] [ text (String.fromInt stat.count) ]
+                                                                                            , H.span [] [ text "keywords" ]
+                                                                                            , H.span [] [ text (String.join " " (Dict.keys (Dict.filter (\k v -> String.length k >= 4 && v >= 2) stat.keywords))) ]
+                                                                                            ]
+                                                                                        ]
+
+                                                                                    Just (Enumerative stat) ->
+                                                                                        -- TODO:
+                                                                                        []
+
+                                                                                    Nothing ->
+                                                                                        []
 
                                                                             ( "-1", _ ) ->
                                                                                 [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontStyleItalic, S.opacity "0.5" ]
