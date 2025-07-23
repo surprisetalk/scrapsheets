@@ -641,7 +641,12 @@ update msg ({ sheet } as model) =
                             let
                                 id : String
                                 id =
-                                    model.library |> Dict.keys |> List.drop y |> List.head |> Maybe.withDefault ""
+                                    model.library
+                                        |> Dict.filter (\k v -> k /= "" && not v.scratch && List.any (String.contains model.search) (k :: v.name :: v.tags))
+                                        |> Dict.keys
+                                        |> List.drop (y - 1)
+                                        |> List.head
+                                        |> Maybe.withDefault ""
                             in
                             case Maybe.map .name (Array.get x libraryCols) of
                                 Just "name" ->
@@ -888,8 +893,7 @@ view ({ sheet } as model) =
                             libraryCols
                         , rows =
                             model.library
-                                -- TODO: Kludge! We shouldn't omit all examples.
-                                |> Dict.filter (\k v -> k /= "" && not v.scratch)
+                                |> Dict.filter (\k v -> k /= "" && not v.scratch && List.any (String.contains model.search) (k :: v.name :: v.tags))
                                 |> Dict.toList
                                 |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "delete", E.string k ) ])
                                 |> Array.fromList
