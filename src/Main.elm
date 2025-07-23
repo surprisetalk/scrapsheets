@@ -310,6 +310,46 @@ type
     | Form (Dict String String)
 
 
+typeName : Type -> String
+typeName typ =
+    case typ of
+        Unknown ->
+            "unknown"
+
+        Text ->
+            "text"
+
+        Number ->
+            "num"
+
+        Boolean ->
+            "bool"
+
+        Many typ_ ->
+            "list " ++ typeName typ_
+
+        Link ->
+            "link"
+
+        SheetId ->
+            "sheet_id"
+
+        Json ->
+            "json"
+
+        Timestamp ->
+            "timestamp"
+
+        Image ->
+            "image"
+
+        Delete ->
+            "delete"
+
+        Form _ ->
+            "form"
+
+
 
 ---- PARSER -------------------------------------------------------------------
 
@@ -666,26 +706,23 @@ update msg ({ sheet } as model) =
                         Idd sheet.id <|
                             case edit of
                                 SheetWrite { x, y } ->
-                                    case y of
+                                    case max 0 y of
                                         0 ->
                                             Maybe.map2 Tuple.pair sheet.write (Array.get x table.cols)
                                                 |> Maybe.map
                                                     (\( write, col ) ->
-                                                        let
-                                                            ( name, typ ) =
-                                                                case String.split ":" write of
-                                                                    [] ->
-                                                                        ( "", "" )
-
-                                                                    name_ :: [] ->
-                                                                        ( name_, String.toLower (Debug.toString col.typ) )
-
-                                                                    name_ :: typ_ ->
-                                                                        ( name_, String.join ":" typ_ )
-                                                        in
                                                         [ { action = "set"
-                                                          , path = [ E.int y, E.string (String.fromInt x) ]
-                                                          , value = E.object [ ( "name", E.string name ), ( "type", E.string typ ), ( "key", E.string col.key ) ]
+                                                          , path = [ E.int 0, E.string (String.fromInt x) ]
+                                                          , value =
+                                                                case String.fromInt y of
+                                                                    "-1" ->
+                                                                        E.object [ ( "name", E.string col.name ), ( "type", E.string write ), ( "key", E.string col.key ) ]
+
+                                                                    "0" ->
+                                                                        E.object [ ( "name", E.string write ), ( "type", E.string (typeName col.typ) ), ( "key", E.string col.key ) ]
+
+                                                                    _ ->
+                                                                        E.object [ ( "name", E.string col.name ), ( "type", E.string (typeName col.typ) ), ( "key", E.string col.key ) ]
                                                           }
                                                         ]
                                                     )
@@ -736,9 +773,9 @@ update msg ({ sheet } as model) =
             ( model, newDoc <| E.object [ ( "type", E.string "query" ), ( "data", E.list identity [ E.object [ ( "lang", E.string "sql" ), ( "code", E.string "select 1" ) ] ] ) ] )
 
         InputChange SheetSearch x ->
-            ( { model | search = x }
+            ( { model | search = x, sheet = { sheet | table = Err "" } }
             , Cmd.batch
-                [ Nav.pushUrl model.nav ("?q=" ++ Url.percentEncode x)
+                [ Nav.replaceUrl model.nav ("?q=" ++ Url.percentEncode x)
                 , case sheet.doc of
                     Ok (Query query) ->
                         -- TODO: Lang to string.
@@ -921,8 +958,8 @@ view ({ sheet } as model) =
     , body =
         [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
         , H.node "style" [] [ text "body { font-family: \"Source Code Pro\", monospace; font-optical-sizing: auto; height: 100vh; width: 100vw; }" ]
-        , H.node "style" [] [ text "tr th:first-child { opacity: 0.5; }" ]
-        , H.node "style" [] [ text "th, td { padding: 0 0.25rem; font-weight: normal; border: 1px solid black; height: 1rem; }" ]
+        , H.node "style" [] [ text "tr th:first-child { opacity: 0.5; text-align: right; }" ]
+        , H.node "style" [] [ text "th, td { padding: 0 0.25rem; font-weight: normal; border: 1px solid black; height: 1rem; vertical-align: top; }" ]
         , H.node "style" [] [ text "th > *, td > * { max-height: 6rem; }" ]
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { td { background: rgba(255,255,255,0.05); } }" ]
         , H.node "style" [] [ text "td:hover { background: rgba(0,0,0,0.15); }" ]
@@ -936,7 +973,7 @@ view ({ sheet } as model) =
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0, S.borderBottom "1px solid rgba(0,0,0,0.5)" ]
                     [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.whiteSpaceNowrap, S.gapRem 0.5, S.padding "0.5rem 1rem" ] <|
                         List.concat
-                            [ [ H.a [ A.href "/", S.fontWeightBold ] [ text "scrapsheets", H.sup [] [ text "" ] ]
+                            [ [ H.a [ A.href "/", S.fontWeight "900" ] [ text "scrapsheets", H.sup [] [ text "" ] ]
                               ]
                             , iif (sheet.id == "")
                                 [ text "/"
@@ -985,6 +1022,9 @@ view ({ sheet } as model) =
                         error ->
                             H.span [] [ H.button [ A.onClick (DocError "") ] [ text "╳" ], text " ", text error ]
                     , case table of
+                        Err "" ->
+                            H.div [ S.displayFlex ] [ H.span [ S.textAlignCenter, S.width "100%", S.paddingRem 2, S.opacity "0.5" ] [ text "loading" ] ]
+
                         Err err ->
                             H.p [] [ text err ]
 
@@ -1002,8 +1042,21 @@ view ({ sheet } as model) =
                                     List.concat
                                         [ Array.toList <|
                                             Array.indexedMap
-                                                (\n row ->
-                                                    H.tr [] <|
+                                                (\n_ row ->
+                                                    let
+                                                        n =
+                                                            -- TODO: Consider moving the header rows to H.thead
+                                                            n_ - 2
+                                                    in
+                                                    H.tr
+                                                        [ case ( String.fromInt n, sheet.stats ) of
+                                                            ( "-2", Err _ ) ->
+                                                                S.displayNone
+
+                                                            _ ->
+                                                                S.displayTableRow
+                                                        ]
+                                                    <|
                                                         (::)
                                                             (H.th
                                                                 [ A.onClick (DocMsg (TabMsg (SheetRowPush n)))
@@ -1012,7 +1065,7 @@ view ({ sheet } as model) =
                                                                 , S.widthRem 0.001
                                                                 , S.whiteSpaceNowrap
                                                                 ]
-                                                                [ text (String.fromInt n) ]
+                                                                [ text (iif (n <= 0) "" (String.fromInt n)) ]
                                                             )
                                                         <|
                                                             List.indexedMap
@@ -1021,9 +1074,12 @@ view ({ sheet } as model) =
                                                                         [ A.onClick CellMouseClick
                                                                         , A.onDoubleClick <|
                                                                             CellMouseDoubleClick <|
-                                                                                case n of
-                                                                                    0 ->
-                                                                                        col.name ++ ":" ++ String.toLower (Debug.toString col.typ)
+                                                                                case String.fromInt n of
+                                                                                    "-1" ->
+                                                                                        typeName col.typ
+
+                                                                                    "0" ->
+                                                                                        col.name
 
                                                                                     _ ->
                                                                                         row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
@@ -1075,20 +1131,28 @@ view ({ sheet } as model) =
                                                                                 S.widthAuto
                                                                         ]
                                                                     <|
-                                                                        case ( n, sheet.write /= Nothing && sheet.select == rect i n i n ) of
+                                                                        case ( String.fromInt n, sheet.write /= Nothing && sheet.select == rect i n i n ) of
                                                                             ( _, True ) ->
                                                                                 [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (TabMsg (SheetWrite sheet.select.a))), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
 
-                                                                            ( 0, _ ) ->
+                                                                            ( "-2", _ ) ->
+                                                                                -- TODO: stats
+                                                                                []
+
+                                                                            ( "-1", _ ) ->
+                                                                                [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontStyleItalic, S.opacity "0.5" ]
+                                                                                    [ text (typeName col.typ)
+                                                                                    ]
+                                                                                ]
+
+                                                                            ( "0", _ ) ->
                                                                                 case col.name of
                                                                                     "" ->
                                                                                         []
 
                                                                                     _ ->
-                                                                                        [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap ]
+                                                                                        [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600" ]
                                                                                             [ text col.name
-
-                                                                                            -- , H.span [ S.opacity "0.5" ] [ text (":" ++ String.toLower (Debug.toString col.typ)) ]
                                                                                             ]
                                                                                         ]
 
@@ -1180,7 +1244,7 @@ view ({ sheet } as model) =
                                                                 Array.toList cols
                                                 )
                                             <|
-                                                Array.append (Array.fromList [ Dict.empty ]) <|
+                                                Array.append (Array.initialize 3 (always Dict.empty)) <|
                                                     rows
 
                                         -- TODO:
@@ -1193,7 +1257,7 @@ view ({ sheet } as model) =
                                             Ok (Tab _) ->
                                                 [ H.tr [ A.onClick (DocMsg (TabMsg (SheetRowPush (Array.length rows)))) ] <|
                                                     (::) (H.th [] [ text "+" ]) <|
-                                                        List.indexedMap (\i col -> H.td [ S.opacity "0.25" ] [ text (String.toLower (Debug.toString col.typ)) ]) <|
+                                                        List.indexedMap (\i col -> H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text (typeName col.typ) ]) <|
                                                             Array.toList cols
                                                 ]
 
