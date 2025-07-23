@@ -1191,8 +1191,8 @@ view ({ sheet } as model) =
                                                 ]
 
                                             Ok (Tab _) ->
-                                                [ H.tr [] <|
-                                                    (::) (H.th [ A.onClick (DocMsg (TabMsg (SheetRowPush (Array.length rows)))) ] [ text "+" ]) <|
+                                                [ H.tr [ A.onClick (DocMsg (TabMsg (SheetRowPush (Array.length rows)))) ] <|
+                                                    (::) (H.th [] [ text "+" ]) <|
                                                         List.indexedMap (\i col -> H.td [ S.opacity "0.25" ] [ text (String.toLower (Debug.toString col.typ)) ]) <|
                                                             Array.toList cols
                                                 ]
@@ -1231,7 +1231,12 @@ view ({ sheet } as model) =
                         -- , H.textarea [] []
                         -- , H.button [] [ text "send (⌘⏎)" ]
                         -- ]
-                        []
+                        [ H.div [ S.paddingRem 1, S.displayFlex, S.flexDirectionColumn, S.gapRem 1 ]
+                            [ H.ul [ S.whiteSpaceNowrap, S.lineHeightRem 1.75 ]
+                                [ H.li [] [ H.a [ A.href "", A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "new column" ] ]
+                                ]
+                            ]
+                        ]
 
                     Ok (Query query) ->
                         [ H.textarea [ A.id "code", A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75, S.minWidth "25vw", S.width "100%", S.border "none", S.backgroundColor "transparent", S.paddingRem 1, S.lineHeightRem 1.5 ]
