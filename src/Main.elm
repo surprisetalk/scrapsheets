@@ -476,6 +476,7 @@ colDecoder =
                 , ( "form", Form Dict.empty )
                 , ( "timestamp", Timestamp )
                 , ( "datetime", Timestamp )
+                , ( "date", Timestamp )
                 , ( "json", Json )
                 , ( "text", Text )
                 , ( "string", Text )

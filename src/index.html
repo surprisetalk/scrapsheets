@@ -469,7 +469,7 @@
                     cat: "text",
                   },
                   "" +
-                    "search entries/ return (" +
+                    "search entries / return (" +
                     "\n  id," +
                     "\n  categories as cat," +
                     "\n  title," +
@@ -478,62 +478,395 @@
                     "\n  published," +
                     "\n  updated" +
                     "\n)" +
-                    "\nfrom http('https://export.arxiv.org/api/query', @{search_query:('all:' || (@params->(''))), max_results:25})",
+                    "\nfrom http(" +
+                    "\n  'https://export.arxiv.org/api/query'," +
+                    "\n  @{search_query:('all:' || (@params->(''))), max_results:25}" +
+                    "\n)",
                 ),
                 "query:wikipedia-search": QuerySql(
-                  {},
-                  "search / from @(http('https://en.wikipedia.org/w/api.php', @{action:'query', generator:'search', prop:'pageimages|url', exintro:'', explaintext:'', `gsrsearch`:(@params->('')), limit:25, format:'json', origin:'*'})->res->`query`->`pages`)",
+                  { i: "number", thumb: "image", title: "text", url: "link" },
+                  "" +
+                    "search `query` pages / return (" +
+                    // "\n  `index` as i," +
+                    "\n  thumbnail->source as thumb," +
+                    "\n  title," +
+                    "\n  fullurl as url" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://en.wikipedia.org/w/api.php'," +
+                    "\n  @{" +
+                    "\n     action:'query'," +
+                    "\n     generator:'search'," +
+                    "\n     prop:'pageimages|info'," +
+                    "\n     piprop:'thumbnail'," +
+                    "\n     pithumbsize:100," +
+                    "\n     inprop:'url'," +
+                    "\n     exintro:''," +
+                    "\n     explaintext:''," +
+                    "\n     `gsrsearch`:(@params->(''))," +
+                    "\n     gsrlimit:25," +
+                    "\n     format:'json'," +
+                    "\n     origin:'*'" +
+                    "\n   }" +
+                    "\n)",
                 ),
                 "query:reddit-search": QuerySql(
-                  {},
-                  "search /data from @(http('https://www.reddit.com/search.json', @{q:(@params->('')), limit:25})->res->data->children)",
+                  {
+                    preview: "image",
+                    ups: "int",
+                    downs: "int",
+                    comms: "int",
+                    created: "datetime",
+                    thumbnail: "image",
+                    subreddit: "text",
+                    subs: "int",
+                    title: "text",
+                    selftext: "text",
+                    author: "text",
+                    is_self: "bool",
+                    spoiler: "bool",
+                    type: "text",
+                    domain: "text",
+                    reddit_url: "link",
+                    url: "link",
+                    dest_url: "link",
+                  },
+                  "" +
+                    "search data children / data return (" +
+                    // "\n  preview->images->(0)->resolutions->(0)->url as preview," +
+                    "\n  thumbnail," +
+                    "\n  title," +
+                    // "\n  selftext," +
+                    "\n  'https://old.reddit.com'||permalink as reddit_url," +
+                    "\n  url," +
+                    "\n  url_overridden_by_dest as dest_url," +
+                    "\n  domain," +
+                    "\n  post_hint as type," +
+                    "\n  ups," +
+                    "\n  downs," +
+                    "\n  is_self," +
+                    "\n  spoiler," +
+                    "\n  num_comments as comms," +
+                    "\n  author," +
+                    "\n  subreddit," +
+                    "\n  subreddit_subscribers as subs," +
+                    "\n  created" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://www.reddit.com/search.json'," +
+                    "\n  @{q:(@params->('')), limit:25}" +
+                    "\n)",
                 ),
                 "query:reddit-subreddit": QuerySql(
-                  {},
-                  "search /data from @(http('https://www.reddit.com/r/'||(@params->r->(0))||'.json', @{limit:25})->res->data->children)",
-                  "r=hmmm",
+                  {
+                    preview: "image",
+                    ups: "int",
+                    downs: "int",
+                    comms: "int",
+                    created: "datetime",
+                    thumbnail: "image",
+                    subreddit: "text",
+                    subs: "int",
+                    title: "text",
+                    selftext: "text",
+                    author: "text",
+                    is_self: "bool",
+                    spoiler: "bool",
+                    type: "text",
+                    domain: "text",
+                    reddit_url: "link",
+                    url: "link",
+                    dest_url: "link",
+                  },
+                  "" +
+                    "search data children / data return (" +
+                    // "\n  preview->images->(0)->resolutions->(0)->url as preview," +
+                    "\n  thumbnail," +
+                    "\n  title," +
+                    // "\n  selftext," +
+                    "\n  'https://old.reddit.com'||permalink as reddit_url," +
+                    "\n  url," +
+                    "\n  url_overridden_by_dest as dest_url," +
+                    "\n  domain," +
+                    "\n  post_hint as type," +
+                    "\n  ups," +
+                    "\n  downs," +
+                    "\n  is_self," +
+                    "\n  spoiler," +
+                    "\n  num_comments as comms," +
+                    "\n  author," +
+                    "\n  subreddit," +
+                    "\n  subreddit_subscribers as subs," +
+                    "\n  created" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://www.reddit.com/r/'||(coalesce(@params->(''),'all'))||'.json'," +
+                    "\n  @{limit:25}" +
+                    "\n)",
+                  "hmmm",
                 ),
                 "query:manifold-search": QuerySql(
-                  {},
-                  "select * from @(http('https://api.manifold.markets/v0/search-markets', @{term:(@params->('')), limit:20})->res)",
+                  {
+                    creatorAvatarUrl: "image",
+                    url: "link",
+                    question: "text",
+                    creatorUsername: "text",
+                    createdTime: "datetime",
+                    closeTime: "datetime",
+                    resolutionTime: "datetime",
+                    resolution: "text",
+                    totalLiquidity: "float",
+                    volume: "float",
+                    volume24Hours: "float",
+                    uniqes: "int",
+                    pool: "text",
+                  },
+                  "" +
+                    "search / return (" +
+                    "\n  url," +
+                    "\n  question," +
+                    // "\n  id," +
+                    // "\n  creatorAvatarUrl," +
+                    // "\n  creatorId," +
+                    "\n  creatorUsername," +
+                    // "\n  creatorName," +
+                    "\n  createdTime," +
+                    "\n  closeTime," +
+                    "\n  resolutionTime," +
+                    "\n  resolution," +
+                    // "\n  outcome," +
+                    // "\n  mechanism," +
+                    "\n  volume24Hours," +
+                    "\n  volume," +
+                    "\n  totalLiquidity," +
+                    // "\n  isResolved," +
+                    "\n  uniqueBettorCount as uniqes," +
+                    // "\n  lastUpdatedTime," +
+                    // "\n  lastBetTime," +
+                    // "\n  lastCommentTime," +
+                    // "\n  token," +
+                    "\n  pool" +
+                    // "\n  probability," +
+                    // "\n  p," +
+                    // "\n  resolutionProbability," +
+                    // "\n  `value`," +
+                    // "\n  `min`," +
+                    // "\n  `max`," +
+                    // "\n  isLogScale" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://api.manifold.markets/v0/search-markets'," +
+                    "\n  @{term:(@params->('')), limit:25}" +
+                    "\n)",
                 ),
                 "query:manifold-trending": QuerySql(
-                  {},
-                  "select * from @(http('https://api.manifold.markets/v0/markets', @{limit:20})->res)",
+                  {
+                    creatorAvatarUrl: "image",
+                    url: "link",
+                    question: "text",
+                    creatorUsername: "text",
+                    createdTime: "datetime",
+                    closeTime: "datetime",
+                    resolutionTime: "datetime",
+                    resolution: "text",
+                    outcomeType: "text",
+                    totalLiquidity: "float",
+                    volume: "float",
+                    volume24Hours: "float",
+                    uniqes: "int",
+                    pool: "text",
+                  },
+                  "" +
+                    "search / return (" +
+                    "\n  url," +
+                    "\n  question," +
+                    // "\n  id," +
+                    // "\n  creatorAvatarUrl," +
+                    // "\n  creatorId," +
+                    "\n  creatorUsername," +
+                    // "\n  creatorName," +
+                    "\n  createdTime," +
+                    "\n  closeTime," +
+                    "\n  resolutionTime," +
+                    "\n  resolution," +
+                    // "\n  mechanism," +
+                    "\n  volume24Hours," +
+                    "\n  volume," +
+                    "\n  totalLiquidity," +
+                    // "\n  isResolved," +
+                    "\n  uniqueBettorCount as uniqes," +
+                    // "\n  lastUpdatedTime," +
+                    // "\n  lastBetTime," +
+                    // "\n  lastCommentTime," +
+                    // "\n  token," +
+                    "\n  pool," +
+                    // "\n  probability," +
+                    // "\n  p," +
+                    // "\n  resolutionProbability," +
+                    // "\n  `value`," +
+                    // "\n  `min`," +
+                    // "\n  `max`," +
+                    // "\n  isLogScale" +
+                    "\n  outcomeType" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://api.manifold.markets/v0/markets'," +
+                    "\n  @{limit:25}" +
+                    "\n)",
                 ),
                 // "query:fred-search": QuerySql({},
                 //   "select * from @(http('https://corsproxy.io/?url=https://api.stlouisfed.org/fred/series/search', @{search_text:(@params->('')), file_type:'json'})->res)"
                 // ),
                 "query:stocks-search": QuerySql(
-                  {},
-                  "select * from @(http('https://corsproxy.io/?url=https://query1.finance.yahoo.com/v1/finance/search', @{q:(@params->(''))})->res->news)",
+                  {
+                    link: "link",
+                    thumb: "image",
+                    title: "text",
+                    publisher: "text",
+                    publishedAt: "datetime",
+                    tickers: "text",
+                  },
+                  "" +
+                    "search news / return (" +
+                    "\n  link," +
+                    "\n  thumbnail->resolutions->(1)->url as thumb," +
+                    "\n  title," +
+                    "\n  publisher," +
+                    "\n  providerPublishTime as publishedAt," +
+                    "\n  relatedTickers as tickers" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://corsproxy.io/?url=https://query1.finance.yahoo.com/v1/finance/search'," +
+                    "\n  @{q:(@params->(''))}" +
+                    "\n)",
                   "AAPL",
                 ),
                 // "query:discogs-search": QuerySql({},
                 //   "select * from @(http('https://api.discogs.com/database/search', @{q:(@params->('')), type:'release'})->res)"
                 // ),
                 "query:speedrun-games": QuerySql(
-                  {},
-                  "select * from @(http('https://www.speedrun.com/api/v1/games', @{name:(@params->(''))})->res->data)",
+                  {
+                    thumb: "image",
+                    url: "link",
+                    title: "text",
+                    release: "date",
+                    discord: "link",
+                  },
+                  "" +
+                    "search data / return (" +
+                    "\n  weblink as url," +
+                    "\n  assets->`cover-tiny`->uri as thumb," +
+                    "\n  names->international as title," +
+                    "\n  `release-date` as release," +
+                    "\n  discord" +
+                    "\n)" +
+                    "\nfrom http('https://www.speedrun.com/api/v1/games', @{name:(@params->(''))})",
                   "mario",
+                  "zelda",
                 ),
                 "query:speedrun-users": QuerySql(
-                  {},
-                  "select * from @(http('https://www.speedrun.com/api/v1/users', @{name:(@params->(''))})->res->data)",
+                  {
+                    url: "link",
+                    thumb: "image",
+                    location: "text",
+                    signup: "datetime",
+                    twitch: "link",
+                    hitbox: "link",
+                    youtube: "link",
+                    twitter: "link",
+                    live: "link",
+                  },
+                  "" +
+                    "search data / return (" +
+                    "\n  weblink as url," +
+                    "\n  assets->image->uri as thumb," +
+                    "\n  names->international as name," +
+                    "\n  location->region->code as location," +
+                    "\n  twitch->uri as twitch," +
+                    "\n  hitbox->uri as hitbox," +
+                    "\n  youtube->uri as youtube," +
+                    "\n  twitter->uri as twitter," +
+                    "\n  speedrunslive->uri as live," +
+                    "\n  signup" +
+                    "\n)" +
+                    "\nfrom http('https://www.speedrun.com/api/v1/users', @{name:(@params->(''))})",
                   "mario",
+                  "zelda",
                 ),
                 // "query:youtube-search": QuerySql({},
                 //   "select * from @(http('https://www.googleapis.com/youtube/v3/search', @{part:'snippet', q:(@params->('')), key:'YOUR_API_KEY', maxResults:25})->res->items)",
                 //   "videogamedunkey"
                 // ),
                 "query:podcast-search": QuerySql(
-                  {},
-                  "select * from @(http('https://itunes.apple.com/search', @{term:(@params->('')), media:'podcast', limit:25})->res->results)",
+                  {
+                    artistName: "text",
+                    collectionName: "text",
+                    trackName: "text",
+                    colUrl: "link",
+                    trackUrl: "link",
+                    feedUrl: "link",
+                    artworkUrl100: "image",
+                    releaseDate: "datetime",
+                    trackCount: "int",
+                    country: "text",
+                    genre: "text",
+                    genres: "text",
+                    trackTimeMillis: "int",
+                    artistUrl: "link",
+                  },
+                  "" +
+                    "search results / return (" +
+                    "\n feedUrl," +
+                    "\n trackViewUrl as trackUrl," +
+                    "\n artworkUrl100," +
+                    "\n artistName," +
+                    // "\n collectionName," +
+                    "\n trackName," +
+                    // "\n collectionViewUrl as colUrl," +
+                    // "\n trackCount," +
+                    // "\n country," +
+                    "\n primaryGenreName as genre," +
+                    // "\n genres," +
+                    // "\n trackTimeMillis," +
+                    // "\n artistViewUrl as artistUrl," +
+                    "\n releaseDate" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://itunes.apple.com/search'," +
+                    "\n  @{term:(@params->('')), media:'podcast', limit:25}" +
+                    "\n)",
                   "articles of interest",
                 ),
                 "query:ossinsight-trends": QuerySql(
-                  {},
-                  "select * from @(http('https://api.ossinsight.io/v1/trends/repos', @{keyword:(@params->(''))})->res->data->`rows`)",
+                  {
+                    repo: "text",
+                    lang: "text",
+                    desc: "text",
+                    stars: "int",
+                    forks: "int",
+                    prs: "int",
+                    pushes: "int",
+                    total_score: "float",
+                    contributors: "text",
+                    cats: "text",
+                  },
+                  "" +
+                    "search data `rows` / return (" +
+                    "\n  repo_name as repo," +
+                    "\n  description as `desc`," +
+                    "\n  primary_language as lang," +
+                    "\n  contributor_logins as contributors," +
+                    // "\n  collections_names as cats," +
+                    "\n  stars," +
+                    "\n  forks," +
+                    "\n  pull_requests as prs," +
+                    "\n  pushes," +
+                    "\n  total_score" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://api.ossinsight.io/v1/trends/repos'," +
+                    "\n  @{keyword:(@params->(''))}" +
+                    "\n)",
                   "language=All period=past_24_hours",
                   "language=JavaScript period=past_3_months",
                   "language=Erlang",
