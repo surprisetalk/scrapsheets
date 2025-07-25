@@ -217,6 +217,7 @@ type Stat
 
 type Doc
     = Library
+    | Shop
     | Tab Table
     | Net Net
     | Query Query_
@@ -324,6 +325,7 @@ type
     | Timestamp
     | Image
     | Delete
+    | Create
     | Form (Dict String String)
 
 
@@ -359,6 +361,9 @@ typeName typ =
 
         Image ->
             "image"
+
+        Create ->
+            "create"
 
         Delete ->
             "delete"
@@ -401,6 +406,9 @@ docDecoder =
                 case typ of
                     "library" ->
                         D.succeed Library
+
+                    "shop" ->
+                        D.succeed Shop
 
                     "table" ->
                         D.field "data" <|
@@ -480,6 +488,7 @@ colDecoder =
                 , ( "json", Json )
                 , ( "text", Text )
                 , ( "string", Text )
+                , ( "create", Create )
                 ]
     in
     D.oneOf
@@ -494,6 +503,11 @@ colDecoder =
 langDecoder : D.Decoder Lang
 langDecoder =
     D.string |> D.andThen (flip Dict.get langs >> Maybe.map D.succeed >> Maybe.withDefault (D.fail "Invalid query language."))
+
+
+shopDecoder : D.Decoder Table
+shopDecoder =
+    D.field "data" tableDecoder
 
 
 
@@ -560,6 +574,7 @@ type Msg
     | DocQuery (Idd D.Value)
     | DocError String
     | DocMsg DocMsg
+    | DocNew E.Value
     | DocNewQuery
     | DocNewTable
     | DocDelete Id
@@ -570,6 +585,7 @@ type Msg
     | CellMouseUp
     | CellHover Index
     | InputChange Input String
+    | ShopFetch (Result Http.Error Table)
 
 
 type DocMsg
@@ -664,8 +680,15 @@ update msg ({ sheet } as model) =
                     , stats = Err ""
                     }
               }
-              -- TODO: Fetch table rows depending on type, e.g. portal:123
-            , Cmd.none
+            , case data.data.doc |> D.decodeValue docDecoder of
+                Ok Shop ->
+                    Http.get
+                        { url = "http://localhost:8000/shop"
+                        , expect = Http.expectJson ShopFetch shopDecoder
+                        }
+
+                _ ->
+                    Cmd.none
             )
 
         DocChange data ->
@@ -786,11 +809,17 @@ update msg ({ sheet } as model) =
         DocDelete id ->
             ( model, deleteDoc id )
 
+        DocNew x ->
+            ( model, newDoc x )
+
         DocNewTable ->
             ( model, newDoc <| E.object [ ( "type", E.string "table" ), ( "data", E.list identity [ E.list identity [ E.object [ ( "name", E.string "a" ), ( "type", E.string "text" ), ( "key", E.string "a" ) ] ] ] ) ] )
 
         DocNewQuery ->
             ( model, newDoc <| E.object [ ( "type", E.string "query" ), ( "data", E.list identity [ E.object [ ( "lang", E.string "sql" ), ( "code", E.string "select 1" ) ] ] ) ] )
+
+        ShopFetch x ->
+            ( { model | sheet = { sheet | table = Result.mapError (always "Something went wrong.") x } }, Cmd.none )
 
         InputChange SheetSearch x ->
             ( { model | search = x, sheet = { sheet | table = Err "" } }
@@ -1325,6 +1354,9 @@ view ({ sheet } as model) =
                                                                                                 Delete ->
                                                                                                     D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])
 
+                                                                                                Create ->
+                                                                                                    D.value |> D.map (\val -> H.button [ A.onClick (DocNew val) ] [ text "create" ])
+
                                                                                                 Form form ->
                                                                                                     D.map3
                                                                                                         (\method action fields ->
@@ -1396,9 +1428,9 @@ view ({ sheet } as model) =
                             [ H.ul [ S.whiteSpaceNowrap, S.lineHeightRem 1.75 ]
                                 -- TODO: [ H.li [] [ H.a [ A.href "#todo" ] [ text "my account" ] ]
                                 -- TODO: [ H.li [] [ H.a [ A.href "/table:tutorial" ] [ text "tutorial" ] ]
-                                [ H.li [] [ H.a [ A.href "/table:examples" ] [ text "examples" ] ]
-                                , H.li [] [ H.a [ A.href "", A.onClick DocNewTable ] [ text "new table" ] ]
-                                , H.li [] [ H.a [ A.href "", A.onClick DocNewQuery ] [ text "new query" ] ]
+                                [ H.li [] [ H.a [ A.href "/shop" ] [ text "shop" ] ]
+                                , H.li [] [ H.button [ A.onClick DocNewTable ] [ text "new table" ] ]
+                                , H.li [] [ H.button [ A.onClick DocNewQuery ] [ text "new query" ] ]
 
                                 -- TODO: github
                                 -- TODO: support/contact email
@@ -1419,7 +1451,7 @@ view ({ sheet } as model) =
                         -- ]
                         [ H.div [ S.paddingRem 1, S.displayFlex, S.flexDirectionColumn, S.gapRem 1 ]
                             [ H.ul [ S.whiteSpaceNowrap, S.lineHeightRem 1.75 ]
-                                [ H.li [] [ H.a [ A.href "", A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "new column" ] ]
+                                [ H.li [] [ H.button [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "new column" ] ]
                                 ]
                             ]
                         ]
