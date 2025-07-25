@@ -33,6 +33,14 @@ select {
   -webkit-user-select: auto;
 }
 
+button {
+  background: none;
+  border: none;
+  padding: 0;
+  font-style: italic;
+  cursor: pointer;
+}
+
 p,
 h1,
 h2,
