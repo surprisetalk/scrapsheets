@@ -311,7 +311,24 @@
                   "sort=updated",
                 ),
                 "query:crypto-markets": QuerySql(
-                  "select * from @(http('https://api.coingecko.com/api/v3/coins/markets', @{vs_currency:'usd', `order`:'market_cap_desc', per_page:100})->res)",
+                  "" +
+                    "search / return (" +
+                    "\n  image(image) as image," +
+                    "\n  int(market_cap_rank) as rank," +
+                    "\n  name," +
+                    "\n  symbol," +
+                    "\n  usd(current_price) as price," +
+                    "\n  usd(market_cap) as market_cap," +
+                    "\n  usd(high_24h) as high_24h," +
+                    "\n  usd(low_24h) as low_24h," +
+                    "\n  percentage(price_change_percentage_24h) as change_24h," +
+                    "\n  usd(ath) as ath," +
+                    "\n  date(ath_date)" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://api.coingecko.com/api/v3/coins/markets'," +
+                    "\n  @{vs_currency:'usd', `order`:'market_cap_desc', per_page:100}" +
+                    "\n)",
                 ),
                 "query:crypto-search": QuerySql(
                   "select thumb::image as thumb, symbol, name, market_cap_rank from @(http('https://api.coingecko.com/api/v3/search', @{`query`:(@params->(''))})->res->coins)",
@@ -455,7 +472,15 @@
           let sheet;
 
           alasql.options.modifier = "RECORDSET";
-          for (const type of ["image", "link"])
+          for (const type of [
+            "image",
+            "link",
+            "usd",
+            "percentage",
+            "date",
+            "int",
+            "float",
+          ])
             alasql.fn[type] = data => ({ type, data });
           alasql.from.SHEET = (id, params = {}) => {
             // TODO: Grab sheet (e.g. portal) with given params.

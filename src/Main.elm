@@ -1311,8 +1311,8 @@ view ({ sheet } as model) =
                                                                                                                             "image" ->
                                                                                                                                 D.string |> D.map (\src -> H.img [ A.src src ] [])
 
-                                                                                                                            typ_ ->
-                                                                                                                                D.fail ("Unknown type:" ++ typ_)
+                                                                                                                            _ ->
+                                                                                                                                D.map text string
                                                                                                                 )
                                                                                                         , D.map text string
                                                                                                         ]
