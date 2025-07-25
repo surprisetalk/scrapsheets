@@ -1079,43 +1079,44 @@ view ({ sheet } as model) =
     , body =
         [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
         , H.node "style" [] [ text "body { font-family: \"Source Code Pro\", monospace; font-optical-sizing: auto; height: 100vh; width: 100vw; }" ]
-        , H.node "style" [] [ text "th, td { padding: 0 0.25rem; font-weight: normal; border: 1px solid black; height: 1rem; vertical-align: top; }" ]
-        , H.node "style" [] [ text "th > *, td > * { max-height: 6rem; }" ]
-        , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { td { background: rgba(255,255,255,0.05); } }" ]
-        , H.node "style" [] [ text "td:hover { background: rgba(0,0,0,0.15); }" ]
-        , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { td:hover { background: rgba(255,255,255,0.15); } }" ]
-        , H.node "style" [] [ text ".selected { background: rgba(0,0,0,0.1); }" ]
-        , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { .selected { background: rgba(255,255,255,0.1); } }" ]
-        , H.node "style" [] [ text ".code { background: black; }" ]
-        , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { .code { background: white; } }" ]
+        , H.node "style" [] [ text "table { background: #fff; }" ]
+        , H.node "style" [] [ text "th, td { padding: 0.1rem 0.25rem; font-weight: normal; border: 1px solid #aaa; height: 1rem; vertical-align: top; }" ]
+        , H.node "style" [] [ text "tr > :first-child { border-left: none; padding-left: 0.5rem; }" ]
+        , H.node "style" [] [ text "tr > :last-child { border-right: none; padding-right: 0.5rem; }" ]
+        , H.node "style" [] [ text "th > *, td > * { max-height: 6rem; text-overlow: ellipsis; }" ]
+        , H.node "style" [] [ text "td:hover { background: rgba(0,0,0,0.025); }" ]
+        , H.node "style" [] [ text ".r0 { position: sticky; top: -1px; background: #f6f6f6; z-index: 1; }" ]
+        , H.node "style" [] [ text ".selected { background: rgba(0,0,0,0.05); }" ]
+        , H.node "style" [] [ text ".code { background: #fff; }" ]
 
         -- , H.node "style" [] [ text "thead tr td { position: sticky; top: 0; }" ]
         -- , H.node "style" [] [ text "tfoot tr:last-child td { position: sticky; bottom: 0; }" ]
         , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
-                [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0, S.borderBottom "1px solid rgba(0,0,0,0.5)" ]
-                    [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.whiteSpaceNowrap, S.gapRem 0.5, S.padding "0.5rem 1rem" ] <|
+                [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0, S.borderBottom "1px solid #000" ]
+                    [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.whiteSpaceNowrap, S.gapRem 0.5, S.padding "0.5rem 0 0.5rem 0.5rem" ] <|
                         List.concat
                             [ [ H.a [ A.href "/", S.fontWeight "900" ] [ text "scrapsheets", H.sup [] [ text "" ] ]
+                              , text "/"
                               ]
                             , iif (sheet.id == "")
-                                [ text "/"
-                                , H.span [] [ text "library" ]
+                                [ H.span [] [ text "library" ]
                                 ]
-                                [ text "/"
-                                , H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ]
+                                [ H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ]
                                 ]
+                            , [ text "/"
+                              ]
                             ]
 
                     -- All current filters should be rendered as text in the searchbar.
                     -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                     -- TODO: If no results found, show saved searches and recent searches.
                     , H.div [ S.displayFlex, S.width "100%", S.height "100%" ]
-                        [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder "search", S.width "100%", S.border "none", S.backgroundColor "rgba(0,0,0,0.25)", S.paddingLeftRem 1 ] []
+                        [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder "search", S.width "100%", S.border "none", S.backgroundColor "#fff", S.paddingLeftRem 1 ] []
                         ]
                     ]
 
-                -- , H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.padding "0.5rem 1rem", S.backgroundColor "rgba(0,0,0,0.5)" ] <|
+                -- , H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.padding "0.5rem 1rem", S.backgroundColor "#fff" ] <|
                 --     [ H.div [ S.displayFlex, S.alignItemsBaseline, S.gapRem 1, S.opacity "0.5" ] <|
                 --         List.concat
                 --             [ List.map (\x -> H.span [ A.onClick (InputChange SheetSearch x), S.textDecorationUnderline, S.opacity "0.5", S.fontSizeRem 0.6 ] [ text x ]) <| examples
@@ -1137,7 +1138,7 @@ view ({ sheet } as model) =
                 --             ]
                 --     ]
                 -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
-                , H.div [ S.overflowAuto, S.height "100%", S.backgroundColor "rgba(0,0,0,0.5)" ]
+                , H.div [ S.overflowAuto, S.height "100%", S.backgroundColor "#eee" ]
                     [ case model.error of
                         "" ->
                             text ""
@@ -1172,7 +1173,19 @@ view ({ sheet } as model) =
                                                             n_ - 2
                                                     in
                                                     H.tr
-                                                        [ case ( String.fromInt n, stats ) of
+                                                        [ case String.fromInt n of
+                                                            "-2" ->
+                                                                S.backgroundColor "#ececec"
+
+                                                            "-1" ->
+                                                                S.backgroundColor "#f6f6f6"
+
+                                                            "0" ->
+                                                                S.backgroundColor "#f6f6f6"
+
+                                                            _ ->
+                                                                S.backgroundColor "#fff"
+                                                        , case ( String.fromInt n, stats ) of
                                                             ( "-2", Err _ ) ->
                                                                 S.displayNone
 
@@ -1180,232 +1193,221 @@ view ({ sheet } as model) =
                                                                 S.displayTableRow
                                                         ]
                                                     <|
-                                                        (::)
-                                                            (H.th
-                                                                [ S.displayNone
-                                                                , A.onClick (DocMsg (TabMsg (SheetRowPush n)))
-                                                                , A.onMouseEnter (CellHover (xy -1 n))
-                                                                , S.textAlignRight
-                                                                , S.widthRem 0.001
-                                                                , S.whiteSpaceNowrap
-                                                                ]
-                                                                [-- text (iif (n <= 0) "" (String.fromInt n))
-                                                                ]
-                                                            )
-                                                        <|
-                                                            List.indexedMap
-                                                                (\i col ->
-                                                                    H.td
-                                                                        [ A.onClick CellMouseClick
-                                                                        , A.onDoubleClick <|
-                                                                            CellMouseDoubleClick <|
-                                                                                case String.fromInt n of
-                                                                                    "-1" ->
-                                                                                        typeName col.typ
+                                                        List.indexedMap
+                                                            (\i col ->
+                                                                H.td
+                                                                    [ A.onClick CellMouseClick
+                                                                    , A.onDoubleClick <|
+                                                                        CellMouseDoubleClick <|
+                                                                            case String.fromInt n of
+                                                                                "-1" ->
+                                                                                    typeName col.typ
 
-                                                                                    "0" ->
-                                                                                        col.name
+                                                                                "0" ->
+                                                                                    col.name
 
-                                                                                    _ ->
-                                                                                        row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
-                                                                        , A.onMouseDown CellMouseDown
-                                                                        , A.onMouseUp CellMouseUp
-                                                                        , A.onMouseEnter (CellHover (xy i n))
-                                                                        , S.heightRem 1.25
-                                                                        , A.classList <|
-                                                                            let
-                                                                                { a, b } =
-                                                                                    sheet.select
+                                                                                _ ->
+                                                                                    row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
+                                                                    , A.onMouseDown CellMouseDown
+                                                                    , A.onMouseUp CellMouseUp
+                                                                    , A.onMouseEnter (CellHover (xy i n))
+                                                                    , S.heightRem 1.25
+                                                                    , S.lineHeight (iif (n == 0 || n == -1) "1.75" "")
+                                                                    , A.classList <|
+                                                                        let
+                                                                            { a, b } =
+                                                                                sheet.select
 
-                                                                                between : number -> number -> number -> Bool
-                                                                                between a_ b_ i_ =
-                                                                                    min a_ b_ <= i_ && i_ <= max a_ b_
+                                                                            between : number -> number -> number -> Bool
+                                                                            between a_ b_ i_ =
+                                                                                min a_ b_ <= i_ && i_ <= max a_ b_
 
-                                                                                eq : number -> number -> number -> Bool
-                                                                                eq a_ b_ i_ =
-                                                                                    a_ == i_ && i_ == b_
-                                                                            in
-                                                                            [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
-                                                                            ]
-                                                                        , case col.typ of
-                                                                            Create ->
-                                                                                S.textAlignRight
-
-                                                                            Boolean ->
-                                                                                S.textAlignCenter
-
-                                                                            Number ->
-                                                                                S.textAlignRight
-
-                                                                            Delete ->
-                                                                                S.textAlignCenter
-
-                                                                            Form _ ->
-                                                                                S.textAlignCenter
-
-                                                                            _ ->
-                                                                                S.textAlignLeft
-                                                                        , case col.typ of
-                                                                            Create ->
-                                                                                S.widthRem 10
-
-                                                                            Boolean ->
-                                                                                S.widthRem 0.5
-
-                                                                            Number ->
-                                                                                S.widthRem 0.5
-
-                                                                            Delete ->
-                                                                                S.widthRem 0.5
-
-                                                                            _ ->
-                                                                                S.widthAuto
+                                                                            eq : number -> number -> number -> Bool
+                                                                            eq a_ b_ i_ =
+                                                                                a_ == i_ && i_ == b_
+                                                                        in
+                                                                        [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
+                                                                        , ( "r0", n == 0 )
                                                                         ]
-                                                                    <|
-                                                                        case ( String.fromInt n, sheet.write /= Nothing && sheet.select == rect i n i n ) of
-                                                                            ( _, True ) ->
-                                                                                [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (TabMsg (SheetWrite sheet.select.a))), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
+                                                                    , case col.typ of
+                                                                        Create ->
+                                                                            S.textAlignRight
 
-                                                                            ( "-2", _ ) ->
-                                                                                case Maybe.andThen (Array.get i) (Result.toMaybe stats) of
-                                                                                    Just (Numeric stat) ->
-                                                                                        [ H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gapRem 0, S.gridColumnGapRem 0.5, S.justifyContentFlexStart, S.opacity "0.5" ]
-                                                                                            [ H.span [] [ text "min" ]
-                                                                                            , H.span [] [ text (Maybe.withDefault "" (Maybe.map String.fromFloat stat.min)) ]
-                                                                                            , H.span [] [ text "max" ]
-                                                                                            , H.span [] [ text (Maybe.withDefault "" (Maybe.map String.fromFloat stat.max)) ]
-                                                                                            , H.span [] [ text "mean" ]
-                                                                                            , H.span [] [ text (iif (stat.count == 0) "" (String.fromInt (round (stat.sum / toFloat stat.count)))) ]
-                                                                                            , H.span [] [ text "count" ]
-                                                                                            , H.span [] [ text (String.fromInt stat.count) ]
-                                                                                            ]
-                                                                                        ]
+                                                                        Boolean ->
+                                                                            S.textAlignCenter
 
-                                                                                    Just (Descriptive stat) ->
-                                                                                        [ H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gapRem 0, S.gridColumnGapRem 0.5, S.justifyContentFlexStart, S.opacity "0.5" ]
-                                                                                            [ H.span [] [ text "min" ]
-                                                                                            , H.span [] [ text (Maybe.withDefault "" (Maybe.map String.fromInt stat.min)) ]
-                                                                                            , H.span [] [ text "max" ]
-                                                                                            , H.span [] [ text (String.fromInt stat.max) ]
-                                                                                            , H.span [] [ text "mean" ]
-                                                                                            , H.span [] [ text (iif (stat.count == 0) "" (String.fromInt (stat.sum // stat.count))) ]
-                                                                                            , H.span [] [ text "count" ]
-                                                                                            , H.span [] [ text (String.fromInt stat.count) ]
-                                                                                            , H.span [] [ text "keywords" ]
-                                                                                            , H.span [] [ text (String.join " " (Dict.keys (Dict.filter (\k v -> String.length k >= 4 && v >= 2) stat.keywords))) ]
-                                                                                            ]
-                                                                                        ]
+                                                                        Number ->
+                                                                            S.textAlignRight
 
-                                                                                    Just (Enumerative stat) ->
-                                                                                        -- TODO:
-                                                                                        []
+                                                                        Delete ->
+                                                                            S.textAlignCenter
 
-                                                                                    Nothing ->
-                                                                                        []
-
-                                                                            ( "-1", _ ) ->
-                                                                                [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontStyleItalic, S.opacity "0.5" ]
-                                                                                    [ text (typeName col.typ)
-                                                                                    ]
-                                                                                ]
-
-                                                                            ( "0", _ ) ->
-                                                                                case col.name of
-                                                                                    "" ->
-                                                                                        []
-
-                                                                                    _ ->
-                                                                                        [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600" ]
-                                                                                            [ text col.name
-                                                                                            ]
-                                                                                        ]
-
-                                                                            _ ->
-                                                                                [ row
-                                                                                    |> Dict.get col.key
-                                                                                    |> Maybe.withDefault (E.string "")
-                                                                                    |> D.decodeValue
-                                                                                        (D.maybe
-                                                                                            (case col.typ of
-                                                                                                Unknown ->
-                                                                                                    D.map text string
-
-                                                                                                SheetId ->
-                                                                                                    D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text id ])
-
-                                                                                                Link ->
-                                                                                                    D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayBlock, S.wordBreakKeepAll, S.hyphensNone, S.maxWidthRem 18, S.fontStyleItalic ] [ text "link" ])
-
-                                                                                                Image ->
-                                                                                                    D.string |> D.map (\src -> H.img [ A.src src ] [])
-
-                                                                                                Text ->
-                                                                                                    D.map text string
-
-                                                                                                Boolean ->
-                                                                                                    D.map (\c -> H.input [ A.type_ "checkbox", A.checked c ] []) D.bool
-
-                                                                                                Number ->
-                                                                                                    D.map text string
-
-                                                                                                Delete ->
-                                                                                                    D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])
-
-                                                                                                Create ->
-                                                                                                    D.value |> D.map (\val -> H.button [ A.onClick (DocNew val) ] [ text "add to library" ])
-
-                                                                                                Form form ->
-                                                                                                    D.map3
-                                                                                                        (\method action fields ->
-                                                                                                            -- TODO: Change this to displayGrid
-                                                                                                            H.form [ A.onSubmit NoOp, S.displayGrid, S.gridTemplateColumns "auto 1fr", S.paddingRem 1 ] <|
-                                                                                                                List.concat
-                                                                                                                    [ List.concatMap
-                                                                                                                        (\field ->
-                                                                                                                            [ H.label [] [ text field.label ]
-                                                                                                                            , H.input [] []
-                                                                                                                            ]
-                                                                                                                        )
-                                                                                                                        fields
-                                                                                                                    , [ H.span [] []
-                                                                                                                      , H.button [ A.type_ "submit" ] [ text method ]
-                                                                                                                      ]
-                                                                                                                    ]
-                                                                                                        )
-                                                                                                        (D.field "method" D.string)
-                                                                                                        (D.field "action" D.string)
-                                                                                                        (D.field "fields"
-                                                                                                            (D.list
-                                                                                                                (D.map (\label -> { label = label })
-                                                                                                                    (D.field "label" D.string)
-                                                                                                                )
-                                                                                                            )
-                                                                                                        )
-
-                                                                                                _ ->
-                                                                                                    D.map text string
-                                                                                            )
-                                                                                        )
-                                                                                    |> Result.map (Maybe.withDefault (text ""))
-                                                                                    |> Result.mapError (D.errorToString >> text)
-                                                                                    |> result
-                                                                                ]
-                                                                )
-                                                                (Array.toList cols)
-                                                                ++ [ case sheet.doc of
-                                                                        Ok (Tab _) ->
-                                                                            H.th
-                                                                                [ A.onClick (DocMsg (TabMsg SheetColumnPush))
-                                                                                , S.textAlignLeft
-                                                                                , S.widthRem 0.001
-                                                                                , S.whiteSpaceNowrap
-                                                                                , S.opacity "0.5"
-                                                                                ]
-                                                                                [ text (iif (n == 0) "+" "") ]
+                                                                        Form _ ->
+                                                                            S.textAlignCenter
 
                                                                         _ ->
-                                                                            text ""
-                                                                   ]
+                                                                            S.textAlignLeft
+                                                                    , case col.typ of
+                                                                        Create ->
+                                                                            S.widthRem 10
+
+                                                                        Boolean ->
+                                                                            S.widthRem 0.5
+
+                                                                        Number ->
+                                                                            S.widthRem 0.5
+
+                                                                        Delete ->
+                                                                            S.widthRem 0.5
+
+                                                                        _ ->
+                                                                            S.widthAuto
+                                                                    ]
+                                                                <|
+                                                                    case ( String.fromInt n, sheet.write /= Nothing && sheet.select == rect i n i n ) of
+                                                                        ( _, True ) ->
+                                                                            [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (TabMsg (SheetWrite sheet.select.a))), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
+
+                                                                        ( "-2", _ ) ->
+                                                                            case Maybe.andThen (Array.get i) (Result.toMaybe stats) of
+                                                                                Just (Numeric stat) ->
+                                                                                    [ H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gapRem 0, S.gridColumnGapRem 0.5, S.justifyContentFlexStart, S.opacity "0.5" ]
+                                                                                        [ H.span [] [ text "min" ]
+                                                                                        , H.span [] [ text (Maybe.withDefault "" (Maybe.map String.fromFloat stat.min)) ]
+                                                                                        , H.span [] [ text "max" ]
+                                                                                        , H.span [] [ text (Maybe.withDefault "" (Maybe.map String.fromFloat stat.max)) ]
+                                                                                        , H.span [] [ text "mean" ]
+                                                                                        , H.span [] [ text (iif (stat.count == 0) "" (String.fromInt (round (stat.sum / toFloat stat.count)))) ]
+                                                                                        , H.span [] [ text "count" ]
+                                                                                        , H.span [] [ text (String.fromInt stat.count) ]
+                                                                                        ]
+                                                                                    ]
+
+                                                                                Just (Descriptive stat) ->
+                                                                                    [ H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gapRem 0, S.gridColumnGapRem 0.5, S.justifyContentFlexStart, S.opacity "0.5" ]
+                                                                                        [ H.span [] [ text "min" ]
+                                                                                        , H.span [] [ text (Maybe.withDefault "" (Maybe.map String.fromInt stat.min)) ]
+                                                                                        , H.span [] [ text "max" ]
+                                                                                        , H.span [] [ text (String.fromInt stat.max) ]
+                                                                                        , H.span [] [ text "mean" ]
+                                                                                        , H.span [] [ text (iif (stat.count == 0) "" (String.fromInt (stat.sum // stat.count))) ]
+                                                                                        , H.span [] [ text "count" ]
+                                                                                        , H.span [] [ text (String.fromInt stat.count) ]
+                                                                                        , H.span [] [ text "keywords" ]
+                                                                                        , H.span [] [ text (String.join " " (Dict.keys (Dict.filter (\k v -> String.length k >= 4 && v >= 2) stat.keywords))) ]
+                                                                                        ]
+                                                                                    ]
+
+                                                                                Just (Enumerative stat) ->
+                                                                                    -- TODO:
+                                                                                    []
+
+                                                                                Nothing ->
+                                                                                    []
+
+                                                                        ( "-1", _ ) ->
+                                                                            [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontStyleItalic, S.opacity "0.5" ]
+                                                                                [ text (typeName col.typ)
+                                                                                ]
+                                                                            ]
+
+                                                                        ( "0", _ ) ->
+                                                                            case col.name of
+                                                                                "" ->
+                                                                                    []
+
+                                                                                _ ->
+                                                                                    [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600" ]
+                                                                                        [ text col.name
+                                                                                        ]
+                                                                                    ]
+
+                                                                        _ ->
+                                                                            [ row
+                                                                                |> Dict.get col.key
+                                                                                |> Maybe.withDefault (E.string "")
+                                                                                |> D.decodeValue
+                                                                                    (D.maybe
+                                                                                        (case col.typ of
+                                                                                            Unknown ->
+                                                                                                D.map text string
+
+                                                                                            SheetId ->
+                                                                                                D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text id ])
+
+                                                                                            Link ->
+                                                                                                D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayBlock, S.wordBreakKeepAll, S.hyphensNone, S.maxWidthRem 18, S.fontStyleItalic ] [ text "link" ])
+
+                                                                                            Image ->
+                                                                                                D.string |> D.map (\src -> H.img [ A.src src ] [])
+
+                                                                                            Text ->
+                                                                                                D.map text string
+
+                                                                                            Boolean ->
+                                                                                                D.map (\c -> H.input [ A.type_ "checkbox", A.checked c ] []) D.bool
+
+                                                                                            Number ->
+                                                                                                D.map text string
+
+                                                                                            Delete ->
+                                                                                                D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])
+
+                                                                                            Create ->
+                                                                                                D.value |> D.map (\val -> H.button [ A.onClick (DocNew val) ] [ text "add to library" ])
+
+                                                                                            Form form ->
+                                                                                                D.map3
+                                                                                                    (\method action fields ->
+                                                                                                        -- TODO: Change this to displayGrid
+                                                                                                        H.form [ A.onSubmit NoOp, S.displayGrid, S.gridTemplateColumns "auto 1fr", S.paddingRem 1 ] <|
+                                                                                                            List.concat
+                                                                                                                [ List.concatMap
+                                                                                                                    (\field ->
+                                                                                                                        [ H.label [] [ text field.label ]
+                                                                                                                        , H.input [] []
+                                                                                                                        ]
+                                                                                                                    )
+                                                                                                                    fields
+                                                                                                                , [ H.span [] []
+                                                                                                                  , H.button [ A.type_ "submit" ] [ text method ]
+                                                                                                                  ]
+                                                                                                                ]
+                                                                                                    )
+                                                                                                    (D.field "method" D.string)
+                                                                                                    (D.field "action" D.string)
+                                                                                                    (D.field "fields"
+                                                                                                        (D.list
+                                                                                                            (D.map (\label -> { label = label })
+                                                                                                                (D.field "label" D.string)
+                                                                                                            )
+                                                                                                        )
+                                                                                                    )
+
+                                                                                            _ ->
+                                                                                                D.map text string
+                                                                                        )
+                                                                                    )
+                                                                                |> Result.map (Maybe.withDefault (text ""))
+                                                                                |> Result.mapError (D.errorToString >> text)
+                                                                                |> result
+                                                                            ]
+                                                            )
+                                                            (Array.toList cols)
+                                                            ++ [ case sheet.doc of
+                                                                    Ok (Tab _) ->
+                                                                        H.th
+                                                                            [ A.onClick (DocMsg (TabMsg SheetColumnPush))
+                                                                            , S.textAlignLeft
+                                                                            , S.widthRem 0.001
+                                                                            , S.whiteSpaceNowrap
+                                                                            , S.opacity "0.5"
+                                                                            ]
+                                                                            [ text (iif (n == 0) "+" "") ]
+
+                                                                    _ ->
+                                                                        text ""
+                                                               ]
                                                 )
                                             <|
                                                 Array.append (Array.initialize 3 (always Dict.empty)) <|
@@ -1419,13 +1421,12 @@ view ({ sheet } as model) =
                                             List.map
                                                 (\( label, msg ) ->
                                                     H.tr [ A.onClick msg ] <|
-                                                        (::) (H.th [ S.displayNone ] [ text "" ]) <|
-                                                            (::) (H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text label ]) <|
-                                                                List.map (\typ -> H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text typ ])
-                                                                    [ "text"
-                                                                    , "list text"
-                                                                    , ""
-                                                                    ]
+                                                        (::) (H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text label ]) <|
+                                                            List.map (\typ -> H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text typ ])
+                                                                [ "text"
+                                                                , "list text"
+                                                                , ""
+                                                                ]
                                                 )
                                                 [ ( "table:...", DocNewTable )
                                                 , ( "query:...", DocNewQuery )
@@ -1433,9 +1434,8 @@ view ({ sheet } as model) =
 
                                         Ok (Tab _) ->
                                             [ H.tr [ A.onClick (DocMsg (TabMsg (SheetRowPush (Array.length rows)))) ] <|
-                                                (::) (H.th [ S.displayNone ] [ text "" ]) <|
-                                                    List.indexedMap (\i col -> H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text (typeName col.typ) ]) <|
-                                                        Array.toList cols
+                                                List.indexedMap (\i col -> H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text (typeName col.typ) ]) <|
+                                                    Array.toList cols
                                             ]
 
                                         _ ->
@@ -1443,7 +1443,7 @@ view ({ sheet } as model) =
                                 ]
                     ]
                 ]
-            , H.aside [ S.displayFlex, S.flexDirectionColumn, S.maxWidth "33vw", S.maxHeight "100vh", S.height "100%", S.backgroundColor "black" ] <|
+            , H.aside [ S.displayFlex, S.flexDirectionColumn, S.maxWidth "33vw", S.maxHeight "100vh", S.height "100%", S.backgroundColor "#fff", S.borderLeft "1px solid #000" ] <|
                 case sheet.doc of
                     Ok (Tab _) ->
                         -- -- TODO: Conversational AI interface.
