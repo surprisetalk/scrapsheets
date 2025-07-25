@@ -1355,7 +1355,7 @@ view ({ sheet } as model) =
                                                                                                     D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])
 
                                                                                                 Create ->
-                                                                                                    D.value |> D.map (\val -> H.button [ A.onClick (DocNew val) ] [ text "create" ])
+                                                                                                    D.value |> D.map (\val -> H.button [ A.onClick (DocNew val) ] [ text "add to library" ])
 
                                                                                                 Form form ->
                                                                                                     D.map3
@@ -1424,19 +1424,7 @@ view ({ sheet } as model) =
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.maxWidth "33vw", S.maxHeight "100vh", S.height "100%", S.backgroundColor "black" ] <|
                 case sheet.doc of
                     Ok Library ->
-                        [ H.div [ S.paddingRem 1, S.displayFlex, S.flexDirectionColumn, S.gapRem 1 ]
-                            [ H.ul [ S.whiteSpaceNowrap, S.lineHeightRem 1.75 ]
-                                -- TODO: [ H.li [] [ H.a [ A.href "#todo" ] [ text "my account" ] ]
-                                -- TODO: [ H.li [] [ H.a [ A.href "/table:tutorial" ] [ text "tutorial" ] ]
-                                [ H.li [] [ H.a [ A.href "/shop" ] [ text "shop" ] ]
-                                , H.li [] [ H.button [ A.onClick DocNewTable ] [ text "new table" ] ]
-                                , H.li [] [ H.button [ A.onClick DocNewQuery ] [ text "new query" ] ]
-
-                                -- TODO: github
-                                -- TODO: support/contact email
-                                ]
-                            ]
-                        ]
+                        []
 
                     Ok (Tab _) ->
                         -- -- TODO: Conversational AI interface.

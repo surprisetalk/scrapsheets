@@ -1158,7 +1158,7 @@ app.get("/shop", async c => {
       [
         { name: "id", type: "sheet_id", key: "id" },
         { name: "name", type: "text", key: "id" },
-        { name: "save", type: "create", key: "data" },
+        { name: "add to library", type: "create", key: "data" },
       ] as unknown as Row<Col>,
       ...Object.entries(examples).map(([k, v]) => ({ id: k, data: v })),
     ],
