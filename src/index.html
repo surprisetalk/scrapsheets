@@ -441,12 +441,44 @@
                   "taylor.town",
                 ),
                 "query:hackernews-top": QuerySql(
-                  {},
-                  "select * from @(http('https://corsproxy.io/?url=https://hnrss.org/frontpage.jsonfeed')->res->items)",
+                  {
+                    title: "text",
+                    author: "text",
+                    hn_url: "link",
+                    url: "link",
+                    published_at: "datetime",
+                  },
+                  "" +
+                    "search items/ return (" +
+                    "\n  title," +
+                    "\n  author->name as author," +
+                    "\n  external_url as hn_url," +
+                    "\n  url," +
+                    "\n  date_published as published_at" +
+                    "\n)" +
+                    "\nfrom http('https://corsproxy.io/?url=https://hnrss.org/frontpage.jsonfeed')",
                 ),
                 "query:arxiv-search": QuerySql(
-                  {},
-                  "select * from @(http('https://export.arxiv.org/api/query', @{search_query:('all:' || (@params->(''))), max_results:25})->res->entries)",
+                  {
+                    id: "link",
+                    title: "text",
+                    summary: "text",
+                    published: "datetime",
+                    updated: "datetime",
+                    authors: "text",
+                    cat: "text",
+                  },
+                  "" +
+                    "search entries/ return (" +
+                    "\n  id," +
+                    "\n  categories as cat," +
+                    "\n  title," +
+                    "\n  summary," +
+                    "\n  authors," +
+                    "\n  published," +
+                    "\n  updated" +
+                    "\n)" +
+                    "\nfrom http('https://export.arxiv.org/api/query', @{search_query:('all:' || (@params->(''))), max_results:25})",
                 ),
                 "query:wikipedia-search": QuerySql(
                   {},
