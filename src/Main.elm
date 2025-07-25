@@ -1080,7 +1080,7 @@ view ({ sheet } as model) =
     { title = "scrapsheets"
     , body =
         [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
-        , H.node "style" [] [ text "body { font-family: \"Source Code Pro\", monospace; font-optical-sizing: auto; height: 100vh; width: 100vw; }" ]
+        , H.node "style" [] [ text "body { font-family: sans-serif; font-optical-sizing: auto; height: 100vh; width: 100vw; }" ]
         , H.node "style" [] [ text "table { background: #fff; }" ]
         , H.node "style" [] [ text "th, td { padding: 0.1rem 0.25rem; font-weight: normal; border: 1px solid #aaa; height: 1rem; vertical-align: top; }" ]
         , H.node "style" [] [ text "tr > :first-child { border-left: none; padding-left: 0.5rem; }" ]
@@ -1089,7 +1089,7 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text "td:hover { background: rgba(0,0,0,0.025); }" ]
         , H.node "style" [] [ text ".r0 { position: sticky; top: -1px; background: #f6f6f6; z-index: 1; }" ]
         , H.node "style" [] [ text ".selected { background: rgba(0,0,0,0.05); }" ]
-        , H.node "style" [] [ text ".code { background: #fff; }" ]
+        , H.node "style" [] [ text "#code { font-family: monospace; background: #fff; }" ]
 
         -- , H.node "style" [] [ text "thead tr td { position: sticky; top: 0; }" ]
         -- , H.node "style" [] [ text "tfoot tr:last-child td { position: sticky; bottom: 0; }" ]
