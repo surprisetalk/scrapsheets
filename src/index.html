@@ -74,12 +74,13 @@
           data: [cols, ...rows],
         });
 
-        const QuerySql = (code, ...examples) => ({
+        const QuerySql = (cols, code, ...examples) => ({
           type: "query",
           data: [
             {
               lang: "sql",
               code,
+              cols,
               args: {},
               examples,
             },
@@ -158,23 +159,30 @@
               //   ],
               // ),
               "query:http-get": QuerySql(
+                {},
                 "select http('https://taylor.town/random')->res as random_number",
               ),
-              // "query:python": QuerySql(
+              // "query:python": QuerySql({},
               //   "return [[{'name':'a','type':'text','key':'a'}], {'a':1}, {'a':2}, {'a':3}]",
               // ),
-              // "query:stonks": QuerySql(
+              // "query:stonks": QuerySql({},
               //   "select stonks->>'id', stonks->>'price' from http('https://taylor.town/stonks'), json(res) stonks",
               // ),
               // TODO: Move these to the shop.
               ...{
                 "query:bluesky-actors": QuerySql(
+                  {
+                    avatar: "image",
+                    did: "link",
+                    handle: "text",
+                    displayName: "text",
+                  },
                   "" +
-                    "search actors/ as @a return (" +
-                    "\n  image(@a->avatar) as avatar," +
-                    "\n  link('http://bsky.app/profile/'||(@a->did)) as did," +
-                    "\n  @a->handle as handle," +
-                    "\n  @a->displayName as displayName" +
+                    "search actors/ return (" +
+                    "\n  avatar," +
+                    "\n  'http://bsky.app/profile/'||(@a->did) as did," +
+                    "\n  handle," +
+                    "\n  displayName" +
                     "\n)" +
                     "\nfrom http(" +
                     "\n  'https://public.api.bsky.app/xrpc/app.bsky.actor.searchActors'," +
@@ -184,15 +192,24 @@
                   "memes",
                 ),
                 "query:github-repos": QuerySql(
+                  {
+                    repo: "link",
+                    full_name: "text",
+                    description: "text",
+                    lang: "text",
+                    license: "text",
+                    stargazers: "int",
+                    open_issues: "int",
+                  },
                   "" +
-                    "search items/ as @x return (" +
-                    "\n  link('http://github.com/'||(@x->full_name)) as repo," +
-                    "\n  @x->full_name as name," +
-                    "\n  @x->description as description," +
-                    "\n  @x->language as lang," +
-                    "\n  @x->license->key as license," +
-                    "\n  (@x->stargazers_count)::int as stargazers," +
-                    "\n  (@x->open_issues_count)::int as open_issues" +
+                    "search items/ return (" +
+                    "\n  'http://github.com/'||(@x->full_name) as repo," +
+                    "\n  full_name," +
+                    "\n  description," +
+                    "\n  language as lang," +
+                    "\n  license->key as license," +
+                    "\n  stargazers_count as stargazers," +
+                    "\n  open_issues_count as open_issues" +
                     "\n)" +
                     "\nfrom http(" +
                     "\n  'https://api.github.com/search/repositories'," +
@@ -220,12 +237,18 @@
                   "is:sponsorable",
                 ),
                 "query:github-users": QuerySql(
+                  {
+                    avatar: "image",
+                    url: "link",
+                    handle: "text",
+                    type: "text",
+                  },
                   "" +
                     "search items/ as @x return (" +
-                    "\n  image(@x->avatar_url) as avatar," +
-                    "\n  link(@x->url) as url," +
-                    "\n  @x->login as handle," +
-                    "\n  @x->type as type" +
+                    "\n  avatar_url as avatar," +
+                    "\n  url," +
+                    "\n  login as handle," +
+                    "\n  type" +
                     "\n)" +
                     "\nfrom http(" +
                     "\n  'https://api.github.com/search/users'," +
@@ -249,24 +272,48 @@
                   "followers:>=1000",
                   "is:sponsorable",
                 ),
-                // "query:github-commits": QuerySql(
+                // "query:github-commits": QuerySql({},
                 //   "select * from @(http('https://api.github.com/search/commits', @{q:(@params->(''))})->res->items)",
                 //   "repo:tekknolagi/scrapscript",
                 //   "surprisetalk",
                 // ),
                 "query:github-prs-issues": QuerySql(
+                  {
+                    id: "text",
+                    number: "number",
+                    title: "text",
+                    url: "link",
+                    avatar: "image",
+                    login: "text",
+                    labels: "text",
+                    state: "text",
+                    locked: "bool",
+                    assignee_avatar: "image",
+                    assignee_login: "text",
+                    milestone: "text",
+                    comments: "text",
+                    created_at: "datetime",
+                    updated_at: "datetime",
+                    closed_at: "datetime",
+                    author_association: "text",
+                    type: "text",
+                    draft: "text",
+                    html_url: "link",
+                    body: "text",
+                    reactions: "text",
+                  },
                   "" +
                     "search items/ as @x labels/ as @label return (" +
                     "\n  @x->id as id," +
                     "\n  @x->number as number," +
                     "\n  @x->title as title," +
-                    "\n  link(@x->html_url) as url," +
-                    "\n  image(@x->user->avatar_url) as avatar," +
+                    "\n  @x->html_url as url," +
+                    "\n  @x->user->avatar_url as avatar," +
                     "\n  @x->user->login as login," +
                     "\n  @label->name as labels," +
                     "\n  @x->state as state," +
                     "\n  @x->locked as locked," +
-                    "\n  image(@x->assignee->avatar_url) as assignee_avatar," +
+                    "\n  @x->assignee->avatar_url as assignee_avatar," +
                     "\n  @x->assignee->login as assignee_login," +
                     "\n  @x->milestone as milestone," +
                     "\n  @x->comments as comments," +
@@ -311,19 +358,32 @@
                   "sort=updated",
                 ),
                 "query:crypto-markets": QuerySql(
+                  {
+                    image: "image",
+                    rank: "int",
+                    name: "text",
+                    symbol: "text",
+                    price: "usd",
+                    market_cap: "usd",
+                    high_24h: "usd",
+                    low_24h: "usd",
+                    change_24h: "usd",
+                    ath: "usd",
+                    ath_date: "datetime",
+                  },
                   "" +
                     "search / return (" +
-                    "\n  image(image) as image," +
-                    "\n  int(market_cap_rank) as rank," +
+                    "\n  image," +
+                    "\n  market_cap_rank as rank," +
                     "\n  name," +
                     "\n  symbol," +
-                    "\n  usd(current_price) as price," +
-                    "\n  usd(market_cap) as market_cap," +
-                    "\n  usd(high_24h) as high_24h," +
-                    "\n  usd(low_24h) as low_24h," +
-                    "\n  percentage(price_change_percentage_24h) as change_24h," +
-                    "\n  usd(ath) as ath," +
-                    "\n  date(ath_date)" +
+                    "\n  current_price as price," +
+                    "\n  market_cap," +
+                    "\n  high_24h," +
+                    "\n  low_24h," +
+                    "\n  price_change_percentage_24h as change_24h," +
+                    "\n  ath," +
+                    "\n  ath_date" +
                     "\n)" +
                     "\nfrom http(" +
                     "\n  'https://api.coingecko.com/api/v3/coins/markets'," +
@@ -331,64 +391,116 @@
                     "\n)",
                 ),
                 "query:crypto-search": QuerySql(
-                  "select thumb::image as thumb, symbol, name, market_cap_rank from @(http('https://api.coingecko.com/api/v3/search', @{`query`:(@params->(''))})->res->coins)",
+                  {
+                    thumb: "image",
+                    rank: "int",
+                    name: "text",
+                    symbol: "text",
+                  },
+                  "" +
+                    "search coins/ return (" +
+                    "\n  market_cap_rank as rank," +
+                    "\n  thumb," +
+                    "\n  symbol," +
+                    "\n  name" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://api.coingecko.com/api/v3/search'," +
+                    "\n  @{`query`:(coalesce(@params->(''),'bitcoin'))}" +
+                    "\n)",
                   "bitcoin",
                   "ethereum",
                   "doge",
                 ),
                 "query:hackernews-search": QuerySql(
-                  "select * from @(http('https://hn.algolia.com/api/v1/search', @{`query`:(@params->(''))})->res->hits)",
+                  {
+                    id: "text",
+                    url: "link",
+                    title: "text",
+                    author: "text",
+                    points: "num",
+                    comments: "num",
+                    created_at: "datetime",
+                    updated_at: "datetime",
+                  },
+                  "" +
+                    "search hits/ return (" +
+                    "\n  story_id as id," +
+                    "\n  url," +
+                    "\n  title," +
+                    "\n  author," +
+                    "\n  points," +
+                    "\n  num_comments as comments," +
+                    "\n  created_at," +
+                    "\n  updated_at" +
+                    "\n)" +
+                    "\nfrom http(" +
+                    "\n  'https://hn.algolia.com/api/v1/search'," +
+                    "\n  @{`query`:(coalesce(@params->(''),'example'))}" +
+                    "\n)",
                   "taylor.town",
                 ),
                 "query:hackernews-top": QuerySql(
+                  {},
                   "select * from @(http('https://corsproxy.io/?url=https://hnrss.org/frontpage.jsonfeed')->res->items)",
                 ),
                 "query:arxiv-search": QuerySql(
+                  {},
                   "select * from @(http('https://export.arxiv.org/api/query', @{search_query:('all:' || (@params->(''))), max_results:25})->res->entries)",
                 ),
                 "query:wikipedia-search": QuerySql(
+                  {},
                   "search / from @(http('https://en.wikipedia.org/w/api.php', @{action:'query', generator:'search', prop:'pageimages|url', exintro:'', explaintext:'', `gsrsearch`:(@params->('')), limit:25, format:'json', origin:'*'})->res->`query`->`pages`)",
                 ),
                 "query:reddit-search": QuerySql(
+                  {},
                   "search /data from @(http('https://www.reddit.com/search.json', @{q:(@params->('')), limit:25})->res->data->children)",
                 ),
                 "query:reddit-subreddit": QuerySql(
+                  {},
                   "search /data from @(http('https://www.reddit.com/r/'||(@params->r->(0))||'.json', @{limit:25})->res->data->children)",
                   "r=hmmm",
                 ),
                 "query:manifold-search": QuerySql(
+                  {},
                   "select * from @(http('https://api.manifold.markets/v0/search-markets', @{term:(@params->('')), limit:20})->res)",
                 ),
                 "query:manifold-trending": QuerySql(
+                  {},
                   "select * from @(http('https://api.manifold.markets/v0/markets', @{limit:20})->res)",
                 ),
-                // "query:fred-search": QuerySql(
+                // "query:fred-search": QuerySql({},
                 //   "select * from @(http('https://corsproxy.io/?url=https://api.stlouisfed.org/fred/series/search', @{search_text:(@params->('')), file_type:'json'})->res)"
                 // ),
                 "query:stocks-search": QuerySql(
+                  {},
                   "select * from @(http('https://corsproxy.io/?url=https://query1.finance.yahoo.com/v1/finance/search', @{q:(@params->(''))})->res->news)",
                   "AAPL",
                 ),
-                // "query:discogs-search": QuerySql(
+                // "query:discogs-search": QuerySql({},
                 //   "select * from @(http('https://api.discogs.com/database/search', @{q:(@params->('')), type:'release'})->res)"
                 // ),
                 "query:speedrun-games": QuerySql(
+                  {},
                   "select * from @(http('https://www.speedrun.com/api/v1/games', @{name:(@params->(''))})->res->data)",
                   "mario",
                 ),
                 "query:speedrun-users": QuerySql(
+                  {},
                   "select * from @(http('https://www.speedrun.com/api/v1/users', @{name:(@params->(''))})->res->data)",
                   "mario",
                 ),
-                // "query:youtube-search": QuerySql(
+                // "query:youtube-search": QuerySql({},
                 //   "select * from @(http('https://www.googleapis.com/youtube/v3/search', @{part:'snippet', q:(@params->('')), key:'YOUR_API_KEY', maxResults:25})->res->items)",
                 //   "videogamedunkey"
                 // ),
                 "query:podcast-search": QuerySql(
+                  {},
                   "select * from @(http('https://itunes.apple.com/search', @{term:(@params->('')), media:'podcast', limit:25})->res->results)",
                   "articles of interest",
                 ),
                 "query:ossinsight-trends": QuerySql(
+                  {},
                   "select * from @(http('https://api.ossinsight.io/v1/trends/repos', @{keyword:(@params->(''))})->res->data->`rows`)",
                   "language=All period=past_24_hours",
                   "language=JavaScript period=past_3_months",
@@ -545,8 +657,7 @@
             return res;
           };
           const queryDoc = debounce(
-            catchy(async (id, { code, lang, args }) => {
-              console.log(id, code, lang, args);
+            catchy(async (id, { code, lang, args, cols: cols_ = {} }) => {
               switch (lang) {
                 case "sql":
                   // TODO: Run alasql if possible, otherwise post to /query.
@@ -564,13 +675,14 @@
                     [`set @params = ?`, [params]],
                     code,
                   ]);
+                  // TODO: If doc contains cols data, use that names and types.
                   app.ports.docQueried.send({
                     id,
                     data: [
                       cols.map(col => ({
-                        name: col.columnid,
                         key: col.columnid,
-                        type: null,
+                        name: col.columnid,
+                        type: cols_?.[col.columnid] ?? null,
                       })),
                       ...rows,
                     ],

@@ -469,11 +469,13 @@ colDecoder =
                 , ( "number", Number )
                 , ( "num", Number )
                 , ( "int", Number )
+                , ( "usd", Number )
                 , ( "sheet_id", SheetId )
                 , ( "link", Link )
                 , ( "image", Image )
                 , ( "form", Form Dict.empty )
                 , ( "timestamp", Timestamp )
+                , ( "datetime", Timestamp )
                 , ( "json", Json )
                 , ( "text", Text )
                 , ( "string", Text )
@@ -1299,32 +1301,16 @@ view ({ sheet } as model) =
                                                                                         (D.maybe
                                                                                             (case col.typ of
                                                                                                 Unknown ->
-                                                                                                    D.oneOf
-                                                                                                        [ D.field "type" D.string
-                                                                                                            |> D.andThen
-                                                                                                                (\typ ->
-                                                                                                                    D.field "data" <|
-                                                                                                                        case typ of
-                                                                                                                            "link" ->
-                                                                                                                                D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayBlock, S.wordBreakKeepAll, S.hyphensNone, S.maxWidthRem 18 ] [ text href ])
-
-                                                                                                                            "image" ->
-                                                                                                                                D.string |> D.map (\src -> H.img [ A.src src ] [])
-
-                                                                                                                            _ ->
-                                                                                                                                D.map text string
-                                                                                                                )
-                                                                                                        , D.map text string
-                                                                                                        ]
+                                                                                                    D.map text string
 
                                                                                                 SheetId ->
                                                                                                     D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text id ])
 
                                                                                                 Link ->
-                                                                                                    D.string |> D.map (\href -> H.a [ A.href href, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text href ])
+                                                                                                    D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayBlock, S.wordBreakKeepAll, S.hyphensNone, S.maxWidthRem 18 ] [ text href ])
 
                                                                                                 Image ->
-                                                                                                    D.string |> D.map (\src -> H.img [ A.src src, S.width "100%", S.objectFitCover ] [])
+                                                                                                    D.string |> D.map (\src -> H.img [ A.src src ] [])
 
                                                                                                 Text ->
                                                                                                     D.map text string
