@@ -1079,7 +1079,6 @@ view ({ sheet } as model) =
     , body =
         [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
         , H.node "style" [] [ text "body { font-family: \"Source Code Pro\", monospace; font-optical-sizing: auto; height: 100vh; width: 100vw; }" ]
-        , H.node "style" [] [ text "tr th:first-child { opacity: 0.5; text-align: right; }" ]
         , H.node "style" [] [ text "th, td { padding: 0 0.25rem; font-weight: normal; border: 1px solid black; height: 1rem; vertical-align: top; }" ]
         , H.node "style" [] [ text "th > *, td > * { max-height: 6rem; }" ]
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { td { background: rgba(255,255,255,0.05); } }" ]
@@ -1089,6 +1088,9 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { .selected { background: rgba(255,255,255,0.1); } }" ]
         , H.node "style" [] [ text ".code { background: black; }" ]
         , H.node "style" [] [ text "@media (prefers-color-scheme: dark) { .code { background: white; } }" ]
+
+        -- , H.node "style" [] [ text "thead tr td { position: sticky; top: 0; }" ]
+        -- , H.node "style" [] [ text "tfoot tr:last-child td { position: sticky; bottom: 0; }" ]
         , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0, S.borderBottom "1px solid rgba(0,0,0,0.5)" ]
@@ -1180,25 +1182,14 @@ view ({ sheet } as model) =
                                                     <|
                                                         (::)
                                                             (H.th
-                                                                [ A.onClick (DocMsg (TabMsg (SheetRowPush n)))
+                                                                [ S.displayNone
+                                                                , A.onClick (DocMsg (TabMsg (SheetRowPush n)))
                                                                 , A.onMouseEnter (CellHover (xy -1 n))
                                                                 , S.textAlignRight
                                                                 , S.widthRem 0.001
                                                                 , S.whiteSpaceNowrap
                                                                 ]
-                                                                [ text <|
-                                                                    case String.fromInt n of
-                                                                        "-2" ->
-                                                                            ""
-
-                                                                        "-1" ->
-                                                                            ""
-
-                                                                        "0" ->
-                                                                            "+"
-
-                                                                        x ->
-                                                                            x
+                                                                [-- text (iif (n <= 0) "" (String.fromInt n))
                                                                 ]
                                                             )
                                                         <|
@@ -1237,6 +1228,9 @@ view ({ sheet } as model) =
                                                                             [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
                                                                             ]
                                                                         , case col.typ of
+                                                                            Create ->
+                                                                                S.textAlignRight
+
                                                                             Boolean ->
                                                                                 S.textAlignCenter
 
@@ -1252,6 +1246,9 @@ view ({ sheet } as model) =
                                                                             _ ->
                                                                                 S.textAlignLeft
                                                                         , case col.typ of
+                                                                            Create ->
+                                                                                S.widthRem 10
+
                                                                             Boolean ->
                                                                                 S.widthRem 0.5
 
@@ -1394,38 +1391,60 @@ view ({ sheet } as model) =
                                                                                     |> result
                                                                                 ]
                                                                 )
-                                                            <|
-                                                                Array.toList cols
+                                                                (Array.toList cols)
+                                                                ++ [ case sheet.doc of
+                                                                        Ok (Tab _) ->
+                                                                            H.th
+                                                                                [ A.onClick (DocMsg (TabMsg SheetColumnPush))
+                                                                                , S.textAlignLeft
+                                                                                , S.widthRem 0.001
+                                                                                , S.whiteSpaceNowrap
+                                                                                , S.opacity "0.5"
+                                                                                ]
+                                                                                [ text (iif (n == 0) "+" "") ]
+
+                                                                        _ ->
+                                                                            text ""
+                                                                   ]
                                                 )
                                             <|
                                                 Array.append (Array.initialize 3 (always Dict.empty)) <|
                                                     rows
-
-                                        -- TODO:
-                                        , case sheet.doc of
-                                            Ok Library ->
-                                                [ H.tr [] [ H.th [] [ text "+" ], H.td [ A.onClick DocNewTable, A.colspan 5, S.textAlignLeft, S.opacity "0.5" ] [ text "table:..." ] ]
-                                                , H.tr [] [ H.th [] [ text "+" ], H.td [ A.onClick DocNewQuery, A.colspan 5, S.textAlignLeft, S.opacity "0.5" ] [ text "query:..." ] ]
-                                                ]
-
-                                            Ok (Tab _) ->
-                                                [ H.tr [ A.onClick (DocMsg (TabMsg (SheetRowPush (Array.length rows)))) ] <|
-                                                    (::) (H.th [] [ text "+" ]) <|
-                                                        List.indexedMap (\i col -> H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text (typeName col.typ) ]) <|
-                                                            Array.toList cols
-                                                ]
-
-                                            _ ->
-                                                []
                                         ]
+
+                                -- TODO: These rows should always be stuck to the bottom of the window.
+                                , H.tfoot [] <|
+                                    case sheet.doc of
+                                        Ok Library ->
+                                            List.map
+                                                (\( label, msg ) ->
+                                                    H.tr [ A.onClick msg ] <|
+                                                        (::) (H.th [ S.displayNone ] [ text "" ]) <|
+                                                            (::) (H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text label ]) <|
+                                                                List.map (\typ -> H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text typ ])
+                                                                    [ "text"
+                                                                    , "list text"
+                                                                    , ""
+                                                                    ]
+                                                )
+                                                [ ( "table:...", DocNewTable )
+                                                , ( "query:...", DocNewQuery )
+                                                ]
+
+                                        Ok (Tab _) ->
+                                            [ H.tr [ A.onClick (DocMsg (TabMsg (SheetRowPush (Array.length rows)))) ] <|
+                                                (::) (H.th [ S.displayNone ] [ text "" ]) <|
+                                                    List.indexedMap (\i col -> H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text (typeName col.typ) ]) <|
+                                                        Array.toList cols
+                                            ]
+
+                                        _ ->
+                                            []
                                 ]
                     ]
                 ]
             , H.aside [ S.displayFlex, S.flexDirectionColumn, S.maxWidth "33vw", S.maxHeight "100vh", S.height "100%", S.backgroundColor "black" ] <|
                 case sheet.doc of
-                    Ok Library ->
-                        []
-
                     Ok (Tab _) ->
                         -- -- TODO: Conversational AI interface.
                         -- [ H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 1, S.marginBottomRem 1.5, S.opacity "0.8" ]
@@ -1437,12 +1456,7 @@ view ({ sheet } as model) =
                         -- , H.textarea [] []
                         -- , H.button [] [ text "send (⌘⏎)" ]
                         -- ]
-                        [ H.div [ S.paddingRem 1, S.displayFlex, S.flexDirectionColumn, S.gapRem 1 ]
-                            [ H.ul [ S.whiteSpaceNowrap, S.lineHeightRem 1.75 ]
-                                [ H.li [] [ H.button [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "new column" ] ]
-                                ]
-                            ]
-                        ]
+                        []
 
                     Ok (Query query) ->
                         [ H.textarea [ A.id "code", A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75, S.minWidth "25vw", S.width "100%", S.border "none", S.backgroundColor "transparent", S.paddingRem 1, S.lineHeightRem 1.5 ]

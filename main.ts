@@ -147,7 +147,7 @@ const examples = {
   //     [["n"], { o: "p" }, { q: [], r: ["s", "t"] }],
   //   ],
   // ),
-  "query:http-get": QuerySql(
+  "simple http get": QuerySql(
     {},
     "select http('https://taylor.town/random')->res as random_number",
   ),
@@ -157,7 +157,7 @@ const examples = {
   // "query:stonks": QuerySql({},
   //   "select stonks->>'id', stonks->>'price' from http('https://taylor.town/stonks'), json(res) stonks",
   // ),
-  "query:bluesky-actors": QuerySql(
+  "bluesky users": QuerySql(
     {
       avatar: "image",
       did: "link",
@@ -178,7 +178,7 @@ const examples = {
     "taylor.town",
     "memes",
   ),
-  "query:github-repos": QuerySql(
+  "github repo": QuerySql(
     {
       repo: "link",
       full_name: "text",
@@ -223,7 +223,7 @@ const examples = {
     "good-first-issues:>n",
     "is:sponsorable",
   ),
-  "query:github-users": QuerySql(
+  "github users": QuerySql(
     {
       avatar: "image",
       url: "link",
@@ -264,7 +264,7 @@ const examples = {
   //   "repo:tekknolagi/scrapscript",
   //   "surprisetalk",
   // ),
-  "query:github-prs-issues": QuerySql(
+  "github prs/issues": QuerySql(
     {
       id: "text",
       number: "number",
@@ -344,7 +344,7 @@ const examples = {
     "sort=reactions-smile",
     "sort=updated",
   ),
-  "query:crypto-markets": QuerySql(
+  "crypto markets": QuerySql(
     {
       image: "image",
       rank: "int",
@@ -377,7 +377,7 @@ const examples = {
       "\n  @{vs_currency:'usd', `order`:'market_cap_desc', per_page:100}" +
       "\n)",
   ),
-  "query:crypto-search": QuerySql(
+  "crypto search": QuerySql(
     {
       thumb: "image",
       rank: "int",
@@ -399,7 +399,7 @@ const examples = {
     "ethereum",
     "doge",
   ),
-  "query:hackernews-search": QuerySql(
+  "hackernews search": QuerySql(
     {
       id: "text",
       url: "link",
@@ -427,7 +427,7 @@ const examples = {
       "\n)",
     "taylor.town",
   ),
-  "query:hackernews-top": QuerySql(
+  "hackernews frontpage": QuerySql(
     {
       title: "text",
       author: "text",
@@ -445,7 +445,7 @@ const examples = {
       "\n)" +
       "\nfrom http('https://corsproxy.io/?url=https://hnrss.org/frontpage.jsonfeed')",
   ),
-  "query:arxiv-search": QuerySql(
+  "arxiv search": QuerySql(
     {
       id: "link",
       title: "text",
@@ -470,7 +470,7 @@ const examples = {
       "\n  @{search_query:('all:' || (@params->(''))), max_results:25}" +
       "\n)",
   ),
-  "query:wikipedia-search": QuerySql(
+  "wikipedia search": QuerySql(
     { i: "number", thumb: "image", title: "text", url: "link" },
     "" +
       "search `query` pages / return (" +
@@ -497,7 +497,7 @@ const examples = {
       "\n   }" +
       "\n)",
   ),
-  "query:reddit-search": QuerySql(
+  "reddit search": QuerySql(
     {
       preview: "image",
       ups: "int",
@@ -544,7 +544,7 @@ const examples = {
       "\n  @{q:(@params->('')), limit:25}" +
       "\n)",
   ),
-  "query:reddit-subreddit": QuerySql(
+  "subreddit posts": QuerySql(
     {
       preview: "image",
       ups: "int",
@@ -592,7 +592,7 @@ const examples = {
       "\n)",
     "hmmm",
   ),
-  "query:manifold-search": QuerySql(
+  "manifold search": QuerySql(
     {
       creatorAvatarUrl: "image",
       url: "link",
@@ -646,7 +646,7 @@ const examples = {
       "\n  @{term:(@params->('')), limit:25}" +
       "\n)",
   ),
-  "query:manifold-trending": QuerySql(
+  "manifold trending": QuerySql(
     {
       creatorAvatarUrl: "image",
       url: "link",
@@ -704,7 +704,7 @@ const examples = {
   // "query:fred-search": QuerySql({},
   //   "select * from @(http('https://corsproxy.io/?url=https://api.stlouisfed.org/fred/series/search', @{search_text:(@params->('')), file_type:'json'})->res)"
   // ),
-  "query:stocks-search": QuerySql(
+  "yahoo finance news": QuerySql(
     {
       link: "link",
       thumb: "image",
@@ -731,7 +731,7 @@ const examples = {
   // "query:discogs-search": QuerySql({},
   //   "select * from @(http('https://api.discogs.com/database/search', @{q:(@params->('')), type:'release'})->res)"
   // ),
-  "query:speedrun-games": QuerySql(
+  "speedrun.com games": QuerySql(
     {
       thumb: "image",
       url: "link",
@@ -751,7 +751,7 @@ const examples = {
     "mario",
     "zelda",
   ),
-  "query:speedrun-users": QuerySql(
+  "speedrun.com users": QuerySql(
     {
       url: "link",
       thumb: "image",
@@ -784,7 +784,7 @@ const examples = {
   //   "select * from @(http('https://www.googleapis.com/youtube/v3/search', @{part:'snippet', q:(@params->('')), key:'YOUR_API_KEY', maxResults:25})->res->items)",
   //   "videogamedunkey"
   // ),
-  "query:podcast-search": QuerySql(
+  "apple podcast search": QuerySql(
     {
       artistName: "text",
       collectionName: "text",
@@ -824,7 +824,7 @@ const examples = {
       "\n)",
     "articles of interest",
   ),
-  "query:ossinsight-trends": QuerySql(
+  "ossinsights.io trends": QuerySql(
     {
       repo: "text",
       lang: "text",
@@ -1156,15 +1156,14 @@ app.get("/shop", async c => {
   return page(c)({
     data: [
       [
+        { name: "name", type: "text", key: "name" },
         { name: "price", type: "usd", key: "price" },
-        { name: "id", type: "sheet_id", key: "id" },
-        { name: "name", type: "text", key: "id" },
         { name: "", type: "create", key: "data" },
       ] as unknown as Row<Col>,
       ...Object.entries(examples).map(([k, v]) => ({
-        id: k,
+        name: k,
         price: 0,
-        data: v,
+        data: { ...v, name: k },
       })),
     ],
     offset: 0,

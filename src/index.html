@@ -296,12 +296,12 @@
           changeId(window.location.pathname.slice(1));
 
           app.ports.newDoc.subscribe(
-            catchy(async ({ type, data }) => {
+            catchy(async ({ name, type, data }) => {
               // TODO: Remove existing listeners.
               sheet = repo?.create({ type, data });
               const id = `${type}:${sheet.documentId}`;
-              Library.set(id, { name: "", tags: [] });
-              await selectDoc(id, sheet);
+              Library.set(id, { name: name ?? "", tags: [] });
+              window.location = `/${id}`;
             }),
           );
 
