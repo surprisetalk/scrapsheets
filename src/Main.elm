@@ -1096,9 +1096,10 @@ view ({ sheet } as model) =
         , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0, S.borderBottom "1px solid #000" ]
-                    [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsBaseline, S.whiteSpaceNowrap, S.gapRem 0.5, S.padding "0.5rem 0 0.5rem 0.5rem" ] <|
+                    [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsCenter, S.whiteSpaceNowrap, S.gapRem 0.5, S.padding "0.75rem 0 0.75rem 0.5rem" ] <|
                         List.concat
-                            [ [ H.a [ A.href "/", S.fontWeight "900" ] [ text "scrapsheets", H.sup [] [ text "" ] ]
+                            [ [ H.a [ A.href "/", S.fontWeight "900", S.fontSizeRem 1.5, S.heightRem 1, S.lineHeight "0.5", S.marginRightRem -0.25 ] [ text "⊞" ]
+                              , H.a [ A.href "/", S.fontWeight "900" ] [ text "scrapsheets" ]
                               , text "/"
                               ]
                             , iif (sheet.id == "")
