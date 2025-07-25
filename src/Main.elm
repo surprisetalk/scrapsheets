@@ -1082,7 +1082,7 @@ view ({ sheet } as model) =
         [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
         , H.node "style" [] [ text "body { font-family: sans-serif; font-optical-sizing: auto; height: 100vh; width: 100vw; }" ]
         , H.node "style" [] [ text "table { background: #fff; }" ]
-        , H.node "style" [] [ text "th, td { padding: 0.1rem 0.25rem; font-weight: normal; border: 1px solid #aaa; height: 1rem; vertical-align: top; }" ]
+        , H.node "style" [] [ text "th, td { padding: 0.1rem 0.25rem; padding-top: 0.25rem; font-weight: normal; border: 1px solid #aaa; height: 1rem; vertical-align: top; }" ]
         , H.node "style" [] [ text "tr > :first-child { border-left: none; padding-left: 0.5rem; }" ]
         , H.node "style" [] [ text "tr > :last-child { border-right: none; padding-right: 0.5rem; }" ]
         , H.node "style" [] [ text "th > *, td > * { max-height: 6rem; text-overlow: ellipsis; }" ]
@@ -1098,7 +1098,7 @@ view ({ sheet } as model) =
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0, S.borderBottom "1px solid #000" ]
                     [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsCenter, S.whiteSpaceNowrap, S.gapRem 0.5, S.padding "0.75rem 0 0.75rem 0.5rem" ] <|
                         List.concat
-                            [ [ H.a [ A.href "/", S.fontWeight "900", S.fontSizeRem 1.5, S.heightRem 1, S.lineHeight "0.5", S.marginRightRem -0.25 ] [ text "⊞" ]
+                            [ [ H.a [ A.href "/", S.fontWeight "900", S.fontSizeRem 1.5, S.heightRem 1, S.lineHeight "0.55", S.marginRightRem -0.25 ] [ text "⊞" ]
                               , H.a [ A.href "/", S.fontWeight "900" ] [ text "scrapsheets" ]
                               , text "/"
                               ]
