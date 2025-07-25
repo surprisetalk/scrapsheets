@@ -85,7 +85,7 @@ port changeDoc : Idd (List Patch) -> Cmd msg
 port notifyDoc : Idd E.Value -> Cmd msg
 
 
-port queryDoc : Idd { lang : String, code : String } -> Cmd msg
+port queryDoc : Idd { lang : String, code : String, cols : D.Value } -> Cmd msg
 
 
 port docSelected : (Idd { doc : D.Value } -> msg) -> Sub msg
@@ -255,6 +255,7 @@ type alias Query_ =
     , code : String
     , args : Args
     , examples : List String
+    , cols : D.Value
     }
 
 
@@ -439,12 +440,13 @@ docDecoder =
                         D.field "data" <|
                             D.index 0 <|
                                 D.map Query
-                                    (D.map4 Query_
+                                    (D.map5 Query_
                                         (D.field "lang" langDecoder)
                                         (D.field "code" D.string)
                                         -- TODO
                                         (D.maybe (D.field "args" (D.succeed Dict.empty)) |> D.map (Maybe.withDefault Dict.empty))
                                         (D.maybe (D.field "examples" (D.list D.string)) |> D.map (Maybe.withDefault []))
+                                        (D.field "cols" D.value)
                                     )
 
                     typ_ ->
@@ -828,7 +830,7 @@ update msg ({ sheet } as model) =
                 , case sheet.doc of
                     Ok (Query query) ->
                         -- TODO: Lang to string.
-                        queryDoc (Idd sheet.id { lang = "sql", code = query.code })
+                        queryDoc (Idd sheet.id { lang = "sql", code = query.code, cols = query.cols })
 
                     _ ->
                         Cmd.none
