@@ -1156,11 +1156,16 @@ app.get("/shop", async c => {
   return page(c)({
     data: [
       [
+        { name: "price", type: "usd", key: "price" },
         { name: "id", type: "sheet_id", key: "id" },
         { name: "name", type: "text", key: "id" },
-        { name: "add to library", type: "create", key: "data" },
+        { name: "", type: "create", key: "data" },
       ] as unknown as Row<Col>,
-      ...Object.entries(examples).map(([k, v]) => ({ id: k, data: v })),
+      ...Object.entries(examples).map(([k, v]) => ({
+        id: k,
+        price: 0,
+        data: v,
+      })),
     ],
     offset: 0,
     count: Object.keys(examples).length,
