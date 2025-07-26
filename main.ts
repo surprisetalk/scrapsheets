@@ -1075,7 +1075,7 @@ export const app = new Hono<{
 app.use("*", logger());
 
 // TODO: Add a storage adapter. Persist somewhere -- doesn't really matter where.
-// TODO: Connect the network adapetr to the websocket.
+// TODO: Connect the network adapter to the websocket.
 // TODO: https://github.com/automerge/automerge-repo-sync-server/blob/main/src/server.js
 // TODO: Configure the port.
 export const automerge = new Repo({
@@ -1093,6 +1093,94 @@ app.get(
       onOpen: undefined,
       onMessage: undefined,
       onClose: undefined,
+      onError: undefined,
+    };
+  }),
+);
+
+// TODO:
+app.get(
+  "/portal/time/sync",
+  upgradeWebSocket(c => {
+    const { auth } = c.req.query(); // TODO: Verify Bearer token on auth.
+    let interval: any;
+    return {
+      onOpen: (_event, ws) => {
+        interval = setInterval(
+          () =>
+            ws.send(
+              JSON.stringify({
+                type: "table",
+                data: [
+                  [{ key: 0, name: "time", type: "int" }],
+                  { 0: new Date().getTime() },
+                ],
+              }),
+            ),
+          10,
+        );
+      },
+      onMessage: undefined,
+      onClose: () => clearInterval(interval),
+      onError: undefined,
+    };
+  }),
+);
+
+app.get(
+  "/portal/stonks/sync",
+  upgradeWebSocket(c => {
+    const { auth } = c.req.query(); // TODO: Verify Bearer token on auth.
+    const stonks: Record<string, number> = {
+      AAPL: 645.32,
+      MSFT: 412.78,
+      GOOGL: 823.45,
+      AMZN: 567.91,
+      NVDA: 789.23,
+      META: 345.67,
+      TSLA: 892.14,
+      BRKB: 234.56,
+      JPM: 478.9,
+      V: 656.23,
+      JNJ: 321.45,
+      WMT: 754.89,
+      PG: 423.67,
+      UNH: 587.12,
+      HD: 698.34,
+      DIS: 276.45,
+      MA: 812.56,
+      PYPL: 389.78,
+      BAC: 523.91,
+      NFLX: 734.23,
+      ADBE: 456.78,
+      CRM: 621.34,
+      PFE: 298.56,
+      ABT: 865.23,
+      CSCO: 342.67,
+      CVX: 778.9,
+      PEP: 512.34,
+    };
+    let interval: any;
+    return {
+      onOpen: (_event, ws) => {
+        interval = setInterval(() => {
+          for (const i in stonks) stonks[i] += 0.5 - Math.random();
+          ws.send(
+            JSON.stringify({
+              type: "table",
+              data: [
+                [
+                  { key: 1, name: "price", type: "usd" },
+                  { key: 0, name: "ticker", type: "text" },
+                ],
+                ...Object.entries(stonks),
+              ],
+            }),
+          );
+        }, 100);
+      },
+      onMessage: undefined,
+      onClose: () => clearInterval(interval),
       onError: undefined,
     };
   }),

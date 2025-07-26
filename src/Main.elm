@@ -60,6 +60,45 @@ result x =
             x_
 
 
+round2 : Float -> Float
+round2 =
+    (*) 100 >> floor >> toFloat >> flip (/) 100
+
+
+commas : String -> String
+commas =
+    String.reverse
+        >> String.toList
+        >> List.indexedMap
+            (\i c ->
+                if i > 0 && modBy 3 i == 0 then
+                    [ ',', c ]
+
+                else
+                    [ c ]
+            )
+        >> List.concat
+        >> String.fromList
+        >> String.reverse
+
+
+usd : Float -> String
+usd amount =
+    let
+        ( intPart, decPart ) =
+            case amount |> abs |> round2 |> String.fromFloat |> String.split "." of
+                a :: b :: _ ->
+                    ( a, String.left 2 <| String.padRight 2 '0' b )
+
+                a :: [] ->
+                    ( a, "00" )
+
+                [] ->
+                    ( "0", "00" )
+    in
+    iif (amount < 0) "-" "" ++ "$" ++ commas intPart ++ "." ++ decPart
+
+
 
 ---- PORTS --------------------------------------------------------------------
 
@@ -318,6 +357,7 @@ type
     = Unknown
     | Text
     | Number
+    | Usd
     | Boolean
     | Many Type
     | Link
@@ -341,6 +381,9 @@ typeName typ =
 
         Number ->
             "num"
+
+        Usd ->
+            "usd"
 
         Boolean ->
             "bool"
@@ -421,7 +464,7 @@ docDecoder =
                     "portal" ->
                         D.field "data" <|
                             D.map Portal <|
-                                D.fail "TODO: args"
+                                D.succeed Dict.empty
 
                     "net-socket" ->
                         D.field "data" <|
@@ -479,7 +522,7 @@ colDecoder =
                 , ( "number", Number )
                 , ( "num", Number )
                 , ( "int", Number )
-                , ( "usd", Number )
+                , ( "usd", Usd )
                 , ( "sheet_id", SheetId )
                 , ( "link", Link )
                 , ( "image", Image )
@@ -1003,6 +1046,32 @@ view ({ sheet } as model) =
                                                 }
                                             |> Numeric
 
+                                    Usd ->
+                                        tbl.rows
+                                            |> Array.foldl
+                                                (\row stat ->
+                                                    row
+                                                        |> Dict.get col.key
+                                                        |> Maybe.andThen (D.decodeValue number >> Result.toMaybe)
+                                                        |> Maybe.map
+                                                            (\n ->
+                                                                { histogram = stat.histogram |> Dict.update (String.fromFloat n) (Maybe.withDefault 0 >> (+) 1 >> Just)
+                                                                , count = stat.count + 1
+                                                                , sum = stat.sum + n
+                                                                , min = stat.min |> Maybe.withDefault n |> min n |> Just
+                                                                , max = stat.max |> Maybe.withDefault n |> max n |> Just
+                                                                }
+                                                            )
+                                                        |> Maybe.withDefault stat
+                                                )
+                                                { histogram = Dict.empty
+                                                , count = 0
+                                                , sum = 0
+                                                , min = Nothing
+                                                , max = Nothing
+                                                }
+                                            |> Numeric
+
                                     Text ->
                                         tbl.rows
                                             |> Array.foldl
@@ -1240,6 +1309,9 @@ view ({ sheet } as model) =
                                                                         Boolean ->
                                                                             S.textAlignCenter
 
+                                                                        Usd ->
+                                                                            S.textAlignRight
+
                                                                         Number ->
                                                                             S.textAlignRight
 
@@ -1261,6 +1333,9 @@ view ({ sheet } as model) =
                                                                         Number ->
                                                                             S.widthRem 0.5
 
+                                                                        Usd ->
+                                                                            S.widthRem 0.5
+
                                                                         Delete ->
                                                                             S.widthRem 0.5
 
@@ -1277,9 +1352,9 @@ view ({ sheet } as model) =
                                                                                 Just (Numeric stat) ->
                                                                                     [ H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gapRem 0, S.gridColumnGapRem 0.5, S.justifyContentFlexStart, S.opacity "0.5" ]
                                                                                         [ H.span [] [ text "min" ]
-                                                                                        , H.span [] [ text (Maybe.withDefault "" (Maybe.map String.fromFloat stat.min)) ]
+                                                                                        , H.span [] [ text (Maybe.withDefault "" (Maybe.map (String.fromFloat << round2) stat.min)) ]
                                                                                         , H.span [] [ text "max" ]
-                                                                                        , H.span [] [ text (Maybe.withDefault "" (Maybe.map String.fromFloat stat.max)) ]
+                                                                                        , H.span [] [ text (Maybe.withDefault "" (Maybe.map (String.fromFloat << round2) stat.max)) ]
                                                                                         , H.span [] [ text "mean" ]
                                                                                         , H.span [] [ text (iif (stat.count == 0) "" (String.fromInt (round (stat.sum / toFloat stat.count)))) ]
                                                                                         , H.span [] [ text "count" ]
@@ -1352,7 +1427,16 @@ view ({ sheet } as model) =
                                                                                                 D.map (\c -> H.input [ A.type_ "checkbox", A.checked c ] []) D.bool
 
                                                                                             Number ->
-                                                                                                D.map text string
+                                                                                                D.oneOf
+                                                                                                    [ D.map (text << String.fromFloat << round2) number
+                                                                                                    , D.map text string
+                                                                                                    ]
+
+                                                                                            Usd ->
+                                                                                                D.oneOf
+                                                                                                    [ D.map (text << usd) number
+                                                                                                    , D.map text string
+                                                                                                    ]
 
                                                                                             Delete ->
                                                                                                 D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])

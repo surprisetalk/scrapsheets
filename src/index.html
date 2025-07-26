@@ -90,6 +90,20 @@
                 name: "shop",
                 doc: { type: "shop" },
               },
+              "portal:time": {
+                name: "time example",
+                doc: {
+                  type: "portal",
+                  data: null,
+                },
+              },
+              "portal:stonks": {
+                name: "stonks example",
+                doc: {
+                  type: "portal",
+                  data: null,
+                },
+              },
               "table:tutorial": {
                 name: "tutorial",
                 scratch: true,
@@ -255,6 +269,7 @@
           );
           app.ports.queryDoc.subscribe(({ id, data }) => queryDoc(id, data));
 
+          let ws;
           const selectDoc = catchy(async (id, sheet) => {
             const [type, doc_id] = id.split(":");
             const doc = Library.get()[id]?.doc ?? sheet?.doc?.();
@@ -267,6 +282,7 @@
               id,
               data: { doc: doc && { ...doc } },
             });
+            if (!type || !doc_id) return;
             if (type === "query") queryDoc(id, doc.data[0]);
             sheet?.on?.("change", data => {
               app.ports.docChanged.send({
@@ -275,11 +291,23 @@
               });
               if (type === "query") queryDoc(id, data.doc.data[0]);
             });
+            ws = new WebSocket(`ws://localhost:8000/${type}/${doc_id}/sync`);
+            ws.onmessage = msg =>
+              app.ports.docChanged.send({
+                id,
+                data: {
+                  doc: JSON.parse(msg.data),
+                  handle: null,
+                  patchInfo: null,
+                  patches: [],
+                },
+              });
           });
 
           const changeId = catchy(async id => {
             const [, doc_id = ""] = id.split(":");
             if (doc_id === sheet?.documentId) return;
+            ws?.close?.();
             // TODO: Remove existing listeners.
             sheet = await repo?.find(doc_id).catch(() => null);
             await selectDoc(id, sheet);
