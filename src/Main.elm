@@ -1087,7 +1087,8 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text "tr > :last-child { border-right: none; padding-right: 0.5rem; }" ]
         , H.node "style" [] [ text "th > *, td > * { max-height: 6rem; text-overlow: ellipsis; }" ]
         , H.node "style" [] [ text "td:hover { background: rgba(0,0,0,0.025); }" ]
-        , H.node "style" [] [ text ".r0 { position: sticky; top: -1px; background: #f6f6f6; z-index: 1; }" ]
+        , H.node "style" [] [ text ".r0 { position: sticky; top: -1px; background: #f6f6f6; z-index: 1; border-bottom: 0px; }" ]
+        , H.node "style" [] [ text ".r0::after { content: \"\"; display: block; position: absolute; width: 100%; left: 0; bottom: -1px; border-bottom: 1px solid #888; }" ]
         , H.node "style" [] [ text ".selected { background: rgba(0,0,0,0.05); }" ]
         , H.node "style" [] [ text "#code { font-family: monospace; background: #fff; }" ]
 
@@ -1215,7 +1216,7 @@ view ({ sheet } as model) =
                                                                     , A.onMouseUp CellMouseUp
                                                                     , A.onMouseEnter (CellHover (xy i n))
                                                                     , S.heightRem 1.25
-                                                                    , S.lineHeight (iif (n == 0 || n == -1) "1.75" "")
+                                                                    , S.lineHeight (iif (n == 0) "1.75" "")
                                                                     , A.classList <|
                                                                         let
                                                                             { a, b } =
@@ -1309,7 +1310,7 @@ view ({ sheet } as model) =
                                                                                     []
 
                                                                         ( "-1", _ ) ->
-                                                                            [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontStyleItalic, S.opacity "0.5" ]
+                                                                            [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontStyleItalic, S.opacity "0.5" ]
                                                                                 [ text (typeName col.typ)
                                                                                 ]
                                                                             ]
@@ -1320,7 +1321,7 @@ view ({ sheet } as model) =
                                                                                     []
 
                                                                                 _ ->
-                                                                                    [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600" ]
+                                                                                    [ H.span [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600" ]
                                                                                         [ text col.name
                                                                                         ]
                                                                                     ]
