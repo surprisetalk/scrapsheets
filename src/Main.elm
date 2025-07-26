@@ -1081,8 +1081,8 @@ view ({ sheet } as model) =
     , body =
         [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
         , H.node "style" [] [ text "body { font-family: sans-serif; font-optical-sizing: auto; height: 100vh; width: 100vw; }" ]
-        , H.node "style" [] [ text "table { background: #fff; }" ]
-        , H.node "style" [] [ text "th, td { padding: 0.1rem 0.25rem; padding-top: 0.25rem; font-weight: normal; border: 1px solid #aaa; height: 1rem; vertical-align: top; }" ]
+        , H.node "style" [] [ text "table { background: #fff; line-height: 1; }" ]
+        , H.node "style" [] [ text "th, td { padding: 0.25rem; padding-bottom: 0.15rem; font-weight: normal; border: 1px solid #888; height: 0.8rem; vertical-align: top; }" ]
         , H.node "style" [] [ text "tr > :first-child { border-left: none; padding-left: 0.5rem; }" ]
         , H.node "style" [] [ text "tr > :last-child { border-right: none; padding-right: 0.5rem; }" ]
         , H.node "style" [] [ text "th > *, td > * { max-height: 6rem; text-overlow: ellipsis; }" ]
