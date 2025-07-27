@@ -156,6 +156,91 @@
 
           let sheet;
 
+          const setupDragDrop = () => {
+            document.body.addEventListener("dragover", e => {
+              e.preventDefault();
+              e.stopPropagation();
+              e.dataTransfer.dropEffect = "copy";
+              document.body.classList.add("drag-over");
+            });
+            document.body.addEventListener("dragleave", e => {
+              e.preventDefault();
+              e.stopPropagation();
+              document.body.classList.remove("drag-over");
+            });
+            document.body.addEventListener("drop", async e => {
+              e.preventDefault();
+              e.stopPropagation();
+              document.body.classList.remove("drag-over");
+              const files = Array.from(e.dataTransfer.files).filter(
+                file => file.type === "text/csv" || file.name.endsWith(".csv"),
+              );
+              for (const file of files) {
+                try {
+                  const lines = (await file.text())
+                    .split("\n")
+                    .filter(line => line.trim());
+                  if (!lines.length) return null;
+                  const [headers, ...data] = lines.map(row => {
+                    const result = [];
+                    let current = "";
+                    let inQuotes = false;
+                    for (let i = 0; i < row.length; i++) {
+                      const char = row[i];
+                      if (char === '"') {
+                        if (inQuotes && row[i + 1] === '"') {
+                          current += '"';
+                          i++;
+                        } else {
+                          inQuotes = !inQuotes;
+                        }
+                      } else if (char === "," && !inQuotes) {
+                        result.push(current.trim());
+                        current = "";
+                      } else {
+                        current += char;
+                      }
+                    }
+                    result.push(current.trim());
+                    return result;
+                  });
+                  if (!headers.length) return;
+                  const newSheet = repo.create({
+                    type: "table",
+                    data: [
+                      headers.map((name, key) => ({
+                        name,
+                        type: "text",
+                        key,
+                      })),
+                      ...data.map(row => {
+                        const rowObj = {};
+                        headers.forEach((header, index) => {
+                          rowObj[index] = row[index] || "";
+                        });
+                        return rowObj;
+                      }),
+                    ],
+                  });
+                  const id = `table:${newSheet.documentId}`;
+                  Library.set(id, {
+                    name: file.name.replace(/\.csv$/i, ""),
+                    tags: [],
+                  });
+                  window.location = `/${id}`;
+                } catch (error) {
+                  console.error("Error processing CSV file:", error);
+                  app.ports.docErrored.send(
+                    `Error processing ${file.name}: ${error.message}`,
+                  );
+                }
+              }
+            });
+          };
+          if (document.readyState === "loading")
+            document.addEventListener("DOMContentLoaded", setupDragDrop);
+          else setupDragDrop();
+
           alasql.options.modifier = "RECORDSET";
           for (const type of [
             "image",

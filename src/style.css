@@ -112,3 +112,26 @@ textarea {
 #__next {
   isolation: isolate;
 }
+
+/* Drag and drop styles */
+body.drag-over {
+  position: relative;
+}
+
+body.drag-over::before {
+  content: 'Drop CSV file to import';
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.8);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 2rem;
+  font-weight: bold;
+  z-index: 9999;
+  pointer-events: none;
+}
