@@ -1101,21 +1101,45 @@ app.get(
     }
     return {
       onOpen: (event, ws) => {
+        // Create a wrapper that makes the Hono WebSocket compatible with Node.js ws
+        const wsWrapper = {
+          ...ws,
+          on: (eventName: string, handler: Function) => {
+            // Map Node.js ws events to Hono WebSocket handlers
+            if (eventName === "message") {
+              // Store the handler to be called in onMessage
+              (ws as any)._messageHandler = handler;
+            } else if (eventName === "close") {
+              (ws as any)._closeHandler = handler;
+            } else if (eventName === "error") {
+              (ws as any)._errorHandler = handler;
+            }
+          },
+          send: (data: any) => ws.send(data),
+          close: () => ws.close(),
+          readyState: 1, // WebSocket.OPEN
+        };
         // Emit connection event to the WebSocket server to trigger automerge sync
-        wss.emit("connection", ws, c.req.raw);
+        wss.emit("connection", wsWrapper, c.req.raw);
         console.log(
           `Automerge sync connected${usr_id ? ` for user ${usr_id}` : " (anonymous)"}`,
         );
       },
       onMessage: (event, ws) => {
-        // Messages are handled automatically by NodeWSServerAdapter
+        // Call the stored message handler if it exists
+        if ((ws as any)._messageHandler)
+          (ws as any)._messageHandler(event.data);
       },
       onClose: (event, ws) => {
+        // Call the stored close handler if it exists
+        if ((ws as any)._closeHandler) (ws as any)._closeHandler();
         console.log(
           `Automerge sync disconnected${usr_id ? ` for user ${usr_id}` : " (anonymous)"}`,
         );
       },
       onError: (event, ws) => {
+        // Call the stored error handler if it exists
+        if ((ws as any)._errorHandler) (ws as any)._errorHandler(event);
         console.error("Automerge sync WebSocket error:", event);
       },
     };

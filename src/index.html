@@ -152,23 +152,25 @@
           const repo = new AM.Repo({
             storage: new AM.IndexedDBStorageAdapter(),
             network: [
-              new AM.BrowserWebSocketClientAdapter(() => {
-                const getAuthToken = () => {
-                  try {
-                    const userData = JSON.parse(
-                      localStorage.getItem("scrapsheets-user") || "{}",
-                    );
-                    return userData.jwt || null;
-                  } catch {
-                    return null;
-                  }
-                };
-                const token = getAuthToken();
-                const baseUrl = "ws://localhost:8000/library/sync";
-                return token
-                  ? `${baseUrl}?auth=${encodeURIComponent(token)}`
-                  : baseUrl;
-              }),
+              new AM.WebSocketClientAdapter(
+                (() => {
+                  const getAuthToken = () => {
+                    try {
+                      const userData = JSON.parse(
+                        localStorage.getItem("scrapsheets-user") || "{}",
+                      );
+                      return userData.jwt || null;
+                    } catch {
+                      return null;
+                    }
+                  };
+                  const token = getAuthToken();
+                  const baseUrl = "ws://localhost:8000/library/sync";
+                  return token
+                    ? `${baseUrl}?auth=${encodeURIComponent(token)}`
+                    : baseUrl;
+                })(),
+              ),
             ],
           });
 
