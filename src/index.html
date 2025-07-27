@@ -394,7 +394,6 @@
               });
               if (type === "query") queryDoc(id, data.doc.data[0]);
             });
-            // For portal endpoints, use custom WebSocket logic
             if (type === "portal") {
               ws = new WebSocket(`ws://localhost:8000/${type}/${doc_id}/sync`);
               ws.onmessage = msg =>
@@ -408,7 +407,6 @@
                   },
                 });
             }
-            // For table/query types, automerge network sync is handled automatically
           });
 
           const changeId = catchy(async id => {
