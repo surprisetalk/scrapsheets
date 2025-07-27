@@ -1099,7 +1099,7 @@ const wss = new WebSocketServer({
 
 export const automerge = new Repo({
   network: [new NodeWSServerAdapter(wss)],
-  storage: new NodeFSStorageAdapter("./data/automerge"),
+  // storage: new NodeFSStorageAdapter("./data/automerge"),
   peerId: `server-${Deno.hostname()}` as AM.PeerId,
   sharePolicy: () => Promise.resolve(false), // Use same strict policy as reference
 });
