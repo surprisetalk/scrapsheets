@@ -1076,7 +1076,27 @@ export const app = new Hono<{
 
 app.use("*", logger());
 
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({
+  noServer: true,
+  maxConnections: 100, // Limit concurrent connections
+  clientTracking: true, // Track clients for cleanup
+});
+
+// // Add connection cleanup on server shutdown
+// const cleanup = () => {
+//   console.log("Cleaning up WebSocket connections...");
+//   wss.clients?.forEach((ws: any) => {
+//     if (ws.readyState === 1) {
+//       // OPEN
+//       ws.close(1001, "Server shutting down");
+//     }
+//   });
+// };
+//
+// // Handle graceful shutdown
+// process.on("SIGTERM", cleanup);
+// process.on("SIGINT", cleanup);
+
 export const automerge = new Repo({
   network: [new NodeWSServerAdapter(wss)],
   storage: new NodeFSStorageAdapter("./data/automerge"),
@@ -1099,48 +1119,144 @@ app.get(
         // Still allow connection but without authenticated features
       }
     }
+
+    let wsWrapper: any = null;
+    let isClosed = false;
+
     return {
       onOpen: (event, ws) => {
         // Create a wrapper that makes the Hono WebSocket compatible with Node.js ws
-        const wsWrapper = {
-          ...ws,
+        wsWrapper = {
+          _handlers: new Map(),
           on: (eventName: string, handler: Function) => {
-            // Map Node.js ws events to Hono WebSocket handlers
-            if (eventName === "message") {
-              // Store the handler to be called in onMessage
-              (ws as any)._messageHandler = handler;
-            } else if (eventName === "close") {
-              (ws as any)._closeHandler = handler;
-            } else if (eventName === "error") {
-              (ws as any)._errorHandler = handler;
+            if (isClosed) return;
+            // Store handlers in a map for proper cleanup
+            if (!wsWrapper._handlers.has(eventName)) {
+              wsWrapper._handlers.set(eventName, []);
+            }
+            wsWrapper._handlers.get(eventName).push(handler);
+          },
+          off: (eventName: string, handler?: Function) => {
+            if (!wsWrapper._handlers.has(eventName)) return;
+            if (handler) {
+              const handlers = wsWrapper._handlers.get(eventName);
+              const index = handlers.indexOf(handler);
+              if (index > -1) handlers.splice(index, 1);
+            } else {
+              wsWrapper._handlers.delete(eventName);
             }
           },
-          send: (data: any) => ws.send(data),
-          close: () => ws.close(),
-          readyState: 1, // WebSocket.OPEN
+          send: (data: any) => {
+            if (isClosed) return;
+            try {
+              ws.send(data);
+            } catch (error) {
+              console.error("WebSocket send error:", error);
+              wsWrapper._triggerClose(1006, "Send failed");
+            }
+          },
+          close: (code?: number, reason?: string) => {
+            if (isClosed) return;
+            isClosed = true;
+            try {
+              ws.close(code, reason);
+            } catch (error) {
+              console.error("WebSocket close error:", error);
+            }
+          },
+          get readyState() {
+            return isClosed ? 3 : 1; // CLOSED : OPEN
+          },
+          _triggerClose: (code: number, reason: string) => {
+            if (isClosed) return;
+            isClosed = true;
+            const handlers = wsWrapper._handlers.get("close") || [];
+            handlers.forEach((handler: Function) => {
+              try {
+                handler(code, reason);
+              } catch (error) {
+                console.error("Error in close handler:", error);
+              }
+            });
+          },
+          _triggerMessage: (data: any) => {
+            if (isClosed) return;
+            const handlers = wsWrapper._handlers.get("message") || [];
+            handlers.forEach((handler: Function) => {
+              try {
+                handler(data);
+              } catch (error) {
+                console.error("Error in message handler:", error);
+              }
+            });
+          },
+          _triggerError: (error: any) => {
+            const handlers = wsWrapper._handlers.get("error") || [];
+            handlers.forEach((handler: Function) => {
+              try {
+                handler(error);
+              } catch (err) {
+                console.error("Error in error handler:", err);
+              }
+            });
+          },
+          // WebSocket constants
+          CONNECTING: 0,
+          OPEN: 1,
+          CLOSING: 2,
+          CLOSED: 3,
+          // Other expected properties
+          protocol: "",
+          extensions: "",
+          url: `ws://localhost:8000/library/sync${auth ? `?auth=${auth}` : ""}`,
+          bufferedAmount: 0,
         };
-        // Emit connection event to the WebSocket server to trigger automerge sync
-        wss.emit("connection", wsWrapper, c.req.raw);
-        console.log(
-          `Automerge sync connected${usr_id ? ` for user ${usr_id}` : " (anonymous)"}`,
-        );
+
+        try {
+          // Emit connection event to the WebSocket server to trigger automerge sync
+          wss.emit("connection", wsWrapper, c.req.raw);
+          console.log(
+            `Automerge sync connected${usr_id ? ` for user ${usr_id}` : " (anonymous)"}`,
+          );
+        } catch (error) {
+          console.error("Error in WebSocket connection setup:", error);
+          wsWrapper._triggerError(error);
+        }
       },
       onMessage: (event, ws) => {
-        // Call the stored message handler if it exists
-        if ((ws as any)._messageHandler)
-          (ws as any)._messageHandler(event.data);
+        if (isClosed || !wsWrapper) return;
+        try {
+          wsWrapper._triggerMessage(event.data);
+        } catch (error) {
+          console.error("Error processing WebSocket message:", error);
+          wsWrapper._triggerError(error);
+        }
       },
       onClose: (event, ws) => {
-        // Call the stored close handler if it exists
-        if ((ws as any)._closeHandler) (ws as any)._closeHandler();
-        console.log(
-          `Automerge sync disconnected${usr_id ? ` for user ${usr_id}` : " (anonymous)"}`,
-        );
+        if (!wsWrapper) return;
+        try {
+          wsWrapper._triggerClose(event.code || 1000, event.reason || "");
+          console.log(
+            `Automerge sync disconnected${usr_id ? ` for user ${usr_id}` : " (anonymous)"}`,
+          );
+        } catch (error) {
+          console.error("Error processing WebSocket close:", error);
+        } finally {
+          // Clean up handlers
+          if (wsWrapper._handlers) {
+            wsWrapper._handlers.clear();
+          }
+          wsWrapper = null;
+        }
       },
       onError: (event, ws) => {
-        // Call the stored error handler if it exists
-        if ((ws as any)._errorHandler) (ws as any)._errorHandler(event);
-        console.error("Automerge sync WebSocket error:", event);
+        if (!wsWrapper) return;
+        try {
+          wsWrapper._triggerError(event);
+          console.error("Automerge sync WebSocket error:", event);
+        } catch (error) {
+          console.error("Error processing WebSocket error:", error);
+        }
       },
     };
   }),

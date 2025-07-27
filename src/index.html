@@ -167,9 +167,17 @@
                   const token = getAuthToken();
                   const baseUrl = "ws://localhost:8000/library/sync";
                   return token
-                    ? `${baseUrl}?auth=${encodeURIComponent(token)}`
+                    ? `${baseUrl}?auth=Bearer%20${encodeURIComponent(token)}`
                     : baseUrl;
                 })(),
+                // {
+                //   // Reduce resource usage with conservative retry settings
+                //   connectionTimeout: 5000,
+                //   reconnectInterval: 2000,
+                //   maxReconnectAttempts: 3,
+                //   // Add exponential backoff
+                //   reconnectBackoffMultiplier: 2,
+                // },
               ),
             ],
           });
