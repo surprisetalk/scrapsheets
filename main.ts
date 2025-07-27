@@ -2,7 +2,7 @@ import { HTTPException } from "jsr:@hono/hono/http-exception";
 import { Context, Hono } from "jsr:@hono/hono";
 import { logger } from "jsr:@hono/hono/logger";
 import { cors } from "jsr:@hono/hono/cors";
-import { jwt, sign } from "jsr:@hono/hono/jwt";
+import { jwt, sign, verify } from "jsr:@hono/hono/jwt";
 import type { JwtVariables } from "jsr:@hono/hono/jwt";
 import sg from "npm:@sendgrid/mail";
 import pg from "https://deno.land/x/postgresjs@v3.4.5/mod.js";
@@ -11,6 +11,8 @@ import { Repo } from "npm:@automerge/automerge-repo";
 import * as AM from "npm:@automerge/automerge-repo";
 import type { AnyDocumentId, DocHandle } from "npm:@automerge/automerge-repo";
 import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-websocket";
+import { NodeFSStorageAdapter } from "npm:@automerge/automerge-repo-storage-nodefs";
+import { WebSocketServer } from "npm:ws";
 import ala from "npm:alasql";
 
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
@@ -1074,26 +1076,48 @@ export const app = new Hono<{
 
 app.use("*", logger());
 
-// TODO: Add a storage adapter. Persist somewhere -- doesn't really matter where.
-// TODO: Connect the network adapter to the websocket.
-// TODO: https://github.com/automerge/automerge-repo-sync-server/blob/main/src/server.js
-// TODO: Configure the port.
+const wss = new WebSocketServer({ noServer: true });
 export const automerge = new Repo({
-  network: [],
-  // @ts-ignore @type
-  peerId: `server-${Deno.hostname()}`,
-  sharePolicy: () => Promise.resolve(false),
+  network: [new NodeWSServerAdapter(wss)],
+  storage: new NodeFSStorageAdapter("./data/automerge"),
+  peerId: `server-${Deno.hostname()}` as AM.PeerId,
+  sharePolicy: () => Promise.resolve(false), // Use same strict policy as reference
 });
 
 app.get(
   "/library/sync",
-  upgradeWebSocket(c => {
-    const { auth } = c.req.query(); // TODO: Verify Bearer token on auth.
+  upgradeWebSocket(async c => {
+    const { auth } = c.req.query();
+    let usr_id: string | null = null;
+    if (auth) {
+      try {
+        const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+        const payload = await verify(token, JWT_SECRET);
+        usr_id = payload.sub as string;
+      } catch (error) {
+        console.error("JWT verification failed:", error);
+        // Still allow connection but without authenticated features
+      }
+    }
     return {
-      onOpen: undefined,
-      onMessage: undefined,
-      onClose: undefined,
-      onError: undefined,
+      onOpen: (event, ws) => {
+        // Emit connection event to the WebSocket server to trigger automerge sync
+        wss.emit("connection", ws, c.req.raw);
+        console.log(
+          `Automerge sync connected${usr_id ? ` for user ${usr_id}` : " (anonymous)"}`,
+        );
+      },
+      onMessage: (event, ws) => {
+        // Messages are handled automatically by NodeWSServerAdapter
+      },
+      onClose: (event, ws) => {
+        console.log(
+          `Automerge sync disconnected${usr_id ? ` for user ${usr_id}` : " (anonymous)"}`,
+        );
+      },
+      onError: (event, ws) => {
+        console.error("Automerge sync WebSocket error:", event);
+      },
     };
   }),
 );

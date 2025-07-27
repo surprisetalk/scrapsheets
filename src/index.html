@@ -151,7 +151,25 @@
 
           const repo = new AM.Repo({
             storage: new AM.IndexedDBStorageAdapter(),
-            // network: [new AM.BrowserWebSocketClientAdapter("wss://sync.automerge.org")],
+            network: [
+              new AM.BrowserWebSocketClientAdapter(() => {
+                const getAuthToken = () => {
+                  try {
+                    const userData = JSON.parse(
+                      localStorage.getItem("scrapsheets-user") || "{}",
+                    );
+                    return userData.jwt || null;
+                  } catch {
+                    return null;
+                  }
+                };
+                const token = getAuthToken();
+                const baseUrl = "ws://localhost:8000/library/sync";
+                return token
+                  ? `${baseUrl}?auth=${encodeURIComponent(token)}`
+                  : baseUrl;
+              }),
+            ],
           });
 
           let sheet;
@@ -376,17 +394,21 @@
               });
               if (type === "query") queryDoc(id, data.doc.data[0]);
             });
-            ws = new WebSocket(`ws://localhost:8000/${type}/${doc_id}/sync`);
-            ws.onmessage = msg =>
-              app.ports.docChanged.send({
-                id,
-                data: {
-                  doc: JSON.parse(msg.data),
-                  handle: null,
-                  patchInfo: null,
-                  patches: [],
-                },
-              });
+            // For portal endpoints, use custom WebSocket logic
+            if (type === "portal") {
+              ws = new WebSocket(`ws://localhost:8000/${type}/${doc_id}/sync`);
+              ws.onmessage = msg =>
+                app.ports.docChanged.send({
+                  id,
+                  data: {
+                    doc: JSON.parse(msg.data),
+                    handle: null,
+                    patchInfo: null,
+                    patches: [],
+                  },
+                });
+            }
+            // For table/query types, automerge network sync is handled automatically
           });
 
           const changeId = catchy(async id => {
