@@ -170,14 +170,6 @@
                     ? `${baseUrl}?auth=Bearer%20${encodeURIComponent(token)}`
                     : baseUrl;
                 })(),
-                // {
-                //   // Reduce resource usage with conservative retry settings
-                //   connectionTimeout: 5000,
-                //   reconnectInterval: 2000,
-                //   maxReconnectAttempts: 3,
-                //   // Add exponential backoff
-                //   reconnectBackoffMultiplier: 2,
-                // },
               ),
             ],
           });

@@ -15,6 +15,7 @@ import { NodeFSStorageAdapter } from "npm:@automerge/automerge-repo-storage-node
 import { WebSocketServer } from "npm:ws";
 import ala from "npm:alasql";
 import { examples } from "./examples.ts";
+import { EventEmitter } from "node:events";
 
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
 const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
@@ -279,58 +280,101 @@ export const app = new Hono<{
 
 app.use("*", logger());
 
-class HonoWebSocketAdapter extends EventTarget {
-  private connections = new Map<string, any>();
+// interface NetworkAdapterInterface {
+//     peerId?: PeerId;
+//     peerMetadata?: PeerMetadata;
+//     addListener<T>(event, fn, context?): this;
+//     connect(peerId, peerMetadata?): void;
+//     disconnect(): void;
+//     emit<T>(event, ...args): boolean;
+//     eventNames(): (keyof NetworkAdapterEvents)[];
+//     isReady(): boolean;
+//     listenerCount(event): number;
+//     listeners<T>(event): ((...args) => void)[];
+//     off<T>(event, fn?, context?, once?): this;
+//     on<T>(event, fn, context?): this;
+//     once<T>(event, fn, context?): this;
+//     removeAllListeners(event?): this;
+//     removeListener<T>(event, fn?, context?, once?): this;
+//     send(message): void;
+//     whenReady(): Promise<void>;
+// }
+// export abstract class NetworkAdapter
+//   extends EventEmitter<NetworkAdapterEvents>
+//   implements NetworkAdapterInterface
+// {
+//   peerId?: PeerId
+//   peerMetadata?: PeerMetadata
+//   abstract isReady(): boolean
+//   abstract whenReady(): Promise<void>
+//   abstract connect(peerId: PeerId, peerMetadata?: PeerMetadata): void
+//   abstract disconnect(): void
+// }
+class HonoWebSocketAdapter
+  extends AM.NetworkAdapter
+  implements AM.NetworkAdapterInterface
+{
+  private connections = new Map<AM.PeerId, any>();
   private _isReady = true;
-  peerId?: AM.PeerId;
-  peerMetadata?: any;
+
   isReady(): boolean {
     return this._isReady;
   }
+
   async whenReady(): Promise<void> {
     return Promise.resolve();
   }
-  connect(peerId: AM.PeerId, peerMetadata?: any) {
-    this.peerId = peerId;
-    this.peerMetadata = peerMetadata;
+
+  connect(peerId: AM.PeerId, peerMetadata?: AM.PeerMetadata): void {
+    // Connection already established via WebSocket
+    this.emit("peer-candidate", { peerId, peerMetadata: peerMetadata || {} });
   }
-  disconnect() {
-    this.connections.clear();
-  }
-  send(message: any) {
-    this.connections.forEach(ws => {
-      if (ws.readyState === 1) {
-        // OPEN
-        ws.send(message.data);
+
+  disconnect(): void {
+    for (const [peerId, ws] of this.connections) {
+      try {
+        ws.close();
+      } catch (error) {
+        console.error(`Error closing connection for ${peerId}:`, error);
       }
+    }
+    this.connections.clear();
+    // Don't emit peer-disconnected for server itself on general disconnect
+  }
+
+  send(message: AM.Message): void {
+    const connection = this.connections.get(message.targetId);
+    if (connection && connection.readyState === WebSocket.OPEN) {
+      connection.send(JSON.stringify(message));
+    } else {
+      console.warn(`No open connection for peer ${message.targetId}`);
+    }
+  }
+
+  addConnection(peerId: AM.PeerId, ws: any): void {
+    this.connections.set(peerId, ws);
+
+    // Emit peer-candidate event to let automerge know about the new peer
+    this.emit("peer-candidate", {
+      peerId,
+      peerMetadata: {},
     });
   }
-  addConnection(ws: any, peerId: AM.PeerId) {
-    this.connections.set(peerId, ws);
-    this.dispatchEvent(
-      new CustomEvent("peer-candidate", {
-        detail: { peerId, peerMetadata: { isEphemeral: true } },
-      }),
-    );
-  }
-  removeConnection(peerId: AM.PeerId) {
+
+  removeConnection(peerId: AM.PeerId): void {
     this.connections.delete(peerId);
-    this.dispatchEvent(
-      new CustomEvent("peer-disconnected", { detail: { peerId } }),
-    );
+    this.emit("peer-disconnected", { peerId });
   }
-  receiveMessage(data: any, fromPeerId: AM.PeerId) {
-    this.dispatchEvent(
-      new CustomEvent("message", {
-        detail: { senderId: fromPeerId, targetId: this.peerId, data },
-      }),
-    );
-  }
-  on(event: string, listener: Function) {
-    this.addEventListener(event, (e: any) => listener(e.detail));
-  }
-  emit(event: string, data: any) {
-    this.dispatchEvent(new CustomEvent(event, { detail: data }));
+
+  handleMessage(peerId: AM.PeerId, data: string): void {
+    try {
+      const message = JSON.parse(data) as AM.Message;
+      // Ensure the message has the correct senderId
+      const messageWithSender = { ...message, senderId: peerId };
+      this.emit("message", messageWithSender);
+    } catch (error) {
+      console.error(`Failed to parse automerge message from ${peerId}:`, error);
+    }
   }
 }
 
@@ -340,35 +384,47 @@ export const automerge = new Repo({
   network: [honoAdapter],
   storage: new NodeFSStorageAdapter("./data/automerge"),
   peerId: `server-${Deno.hostname()}` as AM.PeerId,
-  sharePolicy: () => Promise.resolve(true), // TODO: Adjust share policy.
+  sharePolicy: () => Promise.resolve(true), // TODO:
 });
 
-// TODO: This still doesn't quite work, but I think it's pretty close.
 app.get(
   "/library/sync",
-  upgradeWebSocket(c => {
-    let clientPeerId: AM.PeerId;
+  upgradeWebSocket(async c => {
+    const { auth } = c.req.query();
+    let usr_id: string | null = null;
+    if (auth) {
+      try {
+        const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+        const payload = await verify(token, JWT_SECRET);
+        usr_id = payload.sub as string;
+      } catch (error) {
+        console.error("JWT verification failed:", error);
+      }
+    }
+
+    const peerId = (
+      usr_id
+        ? `user-${usr_id}`
+        : `anonymous-${Math.random().toString(36).substr(2, 9)}`
+    ) as AM.PeerId;
+
     return {
       onOpen(event, ws) {
-        console.log("Automerge sync WebSocket connected");
-        clientPeerId =
-          `client-${Math.random().toString(36).slice(2)}` as AM.PeerId;
-        honoAdapter.addConnection(ws, clientPeerId);
+        console.log(`WebSocket connected: ${peerId}`);
+        honoAdapter.addConnection(peerId, ws);
       },
       onMessage(event, ws) {
-        try {
-          const data = new Uint8Array(event.data);
-          honoAdapter.receiveMessage(data, clientPeerId);
-        } catch (error) {
-          console.error("Error processing automerge message:", error);
+        if (typeof event.data === "string") {
+          honoAdapter.handleMessage(peerId, event.data);
         }
       },
       onClose(event, ws) {
-        console.log("Automerge sync WebSocket disconnected");
-        if (clientPeerId) honoAdapter.removeConnection(clientPeerId);
+        console.log(`WebSocket disconnected: ${peerId}`);
+        honoAdapter.removeConnection(peerId);
       },
       onError(event, ws) {
-        console.error("Automerge sync WebSocket error:", event);
+        console.error(`WebSocket error for ${peerId}:`, event);
+        honoAdapter.removeConnection(peerId);
       },
     };
   }),
