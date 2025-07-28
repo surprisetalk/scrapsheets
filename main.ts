@@ -280,56 +280,23 @@ export const app = new Hono<{
 
 app.use("*", logger());
 
-// interface NetworkAdapterInterface {
-//     peerId?: PeerId;
-//     peerMetadata?: PeerMetadata;
-//     addListener<T>(event, fn, context?): this;
-//     connect(peerId, peerMetadata?): void;
-//     disconnect(): void;
-//     emit<T>(event, ...args): boolean;
-//     eventNames(): (keyof NetworkAdapterEvents)[];
-//     isReady(): boolean;
-//     listenerCount(event): number;
-//     listeners<T>(event): ((...args) => void)[];
-//     off<T>(event, fn?, context?, once?): this;
-//     on<T>(event, fn, context?): this;
-//     once<T>(event, fn, context?): this;
-//     removeAllListeners(event?): this;
-//     removeListener<T>(event, fn?, context?, once?): this;
-//     send(message): void;
-//     whenReady(): Promise<void>;
-// }
-// export abstract class NetworkAdapter
-//   extends EventEmitter<NetworkAdapterEvents>
-//   implements NetworkAdapterInterface
-// {
-//   peerId?: PeerId
-//   peerMetadata?: PeerMetadata
-//   abstract isReady(): boolean
-//   abstract whenReady(): Promise<void>
-//   abstract connect(peerId: PeerId, peerMetadata?: PeerMetadata): void
-//   abstract disconnect(): void
-// }
 class HonoWebSocketAdapter
   extends AM.NetworkAdapter
   implements AM.NetworkAdapterInterface
 {
   private connections = new Map<AM.PeerId, any>();
   private _isReady = true;
-
   isReady(): boolean {
     return this._isReady;
   }
-
-  async whenReady(): Promise<void> {
+  whenReady(): Promise<void> {
     return Promise.resolve();
   }
-
   connect(peerId: AM.PeerId, peerMetadata?: AM.PeerMetadata): void {
     // Connection already established via WebSocket
+    console.log(`🔗 HonoAdapter.connect() called for peer: ${peerId}`);
     this.emit("peer-candidate", { peerId, peerMetadata: peerMetadata || {} });
   }
-
   disconnect(): void {
     for (const [peerId, ws] of this.connections) {
       try {
@@ -341,39 +308,71 @@ class HonoWebSocketAdapter
     this.connections.clear();
     // Don't emit peer-disconnected for server itself on general disconnect
   }
-
   send(message: AM.Message): void {
+    console.log(`📤 HonoAdapter sending message to ${message.targetId}:`, {
+      type: message.type,
+      senderId: message.senderId,
+      targetId: message.targetId,
+      connectionExists: this.connections.has(message.targetId),
+    });
     const connection = this.connections.get(message.targetId);
     if (connection && connection.readyState === WebSocket.OPEN) {
-      connection.send(JSON.stringify(message));
+      // Send the message data as binary if it has a data property, otherwise JSON
+      if ("data" in message && message.data instanceof Uint8Array) {
+        console.log(
+          `📦 Sending binary data (${message.data.length} bytes) to ${message.targetId}`,
+        );
+        connection.send(message.data);
+      } else {
+        console.log(`📄 Sending JSON message to ${message.targetId}`);
+        connection.send(JSON.stringify(message));
+      }
+      console.log(`✅ Message sent successfully to ${message.targetId}`);
     } else {
-      console.warn(`No open connection for peer ${message.targetId}`);
+      console.warn(`❌ No open connection for peer ${message.targetId}`);
+      console.log(
+        `Available connections:`,
+        Array.from(this.connections.keys()),
+      );
     }
   }
-
   addConnection(peerId: AM.PeerId, ws: any): void {
+    console.log(`➕ Adding connection for peer: ${peerId}`);
     this.connections.set(peerId, ws);
+    console.log(`Total connections: ${this.connections.size}`);
 
     // Emit peer-candidate event to let automerge know about the new peer
+    console.log(`🚀 Emitting peer-candidate for: ${peerId}`);
     this.emit("peer-candidate", {
       peerId,
       peerMetadata: {},
     });
   }
-
   removeConnection(peerId: AM.PeerId): void {
+    console.log(`➖ Removing connection for peer: ${peerId}`);
     this.connections.delete(peerId);
+    console.log(`Total connections: ${this.connections.size}`);
+    console.log(`🚪 Emitting peer-disconnected for: ${peerId}`);
     this.emit("peer-disconnected", { peerId });
   }
-
-  handleMessage(peerId: AM.PeerId, data: string): void {
+  handleMessage(peerId: AM.PeerId, data: Uint8Array): void {
+    console.log(`📥 Received binary message from ${peerId}:`, {
+      length: data.length,
+      type: data.constructor.name,
+    });
     try {
-      const message = JSON.parse(data) as AM.Message;
-      // Ensure the message has the correct senderId
-      const messageWithSender = { ...message, senderId: peerId };
-      this.emit("message", messageWithSender);
+      // Automerge expects raw binary data, not parsed JSON
+      // The message format is handled internally by automerge
+      console.log(`🔄 Emitting raw binary message for automerge processing`);
+      this.emit("message", {
+        data,
+        senderId: peerId,
+      } as any);
     } catch (error) {
-      console.error(`Failed to parse automerge message from ${peerId}:`, error);
+      console.error(
+        `❌ Failed to handle automerge message from ${peerId}:`,
+        error,
+      );
     }
   }
 }
@@ -410,20 +409,46 @@ app.get(
 
     return {
       onOpen(event, ws) {
-        console.log(`WebSocket connected: ${peerId}`);
+        console.log(`\ud83d\udd04 WebSocket connected: ${peerId}`);
+        console.log(`Auth status: ${usr_id ? "authenticated" : "anonymous"}`);
         honoAdapter.addConnection(peerId, ws);
       },
       onMessage(event, ws) {
+        console.log(`\ud83d\udce8 WebSocket message received from ${peerId}`, {
+          dataType: typeof event.data,
+          dataLength: event.data?.length || event.data?.byteLength || 0,
+          constructor: event.data?.constructor?.name,
+        });
+        let messageData: Uint8Array;
         if (typeof event.data === "string") {
-          honoAdapter.handleMessage(peerId, event.data);
+          // Convert string to Uint8Array
+          messageData = new TextEncoder().encode(event.data);
+          console.log(`🔄 Converted string to Uint8Array for ${peerId}`);
+        } else if (event.data instanceof ArrayBuffer) {
+          // Convert ArrayBuffer to Uint8Array
+          messageData = new Uint8Array(event.data);
+          console.log(`🔄 Converted ArrayBuffer to Uint8Array for ${peerId}`);
+        } else if (event.data instanceof Uint8Array) {
+          // Already Uint8Array, use directly
+          messageData = event.data;
+          console.log(`✅ Using Uint8Array directly for ${peerId}`);
+        } else {
+          console.warn(
+            `⚠️ Unsupported data type from ${peerId}:`,
+            typeof event.data,
+            event.data?.constructor?.name,
+          );
+          return;
         }
+
+        honoAdapter.handleMessage(peerId, messageData);
       },
       onClose(event, ws) {
-        console.log(`WebSocket disconnected: ${peerId}`);
+        console.log(`\ud83d\udeaa WebSocket disconnected: ${peerId}`);
         honoAdapter.removeConnection(peerId);
       },
       onError(event, ws) {
-        console.error(`WebSocket error for ${peerId}:`, event);
+        console.error(`\u274c WebSocket error for ${peerId}:`, event);
         honoAdapter.removeConnection(peerId);
       },
     };
