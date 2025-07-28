@@ -1,0 +1,137 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  interpolate-size: allow-keywords;
+}
+
+body {
+  line-height: 1.25;
+  -webkit-font-smoothing: antialiased;
+  font-family: sans-serif;
+}
+
+img,
+picture,
+video,
+canvas,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+input,
+button,
+textarea,
+select {
+  font: inherit;
+  -webkit-user-select: auto;
+}
+
+button {
+  background: none;
+  border: none;
+  padding: 0;
+  font-style: italic;
+  cursor: pointer;
+}
+
+p,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  overflow-wrap: break-word;
+  font-weight: normal;
+  font-size: 1em;
+}
+
+p {
+  text-wrap: pretty;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  text-wrap: balance;
+}
+
+ul,
+ol {
+  list-style: none;
+}
+
+a {
+  text-decoration: none;
+  color: inherit;
+  cursor: pointer;
+}
+
+table {
+  border-collapse: collapse;
+  border-spacing: 0;
+}
+
+th,
+td {
+  word-wrap: break-word;
+  hyphens: auto;
+}
+
+sup {
+  opacity: 0.65;
+}
+
+textarea {
+  white-space: revert;
+}
+
+::placeholder {
+  /* color: unset; */
+}
+
+::marker {
+  content: initial;
+}
+
+[hidden] {
+  display: none;
+}
+
+#root,
+#__next {
+  isolation: isolate;
+}
+
+/* Drag and drop styles */
+body.drag-over {
+  position: relative;
+}
+
+body.drag-over::before {
+  content: 'Drop CSV file to import';
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.8);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 2rem;
+  font-weight: bold;
+  z-index: 9999;
+  pointer-events: none;
+}

@@ -1,0 +1,19 @@
+{
+  "imports": {
+    "@automerge/automerge-repo": "npm:@automerge/automerge-repo@^2.0.5",
+    "@automerge/automerge-repo-network-websocket": "npm:@automerge/automerge-repo-network-websocket@^2.0.5",
+    "@automerge/automerge-repo-storage-nodefs": "npm:@automerge/automerge-repo-storage-nodefs@^2.0.5",
+    "@electric-sql/pglite": "npm:@electric-sql/pglite@^0.3.3",
+    "@sendgrid/mail": "npm:@sendgrid/mail@^8.1.5",
+    "@std/assert": "jsr:@std/assert@^1.0.13",
+    "alasql": "npm:alasql@^4.6.6",
+    "elm": "npm:elm@^0.19.1-6",
+    "elm-format": "npm:elm-format@^0.8.8",
+    "elm-review": "npm:elm-review@^2.13.2",
+    "elm-test": "npm:elm-test@^0.19.1-revision15",
+    "pg-gateway": "npm:pg-gateway@^0.3.0-beta.4",
+    "ws": "npm:ws@^8.18.2",
+    "y-websocket": "npm:y-websocket@^3.0.0",
+    "yjs": "npm:yjs@^13.6.27"
+  }
+}

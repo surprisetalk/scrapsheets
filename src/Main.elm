@@ -1,28 +1,30 @@
-module Main exposing (main)
+port module Main exposing (main)
 
 ---- IMPORTS ------------------------------------------------------------------
 
 import Array exposing (Array)
 import Browser
+import Browser.Dom as Dom
+import Browser.Events as Browser
 import Browser.Navigation as Nav
 import Date exposing (Date)
 import Dict exposing (Dict)
-import Html as H exposing (Html, code, text)
-import Html.Attributes as A exposing (..)
-import Html.Events as A exposing (..)
+import Html as H exposing (Html, text)
+import Html.Attributes as A
+import Html.Events as A
 import Html.Lazy as H
 import Html.Style as S
-import Http exposing (stringResolver)
+import Http
 import Json.Decode as D
 import Json.Encode as E
 import Parser as P exposing ((|.), (|=), Parser)
-import Pratt as P
 import Regex exposing (Regex)
-import Scrapscript as S exposing (Scrap(..))
 import Set exposing (Set)
 import Task exposing (Task)
 import Time exposing (Month(..))
 import Url exposing (Url)
+import Url.Parser as UrlP exposing ((</>), (<?>))
+import Url.Parser.Query as UrlQ
 
 
 
@@ -34,268 +36,572 @@ ls =
     List.singleton
 
 
-iif : Bool -> a -> a -> a
-iif c t f =
-    if c then
-        t
-
-    else
-        f
-
-
 flip : (a -> b -> c) -> (b -> a -> c)
 flip f a b =
     f b a
+
+
+iif : Bool -> a -> a -> a
+iif c a b =
+    if c then
+        a
+
+    else
+        b
+
+
+result : Result a a -> a
+result x =
+    case x of
+        Ok x_ ->
+            x_
+
+        Err x_ ->
+            x_
+
+
+round2 : Float -> Float
+round2 =
+    (*) 100 >> floor >> toFloat >> flip (/) 100
+
+
+commas : String -> String
+commas =
+    String.reverse
+        >> String.toList
+        >> List.indexedMap
+            (\i c ->
+                if i > 0 && modBy 3 i == 0 then
+                    [ ',', c ]
+
+                else
+                    [ c ]
+            )
+        >> List.concat
+        >> String.fromList
+        >> String.reverse
+
+
+usd : Float -> String
+usd amount =
+    let
+        ( intPart, decPart ) =
+            case amount |> abs |> round2 |> String.fromFloat |> String.split "." of
+                a :: b :: _ ->
+                    ( a, String.left 2 <| String.padRight 2 '0' b )
+
+                a :: [] ->
+                    ( a, "00" )
+
+                [] ->
+                    ( "0", "00" )
+    in
+    iif (amount < 0) "-" "" ++ "$" ++ commas intPart ++ "." ++ decPart
+
+
+
+---- PORTS --------------------------------------------------------------------
+
+
+port librarySynced : (D.Value -> msg) -> Sub msg
+
+
+port updateLibrary : Idd { name : Maybe String, tags : Maybe (List String) } -> Cmd msg
+
+
+port changeId : Id -> Cmd msg
+
+
+port newDoc : E.Value -> Cmd msg
+
+
+port deleteDoc : String -> Cmd msg
+
+
+port changeDoc : Idd (List Patch) -> Cmd msg
+
+
+port notifyDoc : Idd E.Value -> Cmd msg
+
+
+port queryDoc : Idd { lang : String, code : String, cols : D.Value } -> Cmd msg
+
+
+port docSelected : (Idd { doc : D.Value } -> msg) -> Sub msg
+
+
+port docChanged : (Idd DocDelta -> msg) -> Sub msg
+
+
+port docNotified : (Idd D.Value -> msg) -> Sub msg
+
+
+port docQueried : (Idd D.Value -> msg) -> Sub msg
+
+
+port docErrored : (String -> msg) -> Sub msg
+
+
+type alias DocDelta =
+    -- TODO: This should only include the deltas and not the full doc.
+    { doc : D.Value
+    , handle : D.Value
+    , patchInfo : D.Value
+    , patches : List D.Value
+    }
+
+
+type alias Idd a =
+    { id : Id
+    , data : a
+    }
+
+
+type alias Patch =
+    { action : String
+    , path : List D.Value
+    , value : D.Value
+    }
 
 
 
 ---- MAIN ---------------------------------------------------------------------
 
 
-main : Program () Model Msg
+main : Program Flags Model Msg
 main =
     Browser.application
         { init = init
         , update = update
         , view = view
-        , subscriptions = subscriptions
-        , onUrlChange = UrlChanged
-        , onUrlRequest = LinkClicked
+        , subscriptions = subs
+        , onUrlChange = UrlChange
+        , onUrlRequest = LinkClick
         }
-
-
-
----- SUBSCRIPTIONS ------------------------------------------------------------
-
-
-subscriptions : Model -> Sub Msg
-subscriptions model =
-    model.sheets
-        |> Dict.toList
-        |> List.filterMap (\( id, s ) -> Result.map (Tuple.pair ( id, s.code )) s.sheet |> Result.toMaybe)
-        |> List.filter (\( _, s ) -> s.every > 0)
-        |> List.map (\( ( id, code ), s ) -> Time.every (1000 * s.every) (\_ -> CodeEditing id code))
-        |> Sub.batch
 
 
 
 ---- MODEL --------------------------------------------------------------------
 
 
-type alias SheetId =
-    Int
+type alias Id =
+    String
 
 
-type alias Input valid data =
-    { valid : valid
-    , default : data
-    , data : data
-    }
-
-
-type ColType
-    = Numbers
-    | Strings
-    | Images
-    | Links
-    | Buttons
-    | Datepickers
-    | Colorpickers
-    | Checkboxes
-    | Sliders
-    | Fields
-    | Chart
-    | Colors
-    | Booleans
-
-
-type alias Col =
-    { label : String
-    , typ : ColType
-    , data : Array String
-    }
-
-
-type alias Sheet =
-    { transpose : Bool
-    , rows : Int
-    , cols : Array Col
-    , every : Float
-    }
-
-
-type alias Scrapsheet =
-    { watch : Set SheetId
-    , code : String
-    , sheet : Result String Sheet
-    }
+type alias Library =
+    Dict Id SheetInfo
 
 
 type alias Model =
-    -- The output of `code` completely determines the shape and content of `sheet`.
-    { sheets : Dict SheetId Scrapsheet
-
-    -- the row beneath the sheet opens up with its code and a pointer and tools
-    , shelf : Array (Array SheetId) -- use empty sheets as row/col spacers
-
-    -- sheet and row being dragged
-    , dragSheet : Maybe SheetId
-    , dragRow : Int
+    { nav : Nav.Key
+    , id : String
+    , search : String
+    , error : String
+    , library : Library
+    , sheet : Sheet
     }
+
+
+type alias SheetInfo =
+    { name : String
+    , tags : List String
+    , scratch : Bool
+    , thumb : Svg
+    , peers : Peers
+    }
+
+
+type Peers
+    = Private (Set Id)
+    | Public
+
+
+type alias Sheet =
+    { id : Id
+    , select : Rect
+    , hover : Index
+    , drag : Bool
+    , write : Maybe String
+    , doc : Result String Doc
+    , table : Result String Table
+    , stats : Result String (Dict String Stat)
+    }
+
+
+type alias Svg =
+    -- TODO: Generate nice preview Svg based on sheet contents.
+    ()
+
+
+type Stat
+    = Numeric
+        { histogram : Dict String Int
+        , count : Int
+        , sum : Float
+        , min : Maybe Float
+        , max : Maybe Float
+        }
+    | Enumerative
+        { histogram : Dict String Int
+        }
+    | Descriptive
+        { lengths : Dict Int Int
+        , keywords : Dict String Int
+        , count : Int
+        , sum : Int
+        , min : Maybe Int
+        , max : Int
+        }
+
+
+type Doc
+    = Library
+    | Shop
+    | Tab Table
+    | Net Net
+    | Query Query_
+    | Codex
+    | Portal Args
+
+
+type alias Table =
+    { cols : Array Col
+    , rows : Array Row
+    }
+
+
+type Lang
+    = Prql
+    | Sql
+    | Formula
+    | Scrapscript
+    | Python
+
+
+langs : Dict String Lang
+langs =
+    Dict.fromList
+        [ ( "prql", Prql )
+        , ( "sql", Sql )
+        , ( "formula", Formula )
+        , ( "scrapscript", Scrapscript )
+        , ( "python", Python )
+        ]
+
+
+type alias Query_ =
+    { lang : Lang
+    , code : String
+    , args : Args
+    , examples : List String
+    , cols : D.Value
+    }
+
+
+type alias Col =
+    { key : String
+    , name : String
+    , typ : Type
+    }
+
+
+type alias Row =
+    Dict String D.Value
+
+
+type Net
+    = Hook
+    | Http { url : String, interval : Int }
+    | Socket { url : String }
+
+
+type alias Args =
+    Dict String Type
+
+
+type alias Rect =
+    { a : Index, b : Index }
+
+
+rect : Int -> Int -> Int -> Int -> Rect
+rect ax ay bx by =
+    Rect (xy ax ay) (xy bx by)
+
+
+type alias Index =
+    { x : Int, y : Int }
+
+
+xy : Int -> Int -> Index
+xy x y =
+    Index x y
+
+
+type
+    Type
+    -- | Bytes
+    -- | Tag
+    -- | List
+    -- | Date
+    -- | Color
+    -- | Image
+    -- | Subsheet
+    -- | Shape2d
+    -- | Shape3d
+    -- | Vector
+    -- | Rows (List Type)
+    -- | Doc
+    -- | Plot
+    -- | Map
+    -- | Link
+    = Unknown
+    | Text
+    | Number
+    | Usd
+    | Boolean
+    | Many Type
+    | Link
+    | SheetId
+    | Json
+    | Timestamp
+    | Image
+    | Delete
+    | Create
+    | Form (Dict String String)
+
+
+typeName : Type -> String
+typeName typ =
+    case typ of
+        Unknown ->
+            "unknown"
+
+        Text ->
+            "text"
+
+        Number ->
+            "num"
+
+        Usd ->
+            "usd"
+
+        Boolean ->
+            "bool"
+
+        Many typ_ ->
+            "list " ++ typeName typ_
+
+        Link ->
+            "link"
+
+        SheetId ->
+            "sheet_id"
+
+        Json ->
+            "json"
+
+        Timestamp ->
+            "timestamp"
+
+        Image ->
+            "image"
+
+        Create ->
+            "create"
+
+        Delete ->
+            "delete"
+
+        Form _ ->
+            "form"
+
+
+
+---- PARSER -------------------------------------------------------------------
+
+
+string : D.Decoder String
+string =
+    D.oneOf
+        [ D.string
+        , D.map String.fromInt D.int
+        , D.map String.fromFloat D.float
+        , D.null "NULL"
+        , D.map (String.join ", ") (D.list (D.lazy (\_ -> string)))
+        , D.map (String.join ", " << List.map (\( k, v ) -> k ++ ": " ++ v) << Dict.toList) (D.dict (D.lazy (\_ -> string)))
+        , D.map (\c -> iif c "true" "false") D.bool
+        ]
+
+
+number : D.Decoder Float
+number =
+    D.oneOf
+        [ D.float
+        , D.map toFloat D.int
+        , D.andThen (String.toFloat >> Maybe.map D.succeed >> Maybe.withDefault (D.fail "")) D.string
+        ]
+
+
+docDecoder : D.Decoder Doc
+docDecoder =
+    D.field "type" D.string
+        |> D.andThen
+            (\typ ->
+                case typ of
+                    "library" ->
+                        D.succeed Library
+
+                    "shop" ->
+                        D.succeed Shop
+
+                    "table" ->
+                        D.field "data" <|
+                            D.map Tab tableDecoder
+
+                    "net-hook" ->
+                        D.succeed (Net Hook)
+
+                    "portal" ->
+                        D.field "data" <|
+                            D.map Portal <|
+                                D.succeed Dict.empty
+
+                    "net-socket" ->
+                        D.field "data" <|
+                            D.index 0 <|
+                                D.map (\url -> Net (Socket { url = url }))
+                                    (D.field "url" D.string)
+
+                    "net-http" ->
+                        D.field "data" <|
+                            D.index 0 <|
+                                D.map2 (\url interval -> Net (Http { url = url, interval = interval }))
+                                    (D.field "url" D.string)
+                                    (D.field "interval" D.int)
+
+                    "query" ->
+                        D.field "data" <|
+                            D.index 0 <|
+                                D.map Query
+                                    (D.map5 Query_
+                                        (D.field "lang" langDecoder)
+                                        (D.field "code" D.string)
+                                        -- TODO
+                                        (D.maybe (D.field "args" (D.succeed Dict.empty)) |> D.map (Maybe.withDefault Dict.empty))
+                                        (D.maybe (D.field "examples" (D.list D.string)) |> D.map (Maybe.withDefault []))
+                                        (D.field "cols" D.value)
+                                    )
+
+                    typ_ ->
+                        D.fail ("Bad table type: " ++ typ_)
+            )
+
+
+tableDecoder : D.Decoder Table
+tableDecoder =
+    D.map2 Table
+        (D.index 0 (D.array colDecoder))
+        (D.map (Array.slice 1 -1 << Array.push Dict.empty) (D.array rowDecoder))
+
+
+rowDecoder : D.Decoder Row
+rowDecoder =
+    D.oneOf
+        [ D.array D.value |> D.map (Array.toIndexedList >> List.map (\( k, v ) -> ( String.fromInt k, v )) >> Dict.fromList)
+        , D.dict D.value
+        ]
+
+
+colDecoder : D.Decoder Col
+colDecoder =
+    let
+        types : Dict String Type
+        types =
+            Dict.fromList
+                [ ( "bool", Boolean )
+                , ( "number", Number )
+                , ( "num", Number )
+                , ( "int", Number )
+                , ( "usd", Usd )
+                , ( "sheet_id", SheetId )
+                , ( "link", Link )
+                , ( "image", Image )
+                , ( "form", Form Dict.empty )
+                , ( "timestamp", Timestamp )
+                , ( "datetime", Timestamp )
+                , ( "date", Timestamp )
+                , ( "json", Json )
+                , ( "text", Text )
+                , ( "string", Text )
+                , ( "create", Create )
+                ]
+    in
+    D.oneOf
+        [ D.map3 Col
+            (D.field "key" string)
+            (D.field "name" D.string)
+            (D.field "type" (D.nullable D.string |> D.map (Maybe.andThen (flip Dict.get types) >> Maybe.withDefault Unknown)))
+        , D.succeed (Col "" "" Text)
+        ]
+
+
+langDecoder : D.Decoder Lang
+langDecoder =
+    D.string |> D.andThen (flip Dict.get langs >> Maybe.map D.succeed >> Maybe.withDefault (D.fail "Invalid query language."))
+
+
+shopDecoder : D.Decoder Table
+shopDecoder =
+    D.field "data" tableDecoder
 
 
 
 ---- INIT ---------------------------------------------------------------------
 
 
-init : () -> Url -> Nav.Key -> ( Model, Cmd Msg )
-init _ url _ =
+type alias Flags =
+    {}
+
+
+init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
+init _ url nav =
     let
-        sheets : List String
-        sheets =
-            [ """
-              sheet/empty
-                |> sheet/col/numbers  "c1" [ 1, 2, 3 ]
-              """
-            , """
-              sheet/empty
-                |> sheet/col/numbers  "c1" [ 1, 2, 3 ]
-                |> sheet/col/text     "c2" ["apple","pear","mango"]
-                |> sheet/col/checkbox "c3" [ true, false, true ]
-                |> sheet/col/sliders  "c4" [ 0, 50, 75 ]
-              """
-            , """
-              sheet/limit 2 s1
-              """
-            , """
-              sheet/join "" s0 s1
-              """
-            , """
-              s1 
-                |> sheet/reduce 
-                   [ #sum
-                   , #count
-                   , #max
-                   , #sum 
-                   ]
-              """
-
-            -- , """
-            --   sheet/filter (r1 -> r1.id == 1) s1
-            --   """
-            -- , """
-            --   sheet/join (r1 -> r2 -> r1.id == r2.id) s1 s2
-            --   """
-            -- , """
-            --   sheet/append s1 s2
-            --   """
-            -- , """
-            --   sheet/union (r -> r.id) s1 s2
-            --   """
-            -- , """
-            --   sheet/intersect (r -> r.id) s1 s2
-            --   """
-            -- , """
-            --   sheet/subtract (r -> r.id) s1 s2
-            --   """
-            -- , """
-            --   sheet/group (r -> r.id) s1
-            --   """
-            -- , """
-            --   sheet/sort (r -> r.id) s1
-            --   """
-            -- , """
-            --   sheet/to-columns
-            --   """
-            -- , """
-            --   sheet/from-columns
-            --   """
-            -- , """
-            --   sheet/http "TODO"
-            --   """
-            -- , """
-            --   sheet/websocket "TODO"
-            --   """
-            -- , """
-            --   sheet/every (sheet/http "TODO")
-            --   """
-            --
-            -- basic memory
-            , """
-              sheet/union s1 s2
-              """
-            , """
-              sheet/union (sheet/limit 1 s1) self 
-                |> sheet/limit 10
-              """
-
-            -- TODO: Turn this into a Chart.
-            -- monte carlo
-            , """
-              sheet/union
-                (sheet/every 2 
-                 (sheet/http "https://taylor.town/random")) 
-                self 
-                |> sheet/limit 10
-              """
-            , """
-              s7 |> sheet/reduce [ #avg ]
-              """
-
-            -- game of life
-            , """
-              self
-              |> (game-of-life 30)
-              |> sheet/every (10/10)
-              """
-            , """
-              s9 |> sheet/reduce [ #count, #count, #count, #count, #count, #count, #count, #count, #count, #count, #count, #count, #count, #count, #count ]
-              """
-
-            -- , """
-            --   "[ todo ]"
-            --     |> sheet/from-json pair
-            --     |> sheet/col/numbers
-            --     |> sheet/col/text
-            --   """
-            -- , """
-            --   text/join "" [ "1,a" , "2,b" , "3,c" ]
-            --     |> ( sheet/from-csv (a -> b -> { a, b })
-            --          |> sheet/csv/col/numbers
-            --          |> sheet/csv/col/text
-            --        )
-            --   """
-            ]
+        model : Model
+        model =
+            route url
+                { nav = nav
+                , id = ""
+                , search = ""
+                , error = ""
+                , library = Dict.empty
+                , sheet =
+                    { id = ""
+                    , select = Rect (xy -1 -1) (xy -1 -1)
+                    , hover = xy -1 -1
+                    , drag = False
+                    , write = Nothing
+                    , doc = Err ""
+                    , table = Err ""
+                    , stats = Err ""
+                    }
+                }
     in
-    ( { sheets =
-            sheets
-                |> List.indexedMap
-                    (\i code ->
-                        Tuple.pair i
-                            { watch = Set.singleton -1
-                            , code = String.trim code |> String.replace "             " ""
-                            , sheet = Ok { transpose = False, rows = 0, cols = Array.empty, every = 0 }
-                            }
-                    )
-                |> Dict.fromList
-      , shelf =
-            -- List.indexedMap (\i _ -> [ i ]) sheets
-            Array.fromList <|
-                List.map Array.fromList
-                    [ [ 1, 0 ]
-                    , [ 2, 3, 5, 4 ]
-                    , [ 6, 6, 6 ]
-                    , [ 7, 8 ]
-                    , [ 10 ]
-                    , [ 10 ]
-                    , [ 10 ]
-                    , [ 9 ]
-                    ]
-      , dragSheet = Nothing
-      , dragRow = -1
-      }
-    , Task.succeed -1 |> Task.perform SheetEdited
-    )
+    ( model, changeId model.id )
+
+
+route : Url -> Model -> Model
+route url model =
+    url
+        |> UrlP.parse
+            (UrlP.map
+                (\id search -> { model | id = id, search = Maybe.withDefault "" search })
+                (UrlP.top
+                    </> UrlP.oneOf [ UrlP.string, UrlP.map "" UrlP.top ]
+                    <?> UrlQ.string "q"
+                 -- </> UrlP.fragment (Maybe.andThen (flip Dict.get tools))
+                )
+            )
+        |> Maybe.withDefault model
 
 
 
@@ -304,24 +610,64 @@ init _ url _ =
 
 type Msg
     = NoOp
-    | SheetCreating
-    | SheetDragging SheetId
-    | SheetDragginging { row : Int, after : Bool, x : Float }
-    | SheetDropping
-    | CodeEditing SheetId String
-    | CodeEdited SheetId (Result String Scrapsheet)
-    | DataEditing SheetId ( Int, Int ) String
-    | SheetEdited SheetId
-    | UrlChanged Url
-    | LinkClicked Browser.UrlRequest
+    | UrlChange Url
+    | LinkClick Browser.UrlRequest
+    | LibrarySync D.Value
+    | DocSelect (Idd { doc : D.Value })
+    | DocChange (Idd DocDelta)
+    | DocNotify (Idd D.Value)
+    | DocQuery (Idd D.Value)
+    | DocError String
+    | DocMsg DocMsg
+    | DocNew E.Value
+    | DocNewQuery
+    | DocNewTable
+    | DocDelete Id
+    | KeyPress String
+    | CellMouseClick
+    | CellMouseDoubleClick String
+    | CellMouseDown
+    | CellMouseUp
+    | CellHover Index
+    | InputChange Input String
+    | ShopFetch (Result Http.Error Table)
+
+
+type DocMsg
+    = TabMsg TabMsg
+    | QueryMsg ()
+
+
+type TabMsg
+    = SheetWrite Index
+    | SheetRowPush Int
+    | SheetColumnPush
+
+
+type Input
+    = SheetSearch
+    | CellWrite
+    | ColumnType Int
+    | ColumnKey Int
+    | ColumnLabel Int
+    | QueryCode
 
 
 
----- PARSER -------------------------------------------------------------------
+---- SUBSCRIPTIONS ------------------------------------------------------------
 
 
-type alias Env =
-    Dict SheetId (Maybe Sheet)
+subs : Model -> Sub Msg
+subs model =
+    Sub.batch
+        [ librarySynced LibrarySync
+        , docSelected DocSelect
+        , docChanged DocChange
+        , docNotified DocNotify
+        , docQueried DocQuery
+        , docErrored DocError
+        , Browser.onKeyPress (D.map KeyPress (D.field "key" D.string))
+        ]
 
 
 
@@ -329,435 +675,316 @@ type alias Env =
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
-update msg model =
+update msg ({ sheet } as model) =
     case msg of
         NoOp ->
             ( model, Cmd.none )
 
-        SheetCreating ->
-            let
-                sheetId : Int
-                sheetId =
-                    model.sheets |> Dict.keys |> List.maximum |> Maybe.withDefault 0 |> (+) 1
-            in
-            ( { model
-                | shelf = Array.append (Array.fromList [ Array.fromList [ sheetId ] ]) model.shelf
-                , sheets =
-                    model.sheets
-                        |> Dict.insert sheetId
-                            { watch = Set.empty
-                            , code = "sheet/from-list\n  [\n  ]"
-                            , sheet = Ok { transpose = False, rows = 0, cols = Array.empty, every = 0 }
-                            }
-              }
-            , Cmd.batch
-                []
+        UrlChange url ->
+            ( route url model
+            , changeId (route url model).id
             )
 
-        SheetDragging id ->
-            ( { model | dragSheet = Just id, dragRow = -1 }, Cmd.none )
+        LinkClick (Browser.Internal url) ->
+            -- TODO: ?q=+any ?q=-any ?q==any
+            ( model, Nav.pushUrl model.nav (Url.toString url) )
 
-        SheetDragginging { row, after, x } ->
-            ( { model | dragRow = row }, Cmd.none )
+        LinkClick (Browser.External url) ->
+            ( model, Nav.load url )
 
-        SheetDropping ->
-            case model.dragSheet of
-                Just drag ->
-                    let
-                        shelf =
-                            model.shelf |> Array.map (Array.filter ((/=) drag))
-                    in
-                    ( { model | dragSheet = Nothing, dragRow = -1, shelf = shelf |> Array.set model.dragRow (shelf |> Array.get model.dragRow |> Maybe.withDefault Array.empty |> Array.push drag) }, Cmd.none )
+        LibrarySync data ->
+            ( { model
+                | library =
+                    data
+                        |> D.decodeValue
+                            (D.dict
+                                (D.map5 SheetInfo
+                                    (D.oneOf [ D.field "name" D.string, D.succeed "" ])
+                                    (D.oneOf [ D.field "tags" (D.list D.string), D.succeed [] ])
+                                    (D.oneOf [ D.field "scratch" D.bool, D.succeed False ])
+                                    (D.succeed ())
+                                    (D.succeed Public)
+                                )
+                            )
+                        |> Result.withDefault model.library
+              }
+            , Cmd.none
+            )
 
-                Nothing ->
-                    ( { model | dragSheet = Nothing, dragRow = -1 }, Cmd.none )
+        DocSelect data ->
+            ( { model
+                | error = ""
+                , sheet =
+                    { id = data.id
+                    , select = Rect (xy -1 -1) (xy -1 -1)
+                    , hover = xy -1 -1
+                    , drag = False
+                    , write = Nothing
+                    , doc = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString
+                    , table = Err ""
+                    , stats = Err ""
+                    }
+              }
+            , case data.data.doc |> D.decodeValue docDecoder of
+                Ok Shop ->
+                    Http.get
+                        { url = "http://localhost:8000/shop"
+                        , expect = Http.expectJson ShopFetch shopDecoder
+                        }
 
-        CodeEditing id code ->
-            let
-                env : Env
-                env =
-                    model.sheets |> Dict.map (always (.sheet >> Result.toMaybe))
+                _ ->
+                    Cmd.none
+            )
 
-                tupleMap2 : (a -> c -> e) -> (b -> d -> f) -> ( a, b ) -> ( c, d ) -> ( e, f )
-                tupleMap2 e f ( a, b ) ( c, d ) =
-                    ( e a c, f b d )
+        DocChange data ->
+            ( iif (data.id /= model.sheet.id)
+                model
+                { model | sheet = { sheet | doc = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString } }
+              -- TODO: Fetch table rows depending on type, e.g. portal:123
+            , Cmd.none
+            )
 
-                scrapsheet : Scrap -> Task String ( Set SheetId, Result String Sheet )
-                scrapsheet ss =
-                    case ss of
-                        Var "self" ->
-                            env
-                                -- TODO: Turn input columns into values (e.g. Checkboxes -> Bools)
-                                |> Dict.get id
-                                |> Result.fromMaybe "TODO: sheet not found"
-                                |> Result.map
-                                    (Maybe.withDefault
-                                        { transpose = False
-                                        , rows = 0
-                                        , cols = Array.empty
-                                        , every = 0
-                                        }
-                                    )
-                                |> Tuple.pair Set.empty
-                                |> Task.succeed
+        DocNotify data ->
+            -- TODO:
+            ( model, Cmd.none )
 
-                        Var x ->
+        DocQuery data ->
+            ( iif (data.id /= model.sheet.id)
+                model
+                { model | error = "", sheet = { sheet | table = data.data |> D.decodeValue tableDecoder |> Result.mapError D.errorToString } }
+            , Cmd.none
+            )
+
+        DocError error ->
+            ( { model | error = error }
+            , Cmd.none
+            )
+
+        DocMsg (TabMsg edit) ->
+            ( { model | sheet = { sheet | write = Nothing } }
+            , case sheet.doc of
+                Ok Library ->
+                    case edit of
+                        SheetWrite { x, y } ->
                             let
-                                sheetId =
-                                    x |> String.dropLeft 1 |> String.toInt |> Maybe.withDefault -1
-
-                                static : ColType -> ColType
-                                static col_ =
-                                    case col_ of
-                                        -- TODO: Do the rest of the input types.
-                                        Checkboxes ->
-                                            Booleans
-
-                                        Sliders ->
-                                            Numbers
-
-                                        col ->
-                                            col
+                                id : String
+                                id =
+                                    model.library
+                                        |> Dict.filter (\k v -> k /= "" && not v.scratch && List.any (String.contains model.search) (k :: v.name :: v.tags))
+                                        |> Dict.keys
+                                        |> List.drop (y - 1)
+                                        |> List.head
+                                        |> Maybe.withDefault ""
                             in
-                            env
-                                |> Dict.get sheetId
-                                |> Result.fromMaybe "TODO: sheet not found"
-                                |> Result.andThen (Result.fromMaybe "TODO: sheet isn't here")
-                                |> Result.map (\sheet -> { sheet | cols = sheet.cols |> Array.map (\col -> { col | typ = static col.typ }) })
-                                |> Tuple.pair (Set.singleton sheetId)
-                                |> Task.succeed
+                            case Maybe.map .name (Array.get x libraryCols) of
+                                Just "name" ->
+                                    updateLibrary (Idd id { name = sheet.write, tags = Nothing })
 
-                        Variant "game-of-life" (Record [ ( "l", Int n ), ( "r", sheet ) ]) ->
-                            let
-                                gol : Sheet -> Sheet
-                                gol s =
-                                    let
-                                        getCell : Int -> Int -> Bool
-                                        getCell i j =
-                                            "" /= (s.cols |> Array.get i |> Maybe.andThen (.data >> Array.get j) |> Maybe.withDefault (iif (modBy 20 (i * j) == 0) "✓" ""))
-                                    in
-                                    { s
-                                        | rows = n
-                                        , cols =
-                                            Array.initialize (n * 2)
-                                                (\i ->
-                                                    { label = ""
-                                                    , typ = Booleans
-                                                    , data =
-                                                        Array.initialize n
-                                                            (\j ->
-                                                                case List.sum (List.map2 (\i_ j_ -> iif (getCell (i + i_) (j + j_)) 1 0) [ -1, -1, -1, 0, 0, 1, 1, 1 ] [ -1, 0, 1, -1, 1, -1, 0, 1 ]) of
-                                                                    2 ->
-                                                                        iif (getCell i j) "✓" ""
+                                Just "tags" ->
+                                    updateLibrary (Idd id { name = Nothing, tags = sheet.write |> Maybe.map (String.split ", " >> List.map String.trim) })
 
-                                                                    3 ->
-                                                                        "✓"
-
-                                                                    _ ->
-                                                                        ""
-                                                            )
-                                                    }
-                                                )
-                                    }
-                            in
-                            scrapsheet sheet
-                                |> Task.map (Tuple.mapSecond (Result.map gol))
-
-                        Variant "empty" Hole ->
-                            Task.succeed
-                                ( Set.empty
-                                , Ok
-                                    { transpose = False
-                                    , rows = 0
-                                    , cols = Array.empty
-                                    , every = 0
-                                    }
-                                )
-
-                        Variant "col" (Record [ ( "l", sheet ), ( "r", Record [ ( "l", Text k ), ( "r", col ) ] ) ]) ->
-                            Task.map2 (tupleMap2 Set.union (Result.map2 (\a b -> { a | rows = Basics.max (Array.length b.data) a.rows, cols = Array.push b a.cols })))
-                                (scrapsheet sheet)
-                            <|
-                                Task.succeed <|
-                                    Tuple.pair Set.empty <|
-                                        case col of
-                                            Variant t (List xs) ->
-                                                Ok
-                                                    { label = k
-                                                    , data = xs |> List.map S.toString |> Array.fromList
-                                                    , typ =
-                                                        case t of
-                                                            "numbers" ->
-                                                                Numbers
-
-                                                            "text" ->
-                                                                Strings
-
-                                                            "checkbox" ->
-                                                                Checkboxes
-
-                                                            "sliders" ->
-                                                                Sliders
-
-                                                            _ ->
-                                                                -- TODO: Bad!
-                                                                Strings
-                                                    }
-
-                                            _ ->
-                                                Err "TODO: unknown col"
-
-                        Variant "union" (Record [ ( "l", l ), ( "r", r ) ]) ->
-                            -- TODO: This whole implementation is broken and quite bad.
-                            Task.map2
-                                (tupleMap2 Set.union
-                                    (Result.map2
-                                        (\b d ->
-                                            { transpose = b.transpose || d.transpose
-                                            , rows = b.rows + d.rows
-                                            , cols =
-                                                case ( Array.length b.cols, Array.length d.cols ) of
-                                                    ( 0, _ ) ->
-                                                        d.cols
-
-                                                    ( _, 0 ) ->
-                                                        b.cols
-
-                                                    _ ->
-                                                        List.map2 (\b_ d_ -> { b_ | data = Array.append b_.data d_.data }) (Array.toList b.cols) (Array.toList d.cols) |> Array.fromList
-                                            , every = Basics.max b.every d.every
-                                            }
-                                        )
-                                    )
-                                )
-                                (scrapsheet l)
-                                (scrapsheet r)
-
-                        Variant "limit" (Record [ ( "l", Int n ), ( "r", sheet ) ]) ->
-                            scrapsheet sheet |> Task.map (Tuple.mapSecond (Result.map (\s -> { s | rows = Basics.min n s.rows, cols = s.cols |> Array.map (\col -> { col | data = col.data |> Array.slice 0 n }) })))
-
-                        Variant "every" (Record [ ( "l", Int n ), ( "r", sheet ) ]) ->
-                            scrapsheet sheet |> Task.map (Tuple.mapSecond (Result.map (\s -> { s | every = toFloat n })))
-
-                        Variant "every" (Record [ ( "l", Float n ), ( "r", sheet ) ]) ->
-                            scrapsheet sheet |> Task.map (Tuple.mapSecond (Result.map (\s -> { s | every = n })))
-
-                        Variant "http" (Text x) ->
-                            Http.riskyTask
-                                { method = "GET"
-                                , headers = []
-                                , url = x
-                                , body = Http.emptyBody
-                                , timeout = Just 5000
-                                , resolver =
-                                    stringResolver
-                                        (\s ->
-                                            Ok <|
-                                                Tuple.pair Set.empty <|
-                                                    case s of
-                                                        Http.BadUrl_ err ->
-                                                            Err err
-
-                                                        Http.Timeout_ ->
-                                                            Err "timeout"
-
-                                                        Http.NetworkError_ ->
-                                                            Err "network error"
-
-                                                        Http.BadStatus_ _ err ->
-                                                            Err err
-
-                                                        Http.GoodStatus_ _ body ->
-                                                            Ok
-                                                                { transpose = False
-                                                                , rows = 1
-                                                                , cols = Array.fromList [ { label = "res", typ = Strings, data = Array.fromList [ body ] } ]
-                                                                , every = 0
-                                                                }
-                                        )
-                                }
-
-                        Variant "data" (Record xs) ->
-                            -- TODO: This should be a Dic rather than a Record.
-                            xs
-                                |> List.sortBy Tuple.first
-                                |> List.foldr
-                                    (\( k, v ) c ->
-                                        Result.map2 (flip (::)) c <|
-                                            case v of
-                                                Variant t (List xs_) ->
-                                                    Ok
-                                                        { label = k
-                                                        , data = xs_ |> List.map S.toString |> Array.fromList
-                                                        , typ =
-                                                            case t of
-                                                                "sheet/col/numbers" ->
-                                                                    Numbers
-
-                                                                "sheet/col/text" ->
-                                                                    Strings
-
-                                                                "sheet/col/checkbox" ->
-                                                                    Checkboxes
-
-                                                                "sheet/col/sliders" ->
-                                                                    Sliders
-
-                                                                _ ->
-                                                                    -- TODO: Bad!
-                                                                    Strings
-                                                        }
-
-                                                _ ->
-                                                    Err "TODO: record cols"
-                                    )
-                                    (Ok [])
-                                |> Result.map Array.fromList
-                                |> Result.map (\cols -> { transpose = False, rows = 10, cols = cols, every = 0 })
-                                |> Tuple.pair Set.empty
-                                |> Task.succeed
-
-                        Variant "reduce" (Record [ ( "l", List l ), ( "r", r ) ]) ->
-                            scrapsheet r
-                                |> Task.map
-                                    (Tuple.mapSecond
-                                        (Result.map
-                                            (\s ->
-                                                { s
-                                                    | rows = 1
-                                                    , cols =
-                                                        Array.fromList <|
-                                                            List.map2
-                                                                (\b_ d_ ->
-                                                                    { b_
-                                                                        | data =
-                                                                            Array.fromList <|
-                                                                                case d_ of
-                                                                                    Variant "sum" Hole ->
-                                                                                        b_.data |> Array.toList |> List.filterMap String.toFloat |> List.sum |> String.fromFloat |> List.singleton
-
-                                                                                    Variant "avg" Hole ->
-                                                                                        b_.data |> Array.toList |> List.filterMap String.toFloat |> List.sum |> flip (/) (toFloat (Basics.max 1 (Array.length b_.data))) |> String.fromFloat |> List.singleton
-
-                                                                                    Variant "min" Hole ->
-                                                                                        b_.data |> Array.toList |> List.minimum |> Maybe.withDefault "" |> List.singleton
-
-                                                                                    Variant "max" Hole ->
-                                                                                        b_.data |> Array.toList |> List.maximum |> Maybe.withDefault "" |> List.singleton
-
-                                                                                    Variant "count" Hole ->
-                                                                                        b_.data |> Array.filter ((/=) "") |> Array.length |> String.fromInt |> List.singleton
-
-                                                                                    _ ->
-                                                                                        []
-                                                                    }
-                                                                )
-                                                                (Array.toList s.cols)
-                                                                l
-                                                }
-                                            )
-                                        )
-                                    )
-
-                        Variant "join" (Record [ ( "l", Record [ ( "l", Text k ), ( "r", l ) ] ), ( "r", r ) ]) ->
-                            Task.map2
-                                (tupleMap2 Set.union
-                                    (Result.map2
-                                        (\b d ->
-                                            { transpose = b.transpose || d.transpose
-                                            , rows = b.rows
-                                            , cols = Array.append b.cols (Array.map (\col -> col) d.cols) -- TODO: Implement this for real.
-                                            , every = Basics.max b.every d.every
-                                            }
-                                        )
-                                    )
-                                )
-                                (scrapsheet l)
-                                (scrapsheet r)
+                                _ ->
+                                    Cmd.none
 
                         _ ->
-                            Err ("TODO: scrapscript -> sheet: " ++ Debug.toString ss) |> Tuple.pair Set.empty |> Task.succeed
+                            Cmd.none
 
-                func : String -> Scrap -> Scrap
-                func =
-                    Binop "->" << Var
+                Ok (Tab table) ->
+                    changeDoc <|
+                        Idd sheet.id <|
+                            case edit of
+                                SheetWrite { x, y } ->
+                                    case max 0 y of
+                                        0 ->
+                                            Maybe.map2 Tuple.pair sheet.write (Array.get x table.cols)
+                                                |> Maybe.map
+                                                    (\( write, col ) ->
+                                                        [ { action = "set"
+                                                          , path = [ E.int 0, E.string (String.fromInt x) ]
+                                                          , value =
+                                                                case String.fromInt y of
+                                                                    "-1" ->
+                                                                        E.object [ ( "name", E.string col.name ), ( "type", E.string write ), ( "key", E.string col.key ) ]
 
-                pair : Scrap -> Scrap -> Scrap
-                pair l r =
-                    Record [ ( "l", l ), ( "r", r ) ]
+                                                                    "0" ->
+                                                                        E.object [ ( "name", E.string write ), ( "type", E.string (typeName col.typ) ), ( "key", E.string col.key ) ]
 
-                env_ : Dict String Scrap
-                env_ =
-                    Dict.empty
-                        |> Dict.union (model.sheets |> Dict.keys |> List.map (String.fromInt >> (++) "s") |> List.map (\x -> ( x, Var x )) |> Dict.fromList)
-                        |> Dict.union ([ "numbers", "text", "checkbox", "sliders" ] |> List.map (\x -> ( "sheet/col/" ++ x, func "k" (func "col" (func "sheet" (Variant "col" (pair (Var "sheet") (pair (Var "k") (Variant x (Var "col"))))))) )) |> Dict.fromList)
-                        |> Dict.insert "self" (Var "self")
-                        |> Dict.insert "true" (Variant "true" Hole)
-                        |> Dict.insert "false" (Variant "false" Hole)
-                        |> Dict.insert "sheet/empty" (Variant "empty" Hole)
-                        |> Dict.insert "sheet/limit" (func "a" (func "b" (Variant "limit" (pair (Var "a") (Var "b")))))
-                        |> Dict.insert "sheet/union" (func "a" (func "b" (Variant "union" (pair (Var "a") (Var "b")))))
-                        |> Dict.insert "sheet/every" (func "a" (func "b" (Variant "every" (pair (Var "a") (Var "b")))))
-                        |> Dict.insert "sheet/http" (func "a" (Variant "http" (Var "a")))
-                        |> Dict.insert "sheet/reduce" (func "a" (func "b" (Variant "reduce" (pair (Var "a") (Var "b")))))
-                        |> Dict.insert "sheet/join" (func "a" (func "b" (func "c" (Variant "join" (pair (pair (Var "a") (Var "b")) (Var "c"))))))
-                        |> Dict.insert "game-of-life" (func "a" (func "b" (Variant "game-of-life" (pair (Var "a") (Var "b")))))
-            in
-            ( model
-            , code
-                |> S.run env_
-                |> (\x_ ->
-                        case x_ of
-                            Ok x ->
-                                scrapsheet x
+                                                                    _ ->
+                                                                        E.object [ ( "name", E.string col.name ), ( "type", E.string (typeName col.typ) ), ( "key", E.string col.key ) ]
+                                                          }
+                                                        ]
+                                                    )
+                                                |> Maybe.withDefault []
 
-                            Err x ->
-                                Task.succeed ( Set.empty, Err x )
-                   )
-                |> Task.map (\( watch, sheet ) -> { watch = watch, code = code, sheet = sheet })
-                |> Task.attempt (CodeEdited id)
+                                        _ ->
+                                            table.cols
+                                                |> Array.get x
+                                                |> Maybe.map
+                                                    (\col ->
+                                                        [ { action = "set"
+                                                          , path = [ E.int y, E.string col.key ]
+                                                          , value = sheet.write |> Maybe.map E.string |> Maybe.withDefault E.null
+                                                          }
+                                                        ]
+                                                    )
+                                                |> Maybe.withDefault []
+
+                                SheetRowPush i ->
+                                    [ { action = "push"
+                                      , path = []
+                                      , value = E.list identity [ E.object [] ]
+                                      }
+                                    ]
+
+                                SheetColumnPush ->
+                                    [ { action = "push"
+                                      , path = [ E.int 0 ]
+                                      , value = E.list identity [ E.object [ ( "name", E.string "" ), ( "type", E.string "text" ), ( "key", E.int (Array.length table.cols) ) ] ]
+                                      }
+                                    ]
+
+                _ ->
+                    Cmd.none
             )
 
-        CodeEdited id (Ok ss) ->
-            ( { model | sheets = model.sheets |> Dict.insert id ss }
-            , Task.succeed id |> Task.perform SheetEdited
-            )
-
-        CodeEdited id (Err _) ->
-            -- TODO
+        DocMsg (QueryMsg _) ->
+            -- TODO:
             ( model, Cmd.none )
 
-        DataEditing id ( i, j ) value ->
+        DocDelete id ->
+            ( model, deleteDoc id )
+
+        DocNew x ->
+            ( model, newDoc x )
+
+        DocNewTable ->
+            ( model, newDoc <| E.object [ ( "type", E.string "table" ), ( "data", E.list identity [ E.list identity [ E.object [ ( "name", E.string "a" ), ( "type", E.string "text" ), ( "key", E.string "a" ) ] ] ] ) ] )
+
+        DocNewQuery ->
+            ( model, newDoc <| E.object [ ( "type", E.string "query" ), ( "data", E.list identity [ E.object [ ( "lang", E.string "sql" ), ( "code", E.string "select 1" ) ] ] ) ] )
+
+        ShopFetch x ->
+            ( { model | sheet = { sheet | table = Result.mapError (always "Something went wrong.") x } }, Cmd.none )
+
+        InputChange SheetSearch x ->
+            ( { model | search = x, sheet = { sheet | table = Err "" } }
+            , Cmd.batch
+                [ Nav.replaceUrl model.nav ("?q=" ++ Url.percentEncode x)
+                , case sheet.doc of
+                    Ok (Query query) ->
+                        -- TODO: Lang to string.
+                        queryDoc (Idd sheet.id { lang = "sql", code = query.code, cols = query.cols })
+
+                    _ ->
+                        Cmd.none
+                ]
+            )
+
+        InputChange CellWrite x ->
+            ( { model | sheet = { sheet | write = Just x } }, Cmd.none )
+
+        InputChange QueryCode x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data =
+                    [ { action = "set"
+                      , path = [ E.int 0, E.string "code" ]
+                      , value = E.string x
+                      }
+                    ]
+                }
+            )
+
+        InputChange (ColumnType i) x ->
+            -- TODO:
+            ( model, Cmd.none )
+
+        InputChange (ColumnKey i) x ->
+            -- TODO:
+            ( model, Cmd.none )
+
+        InputChange (ColumnLabel i) x ->
+            -- TODO:
+            ( model, Cmd.none )
+
+        CellMouseDoubleClick write ->
             let
-                edit : Sheet -> Sheet
-                edit sheet =
-                    case Array.get i sheet.cols of
-                        Just col ->
-                            { sheet | cols = sheet.cols |> Array.set i { col | data = col.data |> Array.set j value } }
-
-                        Nothing ->
-                            sheet
+                a =
+                    ( { model | sheet = { sheet | write = Just write } }
+                    , Task.attempt (always NoOp) (Dom.focus "new-cell")
+                    )
             in
-            ( { model | sheets = model.sheets |> Dict.update id (Maybe.map (\x -> { x | sheet = Result.map edit x.sheet })) }
-            , Task.succeed id |> Task.perform SheetEdited
-            )
+            case sheet.doc of
+                Ok Library ->
+                    a
 
-        SheetEdited id ->
-            ( model
-            , model.sheets
-                |> Dict.filter (always (.watch >> Set.member id))
-                |> Dict.map (\k v -> Task.succeed () |> Task.perform (\_ -> CodeEditing k v.code))
-                |> Dict.values
-                |> Cmd.batch
-            )
+                Ok (Tab _) ->
+                    a
 
-        UrlChanged url ->
-            ( model, Cmd.none )
+                _ ->
+                    ( model, Cmd.none )
 
-        LinkClicked (Browser.Internal url) ->
-            ( model, Cmd.none )
+        CellMouseClick ->
+            ( { model | sheet = { sheet | drag = False, select = Rect sheet.hover sheet.hover } }, Cmd.none )
 
-        LinkClicked (Browser.External url) ->
+        CellMouseDown ->
+            ( { model | sheet = { sheet | drag = True, select = Rect sheet.hover sheet.hover } }, Cmd.none )
+
+        CellMouseUp ->
+            ( { model | sheet = { sheet | drag = False, select = Rect sheet.select.a sheet.hover } }, Cmd.none )
+
+        CellHover hover ->
+            let
+                select =
+                    sheet.select
+
+                select_ =
+                    iif sheet.drag { select | b = hover } select
+            in
+            ( { model | sheet = { sheet | hover = hover, select = select_ } }, Cmd.none )
+
+        KeyPress "Enter" ->
+            ( model, Task.attempt (always NoOp) (Dom.blur "new-cell") )
+
+        -- KeyPress "Backspace" ->
+        --     ( { model | sheet = { sheet | write = Nothing } }
+        --     , changeDoc <|
+        --         Idd sheet.id <|
+        --             case sheet.doc of
+        --                 Ok (Tab table) ->
+        --                     -- TODO: Do multiple patches when ranges are selected.
+        --                     case ( negate sheet.select.a.y, negate sheet.select.a.x ) of
+        --                         ( 1, 1 ) ->
+        --                             []
+        --                         ( 1, i ) ->
+        --                             [ { action = "col-del"
+        --                               , path = [ E.string "cols", E.int (negate i) ]
+        --                               , value = E.object []
+        --                               }
+        --                             ]
+        --                         ( i, 1 ) ->
+        --                             [ { action = "row-del"
+        --                               , path = [ E.string "rows", E.int (negate i) ]
+        --                               , value = E.object []
+        --                               }
+        --                             ]
+        --                         ( y, x ) ->
+        --                             table.cols
+        --                                 |> Array.get (negate x)
+        --                                 |> Maybe.map
+        --                                     (\col ->
+        --                                         [ { action = "cell-put"
+        --                                           , path = [ E.string "rows", E.int (negate y), E.int col.key ]
+        --                                           , value = sheet.write |> Maybe.withDefault "" |> E.string
+        --                                           }
+        --                                         ]
+        --                                     )
+        --                                 |> Maybe.withDefault []
+        --                 _ ->
+        --                     []
+        --     )
+        KeyPress _ ->
             ( model, Cmd.none )
 
 
@@ -765,98 +992,568 @@ update msg model =
 ---- VIEW ---------------------------------------------------------------------
 
 
-viewSheet : SheetId -> Sheet -> Html Msg
-viewSheet id sheet =
-    -- TODO: Show some call to action for empty sheets? Or make the region clickable?
-    H.table []
-        [ H.thead []
-            [ H.tr [] <|
-                Array.toList <|
-                    Array.map (H.th [] << ls << text << .label) <|
-                        sheet.cols
-            ]
-        , H.tbody [] <|
-            Array.toList <|
-                Array.initialize sheet.rows
-                    (\i ->
-                        H.tr [] <|
-                            Array.toList <|
-                                Array.initialize (Array.length sheet.cols)
-                                    (\j ->
-                                        H.td [] <|
-                                            ls <|
-                                                Maybe.withDefault (text "") <|
-                                                    Maybe.map
-                                                        (\( typ, val ) ->
-                                                            case ( typ, val ) of
-                                                                ( Checkboxes, x ) ->
-                                                                    H.input [ A.type_ "checkbox", A.checked (x == "#true"), A.onCheck (\c -> DataEditing id ( j, i ) (iif c "#true" "#false")) ] []
-
-                                                                ( Sliders, x ) ->
-                                                                    H.input [ A.custom "dragstart" (D.succeed { message = NoOp, stopPropagation = True, preventDefault = True }), A.draggable "true", A.type_ "range", A.value x, A.onInput (DataEditing id ( j, i )) ] []
-
-                                                                ( Booleans, "#true" ) ->
-                                                                    text "✓"
-
-                                                                ( Booleans, "#false" ) ->
-                                                                    text ""
-
-                                                                _ ->
-                                                                    text val
-                                                        )
-                                                    <|
-                                                        Maybe.andThen (\col -> col.data |> Array.get i |> Maybe.map (Tuple.pair col.typ)) <|
-                                                            Array.get j <|
-                                                                sheet.cols
-                                    )
-                    )
+libraryCols : Array Col
+libraryCols =
+    Array.fromList
+        [ Col "sheet_id" "sheet_id" SheetId
+        , Col "name" "name" Text
+        , Col "tags" "tags" (Many Text)
+        , Col "delete" "" Delete
         ]
 
 
 view : Model -> Browser.Document Msg
-view model =
+view ({ sheet } as model) =
+    -- TODO: Show library sheet if (id == ""), otherwise show loading if (model.id /= model.sheet.id).
+    let
+        info : SheetInfo
+        info =
+            model.library
+                |> Dict.get sheet.id
+                |> Maybe.withDefault { name = "", tags = [], scratch = False, thumb = (), peers = Public }
+
+        stats : Result String (Array Stat)
+        stats =
+            case sheet.doc of
+                Ok (Tab tbl) ->
+                    Ok <|
+                        Array.map
+                            (\col ->
+                                case col.typ of
+                                    Number ->
+                                        tbl.rows
+                                            |> Array.foldl
+                                                (\row stat ->
+                                                    row
+                                                        |> Dict.get col.key
+                                                        |> Maybe.andThen (D.decodeValue number >> Result.toMaybe)
+                                                        |> Maybe.map
+                                                            (\n ->
+                                                                { histogram = stat.histogram |> Dict.update (String.fromFloat n) (Maybe.withDefault 0 >> (+) 1 >> Just)
+                                                                , count = stat.count + 1
+                                                                , sum = stat.sum + n
+                                                                , min = stat.min |> Maybe.withDefault n |> min n |> Just
+                                                                , max = stat.max |> Maybe.withDefault n |> max n |> Just
+                                                                }
+                                                            )
+                                                        |> Maybe.withDefault stat
+                                                )
+                                                { histogram = Dict.empty
+                                                , count = 0
+                                                , sum = 0
+                                                , min = Nothing
+                                                , max = Nothing
+                                                }
+                                            |> Numeric
+
+                                    Usd ->
+                                        tbl.rows
+                                            |> Array.foldl
+                                                (\row stat ->
+                                                    row
+                                                        |> Dict.get col.key
+                                                        |> Maybe.andThen (D.decodeValue number >> Result.toMaybe)
+                                                        |> Maybe.map
+                                                            (\n ->
+                                                                { histogram = stat.histogram |> Dict.update (String.fromFloat n) (Maybe.withDefault 0 >> (+) 1 >> Just)
+                                                                , count = stat.count + 1
+                                                                , sum = stat.sum + n
+                                                                , min = stat.min |> Maybe.withDefault n |> min n |> Just
+                                                                , max = stat.max |> Maybe.withDefault n |> max n |> Just
+                                                                }
+                                                            )
+                                                        |> Maybe.withDefault stat
+                                                )
+                                                { histogram = Dict.empty
+                                                , count = 0
+                                                , sum = 0
+                                                , min = Nothing
+                                                , max = Nothing
+                                                }
+                                            |> Numeric
+
+                                    Text ->
+                                        tbl.rows
+                                            |> Array.foldl
+                                                (\row stat ->
+                                                    row
+                                                        |> Dict.get col.key
+                                                        |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
+                                                        |> Maybe.map
+                                                            (\s ->
+                                                                { lengths = stat.lengths |> Dict.update (String.length s) (Maybe.withDefault 0 >> (+) 1 >> Just)
+                                                                , keywords = s |> String.split " " |> List.foldl (\k -> Dict.update k (Maybe.withDefault 0 >> (+) 1 >> Just)) stat.keywords
+                                                                , count = stat.count + 1
+                                                                , sum = stat.sum + String.length s
+                                                                , min = min (String.length s) (Maybe.withDefault (String.length s) stat.min) |> Just
+                                                                , max = max (String.length s) stat.max
+                                                                }
+                                                            )
+                                                        |> Maybe.withDefault stat
+                                                )
+                                                { lengths = Dict.empty
+                                                , keywords = Dict.empty
+                                                , count = 0
+                                                , sum = 0
+                                                , min = Nothing
+                                                , max = 0
+                                                }
+                                            |> Descriptive
+
+                                    _ ->
+                                        Enumerative
+                                            { histogram = Dict.empty
+                                            }
+                            )
+                            tbl.cols
+
+                x ->
+                    Err "TODO: table stats"
+
+        table : Result String Table
+        table =
+            case ( sheet.doc, sheet.table ) of
+                ( Ok (Tab tbl), _ ) ->
+                    Ok tbl
+
+                ( Ok Library, _ ) ->
+                    Ok
+                        { cols =
+                            libraryCols
+                        , rows =
+                            model.library
+                                |> Dict.filter (\k v -> k /= "" && not v.scratch && List.any (String.contains model.search) (k :: v.name :: v.tags))
+                                |> Dict.toList
+                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "delete", E.string k ) ])
+                                |> Array.fromList
+                        }
+
+                ( _, Ok tbl ) ->
+                    Ok tbl
+
+                ( Err err1, Err err2 ) ->
+                    Err (err1 ++ " " ++ err2)
+
+                ( _, Err err ) ->
+                    Err err
+
+        examples : List String
+        examples =
+            case sheet.doc of
+                Ok (Query query) ->
+                    query.examples
+
+                _ ->
+                    []
+    in
     { title = "scrapsheets"
     , body =
-        -- TODO: Sheets that exist but aren't currently on the shelf should sit minimized in the corner or something like buffers waiting to be placed back on the shelf.
-        [ H.node "style" [] [ text "body * { box-sizing: border-box; }" ]
-        , H.node "style" [] [ text "main { padding-bottom: 10rem; font-family: sans-serif; }" ]
-        , H.node "style" [] [ text "main > div:first-child > div > div { border: 0; box-shadow: 0 4px 4px rgba(0,0,0, 0.2); overflow: hidden; border-radius: 5px; }" ]
-        , H.node "style" [] [ text "textarea { background: #fff; border: 0; height: 100%; padding: 0.5rem; }" ]
-        , H.node "style" [] [ text "table { border-collapse: collapse; }" ]
-        , H.node "style" [] [ text "td, th { text-align: center; border-bottom: 1px solid #ccc; height: 1rem; }" ]
-        , H.node "style" [] [ text "th { padding: 0.25rem 0.5rem; background-color: rgba(0,0,0,0.1); }" ]
-        , H.node "style" [] [ text "tr > :first-child { padding-left: 0.5rem; }" ]
-        , H.node "style" [] [ text "tr > :last-child  { padding-right: 0.5rem; }" ]
-        , H.main_ []
-            [ H.div [ S.displayFlex, S.flexDirectionColumn ] <|
-                List.append [ H.button [ A.onClick SheetCreating, S.marginRem 1 ] [ text "New sheet" ] ] <|
-                    List.indexedMap (\n -> H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 1.25, S.paddingRem 1, S.background (iif (model.dragRow == n) "#eee" ""), S.borderRight (iif (model.dragRow == n) "25px solid #666" ""), A.preventDefaultOn "dragover" (D.succeed ( SheetDragginging { row = n, after = False, x = 0 }, True )), A.preventDefaultOn "drop" (D.succeed ( SheetDropping, True )) ]) <|
-                        List.map
-                            (List.map
-                                (\id ->
-                                    Maybe.withDefault (H.div [] [ text "TODO: sheet not found" ]) <|
-                                        Maybe.map
-                                            (\{ code, sheet } ->
-                                                H.div [ S.displayFlex, S.flexDirectionColumn, S.width "100%", A.draggable "true", A.on "dragstart" (D.succeed (SheetDragging id)), A.on "dragend" (D.succeed NoOp) ]
-                                                    [ case sheet of
-                                                        Ok x ->
-                                                            viewSheet id x
+        [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
+        , H.node "style" [] [ text "body { font-family: sans-serif; font-optical-sizing: auto; height: 100vh; width: 100vw; }" ]
+        , H.node "style" [] [ text "table { background: #fff; line-height: 1; }" ]
+        , H.node "style" [] [ text "th, td { padding: 0.25rem; padding-bottom: 0.15rem; font-weight: normal; border: 1px solid #888; height: 0.8rem; vertical-align: top; }" ]
+        , H.node "style" [] [ text "tr > :first-child { border-left: none; padding-left: 0.5rem; }" ]
+        , H.node "style" [] [ text "tr > :last-child { border-right: none; padding-right: 0.5rem; }" ]
+        , H.node "style" [] [ text "th > *, td > * { max-height: 6rem; text-overlow: ellipsis; }" ]
+        , H.node "style" [] [ text "td:hover { background: rgba(0,0,0,0.025); }" ]
+        , H.node "style" [] [ text ".r0 { position: sticky; top: -1px; background: #f6f6f6; z-index: 1; border-bottom: 0px; }" ]
+        , H.node "style" [] [ text ".r0::after { content: \"\"; display: block; position: absolute; width: 100%; left: 0; bottom: -1px; border-bottom: 1px solid #888; }" ]
+        , H.node "style" [] [ text ".selected { background: rgba(0,0,0,0.05); }" ]
+        , H.node "style" [] [ text "#code { font-family: monospace; background: #fff; }" ]
 
-                                                        Err x ->
-                                                            H.div [ S.paddingRem 1, S.color "#666" ] [ text x ]
-                                                    , H.textarea [ A.onInput (CodeEditing id), S.width "100%", S.fontFamilyMonospace, code |> String.filter ((==) '\n') |> String.length |> (+) 1 |> A.rows ] [ text code ]
-                                                    ]
-                                            )
-                                        <|
-                                            Dict.get id model.sheets
-                                )
-                            )
-                        <|
-                            Array.toList <|
-                                Array.map Array.toList <|
-                                    model.shelf
-            , H.aside []
-                []
+        -- , H.node "style" [] [ text "thead tr td { position: sticky; top: 0; }" ]
+        -- , H.node "style" [] [ text "tfoot tr:last-child td { position: sticky; bottom: 0; }" ]
+        , H.div [ S.displayFlex, S.flexDirectionRow, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
+            [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
+                [ H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0, S.borderBottom "1px solid #000" ]
+                    [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsCenter, S.whiteSpaceNowrap, S.gapRem 0.5, S.padding "0.75rem 0 0.75rem 0.5rem" ] <|
+                        List.concat
+                            [ [ H.a [ A.href "/", S.fontWeight "900", S.fontSizeRem 1.5, S.heightRem 1, S.lineHeight "0.55", S.marginRightRem -0.25 ] [ text "⊞" ]
+                              , H.a [ A.href "/", S.fontWeight "900" ] [ text "scrapsheets" ]
+                              , text "/"
+                              ]
+                            , iif (sheet.id == "")
+                                [ H.span [] [ text "library" ]
+                                ]
+                                [ H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ]
+                                ]
+                            , [ text "/"
+                              ]
+                            ]
+
+                    -- All current filters should be rendered as text in the searchbar.
+                    -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
+                    -- TODO: If no results found, show saved searches and recent searches.
+                    , H.div [ S.displayFlex, S.width "100%", S.height "100%" ]
+                        [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder "search", S.width "100%", S.border "none", S.backgroundColor "#fff", S.paddingLeftRem 1 ] []
+                        ]
+                    ]
+
+                -- , H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.padding "0.5rem 1rem", S.backgroundColor "#fff" ] <|
+                --     [ H.div [ S.displayFlex, S.alignItemsBaseline, S.gapRem 1, S.opacity "0.5" ] <|
+                --         List.concat
+                --             [ List.map (\x -> H.span [ A.onClick (InputChange SheetSearch x), S.textDecorationUnderline, S.opacity "0.5", S.fontSizeRem 0.6 ] [ text x ]) <| examples
+                --             , List.map (\tag -> H.a [ A.href ("/?q=tag:" ++ tag) ] [ text ("#" ++ tag) ]) info.tags
+                --             , List.map (\id -> H.a [ A.href ("/" ++ id) ] [ text ("$" ++ id) ]) [ "backlink" ]
+                --             , List.map (\id -> H.a [ A.href ("/?following=" ++ id) ] [ text ("@" ++ id) ]) [ "anon" ]
+                --             ]
+                --     , H.div [ S.displayFlex, S.alignItemsBaseline, S.flexDirectionRowReverse, S.gapRem 1, S.opacity "0.5" ] <|
+                --         List.concat
+                --             [ case sheet.doc of
+                --                 Ok Library ->
+                --                     [ H.span [ A.onClick DocNewQuery ] [ text "new query" ]
+                --                     , H.span [ A.onClick DocNewTable ] [ text "new table" ]
+                --                     ]
+                --                 _ ->
+                --                     [ H.span [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "⌘C new column" ]
+                --                     ]
+                --             , List.map (\tag -> H.span [] [ text "⌘F find" ]) [ () ]
+                --             ]
+                --     ]
+                -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
+                , H.div [ S.overflowAuto, S.height "100%", S.backgroundColor "#eee" ]
+                    [ case model.error of
+                        "" ->
+                            text ""
+
+                        error ->
+                            H.span [] [ H.button [ A.onClick (DocError "") ] [ text "╳" ], text " ", text error ]
+                    , case table of
+                        Err "" ->
+                            H.div [ S.displayFlex ] [ H.span [ S.textAlignCenter, S.width "100%", S.paddingRem 2, S.opacity "0.5" ] [ text "loading" ] ]
+
+                        Err err ->
+                            H.p [] [ text err ]
+
+                        Ok { cols, rows } ->
+                            H.table [ S.borderCollapseCollapse, S.width "100%", A.onMouseLeave (CellHover (xy -1 -1)) ]
+                                [ H.thead []
+                                    -- [ H.tr [] <|
+                                    --     H.th [] []
+                                    --         :: List.indexedMap
+                                    --             -- TODO: Stats.
+                                    --             (\i col -> H.th [ S.textAlignLeft, S.paddingBottomRem 1 ] [])
+                                    --             (Array.toList cols)
+                                    []
+                                , H.tbody [] <|
+                                    List.concat
+                                        [ Array.toList <|
+                                            Array.indexedMap
+                                                (\n_ row ->
+                                                    let
+                                                        n =
+                                                            -- TODO: Consider moving the header rows to H.thead
+                                                            n_ - 2
+                                                    in
+                                                    H.tr
+                                                        [ case String.fromInt n of
+                                                            "-2" ->
+                                                                S.backgroundColor "#ececec"
+
+                                                            "-1" ->
+                                                                S.backgroundColor "#f6f6f6"
+
+                                                            "0" ->
+                                                                S.backgroundColor "#f6f6f6"
+
+                                                            _ ->
+                                                                S.backgroundColor "#fff"
+                                                        , case ( String.fromInt n, stats ) of
+                                                            ( "-2", Err _ ) ->
+                                                                S.displayNone
+
+                                                            _ ->
+                                                                S.displayTableRow
+                                                        ]
+                                                    <|
+                                                        List.indexedMap
+                                                            (\i col ->
+                                                                H.td
+                                                                    [ A.onClick CellMouseClick
+                                                                    , A.onDoubleClick <|
+                                                                        CellMouseDoubleClick <|
+                                                                            case String.fromInt n of
+                                                                                "-1" ->
+                                                                                    typeName col.typ
+
+                                                                                "0" ->
+                                                                                    col.name
+
+                                                                                _ ->
+                                                                                    row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
+                                                                    , A.onMouseDown CellMouseDown
+                                                                    , A.onMouseUp CellMouseUp
+                                                                    , A.onMouseEnter (CellHover (xy i n))
+                                                                    , S.heightRem 1.25
+                                                                    , S.lineHeight (iif (n == 0) "1.75" "")
+                                                                    , A.classList <|
+                                                                        let
+                                                                            { a, b } =
+                                                                                sheet.select
+
+                                                                            between : number -> number -> number -> Bool
+                                                                            between a_ b_ i_ =
+                                                                                min a_ b_ <= i_ && i_ <= max a_ b_
+
+                                                                            eq : number -> number -> number -> Bool
+                                                                            eq a_ b_ i_ =
+                                                                                a_ == i_ && i_ == b_
+                                                                        in
+                                                                        [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
+                                                                        , ( "r0", n == 0 )
+                                                                        ]
+                                                                    , case col.typ of
+                                                                        Create ->
+                                                                            S.textAlignRight
+
+                                                                        Boolean ->
+                                                                            S.textAlignCenter
+
+                                                                        Usd ->
+                                                                            S.textAlignRight
+
+                                                                        Number ->
+                                                                            S.textAlignRight
+
+                                                                        Delete ->
+                                                                            S.textAlignCenter
+
+                                                                        Form _ ->
+                                                                            S.textAlignCenter
+
+                                                                        _ ->
+                                                                            S.textAlignLeft
+                                                                    , case col.typ of
+                                                                        Create ->
+                                                                            S.widthRem 10
+
+                                                                        Boolean ->
+                                                                            S.widthRem 0.5
+
+                                                                        Number ->
+                                                                            S.widthRem 0.5
+
+                                                                        Usd ->
+                                                                            S.widthRem 0.5
+
+                                                                        Delete ->
+                                                                            S.widthRem 0.5
+
+                                                                        _ ->
+                                                                            S.widthAuto
+                                                                    ]
+                                                                <|
+                                                                    case ( String.fromInt n, sheet.write /= Nothing && sheet.select == rect i n i n ) of
+                                                                        ( _, True ) ->
+                                                                            [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (TabMsg (SheetWrite sheet.select.a))), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
+
+                                                                        ( "-2", _ ) ->
+                                                                            case Maybe.andThen (Array.get i) (Result.toMaybe stats) of
+                                                                                Just (Numeric stat) ->
+                                                                                    [ H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gapRem 0, S.gridColumnGapRem 0.5, S.justifyContentFlexStart, S.opacity "0.5" ]
+                                                                                        [ H.span [] [ text "min" ]
+                                                                                        , H.span [] [ text (Maybe.withDefault "" (Maybe.map (String.fromFloat << round2) stat.min)) ]
+                                                                                        , H.span [] [ text "max" ]
+                                                                                        , H.span [] [ text (Maybe.withDefault "" (Maybe.map (String.fromFloat << round2) stat.max)) ]
+                                                                                        , H.span [] [ text "mean" ]
+                                                                                        , H.span [] [ text (iif (stat.count == 0) "" (String.fromInt (round (stat.sum / toFloat stat.count)))) ]
+                                                                                        , H.span [] [ text "count" ]
+                                                                                        , H.span [] [ text (String.fromInt stat.count) ]
+                                                                                        ]
+                                                                                    ]
+
+                                                                                Just (Descriptive stat) ->
+                                                                                    [ H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gapRem 0, S.gridColumnGapRem 0.5, S.justifyContentFlexStart, S.opacity "0.5" ]
+                                                                                        [ H.span [] [ text "min" ]
+                                                                                        , H.span [] [ text (Maybe.withDefault "" (Maybe.map String.fromInt stat.min)) ]
+                                                                                        , H.span [] [ text "max" ]
+                                                                                        , H.span [] [ text (String.fromInt stat.max) ]
+                                                                                        , H.span [] [ text "mean" ]
+                                                                                        , H.span [] [ text (iif (stat.count == 0) "" (String.fromInt (stat.sum // stat.count))) ]
+                                                                                        , H.span [] [ text "count" ]
+                                                                                        , H.span [] [ text (String.fromInt stat.count) ]
+                                                                                        , H.span [] [ text "keywords" ]
+                                                                                        , H.span [] [ text (String.join " " (Dict.keys (Dict.filter (\k v -> String.length k >= 4 && v >= 2) stat.keywords))) ]
+                                                                                        ]
+                                                                                    ]
+
+                                                                                Just (Enumerative stat) ->
+                                                                                    -- TODO:
+                                                                                    []
+
+                                                                                Nothing ->
+                                                                                    []
+
+                                                                        ( "-1", _ ) ->
+                                                                            [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontStyleItalic, S.opacity "0.5" ]
+                                                                                [ text (typeName col.typ)
+                                                                                ]
+                                                                            ]
+
+                                                                        ( "0", _ ) ->
+                                                                            case col.name of
+                                                                                "" ->
+                                                                                    []
+
+                                                                                _ ->
+                                                                                    [ H.span [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600" ]
+                                                                                        [ text col.name
+                                                                                        ]
+                                                                                    ]
+
+                                                                        _ ->
+                                                                            [ row
+                                                                                |> Dict.get col.key
+                                                                                |> Maybe.withDefault (E.string "")
+                                                                                |> D.decodeValue
+                                                                                    (D.maybe
+                                                                                        (case col.typ of
+                                                                                            Unknown ->
+                                                                                                D.map text string
+
+                                                                                            SheetId ->
+                                                                                                D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text id ])
+
+                                                                                            Link ->
+                                                                                                D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayBlock, S.wordBreakKeepAll, S.hyphensNone, S.maxWidthRem 18, S.fontStyleItalic ] [ text "link" ])
+
+                                                                                            Image ->
+                                                                                                D.string |> D.map (\src -> H.img [ A.src src ] [])
+
+                                                                                            Text ->
+                                                                                                D.map text string
+
+                                                                                            Boolean ->
+                                                                                                D.map (\c -> H.input [ A.type_ "checkbox", A.checked c ] []) D.bool
+
+                                                                                            Number ->
+                                                                                                D.oneOf
+                                                                                                    [ D.map (text << String.fromFloat << round2) number
+                                                                                                    , D.map text string
+                                                                                                    ]
+
+                                                                                            Usd ->
+                                                                                                D.oneOf
+                                                                                                    [ D.map (text << usd) number
+                                                                                                    , D.map text string
+                                                                                                    ]
+
+                                                                                            Delete ->
+                                                                                                D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])
+
+                                                                                            Create ->
+                                                                                                D.value |> D.map (\val -> H.button [ A.onClick (DocNew val) ] [ text "add to library" ])
+
+                                                                                            Form form ->
+                                                                                                D.map3
+                                                                                                    (\method action fields ->
+                                                                                                        -- TODO: Change this to displayGrid
+                                                                                                        H.form [ A.onSubmit NoOp, S.displayGrid, S.gridTemplateColumns "auto 1fr", S.paddingRem 1 ] <|
+                                                                                                            List.concat
+                                                                                                                [ List.concatMap
+                                                                                                                    (\field ->
+                                                                                                                        [ H.label [] [ text field.label ]
+                                                                                                                        , H.input [] []
+                                                                                                                        ]
+                                                                                                                    )
+                                                                                                                    fields
+                                                                                                                , [ H.span [] []
+                                                                                                                  , H.button [ A.type_ "submit" ] [ text method ]
+                                                                                                                  ]
+                                                                                                                ]
+                                                                                                    )
+                                                                                                    (D.field "method" D.string)
+                                                                                                    (D.field "action" D.string)
+                                                                                                    (D.field "fields"
+                                                                                                        (D.list
+                                                                                                            (D.map (\label -> { label = label })
+                                                                                                                (D.field "label" D.string)
+                                                                                                            )
+                                                                                                        )
+                                                                                                    )
+
+                                                                                            _ ->
+                                                                                                D.map text string
+                                                                                        )
+                                                                                    )
+                                                                                |> Result.map (Maybe.withDefault (text ""))
+                                                                                |> Result.mapError (D.errorToString >> text)
+                                                                                |> result
+                                                                            ]
+                                                            )
+                                                            (Array.toList cols)
+                                                            ++ [ case sheet.doc of
+                                                                    Ok (Tab _) ->
+                                                                        H.th
+                                                                            [ A.onClick (DocMsg (TabMsg SheetColumnPush))
+                                                                            , S.textAlignLeft
+                                                                            , S.widthRem 0.001
+                                                                            , S.whiteSpaceNowrap
+                                                                            , S.opacity "0.5"
+                                                                            ]
+                                                                            [ text (iif (n == 0) "+" "") ]
+
+                                                                    _ ->
+                                                                        text ""
+                                                               ]
+                                                )
+                                            <|
+                                                Array.append (Array.initialize 3 (always Dict.empty)) <|
+                                                    rows
+                                        ]
+
+                                -- TODO: These rows should always be stuck to the bottom of the window.
+                                , H.tfoot [] <|
+                                    case sheet.doc of
+                                        Ok Library ->
+                                            List.map
+                                                (\( label, msg ) ->
+                                                    H.tr [ A.onClick msg ] <|
+                                                        (::) (H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text label ]) <|
+                                                            List.map (\typ -> H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text typ ])
+                                                                [ "text"
+                                                                , "list text"
+                                                                , ""
+                                                                ]
+                                                )
+                                                [ ( "table:...", DocNewTable )
+                                                , ( "query:...", DocNewQuery )
+                                                ]
+
+                                        Ok (Tab _) ->
+                                            [ H.tr [ A.onClick (DocMsg (TabMsg (SheetRowPush (Array.length rows)))) ] <|
+                                                List.indexedMap (\i col -> H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text (typeName col.typ) ]) <|
+                                                    Array.toList cols
+                                            ]
+
+                                        _ ->
+                                            []
+                                ]
+                    ]
+                ]
+            , H.aside [ S.displayFlex, S.flexDirectionColumn, S.maxWidth "33vw", S.maxHeight "100vh", S.height "100%", S.backgroundColor "#fff", S.borderLeft "1px solid #000" ] <|
+                case sheet.doc of
+                    Ok (Tab _) ->
+                        -- -- TODO: Conversational AI interface.
+                        -- [ H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 1, S.marginBottomRem 1.5, S.opacity "0.8" ]
+                        --     [ H.p [ S.textAlignRight ] [ text "Vivamus dapibus porttitor eros, et semper mi ultricies sit amet." ]
+                        --     , H.p [] [ text "Fusce euismod neque et elit vulputate commodo. Donec tempor eu justo vitae porttitor. Integer eget sem faucibus, ullamcorper turpis a, pretium enim." ]
+                        --     , H.p [ S.textAlignRight ] [ text "Morbi nec metus pretium, laoreet tortor in, blandit ipsum." ]
+                        --     , H.p [] [ text "Interdum et malesuada fames ac ante ipsum primis in faucibus. Cras egestas est dolor, vel euismod urna convallis vitae. " ]
+                        --     ]
+                        -- , H.textarea [] []
+                        -- , H.button [] [ text "send (⌘⏎)" ]
+                        -- ]
+                        []
+
+                    Ok (Query query) ->
+                        [ H.textarea [ A.id "code", A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75, S.minWidth "25vw", S.width "100%", S.border "none", S.backgroundColor "transparent", S.paddingRem 1, S.lineHeightRem 1.5 ]
+                            [ text (String.trim query.code)
+                            ]
+                        ]
+
+                    _ ->
+                        []
             ]
         ]
     }
