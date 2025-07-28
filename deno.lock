@@ -25,11 +25,7 @@
     "npm:pg-gateway@*": "0.3.0-beta.4",
     "npm:pg-gateway@~0.3.0-beta.4": "0.3.0-beta.4",
     "npm:serve@*": "14.2.4",
-    "npm:ws@*": "8.18.2",
-    "npm:y-websocket@*": "3.0.0_yjs@13.6.27",
-    "npm:y-websocket@3": "3.0.0_yjs@13.6.27",
-    "npm:yjs@*": "13.6.27",
-    "npm:yjs@^13.6.27": "13.6.27"
+    "npm:ws@*": "8.18.2"
   },
   "jsr": {
     "@hono/hono@4.6.14": {
@@ -977,9 +973,6 @@
         "ws"
       ]
     },
-    "isomorphic.js@0.2.5": {
-      "integrity": "sha512-PIeMbHqMt4DnUP3MA/Flc0HElYjMXArsw1qwJZcm9sqR8mq3l8NYizFMty0pWwE/tzIGH3EKK5+jes5mAr85yw=="
-    },
     "jackspeak@3.4.3": {
       "integrity": "sha512-OGlZQpz2yfahA/Rd1Y8Cd9SIEsqvXkLVoSw/cgwhnhFMDbsQFeZYoJJ7bIZBS9BcamUW96asq/npPWugM+RQBw==",
       "dependencies": [
@@ -1003,13 +996,6 @@
     },
     "kleur@3.0.3": {
       "integrity": "sha512-eTIzlVOSUR+JxdDFepEYcBMtZ9Qqdef+rnzWdRZuMbOywu5tO2w2N7rqjoANZ5k9vywhL6Br1VRjUIgTQx4E8w=="
-    },
-    "lib0@0.2.109": {
-      "integrity": "sha512-jP0gbnyW0kwlx1Atc4dcHkBbrVAkdHjuyHxtClUPYla7qCmwIif1qZ6vQeJdR5FrOVdn26HvQT0ko01rgW7/Xw==",
-      "dependencies": [
-        "isomorphic.js"
-      ],
-      "bin": true
     },
     "locate-path@6.0.0": {
       "integrity": "sha512-iPZK6eYjbxRu3uB4/WZ3EsEIMJFMqAoopl3R+zuq0UjcAm/MO6KCweDgPfP3elTztoKP3KtnVHxTn2NHBSDVUw==",
@@ -1518,21 +1504,6 @@
     "xstate@5.20.0": {
       "integrity": "sha512-lFQ0fLwVa0OMZnjNP8zUkt2fwIS85ZBNPvxE41APVYhYj0++aTssgmsnTAiBHdKYbgnd6+L8DRTZ9jPZAFPuyw=="
     },
-    "y-protocols@1.0.6_yjs@13.6.27": {
-      "integrity": "sha512-vHRF2L6iT3rwj1jub/K5tYcTT/mEYDUppgNPXwp8fmLpui9f7Yeq3OEtTLVF012j39QnV+KEQpNqoN7CWU7Y9Q==",
-      "dependencies": [
-        "lib0",
-        "yjs"
-      ]
-    },
-    "y-websocket@3.0.0_yjs@13.6.27": {
-      "integrity": "sha512-mUHy7AzkOZ834T/7piqtlA8Yk6AchqKqcrCXjKW8J1w2lPtRDjz8W5/CvXz9higKAHgKRKqpI3T33YkRFLkPtg==",
-      "dependencies": [
-        "lib0",
-        "y-protocols",
-        "yjs"
-      ]
-    },
     "y18n@5.0.8": {
       "integrity": "sha512-0pfFzegeDWJHJIAmTLRP2DwHjdF5s7jo9tuztdQxAhINCdvS+3nGINqPd00AphqJR/0LhANUS6/+7SCb98YOfA=="
     },
@@ -1549,12 +1520,6 @@
         "string-width@4.2.3",
         "y18n",
         "yargs-parser"
-      ]
-    },
-    "yjs@13.6.27": {
-      "integrity": "sha512-OIDwaflOaq4wC6YlPBy2L6ceKeKuF7DeTxx+jPzv1FHn9tCZ0ZwSRnUBxD05E3yed46fv/FWJbvR+Ud7x0L7zw==",
-      "dependencies": [
-        "lib0"
       ]
     },
     "yocto-queue@0.1.0": {
@@ -1856,9 +1821,7 @@
       "npm:elm-test@~0.19.1-revision15",
       "npm:elm@~0.19.1-6",
       "npm:pg-gateway@~0.3.0-beta.4",
-      "npm:ws@^8.18.2",
-      "npm:y-websocket@3",
-      "npm:yjs@^13.6.27"
+      "npm:ws@^8.18.2"
     ]
   }
 }
