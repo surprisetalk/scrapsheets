@@ -377,6 +377,7 @@ class HonoWebSocketAdapter
   }
 }
 
+// TODO: Replace this with AM.NodeWebSocketAdapter. Try to grab hono's websocket server and pass it in. Use automerge.networkSubsystem.add...?
 const honoAdapter = new HonoWebSocketAdapter();
 
 export const automerge = new Repo({
