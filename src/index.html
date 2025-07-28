@@ -401,7 +401,7 @@
             });
             if (type === "portal") {
               ws = new WebSocket(
-                `ws://sheets-api.scrap.land/${type}/${doc_id}/sync`,
+                `wss://sheets-api.scrap.land/${type}/${doc_id}/sync`,
               );
               ws.onmessage = msg =>
                 app.ports.docChanged.send({
