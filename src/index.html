@@ -166,7 +166,7 @@
                   };
                   const token = getAuthToken();
                   return (
-                    "ws://localhost:8000/library/sync" +
+                    "wss://sheets-api.scrap.land/library/sync" +
                     (token ? `?auth=Bearer%20${encodeURIComponent(token)}` : "")
                   );
                 })(),
@@ -400,7 +400,9 @@
               if (type === "query") queryDoc(id, data.doc.data[0]);
             });
             if (type === "portal") {
-              ws = new WebSocket(`ws://localhost:8000/${type}/${doc_id}/sync`);
+              ws = new WebSocket(
+                `ws://sheets-api.scrap.land/${type}/${doc_id}/sync`,
+              );
               ws.onmessage = msg =>
                 app.ports.docChanged.send({
                   id,

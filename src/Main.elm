@@ -720,7 +720,7 @@ update msg ({ sheet } as model) =
             , case data.data.doc |> D.decodeValue docDecoder of
                 Ok Shop ->
                     Http.get
-                        { url = "http://localhost:8000/shop"
+                        { url = "https://sheets-api.scrap.land/shop"
                         , expect = Http.expectJson ShopFetch shopDecoder
                         }
 
@@ -1004,10 +1004,17 @@ view ({ sheet } as model) =
                         Array.map
                             (\col ->
                                 case col.typ of
-                                    Number -> computeNumericStats tbl.rows col.key
-                                    Usd -> computeNumericStats tbl.rows col.key
-                                    Text -> computeTextStats tbl.rows col.key
-                                    _ -> Enumerative { histogram = Dict.empty }
+                                    Number ->
+                                        computeNumericStats tbl.rows col.key
+
+                                    Usd ->
+                                        computeNumericStats tbl.rows col.key
+
+                                    Text ->
+                                        computeTextStats tbl.rows col.key
+
+                                    _ ->
+                                        Enumerative { histogram = Dict.empty }
                             )
                             tbl.cols
 
