@@ -165,7 +165,7 @@
                     }
                   };
                   const token = getAuthToken();
-                  const baseUrl = "ws://localhost:8000/library/sync";
+                  const baseUrl = "wss://sync.automerge.org"; // TODO: "ws://localhost:8000/library/sync";
                   return token
                     ? `${baseUrl}?auth=Bearer%20${encodeURIComponent(token)}`
                     : baseUrl;
