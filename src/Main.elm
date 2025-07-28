@@ -1071,6 +1071,7 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text ".r0::after { content: \"\"; display: block; position: absolute; width: 100%; left: 0; bottom: -1px; border-bottom: 1px solid #888; }" ]
         , H.node "style" [] [ text ".selected { background: rgba(0,0,0,0.05); }" ]
         , H.node "style" [] [ text "#code { font-family: monospace; background: #fff; }" ]
+        , H.node "style" [] [ text "@media (max-width: 768px) { body > div { flex-direction: column !important; } #aside { max-width: 100% !important; width: 100% !important; height: auto !important; max-height: 40vh !important; border-left: none !important; border-top: 1px solid #000; order: 2; } #code:focus { height: 50vh !important; } main { height: 100% !important; order: 1; } }" ]
 
         -- , H.node "style" [] [ text "thead tr td { position: sticky; top: 0; }" ]
         -- , H.node "style" [] [ text "tfoot tr:last-child td { position: sticky; bottom: 0; }" ]
@@ -1442,7 +1443,7 @@ view ({ sheet } as model) =
                                 ]
                     ]
                 ]
-            , H.aside [ S.displayFlex, S.flexDirectionColumn, S.maxWidth "33vw", S.maxHeight "100vh", S.height "100%", S.backgroundColor "#fff", S.borderLeft "1px solid #000" ] <|
+            , H.aside [ A.id "aside", S.displayFlex, S.flexDirectionColumn, S.maxWidth "33vw", S.maxHeight "100vh", S.height "100%", S.backgroundColor "#fff", S.borderLeft "1px solid #000" ] <|
                 case sheet.doc of
                     Ok (Tab _) ->
                         -- -- TODO: Conversational AI interface.
@@ -1458,7 +1459,7 @@ view ({ sheet } as model) =
                         []
 
                     Ok (Query query) ->
-                        [ H.textarea [ A.id "code", A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpaceNowrap, S.overflowXAuto, S.fontSizeRem 0.75, S.minWidth "25vw", S.width "100%", S.border "none", S.backgroundColor "transparent", S.paddingRem 1, S.lineHeightRem 1.5 ]
+                        [ H.textarea [ A.id "code", A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpacePre, S.overflowAuto, S.fontSizeRem 0.75, S.minWidth "25vw", S.width "100%", S.border "none", S.backgroundColor "transparent", S.paddingRem 1, S.lineHeightRem 1.5 ]
                             [ text (String.trim query.code)
                             ]
                         ]
