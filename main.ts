@@ -416,7 +416,12 @@ app.get(
       onMessage(event, ws) {
         console.log(`WebSocket message received from ${peerId}`, {
           dataType: typeof event.data,
-          dataLength: event.data?.length || event.data?.byteLength || 0,
+          dataLength: (() => {
+            if (typeof event.data === "string") return event.data.length;
+            if (event.data instanceof ArrayBuffer) return event.data.byteLength;
+            if (event.data instanceof Uint8Array) return event.data.length;
+            return 0;
+          })(),
           constructor: event.data?.constructor?.name,
         });
         let messageData: Uint8Array;
