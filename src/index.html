@@ -147,7 +147,9 @@
         );
 
         {
-          await AM.initializeWasm(fetch("/automerge.wasm")); // https://esm.sh/@automerge/automerge/dist/automerge.wasm
+          await AM.initializeWasm(
+            fetch("https://esm.sh/@automerge/automerge/dist/automerge.wasm"),
+          );
 
           const repo = new AM.Repo({
             storage: new AM.IndexedDBStorageAdapter(),
