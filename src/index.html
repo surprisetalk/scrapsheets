@@ -149,7 +149,7 @@
         {
           await AM.initializeWasm(
             fetch("https://esm.sh/@automerge/automerge/dist/automerge.wasm"),
-          );
+          ).catch(console.error);
 
           const repo = new AM.Repo({
             storage: new AM.IndexedDBStorageAdapter(),
