@@ -634,11 +634,6 @@ type Msg
 
 
 type DocMsg
-    = TabMsg TabMsg
-    | QueryMsg ()
-
-
-type TabMsg
     = SheetWrite Index
     | SheetRowPush Int
     | SheetColumnPush
@@ -647,9 +642,6 @@ type TabMsg
 type Input
     = SheetSearch
     | CellWrite
-    | ColumnType Int
-    | ColumnKey Int
-    | ColumnLabel Int
     | QueryCode
 
 
@@ -760,7 +752,7 @@ update msg ({ sheet } as model) =
             , Cmd.none
             )
 
-        DocMsg (TabMsg edit) ->
+        DocMsg edit ->
             ( { model | sheet = { sheet | write = Nothing } }
             , case sheet.doc of
                 Ok Library ->
@@ -847,10 +839,6 @@ update msg ({ sheet } as model) =
                     Cmd.none
             )
 
-        DocMsg (QueryMsg _) ->
-            -- TODO:
-            ( model, Cmd.none )
-
         DocDelete id ->
             ( model, deleteDoc id )
 
@@ -896,18 +884,6 @@ update msg ({ sheet } as model) =
                 }
             )
 
-        InputChange (ColumnType i) x ->
-            -- TODO:
-            ( model, Cmd.none )
-
-        InputChange (ColumnKey i) x ->
-            -- TODO:
-            ( model, Cmd.none )
-
-        InputChange (ColumnLabel i) x ->
-            -- TODO:
-            ( model, Cmd.none )
-
         CellMouseDoubleClick write ->
             let
                 a =
@@ -947,43 +923,6 @@ update msg ({ sheet } as model) =
         KeyPress "Enter" ->
             ( model, Task.attempt (always NoOp) (Dom.blur "new-cell") )
 
-        -- KeyPress "Backspace" ->
-        --     ( { model | sheet = { sheet | write = Nothing } }
-        --     , changeDoc <|
-        --         Idd sheet.id <|
-        --             case sheet.doc of
-        --                 Ok (Tab table) ->
-        --                     -- TODO: Do multiple patches when ranges are selected.
-        --                     case ( negate sheet.select.a.y, negate sheet.select.a.x ) of
-        --                         ( 1, 1 ) ->
-        --                             []
-        --                         ( 1, i ) ->
-        --                             [ { action = "col-del"
-        --                               , path = [ E.string "cols", E.int (negate i) ]
-        --                               , value = E.object []
-        --                               }
-        --                             ]
-        --                         ( i, 1 ) ->
-        --                             [ { action = "row-del"
-        --                               , path = [ E.string "rows", E.int (negate i) ]
-        --                               , value = E.object []
-        --                               }
-        --                             ]
-        --                         ( y, x ) ->
-        --                             table.cols
-        --                                 |> Array.get (negate x)
-        --                                 |> Maybe.map
-        --                                     (\col ->
-        --                                         [ { action = "cell-put"
-        --                                           , path = [ E.string "rows", E.int (negate y), E.int col.key ]
-        --                                           , value = sheet.write |> Maybe.withDefault "" |> E.string
-        --                                           }
-        --                                         ]
-        --                                     )
-        --                                 |> Maybe.withDefault []
-        --                 _ ->
-        --                     []
-        --     )
         KeyPress _ ->
             ( model, Cmd.none )
 
@@ -1012,6 +951,51 @@ view ({ sheet } as model) =
                 |> Dict.get sheet.id
                 |> Maybe.withDefault { name = "", tags = [], scratch = False, thumb = (), peers = Public }
 
+        computeNumericStats : Array Row -> String -> Stat
+        computeNumericStats rows key =
+            rows
+                |> Array.foldl
+                    (\row stat ->
+                        row
+                            |> Dict.get key
+                            |> Maybe.andThen (D.decodeValue number >> Result.toMaybe)
+                            |> Maybe.map
+                                (\n ->
+                                    { histogram = stat.histogram |> Dict.update (String.fromFloat n) (Maybe.withDefault 0 >> (+) 1 >> Just)
+                                    , count = stat.count + 1
+                                    , sum = stat.sum + n
+                                    , min = stat.min |> Maybe.withDefault n |> min n |> Just
+                                    , max = stat.max |> Maybe.withDefault n |> max n |> Just
+                                    }
+                                )
+                            |> Maybe.withDefault stat
+                    )
+                    { histogram = Dict.empty, count = 0, sum = 0, min = Nothing, max = Nothing }
+                |> Numeric
+
+        computeTextStats : Array Row -> String -> Stat
+        computeTextStats rows key =
+            rows
+                |> Array.foldl
+                    (\row stat ->
+                        row
+                            |> Dict.get key
+                            |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
+                            |> Maybe.map
+                                (\s ->
+                                    { lengths = stat.lengths |> Dict.update (String.length s) (Maybe.withDefault 0 >> (+) 1 >> Just)
+                                    , keywords = s |> String.split " " |> List.foldl (\k -> Dict.update k (Maybe.withDefault 0 >> (+) 1 >> Just)) stat.keywords
+                                    , count = stat.count + 1
+                                    , sum = stat.sum + String.length s
+                                    , min = min (String.length s) (Maybe.withDefault (String.length s) stat.min) |> Just
+                                    , max = max (String.length s) stat.max
+                                    }
+                                )
+                            |> Maybe.withDefault stat
+                    )
+                    { lengths = Dict.empty, keywords = Dict.empty, count = 0, sum = 0, min = Nothing, max = 0 }
+                |> Descriptive
+
         stats : Result String (Array Stat)
         stats =
             case sheet.doc of
@@ -1020,90 +1004,10 @@ view ({ sheet } as model) =
                         Array.map
                             (\col ->
                                 case col.typ of
-                                    Number ->
-                                        tbl.rows
-                                            |> Array.foldl
-                                                (\row stat ->
-                                                    row
-                                                        |> Dict.get col.key
-                                                        |> Maybe.andThen (D.decodeValue number >> Result.toMaybe)
-                                                        |> Maybe.map
-                                                            (\n ->
-                                                                { histogram = stat.histogram |> Dict.update (String.fromFloat n) (Maybe.withDefault 0 >> (+) 1 >> Just)
-                                                                , count = stat.count + 1
-                                                                , sum = stat.sum + n
-                                                                , min = stat.min |> Maybe.withDefault n |> min n |> Just
-                                                                , max = stat.max |> Maybe.withDefault n |> max n |> Just
-                                                                }
-                                                            )
-                                                        |> Maybe.withDefault stat
-                                                )
-                                                { histogram = Dict.empty
-                                                , count = 0
-                                                , sum = 0
-                                                , min = Nothing
-                                                , max = Nothing
-                                                }
-                                            |> Numeric
-
-                                    Usd ->
-                                        tbl.rows
-                                            |> Array.foldl
-                                                (\row stat ->
-                                                    row
-                                                        |> Dict.get col.key
-                                                        |> Maybe.andThen (D.decodeValue number >> Result.toMaybe)
-                                                        |> Maybe.map
-                                                            (\n ->
-                                                                { histogram = stat.histogram |> Dict.update (String.fromFloat n) (Maybe.withDefault 0 >> (+) 1 >> Just)
-                                                                , count = stat.count + 1
-                                                                , sum = stat.sum + n
-                                                                , min = stat.min |> Maybe.withDefault n |> min n |> Just
-                                                                , max = stat.max |> Maybe.withDefault n |> max n |> Just
-                                                                }
-                                                            )
-                                                        |> Maybe.withDefault stat
-                                                )
-                                                { histogram = Dict.empty
-                                                , count = 0
-                                                , sum = 0
-                                                , min = Nothing
-                                                , max = Nothing
-                                                }
-                                            |> Numeric
-
-                                    Text ->
-                                        tbl.rows
-                                            |> Array.foldl
-                                                (\row stat ->
-                                                    row
-                                                        |> Dict.get col.key
-                                                        |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
-                                                        |> Maybe.map
-                                                            (\s ->
-                                                                { lengths = stat.lengths |> Dict.update (String.length s) (Maybe.withDefault 0 >> (+) 1 >> Just)
-                                                                , keywords = s |> String.split " " |> List.foldl (\k -> Dict.update k (Maybe.withDefault 0 >> (+) 1 >> Just)) stat.keywords
-                                                                , count = stat.count + 1
-                                                                , sum = stat.sum + String.length s
-                                                                , min = min (String.length s) (Maybe.withDefault (String.length s) stat.min) |> Just
-                                                                , max = max (String.length s) stat.max
-                                                                }
-                                                            )
-                                                        |> Maybe.withDefault stat
-                                                )
-                                                { lengths = Dict.empty
-                                                , keywords = Dict.empty
-                                                , count = 0
-                                                , sum = 0
-                                                , min = Nothing
-                                                , max = 0
-                                                }
-                                            |> Descriptive
-
-                                    _ ->
-                                        Enumerative
-                                            { histogram = Dict.empty
-                                            }
+                                    Number -> computeNumericStats tbl.rows col.key
+                                    Usd -> computeNumericStats tbl.rows col.key
+                                    Text -> computeTextStats tbl.rows col.key
+                                    _ -> Enumerative { histogram = Dict.empty }
                             )
                             tbl.cols
 
@@ -1205,7 +1109,7 @@ view ({ sheet } as model) =
                 --                     , H.span [ A.onClick DocNewTable ] [ text "new table" ]
                 --                     ]
                 --                 _ ->
-                --                     [ H.span [ A.onClick (DocMsg (TabMsg SheetColumnPush)) ] [ text "⌘C new column" ]
+                --                     [ H.span [ A.onClick (DocMsg (SheetColumnPush)) ] [ text "⌘C new column" ]
                 --                     ]
                 --             , List.map (\tag -> H.span [] [ text "⌘F find" ]) [ () ]
                 --             ]
@@ -1345,7 +1249,7 @@ view ({ sheet } as model) =
                                                                 <|
                                                                     case ( String.fromInt n, sheet.write /= Nothing && sheet.select == rect i n i n ) of
                                                                         ( _, True ) ->
-                                                                            [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (TabMsg (SheetWrite sheet.select.a))), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
+                                                                            [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
 
                                                                         ( "-2", _ ) ->
                                                                             case Maybe.andThen (Array.get i) (Result.toMaybe stats) of
@@ -1485,7 +1389,7 @@ view ({ sheet } as model) =
                                                             ++ [ case sheet.doc of
                                                                     Ok (Tab _) ->
                                                                         H.th
-                                                                            [ A.onClick (DocMsg (TabMsg SheetColumnPush))
+                                                                            [ A.onClick (DocMsg SheetColumnPush)
                                                                             , S.textAlignLeft
                                                                             , S.widthRem 0.001
                                                                             , S.whiteSpaceNowrap
@@ -1521,7 +1425,7 @@ view ({ sheet } as model) =
                                                 ]
 
                                         Ok (Tab _) ->
-                                            [ H.tr [ A.onClick (DocMsg (TabMsg (SheetRowPush (Array.length rows)))) ] <|
+                                            [ H.tr [ A.onClick (DocMsg (SheetRowPush (Array.length rows))) ] <|
                                                 List.indexedMap (\i col -> H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text (typeName col.typ) ]) <|
                                                     Array.toList cols
                                             ]
