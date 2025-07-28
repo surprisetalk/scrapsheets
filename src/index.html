@@ -165,12 +165,13 @@
                     }
                   };
                   const token = getAuthToken();
-                  const baseUrl = "wss://sync.automerge.org"; // TODO: "ws://localhost:8000/library/sync";
-                  return token
-                    ? `${baseUrl}?auth=Bearer%20${encodeURIComponent(token)}`
-                    : baseUrl;
+                  return (
+                    "ws://localhost:8000/library/sync" +
+                    (token ? `?auth=Bearer%20${encodeURIComponent(token)}` : "")
+                  );
                 })(),
               ),
+              "wss://sync.automerge.org", // TODO: Remove this.
             ],
           });
 
