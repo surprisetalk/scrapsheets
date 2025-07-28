@@ -16,7 +16,7 @@
   <body>
     <div id="elm"></div>
     <script type="module">
-      import * as AM from "https://esm.sh/@automerge/react@2.0.6/slim?bundle-deps";
+      import * as AM from "https://esm.sh/@automerge/react@2.1.0/slim?bundle-deps";
 
       function debounce(func, timeout = 300) {
         let timer;
@@ -147,9 +147,7 @@
         );
 
         {
-          await AM.initializeWasm(
-            fetch("https://esm.sh/@automerge/automerge/dist/automerge.wasm"),
-          ).catch(console.error);
+          await AM.initializeWasm(fetch("/automerge.wasm")); // https://esm.sh/@automerge/automerge/dist/automerge.wasm
 
           const repo = new AM.Repo({
             storage: new AM.IndexedDBStorageAdapter(),
@@ -173,7 +171,9 @@
                   );
                 })(),
               ),
-              "wss://sync.automerge.org", // TODO: Remove this.
+              new AM.WebSocketClientAdapter(
+                "wss://sync.automerge.org", // TODO: Remove this.
+              ),
             ],
           });
 
