@@ -17,11 +17,8 @@ import Html.Style as S
 import Http
 import Json.Decode as D
 import Json.Encode as E
-import Parser as P exposing ((|.), (|=), Parser)
-import Regex exposing (Regex)
 import Set exposing (Set)
 import Task exposing (Task)
-import Time exposing (Month(..))
 import Url exposing (Url)
 import Url.Parser as UrlP exposing ((</>), (<?>))
 import Url.Parser.Query as UrlQ
