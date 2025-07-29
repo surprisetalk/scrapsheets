@@ -933,7 +933,7 @@ libraryCols =
     Array.fromList
         [ Col "sheet_id" "sheet_id" SheetId
 
-        -- , Col "sheet_id" "text" Text
+        -- , Col "type" "type" Text
         , Col "name" "name" Text
         , Col "tags" "tags" (Many Text)
         , Col "delete" "" Delete
@@ -1034,7 +1034,7 @@ view ({ sheet } as model) =
                             model.library
                                 |> Dict.filter (\k v -> k /= "" && not v.scratch && List.any (String.contains model.search) (k :: v.name :: v.tags))
                                 |> Dict.toList
-                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "delete", E.string k ) ])
+                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "type", E.string (Maybe.withDefault "" <| List.head <| String.split ":" k) ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "delete", E.string k ) ])
                                 |> Array.fromList
                         }
 
@@ -1216,6 +1216,9 @@ view ({ sheet } as model) =
                                                                     , case col.typ of
                                                                         Create ->
                                                                             S.textAlignRight
+
+                                                                        SheetId ->
+                                                                            S.textAlignCenter
 
                                                                         Boolean ->
                                                                             S.textAlignCenter
