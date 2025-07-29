@@ -717,7 +717,7 @@ update msg ({ sheet } as model) =
             , case data.data.doc |> D.decodeValue docDecoder of
                 Ok Shop ->
                     Http.get
-                        { url = "https://sheets-api.scrap.land/shop"
+                        { url = "https://api.sheets.scrap.land/shop"
                         , expect = Http.expectJson ShopFetch shopDecoder
                         }
 

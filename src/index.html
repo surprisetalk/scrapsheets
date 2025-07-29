@@ -166,7 +166,7 @@
                   };
                   const token = getAuthToken();
                   return (
-                    "wss://sheets-api.scrap.land/library/sync" +
+                    "wss://api.sheets.scrap.land/library/sync" +
                     (token ? `?auth=Bearer%20${encodeURIComponent(token)}` : "")
                   );
                 })(),
@@ -401,7 +401,7 @@
             });
             if (type === "portal") {
               ws = new WebSocket(
-                `wss://sheets-api.scrap.land/${type}/${doc_id}/sync`,
+                `wss://api.sheets.scrap.land/${type}/${doc_id}/sync`,
               );
               ws.onmessage = msg =>
                 app.ports.docChanged.send({
