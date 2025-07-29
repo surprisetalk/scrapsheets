@@ -932,6 +932,8 @@ libraryCols : Array Col
 libraryCols =
     Array.fromList
         [ Col "sheet_id" "sheet_id" SheetId
+
+        -- , Col "sheet_id" "text" Text
         , Col "name" "name" Text
         , Col "tags" "tags" (Many Text)
         , Col "delete" "" Delete
@@ -1321,7 +1323,7 @@ view ({ sheet } as model) =
                                                                                                 D.map text string
 
                                                                                             SheetId ->
-                                                                                                D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock ] [ text id ])
+                                                                                                D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock, S.fontStyleItalic ] [ text "link" ])
 
                                                                                             Link ->
                                                                                                 D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayBlock, S.wordBreakKeepAll, S.hyphensNone, S.maxWidthRem 18, S.fontStyleItalic ] [ text "link" ])

@@ -607,9 +607,9 @@ app.get("/shop", async c => {
   return page(c)({
     data: [
       [
-        { name: "name", type: "text", key: "name" },
-        { name: "price", type: "usd", key: "price" },
         { name: "", type: "create", key: "data" },
+        { name: "price", type: "usd", key: "price" },
+        { name: "name", type: "text", key: "name" },
       ] as unknown as Row<Col>,
       ...Object.entries(examples).map(([k, v]) => ({
         name: k,
