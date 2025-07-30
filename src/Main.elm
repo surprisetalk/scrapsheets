@@ -931,7 +931,7 @@ update msg ({ sheet } as model) =
 libraryCols : Array Col
 libraryCols =
     Array.fromList
-        [ Col "sheet_id" "sheet_id" SheetId
+        [ Col "sheet_id" "" SheetId
 
         -- , Col "type" "type" Text
         , Col "name" "name" Text
@@ -1061,6 +1061,8 @@ view ({ sheet } as model) =
         [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
         , H.node "style" [] [ text "body { font-family: sans-serif; font-optical-sizing: auto; height: 100vh; width: 100vw; }" ]
         , H.node "style" [] [ text "table { background: #fff; line-height: 1; }" ]
+        , H.node "style" [] [ text "td a, td button { opacity: 0.8; }" ]
+        , H.node "style" [] [ text "td a:hover, td button:hover { opacity: 1; }" ]
         , H.node "style" [] [ text "th, td { padding: 0.25rem; padding-bottom: 0.15rem; font-weight: normal; border: 1px solid #888; height: 0.8rem; vertical-align: top; }" ]
         , H.node "style" [] [ text "tr > :first-child { border-left: none; padding-left: 0.5rem; }" ]
         , H.node "style" [] [ text "tr > :last-child { border-right: none; padding-right: 0.5rem; }" ]
@@ -1219,7 +1221,7 @@ view ({ sheet } as model) =
                                                                             S.textAlignRight
 
                                                                         SheetId ->
-                                                                            S.textAlignCenter
+                                                                            S.textAlignLeft
 
                                                                         Boolean ->
                                                                             S.textAlignCenter
@@ -1241,6 +1243,9 @@ view ({ sheet } as model) =
                                                                     , case col.typ of
                                                                         Create ->
                                                                             S.widthRem 10
+
+                                                                        SheetId ->
+                                                                            S.widthRem 0.5
 
                                                                         Boolean ->
                                                                             S.widthRem 0.5
@@ -1300,7 +1305,7 @@ view ({ sheet } as model) =
                                                                                     []
 
                                                                         ( "-1", _ ) ->
-                                                                            [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontStyleItalic, S.opacity "0.5" ]
+                                                                            [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.opacity "0.5", S.fontSizeSmall ]
                                                                                 [ text (typeName col.typ)
                                                                                 ]
                                                                             ]
@@ -1327,7 +1332,7 @@ view ({ sheet } as model) =
                                                                                                 D.map text string
 
                                                                                             SheetId ->
-                                                                                                D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayInlineBlock, S.fontStyleItalic ] [ text "link" ])
+                                                                                                D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.overflowVisible, S.fontStyleItalic, S.paddingRightRem 0.5 ] [ text "view" ])
 
                                                                                             Link ->
                                                                                                 D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayBlock, S.wordBreakKeepAll, S.hyphensNone, S.maxWidthRem 18, S.fontStyleItalic ] [ text "link" ])
