@@ -439,6 +439,17 @@ number =
         ]
 
 
+boolean : D.Decoder Bool
+boolean =
+    D.oneOf
+        [ D.bool
+        , D.string |> D.map (\c -> String.toLower c == "true" || c == "t" || c == "1")
+        , D.int |> D.map ((/=) 0)
+        , D.null False
+        , D.succeed False
+        ]
+
+
 docDecoder : D.Decoder Doc
 docDecoder =
     D.field "type" D.string
@@ -634,6 +645,7 @@ type DocMsg
     = SheetWrite Index
     | SheetRowPush Int
     | SheetColumnPush
+    | CellCheck Index Bool
 
 
 type Input
@@ -832,6 +844,19 @@ update msg ({ sheet } as model) =
                                       }
                                     ]
 
+                                CellCheck i c ->
+                                    table.cols
+                                        |> Array.get i.x
+                                        |> Maybe.map
+                                            (\col ->
+                                                [ { action = "set"
+                                                  , path = [ E.int i.y, E.string col.key ]
+                                                  , value = E.bool c
+                                                  }
+                                                ]
+                                            )
+                                        |> Maybe.withDefault []
+
                 _ ->
                     Cmd.none
             )
@@ -884,6 +909,7 @@ update msg ({ sheet } as model) =
         CellMouseDoubleClick write ->
             let
                 a =
+                    -- TODO: Don't set .write if it's a Boolean or non-editable cell.
                     ( { model | sheet = { sheet | write = Just write } }
                     , Task.attempt (always NoOp) (Dom.focus "new-cell")
                     )
@@ -1332,7 +1358,7 @@ view ({ sheet } as model) =
                                                                                                 D.map text string
 
                                                                                             SheetId ->
-                                                                                                D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.overflowVisible, S.fontStyleItalic, S.paddingRightRem 0.5 ] [ text "view" ])
+                                                                                                D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.overflowVisible, S.fontStyleItalic, S.whiteSpaceNowrap, S.paddingRightRem 0.5 ] [ text "view" ])
 
                                                                                             Link ->
                                                                                                 D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayBlock, S.wordBreakKeepAll, S.hyphensNone, S.maxWidthRem 18, S.fontStyleItalic ] [ text "link" ])
@@ -1344,7 +1370,7 @@ view ({ sheet } as model) =
                                                                                                 D.map text string
 
                                                                                             Boolean ->
-                                                                                                D.map (\c -> H.input [ A.type_ "checkbox", A.checked c ] []) D.bool
+                                                                                                boolean |> D.map (\c -> H.input [ A.type_ "checkbox", A.checked c, A.onCheck (DocMsg << CellCheck { x = i, y = n }) ] [])
 
                                                                                             Number ->
                                                                                                 D.oneOf
