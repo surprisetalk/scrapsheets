@@ -223,17 +223,14 @@ const sendVerificationEmail = async (email: string) => {
     });
 };
 
-export const sql = pg({
-  host: "127.0.0.1",
-  port: 5434,
-  database: "postgres",
-  username: "postgres",
-  password: "",
-  ssl: false,
-  prepare: false,
-  fetch_types: true,
-  onnotice: msg => msg.severity !== "DEBUG" && console.log(msg),
-});
+export const sql = pg(
+  Deno.env.get("DATABASE_URL") ??
+    "postgresql://postgres@127.0.0.1:5434/postgres",
+  {
+    fetch_types: true,
+    onnotice: msg => msg.severity !== "DEBUG" && console.log(msg),
+  },
+);
 
 const cselect = async ({
   select,
