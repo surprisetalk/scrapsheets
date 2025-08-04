@@ -1,4 +1,4 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
   <head>
     <title>scrapsheets</title>
@@ -37,7 +37,7 @@
         function catchy(func) {
           return (...args) => {
             try {
-              return func.apply(this, args)?.catch(error => {
+              return func.apply(this, args)?.catch((error) => {
                 console.error(error);
                 app.ports.docErrored.send(
                   error?.message ?? "Something went wrong.",
@@ -123,11 +123,14 @@
             );
             localStorage.setItem(
               "scrapsheets-library",
-              JSON.stringify({ ...library, [id]: { ...library[id], ...info } }),
+              JSON.stringify({
+                ...library,
+                [id]: { ...library[id], ...info },
+              }),
             );
             app.ports.librarySynced.send(Library.get());
           },
-          delete: id => {
+          delete: (id) => {
             const library = JSON.parse(
               localStorage.getItem("scrapsheets-library") ?? "{}",
             );
@@ -140,10 +143,10 @@
         };
         app.ports.librarySynced.send(Library.get());
 
-        app.ports.deleteDoc.subscribe(async id => Library.delete(id));
+        app.ports.deleteDoc.subscribe(async (id) => Library.delete(id));
 
         app.ports.updateLibrary.subscribe(({ id, data }) =>
-          Library.set(id, data),
+          Library.set(id, data)
         );
 
         {
@@ -157,7 +160,8 @@
                   const getAuthToken = () => {
                     try {
                       const userData = JSON.parse(
-                        localStorage.getItem("scrapsheets-user") || "{}",
+                        localStorage.getItem("scrapsheets-user") ||
+                          "{}",
                       );
                       return userData.jwt || null;
                     } catch {
@@ -167,7 +171,9 @@
                   const token = getAuthToken();
                   return (
                     "wss://api.sheets.scrap.land/library/sync" +
-                    (token ? `?auth=Bearer%20${encodeURIComponent(token)}` : "")
+                    (token
+                      ? `?auth=Bearer%20${encodeURIComponent(token)}`
+                      : "")
                   );
                 })(),
               ),
@@ -180,31 +186,33 @@
           let sheet;
 
           const setupDragDrop = () => {
-            document.body.addEventListener("dragover", e => {
+            document.body.addEventListener("dragover", (e) => {
               e.preventDefault();
               e.stopPropagation();
               e.dataTransfer.dropEffect = "copy";
               document.body.classList.add("drag-over");
             });
-            document.body.addEventListener("dragleave", e => {
+            document.body.addEventListener("dragleave", (e) => {
               e.preventDefault();
               e.stopPropagation();
               document.body.classList.remove("drag-over");
             });
-            document.body.addEventListener("drop", async e => {
+            document.body.addEventListener("drop", async (e) => {
               e.preventDefault();
               e.stopPropagation();
               document.body.classList.remove("drag-over");
               const files = Array.from(e.dataTransfer.files).filter(
-                file => file.type === "text/csv" || file.name.endsWith(".csv"),
+                (file) =>
+                  file.type === "text/csv" ||
+                  file.name.endsWith(".csv"),
               );
               for (const file of files) {
                 try {
                   const lines = (await file.text())
                     .split("\n")
-                    .filter(line => line.trim());
+                    .filter((line) => line.trim());
                   if (!lines.length) return null;
-                  const [headers, ...data] = lines.map(row => {
+                  const [headers, ...data] = lines.map((row) => {
                     const result = [];
                     let current = "";
                     let inQuotes = false;
@@ -236,7 +244,7 @@
                         type: "text",
                         key,
                       })),
-                      ...data.map(row => {
+                      ...data.map((row) => {
                         const rowObj = {};
                         headers.forEach((header, index) => {
                           rowObj[index] = row[index] || "";
@@ -260,55 +268,67 @@
               }
             });
           };
-          if (document.readyState === "loading")
-            document.addEventListener("DOMContentLoaded", setupDragDrop);
-          else setupDragDrop();
+          if (document.readyState === "loading") {
+            document.addEventListener(
+              "DOMContentLoaded",
+              setupDragDrop,
+            );
+          } else setupDragDrop();
 
           alasql.options.modifier = "RECORDSET";
-          for (const type of [
-            "image",
-            "link",
-            "usd",
-            "percentage",
-            "date",
-            "int",
-            "float",
-          ])
-            alasql.fn[type] = data => ({ type, data });
+          for (
+            const type of [
+              "image",
+              "link",
+              "usd",
+              "percentage",
+              "date",
+              "int",
+              "float",
+            ]
+          ) {
+            alasql.fn[type] = (data) => ({ type, data });
+          }
           alasql.from.SHEET = (id, params = {}) => {
             // TODO: Grab sheet (e.g. portal) with given params.
             throw new Error("TODO");
           };
           alasql.fn.http = (url, qs = {}) => {
-            const atomToJson = xmlString => {
+            const atomToJson = (xmlString) => {
               const parser = new DOMParser();
               const doc = parser.parseFromString(xmlString, "text/xml");
               const feed = {
                 title: doc.querySelector("feed > title")?.textContent,
-                updated: doc.querySelector("feed > updated")?.textContent,
+                updated: doc.querySelector("feed > updated")
+                  ?.textContent,
                 totalResults: parseInt(
                   doc.querySelector("totalResults")?.textContent || "0",
                 ),
                 entries: [],
               };
-              doc.querySelectorAll("entry").forEach(entry => {
+              doc.querySelectorAll("entry").forEach((entry) => {
                 feed.entries.push({
                   id: entry.querySelector("id")?.textContent,
-                  title: entry.querySelector("title")?.textContent?.trim(),
-                  summary: entry.querySelector("summary")?.textContent?.trim(),
-                  published: entry.querySelector("published")?.textContent,
+                  title: entry.querySelector("title")?.textContent
+                    ?.trim(),
+                  summary: entry.querySelector("summary")?.textContent
+                    ?.trim(),
+                  published: entry.querySelector("published")
+                    ?.textContent,
                   updated: entry.querySelector("updated")?.textContent,
                   authors: Array.from(
                     entry.querySelectorAll("author name"),
-                  ).map(a => a.textContent),
-                  links: Array.from(entry.querySelectorAll("link")).map(l => ({
-                    href: l.getAttribute("href"),
-                    rel: l.getAttribute("rel"),
-                    type: l.getAttribute("type"),
-                  })),
+                  ).map((a) => a.textContent),
+                  links: Array.from(entry.querySelectorAll("link")).map(
+                    (l) => ({
+                      href: l.getAttribute("href"),
+                      rel: l.getAttribute("rel"),
+                      type: l.getAttribute("type"),
+                    }),
+                  ),
                   categories: Array.from(
                     entry.querySelectorAll("category"),
-                  ).map(c => c.getAttribute("term")),
+                  ).map((c) => c.getAttribute("term")),
                 });
               });
               return feed;
@@ -318,18 +338,21 @@
             };
             if (!url) return;
             const request = new XMLHttpRequest();
-            request.open("GET", url + "?" + new URLSearchParams(qs), false); // `false` makes the request synchronous
+            request.open(
+              "GET",
+              url + "?" + new URLSearchParams(qs),
+              false,
+            ); // `false` makes the request synchronous
             request.send(null);
             return {
               status: request.status,
-              res:
-                (
-                  parsers?.[
-                    request
-                      .getResponseHeader("Content-Type")
-                      ?.replace(/;.*$/, "") || "application/json"
-                  ] ?? JSON.parse
-                )?.(request.responseText) || null,
+              res: (
+                parsers?.[
+                  request
+                    .getResponseHeader("Content-Type")
+                    ?.replace(/;.*$/, "") || "application/json"
+                ] ?? JSON.parse
+              )?.(request.responseText) || null,
             };
           };
           alasql.from.HTTP = (url, qs = {}) => {
@@ -338,61 +361,70 @@
             return res;
           };
           const queryDoc = debounce(
-            catchy(async (id, { code, lang, args, cols: cols_ = {} }) => {
-              switch (lang) {
-                case "sql":
-                  // TODO: Run alasql if possible, otherwise post to /query.
-                  const params = new URLSearchParams(window.location.search)
-                    .get("q")
-                    ?.split(/\s+(?=\w+=)/)
-                    .reduce(
-                      (r, p) => {
-                        const [k, v] = p.includes("=") ? p.split("=") : ["", p];
-                        return ((r[k] ||= []).push(v), r);
-                      },
-                      { "": [].join(" ") },
-                    ) ?? { "": null };
-                  const [, { columns: cols, data: rows } = {}] = await alasql([
-                    [`set @params = ?`, [params]],
-                    code,
-                  ]);
-                  // TODO: If doc contains cols data, use that names and types.
-                  app.ports.docQueried.send({
-                    id,
-                    data: [
-                      cols.map(col => ({
-                        key: col.columnid,
-                        name: col.columnid,
-                        type: cols_?.[col.columnid] ?? null,
-                      })),
-                      ...rows,
-                    ],
-                  });
-                  break;
-                default:
-                  throw new Error(`TODO: ${lang}`);
-              }
-            }),
+            catchy(
+              async (id, { code, lang, args, cols: cols_ = {} }) => {
+                switch (lang) {
+                  case "sql":
+                    // TODO: Run alasql if possible, otherwise post to /query.
+                    const params =
+                      new URLSearchParams(window.location.search)
+                        .get("q")
+                        ?.split(/\s+(?=\w+=)/)
+                        .reduce(
+                          (r, p) => {
+                            const [k, v] = p.includes("=")
+                              ? p.split("=")
+                              : ["", p];
+                            return ((r[k] ||= []).push(v), r);
+                          },
+                          { "": [].join(" ") },
+                        ) ?? { "": null };
+                    const [, { columns: cols, data: rows } = {}] =
+                      await alasql([
+                        [`set @params = ?`, [params]],
+                        code,
+                      ]);
+                    // TODO: If doc contains cols data, use that names and types.
+                    app.ports.docQueried.send({
+                      id,
+                      data: [
+                        cols.map((col) => ({
+                          key: col.columnid,
+                          name: col.columnid,
+                          type: cols_?.[col.columnid] ?? null,
+                        })),
+                        ...rows,
+                      ],
+                    });
+                    break;
+                  default:
+                    throw new Error(`TODO: ${lang}`);
+                }
+              },
+            ),
             300,
           );
-          app.ports.queryDoc.subscribe(({ id, data }) => queryDoc(id, data));
+          app.ports.queryDoc.subscribe(({ id, data }) =>
+            queryDoc(id, data)
+          );
 
           let ws;
           const selectDoc = catchy(async (id, sheet) => {
             const [type, doc_id] = id.split(":");
             const doc = Library.get()[id]?.doc ?? sheet?.doc?.();
-            if (!doc)
+            if (!doc) {
               return app.ports.docSelected.send({
                 id: "",
                 data: { doc: { type: "library" } },
               });
+            }
             app.ports.docSelected.send({
               id,
               data: { doc: doc && { ...doc } },
             });
             if (!type || !doc_id) return;
             if (type === "query") queryDoc(id, doc.data[0]);
-            sheet?.on?.("change", data => {
+            sheet?.on?.("change", (data) => {
               app.ports.docChanged.send({
                 id: type + ":" + data.handle.documentId,
                 data,
@@ -403,7 +435,7 @@
               ws = new WebSocket(
                 `wss://api.sheets.scrap.land/${type}/${doc_id}/sync`,
               );
-              ws.onmessage = msg =>
+              ws.onmessage = (msg) =>
                 app.ports.docChanged.send({
                   id,
                   data: {
@@ -416,7 +448,7 @@
             }
           });
 
-          const changeId = catchy(async id => {
+          const changeId = catchy(async (id) => {
             const [, doc_id = ""] = id.split(":");
             if (doc_id === sheet?.documentId) return;
             ws?.close?.();
@@ -444,7 +476,7 @@
                 const doc = Library.get()[id]?.doc;
                 if (doc) {
                   const d = { ...doc };
-                  for (const { path, action, value } of patches)
+                  for (const { path, action, value } of patches) {
                     switch (path.length) {
                       case 2: {
                         const [y, x] = path;
@@ -456,6 +488,7 @@
                       default:
                         throw new Error("TODO: path");
                     }
+                  }
                   app.ports.docChanged.send({
                     id,
                     data: {
@@ -469,8 +502,8 @@
                   return;
                 }
               }
-              sheet?.change(d => {
-                for (const { path, action, value } of patches)
+              sheet?.change((d) => {
+                for (const { path, action, value } of patches) {
                   switch (path.length) {
                     case 0: {
                       d.data[action](...value);
@@ -492,13 +525,16 @@
                     default:
                       throw new Error("TODO: path");
                   }
+                }
               });
             }),
           );
         }
       } catch (error) {
         console.error(error);
-        app.ports.docErrored.send(error?.message ?? "Something went wrong.");
+        app.ports.docErrored.send(
+          error?.message ?? "Something went wrong.",
+        );
       }
     </script>
   </body>

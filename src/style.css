@@ -119,7 +119,7 @@ body.drag-over {
 }
 
 body.drag-over::before {
-  content: 'Drop CSV file to import';
+  content: "Drop CSV file to import";
   position: fixed;
   top: 0;
   left: 0;

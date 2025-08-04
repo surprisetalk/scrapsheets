@@ -32,4 +32,3 @@ jobs:
         run: deno test --allow-all
         env:
           CI: true
-
