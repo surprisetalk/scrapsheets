@@ -44,7 +44,7 @@ async function get<T>(
     route +
       "?" +
       new URLSearchParams(query as Record<string, string>).toString(),
-  ).then(res => res.data);
+  ).then((res) => res.data);
 }
 
 const post = (jwt: string, route: string, body: unknown) =>
@@ -135,7 +135,7 @@ Deno.test(async function allTests(t) {
       const cols = Object.values(cols_);
       assert(cols.length);
       assertEquals(
-        cols.map(col => col.name).join(),
+        cols.map((col) => col.name).join(),
         "created_at,type,doc_id,name,tags,sell_price",
       );
       assertEquals(rows.length, templates.length * 2);
@@ -147,7 +147,7 @@ Deno.test(async function allTests(t) {
       const cols = Object.values(cols_);
       assert(cols.length);
       assertEquals(
-        cols.map(col => col.name).join(),
+        cols.map((col) => col.name).join(),
         "created_at,type,doc_id,name,tags,sell_price",
       );
       assert(rows.length);
@@ -184,7 +184,7 @@ Deno.test(async function allTests(t) {
       const [cols_, ...rows] = await get<Table>(jwt, `/shop`);
       const cols = Object.values(cols_);
       assert(cols.length);
-      assertEquals(cols.map(col => col.name).join(), "name,price,");
+      assertEquals(cols.map((col) => col.name).join(), "name,price,");
       assert(rows.length);
       /*
       for (const { sell_id } of rows) {
@@ -336,5 +336,5 @@ Deno.test(async function allTests(t) {
   listener.close();
   await pglite.close();
 
-  await new Promise(res => setTimeout(res, 250));
+  await new Promise((res) => setTimeout(res, 250));
 });
