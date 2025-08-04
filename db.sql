@@ -43,3 +43,6 @@ create table net
 , created_at timestamp default now()
 , body text not null
 );
+
+insert into usr (name, email)
+values ('Scrapsheets', '');

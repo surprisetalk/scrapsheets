@@ -81,6 +81,7 @@ Deno.test(async function allTests(t) {
 
   await pglite.waitReady;
   await pglite.exec(await Deno.readTextFile("./db.sql"));
+  await pglite.exec(await Deno.readTextFile("./examples.sql"));
 
   {
     const { jwt } = await usr("alice@example.com");
@@ -94,9 +95,9 @@ Deno.test(async function allTests(t) {
           type: "table",
           data: [
             arrayify([
-              { name: "a", type: "string", key: 0 },
-              { name: "b", type: "string", key: 1 },
-              { name: "c", type: "string", key: 2 },
+              { name: "a", type: "text", key: 0 },
+              { name: "b", type: "text", key: 1 },
+              { name: "c", type: "text", key: 2 },
             ]),
           ],
         },

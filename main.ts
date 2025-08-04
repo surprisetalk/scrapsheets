@@ -14,7 +14,6 @@ import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-webso
 import { NodeFSStorageAdapter } from "npm:@automerge/automerge-repo-storage-nodefs";
 import { WebSocketServer } from "npm:ws";
 import ala from "npm:alasql";
-import { examples } from "./examples.ts";
 import { EventEmitter } from "node:events";
 
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
@@ -30,7 +29,9 @@ export type Tag<T extends string, X extends Row[]> = {
 export type Type =
   // TODO: Consider using JSONSchema?
   | "type"
-  | "string"
+  | "text"
+  | "create"
+  | "usd"
   | "int"
   | ["array", Type]
   | ["tuple", Type[]]
@@ -94,6 +95,7 @@ const sheet = async (
     case "net-http":
     case "net-socket":
       return await cselect({
+        cols: null,
         select: sql`select n.created_at, n.body`,
         from: sql`from sheet_usr su inner join net n using (sheet_id)`,
         where: [
@@ -159,7 +161,7 @@ const querify = async (
             i,
             {
               name: col.columnid,
-              type: "string",
+              type: "text",
               key: col.columnid,
             },
           ]),
@@ -233,6 +235,7 @@ export const sql = pg(
 );
 
 const cselect = async ({
+  cols,
   select,
   from,
   where,
@@ -240,6 +243,7 @@ const cselect = async ({
   limit = "50",
   offset = "0",
 }: {
+  cols: Col[] | null;
   select: any;
   from: any;
   where: any[];
@@ -252,15 +256,19 @@ const cselect = async ({
     : sql``;
   const rows =
     await sql`${select} ${from} ${where_} ${order ?? sql``} limit ${limit} offset ${offset}`;
-  const cols: Row<Col> = arrayify(
+  const cols_: Row<Col> = arrayify(
     rows.columns.map((col, i) => ({
       name: col.name,
-      type: "string", // TODO: col.type
+      type: "text", // TODO: col.type
       key: col.name,
     })),
   );
   const [{ count }] = await sql`select count(*) ${from} ${where_}`;
-  return { data: [cols, ...rows], count, offset: parseInt(offset) };
+  return {
+    data: [(cols as unknown as Row<Col>) ?? cols_, ...rows],
+    count,
+    offset: parseInt(offset),
+  };
 };
 
 const page =
@@ -601,27 +609,15 @@ app.post("/login", async c => {
 });
 
 app.get("/shop", async c => {
-  return page(c)({
-    data: [
-      [
-        { name: "name", type: "text", key: "name" },
-        { name: "price", type: "usd", key: "price" },
-        { name: "", type: "create", key: "data" },
-      ] as unknown as Row<Col>,
-      ...Object.entries(examples).map(([k, v]) => ({
-        name: k,
-        price: 0,
-        data: { ...v, name: k },
-      })),
-    ],
-    offset: 0,
-    count: Object.keys(examples).length,
-  });
-  // TODO:
   const { limit, offset, ...qs } = c.req.query();
   return page(c)(
     await cselect({
-      select: sql`select created_at, sell_id, sell_type, sell_price, name`,
+      cols: [
+        { name: "name", type: "text", key: "name" },
+        { name: "price", type: "usd", key: "sell_price" },
+        { name: "", type: "create", key: "row_0" },
+      ],
+      select: sql`select created_at, sell_id, sell_type, sell_price, name, row_0`,
       from: sql`from sheet s`,
       where: [
         sql`sell_price >= 0`,
@@ -698,6 +694,7 @@ app.get("/library", async c => {
   const { limit, offset, ...qs } = c.req.query();
   return page(c)(
     await cselect({
+      cols: null,
       select: sql`select s.created_at, s.type, s.doc_id, s.name, s.tags, s.sell_price`,
       from: sql`
         from sheet_usr su 
@@ -773,7 +770,7 @@ app.get("/codex/:id", async c => {
       const rows = await sql_`
         select 
           table_name as name,
-          '[[{"name":"name","type":"string","key":"column_name"},{"name":"type","type":"string","key":"data_type"},{"name":"key","type":"int","key":"ordinal_position"}]]'::jsonb || jsonb_agg(t)::jsonb as columns
+          '[[{"name":"name","type":"text","key":"column_name"},{"name":"type","type":"text","key":"data_type"},{"name":"key","type":"int","key":"ordinal_position"}]]'::jsonb || jsonb_agg(t)::jsonb as columns
         from information_schema.tables t
         inner join information_schema.columns c using (table_catalog,table_schema,table_name)
         where table_schema = 'public'
@@ -781,7 +778,7 @@ app.get("/codex/:id", async c => {
       `;
       const cols = rows.columns.map((col, i) => ({
         name: col.name,
-        type: "string",
+        type: "text",
         key: col.name,
       })); // TODO:
       await sql_.end();
@@ -792,38 +789,38 @@ app.get("/codex/:id", async c => {
         {
           data: [
             [
-              { name: "name", type: "string", key: "name" },
+              { name: "name", type: "text", key: "name" },
               { name: "columns", type: "table", key: "columns" },
             ],
             {
               name: "shop",
               columns: [
                 [
-                  { name: "name", type: "string", key: 0 },
-                  { name: "type", type: "string", key: 1 },
+                  { name: "name", type: "text", key: 0 },
+                  { name: "type", type: "text", key: 1 },
                   { name: "key", type: "int", key: 2 },
                 ],
-                ["created_at", "string", 0],
-                ["sell_id", "string", 1],
-                ["sell_type", "string", 2],
-                ["sell_price", "string", 3],
-                ["name", "string", 4],
+                ["created_at", "text", 0],
+                ["sell_id", "text", 1],
+                ["sell_type", "text", 2],
+                ["sell_price", "text", 3],
+                ["name", "text", 4],
               ],
             },
             {
               name: "library",
               columns: [
                 [
-                  { name: "name", type: "string", key: 0 },
-                  { name: "type", type: "string", key: 1 },
+                  { name: "name", type: "text", key: 0 },
+                  { name: "type", type: "text", key: 1 },
                   { name: "key", type: "int", key: 2 },
                 ],
-                ["s.created_at", "string", 0],
-                ["s.type", "string", 1],
-                ["s.doc_id", "string", 2],
-                ["s.name", "string", 3],
-                ["s.tags", "string", 4],
-                ["s.sell_price", "string", 5],
+                ["s.created_at", "text", 0],
+                ["s.type", "text", 1],
+                ["s.doc_id", "text", 2],
+                ["s.name", "text", 3],
+                ["s.tags", "text", 4],
+                ["s.sell_price", "text", 5],
               ],
             },
           ],
