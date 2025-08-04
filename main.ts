@@ -632,7 +632,7 @@ app.get("/shop", async c => {
             qs.sell_type.split("-")[1]
           }::numeric`,
       ],
-      order: undefined,
+      order: sql`order by name`,
       limit,
       offset,
     }),

@@ -1,14 +1,15 @@
-insert into sheet (sell_price, created_by, type, doc_id, row_0)
+insert into sheet (sell_price, created_by, type, name, doc_id, row_0)
 select
   0,
   (select usr_id from usr where email = ''),
   'template',
-  replace(doc_id, ' ', '-'),
-  jsonb_build_object('type','query', 'data',jsonb_build_array(jsonb_build_object('lang','sql', 'code',trim(code), 'cols',cols)))
+  name,
+  replace(name, ' ', '-'),
+  jsonb_build_object('name',name, 'type','query', 'data',jsonb_build_array(jsonb_build_object('lang','sql', 'code',trim(code), 'cols',cols)))
 from jsonb_to_recordset(replace($$[
 
 {
-  "doc_id": "simple http get",
+  "name": "simple http get",
   "cols": {},
   "code":"
   \n  select http('https://taylor.town/random')->res as random_number
@@ -16,7 +17,7 @@ from jsonb_to_recordset(replace($$[
 }, 
 
 {
-  "doc_id": "bluesky users",
+  "name": "bluesky users",
   "cols": {
     "avatar": "image",
     "did": "link",
@@ -38,7 +39,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "github repo",
+  "name": "github repo",
   "cols": {
     "repo": "link",
     "full_name": "text",
@@ -53,7 +54,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "github users",
+  "name": "github users",
   "cols": {
     "avatar": "image",
     "url": "link",
@@ -65,7 +66,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "github prs/issues",
+  "name": "github prs/issues",
   "cols": {
     "id": "text",
     "number": "number",
@@ -95,7 +96,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "crypto markets",
+  "name": "crypto markets",
   "cols": {
     "image": "image",
     "rank": "int",
@@ -113,7 +114,7 @@ from jsonb_to_recordset(replace($$[
   "\n  search / return (\n    image,\n    market_cap_rank as rank,\n    name,\n    symbol,\n    current_price as price,\n    market_cap,\n    high_24h,\n    low_24h,\n    price_change_percentage_24h as change_24h,\n    ath,\n    ath_date\n  )\n  from http(\n    'https://api.coingecko.com/api/v3/coins/markets',\n    @{vs_currency:'usd', `order`:'market_cap_desc', per_page:100}\n  )\n  "
 },
 {
-  "doc_id": "crypto search",
+  "name": "crypto search",
   "cols": {
     "thumb": "image",
     "rank": "int",
@@ -125,7 +126,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "hackernews search",
+  "name": "hackernews search",
   "cols": {
     "id": "text",
     "url": "link",
@@ -141,7 +142,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "hackernews frontpage",
+  "name": "hackernews frontpage",
   "cols": {
     "title": "text",
     "author": "text",
@@ -154,7 +155,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "arxiv search",
+  "name": "arxiv search",
   "cols": {
     "id": "link",
     "title": "text",
@@ -169,7 +170,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "wikipedia search",
+  "name": "wikipedia search",
   "cols": {
     "thumb": "image",
     "title": "text",
@@ -179,7 +180,7 @@ from jsonb_to_recordset(replace($$[
   "\n  search `query` pages / return (\n    thumbnail->source as thumb,\n    title,\n    fullurl as url\n  )\n  from http(\n    'https://en.wikipedia.org/w/api.php',\n    @{\n       action:'query',\n       generator:'search',\n       prop:'pageimages|info',\n       piprop:'thumbnail',\n       pithumbsize:100,\n       inprop:'url',\n       exintro:'',\n       explaintext:'',\n       `gsrsearch`:(@params->('')),\n       gsrlimit:25,\n       format:'json',\n       origin:'*'\n     }\n  )\n  "
 },
 {
-  "doc_id": "reddit search",
+  "name": "reddit search",
   "cols": {
     "thumbnail": "image",
     "ups": "int",
@@ -204,7 +205,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "subreddit posts",
+  "name": "subreddit posts",
   "cols": {
     "thumbnail": "image",
     "ups": "int",
@@ -228,7 +229,7 @@ from jsonb_to_recordset(replace($$[
   "\n  search data children / data return (\n    thumbnail,\n    title,\n    'https://old.reddit.com'||permalink as reddit_url,\n    url,\n    url_overridden_by_dest as dest_url,\n    domain,\n    post_hint as type,\n    ups,\n    downs,\n    is_self,\n    spoiler,\n    num_comments as comms,\n    author,\n    subreddit,\n    subreddit_subscribers as subs,\n    created\n  )\n  from http(\n    'https://www.reddit.com/r/'||(coalesce(@params->(''),'all'))||'.json',\n    @{limit:25}\n  )\n  "
 },
 {
-  "doc_id": "manifold search",
+  "name": "manifold search",
   "cols": {
     "creatorAvatarUrl": "image",
     "url": "link",
@@ -249,7 +250,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "manifold trending", 
+  "name": "manifold trending", 
   "cols": {
     "creatorAvatarUrl": "image",
     "url": "link",
@@ -271,7 +272,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "yahoo finance news",
+  "name": "yahoo finance news",
   "cols": {
     "link": "link",
     "thumb": "image", 
@@ -285,7 +286,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "speedrun.com games",
+  "name": "speedrun.com games",
   "cols": {
     "thumb": "image",
     "url": "link",
@@ -298,7 +299,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "speedrun.com users",
+  "name": "speedrun.com users",
   "cols": {
     "url": "link",
     "thumb": "image",
@@ -316,7 +317,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "apple podcast search",
+  "name": "apple podcast search",
   "cols": {
     "artistName": "text",
     "trackName": "text",
@@ -331,7 +332,7 @@ from jsonb_to_recordset(replace($$[
 },
 
 {
-  "doc_id": "ossinsights.io trends",
+  "name": "ossinsights.io trends",
   "cols": {
     "repo": "text",
     "lang": "text",
@@ -348,6 +349,6 @@ from jsonb_to_recordset(replace($$[
 }
 
 ]$$,$$
-  \n  $$,'\n')::jsonb) as s(doc_id text, code text, cols jsonb)
+  \n  $$,'\n')::jsonb) as s(name text, code text, cols jsonb)
 on conflict (doc_id) 
-do update set row_0 = excluded.row_0;
+do update set name = excluded.name, row_0 = excluded.row_0;
