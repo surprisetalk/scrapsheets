@@ -9,12 +9,10 @@ import pg from "https://deno.land/x/postgresjs@v3.4.5/mod.js";
 import { upgradeWebSocket } from "jsr:@hono/hono/deno";
 import { Repo } from "npm:@automerge/automerge-repo";
 import * as AM from "npm:@automerge/automerge-repo";
-import type { AnyDocumentId, DocHandle } from "npm:@automerge/automerge-repo";
-import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-websocket";
+import type { AnyDocumentId } from "npm:@automerge/automerge-repo";
+// import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-websocket";
 import { NodeFSStorageAdapter } from "npm:@automerge/automerge-repo-storage-nodefs";
-import { WebSocketServer } from "npm:ws";
 import ala from "npm:alasql";
-import { EventEmitter } from "node:events";
 
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
 const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
@@ -122,24 +120,24 @@ const sheet = async (
 
 const querify = async (
   c: Context,
-  { lang, code, args = [] }: Query,
-  reqQuery: Record<string, string>,
+  { lang, code, args: _args = [] }: Query,
+  _reqQuery: Record<string, string>,
 ): Promise<Page> => {
   if (lang === "sql") {
     // TODO: Use psql/etc if all sheets are from the same codex.
     const sheet_ids: string[] = [];
     const code_ = code.replace(
       /@[^ ]+/g,
-      (ref) => (sheet_ids.push(ref.slice(1)), "?"),
+      ref => (sheet_ids.push(ref.slice(1)), "?"),
     );
-    const docs: Record<string, Record<string, any>[]> = {};
+    const docs: Record<string, Record<string, unknown>[]> = {};
     for (const sheet_id of sheet_ids) {
       if (docs[sheet_id]) continue;
       const [cols, ...rows] = (await sheet(c, sheet_id, {})).data;
-      docs[sheet_id] = rows.map((row) =>
+      docs[sheet_id] = rows.map(row =>
         Object.fromEntries(
-          Object.values(cols).map((col) => [col.name, row[col.key]]),
-        )
+          Object.values(cols).map(col => [col.name, row[col.key]]),
+        ),
       );
     }
     const {
@@ -152,7 +150,7 @@ const querify = async (
       // TODO: Consider just using postgresjs and passing in tables as ${sql([...])}
       await ala(
         code_,
-        sheet_ids.map((id) => docs[id]),
+        sheet_ids.map(id => docs[id]),
       );
     return {
       data: [
@@ -194,11 +192,9 @@ const createToken = async (
     "SHA-256",
     new TextEncoder().encode(`${epoch}:${email}:${TOKEN_SECRET}`),
   );
-  return `${epoch}:${
-    Array.from(new Uint8Array(hash))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("")
-  }`;
+  return `${epoch}:${Array.from(new Uint8Array(hash))
+    .map(b => b.toString(16).padStart(2, "0"))
+    .join("")}`;
 };
 
 const sendVerificationEmail = async (email: string) => {
@@ -209,7 +205,8 @@ const sendVerificationEmail = async (email: string) => {
       to: email,
       from: "hello@scrap.land",
       subject: "Verify your email",
-      text: `` +
+      text:
+        `` +
         `Welcome to scrap.land` +
         `\n\n` +
         `Please verify your email: ` +
@@ -217,7 +214,7 @@ const sendVerificationEmail = async (email: string) => {
         `?email=${encodeURIComponent(email)}` +
         `&token=${encodeURIComponent(token)}`,
     })
-    .catch((err) => {
+    .catch(err => {
       console.log(`/password?email=${email}&token=${token}`);
       console.error(
         `Could not send verification email to ${email}:`,
@@ -231,7 +228,7 @@ export const sql = pg(
     "postgresql://postgres@127.0.0.1:5434/postgres",
   {
     fetch_types: true,
-    onnotice: (msg) => msg.severity !== "DEBUG" && console.log(msg),
+    onnotice: msg => msg.severity !== "DEBUG" && console.log(msg),
   },
 );
 
@@ -252,8 +249,8 @@ const cselect = async ({
   limit: string;
   offset: string;
 }): Promise<Page> => {
-  const where_ = where.filter((x) => x).length
-    ? sql`where true ${where.filter((x) => x).map((x: any) => sql`and ${x}`)}`
+  const where_ = where.filter(x => x).length
+    ? sql`where true ${where.filter(x => x).map((x: any) => sql`and ${x}`)}`
     : sql``;
   const rows = await sql`${select} ${from} ${where_} ${
     order ?? sql``
@@ -273,10 +270,12 @@ const cselect = async ({
   };
 };
 
-const page = (c: Context) => ({ data, offset, count }: Page) => {
-  c.header("Content-Range", `${offset}-${offset + data.length - 1}/${count}`);
-  return c.json({ data }, 200);
-};
+const page =
+  (c: Context) =>
+  ({ data, offset, count }: Page) => {
+    c.header("Content-Range", `${offset}-${offset + data.length - 1}/${count}`);
+    return c.json({ data }, 200);
+  };
 
 // TODO: Add rate-limiting middleware everywhere.
 export const app = new Hono<{
@@ -285,8 +284,10 @@ export const app = new Hono<{
 
 app.use("*", logger());
 
-class HonoWebSocketAdapter extends AM.NetworkAdapter
-  implements AM.NetworkAdapterInterface {
+class HonoWebSocketAdapter
+  extends AM.NetworkAdapter
+  implements AM.NetworkAdapterInterface
+{
   private connections = new Map<AM.PeerId, any>();
   private _isReady = true;
   isReady(): boolean {
@@ -392,7 +393,7 @@ export const automerge = new Repo({
 
 app.get(
   "/library/sync",
-  upgradeWebSocket(async (c) => {
+  upgradeWebSocket(async c => {
     const { auth } = c.req.query();
     let usr_id: string | null = null;
     if (auth) {
@@ -467,7 +468,7 @@ app.get(
 // TODO:
 app.get(
   "/portal/time/sync",
-  upgradeWebSocket((c) => {
+  upgradeWebSocket(c => {
     const { auth } = c.req.query(); // TODO: Verify Bearer token on auth.
     let interval: any;
     return {
@@ -495,7 +496,7 @@ app.get(
 
 app.get(
   "/portal/stonks/sync",
-  upgradeWebSocket((c) => {
+  upgradeWebSocket(c => {
     const { auth } = c.req.query(); // TODO: Verify Bearer token on auth.
     const stonks: Record<string, number> = {
       AAPL: 645.32,
@@ -573,13 +574,13 @@ app.onError((err, c) => {
   return c.json({ error: "Sorry, something went wrong." }, 500);
 });
 
-app.post("/signup", async (c) => {
+app.post("/signup", async c => {
   const { email } = c.req.query();
   await sendVerificationEmail(email);
   return c.json(null, 200);
 });
 
-app.post("/signup/:token{.+}", async (c) => {
+app.post("/signup/:token{.+}", async c => {
   const token = c.req.param("token");
   const { email, password } = await c.req.json();
   if (!token || !email || !password) return c.json(null, 400);
@@ -590,18 +591,16 @@ app.post("/signup/:token{.+}", async (c) => {
     return c.json(null, 401);
   }
   await sql`
-    insert into usr ${
-    sql({
+    insert into usr ${sql({
       email,
       password: sql`crypt(${password}, gen_salt('bf', 8))` as unknown as string,
-    })
-  } 
+    })} 
     on conflict do update set password = excluded.password
   `;
   return c.json(null, 200);
 });
 
-app.post("/login", async (c) => {
+app.post("/login", async c => {
   const { email, password } = await c.req.json();
   const [usr] =
     await sql`select usr_id from usr where email = ${email} and crypt(${password}, password)`;
@@ -612,7 +611,7 @@ app.post("/login", async (c) => {
   );
 });
 
-app.get("/shop", async (c) => {
+app.get("/shop", async c => {
   const { limit, offset, ...qs } = c.req.query();
   return page(c)(
     await cselect({
@@ -621,8 +620,7 @@ app.get("/shop", async (c) => {
         { name: "price", type: "usd", key: "sell_price" },
         { name: "", type: "create", key: "row_0" },
       ],
-      select:
-        sql`select created_at, sell_id, sell_type, sell_price, name, row_0`,
+      select: sql`select created_at, sell_id, sell_type, sell_price, name, row_0`,
       from: sql`from sheet s`,
       where: [
         sql`sell_price >= 0`,
@@ -630,9 +628,9 @@ app.get("/shop", async (c) => {
         qs.name && sql`name ilike ${qs.name + "%"}`,
         qs.sell_type && sql`sell_type = ${qs.sell_type}`,
         qs.sell_price &&
-        sql`sell_price between ${qs.sell_type.split("-")[0]}::numeric and ${
-          qs.sell_type.split("-")[1]
-        }::numeric`,
+          sql`sell_price between ${qs.sell_type.split("-")[0]}::numeric and ${
+            qs.sell_type.split("-")[1]
+          }::numeric`,
       ],
       order: undefined,
       limit,
@@ -641,10 +639,11 @@ app.get("/shop", async (c) => {
   );
 });
 
-app.post("/net/:id", async (c) => {
-  await sql`insert into net ${
-    sql({ sheet_id: c.req.param("id"), body: await c.req.text() })
-  }`;
+app.post("/net/:id", async c => {
+  await sql`insert into net ${sql({
+    sheet_id: c.req.param("id"),
+    body: await c.req.text(),
+  })}`;
   return c.json(null, 200);
 });
 
@@ -655,11 +654,11 @@ app.use("*", async (c, next) => {
   await next();
 });
 
-app.post("/buy/:id", async (c) => {
-  const sheet_id = await sql.begin(async (sql) => {
-    const [sheet] = await sql`select * from sheet where sell_id = ${
-      c.req.param("id")
-    } and sell_price >= 0`;
+app.post("/buy/:id", async c => {
+  const sheet_id = await sql.begin(async sql => {
+    const [sheet] = await sql`select * from sheet where sell_id = ${c.req.param(
+      "id",
+    )} and sell_price >= 0`;
     if (!sheet) throw new HTTPException(404, { message: "Not found." });
     if (!sheet.sell_type) {
       throw new HTTPException(400, { message: "Not for sale." });
@@ -670,14 +669,14 @@ app.post("/buy/:id", async (c) => {
       : automerge.create({ data: row_0 }).documentId;
     const [{ sheet_id }] = await sql`
       with sell as (
-        select * from sheet where sell_id = ${
-      c.req.param("id")
-    } and sell_price >= 0
+        select * from sheet where sell_id = ${c.req.param(
+          "id",
+        )} and sell_price >= 0
       ), buy as (
         insert into sheet (created_by, type, doc_id, name, buy_id, buy_price, row_0) 
-        select ${
-      c.get("usr_id")
-    }, sell_type, ${doc_id}, name, sell_id, sell_price, ${row_0}
+        select ${c.get(
+          "usr_id",
+        )}, sell_type, ${doc_id}, name, sell_id, sell_price, ${row_0}
         from sell
         returning sheet_id, created_by
       ), buy_usr as (
@@ -692,7 +691,7 @@ app.post("/buy/:id", async (c) => {
   return c.json({ data: sheet_id }, 201);
 });
 
-app.post("/sell/:id", async (c) => {
+app.post("/sell/:id", async c => {
   const { price } = await c.req.json();
   if (price === undefined) {
     throw new HTTPException(400, { message: "Price required." });
@@ -706,13 +705,12 @@ app.post("/sell/:id", async (c) => {
   return c.json(null, 200);
 });
 
-app.get("/library", async (c) => {
+app.get("/library", async c => {
   const { limit, offset, ...qs } = c.req.query();
   return page(c)(
     await cselect({
       cols: null,
-      select:
-        sql`select s.created_at, s.type, s.doc_id, s.name, s.tags, s.sell_price`,
+      select: sql`select s.created_at, s.type, s.doc_id, s.name, s.tags, s.sell_price`,
       from: sql`
         from sheet_usr su 
         inner join sheet s using (sheet_id) 
@@ -731,12 +729,14 @@ app.get("/library", async (c) => {
 });
 
 // TODO: This is not correct.
-app.put("/library/:id", async (c) => {
+app.put("/library/:id", async c => {
   const [sheet] = await sql`
     update sheet 
-    set ${
-    sql({ name: null, tags: [], ...(await c.req.json()) }, "name", "tags")
-  } 
+    set ${sql(
+      { name: null, tags: [], ...(await c.req.json()) },
+      "name",
+      "tags",
+    )} 
     where true
     and sheet_id = ${c.req.param("id")}
     and created_by = ${c.get("usr_id")}
@@ -752,13 +752,19 @@ app.put("/library/:id", async (c) => {
       doc_id,
       row_0: await automerge
         .find<{ data: Table }>(doc_id as AnyDocumentId)
-        .then((hand) => hand.doc().data[0] ?? {}),
+        .then(hand => hand.doc().data[0] ?? {}),
       created_by: c.get("usr_id"),
     };
     await sql`
-      with s as (insert into sheet ${
-      sql(sheet, "type", "doc_id", "name", "tags", "created_by", "row_0")
-    } on conflict (sheet_id) do nothing returning *)
+      with s as (insert into sheet ${sql(
+        sheet,
+        "type",
+        "doc_id",
+        "name",
+        "tags",
+        "created_by",
+        "row_0",
+      )} on conflict (sheet_id) do nothing returning *)
       insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s
     `;
   }
@@ -766,15 +772,15 @@ app.put("/library/:id", async (c) => {
 });
 
 // TODO: This currently takes sheet_id, but we want it to take doc_id.
-app.get("/net/:id", async (c) => {
+app.get("/net/:id", async c => {
   return page(c)(await sheet(c, c.req.param("id"), c.req.query()));
 });
 
-app.post("/query", async (c) => {
+app.post("/query", async c => {
   return page(c)(await querify(c, await c.req.json(), c.req.query()));
 });
 
-app.get("/codex/:id", async (c) => {
+app.get("/codex/:id", async c => {
   const sheet_id = c.req.param("id");
   const [type, doc_id] = sheet_id.split(":");
   switch (type) {
@@ -787,7 +793,7 @@ app.get("/codex/:id", async (c) => {
       }
       // TODO: Be really careful about arbitrary DB access! Don't let them access our DB haha
       const sql_ = pg(db.dsn, {
-        onnotice: (msg) => msg.severity !== "DEBUG" && console.log(msg),
+        onnotice: msg => msg.severity !== "DEBUG" && console.log(msg),
       });
       const rows = await sql_`
         select 
@@ -857,30 +863,30 @@ app.get("/codex/:id", async (c) => {
   }
 });
 
-app.post("/codex-db/:id", async (c) => {
+app.post("/codex-db/:id", async c => {
   const sheet_id = `codex-db:${c.req.param("id")}`;
   await sql`
     insert into db (sheet_id, dsn) 
     select ${sheet_id}, ${await c.req.json()}
-    where exists (select true from sheet_usr su where (su.sheet_id,su.usr_id) = (${sheet_id},${
-    c.get("usr_id")
-  }))
+    where exists (select true from sheet_usr su where (su.sheet_id,su.usr_id) = (${sheet_id},${c.get(
+      "usr_id",
+    )}))
     on conflict (sheet_id) do update set dsn = excluded.dsn
   `;
   return c.json(null, 200);
 });
 
-app.get("/codex/:id/connect", async (c) => {
+app.get("/codex/:id/connect", async c => {
   // TODO:
   return c.json(null, 500);
 });
 
-app.get("/codex/:id/callback", async (c) => {
+app.get("/codex/:id/callback", async c => {
   // TODO:
   return c.json(null, 500);
 });
 
-app.get("/portal/:id", async (c) => {
+app.get("/portal/:id", async c => {
   const [sheet_] = await sql`
     select s_.*
     from sheet_usr su
@@ -894,12 +900,12 @@ app.get("/portal/:id", async (c) => {
   return page(c)(await sheet(c, sheet_.sheet_id, c.req.query()));
 });
 
-app.get("/stats/:id", async (c) => {
+app.get("/stats/:id", async c => {
   // TODO: Get column/table stats about any sheet as a table.
   return c.json(null, 500);
 });
 
-app.all("/mcp/:id", async (c) => {
+app.all("/mcp/:id", async c => {
   // TODO: mcp server
   return c.json(null, 500);
 });

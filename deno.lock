@@ -1526,6 +1526,9 @@
       "integrity": "sha512-rVksvsnNCdJ/ohGc6xgPwyN8eheCxsiLM8mxuE/t/mOVqJewPuO1miLpTHQiRgTKCLexL4MeAFVagts7HmNZ2Q=="
     }
   },
+  "redirects": {
+    "https://esm.sh/@types/react@~18.3.18/index.d.ts": "https://esm.sh/@types/react@18.3.23/index.d.ts"
+  },
   "remote": {
     "https://deno.land/std@0.132.0/_deno_unstable.ts": "23a1a36928f1b6d3b0170aaa67de09af12aa998525f608ff7331b9fb364cbde6",
     "https://deno.land/std@0.132.0/_util/assert.ts": "e94f2eb37cebd7f199952e242c77654e43333c1ac4c5c700e929ea3aa5489f74",
@@ -1805,7 +1808,12 @@
     "https://deno.land/x/postgresjs@v3.4.5/src/queue.js": "15e6345adb6708bf3b99ad39fc2231c2fb61de5f6cba4b7a7a6be881482a4ec3",
     "https://deno.land/x/postgresjs@v3.4.5/src/result.js": "001ff5e0c8d634674f483d07fbcd620a797e3101f842d6c20ca3ace936260465",
     "https://deno.land/x/postgresjs@v3.4.5/src/subscribe.js": "9e4d0c3e573a6048e77ee2f15abbd5bcd17da9ca85a78c914553472c6d6c169b",
-    "https://deno.land/x/postgresjs@v3.4.5/src/types.js": "471f4a6c35412aa202a7c177c0a7e5a7c3bd225f01bbde67c947894c1b8bf6ed"
+    "https://deno.land/x/postgresjs@v3.4.5/src/types.js": "471f4a6c35412aa202a7c177c0a7e5a7c3bd225f01bbde67c947894c1b8bf6ed",
+    "https://esm.sh/@automerge/react@2.1.0/es2022/slim.bundle.mjs": "b81f0c4b015af62c972c9139423b60d06f17578bffc3ff2a921a331bc45e87b9",
+    "https://esm.sh/node/buffer.mjs": "43d7ffab85c67adc0575a7d7c463e84a61ee8efc455d95665c8eb8d4a31e17cd",
+    "https://esm.sh/node/process.mjs": "2c8eeaf6090c03d21bdcec5eddb33b105208c9ba3ef2c7be98f4d9b2495a624e",
+    "https://esm.sh/react@18.3.1/es2022/react.mjs": "fec8d5ab4ffa55c8b563abc31060c3dc0205699aff20beec4aba0311efdcc1a0",
+    "https://esm.sh/react@^18.0.0?target=es2022": "fe14009a42dc84ce0d41fc48a09fcd216dd5b420ee812a3776fcdc1a2b7b83cd"
   },
   "workspace": {
     "dependencies": [
