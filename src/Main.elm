@@ -1437,7 +1437,7 @@ view ({ sheet } as model) =
                                                                             , S.whiteSpaceNowrap
                                                                             , S.opacity "0.5"
                                                                             ]
-                                                                            [ text (iif (n == 0) "+" "") ]
+                                                                            [ text (iif (n == 0) "→" "") ]
 
                                                                     _ ->
                                                                         text ""
@@ -1478,7 +1478,8 @@ view ({ sheet } as model) =
                                                                 , S.whiteSpaceNowrap
                                                                 , S.opacity "0.5"
                                                                 ]
-                                                                []
+                                                                [ text "↴"
+                                                                ]
                                                             ]
 
                                                         _ ->
