@@ -1468,8 +1468,22 @@ view ({ sheet } as model) =
 
                                         Ok (Tab _) ->
                                             [ H.tr [ A.onClick (DocMsg (SheetRowPush (Array.length rows))) ] <|
-                                                List.indexedMap (\i col -> H.td [ S.opacity "0.25" ] [ text (typeName col.typ) ]) <|
-                                                    Array.toList cols
+                                                List.concat
+                                                    [ List.indexedMap (\i col -> H.td [ S.opacity "0.25" ] [ text (typeName col.typ) ]) <|
+                                                        Array.toList cols
+                                                    , case sheet.doc of
+                                                        Ok (Tab _) ->
+                                                            [ H.th
+                                                                [ S.widthRem 0.001
+                                                                , S.whiteSpaceNowrap
+                                                                , S.opacity "0.5"
+                                                                ]
+                                                                []
+                                                            ]
+
+                                                        _ ->
+                                                            []
+                                                    ]
                                             ]
 
                                         _ ->
