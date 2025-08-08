@@ -1247,7 +1247,7 @@ view ({ sheet } as model) =
                                                                             S.textAlignRight
 
                                                                         SheetId ->
-                                                                            S.textAlignLeft
+                                                                            S.textAlignCenter
 
                                                                         Boolean ->
                                                                             S.textAlignCenter
@@ -1358,10 +1358,10 @@ view ({ sheet } as model) =
                                                                                                 D.map text string
 
                                                                                             SheetId ->
-                                                                                                D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.overflowVisible, S.fontStyleItalic, S.whiteSpaceNowrap, S.paddingRightRem 0.5 ] [ text "view" ])
+                                                                                                D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.overflowVisible, S.whiteSpaceNowrap, S.paddingRightRem 0.5 ] [ text "view" ])
 
                                                                                             Link ->
-                                                                                                D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.displayBlock, S.wordBreakKeepAll, S.hyphensNone, S.maxWidthRem 18, S.fontStyleItalic ] [ text "link" ])
+                                                                                                D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.wordBreakKeepAll, S.hyphensNone ] [ text "link" ])
 
                                                                                             Image ->
                                                                                                 D.string |> D.map (\src -> H.img [ A.src src ] [])
@@ -1455,8 +1455,8 @@ view ({ sheet } as model) =
                                             List.map
                                                 (\( label, msg ) ->
                                                     H.tr [ A.onClick msg ] <|
-                                                        (::) (H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text label ]) <|
-                                                            List.map (\typ -> H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text typ ])
+                                                        (::) (H.td [ S.opacity "0.25" ] [ text label ]) <|
+                                                            List.map (\typ -> H.td [ S.opacity "0.25" ] [ text typ ])
                                                                 [ "text"
                                                                 , "list text"
                                                                 , ""
@@ -1468,7 +1468,7 @@ view ({ sheet } as model) =
 
                                         Ok (Tab _) ->
                                             [ H.tr [ A.onClick (DocMsg (SheetRowPush (Array.length rows))) ] <|
-                                                List.indexedMap (\i col -> H.td [ S.fontStyleItalic, S.opacity "0.25" ] [ text (typeName col.typ) ]) <|
+                                                List.indexedMap (\i col -> H.td [ S.opacity "0.25" ] [ text (typeName col.typ) ]) <|
                                                     Array.toList cols
                                             ]
 
