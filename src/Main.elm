@@ -1122,8 +1122,9 @@ view ({ sheet } as model) =
                             ]
                             [ H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ]
                             ]
-                        , [ H.a [ A.href "#", S.marginLeftAuto ] [ text "help" ]
-                          ]
+
+                        -- , [ H.a [ A.href "#", S.marginLeftAuto, S.backgroundColor "#e0e0e0", S.padding "2px 4px" ] [ text "help" ]
+                        --   ]
                         ]
                 , H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0, S.borderBottom "1px solid #aaa" ]
                     -- All current filters should be rendered as text in the searchbar.
