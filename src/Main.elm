@@ -203,6 +203,7 @@ type alias SheetInfo =
     { name : String
     , tags : List String
     , scratch : Bool
+    , system : Bool
     , thumb : Svg
     , peers : Peers
     }
@@ -699,10 +700,11 @@ update msg ({ sheet } as model) =
                     data
                         |> D.decodeValue
                             (D.dict
-                                (D.map5 SheetInfo
+                                (D.map6 SheetInfo
                                     (D.oneOf [ D.field "name" D.string, D.succeed "" ])
                                     (D.oneOf [ D.field "tags" (D.list D.string), D.succeed [] ])
                                     (D.oneOf [ D.field "scratch" D.bool, D.succeed False ])
+                                    (D.oneOf [ D.field "system" D.bool, D.succeed False ])
                                     (D.succeed ())
                                     (D.succeed Public)
                                 )
@@ -974,7 +976,7 @@ view ({ sheet } as model) =
         info =
             model.library
                 |> Dict.get sheet.id
-                |> Maybe.withDefault { name = "", tags = [], scratch = False, thumb = (), peers = Public }
+                |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = (), peers = Public }
 
         computeNumericStats : Array Row -> String -> Stat
         computeNumericStats rows key =
@@ -1060,7 +1062,7 @@ view ({ sheet } as model) =
                             model.library
                                 |> Dict.filter (\k v -> k /= "" && not v.scratch && List.any (String.contains model.search) (k :: v.name :: v.tags))
                                 |> Dict.toList
-                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "type", E.string (Maybe.withDefault "" <| List.head <| String.split ":" k) ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "delete", E.string k ) ])
+                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "type", E.string (Maybe.withDefault "" <| List.head <| String.split ":" k) ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "delete", iif v.system E.null (E.string k) ) ])
                                 |> Array.fromList
                         }
 

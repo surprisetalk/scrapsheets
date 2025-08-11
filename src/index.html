@@ -85,13 +85,19 @@
               ...JSON.parse(
                 localStorage.getItem("scrapsheets-library") ?? "{}",
               ),
-              "": { name: "library", doc: { type: "library" } },
+              "": {
+                name: "library",
+                system: true,
+                doc: { type: "library" },
+              },
               shop: {
                 name: "shop",
+                system: true,
                 doc: { type: "shop" },
               },
               "portal:time": {
                 name: "time demo",
+                system: true,
                 doc: {
                   type: "portal",
                   data: null,
@@ -99,6 +105,7 @@
               },
               "portal:stonks": {
                 name: "stonks demo",
+                system: true,
                 doc: {
                   type: "portal",
                   data: null,
@@ -107,6 +114,7 @@
               "table:tutorial": {
                 name: "tutorial",
                 scratch: true,
+                system: true,
                 doc: Table(
                   ["text::text", "examples::text"].map(Col),
                   ["chapter 1", []],
