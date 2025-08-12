@@ -1446,6 +1446,7 @@ view ({ sheet } as model) =
                                                             )
                                                             (Array.toList cols)
                                                             ++ [ case sheet.doc of
+                                                                    -- TODO: on rightmost column, add a tiny column for mobile "select entire row" which can be used for reordering and deletion too. the library sheet should have this column too. double click to expand row into its own detail table
                                                                     Ok (Tab _) ->
                                                                         H.th
                                                                             [ A.onClick (DocMsg SheetColumnPush)
@@ -1530,8 +1531,9 @@ view ({ sheet } as model) =
                                 [ text (String.trim query.code)
                                 ]
 
-                            -- TODO:
+                            -- -- TODO: Implement query submit button and language selector.
                             -- , H.div [ S.displayFlex, S.alignItemsCenter, S.gapRem 1, S.positionAbsolute, S.bottomRem 1.5, S.rightRem 1.5 ]
+                            --     -- TODO: Add "visual" and "chart" options.
                             --     [ H.select []
                             --         [ H.option [] [ text "sql" ]
                             --         ]
