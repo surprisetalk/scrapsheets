@@ -1103,7 +1103,15 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text "@media (min-width: 768px) { body > div { grid-template-columns: 1fr auto; } #aside { border-left: 1px solid #aaa; } }" ]
         , H.node "style" [] [ text "@media (max-width: 768px) { body > div { grid-template-rows: 1fr auto; } #aside { border-top: 1px solid #aaa; } }" ]
         , H.node "style" [] [ text "@media (max-width: 768px) { #title { display: none; } }" ]
+        , H.node "style" [] [ text "#account > * { padding: 0.25rem 0.5rem; border: 1px solid #aaa; border-radius: 2px; font-size: 0.875rem; }" ]
 
+        -- -- TODO: This should probably be part of the main grid.
+        -- -- TODO: Actually, move this to the aside of the library.
+        -- , H.form [ A.id "account", S.displayGrid, S.gapRem 0.5, S.maxWidth "100vw", S.width "100%", S.gridTemplateColumns "1fr 1fr auto", S.paddingRem 0.5, S.borderTop "1px solid #aaa", S.backgroundColor "#ccc", S.positionAbsolute, S.bottomPx 0, S.zIndex "10" ]
+        --     [ H.input [ S.minWidthRem 2, A.placeholder "email", A.type_ "email", A.name "email" ] []
+        --     , H.input [ S.minWidthRem 2, A.placeholder "password", A.type_ "password", A.name "password" ] []
+        --     , H.button [ A.type_ "submit", S.background "#eee" ] [ text "signup/login" ]
+        --     ]
         -- , H.node "style" [] [ text "thead tr td { position: sticky; top: 0; }" ]
         -- , H.node "style" [] [ text "tfoot tr:last-child td { position: sticky; bottom: 0; }" ]
         , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
@@ -1131,7 +1139,7 @@ view ({ sheet } as model) =
                     -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                     -- TODO: If no results found, show saved searches and recent searches.
                     [ H.div [ S.displayFlex, S.width "100%", S.height "100%" ]
-                        [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder "search", S.width "100%", S.border "none", S.backgroundColor "#fff", S.padding "0.25rem 0.5rem" ] []
+                        [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder "search", S.width "100%", S.border "none", S.backgroundColor "#fff", S.padding "0.25rem 0.5rem", S.fontSizeRem 0.875 ] []
                         ]
                     ]
 
