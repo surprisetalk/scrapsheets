@@ -1100,15 +1100,15 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text ".r0::after { content: \"\"; display: block; position: absolute; width: 100%; left: 0; bottom: -1px; border-bottom: 1px solid #aaa; }" ]
         , H.node "style" [] [ text ".selected { background: rgba(0,0,0,0.05); }" ]
         , H.node "style" [] [ text "#code { font-family: monospace; background: #fff; }" ]
-        , H.node "style" [] [ text "@media (min-width: 768px) { body > div { grid-template-columns: 1fr auto; } #aside { border-left: 1px solid #000; } }" ]
-        , H.node "style" [] [ text "@media (max-width: 768px) { body > div { grid-template-rows: 1fr auto; } #aside { border-top: 1px solid #000; } }" ]
+        , H.node "style" [] [ text "@media (min-width: 768px) { body > div { grid-template-columns: 1fr auto; } #aside { border-left: 1px solid #aaa; } }" ]
+        , H.node "style" [] [ text "@media (max-width: 768px) { body > div { grid-template-rows: 1fr auto; } #aside { border-top: 1px solid #aaa; } }" ]
         , H.node "style" [] [ text "@media (max-width: 768px) { #title { display: none; } }" ]
 
         -- , H.node "style" [] [ text "thead tr td { position: sticky; top: 0; }" ]
         -- , H.node "style" [] [ text "tfoot tr:last-child td { position: sticky; bottom: 0; }" ]
         , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
-                [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsCenter, S.whiteSpaceNowrap, S.gapRem 0.5, S.paddingRem 0.5, S.borderBottom "1px solid #000", S.background "#f0f0f0" ] <|
+                [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsCenter, S.whiteSpaceNowrap, S.gapRem 0.5, S.paddingRem 0.5, S.borderBottom "1px solid #aaa", S.background "#f0f0f0" ] <|
                     List.concat
                         [ [ H.a [ A.href "/", S.fontWeight "900", S.fontSizeRem 1.5, S.heightRem 1, S.lineHeight "0.55" ] [ text "⊞" ]
                           , H.a [ A.href "/", S.fontWeight "900", A.id "title", S.marginLeftRem -0.25 ] [ text "scrapsheets" ]
@@ -1126,7 +1126,7 @@ view ({ sheet } as model) =
                         -- , [ H.a [ A.href "#", S.marginLeftAuto, S.backgroundColor "#e0e0e0", S.padding "2px 4px" ] [ text "help" ]
                         --   ]
                         ]
-                , H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0, S.borderBottom "1px solid #aaa" ]
+                , H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0, S.borderBottom "1px solid #aaa", S.zIndex "2", S.marginBottomPx -1 ]
                     -- All current filters should be rendered as text in the searchbar.
                     -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
                     -- TODO: If no results found, show saved searches and recent searches.
