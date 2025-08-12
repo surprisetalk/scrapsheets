@@ -1525,8 +1525,18 @@ view ({ sheet } as model) =
                         []
 
                     Ok (Query query) ->
-                        [ H.textarea [ A.id "code", A.onInput (InputChange QueryCode), S.minHeightRem 10, S.height "100%", S.whiteSpacePre, S.overflowAuto, S.fontSizeRem 0.75, S.minWidth "25vw", S.width "100%", S.border "none", S.backgroundColor "transparent", S.paddingRem 1, S.lineHeightRem 1.5 ]
-                            [ text (String.trim query.code)
+                        [ H.div [ S.minHeightRem 10, S.height "100%", S.width "100%", S.minWidth "25vw", S.displayFlex, S.positionRelative, S.overflowAuto ]
+                            [ H.textarea [ A.id "code", A.onInput (InputChange QueryCode), S.height "100%", S.width "100%", S.whiteSpacePre, S.fontSizeRem 0.75, S.border "none", S.backgroundColor "transparent", S.paddingRem 1, S.lineHeightRem 1.5 ]
+                                [ text (String.trim query.code)
+                                ]
+
+                            -- TODO:
+                            -- , H.div [ S.displayFlex, S.alignItemsCenter, S.gapRem 1, S.positionAbsolute, S.bottomRem 1.5, S.rightRem 1.5 ]
+                            --     [ H.select []
+                            --         [ H.option [] [ text "sql" ]
+                            --         ]
+                            --     , H.button [ S.backgroundColor "#f0f0f0", S.padding "0.25rem 0.5rem", S.border "1px solid #aaa" ] [ text "submit" ]
+                            --     ]
                             ]
                         ]
 
