@@ -1131,9 +1131,12 @@ view ({ sheet } as model) =
                             [ H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ]
                             ]
 
+                        -- TODO: This is where we'll put actions and keyboard shortcut hints.
                         -- , [ H.a [ A.href "#", S.marginLeftAuto, S.backgroundColor "#e0e0e0", S.padding "2px 4px" ] [ text "help" ]
                         --   ]
                         ]
+
+                -- TODO: Put recent/saved searches on right.
                 , H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0, S.borderBottom "1px solid #aaa", S.zIndex "2", S.marginBottomPx -1 ]
                     -- All current filters should be rendered as text in the searchbar.
                     -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
