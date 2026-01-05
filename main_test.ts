@@ -4,6 +4,8 @@ import { PostgresConnection } from "npm:pg-gateway";
 import { citext } from "npm:@electric-sql/pglite/contrib/citext";
 import { app, arrayify, automerge, createJwt, sql } from "./main.ts";
 import type { Sheet, Table, Template } from "./main.ts";
+import dbSql from "./db.sql" with { type: "text" };
+import examplesSql from "./examples.sql" with { type: "text" };
 
 const request = async (jwt: string, route: string, options?: object) => {
   const res = await app.request(route, {
@@ -80,8 +82,8 @@ Deno.test(async function allTests(t) {
   })();
 
   await pglite.waitReady;
-  await pglite.exec(await Deno.readTextFile("./db.sql"));
-  await pglite.exec(await Deno.readTextFile("./examples.sql"));
+  await pglite.exec(dbSql);
+  await pglite.exec(examplesSql);
 
   {
     const { jwt } = await usr("alice@example.com");
