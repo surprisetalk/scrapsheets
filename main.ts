@@ -13,6 +13,7 @@ import type { AnyDocumentId } from "npm:@automerge/automerge-repo";
 // import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-websocket";
 import { NodeFSStorageAdapter } from "npm:@automerge/automerge-repo-storage-nodefs";
 import ala from "npm:alasql";
+import * as path from "https://deno.land/std@0.188.0/path/mod.ts";
 
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
 const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
@@ -253,9 +254,7 @@ const cselect = async ({
   const where_ = where.filter((x) => x).length
     ? sql`where true ${where.filter((x) => x).map((x: any) => sql`and ${x}`)}`
     : sql``;
-  const rows = await sql`${select} ${from} ${where_} ${
-    order ?? sql``
-  } limit ${limit} offset ${offset}`;
+  const rows = await sql`${select} ${from} ${where_} ${order ?? sql``} limit ${limit} offset ${offset}`;
   const cols_: Row<Col> = arrayify(
     rows.columns.map((col, i) => ({
       name: col.name,
@@ -283,8 +282,7 @@ export const app = new Hono<{
 
 app.use("*", logger());
 
-class HonoWebSocketAdapter extends AM.NetworkAdapter
-  implements AM.NetworkAdapterInterface {
+class HonoWebSocketAdapter extends AM.NetworkAdapter implements AM.NetworkAdapterInterface {
   private connections = new Map<AM.PeerId, any>();
   private _isReady = true;
   isReady(): boolean {
@@ -383,7 +381,7 @@ const honoAdapter = new HonoWebSocketAdapter();
 
 export const automerge = new Repo({
   network: [honoAdapter],
-  storage: new NodeFSStorageAdapter("./data/automerge"),
+  storage: new NodeFSStorageAdapter(`${path.dirname(path.fromFileUrl(Deno.mainModule))}/data/automerge`),
   peerId: `server-${Deno.hostname()}` as AM.PeerId,
   sharePolicy: () => Promise.resolve(true), // TODO:
 });
@@ -404,9 +402,7 @@ app.get(
     }
 
     const peerId = (
-      usr_id
-        ? `user-${usr_id}`
-        : `anonymous-${Math.random().toString(36).substr(2, 9)}`
+      usr_id ? `user-${usr_id}` : `anonymous-${Math.random().toString(36).substr(2, 9)}`
     ) as AM.PeerId;
 
     return {
@@ -584,9 +580,8 @@ app.post("/signup/:token{.+}", async (c) => {
   const [ts, _hash] = token.split(":");
   const epoch = parseInt(ts);
   if (Date.now() / 1000 - epoch > 86400) return c.json(null, 401);
-  if (token !== (await createToken(email, new Date(epoch * 1000)))) {
+  if (token !== (await createToken(email, new Date(epoch * 1000))))
     return c.json(null, 401);
-  }
   await sql`
     insert into usr ${
     sql({
@@ -601,8 +596,7 @@ app.post("/signup/:token{.+}", async (c) => {
 
 app.post("/login", async (c) => {
   const { email, password } = await c.req.json();
-  const [usr] =
-    await sql`select usr_id from usr where email = ${email} and crypt(${password}, password)`;
+  const [usr] = await sql`select usr_id from usr where email = ${email} and crypt(${password}, password)`;
   if (!usr) return c.json(null, 401);
   return c.json(
     { data: { usr_id: usr.usr_id, jwt: await createJwt(usr.usr_id) } },
@@ -619,8 +613,7 @@ app.get("/shop", async (c) => {
         { name: "price", type: "usd", key: "sell_price" },
         { name: "", type: "create", key: "row_0" },
       ],
-      select:
-        sql`select created_at, sell_id, sell_type, sell_price, name, row_0`,
+      select: sql`select created_at, sell_id, sell_type, sell_price, name, row_0`,
       from: sql`from sheet s`,
       where: [
         sql`sell_price >= 0`,
@@ -628,9 +621,7 @@ app.get("/shop", async (c) => {
         qs.name && sql`name ilike ${qs.name + "%"}`,
         qs.sell_type && sql`sell_type = ${qs.sell_type}`,
         qs.sell_price &&
-        sql`sell_price between ${qs.sell_type.split("-")[0]}::numeric and ${
-          qs.sell_type.split("-")[1]
-        }::numeric`,
+        sql`sell_price between ${qs.sell_type.split("-")[0]}::numeric and ${qs.sell_type.split("-")[1]}::numeric`,
       ],
       order: sql`order by name`,
       limit,
@@ -664,9 +655,8 @@ app.post("/buy/:id", async (c) => {
       )
     } and sell_price >= 0`;
     if (!sheet) throw new HTTPException(404, { message: "Not found." });
-    if (!sheet.sell_type) {
+    if (!sheet.sell_type)
       throw new HTTPException(400, { message: "Not for sale." });
-    }
     const row_0 = sheet.type === "template" ? sheet.row_0.data : {};
     const doc_id = sheet.sell_type.startsWith("codex-")
       ? Math.random().toString().slice(2)
@@ -701,9 +691,8 @@ app.post("/buy/:id", async (c) => {
 
 app.post("/sell/:id", async (c) => {
   const { price } = await c.req.json();
-  if (price === undefined) {
+  if (price === undefined)
     throw new HTTPException(400, { message: "Price required." });
-  }
   await sql`
     update sheet set sell_price = ${price} 
     where true
@@ -718,8 +707,7 @@ app.get("/library", async (c) => {
   return page(c)(
     await cselect({
       cols: null,
-      select:
-        sql`select s.created_at, s.type, s.doc_id, s.name, s.tags, s.sell_price`,
+      select: sql`select s.created_at, s.type, s.doc_id, s.name, s.tags, s.sell_price`,
       from: sql`
         from sheet_usr su 
         inner join sheet s using (sheet_id) 
