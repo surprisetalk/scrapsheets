@@ -64,7 +64,7 @@ const usr = async (email: string) => {
 };
 
 Deno.test(async function allTests(t) {
-  const listener = Deno.listen({ port: 5434 });
+  const listener = Deno.listen({ hostname: "127.0.0.1", port: 5434 });
   const pglite = new PGlite({ extensions: { citext } });
 
   (async () => {
