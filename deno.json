@@ -7,6 +7,15 @@
     "useBraces": "preferNone",
     "singleBodyPosition": "maintain"
   },
+  "test": {
+    "permissions": {
+      "env": true,
+      "read": true,
+      "write": true,
+      "net": false,
+      "sys": true
+    }
+  },
   "imports": {
     "@automerge/automerge-repo": "npm:@automerge/automerge-repo@^2.0.5",
     "@automerge/automerge-repo-network-websocket": "npm:@automerge/automerge-repo-network-websocket@^2.0.5",
