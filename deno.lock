@@ -18,6 +18,7 @@
     "npm:alasql@*": "4.6.6",
     "npm:alasql@^4.6.6": "4.6.6",
     "npm:elm-format@~0.8.8": "0.8.8",
+    "npm:elm-review@*": "2.13.2",
     "npm:elm-review@^2.13.2": "2.13.2",
     "npm:elm-test@~0.19.1-revision15": "0.19.1-revision15",
     "npm:elm@*": "0.19.1-6",

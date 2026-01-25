@@ -1,7 +1,7 @@
-import { assert, assertEquals } from "jsr:@std/assert";
-import { PGlite } from "npm:@electric-sql/pglite";
-import { PostgresConnection } from "npm:pg-gateway";
-import { citext } from "npm:@electric-sql/pglite/contrib/citext";
+import { assert, assertEquals } from "@std/assert";
+import { PGlite } from "@electric-sql/pglite";
+import { PostgresConnection } from "pg-gateway";
+import { citext } from "@electric-sql/pglite/contrib/citext";
 import { app, arrayify, automerge, createJwt, sql } from "./main.ts";
 import type { Sheet, Table, Template } from "./main.ts";
 import dbSql from "./db.sql" with { type: "text" };
@@ -22,7 +22,7 @@ const request = async (jwt: string, route: string, options?: object) => {
   return await res.json();
 };
 
-const reject = async (jwt: string, route: string, options?: object) => {
+const _reject = async (jwt: string, route: string, options?: object) => {
   const res = await app.request(route, {
     headers: new Headers({
       "Content-Type": "application/json",
@@ -63,7 +63,7 @@ const usr = async (email: string) => {
   return { usr_id, jwt: await createJwt(usr_id) };
 };
 
-Deno.test(async function allTests(t) {
+Deno.test(async function allTests(_t) {
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 5434 });
   const pglite = new PGlite({ extensions: { citext } });
 

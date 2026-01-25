@@ -1,19 +1,19 @@
-import { HTTPException } from "jsr:@hono/hono/http-exception";
-import { Context, Hono } from "jsr:@hono/hono";
-import { logger } from "jsr:@hono/hono/logger";
-import { cors } from "jsr:@hono/hono/cors";
-import { jwt, sign, verify } from "jsr:@hono/hono/jwt";
-import type { JwtVariables } from "jsr:@hono/hono/jwt";
-import sg from "npm:@sendgrid/mail";
-import pg from "https://deno.land/x/postgresjs@v3.4.5/mod.js";
-import { upgradeWebSocket } from "jsr:@hono/hono/deno";
-import { Repo } from "npm:@automerge/automerge-repo";
-import * as AM from "npm:@automerge/automerge-repo";
-import type { AnyDocumentId } from "npm:@automerge/automerge-repo";
-// import { NodeWSServerAdapter } from "npm:@automerge/automerge-repo-network-websocket";
-import { NodeFSStorageAdapter } from "npm:@automerge/automerge-repo-storage-nodefs";
-import ala from "npm:alasql";
-import * as path from "https://deno.land/std@0.188.0/path/mod.ts";
+import { HTTPException } from "@hono/hono/http-exception";
+import { Context, Hono } from "@hono/hono";
+import { logger } from "@hono/hono/logger";
+import { cors } from "@hono/hono/cors";
+import { jwt, sign, verify } from "@hono/hono/jwt";
+import type { JwtVariables } from "@hono/hono/jwt";
+import sg from "@sendgrid/mail";
+import pg from "postgresjs";
+import { upgradeWebSocket } from "@hono/hono/deno";
+import { Repo } from "@automerge/automerge-repo";
+import * as AM from "@automerge/automerge-repo";
+import type { AnyDocumentId } from "@automerge/automerge-repo";
+// import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket";
+import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
+import ala from "alasql";
+import * as path from "@std/path";
 
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
 const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
@@ -234,6 +234,9 @@ export const sql = pg(
   },
 );
 
+// deno-lint-ignore no-explicit-any
+type SqlFragment = any;
+
 const cselect = async ({
   cols,
   select,
@@ -244,19 +247,19 @@ const cselect = async ({
   offset = "0",
 }: {
   cols: Col[] | null;
-  select: any;
-  from: any;
-  where: any[];
-  order?: any;
+  select: SqlFragment;
+  from: SqlFragment;
+  where: SqlFragment[];
+  order?: SqlFragment;
   limit: string;
   offset: string;
 }): Promise<Page> => {
   const where_ = where.filter((x) => x).length
-    ? sql`where true ${where.filter((x) => x).map((x: any) => sql`and ${x}`)}`
+    ? sql`where true ${where.filter((x) => x).map((x: SqlFragment) => sql`and ${x}`)}`
     : sql``;
   const rows = await sql`${select} ${from} ${where_} ${order ?? sql``} limit ${limit} offset ${offset}`;
   const cols_: Row<Col> = arrayify(
-    rows.columns.map((col, i) => ({
+    rows.columns.map((col, _i) => ({
       name: col.name,
       type: "text", // TODO: col.type
       key: col.name,
@@ -282,8 +285,11 @@ export const app = new Hono<{
 
 app.use("*", logger());
 
+// deno-lint-ignore no-explicit-any
+type WebSocketLike = any;
+
 class HonoWebSocketAdapter extends AM.NetworkAdapter implements AM.NetworkAdapterInterface {
-  private connections = new Map<AM.PeerId, any>();
+  private connections = new Map<AM.PeerId, WebSocketLike>();
   private _isReady = true;
   isReady(): boolean {
     return this._isReady;
@@ -335,7 +341,7 @@ class HonoWebSocketAdapter extends AM.NetworkAdapter implements AM.NetworkAdapte
       );
     }
   }
-  addConnection(peerId: AM.PeerId, ws: any): void {
+  addConnection(peerId: AM.PeerId, ws: WebSocketLike): void {
     console.log(`Adding connection for peer: ${peerId}`);
     this.connections.set(peerId, ws);
     console.log(`Total connections: ${this.connections.size}`);
@@ -363,10 +369,8 @@ class HonoWebSocketAdapter extends AM.NetworkAdapter implements AM.NetworkAdapte
       // Automerge expects raw binary data, not parsed JSON
       // The message format is handled internally by automerge
       console.log(`Emitting raw binary message for automerge processing`);
-      this.emit("message", {
-        data,
-        senderId: peerId,
-      } as any);
+      // deno-lint-ignore no-explicit-any
+      this.emit("message", { data, senderId: peerId } as any);
     } catch (error) {
       console.error(
         `Failed to handle automerge message from ${peerId}:`,
@@ -406,12 +410,12 @@ app.get(
     ) as AM.PeerId;
 
     return {
-      onOpen(event, ws) {
+      onOpen(_event, ws) {
         console.log(`WebSocket connected: ${peerId}`);
         console.log(`Auth status: ${usr_id ? "authenticated" : "anonymous"}`);
         honoAdapter.addConnection(peerId, ws);
       },
-      onMessage(event, ws) {
+      onMessage(event, _ws) {
         console.log(`WebSocket message received from ${peerId}`, {
           dataType: typeof event.data,
           dataLength: (() => {
@@ -446,11 +450,11 @@ app.get(
 
         honoAdapter.handleMessage(peerId, messageData);
       },
-      onClose(event, ws) {
+      onClose(_event, _ws) {
         console.log(`WebSocket disconnected: ${peerId}`);
         honoAdapter.removeConnection(peerId);
       },
-      onError(event, ws) {
+      onError(event, _ws) {
         console.error(`WebSocket error for ${peerId}:`, event);
         honoAdapter.removeConnection(peerId);
       },
@@ -462,8 +466,8 @@ app.get(
 app.get(
   "/portal/time/sync",
   upgradeWebSocket((c) => {
-    const { auth } = c.req.query(); // TODO: Verify Bearer token on auth.
-    let interval: any;
+    const { auth: _auth } = c.req.query(); // TODO: Verify Bearer token on auth.
+    let interval: ReturnType<typeof setInterval> | undefined;
     return {
       onOpen: (_event, ws) => {
         interval = setInterval(
@@ -490,7 +494,7 @@ app.get(
 app.get(
   "/portal/stonks/sync",
   upgradeWebSocket((c) => {
-    const { auth } = c.req.query(); // TODO: Verify Bearer token on auth.
+    const { auth: _auth } = c.req.query(); // TODO: Verify Bearer token on auth.
     const stonks: Record<string, number> = {
       AAPL: 645.32,
       MSFT: 412.78,
@@ -520,7 +524,7 @@ app.get(
       CVX: 778.9,
       PEP: 512.34,
     };
-    let interval: any;
+    let interval: ReturnType<typeof setInterval> | undefined;
     return {
       onOpen: (_event, ws) => {
         interval = setInterval(() => {
@@ -783,7 +787,7 @@ app.post("/query", async (c) => {
 
 app.get("/codex/:id", async (c) => {
   const sheet_id = c.req.param("id");
-  const [type, doc_id] = sheet_id.split(":");
+  const [type, _doc_id] = sheet_id.split(":");
   switch (type) {
     case "codex-db": {
       const [db] = await sql`select dsn from db where sheet_id = ${sheet_id}`;
@@ -805,7 +809,7 @@ app.get("/codex/:id", async (c) => {
         where table_schema = 'public'
         group by table_name, table_type
       `;
-      const cols = rows.columns.map((col, i) => ({
+      const cols = rows.columns.map((col) => ({
         name: col.name,
         type: "text",
         key: col.name,
@@ -879,12 +883,12 @@ app.post("/codex-db/:id", async (c) => {
   return c.json(null, 200);
 });
 
-app.get("/codex/:id/connect", async (c) => {
+app.get("/codex/:id/connect", (c) => {
   // TODO:
   return c.json(null, 500);
 });
 
-app.get("/codex/:id/callback", async (c) => {
+app.get("/codex/:id/callback", (c) => {
   // TODO:
   return c.json(null, 500);
 });
@@ -903,12 +907,12 @@ app.get("/portal/:id", async (c) => {
   return page(c)(await sheet(c, sheet_.sheet_id, c.req.query()));
 });
 
-app.get("/stats/:id", async (c) => {
+app.get("/stats/:id", (c) => {
   // TODO: Get column/table stats about any sheet as a table.
   return c.json(null, 500);
 });
 
-app.all("/mcp/:id", async (c) => {
+app.all("/mcp/:id", (c) => {
   // TODO: mcp server
   return c.json(null, 500);
 });
