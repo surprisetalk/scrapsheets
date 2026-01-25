@@ -1,13 +1,11 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with
-code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
-Scrapsheets is a web-based spreadsheet application that combines traditional
-spreadsheet functionality with modern web technologies. It uses a hybrid
-architecture with:
+Scrapsheets is a web-based spreadsheet application that combines traditional spreadsheet functionality with modern web
+technologies. It uses a hybrid architecture with:
 
 - **Backend**: Deno-based server using Hono framework (main.ts)
 - **Frontend**: Elm single-page application (src/Main.elm)
@@ -30,8 +28,7 @@ architecture with:
 
 - **Development server**: `deno run -A npm:serve dist -s -C -S -n`
 - **Build frontend**: `elm make src/Main.elm --debug --output=dist/index.js`
-- **Watch and build**:
-  `watch src { try { cp -vu src/* dist ; elm make src/Main.elm --debug --output=dist/index.js } }`
+- **Watch and build**: `watch src { try { cp -vu src/* dist ; elm make src/Main.elm --debug --output=dist/index.js } }`
 - **Setup dist directory**: `mkdir dist`
 
 ### Elm Commands (via deno.json imports)
@@ -53,14 +50,12 @@ architecture with:
 - **Database**: PostgreSQL via postgresjs
 - **Real-time sync**: Custom WebSocket adapter for Automerge
 - **Authentication**: JWT-based with email verification via SendGrid
-- **Document types**: table, query, net-hook, net-http, net-socket, portal,
-  codex-*
+- **Document types**: table, query, net-hook, net-http, net-socket, portal, codex-*
 
 ### Key Backend Features
 
 - **Sheet system**: Polymorphic documents identified by `type:doc_id` format
-- **Query engine**: SQL execution via AlaSQL for cross-sheet queries using
-  `@sheet_id` syntax
+- **Query engine**: SQL execution via AlaSQL for cross-sheet queries using `@sheet_id` syntax
 - **Marketplace**: Buy/sell sheets with pricing system
 - **Real-time data**: WebSocket portals for live data (time, stock prices)
 - **Database codex**: Connect external PostgreSQL databases
@@ -84,10 +79,8 @@ architecture with:
 #### Core Tables
 
 - **usr**: User accounts with identity, name, email (citext), and password
-- **sheet**: Central document table with polymorphic sheet_id format
-  (`type:doc_id`)
-  - Types: template, table, net-hook, net-http, net-socket, query, portal,
-    codex-*
+- **sheet**: Central document table with polymorphic sheet_id format (`type:doc_id`)
+  - Types: template, table, net-hook, net-http, net-socket, query, portal, codex-*
   - Marketplace fields: sell_id, sell_type, sell_price, buy_id, buy_price
   - Document data: row_0 (jsonb), name, tags (text[])
 - **sheet_usr**: Many-to-many permissions between sheets and users
@@ -96,9 +89,7 @@ architecture with:
 
 #### Key Schema Features
 
-- **Generated sheet_id**: Computed as `type || ':' || doc_id` (e.g.,
-  "table:abc123")
-- **Marketplace system**: sell_id generated from md5(doc_id||created_by),
-  prevents selling and buying same sheet
+- **Generated sheet_id**: Computed as `type || ':' || doc_id` (e.g., "table:abc123")
+- **Marketplace system**: sell_id generated from md5(doc_id||created_by), prevents selling and buying same sheet
 - **Type constraints**: Enforced sheet types with check constraints
 - **citext extension**: Case-insensitive email handling

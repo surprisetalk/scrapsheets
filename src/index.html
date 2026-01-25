@@ -153,9 +153,7 @@
 
         app.ports.deleteDoc.subscribe(async (id) => Library.delete(id));
 
-        app.ports.updateLibrary.subscribe(({ id, data }) =>
-          Library.set(id, data)
-        );
+        app.ports.updateLibrary.subscribe(({ id, data }) => Library.set(id, data));
 
         {
           await AM.initializeWasm(fetch("/automerge.wasm")); // https://esm.sh/@automerge/automerge/dist/automerge.wasm
@@ -179,9 +177,7 @@
                   const token = getAuthToken();
                   return (
                     "wss://api.sheets.scrap.land/library/sync" +
-                    (token
-                      ? `?auth=Bearer%20${encodeURIComponent(token)}`
-                      : "")
+                    (token ? `?auth=Bearer%20${encodeURIComponent(token)}` : "")
                   );
                 })(),
               ),
@@ -281,7 +277,7 @@
               "DOMContentLoaded",
               setupDragDrop,
             );
-          } else setupDragDrop();
+          } else { setupDragDrop(); }
 
           alasql.options.modifier = "RECORDSET";
           for (
@@ -374,24 +370,20 @@
                 switch (lang) {
                   case "sql":
                     // TODO: Run alasql if possible, otherwise post to /query.
-                    const params =
-                      new URLSearchParams(window.location.search)
-                        .get("q")
-                        ?.split(/\s+(?=\w+=)/)
-                        .reduce(
-                          (r, p) => {
-                            const [k, v] = p.includes("=")
-                              ? p.split("=")
-                              : ["", p];
-                            return ((r[k] ||= []).push(v), r);
-                          },
-                          { "": [].join(" ") },
-                        ) ?? { "": null };
-                    const [, { columns: cols, data: rows } = {}] =
-                      await alasql([
-                        [`set @params = ?`, [params]],
-                        code,
-                      ]);
+                    const params = new URLSearchParams(window.location.search)
+                      .get("q")
+                      ?.split(/\s+(?=\w+=)/)
+                      .reduce(
+                        (r, p) => {
+                          const [k, v] = p.includes("=") ? p.split("=") : ["", p];
+                          return ((r[k] ||= []).push(v), r);
+                        },
+                        { "": [].join(" ") },
+                      ) ?? { "": null };
+                    const [, { columns: cols, data: rows } = {}] = await alasql([
+                      [`set @params = ?`, [params]],
+                      code,
+                    ]);
                     // TODO: If doc contains cols data, use that names and types.
                     app.ports.docQueried.send({
                       id,
@@ -412,9 +404,7 @@
             ),
             300,
           );
-          app.ports.queryDoc.subscribe(({ id, data }) =>
-            queryDoc(id, data)
-          );
+          app.ports.queryDoc.subscribe(({ id, data }) => queryDoc(id, data));
 
           let ws;
           const selectDoc = catchy(async (id, sheet) => {
