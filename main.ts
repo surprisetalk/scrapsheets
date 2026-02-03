@@ -13,10 +13,49 @@ import type { AnyDocumentId } from "@automerge/automerge-repo";
 // import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import ala from "alasql";
+import * as prql from "prql-js";
 import * as path from "@std/path";
 
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
 const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
+
+// Simple in-memory rate limiter (token bucket algorithm)
+const rateLimitBuckets = new Map<string, { tokens: number; lastRefill: number }>();
+const RATE_LIMIT_MAX_TOKENS = 100; // Max requests per window
+const RATE_LIMIT_REFILL_RATE = 10; // Tokens per second
+const RATE_LIMIT_WINDOW_MS = 60_000; // Cleanup old entries after 1 minute of inactivity
+
+const rateLimit = (identifier: string): boolean => {
+  const now = Date.now();
+  let bucket = rateLimitBuckets.get(identifier);
+
+  if (!bucket) {
+    bucket = { tokens: RATE_LIMIT_MAX_TOKENS, lastRefill: now };
+    rateLimitBuckets.set(identifier, bucket);
+  }
+
+  // Refill tokens based on time elapsed
+  const elapsed = (now - bucket.lastRefill) / 1000;
+  bucket.tokens = Math.min(RATE_LIMIT_MAX_TOKENS, bucket.tokens + elapsed * RATE_LIMIT_REFILL_RATE);
+  bucket.lastRefill = now;
+
+  if (bucket.tokens < 1) {
+    return false; // Rate limited
+  }
+
+  bucket.tokens -= 1;
+  return true;
+};
+
+// Cleanup stale rate limit entries periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of rateLimitBuckets) {
+    if (now - bucket.lastRefill > RATE_LIMIT_WINDOW_MS) {
+      rateLimitBuckets.delete(key);
+    }
+  }
+}, RATE_LIMIT_WINDOW_MS);
 
 ala.options.modifier = "RECORDSET";
 
@@ -119,59 +158,81 @@ const sheet = async (
   }
 };
 
+const executeSql = async (
+  c: Context,
+  sqlCode: string,
+): Promise<Page> => {
+  // Extract sheet references (@sheet_id) and replace with placeholders
+  const sheet_ids: string[] = [];
+  const code_ = sqlCode.replace(
+    /@[^ ]+/g,
+    (ref) => (sheet_ids.push(ref.slice(1)), "?"),
+  );
+
+  // Load referenced sheets
+  const docs: Record<string, Record<string, unknown>[]> = {};
+  for (const sheet_id of sheet_ids) {
+    if (docs[sheet_id]) continue;
+    const [cols, ...rows] = (await sheet(c, sheet_id, {})).data;
+    docs[sheet_id] = rows.map((row) =>
+      Object.fromEntries(
+        Object.values(cols).map((col) => [col.name, row[col.key]]),
+      )
+    );
+  }
+
+  const {
+    columns: cols,
+    data: rows,
+  }: {
+    columns: { columnid: string }[];
+    data: Record<string, unknown>[];
+  } = await ala(
+    code_,
+    sheet_ids.map((id) => docs[id]),
+  );
+
+  return {
+    data: [
+      Object.fromEntries(
+        cols.map((col, i) => [
+          i,
+          {
+            name: col.columnid,
+            type: "text",
+            key: col.columnid,
+          },
+        ]),
+      ),
+      ...rows,
+    ],
+    count: rows.length,
+    offset: 0,
+  };
+};
+
 const querify = async (
   c: Context,
   { lang, code, args: _args = [] }: Query,
   _reqQuery: Record<string, string>,
 ): Promise<Page> => {
   if (lang === "sql") {
-    // TODO: Use psql/etc if all sheets are from the same codex.
-    const sheet_ids: string[] = [];
-    const code_ = code.replace(
-      /@[^ ]+/g,
-      (ref) => (sheet_ids.push(ref.slice(1)), "?"),
-    );
-    const docs: Record<string, Record<string, unknown>[]> = {};
-    for (const sheet_id of sheet_ids) {
-      if (docs[sheet_id]) continue;
-      const [cols, ...rows] = (await sheet(c, sheet_id, {})).data;
-      docs[sheet_id] = rows.map((row) =>
-        Object.fromEntries(
-          Object.values(cols).map((col) => [col.name, row[col.key]]),
-        )
-      );
+    return await executeSql(c, code);
+  } else if (lang === "prql") {
+    // Compile PRQL to SQL, then execute
+    try {
+      const sqlResult = prql.compile(code);
+      if (!sqlResult) {
+        throw new HTTPException(400, { message: "PRQL compilation returned empty result" });
+      }
+      return await executeSql(c, sqlResult);
+    } catch (err) {
+      if (err instanceof HTTPException) throw err;
+      const message = err instanceof Error ? err.message : "PRQL compilation failed";
+      throw new HTTPException(400, { message: `PRQL error: ${message}` });
     }
-    const {
-      columns: cols,
-      data: rows,
-    }: {
-      columns: { columnid: string }[];
-      data: Record<string, unknown>[];
-    } =
-      // TODO: Consider just using postgresjs and passing in tables as ${sql([...])}
-      await ala(
-        code_,
-        sheet_ids.map((id) => docs[id]),
-      );
-    return {
-      data: [
-        Object.fromEntries(
-          cols.map((col, i) => [
-            i,
-            {
-              name: col.columnid,
-              type: "text",
-              key: col.columnid,
-            },
-          ]),
-        ),
-        ...rows,
-      ],
-      count: -1, // TODO:
-      offset: -1, // TODO:
-    };
   } else {
-    throw new HTTPException(500, { message: "TODO" });
+    throw new HTTPException(400, { message: `Unsupported query language: ${lang}` });
   }
 };
 
@@ -278,12 +339,25 @@ const page = (c: Context) => ({ data, offset, count }: Page) => {
   return c.json({ data }, 200);
 };
 
-// TODO: Add rate-limiting middleware everywhere.
 export const app = new Hono<{
   Variables: JwtVariables & { usr_id: string };
 }>();
 
 app.use("*", logger());
+
+// Rate limiting middleware
+app.use("*", async (c, next) => {
+  // Use IP address as identifier, fall back to a default for local dev
+  const ip = c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
+    c.req.header("x-real-ip") ||
+    "127.0.0.1";
+
+  if (!rateLimit(ip)) {
+    throw new HTTPException(429, { message: "Too many requests. Please slow down." });
+  }
+
+  await next();
+});
 
 // deno-lint-ignore no-explicit-any
 type WebSocketLike = any;
@@ -383,11 +457,39 @@ class HonoWebSocketAdapter extends AM.NetworkAdapter implements AM.NetworkAdapte
 // TODO: Replace this with AM.NodeWebSocketAdapter. Try to grab hono's websocket server and pass it in. Use automerge.networkSubsystem.add...?
 const honoAdapter = new HonoWebSocketAdapter();
 
+// Cache of peer ID to user ID mappings for share policy checks
+const peerUserMap = new Map<AM.PeerId, string | null>();
+
+const sharePolicy = async (peerId: AM.PeerId, documentId?: AM.DocumentId): Promise<boolean> => {
+  // Server always has access
+  if (peerId.startsWith("server-")) return true;
+
+  // If no document specified, deny
+  if (!documentId) return false;
+
+  // Extract user ID from peer ID (format: "user-{usr_id}" or "anonymous-{random}")
+  const usr_id = peerUserMap.get(peerId);
+
+  // Anonymous users can't access documents via sync
+  if (!usr_id) return false;
+
+  // Check if user has access to this document in the database
+  const [access] = await sql`
+    select true as has_access
+    from sheet_usr su
+    inner join sheet s using (sheet_id)
+    where s.doc_id = ${documentId}
+      and su.usr_id = ${usr_id}
+  `;
+
+  return !!access?.has_access;
+};
+
 export const automerge = new Repo({
   network: [honoAdapter],
   storage: new NodeFSStorageAdapter(`${path.dirname(path.fromFileUrl(Deno.mainModule))}/data/automerge`),
   peerId: `server-${Deno.hostname()}` as AM.PeerId,
-  sharePolicy: () => Promise.resolve(true), // TODO:
+  sharePolicy,
 });
 
 app.get(
@@ -413,6 +515,8 @@ app.get(
       onOpen(_event, ws) {
         console.log(`WebSocket connected: ${peerId}`);
         console.log(`Auth status: ${usr_id ? "authenticated" : "anonymous"}`);
+        // Register the peer's user ID for share policy checks
+        peerUserMap.set(peerId, usr_id);
         honoAdapter.addConnection(peerId, ws);
       },
       onMessage(event, _ws) {
@@ -452,24 +556,40 @@ app.get(
       },
       onClose(_event, _ws) {
         console.log(`WebSocket disconnected: ${peerId}`);
+        peerUserMap.delete(peerId);
         honoAdapter.removeConnection(peerId);
       },
       onError(event, _ws) {
         console.error(`WebSocket error for ${peerId}:`, event);
+        peerUserMap.delete(peerId);
         honoAdapter.removeConnection(peerId);
       },
     };
   }),
 );
 
-// TODO:
+// Helper to verify WebSocket auth tokens
+const verifyWsAuth = async (auth: string | undefined): Promise<string | null> => {
+  if (!auth) return null;
+  try {
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+    const payload = await verify(token, JWT_SECRET);
+    return payload.sub as string;
+  } catch {
+    return null;
+  }
+};
+
 app.get(
   "/portal/time/sync",
-  upgradeWebSocket((c) => {
-    const { auth: _auth } = c.req.query(); // TODO: Verify Bearer token on auth.
+  upgradeWebSocket(async (c) => {
+    const { auth } = c.req.query();
+    const usr_id = await verifyWsAuth(auth);
+    // Time portal is public, but we log auth status
     let interval: ReturnType<typeof setInterval> | undefined;
     return {
       onOpen: (_event, ws) => {
+        console.log(`Time portal connected, auth: ${usr_id ? "yes" : "no"}`);
         interval = setInterval(
           () =>
             ws.send(
@@ -493,8 +613,21 @@ app.get(
 
 app.get(
   "/portal/stonks/sync",
-  upgradeWebSocket((c) => {
-    const { auth: _auth } = c.req.query(); // TODO: Verify Bearer token on auth.
+  upgradeWebSocket(async (c) => {
+    const { auth } = c.req.query();
+    const usr_id = await verifyWsAuth(auth);
+    // Stonks portal requires authentication
+    if (!usr_id) {
+      return {
+        onOpen: (_event, ws) => {
+          ws.send(JSON.stringify({ error: "Authentication required" }));
+          ws.close(4001, "Unauthorized");
+        },
+        onMessage: undefined,
+        onClose: undefined,
+        onError: undefined,
+      };
+    }
     const stonks: Record<string, number> = {
       AAPL: 645.32,
       MSFT: 412.78,
@@ -527,6 +660,7 @@ app.get(
     let interval: ReturnType<typeof setInterval> | undefined;
     return {
       onOpen: (_event, ws) => {
+        console.log(`Stonks portal connected for user: ${usr_id}`);
         interval = setInterval(() => {
           for (const i in stonks) stonks[i] += 0.5 - Math.random();
           ws.send(
@@ -729,51 +863,71 @@ app.get("/library", async (c) => {
   );
 });
 
-// TODO: This is not correct.
 app.put("/library/:id", async (c) => {
-  const [sheet] = await sql`
-    update sheet 
-    set ${
-    sql(
-      { name: null, tags: [], ...(await c.req.json()) },
-      "name",
-      "tags",
-    )
-  } 
-    where true
-    and sheet_id = ${c.req.param("id")}
-    and created_by = ${c.get("usr_id")}
-    returning sheet_id
+  const sheet_id = c.req.param("id");
+  const usr_id = c.get("usr_id");
+  const body = await c.req.json();
+
+  // Check if the user already has access to this sheet
+  const [existingAccess] = await sql`
+    select s.sheet_id, s.created_by
+    from sheet_usr su
+    inner join sheet s using (sheet_id)
+    where su.sheet_id = ${sheet_id} and su.usr_id = ${usr_id}
   `;
-  if (!sheet) {
-    const [type, doc_id] = c.req.param("id").split(":");
-    const sheet = {
-      name: "",
-      tags: [],
-      ...(await c.req.json()),
-      type,
-      doc_id,
-      row_0: await automerge
-        .find<{ data: Table }>(doc_id as AnyDocumentId)
-        .then((hand) => hand.doc().data[0] ?? {}),
-      created_by: c.get("usr_id"),
-    };
-    await sql`
-      with s as (insert into sheet ${
-      sql(
-        sheet,
-        "type",
-        "doc_id",
-        "name",
-        "tags",
-        "created_by",
-        "row_0",
-      )
-    } on conflict (sheet_id) do nothing returning *)
-      insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s
-    `;
+
+  if (existingAccess) {
+    // User has access - update name/tags if they own it
+    if (existingAccess.created_by === BigInt(usr_id)) {
+      await sql`
+        update sheet
+        set ${sql({ name: body.name ?? "", tags: body.tags ?? [] }, "name", "tags")}
+        where sheet_id = ${sheet_id}
+      `;
+    }
+    return c.json(null, 200);
   }
-  return c.json(null, 200);
+
+  // User doesn't have access - check if sheet exists at all
+  const [existingSheet] = await sql`select sheet_id from sheet where sheet_id = ${sheet_id}`;
+
+  if (existingSheet) {
+    // Sheet exists but user doesn't have access - forbidden
+    throw new HTTPException(403, { message: "You don't have access to this sheet." });
+  }
+
+  // Sheet doesn't exist - create it (user is claiming a new automerge doc)
+  const [type, doc_id] = sheet_id.split(":");
+  if (!type || !doc_id) {
+    throw new HTTPException(400, { message: "Invalid sheet_id format." });
+  }
+
+  // Verify the automerge document exists
+  const row_0 = await automerge
+    .find<{ data: Table }>(doc_id as AnyDocumentId)
+    .then((hand) => hand.doc()?.data?.[0] ?? {})
+    .catch(() => {
+      throw new HTTPException(404, { message: "Document not found." });
+    });
+
+  const sheet = {
+    name: body.name ?? "",
+    tags: body.tags ?? [],
+    type,
+    doc_id,
+    row_0,
+    created_by: usr_id,
+  };
+
+  await sql`
+    with s as (
+      insert into sheet ${sql(sheet, "type", "doc_id", "name", "tags", "created_by", "row_0")}
+      returning sheet_id, created_by
+    )
+    insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s
+  `;
+
+  return c.json(null, 201);
 });
 
 // TODO: This currently takes sheet_id, but we want it to take doc_id.
@@ -883,14 +1037,72 @@ app.post("/codex-db/:id", async (c) => {
   return c.json(null, 200);
 });
 
-app.get("/codex/:id/connect", (c) => {
-  // TODO:
-  return c.json(null, 500);
+app.get("/codex/:id/connect", async (c) => {
+  const sheet_id = c.req.param("id");
+  const [type, doc_id] = sheet_id.split(":");
+  const { provider } = c.req.query();
+
+  // Verify user has access to this codex
+  const [access] = await sql`
+    select true from sheet_usr
+    where sheet_id = ${`codex-${type}:${doc_id}`}
+      and usr_id = ${c.get("usr_id")}
+  `;
+
+  if (!access) {
+    throw new HTTPException(403, { message: "Access denied to this codex." });
+  }
+
+  // For now, only support direct PostgreSQL connection strings
+  // Future: add OAuth flows for Google Sheets, Airtable, etc.
+  switch (provider || type) {
+    case "db":
+    case "postgres":
+    case "postgresql":
+      return c.json({
+        provider: "postgresql",
+        method: "dsn",
+        instructions: "POST a PostgreSQL connection string (DSN) to /codex-db/:id",
+        example: "postgresql://user:pass@host:5432/database",
+        connect_url: `/codex-db/${doc_id}`,
+      }, 200);
+
+    case "google-sheets":
+    case "airtable":
+    case "notion":
+      // Placeholder for future OAuth providers
+      return c.json({
+        provider,
+        method: "oauth",
+        status: "not_implemented",
+        message: `OAuth integration with ${provider} is coming soon.`,
+      }, 501);
+
+    default:
+      return c.json({
+        available_providers: [
+          { id: "postgresql", name: "PostgreSQL", status: "available" },
+          { id: "google-sheets", name: "Google Sheets", status: "coming_soon" },
+          { id: "airtable", name: "Airtable", status: "coming_soon" },
+          { id: "notion", name: "Notion", status: "coming_soon" },
+        ],
+      }, 200);
+  }
 });
 
 app.get("/codex/:id/callback", (c) => {
-  // TODO:
-  return c.json(null, 500);
+  // OAuth callback handler - placeholder for future OAuth flows
+  const { provider, code, state: _state } = c.req.query();
+
+  if (!provider || !code) {
+    throw new HTTPException(400, { message: "Missing provider or authorization code." });
+  }
+
+  // For now, return not implemented
+  return c.json({
+    error: "oauth_not_implemented",
+    message: `OAuth callback for ${provider} is not yet implemented.`,
+  }, 501);
 });
 
 app.get("/portal/:id", async (c) => {
@@ -907,9 +1119,93 @@ app.get("/portal/:id", async (c) => {
   return page(c)(await sheet(c, sheet_.sheet_id, c.req.query()));
 });
 
-app.get("/stats/:id", (c) => {
-  // TODO: Get column/table stats about any sheet as a table.
-  return c.json(null, 500);
+app.get("/stats/:id", async (c) => {
+  const sheet_id = c.req.param("id");
+  const sheetData = await sheet(c, sheet_id, c.req.query());
+  const [colsRow, ...rows] = sheetData.data;
+  const cols = Object.values(colsRow) as Col[];
+
+  // Compute statistics for each column
+  const stats = cols.map((col) => {
+    const values = rows.map((row) => row[col.key]).filter((v) => v != null);
+    const numericValues = values
+      .map((v) => (typeof v === "number" ? v : parseFloat(String(v))))
+      .filter((n) => !isNaN(n));
+
+    const isNumeric = numericValues.length > values.length / 2;
+
+    if (isNumeric && numericValues.length > 0) {
+      const sum = numericValues.reduce((a, b) => a + b, 0);
+      const min = Math.min(...numericValues);
+      const max = Math.max(...numericValues);
+      const mean = sum / numericValues.length;
+      const sorted = [...numericValues].sort((a, b) => a - b);
+      const median = sorted[Math.floor(sorted.length / 2)];
+
+      return {
+        column: col.name,
+        type: "numeric",
+        count: numericValues.length,
+        null_count: rows.length - values.length,
+        min,
+        max,
+        sum,
+        mean,
+        median,
+      };
+    } else {
+      // Text/categorical stats
+      const lengths = values.map((v) => String(v).length);
+      const histogram: Record<string, number> = {};
+      for (const v of values) {
+        const key = String(v).slice(0, 100); // Truncate long values
+        histogram[key] = (histogram[key] || 0) + 1;
+      }
+
+      // Get top 10 most frequent values
+      const topValues = Object.entries(histogram)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([value, count]) => ({ value, count }));
+
+      return {
+        column: col.name,
+        type: "text",
+        count: values.length,
+        null_count: rows.length - values.length,
+        unique_count: Object.keys(histogram).length,
+        min_length: lengths.length ? Math.min(...lengths) : 0,
+        max_length: lengths.length ? Math.max(...lengths) : 0,
+        avg_length: lengths.length ? lengths.reduce((a, b) => a + b, 0) / lengths.length : 0,
+        top_values: topValues,
+      };
+    }
+  });
+
+  // Format as a table
+  const statsCols = [
+    { name: "column", type: "text", key: "column" },
+    { name: "type", type: "text", key: "type" },
+    { name: "count", type: "int", key: "count" },
+    { name: "null_count", type: "int", key: "null_count" },
+    { name: "unique_count", type: "int", key: "unique_count" },
+    { name: "min", type: "text", key: "min" },
+    { name: "max", type: "text", key: "max" },
+    { name: "mean", type: "text", key: "mean" },
+    { name: "top_values", type: "json", key: "top_values" },
+  ];
+
+  return c.json({
+    data: [
+      arrayify(statsCols),
+      ...stats.map((s) => ({
+        ...s,
+        min: s.type === "numeric" ? s.min : s.min_length,
+        max: s.type === "numeric" ? s.max : s.max_length,
+        mean: s.type === "numeric" ? s.mean?.toFixed(2) : s.avg_length?.toFixed(1),
+      })),
+    ],
+  }, 200);
 });
 
 app.all("/mcp/:id", (c) => {

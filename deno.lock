@@ -2,14 +2,18 @@
   "version": "5",
   "specifiers": {
     "jsr:@hono/hono@*": "4.6.14",
+    "jsr:@hono/hono@4": "4.6.14",
     "jsr:@std/assert@*": "1.0.13",
     "jsr:@std/assert@^1.0.13": "1.0.13",
+    "jsr:@std/internal@^1.0.12": "1.0.12",
     "jsr:@std/internal@^1.0.6": "1.0.8",
+    "jsr:@std/path@1": "1.1.4",
     "npm:@automerge/automerge-repo-network-websocket@*": "2.0.5_ws@8.18.2",
     "npm:@automerge/automerge-repo-network-websocket@^2.0.5": "2.0.5_ws@8.18.2",
     "npm:@automerge/automerge-repo-storage-nodefs@*": "2.1.0",
-    "npm:@automerge/automerge-repo@*": "2.0.5",
-    "npm:@automerge/automerge-repo@^2.0.5": "2.0.5",
+    "npm:@automerge/automerge-repo-storage-nodefs@^2.0.5": "2.1.0",
+    "npm:@automerge/automerge-repo@*": "2.1.0",
+    "npm:@automerge/automerge-repo@^2.0.5": "2.1.0",
     "npm:@electric-sql/pglite@*": "0.3.3",
     "npm:@electric-sql/pglite@~0.3.3": "0.3.3",
     "npm:@sendgrid/mail@*": "8.1.5",
@@ -25,6 +29,8 @@
     "npm:elm@~0.19.1-6": "0.19.1-6",
     "npm:pg-gateway@*": "0.3.0-beta.4",
     "npm:pg-gateway@~0.3.0-beta.4": "0.3.0-beta.4",
+    "npm:prql-js@0.12.1": "0.12.1",
+    "npm:prql-js@~0.12.1": "0.12.1",
     "npm:serve@*": "14.2.4",
     "npm:ws@*": "8.18.2"
   },
@@ -35,11 +41,20 @@
     "@std/assert@1.0.13": {
       "integrity": "ae0d31e41919b12c656c742b22522c32fb26ed0cba32975cb0de2a273cb68b29",
       "dependencies": [
-        "jsr:@std/internal"
+        "jsr:@std/internal@^1.0.6"
       ]
     },
     "@std/internal@1.0.8": {
       "integrity": "fc66e846d8d38a47cffd274d80d2ca3f0de71040f855783724bb6b87f60891f5"
+    },
+    "@std/internal@1.0.12": {
+      "integrity": "972a634fd5bc34b242024402972cd5143eac68d8dffaca5eaa4dba30ce17b027"
+    },
+    "@std/path@1.1.4": {
+      "integrity": "1d2d43f39efb1b42f0b1882a25486647cb851481862dc7313390b2bb044314b5",
+      "dependencies": [
+        "jsr:@std/internal@^1.0.12"
+      ]
     }
   },
   "npm": {
@@ -1196,6 +1211,9 @@
     "proxy-from-env@1.1.0": {
       "integrity": "sha512-D+zkORCbA9f1tdWRK0RaCR3GPv50cMxcrz4X8k5LTSUD1Dkw47mKJEZQNunItRTkWwgtaUSo1RVFRIG9ZXiFYg=="
     },
+    "prql-js@0.12.1": {
+      "integrity": "sha512-YfhOkqi5G2Z8LW1pn5SVrC9icUA0Wgdxap5Z2AYIr+SwBakRz4M6SURVhr5rEMMQYjDtSYjSORNXcGcghOGzNQ=="
+    },
     "pump@3.0.3": {
       "integrity": "sha512-todwxLMY7/heScKmntwQG8CXVkWUOdYxIvY2s0VWAAMh/nd8SoYiRaKjlr7+iCs984f2P8zvrfWcDDYVb73NfA==",
       "dependencies": [
@@ -1829,7 +1847,9 @@
   },
   "workspace": {
     "dependencies": [
+      "jsr:@hono/hono@4",
       "jsr:@std/assert@^1.0.13",
+      "jsr:@std/path@1",
       "npm:@automerge/automerge-repo-network-websocket@^2.0.5",
       "npm:@automerge/automerge-repo-storage-nodefs@^2.0.5",
       "npm:@automerge/automerge-repo@^2.0.5",
@@ -1841,6 +1861,7 @@
       "npm:elm-test@~0.19.1-revision15",
       "npm:elm@~0.19.1-6",
       "npm:pg-gateway@~0.3.0-beta.4",
+      "npm:prql-js@~0.12.1",
       "npm:ws@^8.18.2"
     ]
   }

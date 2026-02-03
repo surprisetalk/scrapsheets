@@ -139,6 +139,18 @@ port docQueried : (Idd D.Value -> msg) -> Sub msg
 port docErrored : (String -> msg) -> Sub msg
 
 
+port signup : String -> Cmd msg
+
+
+port login : { email : String, password : String } -> Cmd msg
+
+
+port logout : () -> Cmd msg
+
+
+port authResult : (D.Value -> msg) -> Sub msg
+
+
 type alias DocDelta =
     -- TODO: This should only include the deltas and not the full doc.
     { doc : D.Value
@@ -196,7 +208,21 @@ type alias Model =
     , error : String
     , library : Library
     , sheet : Sheet
+    , auth : Auth
     }
+
+
+type alias Auth =
+    { state : AuthState
+    , email : String
+    , password : String
+    }
+
+
+type AuthState
+    = Anonymous
+    | LoggingIn
+    | LoggedIn { usrId : String }
 
 
 type alias SheetInfo =
@@ -593,6 +619,11 @@ init _ url nav =
                     , table = Err ""
                     , stats = Err ""
                     }
+                , auth =
+                    { state = Anonymous
+                    , email = ""
+                    , password = ""
+                    }
                 }
     in
     ( model, changeId model.id )
@@ -640,6 +671,15 @@ type Msg
     | CellHover Index
     | InputChange Input String
     | ShopFetch (Result Http.Error Table)
+    | AuthMsg AuthMsg
+    | AuthResult D.Value
+
+
+type AuthMsg
+    = AuthEmailChange String
+    | AuthPasswordChange String
+    | AuthSubmit
+    | AuthLogout
 
 
 type DocMsg
@@ -653,6 +693,8 @@ type Input
     = SheetSearch
     | CellWrite
     | QueryCode
+    | AuthEmail
+    | AuthPassword
 
 
 
@@ -668,6 +710,7 @@ subs model =
         , docNotified DocNotify
         , docQueried DocQuery
         , docErrored DocError
+        , authResult AuthResult
         , Browser.onKeyPress (D.map KeyPress (D.field "key" D.string))
         ]
 
@@ -677,7 +720,7 @@ subs model =
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
-update msg ({ sheet } as model) =
+update msg ({ sheet, auth } as model) =
     case msg of
         NoOp ->
             ( model, Cmd.none )
@@ -748,8 +791,35 @@ update msg ({ sheet } as model) =
             )
 
         DocNotify data ->
-            -- TODO:
-            ( model, Cmd.none )
+            -- Handle document notifications (collaboration events, peer updates, etc.)
+            if data.id /= model.sheet.id then
+                ( model, Cmd.none )
+
+            else
+                -- Decode the notification and update model accordingly
+                let
+                    notificationType =
+                        data.data
+                            |> D.decodeValue (D.field "type" D.string)
+                            |> Result.withDefault ""
+                in
+                case notificationType of
+                    "refresh" ->
+                        -- Request a fresh copy of the document
+                        ( model, changeId model.sheet.id )
+
+                    "error" ->
+                        let
+                            errorMsg =
+                                data.data
+                                    |> D.decodeValue (D.field "message" D.string)
+                                    |> Result.withDefault "Unknown error"
+                        in
+                        ( { model | error = errorMsg }, Cmd.none )
+
+                    _ ->
+                        -- Unknown notification type, ignore
+                        ( model, Cmd.none )
 
         DocQuery data ->
             ( iif (data.id /= model.sheet.id)
@@ -895,6 +965,12 @@ update msg ({ sheet } as model) =
         InputChange CellWrite x ->
             ( { model | sheet = { sheet | write = Just x } }, Cmd.none )
 
+        InputChange AuthEmail x ->
+            ( { model | auth = { auth | email = x } }, Cmd.none )
+
+        InputChange AuthPassword x ->
+            ( { model | auth = { auth | password = x } }, Cmd.none )
+
         InputChange QueryCode x ->
             ( model
             , changeDoc
@@ -950,6 +1026,51 @@ update msg ({ sheet } as model) =
 
         KeyPress _ ->
             ( model, Cmd.none )
+
+        AuthMsg authMsg ->
+            case authMsg of
+                AuthEmailChange email ->
+                    ( { model | auth = { auth | email = email } }, Cmd.none )
+
+                AuthPasswordChange password ->
+                    ( { model | auth = { auth | password = password } }, Cmd.none )
+
+                AuthSubmit ->
+                    if String.isEmpty auth.password then
+                        -- Signup flow: send verification email
+                        ( { model | auth = { auth | state = LoggingIn } }
+                        , signup auth.email
+                        )
+
+                    else
+                        -- Login flow
+                        ( { model | auth = { auth | state = LoggingIn } }
+                        , login { email = auth.email, password = auth.password }
+                        )
+
+                AuthLogout ->
+                    ( { model | auth = { state = Anonymous, email = "", password = "" } }
+                    , logout ()
+                    )
+
+        AuthResult data ->
+            let
+                decoded =
+                    D.decodeValue
+                        (D.oneOf
+                            [ D.field "usr_id" D.string |> D.map (\usrId -> LoggedIn { usrId = usrId })
+                            , D.field "error" D.string |> D.map (\_ -> Anonymous)
+                            , D.succeed Anonymous
+                            ]
+                        )
+                        data
+            in
+            case decoded of
+                Ok newState ->
+                    ( { model | auth = { auth | state = newState, password = "" } }, Cmd.none )
+
+                Err _ ->
+                    ( { model | auth = { auth | state = Anonymous } }, Cmd.none )
 
 
 
@@ -1104,14 +1225,61 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text "@media (max-width: 768px) { body > div { grid-template-rows: 1fr auto; } #aside { border-top: 1px solid #aaa; } }" ]
         , H.node "style" [] [ text "@media (max-width: 768px) { #title { display: none; } }" ]
         , H.node "style" [] [ text "#account > * { padding: 0.25rem 0.5rem; border: 1px solid #aaa; border-radius: 2px; font-size: 0.875rem; }" ]
+        , case model.auth.state of
+            LoggedIn _ ->
+                text ""
 
-        -- -- TODO: This should probably be part of the main grid.
-        -- -- TODO: Actually, move this to the aside of the library.
-        -- , H.form [ A.id "account", S.displayGrid, S.gapRem 0.5, S.maxWidth "100vw", S.width "100%", S.gridTemplateColumns "1fr 1fr auto", S.paddingRem 0.5, S.borderTop "1px solid #aaa", S.backgroundColor "#ccc", S.positionAbsolute, S.bottomPx 0, S.zIndex "10" ]
-        --     [ H.input [ S.minWidthRem 2, A.placeholder "email", A.type_ "email", A.name "email" ] []
-        --     , H.input [ S.minWidthRem 2, A.placeholder "password", A.type_ "password", A.name "password" ] []
-        --     , H.button [ A.type_ "submit", S.background "#eee" ] [ text "signup/login" ]
-        --     ]
+            _ ->
+                H.form
+                    [ A.id "account"
+                    , A.onSubmit (AuthMsg AuthSubmit)
+                    , S.displayGrid
+                    , S.gapRem 0.5
+                    , S.maxWidth "100vw"
+                    , S.width "100%"
+                    , S.gridTemplateColumns "1fr 1fr auto"
+                    , S.paddingRem 0.5
+                    , S.borderTop "1px solid #aaa"
+                    , S.backgroundColor "#ccc"
+                    , S.positionAbsolute
+                    , S.bottomPx 0
+                    , S.zIndex "10"
+                    ]
+                    [ H.input
+                        [ S.minWidthRem 2
+                        , A.placeholder "email"
+                        , A.type_ "email"
+                        , A.name "email"
+                        , A.value model.auth.email
+                        , A.onInput (InputChange AuthEmail)
+                        , A.disabled (model.auth.state == LoggingIn)
+                        ]
+                        []
+                    , H.input
+                        [ S.minWidthRem 2
+                        , A.placeholder "password"
+                        , A.type_ "password"
+                        , A.name "password"
+                        , A.value model.auth.password
+                        , A.onInput (InputChange AuthPassword)
+                        , A.disabled (model.auth.state == LoggingIn)
+                        ]
+                        []
+                    , H.button
+                        [ A.type_ "submit"
+                        , S.background "#eee"
+                        , A.disabled (model.auth.state == LoggingIn)
+                        ]
+                        [ text
+                            (case model.auth.state of
+                                LoggingIn ->
+                                    "..."
+
+                                _ ->
+                                    iif (String.isEmpty model.auth.password) "signup" "login"
+                            )
+                        ]
+                    ]
         -- , H.node "style" [] [ text "thead tr td { position: sticky; top: 0; }" ]
         -- , H.node "style" [] [ text "tfoot tr:last-child td { position: sticky; bottom: 0; }" ]
         , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
@@ -1122,9 +1290,16 @@ view ({ sheet } as model) =
                           , H.a [ A.href "/", S.fontWeight "900", A.id "title", S.marginLeftRem -0.25 ] [ text "scrapsheets" ]
                           , text "/"
                           ]
-                        , [ H.span [] [ text "anon" ]
-                          , text "/"
-                          ]
+                        , case model.auth.state of
+                            LoggedIn { usrId } ->
+                                [ H.span [ A.onClick (AuthMsg AuthLogout), S.cursorPointer ] [ text ("user:" ++ usrId) ]
+                                , text "/"
+                                ]
+
+                            _ ->
+                                [ H.span [] [ text "anon" ]
+                                , text "/"
+                                ]
                         , iif (sheet.id == "")
                             [ H.span [] [ text "library" ]
                             ]
