@@ -8,12 +8,12 @@
     "jsr:@std/internal@^1.0.12": "1.0.12",
     "jsr:@std/internal@^1.0.6": "1.0.8",
     "jsr:@std/path@1": "1.1.4",
-    "npm:@automerge/automerge-repo-network-websocket@*": "2.0.5_ws@8.18.2",
-    "npm:@automerge/automerge-repo-network-websocket@^2.0.5": "2.0.5_ws@8.18.2",
-    "npm:@automerge/automerge-repo-storage-nodefs@*": "2.1.0",
-    "npm:@automerge/automerge-repo-storage-nodefs@^2.0.5": "2.1.0",
-    "npm:@automerge/automerge-repo@*": "2.1.0",
-    "npm:@automerge/automerge-repo@^2.0.5": "2.1.0",
+    "npm:@automerge/automerge-repo-network-websocket@2.5.1": "2.5.1_ws@8.18.2",
+    "npm:@automerge/automerge-repo-storage-indexeddb@2.5.1": "2.5.1",
+    "npm:@automerge/automerge-repo-storage-nodefs@^2.5.1": "2.5.1",
+    "npm:@automerge/automerge-repo@2.5.1": "2.5.1",
+    "npm:@automerge/automerge-repo@^2.5.1": "2.5.1",
+    "npm:@automerge/automerge@2.2.8": "2.2.8",
     "npm:@electric-sql/pglite@*": "0.3.3",
     "npm:@electric-sql/pglite@~0.3.3": "0.3.3",
     "npm:@sendgrid/mail@*": "8.1.5",
@@ -58,10 +58,10 @@
     }
   },
   "npm": {
-    "@automerge/automerge-repo-network-websocket@2.0.5_ws@8.18.2": {
-      "integrity": "sha512-jVKLCy2+V4d/5I6lHL+UdReOk7XXg2yqKDKE4vgNPalgYu0v9RnC4TqBStCdmSM91Xfcq8cy1ifvuI+HUT2YFw==",
+    "@automerge/automerge-repo-network-websocket@2.5.1_ws@8.18.2": {
+      "integrity": "sha512-urvhlmTZ6VoJi5o0T2mtkVd4X1cuUdBC5/C/UY5FFgWczEq7PwCdNhUndv1CQSn8ePPsT59z7ZnRzZJbqqu22Q==",
       "dependencies": [
-        "@automerge/automerge-repo@2.0.5",
+        "@automerge/automerge-repo",
         "cbor-x",
         "debug@4.4.1",
         "eventemitter3",
@@ -69,15 +69,21 @@
         "ws"
       ]
     },
-    "@automerge/automerge-repo-storage-nodefs@2.1.0": {
-      "integrity": "sha512-SV0Sq5sCPp0sHM4WJF0Dx8Y3EiWVoz4dzhpS873Qnli6Bp9iPVAs7nlISZhpavPE036mrVCJcWXYA2Dsi5jqQQ==",
+    "@automerge/automerge-repo-storage-indexeddb@2.5.1": {
+      "integrity": "sha512-klyemjiwEn2+PW+NTjvBtjmykjJVoaBbQgk5P02jIgvAO7KH8OACldFzPrJdO0o6WAxkiOdtte8RHFKrDPkBlw==",
       "dependencies": [
-        "@automerge/automerge-repo@2.1.0",
+        "@automerge/automerge-repo"
+      ]
+    },
+    "@automerge/automerge-repo-storage-nodefs@2.5.1": {
+      "integrity": "sha512-KH2ZMMq0x9Y19MuOOFYueDklHBkK4c9WAnV22D/kFBpHQ65OF9QO2mDWPD80kaBO/17LHCaYLwPSfpdyz+aC8g==",
+      "dependencies": [
+        "@automerge/automerge-repo",
         "rimraf"
       ]
     },
-    "@automerge/automerge-repo@2.0.5": {
-      "integrity": "sha512-xnMsZhh6Bp1au22YbMN1nZ3nTdEQpExYB6a/LRqDaf9zMkbu7aLAzslil+TaF/98xqpZftC9rct7xYxFXXCkQw==",
+    "@automerge/automerge-repo@2.5.1": {
+      "integrity": "sha512-w242TXb2TaGHFux7dDtJIUVJMqSSq1iYvNia8FVYgVTUDvbm8chaGMe1kVdKMEINFiB/BNYPtsoJIPjJhQArLg==",
       "dependencies": [
         "@automerge/automerge",
         "bs58check",
@@ -89,21 +95,8 @@
         "xstate"
       ]
     },
-    "@automerge/automerge-repo@2.1.0": {
-      "integrity": "sha512-gqJkyM6Adbgqx7amn4uuz9ezuJHkiYRd9Ad5Z1xoKLq2GjlIIXDvW/NEHGP12CAS3pAbXJsBD0KyP949KvgywA==",
-      "dependencies": [
-        "@automerge/automerge",
-        "bs58check",
-        "cbor-x",
-        "debug@4.4.1",
-        "eventemitter3",
-        "fast-sha256",
-        "uuid",
-        "xstate"
-      ]
-    },
-    "@automerge/automerge@2.2.9": {
-      "integrity": "sha512-6HM52Ops79hAQBWMg/t0MNfGOdEiXyenQjO9F1hKZq0RWDsMLpPa1SzRy/C4/4UyX67sTHuA5CwBpH34SpfZlA==",
+    "@automerge/automerge@2.2.8": {
+      "integrity": "sha512-kP6Z9lIkNeIGe/jhF8SUQAgUMwVjtXCBL0eZEgQGCoWvPNTPcg8fnQco28XkYBrfkkuqiEUAbdHhJmSp0y79ug==",
       "dependencies": [
         "uuid"
       ]
@@ -622,8 +615,8 @@
     "delayed-stream@1.0.0": {
       "integrity": "sha512-ZySD7Nf91aLB0RxL4KGrKHBXl7Eds1DAmEdcoVawXnLD7SDhpNgtuII2aAkg7a7QS41jxPSZ17p4VdGnMHk3MQ=="
     },
-    "detect-libc@2.0.4": {
-      "integrity": "sha512-3UDv+G9CsCKO1WKMGw9fwq/SWJYbI0c5Y7LU1AXYoDdbhE2AHQ6N6Nb34sG8Fj7T5APy8qXDCKuuIHd1BR0tVA=="
+    "detect-libc@2.1.2": {
+      "integrity": "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ=="
     },
     "dunder-proto@1.0.1": {
       "integrity": "sha512-KIN/nDJBQRcXw0MLVhZE9iQHmG68qAVIBg9CqmUYjmQIhgij9U5MFvrqkUL5FbtyyzZuOeOt0zdeRe4UY7ct+A==",
@@ -738,8 +731,8 @@
     "escalade@3.2.0": {
       "integrity": "sha512-WUj2qlxaQtO4g6Pq5c29GTcWGDyd8itL8zTlipgECz3JesAiiOKotd8JU6otB3PACgG6xkJUyVhboMS+bje/jA=="
     },
-    "eventemitter3@5.0.1": {
-      "integrity": "sha512-GWkBvjiSZK87ELrYOSESUYeVIc9mvLLf/nXalMOS5dYrgZq9o5OVkbZAVM06CVxYsCwH9BDZFPlQTlPA1j4ahA=="
+    "eventemitter3@5.0.4": {
+      "integrity": "sha512-mlsTRyGaPBjPedk6Bvw+aqbsXDtoAyAzm5MO7JgU+yVRyMQ5O8bD4Kcci7BS85f93veegeCPkL8R4GLClnjLFw=="
     },
     "execa@5.1.1": {
       "integrity": "sha512-8uSpZZocAZRBAPIEINJj3Lo9HyGitllczc27Eh5YYojjMFMn8yHMDMaUHE2Jqfq05D/wucwI4JGURyXt1vchyg==",
@@ -863,8 +856,8 @@
         "is-glob"
       ]
     },
-    "glob@10.4.5": {
-      "integrity": "sha512-7Bv8RF0k6xjo7d4A/PxYLbUCfb6c+Vpd2/mB2yRDlew7Jb5hEXiCD9ibfO7wpk8i4sevK6DFny9h7EYbM3/sHg==",
+    "glob@10.5.0": {
+      "integrity": "sha512-DfXN8DfhJ7NH3Oe7cFmu3NCu1wKbkReJ8TorzSAFbSKrlNaQSKfIzqYqVY8zlbs2NLBbWpRiU52GX2PbaBVNkg==",
       "dependencies": [
         "foreground-child",
         "jackspeak",
@@ -1520,8 +1513,8 @@
     "xmlbuilder@15.1.1": {
       "integrity": "sha512-yMqGBqtXyeN1e3TGYvgNgDVZ3j84W4cwkOXQswghol6APgZWaff9lnbvN7MHYJOiXsvGPXtjTYJEiC9J2wv9Eg=="
     },
-    "xstate@5.20.0": {
-      "integrity": "sha512-lFQ0fLwVa0OMZnjNP8zUkt2fwIS85ZBNPvxE41APVYhYj0++aTssgmsnTAiBHdKYbgnd6+L8DRTZ9jPZAFPuyw=="
+    "xstate@5.26.0": {
+      "integrity": "sha512-Fvi9VBoqHgsGYLU2NTag8xDTWtKqUC0+ue7EAhBNBb06wf620QEy05upBaEI1VLMzIn63zugLV8nHb69ZUWYAA=="
     },
     "y18n@5.0.8": {
       "integrity": "sha512-0pfFzegeDWJHJIAmTLRP2DwHjdF5s7jo9tuztdQxAhINCdvS+3nGINqPd00AphqJR/0LhANUS6/+7SCb98YOfA=="
@@ -1850,9 +1843,10 @@
       "jsr:@hono/hono@4",
       "jsr:@std/assert@^1.0.13",
       "jsr:@std/path@1",
-      "npm:@automerge/automerge-repo-network-websocket@^2.0.5",
-      "npm:@automerge/automerge-repo-storage-nodefs@^2.0.5",
-      "npm:@automerge/automerge-repo@^2.0.5",
+      "npm:@automerge/automerge-repo-network-websocket@^2.5.1",
+      "npm:@automerge/automerge-repo-storage-nodefs@^2.5.1",
+      "npm:@automerge/automerge-repo@^2.5.1",
+      "npm:@automerge/automerge@^3.2.3",
       "npm:@electric-sql/pglite@~0.3.3",
       "npm:@sendgrid/mail@^8.1.5",
       "npm:alasql@^4.6.6",

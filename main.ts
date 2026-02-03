@@ -362,7 +362,7 @@ app.use("*", async (c, next) => {
 // deno-lint-ignore no-explicit-any
 type WebSocketLike = any;
 
-class HonoWebSocketAdapter extends AM.NetworkAdapter implements AM.NetworkAdapterInterface {
+class HonoWebSocketAdapter extends AM.NetworkAdapter {
   private connections = new Map<AM.PeerId, WebSocketLike>();
   private _isReady = true;
   isReady(): boolean {
@@ -878,7 +878,8 @@ app.put("/library/:id", async (c) => {
 
   if (existingAccess) {
     // User has access - update name/tags if they own it
-    if (existingAccess.created_by === BigInt(usr_id)) {
+    // Compare as strings to handle bigint/string type variations from DB
+    if (String(existingAccess.created_by) === String(usr_id)) {
       await sql`
         update sheet
         set ${sql({ name: body.name ?? "", tags: body.tags ?? [] }, "name", "tags")}

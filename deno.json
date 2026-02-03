@@ -25,9 +25,10 @@
     "@hono/hono/deno": "jsr:@hono/hono@^4/deno",
     "postgresjs": "https://deno.land/x/postgresjs@v3.4.5/mod.js",
     "@std/path": "jsr:@std/path@^1",
-    "@automerge/automerge-repo": "npm:@automerge/automerge-repo@^2.0.5",
-    "@automerge/automerge-repo-network-websocket": "npm:@automerge/automerge-repo-network-websocket@^2.0.5",
-    "@automerge/automerge-repo-storage-nodefs": "npm:@automerge/automerge-repo-storage-nodefs@^2.0.5",
+    "@automerge/automerge": "npm:@automerge/automerge@^3.2.3",
+    "@automerge/automerge-repo": "npm:@automerge/automerge-repo@^2.5.1",
+    "@automerge/automerge-repo-network-websocket": "npm:@automerge/automerge-repo-network-websocket@^2.5.1",
+    "@automerge/automerge-repo-storage-nodefs": "npm:@automerge/automerge-repo-storage-nodefs@^2.5.1",
     "@electric-sql/pglite": "npm:@electric-sql/pglite@^0.3.3",
     "@electric-sql/pglite/contrib/citext": "npm:@electric-sql/pglite@^0.3.3/contrib/citext",
     "@sendgrid/mail": "npm:@sendgrid/mail@^8.1.5",
@@ -41,8 +42,6 @@
     "pg-gateway": "npm:pg-gateway@^0.3.0-beta.4",
     "ws": "npm:ws@^8.18.2",
     "node-buffer": "https://esm.sh/node/buffer.mjs",
-    "node-process": "https://esm.sh/node/process.mjs",
-    "react-esm": "https://esm.sh/react@^18.0.0?target=es2022",
-    "@automerge/react-slim": "https://esm.sh/@automerge/react@2.1.0/es2022/slim.bundle.mjs"
+    "node-process": "https://esm.sh/node/process.mjs"
   }
 }

@@ -16,7 +16,10 @@
   <body>
     <div id="elm"></div>
     <script type="module">
-      import * as AM from "https://esm.sh/@automerge/react@2.1.0/slim?bundle-deps";
+      // Import Automerge packages for browser with pinned versions and shared deps
+      import { Repo } from "https://esm.sh/@automerge/automerge-repo@2.5.1?deps=@automerge/automerge@3.2.3";
+      import { IndexedDBStorageAdapter } from "https://esm.sh/@automerge/automerge-repo-storage-indexeddb@2.5.1?deps=@automerge/automerge@3.2.3,@automerge/automerge-repo@2.5.1";
+      import { BrowserWebSocketClientAdapter } from "https://esm.sh/@automerge/automerge-repo-network-websocket@2.5.1?deps=@automerge/automerge@3.2.3,@automerge/automerge-repo@2.5.1";
 
       function debounce(func, timeout = 300) {
         let timer;
@@ -156,34 +159,27 @@
         app.ports.updateLibrary.subscribe(({ id, data }) => Library.set(id, data));
 
         {
-          await AM.initializeWasm(fetch("/automerge.wasm")); // https://esm.sh/@automerge/automerge/dist/automerge.wasm
+          // Initialize the Automerge Repo with storage and network adapters
+          const getAuthToken = () => {
+            try {
+              const userData = JSON.parse(
+                localStorage.getItem("scrapsheets-user") || "{}",
+              );
+              return userData.jwt || null;
+            } catch {
+              return null;
+            }
+          };
 
-          const repo = new AM.Repo({
-            storage: new AM.IndexedDBStorageAdapter(),
+          const token = getAuthToken();
+          const syncUrl =
+            "wss://api.sheets.scrap.land/library/sync" +
+            (token ? `?auth=Bearer%20${encodeURIComponent(token)}` : "");
+
+          const repo = new Repo({
+            storage: new IndexedDBStorageAdapter(),
             network: [
-              new AM.WebSocketClientAdapter(
-                (() => {
-                  const getAuthToken = () => {
-                    try {
-                      const userData = JSON.parse(
-                        localStorage.getItem("scrapsheets-user") ||
-                          "{}",
-                      );
-                      return userData.jwt || null;
-                    } catch {
-                      return null;
-                    }
-                  };
-                  const token = getAuthToken();
-                  return (
-                    "wss://api.sheets.scrap.land/library/sync" +
-                    (token ? `?auth=Bearer%20${encodeURIComponent(token)}` : "")
-                  );
-                })(),
-              ),
-              new AM.WebSocketClientAdapter(
-                "wss://sync.automerge.org", // TODO: Remove this.
-              ),
+              new BrowserWebSocketClientAdapter(syncUrl),
             ],
           });
 
