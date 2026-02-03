@@ -12,11 +12,13 @@
       "env": true,
       "read": true,
       "write": true,
-      "net": false,
+      "net": true,
+      "run": true,
       "sys": true
     }
   },
   "imports": {
+    "astral": "jsr:@astral/astral@^0.5",
     "@hono/hono": "jsr:@hono/hono@^4",
     "@hono/hono/http-exception": "jsr:@hono/hono@^4/http-exception",
     "@hono/hono/logger": "jsr:@hono/hono@^4/logger",
