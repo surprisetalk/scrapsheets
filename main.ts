@@ -616,18 +616,7 @@ app.get(
   upgradeWebSocket(async (c) => {
     const { auth } = c.req.query();
     const usr_id = await verifyWsAuth(auth);
-    // Stonks portal requires authentication
-    if (!usr_id) {
-      return {
-        onOpen: (_event, ws) => {
-          ws.send(JSON.stringify({ error: "Authentication required" }));
-          ws.close(4001, "Unauthorized");
-        },
-        onMessage: undefined,
-        onClose: undefined,
-        onError: undefined,
-      };
-    }
+    // Stonks portal is public, but we log auth status
     const stonks: Record<string, number> = {
       AAPL: 645.32,
       MSFT: 412.78,
@@ -660,7 +649,7 @@ app.get(
     let interval: ReturnType<typeof setInterval> | undefined;
     return {
       onOpen: (_event, ws) => {
-        console.log(`Stonks portal connected for user: ${usr_id}`);
+        console.log(`Stonks portal connected, auth: ${usr_id ? "yes" : "no"}`);
         interval = setInterval(() => {
           for (const i in stonks) stonks[i] += 0.5 - Math.random();
           ws.send(

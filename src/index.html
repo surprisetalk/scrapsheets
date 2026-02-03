@@ -272,7 +272,9 @@
                     name: file.name.replace(/\.csv$/i, ""),
                     tags: [],
                   });
-                  window.location = `/${id}`;
+                  requestAnimationFrame(() => {
+                    window.location = `/${id}`;
+                  });
                 } catch (error) {
                   console.error("Error processing CSV file:", error);
                   app.ports.docErrored.send(
@@ -473,7 +475,9 @@
               sheet = repo?.create({ type, data });
               const id = `${type}:${sheet.documentId}`;
               Library.set(id, { name: name ?? "", tags: [] });
-              window.location = `/${id}`;
+              requestAnimationFrame(() => {
+                window.location = `/${id}`;
+              });
             }),
           );
 
