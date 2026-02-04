@@ -2023,7 +2023,30 @@ view ({ sheet } as model) =
                             text ""
 
                         error ->
-                            H.span [] [ H.button [ A.onClick (DocError "") ] [ text "╳" ], text " ", text error ]
+                            H.div
+                                [ S.backgroundColor "#fee"
+                                , S.border "1px solid #c88"
+                                , S.borderRadius "4px"
+                                , S.padding "0.75rem"
+                                , S.margin "0.5rem"
+                                , S.fontFamily "monospace"
+                                , S.fontSizeRem 0.8
+                                , S.whiteSpacePre
+                                , S.overflowXAuto
+                                ]
+                                [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.marginBottomRem 0.5 ]
+                                    [ H.strong [] [ text "Error" ]
+                                    , H.button
+                                        [ A.onClick (DocError "")
+                                        , S.border "none"
+                                        , S.background "transparent"
+                                        , S.cursorPointer
+                                        , S.fontSizeRem 1
+                                        ]
+                                        [ text "×" ]
+                                    ]
+                                , text error
+                                ]
                     , case table of
                         Err "" ->
                             H.div [ S.displayFlex ] [ H.span [ S.textAlignCenter, S.width "100%", S.paddingRem 2, S.opacity "0.5" ] [ text "loading" ] ]

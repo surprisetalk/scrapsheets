@@ -51,19 +51,26 @@
           flags: {},
         });
 
-        function catchy(func) {
+        // Debug logging helper
+        const debug = {
+          log: (...args) => console.log('[scrapsheets]', ...args),
+          error: (...args) => console.error('[scrapsheets]', ...args),
+          warn: (...args) => console.warn('[scrapsheets]', ...args),
+        };
+
+        function catchy(func, context = 'unknown') {
           return (...args) => {
             try {
               return func.apply(this, args)?.catch((error) => {
-                console.error(error);
+                debug.error(`Error in ${context}:`, error);
                 app.ports.docErrored.send(
-                  error?.message ?? "Something went wrong.",
+                  `[${context}] ${error?.message ?? "Something went wrong."}`,
                 );
               });
             } catch (error) {
-              console.error(error);
+              debug.error(`Sync error in ${context}:`, error);
               app.ports.docErrored.send(
-                error?.message ?? "Something went wrong.",
+                `[${context}] ${error?.message ?? "Something went wrong."}`,
               );
             }
           };
@@ -213,12 +220,46 @@
             "wss://api.sheets.scrap.land/library/sync" +
             (token ? `?auth=Bearer%20${encodeURIComponent(token)}` : "");
 
+          // Track sync connection status
+          const syncStatus = {
+            connected: false,
+            lastError: null,
+            attempts: 0,
+          };
+
+          debug.log('Initializing repo with sync URL:', syncUrl);
+          const networkAdapter = new BrowserWebSocketClientAdapter(syncUrl);
+
           const repo = new Repo({
             storage: new IndexedDBStorageAdapter(),
-            network: [
-              new BrowserWebSocketClientAdapter(syncUrl),
-            ],
+            network: [networkAdapter],
           });
+
+          // Log repo events if available
+          if (repo.on) {
+            repo.on('document', ({ handle }) => {
+              debug.log('Repo received document:', handle.documentId);
+            });
+          }
+
+          // Expose debug info globally for console access
+          window.__scrapsheets = {
+            repo,
+            syncStatus,
+            Library,
+            getDocState: (id) => {
+              const [type, doc_id] = id.split(':');
+              const inLibrary = Library.get()[id];
+              return {
+                id,
+                type,
+                doc_id,
+                inLibrary: !!inLibrary,
+                libraryEntry: inLibrary,
+                repoHandles: repo.handles ? Object.keys(repo.handles) : 'N/A',
+              };
+            },
+          };
 
           let sheet;
 
@@ -449,27 +490,59 @@
           app.ports.queryDoc.subscribe(({ id, data }) => queryDoc(id, data));
 
           let ws;
-          const selectDoc = catchy(async (id, sheet) => {
+          const selectDoc = catchy(async (id, sheetHandle) => {
             const [type, doc_id] = id.split(":");
-            const doc = Library.get()[id]?.doc ?? sheet?.doc?.();
+            debug.log('selectDoc called:', { id, type, doc_id, hasSheetHandle: !!sheetHandle });
+
+            const libraryEntry = Library.get()[id];
+            const docFromLibrary = libraryEntry?.doc;
+            const docFromHandle = sheetHandle?.doc?.();
+
+            debug.log('Document sources:', {
+              inLibrary: !!libraryEntry,
+              hasDocInLibrary: !!docFromLibrary,
+              hasDocFromHandle: !!docFromHandle,
+              libraryEntry,
+            });
+
+            const doc = docFromLibrary ?? docFromHandle;
+
             if (!doc) {
               if (type && doc_id) {
-                return app.ports.docErrored.send(
-                  `Document "${id}" could not be loaded. It may have been deleted or not synced to this device.`
-                );
+                const errorDetails = [
+                  `Document "${id}" could not be loaded.`,
+                  '',
+                  'Debug info:',
+                  `• In localStorage library: ${!!libraryEntry}`,
+                  `• Has doc in library: ${!!docFromLibrary}`,
+                  `• Automerge handle exists: ${!!sheetHandle}`,
+                  `• Handle has doc: ${!!docFromHandle}`,
+                  `• Handle state: ${sheetHandle?.state ?? 'N/A'}`,
+                  '',
+                  'Possible causes:',
+                  '• Document was deleted',
+                  '• Sync not complete (try refreshing)',
+                  '• Created on different device/browser',
+                ].join('\n');
+
+                debug.error('Document load failed:', errorDetails);
+                return app.ports.docErrored.send(errorDetails);
               }
+              debug.log('No doc_id, showing library');
               return app.ports.docSelected.send({
                 id: "",
                 data: { doc: { type: "library" } },
               });
             }
+
+            debug.log('Document loaded successfully:', { id, docType: doc.type });
             app.ports.docSelected.send({
               id,
               data: { doc: doc && { ...doc } },
             });
             if (!type || !doc_id) return;
             if (type === "query") queryDoc(id, doc.data[0]);
-            sheet?.on?.("change", (data) => {
+            sheetHandle?.on?.("change", (data) => {
               app.ports.docChanged.send({
                 id: type + ":" + data.handle.documentId,
                 data,
@@ -491,38 +564,89 @@
                   },
                 });
             }
-          });
+          }, 'selectDoc');
 
           const changeId = catchy(async (id) => {
-            const [, doc_id = ""] = id.split(":");
-            if (doc_id === sheet?.documentId) return;
+            debug.log('changeId called:', id);
+            const [type, doc_id = ""] = id.split(":");
+            if (doc_id === sheet?.documentId) {
+              debug.log('Same document, skipping');
+              return;
+            }
             ws?.close?.();
-            // TODO: Remove existing listeners.
-            sheet = await repo?.find(doc_id).catch(() => null);
+
+            // If no doc_id, just show library
+            if (!doc_id) {
+              debug.log('No doc_id, showing library');
+              sheet = null;
+              await selectDoc(id, null);
+              return;
+            }
+
+            // Try to find the document in the repo
+            debug.log('Looking up document in repo:', doc_id);
+            try {
+              sheet = await repo?.find(doc_id);
+              debug.log('repo.find result:', {
+                found: !!sheet,
+                documentId: sheet?.documentId,
+                state: sheet?.state,
+                isReady: sheet?.isReady?.(),
+              });
+
+              // Wait for the document to be ready if it exists
+              if (sheet && sheet.whenReady) {
+                debug.log('Waiting for document to be ready...');
+                const timeoutMs = 5000;
+                const readyPromise = sheet.whenReady();
+                const timeoutPromise = new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error('Document load timeout')), timeoutMs)
+                );
+                try {
+                  await Promise.race([readyPromise, timeoutPromise]);
+                  debug.log('Document ready, state:', sheet.state);
+                } catch (e) {
+                  debug.warn('Document ready timeout/error:', e.message);
+                }
+              }
+            } catch (err) {
+              debug.error('repo.find error:', err);
+              sheet = null;
+            }
+
             await selectDoc(id, sheet);
-          });
+          }, 'changeId');
           app.ports.changeId.subscribe(changeId);
           changeId(window.location.pathname.slice(1));
 
           app.ports.newDoc.subscribe(
             catchy(async ({ name, type, data }) => {
+              debug.log('newDoc called:', { name, type });
               // TODO: Remove existing listeners.
               sheet = repo?.create({ type, data });
+              if (!sheet) {
+                debug.error('Failed to create document - repo.create returned null');
+                app.ports.docErrored.send('Failed to create document. Repo may not be initialized.');
+                return;
+              }
               const id = `${type}:${sheet.documentId}`;
+              debug.log('Document created:', id);
               Library.set(id, { name: name ?? "", tags: [] });
 
               // Register document in database with retry for sync timing
+              debug.log('Registering document with server...');
               const registered = await registerDocWithRetry(id, name);
               if (!registered) {
-                console.error("Failed to register document after retries");
-                app.ports.docErrored.send("Failed to save document. Please try again.");
+                debug.error("Failed to register document after retries");
+                app.ports.docErrored.send("Failed to save document to server. The document was created locally but may not sync. Please try again.");
                 return;
               }
+              debug.log('Document registered successfully');
 
               requestAnimationFrame(() => {
                 window.location = `/${id}`;
               });
-            }),
+            }, 'newDoc'),
           );
 
           app.ports.changeDoc.subscribe(
@@ -583,13 +707,13 @@
                   }
                 }
               });
-            }),
+            }, 'changeDoc'),
           );
         }
       } catch (error) {
-        console.error(error);
+        console.error('[scrapsheets] Fatal initialization error:', error);
         app.ports.docErrored.send(
-          error?.message ?? "Something went wrong.",
+          `Initialization failed: ${error?.message ?? "Something went wrong."}`,
         );
       }
     </script>
