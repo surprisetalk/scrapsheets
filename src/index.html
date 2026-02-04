@@ -683,15 +683,19 @@
               Library.set(id, { name: name ?? "", tags: [] });
               debug.log('Saved to localStorage library');
 
-              // Try to flush storage if the method exists
-              if (repo.flush) {
-                debug.log('Flushing repo storage...');
-                await repo.flush();
-                debug.log('Repo storage flushed');
-              } else if (repo.storageSubsystem?.flush) {
-                debug.log('Flushing storage subsystem...');
-                await repo.storageSubsystem.flush();
-                debug.log('Storage subsystem flushed');
+              // Try to flush storage if the method exists (may fail if other handles aren't ready)
+              try {
+                if (repo.flush) {
+                  debug.log('Flushing repo storage...');
+                  await repo.flush();
+                  debug.log('Repo storage flushed');
+                } else if (repo.storageSubsystem?.flush) {
+                  debug.log('Flushing storage subsystem...');
+                  await repo.storageSubsystem.flush();
+                  debug.log('Storage subsystem flushed');
+                }
+              } catch (flushErr) {
+                debug.warn('Flush failed (non-fatal):', flushErr.message);
               }
 
               // Verify the document can be found before proceeding
