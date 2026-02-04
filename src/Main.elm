@@ -273,6 +273,14 @@ type alias Sheet =
     , filterOpen : Maybe String
     , findReplace : Maybe FindReplace
     , queryAutocomplete : Maybe QueryAutocomplete
+    , undoStack : List UndoEntry
+    , redoStack : List UndoEntry
+    }
+
+
+type alias UndoEntry =
+    { forward : List Patch -- Patches to redo
+    , backward : List Patch -- Patches to undo (inverse)
     }
 
 
@@ -677,6 +685,8 @@ init _ url nav =
                     , filterOpen = Nothing
                     , findReplace = Nothing
                     , queryAutocomplete = Nothing
+                    , undoStack = []
+                    , redoStack = []
                     }
                 , auth =
                     { state = Anonymous
@@ -741,6 +751,8 @@ type Msg
     | FindPrev
     | ReplaceOne
     | ReplaceAll
+    | Undo
+    | Redo
     | InputChange Input String
     | ShopFetch (Result Http.Error Table)
     | CsvImportSelect
@@ -881,6 +893,8 @@ update msg ({ sheet, auth } as model) =
                     , filterOpen = Nothing
                     , findReplace = Nothing
                     , queryAutocomplete = Nothing
+                    , undoStack = []
+                    , redoStack = []
                     }
               }
             , case data.data.doc |> D.decodeValue docDecoder of
@@ -946,10 +960,10 @@ update msg ({ sheet, auth } as model) =
             )
 
         DocMsg edit ->
-            ( { model | sheet = { sheet | write = Nothing } }
-            , case sheet.doc of
+            case sheet.doc of
                 Ok Library ->
-                    case edit of
+                    ( { model | sheet = { sheet | write = Nothing } }
+                    , case edit of
                         SheetWrite { x, y } ->
                             let
                                 id : String
@@ -973,83 +987,145 @@ update msg ({ sheet, auth } as model) =
 
                         _ ->
                             Cmd.none
+                    )
 
                 Ok (Tab table) ->
-                    changeDoc <|
-                        Idd sheet.id <|
+                    let
+                        -- Helper to get old cell value as E.Value
+                        getOldValue : Int -> String -> E.Value
+                        getOldValue rowIdx key =
+                            table.rows
+                                |> Array.get (rowIdx - 1)
+                                |> Maybe.andThen (Dict.get key)
+                                |> Maybe.map (\v -> D.decodeValue D.value v |> Result.withDefault E.null)
+                                |> Maybe.withDefault E.null
+
+                        -- Compute forward and backward patches based on edit type
+                        ( forwardPatches, backwardPatches ) =
                             case edit of
                                 SheetWrite { x, y } ->
-                                    case max 0 y of
-                                        0 ->
-                                            Maybe.map2 Tuple.pair sheet.write (Array.get x table.cols)
-                                                |> Maybe.map
-                                                    (\( write, col ) ->
-                                                        [ { action = "set"
-                                                          , path = [ E.int 0, E.string (String.fromInt x) ]
-                                                          , value =
-                                                                case String.fromInt y of
-                                                                    "-1" ->
-                                                                        E.object [ ( "name", E.string col.name ), ( "type", E.string write ), ( "key", E.string col.key ) ]
+                                    case ( max 0 y, Array.get x table.cols ) of
+                                        ( 0, Just col ) ->
+                                            -- Editing column header (row 0)
+                                            let
+                                                forward =
+                                                    sheet.write
+                                                        |> Maybe.map
+                                                            (\write ->
+                                                                [ { action = "set"
+                                                                  , path = [ E.int 0, E.string (String.fromInt x) ]
+                                                                  , value =
+                                                                        if y == -1 then
+                                                                            E.object [ ( "name", E.string col.name ), ( "type", E.string write ), ( "key", E.string col.key ) ]
 
-                                                                    "0" ->
-                                                                        E.object [ ( "name", E.string write ), ( "type", E.string (typeName col.typ) ), ( "key", E.string col.key ) ]
+                                                                        else
+                                                                            E.object [ ( "name", E.string write ), ( "type", E.string (typeName col.typ) ), ( "key", E.string col.key ) ]
+                                                                  }
+                                                                ]
+                                                            )
+                                                        |> Maybe.withDefault []
 
-                                                                    _ ->
-                                                                        E.object [ ( "name", E.string col.name ), ( "type", E.string (typeName col.typ) ), ( "key", E.string col.key ) ]
-                                                          }
-                                                        ]
-                                                    )
-                                                |> Maybe.withDefault []
+                                                backward =
+                                                    [ { action = "set"
+                                                      , path = [ E.int 0, E.string (String.fromInt x) ]
+                                                      , value = E.object [ ( "name", E.string col.name ), ( "type", E.string (typeName col.typ) ), ( "key", E.string col.key ) ]
+                                                      }
+                                                    ]
+                                            in
+                                            ( forward, backward )
+
+                                        ( rowY, Just col ) ->
+                                            -- Editing data cell
+                                            let
+                                                oldValue =
+                                                    getOldValue rowY col.key
+
+                                                forward =
+                                                    [ { action = "set"
+                                                      , path = [ E.int rowY, E.string col.key ]
+                                                      , value = sheet.write |> Maybe.map E.string |> Maybe.withDefault E.null
+                                                      }
+                                                    ]
+
+                                                backward =
+                                                    [ { action = "set"
+                                                      , path = [ E.int rowY, E.string col.key ]
+                                                      , value = oldValue
+                                                      }
+                                                    ]
+                                            in
+                                            ( forward, backward )
 
                                         _ ->
-                                            table.cols
-                                                |> Array.get x
-                                                |> Maybe.map
-                                                    (\col ->
-                                                        [ { action = "set"
-                                                          , path = [ E.int y, E.string col.key ]
-                                                          , value = sheet.write |> Maybe.map E.string |> Maybe.withDefault E.null
-                                                          }
-                                                        ]
-                                                    )
-                                                |> Maybe.withDefault []
+                                            ( [], [] )
 
-                                SheetRowPush i ->
-                                    [ { action = "push"
-                                      , path = []
-                                      , value = E.list identity [ E.object [] ]
-                                      }
-                                    ]
+                                SheetRowPush _ ->
+                                    let
+                                        rowCount =
+                                            Array.length table.rows + 1
+
+                                        forward =
+                                            [ { action = "push"
+                                              , path = []
+                                              , value = E.list identity [ E.object [] ]
+                                              }
+                                            ]
+
+                                        backward =
+                                            [ { action = "splice"
+                                              , path = []
+                                              , value = E.list E.int [ rowCount, 1 ]
+                                              }
+                                            ]
+                                    in
+                                    ( forward, backward )
 
                                 SheetColumnPush ->
-                                    [ { action = "push"
-                                      , path = [ E.int 0 ]
-                                      , value = E.list identity [ E.object [ ( "name", E.string "" ), ( "type", E.string "text" ), ( "key", E.int (Array.length table.cols) ) ] ]
-                                      }
-                                    ]
+                                    let
+                                        colCount =
+                                            Array.length table.cols
+
+                                        forward =
+                                            [ { action = "push"
+                                              , path = [ E.int 0 ]
+                                              , value = E.list identity [ E.object [ ( "name", E.string "" ), ( "type", E.string "text" ), ( "key", E.int colCount ) ] ]
+                                              }
+                                            ]
+
+                                        backward =
+                                            [ { action = "splice"
+                                              , path = [ E.int 0 ]
+                                              , value = E.list E.int [ colCount, 1 ]
+                                              }
+                                            ]
+                                    in
+                                    ( forward, backward )
 
                                 SheetRowDelete indices ->
-                                    -- Delete rows from highest to lowest to maintain index validity
-                                    indices
-                                        |> List.sort
-                                        |> List.reverse
-                                        |> List.map
-                                            (\i ->
-                                                { action = "splice"
-                                                , path = []
-                                                , value = E.list E.int [ i, 1 ]
-                                                }
-                                            )
+                                    -- Delete rows - no undo support for now (would need to store row data)
+                                    let
+                                        forward =
+                                            indices
+                                                |> List.sort
+                                                |> List.reverse
+                                                |> List.map
+                                                    (\i ->
+                                                        { action = "splice"
+                                                        , path = []
+                                                        , value = E.list E.int [ i, 1 ]
+                                                        }
+                                                    )
+                                    in
+                                    ( forward, [] )
 
                                 SheetColumnDelete indices ->
-                                    -- Delete columns and their data from rows
+                                    -- Delete columns - no undo support for now (would need to store column data)
                                     let
                                         colKeys =
                                             indices
                                                 |> List.filterMap (\i -> Array.get i table.cols)
                                                 |> List.map .key
 
-                                        -- Remove columns from header (index 0)
                                         colPatches =
                                             indices
                                                 |> List.sort
@@ -1062,7 +1138,6 @@ update msg ({ sheet, auth } as model) =
                                                         }
                                                     )
 
-                                        -- Remove column data from each row
                                         rowPatches =
                                             table.rows
                                                 |> Array.toIndexedList
@@ -1078,39 +1153,96 @@ update msg ({ sheet, auth } as model) =
                                                                 )
                                                     )
                                     in
-                                    colPatches ++ rowPatches
+                                    ( colPatches ++ rowPatches, [] )
 
                                 SheetClearCells indices ->
-                                    -- Clear cell contents without deleting rows
-                                    indices
-                                        |> List.filterMap
-                                            (\idx ->
-                                                Array.get idx.x table.cols
-                                                    |> Maybe.map
-                                                        (\col ->
-                                                            { action = "set"
-                                                            , path = [ E.int idx.y, E.string col.key ]
-                                                            , value = E.string ""
-                                                            }
-                                                        )
-                                            )
+                                    let
+                                        patchPairs =
+                                            indices
+                                                |> List.filterMap
+                                                    (\idx ->
+                                                        Array.get idx.x table.cols
+                                                            |> Maybe.map
+                                                                (\col ->
+                                                                    ( { action = "set"
+                                                                      , path = [ E.int idx.y, E.string col.key ]
+                                                                      , value = E.string ""
+                                                                      }
+                                                                    , { action = "set"
+                                                                      , path = [ E.int idx.y, E.string col.key ]
+                                                                      , value = getOldValue idx.y col.key
+                                                                      }
+                                                                    )
+                                                                )
+                                                    )
+
+                                        forward =
+                                            List.map Tuple.first patchPairs
+
+                                        backward =
+                                            List.map Tuple.second patchPairs
+                                    in
+                                    ( forward, backward )
 
                                 CellCheck i c ->
-                                    table.cols
-                                        |> Array.get i.x
-                                        |> Maybe.map
-                                            (\col ->
-                                                [ { action = "set"
-                                                  , path = [ E.int i.y, E.string col.key ]
-                                                  , value = E.bool c
-                                                  }
-                                                ]
-                                            )
-                                        |> Maybe.withDefault []
+                                    case Array.get i.x table.cols of
+                                        Just col ->
+                                            let
+                                                oldValue =
+                                                    getOldValue i.y col.key
+
+                                                forward =
+                                                    [ { action = "set"
+                                                      , path = [ E.int i.y, E.string col.key ]
+                                                      , value = E.bool c
+                                                      }
+                                                    ]
+
+                                                backward =
+                                                    [ { action = "set"
+                                                      , path = [ E.int i.y, E.string col.key ]
+                                                      , value = oldValue
+                                                      }
+                                                    ]
+                                            in
+                                            ( forward, backward )
+
+                                        Nothing ->
+                                            ( [], [] )
+
+                        -- Update undo stack if we have patches to track
+                        newUndoStack =
+                            if List.isEmpty forwardPatches || List.isEmpty backwardPatches then
+                                sheet.undoStack
+
+                            else
+                                { forward = forwardPatches, backward = backwardPatches } :: sheet.undoStack |> List.take 50
+
+                        -- Clear redo stack on new changes (unless no undo tracking)
+                        newRedoStack =
+                            if List.isEmpty backwardPatches then
+                                sheet.redoStack
+
+                            else
+                                []
+                    in
+                    if List.isEmpty forwardPatches then
+                        ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
+
+                    else
+                        ( { model
+                            | sheet =
+                                { sheet
+                                    | write = Nothing
+                                    , undoStack = newUndoStack
+                                    , redoStack = newRedoStack
+                                }
+                          }
+                        , changeDoc { id = sheet.id, data = forwardPatches }
+                        )
 
                 _ ->
-                    Cmd.none
-            )
+                    ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
 
         DocDelete id ->
             ( model, deleteDoc id )
@@ -1497,6 +1629,38 @@ update msg ({ sheet, auth } as model) =
                 _ ->
                     ( model, Cmd.none )
 
+        Undo ->
+            case sheet.undoStack of
+                [] ->
+                    ( model, Cmd.none )
+
+                entry :: rest ->
+                    ( { model
+                        | sheet =
+                            { sheet
+                                | undoStack = rest
+                                , redoStack = entry :: sheet.redoStack
+                            }
+                      }
+                    , changeDoc { id = sheet.id, data = entry.backward }
+                    )
+
+        Redo ->
+            case sheet.redoStack of
+                [] ->
+                    ( model, Cmd.none )
+
+                entry :: rest ->
+                    ( { model
+                        | sheet =
+                            { sheet
+                                | redoStack = rest
+                                , undoStack = entry :: sheet.undoStack
+                            }
+                      }
+                    , changeDoc { id = sheet.id, data = entry.forward }
+                    )
+
         KeyDown event ->
             -- Handle global shortcuts first (Ctrl+F, Ctrl+H, Escape for find/replace)
             if (event.ctrl || event.meta) && event.key == "f" then
@@ -1510,6 +1674,15 @@ update msg ({ sheet, auth } as model) =
 
             else if event.key == "Enter" && sheet.findReplace /= Nothing then
                 update FindNext model
+
+            else if (event.ctrl || event.meta) && event.key == "z" && not event.shift then
+                update Undo model
+
+            else if (event.ctrl || event.meta) && event.key == "z" && event.shift then
+                update Redo model
+
+            else if (event.ctrl || event.meta) && event.key == "y" then
+                update Redo model
 
             else
                 let
