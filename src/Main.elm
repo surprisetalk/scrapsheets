@@ -100,6 +100,23 @@ usd amount =
     iif (amount < 0) "-" "" ++ "$" ++ commas intPart ++ "." ++ decPart
 
 
+formatPercentage : Float -> String
+formatPercentage value =
+    -- Assumes value is a decimal (e.g., 0.25 = 25%)
+    let
+        percentage =
+            value * 100 |> round2
+
+        formatted =
+            if percentage == toFloat (round percentage) then
+                String.fromInt (round percentage)
+
+            else
+                String.fromFloat percentage
+    in
+    formatted ++ "%"
+
+
 
 ---- PORTS --------------------------------------------------------------------
 
@@ -445,6 +462,8 @@ type
     | Number
     | Usd
     | Boolean
+    | Percentage
+    | Date
     | Many Type
     | Link
     | SheetId
@@ -454,6 +473,7 @@ type
     | Delete
     | Create
     | Form (Dict String String)
+    | Enum (List String)
 
 
 typeName : Type -> String
@@ -473,6 +493,12 @@ typeName typ =
 
         Boolean ->
             "bool"
+
+        Percentage ->
+            "pct"
+
+        Date ->
+            "date"
 
         Many typ_ ->
             "list " ++ typeName typ_
@@ -500,6 +526,9 @@ typeName typ =
 
         Form _ ->
             "form"
+
+        Enum options ->
+            "enum:" ++ String.join "," options
 
 
 
@@ -620,24 +649,41 @@ colDecoder =
                 , ( "num", Number )
                 , ( "int", Number )
                 , ( "usd", Usd )
+                , ( "pct", Percentage )
+                , ( "percentage", Percentage )
+                , ( "percent", Percentage )
                 , ( "sheet_id", SheetId )
                 , ( "link", Link )
                 , ( "image", Image )
                 , ( "form", Form Dict.empty )
                 , ( "timestamp", Timestamp )
                 , ( "datetime", Timestamp )
-                , ( "date", Timestamp )
+                , ( "date", Date )
                 , ( "json", Json )
                 , ( "text", Text )
                 , ( "string", Text )
                 , ( "create", Create )
                 ]
+
+        parseType : String -> Type
+        parseType typeStr =
+            if String.startsWith "enum:" typeStr then
+                -- Parse "enum:option1,option2,option3"
+                typeStr
+                    |> String.dropLeft 5
+                    |> String.split ","
+                    |> List.map String.trim
+                    |> List.filter (not << String.isEmpty)
+                    |> Enum
+
+            else
+                Dict.get typeStr types |> Maybe.withDefault Unknown
     in
     D.oneOf
         [ D.map3 Col
             (D.field "key" string)
             (D.field "name" D.string)
-            (D.field "type" (D.nullable D.string |> D.map (Maybe.andThen (flip Dict.get types) >> Maybe.withDefault Unknown)))
+            (D.field "type" (D.nullable D.string |> D.map (Maybe.map parseType >> Maybe.withDefault Unknown)))
         , D.succeed (Col "" "" Text)
         ]
 
@@ -2965,6 +3011,9 @@ view ({ sheet } as model) =
                                                                         Number ->
                                                                             S.textAlignRight
 
+                                                                        Percentage ->
+                                                                            S.textAlignRight
+
                                                                         Delete ->
                                                                             S.textAlignCenter
 
@@ -2989,6 +3038,9 @@ view ({ sheet } as model) =
                                                                         Usd ->
                                                                             S.widthRem 0.5
 
+                                                                        Percentage ->
+                                                                            S.widthRem 0.5
+
                                                                         Delete ->
                                                                             S.widthRem 0.5
 
@@ -2998,7 +3050,31 @@ view ({ sheet } as model) =
                                                                 <|
                                                                     case ( String.fromInt n, sheet.write /= Nothing && sheet.select == rect i n i n ) of
                                                                         ( _, True ) ->
-                                                                            [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
+                                                                            case col.typ of
+                                                                                Enum options ->
+                                                                                    [ H.select
+                                                                                        [ A.id "new-cell"
+                                                                                        , A.value (Maybe.withDefault "" sheet.write)
+                                                                                        , A.onInput (InputChange CellWrite)
+                                                                                        , A.onBlur (DocMsg (SheetWrite sheet.select.a))
+                                                                                        , S.width "100%"
+                                                                                        , S.height "100%"
+                                                                                        ]
+                                                                                        (H.option [ A.value "" ] [ text "-- select --" ]
+                                                                                            :: List.map
+                                                                                                (\opt ->
+                                                                                                    H.option
+                                                                                                        [ A.value opt
+                                                                                                        , A.selected (Just opt == sheet.write)
+                                                                                                        ]
+                                                                                                        [ text opt ]
+                                                                                                )
+                                                                                                options
+                                                                                        )
+                                                                                    ]
+
+                                                                                _ ->
+                                                                                    [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
 
                                                                         ( "-2", _ ) ->
                                                                             case Maybe.andThen (Array.get i) (Result.toMaybe stats) of
@@ -3192,6 +3268,20 @@ view ({ sheet } as model) =
                                                                                                     [ D.map (text << usd) number
                                                                                                     , D.map text string
                                                                                                     ]
+
+                                                                                            Percentage ->
+                                                                                                D.oneOf
+                                                                                                    [ D.map (text << formatPercentage) number
+                                                                                                    , D.map text string
+                                                                                                    ]
+
+                                                                                            Date ->
+                                                                                                D.oneOf
+                                                                                                    [ D.map text string
+                                                                                                    ]
+
+                                                                                            Enum _ ->
+                                                                                                D.map text string
 
                                                                                             Delete ->
                                                                                                 D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])
