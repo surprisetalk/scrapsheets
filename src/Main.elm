@@ -164,6 +164,12 @@ port pasteFromClipboard : (String -> msg) -> Sub msg
 port requestCopy : (() -> msg) -> Sub msg
 
 
+port queryEditorState : ({ cursorPos : Int, textBeforeCursor : String } -> msg) -> Sub msg
+
+
+port insertAtCursor : String -> Cmd msg
+
+
 type alias DocDelta =
     -- TODO: This should only include the deltas and not the full doc.
     { doc : D.Value
@@ -266,6 +272,14 @@ type alias Sheet =
     , filters : Dict String Filter
     , filterOpen : Maybe String
     , findReplace : Maybe FindReplace
+    , queryAutocomplete : Maybe QueryAutocomplete
+    }
+
+
+type alias QueryAutocomplete =
+    { trigger : String -- The text that triggered autocomplete (e.g., "@tab")
+    , suggestions : List String -- Matching sheet IDs
+    , selectedIndex : Int -- Currently highlighted suggestion
     }
 
 
@@ -662,6 +676,7 @@ init _ url nav =
                     , filters = Dict.empty
                     , filterOpen = Nothing
                     , findReplace = Nothing
+                    , queryAutocomplete = Nothing
                     }
                 , auth =
                     { state = Anonymous
@@ -737,6 +752,10 @@ type Msg
     | ClipboardCopy
     | ClipboardPaste String
     | SelectAll
+    | QueryEditorUpdate { cursorPos : Int, textBeforeCursor : String }
+    | AutocompleteSelect String
+    | AutocompleteNav Int
+    | AutocompleteClose
 
 
 type alias KeyEvent =
@@ -789,6 +808,7 @@ subs model =
         , Browser.onKeyDown keyEventDecoder
         , pasteFromClipboard ClipboardPaste
         , requestCopy (always ClipboardCopy)
+        , queryEditorState QueryEditorUpdate
         ]
 
 
@@ -860,6 +880,7 @@ update msg ({ sheet, auth } as model) =
                     , filters = Dict.empty
                     , filterOpen = Nothing
                     , findReplace = Nothing
+                    , queryAutocomplete = Nothing
                     }
               }
             , case data.data.doc |> D.decodeValue docDecoder of
@@ -1769,6 +1790,113 @@ update msg ({ sheet, auth } as model) =
 
                         else
                             ( model, Cmd.none )
+
+        QueryEditorUpdate { cursorPos, textBeforeCursor } ->
+            -- Handle special keyboard navigation signals
+            case textBeforeCursor of
+                "__NAV_DOWN__" ->
+                    update (AutocompleteNav 1) model
+
+                "__NAV_UP__" ->
+                    update (AutocompleteNav -1) model
+
+                "__SELECT__" ->
+                    case sheet.queryAutocomplete of
+                        Just ac ->
+                            ac.suggestions
+                                |> List.drop ac.selectedIndex
+                                |> List.head
+                                |> Maybe.map (\ref -> update (AutocompleteSelect ref) model)
+                                |> Maybe.withDefault ( model, Cmd.none )
+
+                        Nothing ->
+                            ( model, Cmd.none )
+
+                "__CLOSE__" ->
+                    update AutocompleteClose model
+
+                _ ->
+                    -- Normal cursor position update - check for autocomplete trigger
+                    let
+                        -- Find the last @ and get text after it
+                        maybeAtIndex =
+                            String.indices "@" textBeforeCursor
+                                |> List.reverse
+                                |> List.head
+
+                        autocomplete =
+                            case maybeAtIndex of
+                                Just atIdx ->
+                                    let
+                                        trigger =
+                                            String.dropLeft atIdx textBeforeCursor
+
+                                        -- Filter matching sheet IDs
+                                        searchTerm =
+                                            String.dropLeft 1 trigger
+                                                |> String.toLower
+
+                                        matches =
+                                            model.library
+                                                |> Dict.keys
+                                                |> List.filter
+                                                    (\k ->
+                                                        (String.startsWith "table:" k || String.startsWith "query:" k)
+                                                            && String.contains searchTerm (String.toLower k)
+                                                    )
+                                                |> List.take 8
+                                    in
+                                    if String.contains " " trigger || String.contains "\n" trigger then
+                                        -- Space or newline after @ cancels autocomplete
+                                        Nothing
+
+                                    else if List.isEmpty matches then
+                                        Nothing
+
+                                    else
+                                        Just
+                                            { trigger = trigger
+                                            , suggestions = matches
+                                            , selectedIndex = 0
+                                            }
+
+                                Nothing ->
+                                    Nothing
+                    in
+                    ( { model | sheet = { sheet | queryAutocomplete = autocomplete } }, Cmd.none )
+
+        AutocompleteSelect ref ->
+            -- Insert the selected reference and close autocomplete
+            case sheet.queryAutocomplete of
+                Just ac ->
+                    let
+                        -- Calculate what to insert (reference minus what's already typed)
+                        toInsert =
+                            String.dropLeft (String.length ac.trigger) ref
+                    in
+                    ( { model | sheet = { sheet | queryAutocomplete = Nothing } }
+                    , insertAtCursor toInsert
+                    )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        AutocompleteNav delta ->
+            case sheet.queryAutocomplete of
+                Just ac ->
+                    let
+                        newIndex =
+                            modBy (List.length ac.suggestions) (ac.selectedIndex + delta)
+                    in
+                    ( { model | sheet = { sheet | queryAutocomplete = Just { ac | selectedIndex = newIndex } } }
+                    , Cmd.none
+                    )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        AutocompleteClose ->
+            ( { model | sheet = { sheet | queryAutocomplete = Nothing } }, Cmd.none )
 
         AuthMsg authMsg ->
             case authMsg of
@@ -3019,19 +3147,159 @@ view ({ sheet } as model) =
                         []
 
                     Ok (Query query) ->
-                        [ H.div [ S.minHeightRem 10, S.height "100%", S.width "100%", S.minWidth "25vw", S.displayFlex, S.positionRelative, S.overflowAuto ]
-                            [ H.textarea [ A.id "code", A.onInput (InputChange QueryCode), S.height "100%", S.width "100%", S.whiteSpacePre, S.fontSizeRem 0.75, S.border "none", S.backgroundColor "transparent", S.paddingRem 1, S.lineHeightRem 1.5 ]
-                                [ text (String.trim query.code)
+                        let
+                            codeLines =
+                                String.lines (String.trim query.code)
+
+                            lineCount =
+                                max 1 (List.length codeLines)
+
+                            -- Available sheet references for hints
+                            sheetRefs =
+                                model.library
+                                    |> Dict.keys
+                                    |> List.filter (\k -> String.startsWith "table:" k || String.startsWith "query:" k)
+                                    |> List.take 5
+                        in
+                        [ H.div [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%", S.minWidth "25vw" ]
+                            [ -- Editor with line numbers
+                              H.div [ S.displayFlex, S.flexGrow "1", S.minHeightRem 8, S.overflowAuto, S.backgroundColor "#f8f8f8" ]
+                                [ -- Line numbers gutter
+                                  H.div
+                                    [ S.paddingRem 1
+                                    , S.paddingRight "0.5rem"
+                                    , S.backgroundColor "#eee"
+                                    , S.borderRight "1px solid #ddd"
+                                    , S.fontFamily "monospace"
+                                    , S.fontSizeRem 0.75
+                                    , S.lineHeightRem 1.5
+                                    , S.color "#999"
+                                    , S.textAlign "right"
+                                    , S.userSelect "none"
+                                    , S.minWidthRem 2.5
+                                    ]
+                                    (List.range 1 lineCount
+                                        |> List.map (\n -> H.div [] [ text (String.fromInt n) ])
+                                    )
+
+                                -- Code textarea with autocomplete
+                                , H.div [ S.positionRelative, S.flexGrow "1", S.height "100%" ]
+                                    [ H.textarea
+                                        [ A.id "code"
+                                        , A.onInput (InputChange QueryCode)
+                                        , A.spellcheck False
+                                        , S.height "100%"
+                                        , S.width "100%"
+                                        , S.whiteSpacePre
+                                        , S.fontFamily "monospace"
+                                        , S.fontSizeRem 0.75
+                                        , S.border "none"
+                                        , S.backgroundColor "transparent"
+                                        , S.paddingRem 1
+                                        , S.paddingLeft "0.5rem"
+                                        , S.lineHeightRem 1.5
+                                        , S.resize "none"
+                                        , S.outline "none"
+                                        ]
+                                        [ text (String.trim query.code) ]
+
+                                    -- Autocomplete dropdown
+                                    , case sheet.queryAutocomplete of
+                                        Nothing ->
+                                            text ""
+
+                                        Just ac ->
+                                            H.div
+                                                [ S.positionAbsolute
+                                                , S.top "2rem"
+                                                , S.left "0.5rem"
+                                                , S.backgroundColor "#fff"
+                                                , S.border "1px solid #ccc"
+                                                , S.borderRadius "4px"
+                                                , S.boxShadow "0 2px 8px rgba(0,0,0,0.15)"
+                                                , S.zIndex "100"
+                                                , S.maxHeightRem 12
+                                                , S.overflowYAuto
+                                                , S.minWidthRem 15
+                                                ]
+                                                (ac.suggestions
+                                                    |> List.indexedMap
+                                                        (\i ref ->
+                                                            H.div
+                                                                [ A.onClick (AutocompleteSelect ref)
+                                                                , S.padding "0.5rem 0.75rem"
+                                                                , S.cursorPointer
+                                                                , S.fontFamily "monospace"
+                                                                , S.fontSizeRem 0.75
+                                                                , S.backgroundColor
+                                                                    (if i == ac.selectedIndex then
+                                                                        "#e8f4ff"
+
+                                                                     else
+                                                                        "transparent"
+                                                                    )
+                                                                , S.borderBottom "1px solid #eee"
+                                                                ]
+                                                                [ H.span [ S.color "#888" ] [ text "@" ]
+                                                                , text ref
+                                                                ]
+                                                        )
+                                                )
+                                    ]
                                 ]
 
-                            -- -- TODO: Implement query submit button and language selector.
-                            -- , H.div [ S.displayFlex, S.alignItemsCenter, S.gapRem 1, S.positionAbsolute, S.bottomRem 1.5, S.rightRem 1.5 ]
-                            --     -- TODO: Add "visual" and "chart" options.
-                            --     [ H.select []
-                            --         [ H.option [] [ text "sql" ]
-                            --         ]
-                            --     , H.button [ S.backgroundColor "#f0f0f0", S.padding "0.25rem 0.5rem", S.border "1px solid #aaa" ] [ text "submit" ]
-                            --     ]
+                            -- Query error display (inline, below editor)
+                            , case model.error of
+                                "" ->
+                                    text ""
+
+                                err ->
+                                    H.div
+                                        [ S.backgroundColor "#fee"
+                                        , S.borderTop "2px solid #c66"
+                                        , S.padding "0.75rem"
+                                        , S.fontFamily "monospace"
+                                        , S.fontSizeRem 0.75
+                                        , S.whiteSpacePre
+                                        , S.overflowXAuto
+                                        , S.maxHeightRem 8
+                                        , S.overflowYAuto
+                                        ]
+                                        [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsStart ]
+                                            [ H.span [ S.color "#c00" ] [ text err ]
+                                            , H.button
+                                                [ A.onClick (DocError "")
+                                                , S.border "none"
+                                                , S.background "transparent"
+                                                , S.cursorPointer
+                                                , S.color "#c00"
+                                                , S.fontSizeRem 1
+                                                , S.marginLeft "0.5rem"
+                                                ]
+                                                [ text "×" ]
+                                            ]
+                                        ]
+
+                            -- Sheet reference hints
+                            , if List.isEmpty sheetRefs then
+                                text ""
+
+                              else
+                                H.div
+                                    [ S.padding "0.5rem 0.75rem"
+                                    , S.backgroundColor "#f0f0f0"
+                                    , S.borderTop "1px solid #ddd"
+                                    , S.fontSizeRem 0.7
+                                    , S.color "#666"
+                                    ]
+                                    [ H.span [ S.fontWeight "600" ] [ text "Sheet refs: " ]
+                                    , text (String.join ", " (List.map (\s -> "@" ++ s) sheetRefs))
+                                    , if Dict.size model.library > 5 then
+                                        H.span [ S.color "#999" ] [ text " ..." ]
+
+                                      else
+                                        text ""
+                                    ]
                             ]
                         ]
 

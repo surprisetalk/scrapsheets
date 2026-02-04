@@ -180,6 +180,75 @@
 
         app.ports.updateLibrary.subscribe(({ id, data }) => Library.set(id, data));
 
+        // Query editor autocomplete
+        const setupQueryEditorTracking = () => {
+          const codeEditor = document.getElementById('code');
+          if (!codeEditor) return;
+
+          // Track cursor position on input and selection change
+          const reportState = () => {
+            if (!app.ports.queryEditorState) return;
+            const cursorPos = codeEditor.selectionStart;
+            const textBeforeCursor = codeEditor.value.substring(0, cursorPos);
+            app.ports.queryEditorState.send({ cursorPos, textBeforeCursor });
+          };
+
+          codeEditor.addEventListener('input', reportState);
+          codeEditor.addEventListener('click', reportState);
+          codeEditor.addEventListener('keyup', (e) => {
+            // Report on arrow keys and other navigation
+            if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) {
+              reportState();
+            }
+          });
+
+          // Handle autocomplete keyboard navigation
+          codeEditor.addEventListener('keydown', (e) => {
+            // Check if autocomplete is showing (hacky but works)
+            const dropdown = document.querySelector('[style*="z-index: 100"]');
+            if (!dropdown) return;
+
+            if (e.key === 'ArrowDown') {
+              e.preventDefault();
+              app.ports.queryEditorState.send({ cursorPos: -1, textBeforeCursor: '__NAV_DOWN__' });
+            } else if (e.key === 'ArrowUp') {
+              e.preventDefault();
+              app.ports.queryEditorState.send({ cursorPos: -2, textBeforeCursor: '__NAV_UP__' });
+            } else if (e.key === 'Enter' || e.key === 'Tab') {
+              e.preventDefault();
+              app.ports.queryEditorState.send({ cursorPos: -3, textBeforeCursor: '__SELECT__' });
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              app.ports.queryEditorState.send({ cursorPos: -4, textBeforeCursor: '__CLOSE__' });
+            }
+          });
+        };
+
+        // Insert text at cursor in query editor
+        app.ports.insertAtCursor.subscribe((text) => {
+          const codeEditor = document.getElementById('code');
+          if (!codeEditor) return;
+
+          const start = codeEditor.selectionStart;
+          const end = codeEditor.selectionEnd;
+          const value = codeEditor.value;
+
+          codeEditor.value = value.substring(0, start) + text + value.substring(end);
+          codeEditor.selectionStart = codeEditor.selectionEnd = start + text.length;
+          codeEditor.focus();
+
+          // Trigger input event so Elm gets the updated value
+          codeEditor.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+
+        // Re-setup editor tracking when DOM changes (e.g., navigating to a query)
+        const observer = new MutationObserver(() => {
+          if (document.getElementById('code')) {
+            setupQueryEditorTracking();
+          }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+
         // Clipboard handling
         app.ports.copyToClipboard.subscribe(async (text) => {
           try {
@@ -484,9 +553,62 @@
             if (status >= 400) throw new Error("Something went wrong.");
             return res;
           };
+          // Parse SQL error to extract position info
+          const parseQueryError = (error, code) => {
+            const msg = error?.message || String(error);
+            const lines = code.split('\n');
+
+            // Try to extract line/column from common error patterns
+            // AlaSQL: "Parse error on line X"
+            const lineMatch = msg.match(/line\s+(\d+)/i);
+            // Position in string
+            const posMatch = msg.match(/position\s+(\d+)/i);
+
+            let lineNum = null;
+            let colNum = null;
+            let context = null;
+
+            if (lineMatch) {
+              lineNum = parseInt(lineMatch[1], 10);
+            }
+
+            if (posMatch && !lineNum) {
+              // Convert position to line/column
+              const pos = parseInt(posMatch[1], 10);
+              let charCount = 0;
+              for (let i = 0; i < lines.length; i++) {
+                if (charCount + lines[i].length >= pos) {
+                  lineNum = i + 1;
+                  colNum = pos - charCount;
+                  break;
+                }
+                charCount += lines[i].length + 1; // +1 for newline
+              }
+            }
+
+            // Add context (the offending line)
+            if (lineNum && lineNum <= lines.length) {
+              context = lines[lineNum - 1];
+            }
+
+            // Format error message with line info
+            let formatted = msg;
+            if (lineNum) {
+              formatted = `Line ${lineNum}${colNum ? `:${colNum}` : ''}: ${msg}`;
+              if (context) {
+                formatted += `\n\n  ${lineNum} │ ${context}`;
+                if (colNum) {
+                  formatted += `\n    │ ${' '.repeat(colNum - 1)}^`;
+                }
+              }
+            }
+
+            return formatted;
+          };
+
           const queryDoc = debounce(
-            catchy(
-              async (id, { code, lang, args, cols: cols_ = {} }) => {
+            async (id, { code, lang, args, cols: cols_ = {} }) => {
+              try {
                 switch (lang) {
                   case "sql":
                     // TODO: Run alasql if possible, otherwise post to /query.
@@ -518,10 +640,13 @@
                     });
                     break;
                   default:
-                    throw new Error(`TODO: ${lang}`);
+                    throw new Error(`Unsupported query language: ${lang}`);
                 }
-              },
-            ),
+              } catch (error) {
+                const formatted = parseQueryError(error, code);
+                app.ports.docErrored.send(formatted);
+              }
+            },
             300,
           );
           app.ports.queryDoc.subscribe(({ id, data }) => queryDoc(id, data));
