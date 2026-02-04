@@ -49,7 +49,8 @@
     "npm:elm-format@~0.8.8": "0.8.8",
     "npm:elm-review@*": "2.13.2",
     "npm:elm-review@^2.13.2": "2.13.2",
-    "npm:elm-test@~0.19.1-revision15": "0.19.1-revision15",
+    "npm:elm-test@*": "0.19.1-revision17",
+    "npm:elm-test@~0.19.1-revision15": "0.19.1-revision17",
     "npm:elm@*": "0.19.1-6",
     "npm:elm@~0.19.1-6": "0.19.1-6",
     "npm:pg-gateway@*": "0.3.0-beta.4",
@@ -781,8 +782,8 @@
     "elm-solve-deps-wasm@2.0.0": {
       "integrity": "sha512-11OV8FgB9qsth/F94q2SJjb1MoEgbworSyNM1L+YlxVoaxp7wtWPyA8cNcPEkSoIKG1B8Tqg68ED1P6dVamHSg=="
     },
-    "elm-test@0.19.1-revision15": {
-      "integrity": "sha512-QusEZmlctM4VePiwemfxwcDrhDHfHXuXau3SedRwWuBBnPQK3/WjMUzULWSbTCYHIj3DgkA84Co+V/nE0161cg==",
+    "elm-test@0.19.1-revision17": {
+      "integrity": "sha512-P9J8tXdLXmqgIMlSozfcb/KCORq4GuxfwBbzqFLMss8KlGmUKonOJwseRX6xVkdU5xgGVA/mz9rfMTNomIbwng==",
       "dependencies": [
         "chalk@4.1.2",
         "chokidar",

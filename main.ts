@@ -920,6 +920,227 @@ app.put("/library/:id", async (c) => {
   return c.json(null, 201);
 });
 
+// CSV Import - parse CSV and create a new table sheet
+app.post("/import/csv", async (c) => {
+  const usr_id = c.get("usr_id");
+  const contentType = c.req.header("content-type") || "";
+
+  let csvText: string;
+  let sheetName = "Imported CSV";
+
+  if (contentType.includes("multipart/form-data")) {
+    const formData = await c.req.formData();
+    const file = formData.get("file") as File | null;
+    if (!file) {
+      throw new HTTPException(400, { message: "No file provided." });
+    }
+    csvText = await file.text();
+    sheetName = file.name.replace(/\.csv$/i, "") || sheetName;
+  } else {
+    // Raw CSV text in body
+    csvText = await c.req.text();
+  }
+
+  if (!csvText.trim()) {
+    throw new HTTPException(400, { message: "Empty CSV content." });
+  }
+
+  // Parse CSV
+  const parseCSV = (text: string): string[][] => {
+    const rows: string[][] = [];
+    let currentRow: string[] = [];
+    let currentField = "";
+    let inQuotes = false;
+
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i];
+      const nextChar = text[i + 1];
+
+      if (inQuotes) {
+        if (char === '"' && nextChar === '"') {
+          currentField += '"';
+          i++; // Skip next quote
+        } else if (char === '"') {
+          inQuotes = false;
+        } else {
+          currentField += char;
+        }
+      } else {
+        if (char === '"') {
+          inQuotes = true;
+        } else if (char === ",") {
+          currentRow.push(currentField);
+          currentField = "";
+        } else if (char === "\n" || (char === "\r" && nextChar === "\n")) {
+          currentRow.push(currentField);
+          rows.push(currentRow);
+          currentRow = [];
+          currentField = "";
+          if (char === "\r") i++; // Skip \n in \r\n
+        } else if (char !== "\r") {
+          currentField += char;
+        }
+      }
+    }
+
+    // Don't forget the last field/row
+    if (currentField || currentRow.length > 0) {
+      currentRow.push(currentField);
+      rows.push(currentRow);
+    }
+
+    return rows;
+  };
+
+  const parsed = parseCSV(csvText);
+  if (parsed.length < 1) {
+    throw new HTTPException(400, { message: "CSV has no data." });
+  }
+
+  const [headerRow, ...dataRows] = parsed;
+
+  // Infer types from data
+  const inferType = (values: string[]): string => {
+    let numericCount = 0;
+    let boolCount = 0;
+    let total = 0;
+
+    for (const val of values) {
+      if (!val.trim()) continue;
+      total++;
+      if (!isNaN(Number(val))) numericCount++;
+      if (["true", "false", "t", "f", "1", "0", "yes", "no"].includes(val.toLowerCase())) boolCount++;
+    }
+
+    if (total === 0) return "text";
+    if (numericCount / total > 0.8) return "num";
+    if (boolCount / total > 0.8) return "bool";
+    return "text";
+  };
+
+  // Build column definitions
+  const cols: Col[] = headerRow.map((name, i) => {
+    const colValues = dataRows.map((row) => row[i] || "");
+    return {
+      name: name.trim() || `Column ${i + 1}`,
+      type: inferType(colValues) as Type,
+      key: String(i),
+    };
+  });
+
+  // Build rows with proper type conversion
+  const rows: Row[] = dataRows.map((row) => {
+    const obj: Row = {};
+    cols.forEach((col, i) => {
+      const val = row[i] ?? "";
+      if (col.type === "num" && val.trim()) {
+        obj[col.key] = Number(val);
+      } else if (col.type === "bool") {
+        obj[col.key] = ["true", "t", "1", "yes"].includes(val.toLowerCase());
+      } else {
+        obj[col.key] = val;
+      }
+    });
+    return obj;
+  });
+
+  // Create automerge document
+  const colsRow: Row<Col> = {};
+  cols.forEach((col, i) => {
+    colsRow[i] = col;
+  });
+
+  const tableData: Table = [colsRow, ...rows];
+  const handle = automerge.create<{ type: string; data: Table }>();
+  handle.change((doc) => {
+    doc.type = "table";
+    doc.data = tableData;
+  });
+
+  const doc_id = handle.documentId;
+
+  // Create sheet record in database
+  const sheet = {
+    name: sheetName,
+    tags: ["imported"],
+    type: "table",
+    doc_id,
+    row_0: colsRow,
+    created_by: usr_id,
+  };
+
+  const [created] = await sql`
+    with s as (
+      insert into sheet ${sql(sheet, "type", "doc_id", "name", "tags", "created_by", "row_0")}
+      returning sheet_id, created_by
+    )
+    insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s
+    returning sheet_id
+  `;
+
+  return c.json({ sheet_id: created.sheet_id, rows: rows.length, cols: cols.length }, 201);
+});
+
+// CSV Export - downloads sheet data as CSV file
+app.get("/export/:id.csv", async (c) => {
+  const sheet_id = c.req.param("id");
+  const usr_id = c.get("usr_id");
+
+  // Verify user has access to this sheet
+  const [access] = await sql`
+    select s.type, s.doc_id
+    from sheet_usr su
+    inner join sheet s using (sheet_id)
+    where su.sheet_id = ${sheet_id} and su.usr_id = ${usr_id}
+  `;
+
+  if (!access) {
+    throw new HTTPException(403, { message: "You don't have access to this sheet." });
+  }
+
+  if (access.type !== "table") {
+    throw new HTTPException(400, { message: "Only table sheets can be exported as CSV." });
+  }
+
+  // Fetch the document from Automerge
+  const handle = await automerge.find<{ data: Table }>(access.doc_id as AnyDocumentId);
+  const doc = handle.doc();
+
+  if (!doc?.data || doc.data.length < 1) {
+    throw new HTTPException(404, { message: "Document data not found." });
+  }
+
+  const [colsRow, ...rows] = doc.data;
+  const cols = Object.values(colsRow) as Col[];
+
+  // Helper to escape CSV values
+  const escapeCSV = (val: unknown): string => {
+    if (val === null || val === undefined) return "";
+    const str = String(val);
+    // Quote if contains comma, quote, or newline
+    if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+      return '"' + str.replace(/"/g, '""') + '"';
+    }
+    return str;
+  };
+
+  // Build CSV content
+  const headerRow = cols.map((col) => escapeCSV(col.name)).join(",");
+  const dataRows = rows.map((row) =>
+    cols.map((col) => escapeCSV(row[col.key])).join(",")
+  );
+  const csv = [headerRow, ...dataRows].join("\n");
+
+  // Return as downloadable CSV
+  const filename = sheet_id.replace(/[^a-zA-Z0-9-_]/g, "_") + ".csv";
+  return new Response(csv, {
+    headers: {
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${filename}"`,
+    },
+  });
+});
+
 // TODO: This currently takes sheet_id, but we want it to take doc_id.
 app.get("/net/:id", async (c) => {
   return page(c)(await sheet(c, c.req.param("id"), c.req.query()));

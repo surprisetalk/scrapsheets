@@ -9,6 +9,8 @@ import Browser.Events as Browser
 import Browser.Navigation as Nav
 import Date exposing (Date)
 import Dict exposing (Dict)
+import File exposing (File)
+import File.Select as Select
 import Html as H exposing (Html, text)
 import Html.Attributes as A
 import Html.Events as A
@@ -249,7 +251,34 @@ type alias Sheet =
     , doc : Result String Doc
     , table : Result String Table
     , stats : Result String (Dict String Stat)
+    , sort : Maybe ( String, SortOrder )
+    , filters : Dict String Filter
+    , filterOpen : Maybe String
+    , findReplace : Maybe FindReplace
     }
+
+
+type alias FindReplace =
+    { findText : String
+    , replaceText : String
+    , showReplace : Bool
+    , matches : List Index
+    , currentMatch : Int
+    }
+
+
+type SortOrder
+    = Ascending
+    | Descending
+
+
+type Filter
+    = TextContains String
+    | TextEquals String
+    | NumberGreaterThan Float
+    | NumberLessThan Float
+    | NumberBetween Float Float
+    | BooleanIs Bool
 
 
 type alias Svg =
@@ -618,6 +647,10 @@ init _ url nav =
                     , doc = Err ""
                     , table = Err ""
                     , stats = Err ""
+                    , sort = Nothing
+                    , filters = Dict.empty
+                    , filterOpen = Nothing
+                    , findReplace = Nothing
                     }
                 , auth =
                     { state = Anonymous
@@ -663,16 +696,41 @@ type Msg
     | DocNewQuery
     | DocNewTable
     | DocDelete Id
-    | KeyPress String
+    | KeyDown KeyEvent
     | CellMouseClick
     | CellMouseDoubleClick String
     | CellMouseDown
     | CellMouseUp
     | CellHover Index
+    | ColumnSort String
+    | FilterToggle String
+    | FilterSet String Filter
+    | FilterClear String
+    | FilterInput String String
+    | FindOpen Bool
+    | FindClose
+    | FindTextChange String
+    | ReplaceTextChange String
+    | FindNext
+    | FindPrev
+    | ReplaceOne
+    | ReplaceAll
     | InputChange Input String
     | ShopFetch (Result Http.Error Table)
+    | CsvImportSelect
+    | CsvImportFile File
+    | CsvImportUpload String String
+    | CsvImportResult (Result Http.Error D.Value)
     | AuthMsg AuthMsg
     | AuthResult D.Value
+
+
+type alias KeyEvent =
+    { key : String
+    , shift : Bool
+    , ctrl : Bool
+    , meta : Bool
+    }
 
 
 type AuthMsg
@@ -711,8 +769,18 @@ subs model =
         , docQueried DocQuery
         , docErrored DocError
         , authResult AuthResult
-        , Browser.onKeyPress (D.map KeyPress (D.field "key" D.string))
+        , Browser.onKeyDown keyEventDecoder
         ]
+
+
+keyEventDecoder : D.Decoder Msg
+keyEventDecoder =
+    D.map4 KeyEvent
+        (D.field "key" D.string)
+        (D.field "shiftKey" D.bool)
+        (D.field "ctrlKey" D.bool)
+        (D.field "metaKey" D.bool)
+        |> D.map KeyDown
 
 
 
@@ -769,6 +837,10 @@ update msg ({ sheet, auth } as model) =
                     , doc = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString
                     , table = Err ""
                     , stats = Err ""
+                    , sort = Nothing
+                    , filters = Dict.empty
+                    , filterOpen = Nothing
+                    , findReplace = Nothing
                     }
               }
             , case data.data.doc |> D.decodeValue docDecoder of
@@ -948,6 +1020,34 @@ update msg ({ sheet, auth } as model) =
         ShopFetch x ->
             ( { model | sheet = { sheet | table = Result.mapError (always "Something went wrong.") x } }, Cmd.none )
 
+        CsvImportSelect ->
+            ( model, Select.file [ "text/csv", ".csv" ] CsvImportFile )
+
+        CsvImportFile file ->
+            ( model
+            , Task.perform (CsvImportUpload (File.name file)) (File.toString file)
+            )
+
+        CsvImportUpload filename content ->
+            ( model
+            , Http.post
+                { url = "https://api.sheets.scrap.land/import/csv"
+                , body =
+                    Http.multipartBody
+                        [ Http.stringPart "filename" filename
+                        , Http.stringPart "content" content
+                        ]
+                , expect = Http.expectJson CsvImportResult D.value
+                }
+            )
+
+        CsvImportResult (Ok response) ->
+            -- Refresh library to show the new sheet
+            ( model, changeId "" )
+
+        CsvImportResult (Err err) ->
+            ( { model | error = "CSV import failed" }, Cmd.none )
+
         InputChange SheetSearch x ->
             ( { model | search = x, sheet = { sheet | table = Err "" } }
             , Cmd.batch
@@ -1021,11 +1121,458 @@ update msg ({ sheet, auth } as model) =
             in
             ( { model | sheet = { sheet | hover = hover, select = select_ } }, Cmd.none )
 
-        KeyPress "Enter" ->
-            ( model, Task.attempt (always NoOp) (Dom.blur "new-cell") )
+        ColumnSort key ->
+            let
+                newSort =
+                    case sheet.sort of
+                        Just ( currentKey, Ascending ) ->
+                            if currentKey == key then
+                                Just ( key, Descending )
 
-        KeyPress _ ->
-            ( model, Cmd.none )
+                            else
+                                Just ( key, Ascending )
+
+                        Just ( currentKey, Descending ) ->
+                            if currentKey == key then
+                                Nothing
+
+                            else
+                                Just ( key, Ascending )
+
+                        Nothing ->
+                            Just ( key, Ascending )
+            in
+            ( { model | sheet = { sheet | sort = newSort } }, Cmd.none )
+
+        FilterToggle key ->
+            let
+                newFilterOpen =
+                    if sheet.filterOpen == Just key then
+                        Nothing
+
+                    else
+                        Just key
+            in
+            ( { model | sheet = { sheet | filterOpen = newFilterOpen } }, Cmd.none )
+
+        FilterSet key filter ->
+            ( { model
+                | sheet =
+                    { sheet
+                        | filters = Dict.insert key filter sheet.filters
+                        , filterOpen = Nothing
+                    }
+              }
+            , Cmd.none
+            )
+
+        FilterClear key ->
+            ( { model
+                | sheet =
+                    { sheet
+                        | filters =
+                            if key == "" then
+                                Dict.empty
+
+                            else
+                                Dict.remove key sheet.filters
+                        , filterOpen = Nothing
+                    }
+              }
+            , Cmd.none
+            )
+
+        FilterInput key value ->
+            -- Create a TextContains filter from the input value
+            if String.isEmpty value then
+                ( { model | sheet = { sheet | filters = Dict.remove key sheet.filters } }, Cmd.none )
+
+            else
+                ( { model | sheet = { sheet | filters = Dict.insert key (TextContains value) sheet.filters } }, Cmd.none )
+
+        FindOpen showReplace ->
+            ( { model
+                | sheet =
+                    { sheet
+                        | findReplace =
+                            Just
+                                { findText = ""
+                                , replaceText = ""
+                                , showReplace = showReplace
+                                , matches = []
+                                , currentMatch = 0
+                                }
+                    }
+              }
+            , Task.attempt (always NoOp) (Dom.focus "find-input")
+            )
+
+        FindClose ->
+            ( { model | sheet = { sheet | findReplace = Nothing } }, Cmd.none )
+
+        FindTextChange findText ->
+            case sheet.findReplace of
+                Just fr ->
+                    let
+                        -- Find all matching cells
+                        matches =
+                            case sheet.doc of
+                                Ok (Tab tbl) ->
+                                    if String.isEmpty findText then
+                                        []
+
+                                    else
+                                        tbl.rows
+                                            |> Array.toIndexedList
+                                            |> List.concatMap
+                                                (\( rowIdx, row ) ->
+                                                    tbl.cols
+                                                        |> Array.toIndexedList
+                                                        |> List.filterMap
+                                                            (\( colIdx, col ) ->
+                                                                let
+                                                                    cellVal =
+                                                                        Dict.get col.key row
+                                                                            |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
+                                                                            |> Maybe.withDefault ""
+                                                                in
+                                                                if String.contains (String.toLower findText) (String.toLower cellVal) then
+                                                                    Just (xy colIdx (rowIdx + 1))
+
+                                                                else
+                                                                    Nothing
+                                                            )
+                                                )
+
+                                _ ->
+                                    []
+
+                        newFr =
+                            { fr
+                                | findText = findText
+                                , matches = matches
+                                , currentMatch = 0
+                            }
+
+                        -- Select the first match if any
+                        newSelect =
+                            case List.head matches of
+                                Just idx ->
+                                    Rect idx idx
+
+                                Nothing ->
+                                    sheet.select
+                    in
+                    ( { model | sheet = { sheet | findReplace = Just newFr, select = newSelect } }, Cmd.none )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        ReplaceTextChange replaceText ->
+            case sheet.findReplace of
+                Just fr ->
+                    ( { model | sheet = { sheet | findReplace = Just { fr | replaceText = replaceText } } }, Cmd.none )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        FindNext ->
+            case sheet.findReplace of
+                Just fr ->
+                    if List.isEmpty fr.matches then
+                        ( model, Cmd.none )
+
+                    else
+                        let
+                            nextIdx =
+                                modBy (List.length fr.matches) (fr.currentMatch + 1)
+
+                            nextMatch =
+                                fr.matches |> List.drop nextIdx |> List.head
+
+                            newSelect =
+                                case nextMatch of
+                                    Just idx ->
+                                        Rect idx idx
+
+                                    Nothing ->
+                                        sheet.select
+                        in
+                        ( { model | sheet = { sheet | findReplace = Just { fr | currentMatch = nextIdx }, select = newSelect } }, Cmd.none )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        FindPrev ->
+            case sheet.findReplace of
+                Just fr ->
+                    if List.isEmpty fr.matches then
+                        ( model, Cmd.none )
+
+                    else
+                        let
+                            len =
+                                List.length fr.matches
+
+                            prevIdx =
+                                modBy len (fr.currentMatch - 1 + len)
+
+                            prevMatch =
+                                fr.matches |> List.drop prevIdx |> List.head
+
+                            newSelect =
+                                case prevMatch of
+                                    Just idx ->
+                                        Rect idx idx
+
+                                    Nothing ->
+                                        sheet.select
+                        in
+                        ( { model | sheet = { sheet | findReplace = Just { fr | currentMatch = prevIdx }, select = newSelect } }, Cmd.none )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        ReplaceOne ->
+            case ( sheet.findReplace, sheet.doc ) of
+                ( Just fr, Ok (Tab tbl) ) ->
+                    case fr.matches |> List.drop fr.currentMatch |> List.head of
+                        Just matchIdx ->
+                            case Array.get matchIdx.x tbl.cols of
+                                Just col ->
+                                    ( model
+                                    , changeDoc
+                                        { id = sheet.id
+                                        , data =
+                                            [ { action = "set"
+                                              , path = [ E.int matchIdx.y, E.string col.key ]
+                                              , value = E.string fr.replaceText
+                                              }
+                                            ]
+                                        }
+                                    )
+
+                                Nothing ->
+                                    ( model, Cmd.none )
+
+                        Nothing ->
+                            ( model, Cmd.none )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        ReplaceAll ->
+            case ( sheet.findReplace, sheet.doc ) of
+                ( Just fr, Ok (Tab tbl) ) ->
+                    let
+                        patches =
+                            fr.matches
+                                |> List.filterMap
+                                    (\matchIdx ->
+                                        Array.get matchIdx.x tbl.cols
+                                            |> Maybe.map
+                                                (\col ->
+                                                    { action = "set"
+                                                    , path = [ E.int matchIdx.y, E.string col.key ]
+                                                    , value = E.string fr.replaceText
+                                                    }
+                                                )
+                                    )
+                    in
+                    if List.isEmpty patches then
+                        ( model, Cmd.none )
+
+                    else
+                        ( model
+                        , changeDoc { id = sheet.id, data = patches }
+                        )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        KeyDown event ->
+            -- Handle global shortcuts first (Ctrl+F, Ctrl+H, Escape for find/replace)
+            if (event.ctrl || event.meta) && event.key == "f" then
+                update (FindOpen False) model
+
+            else if (event.ctrl || event.meta) && event.key == "h" then
+                update (FindOpen True) model
+
+            else if event.key == "Escape" && sheet.findReplace /= Nothing then
+                update FindClose model
+
+            else if event.key == "Enter" && sheet.findReplace /= Nothing then
+                update FindNext model
+
+            else
+                let
+                    isEditing =
+                        sheet.write /= Nothing
+
+                    isFindOpen =
+                        sheet.findReplace /= Nothing
+
+                    sel =
+                        sheet.select.a
+
+                    -- Get table bounds for navigation
+                    bounds =
+                        case sheet.doc of
+                            Ok (Tab tbl) ->
+                                { maxX = Array.length tbl.cols - 1
+                                , maxY = Array.length tbl.rows
+                                }
+
+                            Ok Library ->
+                                { maxX = Array.length libraryCols - 1
+                                , maxY = Dict.size model.library
+                                }
+
+                            _ ->
+                                { maxX = 0, maxY = 0 }
+
+                    -- Move selection, clamping to bounds
+                    move : Int -> Int -> ( Model, Cmd Msg )
+                    move dx dy =
+                        let
+                            newX =
+                                clamp 0 bounds.maxX (sel.x + dx)
+
+                            newY =
+                                clamp 1 bounds.maxY (sel.y + dy)
+
+                            newSel =
+                                xy newX newY
+                        in
+                        ( { model | sheet = { sheet | select = Rect newSel newSel } }
+                        , Cmd.none
+                        )
+
+                    -- Start editing the current cell
+                    startEdit =
+                        case sheet.doc of
+                            Ok (Tab tbl) ->
+                                let
+                                    col =
+                                        Array.get sel.x tbl.cols
+
+                                    row =
+                                        Array.get (sel.y - 1) tbl.rows
+                                in
+                                case ( col, row ) of
+                                    ( Just c, Just r ) ->
+                                        let
+                                            val =
+                                                r
+                                                    |> Dict.get c.key
+                                                    |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
+                                                    |> Maybe.withDefault ""
+                                        in
+                                        ( { model | sheet = { sheet | write = Just val } }
+                                        , Task.attempt (always NoOp) (Dom.focus "new-cell")
+                                        )
+
+                                    _ ->
+                                        ( model, Cmd.none )
+
+                            Ok Library ->
+                                -- Library editing handled differently
+                                ( model, Cmd.none )
+
+                            _ ->
+                                ( model, Cmd.none )
+                in
+                if isEditing then
+                    -- When editing a cell
+                    case event.key of
+                    "Enter" ->
+                        -- Confirm edit and move down
+                        let
+                            newY =
+                                clamp 1 bounds.maxY (sel.y + 1)
+
+                            newSel =
+                                xy sel.x newY
+                        in
+                        ( { model | sheet = { sheet | select = Rect newSel newSel } }
+                        , Task.attempt (always NoOp) (Dom.blur "new-cell")
+                        )
+
+                    "Escape" ->
+                        -- Cancel edit (discard changes)
+                        ( { model | sheet = { sheet | write = Nothing } }
+                        , Cmd.none
+                        )
+
+                    "Tab" ->
+                        -- Confirm and move horizontally
+                        let
+                            dx =
+                                iif event.shift -1 1
+
+                            newX =
+                                clamp 0 bounds.maxX (sel.x + dx)
+
+                            newSel =
+                                xy newX sel.y
+                        in
+                        ( { model | sheet = { sheet | select = Rect newSel newSel } }
+                        , Task.attempt (always NoOp) (Dom.blur "new-cell")
+                        )
+
+                    _ ->
+                        ( model, Cmd.none )
+
+            else if sel.x < 0 || sel.y < 0 then
+                -- No selection yet, ignore navigation
+                ( model, Cmd.none )
+
+            else
+                -- When not editing, navigate with keys
+                case event.key of
+                    "ArrowUp" ->
+                        move 0 -1
+
+                    "ArrowDown" ->
+                        move 0 1
+
+                    "ArrowLeft" ->
+                        move -1 0
+
+                    "ArrowRight" ->
+                        move 1 0
+
+                    "Tab" ->
+                        move (iif event.shift -1 1) 0
+
+                    "Enter" ->
+                        -- Start editing current cell
+                        startEdit
+
+                    _ ->
+                        -- If it's a single printable character, start editing with it
+                        if String.length event.key == 1 && not event.ctrl && not event.meta then
+                            case sheet.doc of
+                                Ok (Tab tbl) ->
+                                    let
+                                        col =
+                                            Array.get sel.x tbl.cols
+                                    in
+                                    case col of
+                                        Just c ->
+                                            -- Start editing with the typed character
+                                            ( { model | sheet = { sheet | write = Just event.key } }
+                                            , Task.attempt (always NoOp) (Dom.focus "new-cell")
+                                            )
+
+                                        _ ->
+                                            ( model, Cmd.none )
+
+                                _ ->
+                                    ( model, Cmd.none )
+
+                        else
+                            ( model, Cmd.none )
 
         AuthMsg authMsg ->
             case authMsg of
@@ -1087,6 +1634,118 @@ libraryCols =
         , Col "tags" "tags" (Many Text)
         , Col "delete" "" Delete
         ]
+
+
+viewFindReplace : Maybe FindReplace -> Html Msg
+viewFindReplace maybeFindReplace =
+    case maybeFindReplace of
+        Nothing ->
+            text ""
+
+        Just fr ->
+            H.div
+                [ S.positionFixed
+                , S.topRem 3
+                , S.rightRem 1
+                , S.backgroundColor "#fff"
+                , S.border "1px solid #aaa"
+                , S.borderRadius "4px"
+                , S.padding "0.5rem"
+                , S.displayFlex
+                , S.flexDirectionColumn
+                , S.gapRem 0.5
+                , S.zIndex "100"
+                , S.boxShadow "0 2px 8px rgba(0,0,0,0.15)"
+                ]
+                [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter ]
+                    [ H.span [ S.fontWeight "600", S.fontSizeRem 0.875 ]
+                        [ text (iif fr.showReplace "Find & Replace" "Find") ]
+                    , H.button
+                        [ A.onClick FindClose
+                        , S.border "none"
+                        , S.background "transparent"
+                        , S.cursorPointer
+                        , S.fontSizeRem 1
+                        ]
+                        [ text "×" ]
+                    ]
+                , H.div [ S.displayFlex, S.gapRem 0.25 ]
+                    [ H.input
+                        [ A.placeholder "Find..."
+                        , A.value fr.findText
+                        , A.onInput FindTextChange
+                        , A.id "find-input"
+                        , S.padding "0.25rem 0.5rem"
+                        , S.border "1px solid #ccc"
+                        , S.borderRadius "2px"
+                        , S.widthRem 12
+                        ]
+                        []
+                    , H.button
+                        [ A.onClick FindPrev
+                        , S.padding "0.25rem 0.5rem"
+                        , S.border "1px solid #ccc"
+                        , S.borderRadius "2px"
+                        , S.cursorPointer
+                        ]
+                        [ text "◀" ]
+                    , H.button
+                        [ A.onClick FindNext
+                        , S.padding "0.25rem 0.5rem"
+                        , S.border "1px solid #ccc"
+                        , S.borderRadius "2px"
+                        , S.cursorPointer
+                        ]
+                        [ text "▶" ]
+                    ]
+                , H.div [ S.fontSizeRem 0.75, S.opacity "0.7" ]
+                    [ text
+                        (if List.isEmpty fr.matches then
+                            iif (String.isEmpty fr.findText) "" "No matches"
+
+                         else
+                            String.fromInt (fr.currentMatch + 1)
+                                ++ " of "
+                                ++ String.fromInt (List.length fr.matches)
+                        )
+                    ]
+                , if fr.showReplace then
+                    H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25 ]
+                        [ H.input
+                            [ A.placeholder "Replace with..."
+                            , A.value fr.replaceText
+                            , A.onInput ReplaceTextChange
+                            , S.padding "0.25rem 0.5rem"
+                            , S.border "1px solid #ccc"
+                            , S.borderRadius "2px"
+                            , S.widthRem 12
+                            ]
+                            []
+                        , H.div [ S.displayFlex, S.gapRem 0.25 ]
+                            [ H.button
+                                [ A.onClick ReplaceOne
+                                , S.padding "0.25rem 0.5rem"
+                                , S.border "1px solid #ccc"
+                                , S.borderRadius "2px"
+                                , S.cursorPointer
+                                , S.fontSizeRem 0.75
+                                ]
+                                [ text "Replace" ]
+                            , H.button
+                                [ A.onClick ReplaceAll
+                                , S.padding "0.25rem 0.5rem"
+                                , S.border "1px solid #ccc"
+                                , S.borderRadius "2px"
+                                , S.cursorPointer
+                                , S.fontSizeRem 0.75
+                                ]
+                                [ text "Replace All" ]
+                            ]
+                        ]
+
+                  else
+                    text ""
+                ]
 
 
 view : Model -> Browser.Document Msg
@@ -1220,6 +1879,8 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text ".r0 { position: sticky; top: -1px; background: #f6f6f6; z-index: 1; border-bottom: 0px; }" ]
         , H.node "style" [] [ text ".r0::after { content: \"\"; display: block; position: absolute; width: 100%; left: 0; bottom: -1px; border-bottom: 1px solid #aaa; }" ]
         , H.node "style" [] [ text ".selected { background: rgba(0,0,0,0.05); }" ]
+        , H.node "style" [] [ text ".match-highlight { background: rgba(255,200,0,0.3); }" ]
+        , H.node "style" [] [ text ".match-current { background: rgba(255,150,0,0.5); }" ]
         , H.node "style" [] [ text "#code { font-family: monospace; background: #fff; }" ]
         , H.node "style" [] [ text "@media (min-width: 768px) { body > div { grid-template-columns: 1fr auto; } #aside { border-left: 1px solid #aaa; } }" ]
         , H.node "style" [] [ text "@media (max-width: 768px) { body > div { grid-template-rows: 1fr auto; } #aside { border-top: 1px solid #aaa; } }" ]
@@ -1282,6 +1943,7 @@ view ({ sheet } as model) =
                     ]
         -- , H.node "style" [] [ text "thead tr td { position: sticky; top: 0; }" ]
         -- , H.node "style" [] [ text "tfoot tr:last-child td { position: sticky; bottom: 0; }" ]
+        , viewFindReplace sheet.findReplace
         , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsCenter, S.whiteSpaceNowrap, S.gapRem 0.5, S.paddingRem 0.5, S.borderBottom "1px solid #aaa", S.background "#f0f0f0" ] <|
@@ -1305,10 +1967,22 @@ view ({ sheet } as model) =
                             ]
                             [ H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ]
                             ]
+                        , case sheet.doc of
+                            Ok (Tab _) ->
+                                [ H.a
+                                    [ A.href ("https://api.sheets.scrap.land/export/" ++ sheet.id ++ ".csv")
+                                    , A.download (sheet.id ++ ".csv")
+                                    , S.marginLeftAuto
+                                    , S.backgroundColor "#e8e8e8"
+                                    , S.padding "2px 8px"
+                                    , S.borderRadius "2px"
+                                    , S.fontSizeRem 0.75
+                                    ]
+                                    [ text "export csv" ]
+                                ]
 
-                        -- TODO: This is where we'll put actions and keyboard shortcut hints.
-                        -- , [ H.a [ A.href "#", S.marginLeftAuto, S.backgroundColor "#e0e0e0", S.padding "2px 4px" ] [ text "help" ]
-                        --   ]
+                            _ ->
+                                []
                         ]
 
                 -- TODO: Put recent/saved searches on right.
@@ -1358,7 +2032,128 @@ view ({ sheet } as model) =
                             H.p [] [ text err ]
 
                         Ok { cols, rows } ->
-                            H.table [ S.borderCollapseCollapse, S.width "100%", A.onMouseLeave (CellHover (xy -1 -1)) ]
+                            let
+                                -- Apply filters
+                                applyFilter : Filter -> String -> Row -> Bool
+                                applyFilter filter key row =
+                                    let
+                                        val =
+                                            Dict.get key row
+                                                |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
+                                                |> Maybe.withDefault ""
+
+                                        numVal =
+                                            String.toFloat val
+                                    in
+                                    case filter of
+                                        TextContains substr ->
+                                            String.contains (String.toLower substr) (String.toLower val)
+
+                                        TextEquals exact ->
+                                            String.toLower val == String.toLower exact
+
+                                        NumberGreaterThan n ->
+                                            Maybe.map (\v -> v > n) numVal |> Maybe.withDefault False
+
+                                        NumberLessThan n ->
+                                            Maybe.map (\v -> v < n) numVal |> Maybe.withDefault False
+
+                                        NumberBetween lo hi ->
+                                            Maybe.map (\v -> v >= lo && v <= hi) numVal |> Maybe.withDefault False
+
+                                        BooleanIs b ->
+                                            (String.toLower val == "true" || val == "1") == b
+
+                                rowPassesFilters : Row -> Bool
+                                rowPassesFilters row =
+                                    Dict.foldl
+                                        (\key filter acc -> acc && applyFilter filter key row)
+                                        True
+                                        sheet.filters
+
+                                filteredRows =
+                                    Array.filter rowPassesFilters rows
+
+                                -- Apply sorting
+                                sortedRows =
+                                    case sheet.sort of
+                                        Just ( sortKey, sortOrder ) ->
+                                            let
+                                                compareRows r1 r2 =
+                                                    let
+                                                        v1 =
+                                                            Dict.get sortKey r1
+                                                                |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
+                                                                |> Maybe.withDefault ""
+
+                                                        v2 =
+                                                            Dict.get sortKey r2
+                                                                |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
+                                                                |> Maybe.withDefault ""
+
+                                                        -- Try numeric comparison first
+                                                        numCompare =
+                                                            Maybe.map2 compare
+                                                                (String.toFloat v1)
+                                                                (String.toFloat v2)
+                                                    in
+                                                    case numCompare of
+                                                        Just ord ->
+                                                            ord
+
+                                                        Nothing ->
+                                                            compare v1 v2
+
+                                                sorted =
+                                                    Array.toList filteredRows |> List.sortWith compareRows
+                                            in
+                                            case sortOrder of
+                                                Ascending ->
+                                                    Array.fromList sorted
+
+                                                Descending ->
+                                                    Array.fromList (List.reverse sorted)
+
+                                        Nothing ->
+                                            filteredRows
+
+                                filterCount =
+                                    Dict.size sheet.filters
+
+                                filteredCount =
+                                    Array.length sortedRows
+
+                                totalCount =
+                                    Array.length rows
+                            in
+                            H.div []
+                                [ if filterCount > 0 then
+                                    H.div
+                                        [ S.padding "0.25rem 0.5rem"
+                                        , S.backgroundColor "#fff8e0"
+                                        , S.borderBottom "1px solid #e0d8a0"
+                                        , S.fontSizeRem 0.75
+                                        , S.displayFlex
+                                        , S.justifyContentSpaceBetween
+                                        , S.alignItemsCenter
+                                        ]
+                                        [ H.span []
+                                            [ text ("Showing " ++ String.fromInt filteredCount ++ " of " ++ String.fromInt totalCount ++ " rows") ]
+                                        , H.button
+                                            [ A.onClick (FilterClear "")
+                                            , S.padding "0.125rem 0.5rem"
+                                            , S.fontSizeRem 0.7
+                                            , S.background "#fff"
+                                            , S.border "1px solid #ccc"
+                                            , S.borderRadius "2px"
+                                            , S.cursorPointer
+                                            ]
+                                            [ text "Clear all filters" ]
+                                        ]
+
+                                  else
+                                    text ""
+                                , H.table [ S.borderCollapseCollapse, S.width "100%", A.onMouseLeave (CellHover (xy -1 -1)) ]
                                 [ H.thead []
                                     -- [ H.tr [] <|
                                     --     H.th [] []
@@ -1430,9 +2225,33 @@ view ({ sheet } as model) =
                                                                             eq : number -> number -> number -> Bool
                                                                             eq a_ b_ i_ =
                                                                                 a_ == i_ && i_ == b_
+
+                                                                            cellIdx =
+                                                                                xy i n
+
+                                                                            isMatch =
+                                                                                case sheet.findReplace of
+                                                                                    Just fr ->
+                                                                                        List.member cellIdx fr.matches
+
+                                                                                    Nothing ->
+                                                                                        False
+
+                                                                            isCurrentMatch =
+                                                                                case sheet.findReplace of
+                                                                                    Just fr ->
+                                                                                        fr.matches
+                                                                                            |> List.drop fr.currentMatch
+                                                                                            |> List.head
+                                                                                            |> (==) (Just cellIdx)
+
+                                                                                    Nothing ->
+                                                                                        False
                                                                         in
                                                                         [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
                                                                         , ( "r0", n == 0 )
+                                                                        , ( "match-highlight", isMatch && not isCurrentMatch )
+                                                                        , ( "match-current", isCurrentMatch )
                                                                         ]
                                                                     , case col.typ of
                                                                         Create ->
@@ -1534,8 +2353,110 @@ view ({ sheet } as model) =
                                                                                     []
 
                                                                                 _ ->
-                                                                                    [ H.span [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600" ]
-                                                                                        [ text col.name
+                                                                                    let
+                                                                                        sortIndicator =
+                                                                                            case sheet.sort of
+                                                                                                Just ( sortKey, Ascending ) ->
+                                                                                                    if sortKey == col.key then
+                                                                                                        " ▲"
+
+                                                                                                    else
+                                                                                                        ""
+
+                                                                                                Just ( sortKey, Descending ) ->
+                                                                                                    if sortKey == col.key then
+                                                                                                        " ▼"
+
+                                                                                                    else
+                                                                                                        ""
+
+                                                                                                Nothing ->
+                                                                                                    ""
+
+                                                                                        hasFilter =
+                                                                                            Dict.member col.key sheet.filters
+
+                                                                                        filterIndicator =
+                                                                                            if hasFilter then
+                                                                                                " ⧩"
+
+                                                                                            else
+                                                                                                ""
+
+                                                                                        isFilterOpen =
+                                                                                            sheet.filterOpen == Just col.key
+
+                                                                                        currentFilterValue =
+                                                                                            case Dict.get col.key sheet.filters of
+                                                                                                Just (TextContains v) ->
+                                                                                                    v
+
+                                                                                                _ ->
+                                                                                                    ""
+                                                                                    in
+                                                                                    [ H.div [ S.displayFlex, S.flexDirectionColumn, S.positionRelative ]
+                                                                                        [ H.div [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ]
+                                                                                            [ H.span
+                                                                                                [ S.textOverflowEllipsis
+                                                                                                , S.overflowHidden
+                                                                                                , S.whiteSpaceNowrap
+                                                                                                , S.fontWeight "600"
+                                                                                                , S.cursorPointer
+                                                                                                , A.onClick (ColumnSort col.key)
+                                                                                                ]
+                                                                                                [ text (col.name ++ sortIndicator) ]
+                                                                                            , H.span
+                                                                                                [ S.cursorPointer
+                                                                                                , S.opacity (iif hasFilter "1" "0.3")
+                                                                                                , S.fontSizeRem 0.7
+                                                                                                , A.onClick (FilterToggle col.key)
+                                                                                                , A.title "Filter"
+                                                                                                ]
+                                                                                                [ text (iif hasFilter "⧩" "▽") ]
+                                                                                            ]
+                                                                                        , if isFilterOpen then
+                                                                                            H.div
+                                                                                                [ S.positionAbsolute
+                                                                                                , S.top "100%"
+                                                                                                , S.left "0"
+                                                                                                , S.backgroundColor "#fff"
+                                                                                                , S.border "1px solid #ccc"
+                                                                                                , S.borderRadius "4px"
+                                                                                                , S.padding "0.5rem"
+                                                                                                , S.zIndex "100"
+                                                                                                , S.boxShadow "0 2px 8px rgba(0,0,0,0.15)"
+                                                                                                , S.minWidth "150px"
+                                                                                                ]
+                                                                                                [ H.input
+                                                                                                    [ A.placeholder "contains..."
+                                                                                                    , A.value currentFilterValue
+                                                                                                    , A.onInput (FilterInput col.key)
+                                                                                                    , S.width "100%"
+                                                                                                    , S.padding "0.25rem"
+                                                                                                    , S.border "1px solid #ddd"
+                                                                                                    , S.borderRadius "2px"
+                                                                                                    , S.fontSizeRem 0.8
+                                                                                                    ]
+                                                                                                    []
+                                                                                                , if hasFilter then
+                                                                                                    H.button
+                                                                                                        [ A.onClick (FilterClear col.key)
+                                                                                                        , S.marginTop "0.25rem"
+                                                                                                        , S.padding "0.25rem 0.5rem"
+                                                                                                        , S.fontSizeRem 0.7
+                                                                                                        , S.background "#f0f0f0"
+                                                                                                        , S.border "1px solid #ccc"
+                                                                                                        , S.borderRadius "2px"
+                                                                                                        , S.cursorPointer
+                                                                                                        ]
+                                                                                                        [ text "Clear" ]
+
+                                                                                                  else
+                                                                                                    text ""
+                                                                                                ]
+
+                                                                                          else
+                                                                                            text ""
                                                                                         ]
                                                                                     ]
 
@@ -1638,7 +2559,7 @@ view ({ sheet } as model) =
                                                 )
                                             <|
                                                 Array.append (Array.initialize 3 (always Dict.empty)) <|
-                                                    rows
+                                                    sortedRows
                                         ]
 
                                 -- TODO: These rows should always be stuck to the bottom of the window.
@@ -1657,6 +2578,7 @@ view ({ sheet } as model) =
                                                 )
                                                 [ ( "table:...", DocNewTable )
                                                 , ( "query:...", DocNewQuery )
+                                                , ( "import csv...", CsvImportSelect )
                                                 ]
 
                                         Ok (Tab _) ->
@@ -1682,6 +2604,7 @@ view ({ sheet } as model) =
 
                                         _ ->
                                             []
+                                ]
                                 ]
                     ]
                 ]
