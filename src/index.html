@@ -621,17 +621,67 @@
 
           app.ports.newDoc.subscribe(
             catchy(async ({ name, type, data }) => {
-              debug.log('newDoc called:', { name, type });
-              // TODO: Remove existing listeners.
-              sheet = repo?.create({ type, data });
-              if (!sheet) {
-                debug.error('Failed to create document - repo.create returned null');
-                app.ports.docErrored.send('Failed to create document. Repo may not be initialized.');
+              debug.log('newDoc called:', { name, type, dataKeys: Object.keys(data || {}) });
+
+              if (!repo) {
+                debug.error('Repo not initialized');
+                app.ports.docErrored.send('Cannot create document: sync not initialized. Please refresh the page.');
                 return;
               }
+
+              // Create the document
+              debug.log('Creating document via repo.create...');
+              sheet = repo.create({ type, data });
+
+              if (!sheet) {
+                debug.error('repo.create returned null/undefined');
+                app.ports.docErrored.send('Failed to create document. Please refresh and try again.');
+                return;
+              }
+
               const id = `${type}:${sheet.documentId}`;
-              debug.log('Document created:', id);
+              debug.log('Document handle created:', {
+                id,
+                documentId: sheet.documentId,
+                state: sheet.state,
+                isReady: sheet.isReady?.(),
+              });
+
+              // Wait for the document to be ready (persisted to IndexedDB)
+              if (sheet.whenReady) {
+                debug.log('Waiting for document to be ready...');
+                try {
+                  await Promise.race([
+                    sheet.whenReady(),
+                    new Promise((_, reject) =>
+                      setTimeout(() => reject(new Error('Timeout waiting for document')), 10000)
+                    ),
+                  ]);
+                  debug.log('Document ready, state:', sheet.state);
+                } catch (e) {
+                  debug.error('Document ready failed:', e.message);
+                  app.ports.docErrored.send(`Document creation timed out: ${e.message}. Please try again.`);
+                  return;
+                }
+              }
+
+              // Verify the document has content
+              const doc = sheet.doc?.();
+              debug.log('Document content check:', {
+                hasDoc: !!doc,
+                docType: doc?.type,
+                hasData: !!doc?.data,
+              });
+
+              if (!doc) {
+                debug.error('Document created but has no content');
+                app.ports.docErrored.send('Document was created but has no content. Please try again.');
+                return;
+              }
+
+              // Save to localStorage library
               Library.set(id, { name: name ?? "", tags: [] });
+              debug.log('Saved to localStorage library');
 
               // Register document in database with retry for sync timing
               debug.log('Registering document with server...');
@@ -641,11 +691,13 @@
                 app.ports.docErrored.send("Failed to save document to server. The document was created locally but may not sync. Please try again.");
                 return;
               }
-              debug.log('Document registered successfully');
+              debug.log('Document registered with server successfully');
 
-              requestAnimationFrame(() => {
-                window.location = `/${id}`;
-              });
+              // Small delay to ensure IndexedDB write completes
+              await new Promise(resolve => setTimeout(resolve, 100));
+
+              debug.log('Navigating to new document:', id);
+              window.location = `/${id}`;
             }, 'newDoc'),
           );
 
