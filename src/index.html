@@ -683,6 +683,56 @@
               Library.set(id, { name: name ?? "", tags: [] });
               debug.log('Saved to localStorage library');
 
+              // Try to flush storage if the method exists
+              if (repo.flush) {
+                debug.log('Flushing repo storage...');
+                await repo.flush();
+                debug.log('Repo storage flushed');
+              } else if (repo.storageSubsystem?.flush) {
+                debug.log('Flushing storage subsystem...');
+                await repo.storageSubsystem.flush();
+                debug.log('Storage subsystem flushed');
+              }
+
+              // Verify the document can be found before proceeding
+              debug.log('Verifying document is persisted...');
+              const doc_id = sheet.documentId;
+              let verifyAttempts = 0;
+              const maxVerifyAttempts = 10;
+              let verified = false;
+
+              while (verifyAttempts < maxVerifyAttempts && !verified) {
+                verifyAttempts++;
+                try {
+                  const foundHandle = await repo.find(doc_id);
+                  if (foundHandle) {
+                    await foundHandle.whenReady();
+                    const foundDoc = foundHandle.doc?.();
+                    if (foundDoc) {
+                      debug.log(`Document verified on attempt ${verifyAttempts}:`, {
+                        state: foundHandle.state,
+                        hasDoc: !!foundDoc,
+                      });
+                      verified = true;
+                    }
+                  }
+                } catch (e) {
+                  debug.log(`Verify attempt ${verifyAttempts} failed:`, e.message);
+                }
+                if (!verified) {
+                  await new Promise(resolve => setTimeout(resolve, 200));
+                }
+              }
+
+              if (!verified) {
+                debug.error('Document could not be verified after creation');
+                app.ports.docErrored.send(
+                  'Document was created but could not be verified. ' +
+                  'This may be a sync issue. Please try refreshing the page.'
+                );
+                return;
+              }
+
               // Register document in database with retry for sync timing
               debug.log('Registering document with server...');
               const registered = await registerDocWithRetry(id, name);
@@ -693,11 +743,10 @@
               }
               debug.log('Document registered with server successfully');
 
-              // Small delay to ensure IndexedDB write completes
-              await new Promise(resolve => setTimeout(resolve, 100));
-
-              debug.log('Navigating to new document:', id);
-              window.location = `/${id}`;
+              // Update URL and load document without full page reload
+              debug.log('Loading new document:', id);
+              window.history.pushState({}, '', `/${id}`);
+              await selectDoc(id, sheet);
             }, 'newDoc'),
           );
 
