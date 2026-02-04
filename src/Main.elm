@@ -7,6 +7,7 @@ import Browser
 import Browser.Dom as Dom
 import Browser.Events as Browser
 import Browser.Navigation as Nav
+import Clipboard
 import Date exposing (Date)
 import Dict exposing (Dict)
 import File exposing (File)
@@ -19,6 +20,7 @@ import Html.Style as S
 import Http
 import Json.Decode as D
 import Json.Encode as E
+import Navigation as Nav2
 import Set exposing (Set)
 import Task exposing (Task)
 import Url exposing (Url)
@@ -151,6 +153,15 @@ port logout : () -> Cmd msg
 
 
 port authResult : (D.Value -> msg) -> Sub msg
+
+
+port copyToClipboard : String -> Cmd msg
+
+
+port pasteFromClipboard : (String -> msg) -> Sub msg
+
+
+port requestCopy : (() -> msg) -> Sub msg
 
 
 type alias DocDelta =
@@ -723,6 +734,9 @@ type Msg
     | CsvImportResult (Result Http.Error D.Value)
     | AuthMsg AuthMsg
     | AuthResult D.Value
+    | ClipboardCopy
+    | ClipboardPaste String
+    | SelectAll
 
 
 type alias KeyEvent =
@@ -744,6 +758,9 @@ type DocMsg
     = SheetWrite Index
     | SheetRowPush Int
     | SheetColumnPush
+    | SheetRowDelete (List Int)
+    | SheetColumnDelete (List Int)
+    | SheetClearCells (List Index)
     | CellCheck Index Bool
 
 
@@ -770,6 +787,8 @@ subs model =
         , docErrored DocError
         , authResult AuthResult
         , Browser.onKeyDown keyEventDecoder
+        , pasteFromClipboard ClipboardPaste
+        , requestCopy (always ClipboardCopy)
         ]
 
 
@@ -987,6 +1006,73 @@ update msg ({ sheet, auth } as model) =
                                       , value = E.list identity [ E.object [ ( "name", E.string "" ), ( "type", E.string "text" ), ( "key", E.int (Array.length table.cols) ) ] ]
                                       }
                                     ]
+
+                                SheetRowDelete indices ->
+                                    -- Delete rows from highest to lowest to maintain index validity
+                                    indices
+                                        |> List.sort
+                                        |> List.reverse
+                                        |> List.map
+                                            (\i ->
+                                                { action = "splice"
+                                                , path = []
+                                                , value = E.list E.int [ i, 1 ]
+                                                }
+                                            )
+
+                                SheetColumnDelete indices ->
+                                    -- Delete columns and their data from rows
+                                    let
+                                        colKeys =
+                                            indices
+                                                |> List.filterMap (\i -> Array.get i table.cols)
+                                                |> List.map .key
+
+                                        -- Remove columns from header (index 0)
+                                        colPatches =
+                                            indices
+                                                |> List.sort
+                                                |> List.reverse
+                                                |> List.map
+                                                    (\i ->
+                                                        { action = "splice"
+                                                        , path = [ E.int 0 ]
+                                                        , value = E.list E.int [ i, 1 ]
+                                                        }
+                                                    )
+
+                                        -- Remove column data from each row
+                                        rowPatches =
+                                            table.rows
+                                                |> Array.toIndexedList
+                                                |> List.concatMap
+                                                    (\( rowIdx, _ ) ->
+                                                        colKeys
+                                                            |> List.map
+                                                                (\key ->
+                                                                    { action = "del"
+                                                                    , path = [ E.int (rowIdx + 1), E.string key ]
+                                                                    , value = E.null
+                                                                    }
+                                                                )
+                                                    )
+                                    in
+                                    colPatches ++ rowPatches
+
+                                SheetClearCells indices ->
+                                    -- Clear cell contents without deleting rows
+                                    indices
+                                        |> List.filterMap
+                                            (\idx ->
+                                                Array.get idx.x table.cols
+                                                    |> Maybe.map
+                                                        (\col ->
+                                                            { action = "set"
+                                                            , path = [ E.int idx.y, E.string col.key ]
+                                                            , value = E.string ""
+                                                            }
+                                                        )
+                                            )
 
                                 CellCheck i c ->
                                     table.cols
@@ -1529,18 +1615,63 @@ update msg ({ sheet, auth } as model) =
 
             else
                 -- When not editing, navigate with keys
+                let
+                    -- Expand selection instead of moving when shift is held
+                    expand dx dy =
+                        let
+                            newSelect =
+                                Nav2.expandSelection bounds dx dy sheet.select
+                        in
+                        ( { model | sheet = { sheet | select = newSelect } }, Cmd.none )
+
+                    -- Get selected row indices for deletion
+                    selectedRows =
+                        let
+                            norm =
+                                Nav2.normalizeRect sheet.select
+                        in
+                        List.range norm.a.y norm.b.y
+
+                    -- Get selected column indices for deletion
+                    selectedCols =
+                        let
+                            norm =
+                                Nav2.normalizeRect sheet.select
+                        in
+                        List.range norm.a.x norm.b.x
+
+                    -- Get all selected cell indices for clearing
+                    selectedCells =
+                        Nav2.rectToIndices sheet.select
+                in
                 case event.key of
                     "ArrowUp" ->
-                        move 0 -1
+                        if event.shift then
+                            expand 0 -1
+
+                        else
+                            move 0 -1
 
                     "ArrowDown" ->
-                        move 0 1
+                        if event.shift then
+                            expand 0 1
+
+                        else
+                            move 0 1
 
                     "ArrowLeft" ->
-                        move -1 0
+                        if event.shift then
+                            expand -1 0
+
+                        else
+                            move -1 0
 
                     "ArrowRight" ->
-                        move 1 0
+                        if event.shift then
+                            expand 1 0
+
+                        else
+                            move 1 0
 
                     "Tab" ->
                         move (iif event.shift -1 1) 0
@@ -1548,6 +1679,71 @@ update msg ({ sheet, auth } as model) =
                     "Enter" ->
                         -- Start editing current cell
                         startEdit
+
+                    "Delete" ->
+                        -- Clear selected cells (or delete row if Ctrl)
+                        if event.ctrl || event.meta then
+                            update (DocMsg (SheetRowDelete selectedRows)) model
+
+                        else
+                            update (DocMsg (SheetClearCells selectedCells)) model
+
+                    "Backspace" ->
+                        -- Clear selected cells
+                        update (DocMsg (SheetClearCells selectedCells)) model
+
+                    "a" ->
+                        -- Ctrl+A to select all
+                        if event.ctrl || event.meta then
+                            update SelectAll model
+
+                        else
+                            -- Start editing with 'a'
+                            case sheet.doc of
+                                Ok (Tab tbl) ->
+                                    case Array.get sel.x tbl.cols of
+                                        Just _ ->
+                                            ( { model | sheet = { sheet | write = Just "a" } }
+                                            , Task.attempt (always NoOp) (Dom.focus "new-cell")
+                                            )
+
+                                        _ ->
+                                            ( model, Cmd.none )
+
+                                _ ->
+                                    ( model, Cmd.none )
+
+                    "Home" ->
+                        -- Jump to beginning of row, or top-left with Ctrl
+                        if event.ctrl || event.meta then
+                            let
+                                newSel =
+                                    xy 0 1
+                            in
+                            ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
+
+                        else
+                            let
+                                newSel =
+                                    xy 0 sel.y
+                            in
+                            ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
+
+                    "End" ->
+                        -- Jump to end of row, or bottom-right with Ctrl
+                        if event.ctrl || event.meta then
+                            let
+                                newSel =
+                                    xy bounds.maxX bounds.maxY
+                            in
+                            ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
+
+                        else
+                            let
+                                newSel =
+                                    xy bounds.maxX sel.y
+                            in
+                            ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
 
                     _ ->
                         -- If it's a single printable character, start editing with it
@@ -1618,6 +1814,182 @@ update msg ({ sheet, auth } as model) =
 
                 Err _ ->
                     ( { model | auth = { auth | state = Anonymous } }, Cmd.none )
+
+        ClipboardCopy ->
+            -- Copy selected cells to clipboard as TSV
+            case sheet.doc of
+                Ok (Tab tbl) ->
+                    let
+                        sel =
+                            Nav2.normalizeRect sheet.select
+
+                        -- Extract selected cells as 2D list of strings
+                        rows =
+                            List.range sel.a.y sel.b.y
+                                |> List.map
+                                    (\y ->
+                                        List.range sel.a.x sel.b.x
+                                            |> List.map
+                                                (\x ->
+                                                    Array.get x tbl.cols
+                                                        |> Maybe.andThen
+                                                            (\col ->
+                                                                Array.get (y - 1) tbl.rows
+                                                                    |> Maybe.andThen (Dict.get col.key)
+                                                                    |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
+                                                            )
+                                                        |> Maybe.withDefault ""
+                                                )
+                                    )
+
+                        tsv =
+                            Clipboard.serializeToTsv rows
+                    in
+                    ( model, copyToClipboard tsv )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        ClipboardPaste text ->
+            -- Parse pasted data and insert into table, expanding bounds as needed
+            case sheet.doc of
+                Ok (Tab tbl) ->
+                    let
+                        sel =
+                            sheet.select.a
+
+                        -- Detect format and parse
+                        data =
+                            case Clipboard.detectFormat text of
+                                Clipboard.Tsv ->
+                                    Clipboard.parseTsv text
+
+                                Clipboard.Csv ->
+                                    Clipboard.parseCsv text
+
+                                Clipboard.JsonArray ->
+                                    Clipboard.parseJson text
+                                        |> Result.withDefault [ [ text ] ]
+
+                                Clipboard.PlainText ->
+                                    [ [ text ] ]
+
+                        -- Calculate required dimensions
+                        pasteWidth =
+                            data |> List.map List.length |> List.maximum |> Maybe.withDefault 0
+
+                        pasteHeight =
+                            List.length data
+
+                        currentColCount =
+                            Array.length tbl.cols
+
+                        currentRowCount =
+                            Array.length tbl.rows
+
+                        -- How many new columns/rows needed?
+                        neededCols =
+                            max 0 (sel.x + pasteWidth - currentColCount)
+
+                        neededRows =
+                            max 0 (sel.y + pasteHeight - 1 - currentRowCount)
+
+                        -- Generate patches to add new columns
+                        newColPatches =
+                            List.range 0 (neededCols - 1)
+                                |> List.map
+                                    (\i ->
+                                        let
+                                            newKey =
+                                                String.fromInt (currentColCount + i)
+                                        in
+                                        { action = "push"
+                                        , path = [ E.int 0 ]
+                                        , value =
+                                            E.list identity
+                                                [ E.object
+                                                    [ ( "name", E.string "" )
+                                                    , ( "type", E.string "text" )
+                                                    , ( "key", E.string newKey )
+                                                    ]
+                                                ]
+                                        }
+                                    )
+
+                        -- Generate patches to add new rows
+                        newRowPatches =
+                            List.range 0 (neededRows - 1)
+                                |> List.map
+                                    (\_ ->
+                                        { action = "push"
+                                        , path = []
+                                        , value = E.list identity [ E.object [] ]
+                                        }
+                                    )
+
+                        -- Build column key lookup (existing + new)
+                        colKey : Int -> String
+                        colKey x =
+                            if x < currentColCount then
+                                Array.get x tbl.cols
+                                    |> Maybe.map .key
+                                    |> Maybe.withDefault (String.fromInt x)
+
+                            else
+                                String.fromInt x
+
+                        -- Generate patches for each cell value
+                        cellPatches =
+                            data
+                                |> List.indexedMap
+                                    (\rowOffset row ->
+                                        row
+                                            |> List.indexedMap
+                                                (\colOffset value ->
+                                                    let
+                                                        x =
+                                                            sel.x + colOffset
+
+                                                        y =
+                                                            sel.y + rowOffset
+                                                    in
+                                                    { action = "set"
+                                                    , path = [ E.int y, E.string (colKey x) ]
+                                                    , value = E.string value
+                                                    }
+                                                )
+                                    )
+                                |> List.concat
+
+                        -- Combine all patches: columns first, then rows, then values
+                        allPatches =
+                            newColPatches ++ newRowPatches ++ cellPatches
+                    in
+                    if List.isEmpty allPatches then
+                        ( model, Cmd.none )
+
+                    else
+                        ( model, changeDoc { id = sheet.id, data = allPatches } )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        SelectAll ->
+            case sheet.doc of
+                Ok (Tab tbl) ->
+                    let
+                        bounds =
+                            { maxX = Array.length tbl.cols - 1
+                            , maxY = Array.length tbl.rows
+                            }
+
+                        newSelect =
+                            Nav2.selectAll bounds
+                    in
+                    ( { model | sheet = { sheet | select = newSelect } }, Cmd.none )
+
+                _ ->
+                    ( model, Cmd.none )
 
 
 

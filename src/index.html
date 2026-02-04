@@ -180,6 +180,42 @@
 
         app.ports.updateLibrary.subscribe(({ id, data }) => Library.set(id, data));
 
+        // Clipboard handling
+        app.ports.copyToClipboard.subscribe(async (text) => {
+          try {
+            await navigator.clipboard.writeText(text);
+            debug.log('Copied to clipboard:', text.substring(0, 50) + '...');
+          } catch (err) {
+            debug.error('Failed to copy:', err);
+          }
+        });
+
+        // Listen for paste events and send to Elm
+        document.addEventListener('paste', (e) => {
+          // Don't intercept paste when typing in an input
+          if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+            return;
+          }
+          e.preventDefault();
+          const text = e.clipboardData.getData('text/plain');
+          if (text && app.ports.pasteFromClipboard) {
+            app.ports.pasteFromClipboard.send(text);
+          }
+        });
+
+        // Listen for copy events
+        document.addEventListener('copy', (e) => {
+          // Don't intercept copy when selecting text in an input
+          if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+            return;
+          }
+          // The actual copy is triggered via port, so we just let Elm know
+          if (app.ports.requestCopy) {
+            e.preventDefault();
+            app.ports.requestCopy.send(null);
+          }
+        });
+
         {
           // Initialize the Automerge Repo with storage and network adapters
           const getAuthToken = () => {
