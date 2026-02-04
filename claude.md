@@ -10,7 +10,7 @@ technologies. It uses a hybrid architecture with:
 - **Backend**: Deno-based server using Hono framework (main.ts)
 - **Frontend**: Elm single-page application (src/Main.elm)
 - **Database**: PostgreSQL with schema defined in db.sql
-- **Real-time collaboration**: Automerge CRDT for document synchronization
+- **Real-time collaboration**: Automerge CRDT for document synchronization (see https://automerge.org/llms-full.txt)
 - **Data storage**: File-based automerge documents in data/automerge/
 
 ## Important Files

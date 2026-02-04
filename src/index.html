@@ -185,6 +185,29 @@
             }
           };
 
+          // Register a document with the server, retrying on 404 (sync timing)
+          async function registerDocWithRetry(id, name) {
+            const token = getAuthToken();
+            if (!token) return true; // No auth, skip registration
+
+            for (let attempt = 0; attempt < 5; attempt++) {
+              if (attempt > 0) {
+                await new Promise(r => setTimeout(r, 100 * Math.pow(2, attempt)));
+              }
+              const res = await fetch(`https://api.sheets.scrap.land/library/${id}`, {
+                method: "PUT",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Authorization": `Bearer ${token}`,
+                },
+                body: JSON.stringify({ name: name ?? "", tags: [] }),
+              });
+              if (res.ok) return true;
+              if (res.status !== 404) break; // Only retry on 404 (sync timing)
+            }
+            return false;
+          }
+
           const token = getAuthToken();
           const syncUrl =
             "wss://api.sheets.scrap.land/library/sync" +
@@ -268,10 +291,17 @@
                     ],
                   });
                   const id = `table:${newSheet.documentId}`;
-                  Library.set(id, {
-                    name: file.name.replace(/\.csv$/i, ""),
-                    tags: [],
-                  });
+                  const csvName = file.name.replace(/\.csv$/i, "");
+                  Library.set(id, { name: csvName, tags: [] });
+
+                  // Register document in database with retry for sync timing
+                  const registered = await registerDocWithRetry(id, csvName);
+                  if (!registered) {
+                    console.error("Failed to register CSV document after retries");
+                    app.ports.docErrored.send("Failed to save imported file. Please try again.");
+                    return;
+                  }
+
                   requestAnimationFrame(() => {
                     window.location = `/${id}`;
                   });
@@ -481,17 +511,12 @@
               const id = `${type}:${sheet.documentId}`;
               Library.set(id, { name: name ?? "", tags: [] });
 
-              // Register document in database for sync
-              const token = getAuthToken();
-              if (token) {
-                await fetch(`https://api.sheets.scrap.land/library/${id}`, {
-                  method: "PUT",
-                  headers: {
-                    "Content-Type": "application/json",
-                    "Authorization": `Bearer ${token}`,
-                  },
-                  body: JSON.stringify({ name: name ?? "", tags: [] }),
-                });
+              // Register document in database with retry for sync timing
+              const registered = await registerDocWithRetry(id, name);
+              if (!registered) {
+                console.error("Failed to register document after retries");
+                app.ports.docErrored.send("Failed to save document. Please try again.");
+                return;
               }
 
               requestAnimationFrame(() => {
