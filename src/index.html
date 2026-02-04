@@ -51,9 +51,10 @@
           flags: {},
         });
 
-        // Debug logging helper
+        // Debug logging - set localStorage.debug = 'scrapsheets' to enable verbose logging
+        const VERBOSE = localStorage.getItem('debug')?.includes('scrapsheets');
         const debug = {
-          log: (...args) => console.log('[scrapsheets]', ...args),
+          log: VERBOSE ? (...args) => console.log('[scrapsheets]', ...args) : () => {},
           error: (...args) => console.error('[scrapsheets]', ...args),
           warn: (...args) => console.warn('[scrapsheets]', ...args),
         };
@@ -492,50 +493,31 @@
           let ws;
           const selectDoc = catchy(async (id, sheetHandle) => {
             const [type, doc_id] = id.split(":");
-            debug.log('selectDoc called:', { id, type, doc_id, hasSheetHandle: !!sheetHandle });
+            debug.log('selectDoc:', id);
 
             const libraryEntry = Library.get()[id];
-            const docFromLibrary = libraryEntry?.doc;
-            const docFromHandle = sheetHandle?.doc?.();
-
-            debug.log('Document sources:', {
-              inLibrary: !!libraryEntry,
-              hasDocInLibrary: !!docFromLibrary,
-              hasDocFromHandle: !!docFromHandle,
-              libraryEntry,
-            });
-
-            const doc = docFromLibrary ?? docFromHandle;
+            const doc = libraryEntry?.doc ?? sheetHandle?.doc?.();
 
             if (!doc) {
               if (type && doc_id) {
-                const errorDetails = [
+                // Show detailed error for debugging
+                return app.ports.docErrored.send([
                   `Document "${id}" could not be loaded.`,
                   '',
-                  'Debug info:',
-                  `• In localStorage library: ${!!libraryEntry}`,
-                  `• Has doc in library: ${!!docFromLibrary}`,
-                  `• Automerge handle exists: ${!!sheetHandle}`,
-                  `• Handle has doc: ${!!docFromHandle}`,
+                  `• In library: ${!!libraryEntry}`,
+                  `• Handle exists: ${!!sheetHandle}`,
                   `• Handle state: ${sheetHandle?.state ?? 'N/A'}`,
                   '',
-                  'Possible causes:',
-                  '• Document was deleted',
-                  '• Sync not complete (try refreshing)',
-                  '• Created on different device/browser',
-                ].join('\n');
-
-                debug.error('Document load failed:', errorDetails);
-                return app.ports.docErrored.send(errorDetails);
+                  'Try refreshing the page.',
+                ].join('\n'));
               }
-              debug.log('No doc_id, showing library');
               return app.ports.docSelected.send({
                 id: "",
                 data: { doc: { type: "library" } },
               });
             }
 
-            debug.log('Document loaded successfully:', { id, docType: doc.type });
+            debug.log('Loaded:', id);
             app.ports.docSelected.send({
               id,
               data: { doc: doc && { ...doc } },
@@ -567,50 +549,29 @@
           }, 'selectDoc');
 
           const changeId = catchy(async (id) => {
-            debug.log('changeId called:', id);
             const [type, doc_id = ""] = id.split(":");
-            if (doc_id === sheet?.documentId) {
-              debug.log('Same document, skipping');
-              return;
-            }
+            if (doc_id === sheet?.documentId) return;
             ws?.close?.();
 
-            // If no doc_id, just show library
+            debug.log('changeId:', id);
+
             if (!doc_id) {
-              debug.log('No doc_id, showing library');
               sheet = null;
               await selectDoc(id, null);
               return;
             }
 
-            // Try to find the document in the repo
-            debug.log('Looking up document in repo:', doc_id);
+            // Find document in repo
             try {
               sheet = await repo?.find(doc_id);
-              debug.log('repo.find result:', {
-                found: !!sheet,
-                documentId: sheet?.documentId,
-                state: sheet?.state,
-                isReady: sheet?.isReady?.(),
-              });
-
-              // Wait for the document to be ready if it exists
-              if (sheet && sheet.whenReady) {
-                debug.log('Waiting for document to be ready...');
-                const timeoutMs = 5000;
-                const readyPromise = sheet.whenReady();
-                const timeoutPromise = new Promise((_, reject) =>
-                  setTimeout(() => reject(new Error('Document load timeout')), timeoutMs)
-                );
-                try {
-                  await Promise.race([readyPromise, timeoutPromise]);
-                  debug.log('Document ready, state:', sheet.state);
-                } catch (e) {
-                  debug.warn('Document ready timeout/error:', e.message);
-                }
+              if (sheet?.whenReady) {
+                await Promise.race([
+                  sheet.whenReady(),
+                  new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
+                ]).catch(() => {});
               }
             } catch (err) {
-              debug.error('repo.find error:', err);
+              debug.warn('repo.find failed:', err.message);
               sheet = null;
             }
 
@@ -621,134 +582,32 @@
 
           app.ports.newDoc.subscribe(
             catchy(async ({ name, type, data }) => {
-              debug.log('newDoc called:', { name, type, dataKeys: Object.keys(data || {}) });
+              debug.log('newDoc:', { type, name });
 
               if (!repo) {
-                debug.error('Repo not initialized');
-                app.ports.docErrored.send('Cannot create document: sync not initialized. Please refresh the page.');
+                app.ports.docErrored.send('Sync not initialized. Please refresh.');
                 return;
               }
 
-              // Create the document
-              debug.log('Creating document via repo.create...');
+              // Create document and wait for it to be ready
               sheet = repo.create({ type, data });
-
               if (!sheet) {
-                debug.error('repo.create returned null/undefined');
-                app.ports.docErrored.send('Failed to create document. Please refresh and try again.');
+                app.ports.docErrored.send('Failed to create document.');
                 return;
               }
 
               const id = `${type}:${sheet.documentId}`;
-              debug.log('Document handle created:', {
-                id,
-                documentId: sheet.documentId,
-                state: sheet.state,
-                isReady: sheet.isReady?.(),
-              });
+              debug.log('Created:', id);
 
-              // Wait for the document to be ready (persisted to IndexedDB)
               if (sheet.whenReady) {
-                debug.log('Waiting for document to be ready...');
-                try {
-                  await Promise.race([
-                    sheet.whenReady(),
-                    new Promise((_, reject) =>
-                      setTimeout(() => reject(new Error('Timeout waiting for document')), 10000)
-                    ),
-                  ]);
-                  debug.log('Document ready, state:', sheet.state);
-                } catch (e) {
-                  debug.error('Document ready failed:', e.message);
-                  app.ports.docErrored.send(`Document creation timed out: ${e.message}. Please try again.`);
-                  return;
-                }
+                await sheet.whenReady();
               }
 
-              // Verify the document has content
-              const doc = sheet.doc?.();
-              debug.log('Document content check:', {
-                hasDoc: !!doc,
-                docType: doc?.type,
-                hasData: !!doc?.data,
-              });
-
-              if (!doc) {
-                debug.error('Document created but has no content');
-                app.ports.docErrored.send('Document was created but has no content. Please try again.');
-                return;
-              }
-
-              // Save to localStorage library
+              // Save to localStorage and register with server
               Library.set(id, { name: name ?? "", tags: [] });
-              debug.log('Saved to localStorage library');
+              await registerDocWithRetry(id, name);
 
-              // Try to flush storage if the method exists (may fail if other handles aren't ready)
-              try {
-                if (repo.flush) {
-                  debug.log('Flushing repo storage...');
-                  await repo.flush();
-                  debug.log('Repo storage flushed');
-                } else if (repo.storageSubsystem?.flush) {
-                  debug.log('Flushing storage subsystem...');
-                  await repo.storageSubsystem.flush();
-                  debug.log('Storage subsystem flushed');
-                }
-              } catch (flushErr) {
-                debug.warn('Flush failed (non-fatal):', flushErr.message);
-              }
-
-              // Verify the document can be found before proceeding
-              debug.log('Verifying document is persisted...');
-              const doc_id = sheet.documentId;
-              let verifyAttempts = 0;
-              const maxVerifyAttempts = 10;
-              let verified = false;
-
-              while (verifyAttempts < maxVerifyAttempts && !verified) {
-                verifyAttempts++;
-                try {
-                  const foundHandle = await repo.find(doc_id);
-                  if (foundHandle) {
-                    await foundHandle.whenReady();
-                    const foundDoc = foundHandle.doc?.();
-                    if (foundDoc) {
-                      debug.log(`Document verified on attempt ${verifyAttempts}:`, {
-                        state: foundHandle.state,
-                        hasDoc: !!foundDoc,
-                      });
-                      verified = true;
-                    }
-                  }
-                } catch (e) {
-                  debug.log(`Verify attempt ${verifyAttempts} failed:`, e.message);
-                }
-                if (!verified) {
-                  await new Promise(resolve => setTimeout(resolve, 200));
-                }
-              }
-
-              if (!verified) {
-                debug.error('Document could not be verified after creation');
-                app.ports.docErrored.send(
-                  'Document was created but could not be verified. ' +
-                  'This may be a sync issue. Please try refreshing the page.'
-                );
-                return;
-              }
-
-              // Register document in database with retry for sync timing
-              debug.log('Registering document with server...');
-              const registered = await registerDocWithRetry(id, name);
-              if (!registered) {
-                debug.error("Failed to register document after retries");
-                app.ports.docErrored.send("Failed to save document to server. The document was created locally but may not sync. Please try again.");
-                return;
-              }
-              debug.log('Document registered with server successfully');
-
-              // Update URL and load document without full page reload
-              debug.log('Loading new document:', id);
+              // Load document without page reload (key fix: keeps sheet handle in memory)
               window.history.pushState({}, '', `/${id}`);
               await selectDoc(id, sheet);
             }, 'newDoc'),
