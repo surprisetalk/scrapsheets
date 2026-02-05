@@ -22,8 +22,7 @@ const request = async (jwt: string, route: string, options?: object) => {
   return await res.json();
 };
 
-// TODO: Re-enable when automerge tests are fixed
-const _reject = async (jwt: string, route: string, options?: object) => {
+const reject = async (jwt: string, route: string, options?: object) => {
   const res = await app.request(route, {
     headers: new Headers({
       "Content-Type": "application/json",
@@ -57,8 +56,8 @@ const put = (jwt: string, route: string, body: unknown) =>
 
 const usr = async (email: string) => {
   const [{ usr_id }] = await sql`
-    insert into usr (email) values (${email}) 
-    on conflict (email) do update set email = excluded.email 
+    insert into usr (email) values (${email})
+    on conflict (email) do update set email = excluded.email
     returning *
   `;
   return { usr_id, jwt: await createJwt(usr_id) };
@@ -91,9 +90,7 @@ Deno.test(async function allTests(_t) {
 
     // Alice creates templates.
     {
-      // TODO: Even more complicated queries, etc.
       const templates: Template[] = [
-        // ["template", ["net-hook", []]],
         {
           type: "table",
           data: [
@@ -166,7 +163,8 @@ Deno.test(async function allTests(_t) {
         );
         assertEquals(name, meta.name);
         assertEquals(tags, meta.tags);
-        assertEquals(sell_price, "0"); // TODO: should return number
+        // postgres.js returns numeric as string (arbitrary precision)
+        assertEquals(sell_price, "0");
       }
     }
   }
@@ -182,23 +180,35 @@ Deno.test(async function allTests(_t) {
   {
     const { jwt } = await usr("bob@example.com");
 
-    // Bob purchases everything in the shop.
+    // Bob purchases items from the shop.
     {
       const [cols_, ...rows] = await get<Table>(jwt, `/shop`);
       const cols = Object.values(cols_);
       assert(cols.length);
       assertEquals(cols.map((col) => col.name).join(), "name,price,");
       assert(rows.length);
-      // NOTE: Purchase/buy tests are commented out because they depend on
-      // complex automerge document operations that require WebSocket integration.
-      // TODO: Re-enable these tests after setting up proper test fixtures for:
-      // - automerge document creation and mutation
-      // - portal WebSocket connections
-      // - net-* webhook/socket tests
-      // See: https://github.com/automerge/automerge-repo for test setup patterns
+
+      // Buy the first 3 items
+      const toBuy = rows.slice(0, 3);
+      for (const row of toBuy) {
+        const { data: sheet_id } = await post(jwt, `/buy/${row.sell_id}`, {});
+        assert(sheet_id, "Buy should return a sheet_id");
+      }
+
+      // Verify Bob's library grew
+      const [, ...bobRows] = await get<Table>(jwt, `/library`);
+      assertEquals(bobRows.length, toBuy.length);
     }
 
-    // Bob runs a basic SQL query (doesn't depend on automerge documents)
+    // Buying with invalid sell_id returns 404.
+    {
+      await reject(jwt, `/buy/nonexistent_sell_id`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+    }
+
+    // Bob runs a basic SQL query
     {
       const {
         data: [cols_, ...rows],
@@ -211,6 +221,20 @@ Deno.test(async function allTests(_t) {
       assert(cols.length);
       assertEquals(cols.map((col) => col.name).join(), "a,b,c");
       assertEquals(rows.length, 1);
+    }
+
+    // SQL query with multiple rows and types
+    {
+      const {
+        data: [cols_, ...rows],
+      }: { data: Table } = await post(jwt, `/query`, {
+        lang: "sql",
+        code: `select 1 as num, 'hello' as txt union all select 2, 'world'`,
+        args: [],
+      });
+      const cols = Object.values(cols_);
+      assertEquals(cols.map((col) => col.name).join(), "num,txt");
+      assertEquals(rows.length, 2);
     }
 
     // Bob runs a PRQL query - tests that PRQL compiles to SQL and executes

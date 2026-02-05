@@ -39,9 +39,8 @@ const rateLimit = (identifier: string): boolean => {
   bucket.tokens = Math.min(RATE_LIMIT_MAX_TOKENS, bucket.tokens + elapsed * RATE_LIMIT_REFILL_RATE);
   bucket.lastRefill = now;
 
-  if (bucket.tokens < 1) {
+  if (bucket.tokens < 1)
     return false; // Rate limited
-  }
 
   bucket.tokens -= 1;
   return true;
@@ -51,9 +50,8 @@ const rateLimit = (identifier: string): boolean => {
 setInterval(() => {
   const now = Date.now();
   for (const [key, bucket] of rateLimitBuckets) {
-    if (now - bucket.lastRefill > RATE_LIMIT_WINDOW_MS) {
+    if (now - bucket.lastRefill > RATE_LIMIT_WINDOW_MS)
       rateLimitBuckets.delete(key);
-    }
   }
 }, RATE_LIMIT_WINDOW_MS);
 
@@ -216,15 +214,14 @@ const querify = async (
   { lang, code, args: _args = [] }: Query,
   _reqQuery: Record<string, string>,
 ): Promise<Page> => {
-  if (lang === "sql") {
+  if (lang === "sql")
     return await executeSql(c, code);
-  } else if (lang === "prql") {
+  else if (lang === "prql") {
     // Compile PRQL to SQL, then execute
     try {
       const sqlResult = prql.compile(code);
-      if (!sqlResult) {
+      if (!sqlResult)
         throw new HTTPException(400, { message: "PRQL compilation returned empty result" });
-      }
       return await executeSql(c, sqlResult);
     } catch (err) {
       if (err instanceof HTTPException) throw err;
@@ -298,6 +295,13 @@ export const sql = pg(
 // deno-lint-ignore no-explicit-any
 type SqlFragment = any;
 
+const pgType = (oid: number): Type =>
+  [1700, 790].includes(oid)
+    ? "usd" // numeric, money
+    : [23, 20, 21, 700, 701].includes(oid)
+    ? "int" // int2, int4, int8, float4, float8
+    : "text";
+
 const cselect = async ({
   cols,
   select,
@@ -320,9 +324,9 @@ const cselect = async ({
     : sql``;
   const rows = await sql`${select} ${from} ${where_} ${order ?? sql``} limit ${limit} offset ${offset}`;
   const cols_: Row<Col> = arrayify(
-    rows.columns.map((col, _i) => ({
+    rows.columns.map((col: { name: string; type: number }) => ({
       name: col.name,
-      type: "text", // TODO: col.type
+      type: pgType(col.type),
       key: col.name,
     })),
   );
@@ -352,9 +356,8 @@ app.use("*", async (c, next) => {
     c.req.header("x-real-ip") ||
     "127.0.0.1";
 
-  if (!rateLimit(ip)) {
+  if (!rateLimit(ip))
     throw new HTTPException(429, { message: "Too many requests. Please slow down." });
-  }
 
   await next();
 });
@@ -770,9 +773,8 @@ app.post("/net/:id", async (c) => {
 // CORS proxy for external data sources (unauthenticated, rate-limited)
 app.get("/proxy", async (c) => {
   const url = c.req.query("url");
-  if (!url) {
+  if (!url)
     return c.json({ error: "Missing url parameter" }, 400);
-  }
 
   // Validate URL
   let parsed: URL;
@@ -783,21 +785,18 @@ app.get("/proxy", async (c) => {
   }
 
   // Only allow http/https
-  if (!["http:", "https:"].includes(parsed.protocol)) {
+  if (!["http:", "https:"].includes(parsed.protocol))
     return c.json({ error: "Only HTTP(S) URLs allowed" }, 400);
-  }
 
   // Block internal addresses
   const blockedHosts = ["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"];
-  if (blockedHosts.includes(parsed.hostname) || parsed.hostname.endsWith(".local")) {
+  if (blockedHosts.includes(parsed.hostname) || parsed.hostname.endsWith(".local"))
     return c.json({ error: "Internal URLs not allowed" }, 400);
-  }
 
   // Rate limit by IP
   const ip = c.req.header("x-forwarded-for")?.split(",")[0] || "unknown";
-  if (!rateLimit(`proxy:${ip}`)) {
+  if (!rateLimit(`proxy:${ip}`))
     return c.json({ error: "Rate limit exceeded" }, 429);
-  }
 
   try {
     const res = await fetch(url, {
@@ -938,9 +937,8 @@ app.put("/library/:id", async (c) => {
 
   // Sheet doesn't exist - create it (user is claiming a new automerge doc)
   const [type, doc_id] = sheet_id.split(":");
-  if (!type || !doc_id) {
+  if (!type || !doc_id)
     throw new HTTPException(400, { message: "Invalid sheet_id format." });
-  }
 
   // Verify the automerge document exists
   const row_0 = await automerge
@@ -981,9 +979,8 @@ app.post("/import/csv", async (c) => {
   if (contentType.includes("multipart/form-data")) {
     const formData = await c.req.formData();
     const file = formData.get("file") as File | null;
-    if (!file) {
+    if (!file)
       throw new HTTPException(400, { message: "No file provided." });
-    }
     csvText = await file.text();
     sheetName = file.name.replace(/\.csv$/i, "") || sheetName;
   } else {
@@ -991,9 +988,8 @@ app.post("/import/csv", async (c) => {
     csvText = await c.req.text();
   }
 
-  if (!csvText.trim()) {
+  if (!csvText.trim())
     throw new HTTPException(400, { message: "Empty CSV content." });
-  }
 
   // Parse CSV
   const parseCSV = (text: string): string[][] => {
@@ -1010,15 +1006,14 @@ app.post("/import/csv", async (c) => {
         if (char === '"' && nextChar === '"') {
           currentField += '"';
           i++; // Skip next quote
-        } else if (char === '"') {
+        } else if (char === '"')
           inQuotes = false;
-        } else {
+        else
           currentField += char;
-        }
       } else {
-        if (char === '"') {
+        if (char === '"')
           inQuotes = true;
-        } else if (char === ",") {
+        else if (char === ",") {
           currentRow.push(currentField);
           currentField = "";
         } else if (char === "\n" || (char === "\r" && nextChar === "\n")) {
@@ -1043,9 +1038,8 @@ app.post("/import/csv", async (c) => {
   };
 
   const parsed = parseCSV(csvText);
-  if (parsed.length < 1) {
+  if (parsed.length < 1)
     throw new HTTPException(400, { message: "CSV has no data." });
-  }
 
   const [headerRow, ...dataRows] = parsed;
 
@@ -1083,13 +1077,12 @@ app.post("/import/csv", async (c) => {
     const obj: Row = {};
     cols.forEach((col, i) => {
       const val = row[i] ?? "";
-      if (col.type === "num" && val.trim()) {
+      if (col.type === "num" && val.trim())
         obj[col.key] = Number(val);
-      } else if (col.type === "bool") {
+      else if (col.type === "bool")
         obj[col.key] = ["true", "t", "1", "yes"].includes(val.toLowerCase());
-      } else {
+      else
         obj[col.key] = val;
-      }
     });
     return obj;
   });
@@ -1144,21 +1137,18 @@ app.get("/export/:id.csv", async (c) => {
     where su.sheet_id = ${sheet_id} and su.usr_id = ${usr_id}
   `;
 
-  if (!access) {
+  if (!access)
     throw new HTTPException(403, { message: "You don't have access to this sheet." });
-  }
 
-  if (access.type !== "table") {
+  if (access.type !== "table")
     throw new HTTPException(400, { message: "Only table sheets can be exported as CSV." });
-  }
 
   // Fetch the document from Automerge
   const handle = await automerge.find<{ data: Table }>(access.doc_id as AnyDocumentId);
   const doc = handle.doc();
 
-  if (!doc?.data || doc.data.length < 1) {
+  if (!doc?.data || doc.data.length < 1)
     throw new HTTPException(404, { message: "Document data not found." });
-  }
 
   const [colsRow, ...rows] = doc.data;
   const cols = Object.values(colsRow) as Col[];
@@ -1168,17 +1158,14 @@ app.get("/export/:id.csv", async (c) => {
     if (val === null || val === undefined) return "";
     const str = String(val);
     // Quote if contains comma, quote, or newline
-    if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+    if (str.includes(",") || str.includes('"') || str.includes("\n"))
       return '"' + str.replace(/"/g, '""') + '"';
-    }
     return str;
   };
 
   // Build CSV content
   const headerRow = cols.map((col) => escapeCSV(col.name)).join(",");
-  const dataRows = rows.map((row) =>
-    cols.map((col) => escapeCSV(row[col.key])).join(",")
-  );
+  const dataRows = rows.map((row) => cols.map((col) => escapeCSV(row[col.key])).join(","));
   const csv = [headerRow, ...dataRows].join("\n");
 
   // Return as downloadable CSV
@@ -1310,9 +1297,8 @@ app.get("/codex/:id/connect", async (c) => {
       and usr_id = ${c.get("usr_id")}
   `;
 
-  if (!access) {
+  if (!access)
     throw new HTTPException(403, { message: "Access denied to this codex." });
-  }
 
   // For now, only support direct PostgreSQL connection strings
   // Future: add OAuth flows for Google Sheets, Airtable, etc.
@@ -1355,9 +1341,8 @@ app.get("/codex/:id/callback", (c) => {
   // OAuth callback handler - placeholder for future OAuth flows
   const { provider, code, state: _state } = c.req.query();
 
-  if (!provider || !code) {
+  if (!provider || !code)
     throw new HTTPException(400, { message: "Missing provider or authorization code." });
-  }
 
   // For now, return not implemented
   return c.json({
