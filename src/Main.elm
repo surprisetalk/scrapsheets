@@ -2437,6 +2437,7 @@ viewSettings show info =
                         , A.value info.name
                         , A.onInput SettingsNameChange
                         , A.placeholder "Sheet name"
+                        , A.attribute "onfocus" "this.select()"
                         , S.width "100%"
                         , S.padding "0.5rem"
                         , S.border "1px solid #ccc"
@@ -3539,8 +3540,32 @@ view ({ sheet } as model) =
                                                 )
                                                 [ ( "table:...", DocNewTable )
                                                 , ( "query:...", DocNewQuery )
-                                                , ( "import csv...", CsvImportSelect )
                                                 ]
+                                                ++ [ H.tr [] <|
+                                                        (::)
+                                                            (H.td [ S.opacity "0.25" ]
+                                                                [ H.label [ S.cursorPointer ]
+                                                                    [ text "import csv..."
+                                                                    , H.input
+                                                                        [ A.type_ "file"
+                                                                        , A.accept ".csv,text/csv"
+                                                                        , A.on "change"
+                                                                            (D.at [ "target", "files" ] (D.index 0 File.decoder)
+                                                                                |> D.map CsvImportFile
+                                                                            )
+                                                                        , S.display "none"
+                                                                        ]
+                                                                        []
+                                                                    ]
+                                                                ]
+                                                            )
+                                                        <|
+                                                            List.map (\typ -> H.td [ S.opacity "0.25" ] [ text typ ])
+                                                                [ "text"
+                                                                , "list text"
+                                                                , ""
+                                                                ]
+                                                   ]
 
                                         Ok (Tab _) ->
                                             [ H.tr [ A.onClick (DocMsg (SheetRowPush (Array.length rows))) ] <|
