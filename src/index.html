@@ -530,10 +530,16 @@
               "application/atom+xml": atomToJson,
             };
             if (!url) return;
+            // Route external URLs through proxy to avoid CORS issues
+            const apiBase = "https://api.sheets.scrap.land";
+            const isExternal = !url.startsWith(window.location.origin) && !url.startsWith(apiBase);
+            const targetUrl = isExternal
+              ? `${apiBase}/proxy?url=${encodeURIComponent(url + "?" + new URLSearchParams(qs))}`
+              : url + "?" + new URLSearchParams(qs);
             const request = new XMLHttpRequest();
             request.open(
               "GET",
-              url + "?" + new URLSearchParams(qs),
+              targetUrl,
               false,
             ); // `false` makes the request synchronous
             request.send(null);
@@ -550,7 +556,10 @@
           };
           alasql.from.HTTP = (url, qs = {}) => {
             const { status, res } = alasql.fn.http(url, qs);
-            if (status >= 400) throw new Error("Something went wrong.");
+            if (status >= 400) {
+              const msg = res?.error || `HTTP ${status}`;
+              throw new Error(`Failed to fetch data: ${msg}`);
+            }
             return res;
           };
           // Parse SQL error to extract position info
@@ -661,16 +670,15 @@
 
             if (!doc) {
               if (type && doc_id) {
-                // Show detailed error for debugging
-                return app.ports.docErrored.send([
-                  `Document "${id}" could not be loaded.`,
-                  '',
-                  `• In library: ${!!libraryEntry}`,
-                  `• Handle exists: ${!!sheetHandle}`,
-                  `• Handle state: ${sheetHandle?.state ?? 'N/A'}`,
-                  '',
-                  'Try refreshing the page.',
-                ].join('\n'));
+                // User-friendly error with collapsible details
+                const details = [
+                  `In library: ${!!libraryEntry}`,
+                  `Handle exists: ${!!sheetHandle}`,
+                  `Handle state: ${sheetHandle?.state ?? 'N/A'}`,
+                ].join(' | ');
+                return app.ports.docErrored.send(
+                  `Could not load this document. It may have been deleted or not yet synced.\n\nTry refreshing the page.\n\n[Details: ${details}]`
+                );
               }
               return app.ports.docSelected.send({
                 id: "",
@@ -722,15 +730,29 @@
               return;
             }
 
-            // Find document in repo
-            try {
-              sheet = await repo?.find(doc_id);
-              if (sheet?.whenReady) {
-                await Promise.race([
-                  sheet.whenReady(),
-                  new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
-                ]).catch(() => {});
+            // Find document in repo with retry logic
+            const findWithTimeout = async (retries = 2) => {
+              for (let attempt = 0; attempt < retries; attempt++) {
+                try {
+                  const handle = await repo?.find(doc_id);
+                  if (handle?.whenReady) {
+                    await Promise.race([
+                      handle.whenReady(),
+                      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 10000)),
+                    ]);
+                  }
+                  return handle;
+                } catch (err) {
+                  debug.warn(`repo.find attempt ${attempt + 1} failed:`, err.message);
+                  if (attempt < retries - 1) {
+                    await new Promise(r => setTimeout(r, 1000)); // Wait 1s before retry
+                  }
+                }
               }
+              return null;
+            };
+            try {
+              sheet = await findWithTimeout();
             } catch (err) {
               debug.warn('repo.find failed:', err.message);
               sheet = null;
@@ -772,6 +794,38 @@
               window.history.pushState({}, '', `/${id}`);
               await selectDoc(id, sheet);
             }, 'newDoc'),
+          );
+
+          app.ports.importCsv.subscribe(
+            catchy(async ({ filename, content }) => {
+              debug.log('importCsv:', filename);
+              const token = getAuthToken();
+              if (!token) {
+                app.ports.docErrored.send('Please log in to import CSV files.');
+                return;
+              }
+              try {
+                const formData = new FormData();
+                formData.append('filename', filename);
+                formData.append('content', content);
+                const res = await fetch('https://api.sheets.scrap.land/import/csv', {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `Bearer ${token}`,
+                  },
+                  body: formData,
+                });
+                if (!res.ok) {
+                  const text = await res.text();
+                  app.ports.docErrored.send(`CSV import failed: ${text || res.statusText}`);
+                  return;
+                }
+                // Refresh library to show the new sheet
+                await changeId('');
+              } catch (err) {
+                app.ports.docErrored.send(`CSV import failed: ${err?.message ?? 'Unknown error'}`);
+              }
+            }, 'importCsv'),
           );
 
           app.ports.changeDoc.subscribe(

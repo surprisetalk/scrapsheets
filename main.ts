@@ -767,6 +767,56 @@ app.post("/net/:id", async (c) => {
   return c.json(null, 200);
 });
 
+// CORS proxy for external data sources (unauthenticated, rate-limited)
+app.get("/proxy", async (c) => {
+  const url = c.req.query("url");
+  if (!url) {
+    return c.json({ error: "Missing url parameter" }, 400);
+  }
+
+  // Validate URL
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return c.json({ error: "Invalid URL" }, 400);
+  }
+
+  // Only allow http/https
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    return c.json({ error: "Only HTTP(S) URLs allowed" }, 400);
+  }
+
+  // Block internal addresses
+  const blockedHosts = ["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"];
+  if (blockedHosts.includes(parsed.hostname) || parsed.hostname.endsWith(".local")) {
+    return c.json({ error: "Internal URLs not allowed" }, 400);
+  }
+
+  // Rate limit by IP
+  const ip = c.req.header("x-forwarded-for")?.split(",")[0] || "unknown";
+  if (!rateLimit(`proxy:${ip}`)) {
+    return c.json({ error: "Rate limit exceeded" }, 429);
+  }
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Scrapsheets/1.0",
+        "Accept": "application/json, application/xml, text/xml, application/atom+xml, */*",
+      },
+    });
+    const contentType = res.headers.get("content-type") || "application/octet-stream";
+    const body = await res.text();
+    return c.text(body, res.status as 200, {
+      "Content-Type": contentType,
+      "X-Proxy-Status": String(res.status),
+    });
+  } catch (err) {
+    return c.json({ error: `Fetch failed: ${err instanceof Error ? err.message : "Unknown error"}` }, 502);
+  }
+});
+
 app.use("*", jwt({ secret: JWT_SECRET }));
 
 app.use("*", async (c, next) => {

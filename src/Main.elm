@@ -169,6 +169,9 @@ port login : { email : String, password : String } -> Cmd msg
 port logout : () -> Cmd msg
 
 
+port importCsv : { filename : String, content : String } -> Cmd msg
+
+
 port authResult : (D.Value -> msg) -> Sub msg
 
 
@@ -245,6 +248,8 @@ type alias Model =
     , library : Library
     , sheet : Sheet
     , auth : Auth
+    , deleteConfirm : Maybe String
+    , showSettings : Bool
     }
 
 
@@ -739,6 +744,8 @@ init _ url nav =
                     , email = ""
                     , password = ""
                     }
+                , deleteConfirm = Nothing
+                , showSettings = False
                 }
     in
     ( model, changeId model.id )
@@ -746,17 +753,23 @@ init _ url nav =
 
 route : Url -> Model -> Model
 route url model =
-    url
-        |> UrlP.parse
-            (UrlP.map
-                (\id search -> { model | id = id, search = Maybe.withDefault "" search })
-                (UrlP.top
-                    </> UrlP.oneOf [ UrlP.string, UrlP.map "" UrlP.top ]
-                    <?> UrlQ.string "q"
-                 -- </> UrlP.fragment (Maybe.andThen (flip Dict.get tools))
-                )
-            )
-        |> Maybe.withDefault model
+    let
+        showSettings =
+            url.fragment == Just "settings"
+
+        baseModel =
+            url
+                |> UrlP.parse
+                    (UrlP.map
+                        (\id search -> { model | id = id, search = Maybe.withDefault "" search })
+                        (UrlP.top
+                            </> UrlP.oneOf [ UrlP.string, UrlP.map "" UrlP.top ]
+                            <?> UrlQ.string "q"
+                        )
+                    )
+                |> Maybe.withDefault model
+    in
+    { baseModel | showSettings = showSettings }
 
 
 
@@ -778,6 +791,12 @@ type Msg
     | DocNewQuery
     | DocNewTable
     | DocDelete Id
+    | DocDeleteConfirm Id
+    | DocDeleteCancel
+    | SettingsOpen
+    | SettingsClose
+    | SettingsNameChange String
+    | SettingsTagsChange String
     | KeyDown KeyEvent
     | CellMouseClick
     | CellMouseDoubleClick String
@@ -804,7 +823,6 @@ type Msg
     | CsvImportSelect
     | CsvImportFile File
     | CsvImportUpload String String
-    | CsvImportResult (Result Http.Error D.Value)
     | AuthMsg AuthMsg
     | AuthResult D.Value
     | ClipboardCopy
@@ -872,12 +890,20 @@ subs model =
 
 keyEventDecoder : D.Decoder Msg
 keyEventDecoder =
-    D.map4 KeyEvent
+    D.map5
+        (\key shift ctrl meta tagName ->
+            -- Skip keyboard handling when focus is on input elements
+            if List.member tagName [ "INPUT", "TEXTAREA", "SELECT" ] then
+                NoOp
+
+            else
+                KeyDown { key = key, shift = shift, ctrl = ctrl, meta = meta }
+        )
         (D.field "key" D.string)
         (D.field "shiftKey" D.bool)
         (D.field "ctrlKey" D.bool)
         (D.field "metaKey" D.bool)
-        |> D.map KeyDown
+        (D.at [ "target", "tagName" ] D.string |> D.maybe |> D.map (Maybe.withDefault ""))
 
 
 
@@ -1291,7 +1317,34 @@ update msg ({ sheet, auth } as model) =
                     ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
 
         DocDelete id ->
-            ( model, deleteDoc id )
+            -- Show confirmation instead of immediately deleting
+            ( { model | deleteConfirm = Just id }, Cmd.none )
+
+        DocDeleteConfirm id ->
+            -- Actually delete after confirmation
+            ( { model | deleteConfirm = Nothing }, deleteDoc id )
+
+        DocDeleteCancel ->
+            ( { model | deleteConfirm = Nothing }, Cmd.none )
+
+        SettingsOpen ->
+            ( { model | showSettings = True }, Cmd.none )
+
+        SettingsClose ->
+            ( { model | showSettings = False }, Nav.replaceUrl model.nav ("/" ++ model.sheet.id) )
+
+        SettingsNameChange newName ->
+            ( model, updateLibrary (Idd sheet.id { name = Just newName, tags = Nothing }) )
+
+        SettingsTagsChange newTags ->
+            let
+                tags =
+                    newTags
+                        |> String.split ","
+                        |> List.map String.trim
+                        |> List.filter (not << String.isEmpty)
+            in
+            ( model, updateLibrary (Idd sheet.id { name = Nothing, tags = Just tags }) )
 
         DocNew x ->
             ( model, newDoc x )
@@ -1314,24 +1367,7 @@ update msg ({ sheet, auth } as model) =
             )
 
         CsvImportUpload filename content ->
-            ( model
-            , Http.post
-                { url = "https://api.sheets.scrap.land/import/csv"
-                , body =
-                    Http.multipartBody
-                        [ Http.stringPart "filename" filename
-                        , Http.stringPart "content" content
-                        ]
-                , expect = Http.expectJson CsvImportResult D.value
-                }
-            )
-
-        CsvImportResult (Ok response) ->
-            -- Refresh library to show the new sheet
-            ( model, changeId "" )
-
-        CsvImportResult (Err err) ->
-            ( { model | error = "CSV import failed" }, Cmd.none )
+            ( model, importCsv { filename = filename, content = content } )
 
         InputChange SheetSearch x ->
             ( { model | search = x, sheet = { sheet | table = Err "" } }
@@ -2355,6 +2391,143 @@ libraryCols =
         ]
 
 
+viewSettings : Bool -> SheetInfo -> Html Msg
+viewSettings show info =
+    if not show then
+        text ""
+
+    else
+        H.div
+            [ S.positionFixed
+            , S.top "0"
+            , S.left "0"
+            , S.right "0"
+            , S.bottom "0"
+            , S.backgroundColor "rgba(0,0,0,0.5)"
+            , S.displayFlex
+            , S.alignItemsCenter
+            , S.justifyContentCenter
+            , S.zIndex "1000"
+            , A.onClick SettingsClose
+            ]
+            [ H.div
+                [ S.backgroundColor "#fff"
+                , S.border "1px solid #aaa"
+                , S.borderRadius "4px"
+                , S.padding "1rem"
+                , S.minWidthRem 20
+                , S.boxShadow "0 2px 8px rgba(0,0,0,0.15)"
+                , A.stopPropagationOn "click" (D.succeed ( NoOp, True ))
+                ]
+                [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter, S.marginBottom "1rem" ]
+                    [ H.h3 [ S.margin "0" ] [ text "Sheet Settings" ]
+                    , H.button
+                        [ A.onClick SettingsClose
+                        , S.border "none"
+                        , S.background "transparent"
+                        , S.cursorPointer
+                        , S.fontSizeRem 1.2
+                        ]
+                        [ text "×" ]
+                    ]
+                , H.div [ S.marginBottom "1rem" ]
+                    [ H.label [ S.display "block", S.marginBottom "0.25rem", S.fontWeight "600" ] [ text "Name" ]
+                    , H.input
+                        [ A.type_ "text"
+                        , A.value info.name
+                        , A.onInput SettingsNameChange
+                        , A.placeholder "Sheet name"
+                        , S.width "100%"
+                        , S.padding "0.5rem"
+                        , S.border "1px solid #ccc"
+                        , S.borderRadius "4px"
+                        ]
+                        []
+                    ]
+                , H.div [ S.marginBottom "1rem" ]
+                    [ H.label [ S.display "block", S.marginBottom "0.25rem", S.fontWeight "600" ] [ text "Tags" ]
+                    , H.input
+                        [ A.type_ "text"
+                        , A.value (String.join ", " info.tags)
+                        , A.onInput SettingsTagsChange
+                        , A.placeholder "tag1, tag2, tag3"
+                        , S.width "100%"
+                        , S.padding "0.5rem"
+                        , S.border "1px solid #ccc"
+                        , S.borderRadius "4px"
+                        ]
+                        []
+                    , H.small [ S.color "#666" ] [ text "Separate tags with commas" ]
+                    ]
+                , H.button
+                    [ A.onClick SettingsClose
+                    , S.width "100%"
+                    , S.padding "0.5rem 1rem"
+                    , S.border "none"
+                    , S.borderRadius "4px"
+                    , S.background "#007bff"
+                    , S.color "#fff"
+                    , S.cursorPointer
+                    ]
+                    [ text "Done" ]
+                ]
+            ]
+
+
+viewDeleteConfirm : Maybe String -> Html Msg
+viewDeleteConfirm maybeId =
+    case maybeId of
+        Nothing ->
+            text ""
+
+        Just id ->
+            H.div
+                [ S.positionFixed
+                , S.top "0"
+                , S.left "0"
+                , S.right "0"
+                , S.bottom "0"
+                , S.backgroundColor "rgba(0,0,0,0.5)"
+                , S.displayFlex
+                , S.alignItemsCenter
+                , S.justifyContentCenter
+                , S.zIndex "1000"
+                ]
+                [ H.div
+                    [ S.backgroundColor "#fff"
+                    , S.border "1px solid #aaa"
+                    , S.borderRadius "4px"
+                    , S.padding "1rem"
+                    , S.maxWidthRem 20
+                    , S.boxShadow "0 2px 8px rgba(0,0,0,0.15)"
+                    ]
+                    [ H.p [ S.marginBottom "1rem" ]
+                        [ text "Are you sure you want to delete this sheet? This cannot be undone." ]
+                    , H.div [ S.displayFlex, S.gapRem 0.5, S.justifyContentFlexEnd ]
+                        [ H.button
+                            [ A.onClick DocDeleteCancel
+                            , S.padding "0.5rem 1rem"
+                            , S.border "1px solid #ccc"
+                            , S.borderRadius "4px"
+                            , S.background "#f0f0f0"
+                            , S.cursorPointer
+                            ]
+                            [ text "Cancel" ]
+                        , H.button
+                            [ A.onClick (DocDeleteConfirm id)
+                            , S.padding "0.5rem 1rem"
+                            , S.border "none"
+                            , S.borderRadius "4px"
+                            , S.background "#dc3545"
+                            , S.color "#fff"
+                            , S.cursorPointer
+                            ]
+                            [ text "Delete" ]
+                        ]
+                    ]
+                ]
+
+
 viewFindReplace : Maybe FindReplace -> Html Msg
 viewFindReplace maybeFindReplace =
     case maybeFindReplace of
@@ -2561,7 +2734,7 @@ view ({ sheet } as model) =
                             model.library
                                 |> Dict.filter (\k v -> k /= "" && not v.scratch && List.any (String.contains model.search) (k :: v.name :: v.tags))
                                 |> Dict.toList
-                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "type", E.string (Maybe.withDefault "" <| List.head <| String.split ":" k) ), ( "name", E.string v.name ), ( "tags", E.list E.string v.tags ), ( "delete", iif v.system E.null (E.string k) ) ])
+                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "type", E.string (Maybe.withDefault "" <| List.head <| String.split ":" k) ), ( "name", E.string (iif (String.isEmpty (String.trim v.name)) "(untitled)" v.name) ), ( "tags", E.list E.string v.tags ), ( "delete", iif v.system E.null (E.string k) ) ])
                                 |> Array.fromList
                         }
 
@@ -2593,7 +2766,7 @@ view ({ sheet } as model) =
         , H.node "style" [] [ text "th, td { padding: 0.25rem; padding-bottom: 0.15rem; font-weight: normal; border: 1px solid #aaa; height: 0.8rem; vertical-align: top; }" ]
         , H.node "style" [] [ text "tr > :first-child { border-left: none; padding-left: 0.5rem; }" ]
         , H.node "style" [] [ text "tr > :last-child { border-right: none; padding-right: 0.5rem; }" ]
-        , H.node "style" [] [ text "th > *, td > * { max-height: 6rem; text-overlow: ellipsis; }" ]
+        , H.node "style" [] [ text "th > *, td > * { max-height: 6rem; text-overflow: ellipsis; overflow: hidden; }" ]
         , H.node "style" [] [ text "td:hover { background: rgba(0,0,0,0.025); }" ]
         , H.node "style" [] [ text ".r0 { position: sticky; top: -1px; background: #f6f6f6; z-index: 1; border-bottom: 0px; }" ]
         , H.node "style" [] [ text ".r0::after { content: \"\"; display: block; position: absolute; width: 100%; left: 0; bottom: -1px; border-bottom: 1px solid #aaa; }" ]
@@ -2663,6 +2836,8 @@ view ({ sheet } as model) =
         -- , H.node "style" [] [ text "thead tr td { position: sticky; top: 0; }" ]
         -- , H.node "style" [] [ text "tfoot tr:last-child td { position: sticky; bottom: 0; }" ]
         , viewFindReplace sheet.findReplace
+        , viewDeleteConfirm model.deleteConfirm
+        , viewSettings model.showSettings info
         , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
                 [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsCenter, S.whiteSpaceNowrap, S.gapRem 0.5, S.paddingRem 0.5, S.borderBottom "1px solid #aaa", S.background "#f0f0f0" ] <|
@@ -3027,22 +3202,22 @@ view ({ sheet } as model) =
                                                                             S.widthRem 10
 
                                                                         SheetId ->
-                                                                            S.widthRem 0.5
+                                                                            S.widthRem 3
 
                                                                         Boolean ->
-                                                                            S.widthRem 0.5
+                                                                            S.widthRem 2
 
                                                                         Number ->
-                                                                            S.widthRem 0.5
+                                                                            S.widthRem 5
 
                                                                         Usd ->
-                                                                            S.widthRem 0.5
+                                                                            S.widthRem 5
 
                                                                         Percentage ->
-                                                                            S.widthRem 0.5
+                                                                            S.widthRem 4
 
                                                                         Delete ->
-                                                                            S.widthRem 0.5
+                                                                            S.widthRem 4
 
                                                                         _ ->
                                                                             S.widthAuto
