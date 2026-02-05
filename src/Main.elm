@@ -2977,9 +2977,11 @@ viewCell sheet stats i n col row =
         [ A.onClick CellMouseClick
         , A.onDoubleClick <|
             CellMouseDoubleClick <|
-                if n < 0 then typeName col.typ
-                else if n == 0 then col.name
-                else row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
+                case String.fromInt n of
+                    "0" -> col.name
+                    "-1" -> typeName col.typ
+                    "-2" -> typeName col.typ
+                    _ -> row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
         , A.onMouseDown CellMouseDown
         , A.onMouseUp CellMouseUp
         , A.onMouseEnter (CellHover (xy i n))
@@ -2993,31 +2995,39 @@ viewCell sheet stats i n col row =
         if sheet.write /= Nothing && sheet.select == rect i n i n then
             viewEditCell sheet col
 
-        else if n == -2 then
-            viewStatCell (Maybe.andThen (Array.get i) (Result.toMaybe stats))
-
-        else if n == -1 then
-            [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.opacity "0.5", S.fontSizeSmall ] [ text (typeName col.typ) ] ]
-
-        else if n == 0 then
-            viewHeaderCell sheet col
-
         else
-            [ row
-                |> Dict.get col.key
-                |> Maybe.withDefault (E.string "")
-                |> D.decodeValue (cellDecoder col.typ i n)
-                |> Result.map (Maybe.withDefault (text ""))
-                |> Result.mapError (D.errorToString >> text)
-                |> result
-            ]
+            case String.fromInt n of
+                "-2" ->
+                    viewStatCell (Maybe.andThen (Array.get i) (Result.toMaybe stats))
+
+                "-1" ->
+                    [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.opacity "0.5", S.fontSizeSmall ] [ text (typeName col.typ) ] ]
+
+                "0" ->
+                    viewHeaderCell sheet col
+
+                _ ->
+                    [ row
+                        |> Dict.get col.key
+                        |> Maybe.withDefault (E.string "")
+                        |> D.decodeValue (cellDecoder col.typ i n)
+                        |> Result.map (Maybe.withDefault (text ""))
+                        |> Result.mapError (D.errorToString >> text)
+                        |> result
+                    ]
 
 
 viewTableRow : Sheet -> Doc -> Result String (Array Stat) -> Array Col -> Int -> Row -> Html Msg
 viewTableRow sheet doc stats cols n row =
     H.tr
-        [ S.backgroundColor (if n == -2 then "#ececec" else if n <= 0 then "#f6f6f6" else "#fff")
-        , if n == -2 && Result.toMaybe stats == Nothing then S.displayNone else S.displayTableRow
+        [ case String.fromInt n of
+            "-2" -> S.backgroundColor "#ececec"
+            "-1" -> S.backgroundColor "#f6f6f6"
+            "0" -> S.backgroundColor "#f6f6f6"
+            _ -> S.backgroundColor "#fff"
+        , case ( String.fromInt n, stats ) of
+            ( "-2", Err _ ) -> S.displayNone
+            _ -> S.displayTableRow
         ]
     <|
         List.indexedMap (\i col -> viewCell sheet stats i n col row) (Array.toList cols)
