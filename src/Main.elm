@@ -20,7 +20,7 @@ import Html.Style as S
 import Http
 import Json.Decode as D
 import Json.Encode as E
-import Navigation as Nav2
+import Navigation as Nav2 exposing (Index, Rect, SortOrder(..), TableBounds, xy, rect)
 import Set exposing (Set)
 import Task exposing (Task)
 import Url exposing (Url)
@@ -289,7 +289,7 @@ type alias Sheet =
     , write : Maybe String
     , doc : Result String Doc
     , table : Result String Table
-    , stats : Result String (Dict String Stat)
+    , stats : Result String (Array Stat)
     , sort : Maybe ( String, SortOrder )
     , filters : Dict String Filter
     , filterOpen : Maybe String
@@ -320,11 +320,6 @@ type alias FindReplace =
     , matches : List Index
     , currentMatch : Int
     }
-
-
-type SortOrder
-    = Ascending
-    | Descending
 
 
 type Filter
@@ -425,24 +420,6 @@ type Net
 
 type alias Args =
     Dict String Type
-
-
-type alias Rect =
-    { a : Index, b : Index }
-
-
-rect : Int -> Int -> Int -> Int -> Rect
-rect ax ay bx by =
-    Rect (xy ax ay) (xy bx by)
-
-
-type alias Index =
-    { x : Int, y : Int }
-
-
-xy : Int -> Int -> Index
-xy x y =
-    Index x y
 
 
 type
@@ -959,7 +936,7 @@ update msg ({ sheet, auth } as model) =
                     , write = Nothing
                     , doc = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString
                     , table = Err ""
-                    , stats = Err ""
+                    , stats = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString |> Result.andThen computeStats
                     , sort = Nothing
                     , filters = Dict.empty
                     , filterOpen = Nothing
@@ -983,7 +960,8 @@ update msg ({ sheet, auth } as model) =
         DocChange data ->
             ( iif (data.id /= model.sheet.id)
                 model
-                { model | sheet = { sheet | doc = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString } }
+                (let parsedDoc = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString
+                 in { model | sheet = { sheet | doc = parsedDoc, stats = Result.andThen computeStats parsedDoc } })
               -- TODO: Fetch table rows depending on type, e.g. portal:123
             , Cmd.none
             )
@@ -2641,307 +2619,597 @@ viewFindReplace maybeFindReplace =
                 ]
 
 
-view : Model -> Browser.Document Msg
-view ({ sheet } as model) =
-    -- TODO: Show library sheet if (id == ""), otherwise show loading if (model.id /= model.sheet.id).
-    let
-        info : SheetInfo
-        info =
-            model.library
-                |> Dict.get sheet.id
-                |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = (), peers = Public }
+computeNumericStats : Array Row -> String -> Stat
+computeNumericStats rows key =
+    rows
+        |> Array.foldl
+            (\row stat ->
+                row
+                    |> Dict.get key
+                    |> Maybe.andThen (D.decodeValue number >> Result.toMaybe)
+                    |> Maybe.map
+                        (\n ->
+                            { histogram = stat.histogram |> Dict.update (String.fromFloat n) (Maybe.withDefault 0 >> (+) 1 >> Just)
+                            , count = stat.count + 1
+                            , sum = stat.sum + n
+                            , min = stat.min |> Maybe.withDefault n |> min n |> Just
+                            , max = stat.max |> Maybe.withDefault n |> max n |> Just
+                            }
+                        )
+                    |> Maybe.withDefault stat
+            )
+            { histogram = Dict.empty, count = 0, sum = 0, min = Nothing, max = Nothing }
+        |> Numeric
 
-        computeNumericStats : Array Row -> String -> Stat
-        computeNumericStats rows key =
-            rows
-                |> Array.foldl
-                    (\row stat ->
-                        row
-                            |> Dict.get key
-                            |> Maybe.andThen (D.decodeValue number >> Result.toMaybe)
-                            |> Maybe.map
-                                (\n ->
-                                    { histogram = stat.histogram |> Dict.update (String.fromFloat n) (Maybe.withDefault 0 >> (+) 1 >> Just)
-                                    , count = stat.count + 1
-                                    , sum = stat.sum + n
-                                    , min = stat.min |> Maybe.withDefault n |> min n |> Just
-                                    , max = stat.max |> Maybe.withDefault n |> max n |> Just
-                                    }
-                                )
-                            |> Maybe.withDefault stat
+
+computeTextStats : Array Row -> String -> Stat
+computeTextStats rows key =
+    rows
+        |> Array.foldl
+            (\row stat ->
+                row
+                    |> Dict.get key
+                    |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
+                    |> Maybe.map
+                        (\s ->
+                            { lengths = stat.lengths |> Dict.update (String.length s) (Maybe.withDefault 0 >> (+) 1 >> Just)
+                            , keywords = s |> String.split " " |> List.foldl (\k -> Dict.update k (Maybe.withDefault 0 >> (+) 1 >> Just)) stat.keywords
+                            , count = stat.count + 1
+                            , sum = stat.sum + String.length s
+                            , min = min (String.length s) (Maybe.withDefault (String.length s) stat.min) |> Just
+                            , max = max (String.length s) stat.max
+                            }
+                        )
+                    |> Maybe.withDefault stat
+            )
+            { lengths = Dict.empty, keywords = Dict.empty, count = 0, sum = 0, min = Nothing, max = 0 }
+        |> Descriptive
+
+
+computeStats : Doc -> Result String (Array Stat)
+computeStats doc =
+    case doc of
+        Tab tbl ->
+            Ok <|
+                Array.map
+                    (\col ->
+                        case col.typ of
+                            Number ->
+                                computeNumericStats tbl.rows col.key
+
+                            Usd ->
+                                computeNumericStats tbl.rows col.key
+
+                            Text ->
+                                computeTextStats tbl.rows col.key
+
+                            _ ->
+                                Enumerative { histogram = Dict.empty }
                     )
-                    { histogram = Dict.empty, count = 0, sum = 0, min = Nothing, max = Nothing }
-                |> Numeric
+                    tbl.cols
 
-        computeTextStats : Array Row -> String -> Stat
-        computeTextStats rows key =
-            rows
-                |> Array.foldl
-                    (\row stat ->
-                        row
-                            |> Dict.get key
-                            |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
-                            |> Maybe.map
-                                (\s ->
-                                    { lengths = stat.lengths |> Dict.update (String.length s) (Maybe.withDefault 0 >> (+) 1 >> Just)
-                                    , keywords = s |> String.split " " |> List.foldl (\k -> Dict.update k (Maybe.withDefault 0 >> (+) 1 >> Just)) stat.keywords
-                                    , count = stat.count + 1
-                                    , sum = stat.sum + String.length s
-                                    , min = min (String.length s) (Maybe.withDefault (String.length s) stat.min) |> Just
-                                    , max = max (String.length s) stat.max
-                                    }
-                                )
-                            |> Maybe.withDefault stat
-                    )
-                    { lengths = Dict.empty, keywords = Dict.empty, count = 0, sum = 0, min = Nothing, max = 0 }
-                |> Descriptive
+        _ ->
+            Err ""
 
-        stats : Result String (Array Stat)
-        stats =
-            case sheet.doc of
-                Ok (Tab tbl) ->
-                    Ok <|
-                        Array.map
-                            (\col ->
-                                case col.typ of
-                                    Number ->
-                                        computeNumericStats tbl.rows col.key
 
-                                    Usd ->
-                                        computeNumericStats tbl.rows col.key
+resolveTable : Model -> Result String Table
+resolveTable model =
+    case ( model.sheet.doc, model.sheet.table ) of
+        ( Ok (Tab tbl), _ ) ->
+            Ok tbl
 
-                                    Text ->
-                                        computeTextStats tbl.rows col.key
-
-                                    _ ->
-                                        Enumerative { histogram = Dict.empty }
+        ( Ok Library, _ ) ->
+            Ok
+                { cols = libraryCols
+                , rows =
+                    model.library
+                        |> Dict.filter (\k v -> k /= "" && not v.scratch && List.any (String.contains model.search) (k :: v.name :: v.tags))
+                        |> Dict.toList
+                        |> List.map
+                            (\( k, v ) ->
+                                Dict.fromList
+                                    [ ( "sheet_id", E.string k )
+                                    , ( "type", E.string (Maybe.withDefault "" <| List.head <| String.split ":" k) )
+                                    , ( "name", E.string (iif (String.isEmpty (String.trim v.name)) "(untitled)" v.name) )
+                                    , ( "tags", E.list E.string v.tags )
+                                    , ( "delete", iif v.system E.null (E.string k) )
+                                    ]
                             )
-                            tbl.cols
+                        |> Array.fromList
+                }
 
-                x ->
-                    Err "TODO: table stats"
+        ( _, Ok tbl ) ->
+            Ok tbl
 
-        table : Result String Table
-        table =
-            case ( sheet.doc, sheet.table ) of
-                ( Ok (Tab tbl), _ ) ->
-                    Ok tbl
+        ( Err err1, Err err2 ) ->
+            Err (err1 ++ " " ++ err2)
 
-                ( Ok Library, _ ) ->
-                    Ok
-                        { cols =
-                            libraryCols
-                        , rows =
-                            model.library
-                                |> Dict.filter (\k v -> k /= "" && not v.scratch && List.any (String.contains model.search) (k :: v.name :: v.tags))
-                                |> Dict.toList
-                                |> List.map (\( k, v ) -> Dict.fromList [ ( "sheet_id", E.string k ), ( "type", E.string (Maybe.withDefault "" <| List.head <| String.split ":" k) ), ( "name", E.string (iif (String.isEmpty (String.trim v.name)) "(untitled)" v.name) ), ( "tags", E.list E.string v.tags ), ( "delete", iif v.system E.null (E.string k) ) ])
-                                |> Array.fromList
-                        }
+        ( _, Err err ) ->
+            Err err
 
-                ( _, Ok tbl ) ->
-                    Ok tbl
 
-                ( Err err1, Err err2 ) ->
-                    Err (err1 ++ " " ++ err2)
+applyFilter : Filter -> String -> Row -> Bool
+applyFilter filter key row =
+    let
+        val =
+            Dict.get key row |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
 
-                ( _, Err err ) ->
-                    Err err
+        numVal =
+            String.toFloat val
+    in
+    case filter of
+        TextContains substr ->
+            String.contains (String.toLower substr) (String.toLower val)
 
-        examples : List String
-        examples =
-            case sheet.doc of
-                Ok (Query query) ->
-                    query.examples
+        TextEquals exact ->
+            String.toLower val == String.toLower exact
+
+        NumberGreaterThan n ->
+            Maybe.map (\v -> v > n) numVal |> Maybe.withDefault False
+
+        NumberLessThan n ->
+            Maybe.map (\v -> v < n) numVal |> Maybe.withDefault False
+
+        NumberBetween lo hi ->
+            Maybe.map (\v -> v >= lo && v <= hi) numVal |> Maybe.withDefault False
+
+        BooleanIs b ->
+            (String.toLower val == "true" || val == "1") == b
+
+
+filterAndSort : Sheet -> Array Row -> Array Row
+filterAndSort sheet rows =
+    let
+        passes row =
+            Dict.foldl (\key filter acc -> acc && applyFilter filter key row) True sheet.filters
+
+        filtered =
+            Array.filter passes rows
+    in
+    case sheet.sort of
+        Just ( sortKey, sortOrder ) ->
+            let
+                cmp r1 r2 =
+                    let
+                        v1 =
+                            Dict.get sortKey r1 |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
+
+                        v2 =
+                            Dict.get sortKey r2 |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
+                    in
+                    Maybe.map2 compare (String.toFloat v1) (String.toFloat v2) |> Maybe.withDefault (compare v1 v2)
+
+                sorted =
+                    Array.toList filtered |> List.sortWith cmp
+            in
+            Array.fromList (iif (sortOrder == Descending) (List.reverse sorted) sorted)
+
+        Nothing ->
+            filtered
+
+
+typeAlign : Type -> H.Attribute Msg
+typeAlign typ =
+    case typ of
+        Create -> S.textAlignRight
+        SheetId -> S.textAlignCenter
+        Boolean -> S.textAlignCenter
+        Usd -> S.textAlignRight
+        Number -> S.textAlignRight
+        Percentage -> S.textAlignRight
+        Delete -> S.textAlignCenter
+        Form _ -> S.textAlignCenter
+        _ -> S.textAlignLeft
+
+
+typeWidth : Type -> H.Attribute Msg
+typeWidth typ =
+    case typ of
+        Create -> S.widthRem 10
+        SheetId -> S.widthRem 3
+        Boolean -> S.widthRem 2
+        Number -> S.widthRem 5
+        Usd -> S.widthRem 5
+        Percentage -> S.widthRem 4
+        Delete -> S.widthRem 4
+        _ -> S.widthAuto
+
+
+cellClasses : Sheet -> Int -> Int -> H.Attribute Msg
+cellClasses sheet i n =
+    let
+        { a, b } =
+            sheet.select
+
+        between a_ b_ i_ =
+            min a_ b_ <= i_ && i_ <= max a_ b_
+
+        eq a_ b_ i_ =
+            a_ == i_ && i_ == b_
+
+        cellIdx =
+            xy i n
+
+        isMatch =
+            case sheet.findReplace of
+                Just fr -> List.member cellIdx fr.matches
+                Nothing -> False
+
+        isCurrentMatch =
+            case sheet.findReplace of
+                Just fr -> fr.matches |> List.drop fr.currentMatch |> List.head |> (==) (Just cellIdx)
+                Nothing -> False
+    in
+    A.classList
+        [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
+        , ( "r0", n == 0 )
+        , ( "match-highlight", isMatch && not isCurrentMatch )
+        , ( "match-current", isCurrentMatch )
+        ]
+
+
+cellDecoder : Type -> Int -> Int -> D.Decoder (Maybe (Html Msg))
+cellDecoder typ i n =
+    D.maybe
+        (case typ of
+            Unknown -> D.map text string
+            SheetId -> D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.overflowVisible, S.whiteSpaceNowrap, S.paddingRightRem 0.5 ] [ text "view" ])
+            Link -> D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.wordBreakKeepAll, S.hyphensNone ] [ text "link" ])
+            Image -> D.string |> D.map (\src -> H.img [ A.src src ] [])
+            Text -> D.map text string
+            Boolean -> boolean |> D.map (\c -> H.input [ A.type_ "checkbox", A.checked c, A.onCheck (DocMsg << CellCheck { x = i, y = n }) ] [])
+            Number -> D.oneOf [ D.map (text << String.fromFloat << round2) number, D.map text string ]
+            Usd -> D.oneOf [ D.map (text << usd) number, D.map text string ]
+            Percentage -> D.oneOf [ D.map (text << formatPercentage) number, D.map text string ]
+            Date -> D.map text string
+            Enum _ -> D.map text string
+            Delete -> D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])
+            Create -> D.value |> D.map (\val -> H.button [ A.onClick (DocNew val) ] [ text "add to library" ])
+            Form _ ->
+                D.map3
+                    (\method _ fields ->
+                        H.form [ A.onSubmit NoOp, S.displayGrid, S.gridTemplateColumns "auto 1fr", S.paddingRem 1 ] <|
+                            List.concatMap (\f -> [ H.label [] [ text f.label ], H.input [] [] ]) fields
+                                ++ [ H.span [] [], H.button [ A.type_ "submit" ] [ text method ] ]
+                    )
+                    (D.field "method" D.string)
+                    (D.field "action" D.string)
+                    (D.field "fields" (D.list (D.map (\label -> { label = label }) (D.field "label" D.string))))
+            _ -> D.map text string
+        )
+
+
+viewStatCell : Maybe Stat -> List (Html Msg)
+viewStatCell maybeStat =
+    let
+        grid =
+            H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gapRem 0, S.gridColumnGapRem 0.5, S.justifyContentFlexStart, S.opacity "0.5" ]
+
+        kv k v =
+            [ H.span [] [ text k ], H.span [] [ text v ] ]
+    in
+    case maybeStat of
+        Just (Numeric stat) ->
+            [ grid <|
+                kv "min" (Maybe.withDefault "" (Maybe.map (String.fromFloat << round2) stat.min))
+                    ++ kv "max" (Maybe.withDefault "" (Maybe.map (String.fromFloat << round2) stat.max))
+                    ++ kv "mean" (iif (stat.count == 0) "" (String.fromInt (round (stat.sum / toFloat stat.count))))
+                    ++ kv "count" (String.fromInt stat.count)
+            ]
+
+        Just (Descriptive stat) ->
+            [ grid <|
+                kv "min" (Maybe.withDefault "" (Maybe.map String.fromInt stat.min))
+                    ++ kv "max" (String.fromInt stat.max)
+                    ++ kv "mean" (iif (stat.count == 0) "" (String.fromInt (stat.sum // stat.count)))
+                    ++ kv "count" (String.fromInt stat.count)
+                    ++ kv "keywords" (String.join " " (Dict.keys (Dict.filter (\k v -> String.length k >= 4 && v >= 2) stat.keywords)))
+            ]
+
+        _ ->
+            []
+
+
+viewHeaderCell : Sheet -> Col -> List (Html Msg)
+viewHeaderCell sheet col =
+    case col.name of
+        "" ->
+            []
+
+        _ ->
+            let
+                sortIndicator =
+                    case sheet.sort of
+                        Just ( sortKey, Ascending ) -> iif (sortKey == col.key) " ▲" ""
+                        Just ( sortKey, Descending ) -> iif (sortKey == col.key) " ▼" ""
+                        Nothing -> ""
+
+                hasFilter =
+                    Dict.member col.key sheet.filters
+
+                isFilterOpen =
+                    sheet.filterOpen == Just col.key
+
+                currentFilterValue =
+                    case Dict.get col.key sheet.filters of
+                        Just (TextContains v) -> v
+                        _ -> ""
+            in
+            [ H.div [ S.displayFlex, S.flexDirectionColumn, S.positionRelative ]
+                [ H.div [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ]
+                    [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600", S.cursorPointer, A.onClick (ColumnSort col.key) ]
+                        [ text (col.name ++ sortIndicator) ]
+                    , H.span [ S.cursorPointer, S.opacity (iif hasFilter "1" "0.3"), S.fontSizeRem 0.7, A.onClick (FilterToggle col.key), A.title "Filter" ]
+                        [ text (iif hasFilter "⧩" "▽") ]
+                    ]
+                , if isFilterOpen then
+                    H.div [ S.positionAbsolute, S.top "100%", S.left "0", S.backgroundColor "#fff", S.border "1px solid #ccc", S.borderRadius "4px", S.padding "0.5rem", S.zIndex "100", S.boxShadow "0 2px 8px rgba(0,0,0,0.15)", S.minWidth "150px" ]
+                        [ H.input [ A.placeholder "contains...", A.value currentFilterValue, A.onInput (FilterInput col.key), S.width "100%", S.padding "0.25rem", S.border "1px solid #ddd", S.borderRadius "2px", S.fontSizeRem 0.8 ] []
+                        , if hasFilter then
+                            H.button [ A.onClick (FilterClear col.key), S.marginTop "0.25rem", S.padding "0.25rem 0.5rem", S.fontSizeRem 0.7, S.background "#f0f0f0", S.border "1px solid #ccc", S.borderRadius "2px", S.cursorPointer ] [ text "Clear" ]
+                          else
+                            text ""
+                        ]
+                  else
+                    text ""
+                ]
+            ]
+
+
+viewEditCell : Sheet -> Col -> List (Html Msg)
+viewEditCell sheet col =
+    case col.typ of
+        Enum options ->
+            [ H.select
+                [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%" ]
+                (H.option [ A.value "" ] [ text "-- select --" ]
+                    :: List.map (\opt -> H.option [ A.value opt, A.selected (Just opt == sheet.write) ] [ text opt ]) options
+                )
+            ]
+
+        _ ->
+            [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
+
+
+viewCell : Sheet -> Result String (Array Stat) -> Int -> Int -> Col -> Row -> Html Msg
+viewCell sheet stats i n col row =
+    H.td
+        [ A.onClick CellMouseClick
+        , A.onDoubleClick <|
+            CellMouseDoubleClick <|
+                if n < 0 then typeName col.typ
+                else if n == 0 then col.name
+                else row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
+        , A.onMouseDown CellMouseDown
+        , A.onMouseUp CellMouseUp
+        , A.onMouseEnter (CellHover (xy i n))
+        , S.heightRem 1.25
+        , S.lineHeight (iif (n == 0) "1.75" "")
+        , cellClasses sheet i n
+        , typeAlign col.typ
+        , typeWidth col.typ
+        ]
+    <|
+        if sheet.write /= Nothing && sheet.select == rect i n i n then
+            viewEditCell sheet col
+
+        else if n == -2 then
+            viewStatCell (Maybe.andThen (Array.get i) (Result.toMaybe stats))
+
+        else if n == -1 then
+            [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.opacity "0.5", S.fontSizeSmall ] [ text (typeName col.typ) ] ]
+
+        else if n == 0 then
+            viewHeaderCell sheet col
+
+        else
+            [ row
+                |> Dict.get col.key
+                |> Maybe.withDefault (E.string "")
+                |> D.decodeValue (cellDecoder col.typ i n)
+                |> Result.map (Maybe.withDefault (text ""))
+                |> Result.mapError (D.errorToString >> text)
+                |> result
+            ]
+
+
+viewTableRow : Sheet -> Doc -> Result String (Array Stat) -> Array Col -> Int -> Row -> Html Msg
+viewTableRow sheet doc stats cols n row =
+    H.tr
+        [ S.backgroundColor (if n == -2 then "#ececec" else if n <= 0 then "#f6f6f6" else "#fff")
+        , if n == -2 && Result.toMaybe stats == Nothing then S.displayNone else S.displayTableRow
+        ]
+    <|
+        List.indexedMap (\i col -> viewCell sheet stats i n col row) (Array.toList cols)
+            ++ [ case doc of
+                    Tab _ -> H.th [ A.onClick (DocMsg SheetColumnPush), S.textAlignLeft, S.widthRem 0.001, S.whiteSpaceNowrap, S.opacity "0.5" ] [ text (iif (n == 0) "→" "") ]
+                    _ -> text ""
+               ]
+
+
+viewFilterBar : Sheet -> Int -> Int -> Html Msg
+viewFilterBar sheet filteredCount totalCount =
+    if Dict.isEmpty sheet.filters then
+        text ""
+
+    else
+        H.div [ S.padding "0.25rem 0.5rem", S.backgroundColor "#fff8e0", S.borderBottom "1px solid #e0d8a0", S.fontSizeRem 0.75, S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter ]
+            [ H.span [] [ text ("Showing " ++ String.fromInt filteredCount ++ " of " ++ String.fromInt totalCount ++ " rows") ]
+            , H.button [ A.onClick (FilterClear ""), S.padding "0.125rem 0.5rem", S.fontSizeRem 0.7, S.background "#fff", S.border "1px solid #ccc", S.borderRadius "2px", S.cursorPointer ] [ text "Clear all filters" ]
+            ]
+
+
+viewTableFooter : Sheet -> Array Col -> Int -> Html Msg
+viewTableFooter sheet cols rowCount =
+    H.tfoot [] <|
+        case sheet.doc of
+            Ok Library ->
+                List.map
+                    (\( label, msg ) ->
+                        H.tr [ A.onClick msg ] <|
+                            H.td [ S.opacity "0.25" ] [ text label ]
+                                :: List.map (\typ -> H.td [ S.opacity "0.25" ] [ text typ ]) [ "text", "list text", "" ]
+                    )
+                    [ ( "table:...", DocNewTable ), ( "query:...", DocNewQuery ) ]
+                    ++ [ H.tr [] <|
+                            H.td [ S.opacity "0.25" ]
+                                [ H.label [ S.cursorPointer ]
+                                    [ text "import csv..."
+                                    , H.input [ A.type_ "file", A.accept ".csv,text/csv", A.on "change" (D.at [ "target", "files" ] (D.index 0 File.decoder) |> D.map CsvImportFile), S.display "none" ] []
+                                    ]
+                                ]
+                                :: List.map (\typ -> H.td [ S.opacity "0.25" ] [ text typ ]) [ "text", "list text", "" ]
+                       ]
+
+            Ok (Tab _) ->
+                [ H.tr [ A.onClick (DocMsg (SheetRowPush rowCount)) ] <|
+                    List.indexedMap (\_ col -> H.td [ S.opacity "0.25" ] [ text (typeName col.typ) ]) (Array.toList cols)
+                        ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap, S.opacity "0.5" ] [ text "↴" ] ]
+                ]
+
+            _ ->
+                []
+
+
+viewError : String -> Html Msg
+viewError error =
+    case error of
+        "" ->
+            text ""
+
+        _ ->
+            H.div [ S.backgroundColor "#fee", S.border "1px solid #c88", S.borderRadius "4px", S.padding "0.75rem", S.margin "0.5rem", S.fontFamily "monospace", S.fontSizeRem 0.8, S.whiteSpacePre, S.overflowXAuto ]
+                [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.marginBottomRem 0.5 ]
+                    [ H.strong [] [ text "Error" ]
+                    , H.button [ A.onClick (DocError ""), S.border "none", S.background "transparent", S.cursorPointer, S.fontSizeRem 1 ] [ text "×" ]
+                    ]
+                , text error
+                ]
+
+
+viewAuthForm : Auth -> Html Msg
+viewAuthForm auth =
+    case auth.state of
+        LoggedIn _ ->
+            text ""
+
+        _ ->
+            H.form [ A.id "account", A.onSubmit (AuthMsg AuthSubmit), S.displayGrid, S.gapRem 0.5, S.maxWidth "100vw", S.width "100%", S.gridTemplateColumns "1fr 1fr auto", S.paddingRem 0.5, S.borderTop "1px solid #aaa", S.backgroundColor "#ccc", S.positionAbsolute, S.bottomPx 0, S.zIndex "10" ]
+                [ H.input [ S.minWidthRem 2, A.placeholder "email", A.type_ "email", A.name "email", A.value auth.email, A.onInput (InputChange AuthEmail), A.disabled (auth.state == LoggingIn) ] []
+                , H.input [ S.minWidthRem 2, A.placeholder "password", A.type_ "password", A.name "password", A.value auth.password, A.onInput (InputChange AuthPassword), A.disabled (auth.state == LoggingIn) ] []
+                , H.button [ A.type_ "submit", S.background "#eee", A.disabled (auth.state == LoggingIn) ]
+                    [ text (iif (auth.state == LoggingIn) "..." (iif (String.isEmpty auth.password) "signup" "login")) ]
+                ]
+
+
+viewToolbar : Model -> SheetInfo -> Html Msg
+viewToolbar model info =
+    let
+        sheet =
+            model.sheet
+    in
+    H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsCenter, S.whiteSpaceNowrap, S.gapRem 0.5, S.paddingRem 0.5, S.borderBottom "1px solid #aaa", S.background "#f0f0f0" ] <|
+        List.concat
+            [ [ H.a [ A.href "/", S.fontWeight "900", S.fontSizeRem 1.5, S.heightRem 1, S.lineHeight "0.55" ] [ text "⊞" ]
+              , H.a [ A.href "/", S.fontWeight "900", A.id "title", S.marginLeftRem -0.25 ] [ text "scrapsheets" ]
+              , text "/"
+              ]
+            , case model.auth.state of
+                LoggedIn { usrId } -> [ H.span [ A.onClick (AuthMsg AuthLogout), S.cursorPointer ] [ text ("user:" ++ usrId) ], text "/" ]
+                _ -> [ H.span [] [ text "anon" ], text "/" ]
+            , iif (sheet.id == "")
+                [ H.span [] [ text "library" ] ]
+                [ H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ] ]
+            , case sheet.doc of
+                Ok (Tab _) ->
+                    [ H.a [ A.href ("https://api.sheets.scrap.land/export/" ++ sheet.id ++ ".csv"), A.download (sheet.id ++ ".csv"), S.marginLeftAuto, S.backgroundColor "#e8e8e8", S.padding "2px 8px", S.borderRadius "2px", S.fontSizeRem 0.75 ] [ text "export csv" ] ]
 
                 _ ->
                     []
+            ]
+
+
+viewQueryEditor : Model -> Query_ -> Html Msg
+viewQueryEditor model query =
+    let
+        sheet =
+            model.sheet
+
+        lineCount =
+            max 1 (List.length (String.lines (String.trim query.code)))
+
+        sheetRefs =
+            model.library |> Dict.keys |> List.filter (\k -> String.startsWith "table:" k || String.startsWith "query:" k) |> List.take 5
+    in
+    H.div [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%", S.minWidth "25vw" ]
+        [ H.div [ S.displayFlex, S.flexGrow "1", S.minHeightRem 8, S.overflowAuto, S.backgroundColor "#f8f8f8" ]
+            [ H.div [ S.paddingRem 1, S.paddingRight "0.5rem", S.backgroundColor "#eee", S.borderRight "1px solid #ddd", S.fontFamily "monospace", S.fontSizeRem 0.75, S.lineHeightRem 1.5, S.color "#999", S.textAlign "right", S.userSelect "none", S.minWidthRem 2.5 ]
+                (List.range 1 lineCount |> List.map (\n -> H.div [] [ text (String.fromInt n) ]))
+            , H.div [ S.positionRelative, S.flexGrow "1", S.height "100%" ]
+                [ H.textarea [ A.id "code", A.onInput (InputChange QueryCode), A.spellcheck False, S.height "100%", S.width "100%", S.whiteSpacePre, S.fontFamily "monospace", S.fontSizeRem 0.75, S.border "none", S.backgroundColor "transparent", S.paddingRem 1, S.paddingLeft "0.5rem", S.lineHeightRem 1.5, S.resize "none", S.outline "none" ]
+                    [ text (String.trim query.code) ]
+                , case sheet.queryAutocomplete of
+                    Nothing ->
+                        text ""
+
+                    Just ac ->
+                        H.div [ S.positionAbsolute, S.top "2rem", S.left "0.5rem", S.backgroundColor "#fff", S.border "1px solid #ccc", S.borderRadius "4px", S.boxShadow "0 2px 8px rgba(0,0,0,0.15)", S.zIndex "100", S.maxHeightRem 12, S.overflowYAuto, S.minWidthRem 15 ]
+                            (ac.suggestions
+                                |> List.indexedMap
+                                    (\i ref ->
+                                        H.div [ A.onClick (AutocompleteSelect ref), S.padding "0.5rem 0.75rem", S.cursorPointer, S.fontFamily "monospace", S.fontSizeRem 0.75, S.backgroundColor (iif (i == ac.selectedIndex) "#e8f4ff" "transparent"), S.borderBottom "1px solid #eee" ]
+                                            [ H.span [ S.color "#888" ] [ text "@" ], text ref ]
+                                    )
+                            )
+                ]
+            ]
+        , case model.error of
+            "" -> text ""
+            err ->
+                H.div [ S.backgroundColor "#fee", S.borderTop "2px solid #c66", S.padding "0.75rem", S.fontFamily "monospace", S.fontSizeRem 0.75, S.whiteSpacePre, S.overflowXAuto, S.maxHeightRem 8, S.overflowYAuto ]
+                    [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsStart ]
+                        [ H.span [ S.color "#c00" ] [ text err ]
+                        , H.button [ A.onClick (DocError ""), S.border "none", S.background "transparent", S.cursorPointer, S.color "#c00", S.fontSizeRem 1, S.marginLeft "0.5rem" ] [ text "×" ]
+                        ]
+                    ]
+        , if List.isEmpty sheetRefs then
+            text ""
+          else
+            H.div [ S.padding "0.5rem 0.75rem", S.backgroundColor "#f0f0f0", S.borderTop "1px solid #ddd", S.fontSizeRem 0.7, S.color "#666" ]
+                [ H.span [ S.fontWeight "600" ] [ text "Sheet refs: " ]
+                , text (String.join ", " (List.map (\s -> "@" ++ s) sheetRefs))
+                , iif (Dict.size model.library > 5) (H.span [ S.color "#999" ] [ text " ..." ]) (text "")
+                ]
+        ]
+
+
+view : Model -> Browser.Document Msg
+view ({ sheet } as model) =
+    let
+        info =
+            model.library |> Dict.get sheet.id |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = (), peers = Public }
+
+        stats =
+            sheet.stats
+
+        table =
+            resolveTable model
     in
     { title = "scrapsheets"
     , body =
-        [ H.node "style" [] [ text "body * { gap: 1rem; }" ]
-        , H.node "style" [] [ text "body { font-family: sans-serif; font-optical-sizing: auto; height: 100vh; width: 100vw; }" ]
-        , H.node "style" [] [ text "table { background: #fff; line-height: 1; }" ]
-        , H.node "style" [] [ text "td a, td button { opacity: 0.8; }" ]
-        , H.node "style" [] [ text "td a:hover, td button:hover { opacity: 1; }" ]
-        , H.node "style" [] [ text "th, td { padding: 0.25rem; padding-bottom: 0.15rem; font-weight: normal; border: 1px solid #aaa; height: 0.8rem; vertical-align: top; }" ]
-        , H.node "style" [] [ text "tr > :first-child { border-left: none; padding-left: 0.5rem; }" ]
-        , H.node "style" [] [ text "tr > :last-child { border-right: none; padding-right: 0.5rem; }" ]
-        , H.node "style" [] [ text "th > *, td > * { max-height: 6rem; text-overflow: ellipsis; overflow: hidden; }" ]
-        , H.node "style" [] [ text "td:hover { background: rgba(0,0,0,0.025); }" ]
-        , H.node "style" [] [ text ".r0 { position: sticky; top: -1px; background: #f6f6f6; z-index: 1; border-bottom: 0px; }" ]
-        , H.node "style" [] [ text ".r0::after { content: \"\"; display: block; position: absolute; width: 100%; left: 0; bottom: -1px; border-bottom: 1px solid #aaa; }" ]
-        , H.node "style" [] [ text ".selected { background: rgba(0,0,0,0.05); }" ]
-        , H.node "style" [] [ text ".match-highlight { background: rgba(255,200,0,0.3); }" ]
-        , H.node "style" [] [ text ".match-current { background: rgba(255,150,0,0.5); }" ]
-        , H.node "style" [] [ text "#code { font-family: monospace; background: #fff; }" ]
-        , H.node "style" [] [ text "@media (min-width: 768px) { body > div { grid-template-columns: 1fr auto; } #aside { border-left: 1px solid #aaa; } }" ]
-        , H.node "style" [] [ text "@media (max-width: 768px) { body > div { grid-template-rows: 1fr auto; } #aside { border-top: 1px solid #aaa; } }" ]
-        , H.node "style" [] [ text "@media (max-width: 768px) { #title { display: none; } }" ]
-        , H.node "style" [] [ text "#account > * { padding: 0.25rem 0.5rem; border: 1px solid #aaa; border-radius: 2px; font-size: 0.875rem; }" ]
-        , case model.auth.state of
-            LoggedIn _ ->
-                text ""
-
-            _ ->
-                H.form
-                    [ A.id "account"
-                    , A.onSubmit (AuthMsg AuthSubmit)
-                    , S.displayGrid
-                    , S.gapRem 0.5
-                    , S.maxWidth "100vw"
-                    , S.width "100%"
-                    , S.gridTemplateColumns "1fr 1fr auto"
-                    , S.paddingRem 0.5
-                    , S.borderTop "1px solid #aaa"
-                    , S.backgroundColor "#ccc"
-                    , S.positionAbsolute
-                    , S.bottomPx 0
-                    , S.zIndex "10"
-                    ]
-                    [ H.input
-                        [ S.minWidthRem 2
-                        , A.placeholder "email"
-                        , A.type_ "email"
-                        , A.name "email"
-                        , A.value model.auth.email
-                        , A.onInput (InputChange AuthEmail)
-                        , A.disabled (model.auth.state == LoggingIn)
-                        ]
-                        []
-                    , H.input
-                        [ S.minWidthRem 2
-                        , A.placeholder "password"
-                        , A.type_ "password"
-                        , A.name "password"
-                        , A.value model.auth.password
-                        , A.onInput (InputChange AuthPassword)
-                        , A.disabled (model.auth.state == LoggingIn)
-                        ]
-                        []
-                    , H.button
-                        [ A.type_ "submit"
-                        , S.background "#eee"
-                        , A.disabled (model.auth.state == LoggingIn)
-                        ]
-                        [ text
-                            (case model.auth.state of
-                                LoggingIn ->
-                                    "..."
-
-                                _ ->
-                                    iif (String.isEmpty model.auth.password) "signup" "login"
-                            )
-                        ]
-                    ]
-        -- , H.node "style" [] [ text "thead tr td { position: sticky; top: 0; }" ]
-        -- , H.node "style" [] [ text "tfoot tr:last-child td { position: sticky; bottom: 0; }" ]
+        [ viewAuthForm model.auth
         , viewFindReplace sheet.findReplace
         , viewDeleteConfirm model.deleteConfirm
         , viewSettings model.showSettings info
         , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
-                [ H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsCenter, S.whiteSpaceNowrap, S.gapRem 0.5, S.paddingRem 0.5, S.borderBottom "1px solid #aaa", S.background "#f0f0f0" ] <|
-                    List.concat
-                        [ [ H.a [ A.href "/", S.fontWeight "900", S.fontSizeRem 1.5, S.heightRem 1, S.lineHeight "0.55" ] [ text "⊞" ]
-                          , H.a [ A.href "/", S.fontWeight "900", A.id "title", S.marginLeftRem -0.25 ] [ text "scrapsheets" ]
-                          , text "/"
-                          ]
-                        , case model.auth.state of
-                            LoggedIn { usrId } ->
-                                [ H.span [ A.onClick (AuthMsg AuthLogout), S.cursorPointer ] [ text ("user:" ++ usrId) ]
-                                , text "/"
-                                ]
-
-                            _ ->
-                                [ H.span [] [ text "anon" ]
-                                , text "/"
-                                ]
-                        , iif (sheet.id == "")
-                            [ H.span [] [ text "library" ]
-                            ]
-                            [ H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ]
-                            ]
-                        , case sheet.doc of
-                            Ok (Tab _) ->
-                                [ H.a
-                                    [ A.href ("https://api.sheets.scrap.land/export/" ++ sheet.id ++ ".csv")
-                                    , A.download (sheet.id ++ ".csv")
-                                    , S.marginLeftAuto
-                                    , S.backgroundColor "#e8e8e8"
-                                    , S.padding "2px 8px"
-                                    , S.borderRadius "2px"
-                                    , S.fontSizeRem 0.75
-                                    ]
-                                    [ text "export csv" ]
-                                ]
-
-                            _ ->
-                                []
-                        ]
-
-                -- TODO: Put recent/saved searches on right.
+                [ viewToolbar model info
                 , H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0, S.borderBottom "1px solid #aaa", S.zIndex "2", S.marginBottomPx -1 ]
-                    -- All current filters should be rendered as text in the searchbar.
-                    -- This helps people (1) learn the language and (2) indicate that they're searching rather than editing.
-                    -- TODO: If no results found, show saved searches and recent searches.
                     [ H.div [ S.displayFlex, S.width "100%", S.height "100%" ]
-                        [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder "search", S.width "100%", S.border "none", S.backgroundColor "#fff", S.padding "0.25rem 0.5rem", S.fontSizeRem 0.875 ] []
-                        ]
+                        [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder "search", S.width "100%", S.border "none", S.backgroundColor "#fff", S.padding "0.25rem 0.5rem", S.fontSizeRem 0.875 ] [] ]
                     ]
-
-                -- , H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.padding "0.5rem 1rem", S.backgroundColor "#fff" ] <|
-                --     [ H.div [ S.displayFlex, S.alignItemsBaseline, S.gapRem 1, S.opacity "0.5" ] <|
-                --         List.concat
-                --             [ List.map (\x -> H.span [ A.onClick (InputChange SheetSearch x), S.textDecorationUnderline, S.opacity "0.5", S.fontSizeRem 0.6 ] [ text x ]) <| examples
-                --             , List.map (\tag -> H.a [ A.href ("/?q=tag:" ++ tag) ] [ text ("#" ++ tag) ]) info.tags
-                --             , List.map (\id -> H.a [ A.href ("/" ++ id) ] [ text ("$" ++ id) ]) [ "backlink" ]
-                --             , List.map (\id -> H.a [ A.href ("/?following=" ++ id) ] [ text ("@" ++ id) ]) [ "anon" ]
-                --             ]
-                --     , H.div [ S.displayFlex, S.alignItemsBaseline, S.flexDirectionRowReverse, S.gapRem 1, S.opacity "0.5" ] <|
-                --         List.concat
-                --             [ case sheet.doc of
-                --                 Ok Library ->
-                --                     [ H.span [ A.onClick DocNewQuery ] [ text "new query" ]
-                --                     , H.span [ A.onClick DocNewTable ] [ text "new table" ]
-                --                     ]
-                --                 _ ->
-                --                     [ H.span [ A.onClick (DocMsg (SheetColumnPush)) ] [ text "⌘C new column" ]
-                --                     ]
-                --             , List.map (\tag -> H.span [] [ text "⌘F find" ]) [ () ]
-                --             ]
-                --     ]
-                -- TODO: https://package.elm-lang.org/packages/elm/html/latest/Html-Keyed
                 , H.div [ S.overflowAuto, S.height "100%", S.backgroundColor "#eee" ]
-                    [ case model.error of
-                        "" ->
-                            text ""
-
-                        error ->
-                            H.div
-                                [ S.backgroundColor "#fee"
-                                , S.border "1px solid #c88"
-                                , S.borderRadius "4px"
-                                , S.padding "0.75rem"
-                                , S.margin "0.5rem"
-                                , S.fontFamily "monospace"
-                                , S.fontSizeRem 0.8
-                                , S.whiteSpacePre
-                                , S.overflowXAuto
-                                ]
-                                [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.marginBottomRem 0.5 ]
-                                    [ H.strong [] [ text "Error" ]
-                                    , H.button
-                                        [ A.onClick (DocError "")
-                                        , S.border "none"
-                                        , S.background "transparent"
-                                        , S.cursorPointer
-                                        , S.fontSizeRem 1
-                                        ]
-                                        [ text "×" ]
-                                    ]
-                                , text error
-                                ]
+                    [ viewError model.error
                     , case table of
                         Err "" ->
                             H.div [ S.displayFlex ] [ H.span [ S.textAlignCenter, S.width "100%", S.paddingRem 2, S.opacity "0.5" ] [ text "loading" ] ]
@@ -2951,823 +3219,29 @@ view ({ sheet } as model) =
 
                         Ok { cols, rows } ->
                             let
-                                -- Apply filters
-                                applyFilter : Filter -> String -> Row -> Bool
-                                applyFilter filter key row =
-                                    let
-                                        val =
-                                            Dict.get key row
-                                                |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
-                                                |> Maybe.withDefault ""
-
-                                        numVal =
-                                            String.toFloat val
-                                    in
-                                    case filter of
-                                        TextContains substr ->
-                                            String.contains (String.toLower substr) (String.toLower val)
-
-                                        TextEquals exact ->
-                                            String.toLower val == String.toLower exact
-
-                                        NumberGreaterThan n ->
-                                            Maybe.map (\v -> v > n) numVal |> Maybe.withDefault False
-
-                                        NumberLessThan n ->
-                                            Maybe.map (\v -> v < n) numVal |> Maybe.withDefault False
-
-                                        NumberBetween lo hi ->
-                                            Maybe.map (\v -> v >= lo && v <= hi) numVal |> Maybe.withDefault False
-
-                                        BooleanIs b ->
-                                            (String.toLower val == "true" || val == "1") == b
-
-                                rowPassesFilters : Row -> Bool
-                                rowPassesFilters row =
-                                    Dict.foldl
-                                        (\key filter acc -> acc && applyFilter filter key row)
-                                        True
-                                        sheet.filters
-
-                                filteredRows =
-                                    Array.filter rowPassesFilters rows
-
-                                -- Apply sorting
                                 sortedRows =
-                                    case sheet.sort of
-                                        Just ( sortKey, sortOrder ) ->
-                                            let
-                                                compareRows r1 r2 =
-                                                    let
-                                                        v1 =
-                                                            Dict.get sortKey r1
-                                                                |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
-                                                                |> Maybe.withDefault ""
+                                    filterAndSort sheet rows
 
-                                                        v2 =
-                                                            Dict.get sortKey r2
-                                                                |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
-                                                                |> Maybe.withDefault ""
-
-                                                        -- Try numeric comparison first
-                                                        numCompare =
-                                                            Maybe.map2 compare
-                                                                (String.toFloat v1)
-                                                                (String.toFloat v2)
-                                                    in
-                                                    case numCompare of
-                                                        Just ord ->
-                                                            ord
-
-                                                        Nothing ->
-                                                            compare v1 v2
-
-                                                sorted =
-                                                    Array.toList filteredRows |> List.sortWith compareRows
-                                            in
-                                            case sortOrder of
-                                                Ascending ->
-                                                    Array.fromList sorted
-
-                                                Descending ->
-                                                    Array.fromList (List.reverse sorted)
-
-                                        Nothing ->
-                                            filteredRows
-
-                                filterCount =
-                                    Dict.size sheet.filters
-
-                                filteredCount =
-                                    Array.length sortedRows
-
-                                totalCount =
-                                    Array.length rows
+                                doc =
+                                    sheet.doc |> Result.withDefault Library
                             in
                             H.div []
-                                [ if filterCount > 0 then
-                                    H.div
-                                        [ S.padding "0.25rem 0.5rem"
-                                        , S.backgroundColor "#fff8e0"
-                                        , S.borderBottom "1px solid #e0d8a0"
-                                        , S.fontSizeRem 0.75
-                                        , S.displayFlex
-                                        , S.justifyContentSpaceBetween
-                                        , S.alignItemsCenter
-                                        ]
-                                        [ H.span []
-                                            [ text ("Showing " ++ String.fromInt filteredCount ++ " of " ++ String.fromInt totalCount ++ " rows") ]
-                                        , H.button
-                                            [ A.onClick (FilterClear "")
-                                            , S.padding "0.125rem 0.5rem"
-                                            , S.fontSizeRem 0.7
-                                            , S.background "#fff"
-                                            , S.border "1px solid #ccc"
-                                            , S.borderRadius "2px"
-                                            , S.cursorPointer
-                                            ]
-                                            [ text "Clear all filters" ]
-                                        ]
-
-                                  else
-                                    text ""
+                                [ viewFilterBar sheet (Array.length sortedRows) (Array.length rows)
                                 , H.table [ S.borderCollapseCollapse, S.width "100%", A.onMouseLeave (CellHover (xy -1 -1)) ]
-                                [ H.thead []
-                                    -- [ H.tr [] <|
-                                    --     H.th [] []
-                                    --         :: List.indexedMap
-                                    --             -- TODO: Stats.
-                                    --             (\i col -> H.th [ S.textAlignLeft, S.paddingBottomRem 1 ] [])
-                                    --             (Array.toList cols)
-                                    []
-                                , H.tbody [] <|
-                                    List.concat
-                                        [ Array.toList <|
-                                            Array.indexedMap
-                                                (\n_ row ->
-                                                    let
-                                                        n =
-                                                            -- TODO: Consider moving the header rows to H.thead
-                                                            n_ - 2
-                                                    in
-                                                    H.tr
-                                                        [ case String.fromInt n of
-                                                            "-2" ->
-                                                                S.backgroundColor "#ececec"
-
-                                                            "-1" ->
-                                                                S.backgroundColor "#f6f6f6"
-
-                                                            "0" ->
-                                                                S.backgroundColor "#f6f6f6"
-
-                                                            _ ->
-                                                                S.backgroundColor "#fff"
-                                                        , case ( String.fromInt n, stats ) of
-                                                            ( "-2", Err _ ) ->
-                                                                S.displayNone
-
-                                                            _ ->
-                                                                S.displayTableRow
-                                                        ]
-                                                    <|
-                                                        List.indexedMap
-                                                            (\i col ->
-                                                                H.td
-                                                                    [ A.onClick CellMouseClick
-                                                                    , A.onDoubleClick <|
-                                                                        CellMouseDoubleClick <|
-                                                                            case String.fromInt n of
-                                                                                "-1" ->
-                                                                                    typeName col.typ
-
-                                                                                "0" ->
-                                                                                    col.name
-
-                                                                                _ ->
-                                                                                    row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
-                                                                    , A.onMouseDown CellMouseDown
-                                                                    , A.onMouseUp CellMouseUp
-                                                                    , A.onMouseEnter (CellHover (xy i n))
-                                                                    , S.heightRem 1.25
-                                                                    , S.lineHeight (iif (n == 0) "1.75" "")
-                                                                    , A.classList <|
-                                                                        let
-                                                                            { a, b } =
-                                                                                sheet.select
-
-                                                                            between : number -> number -> number -> Bool
-                                                                            between a_ b_ i_ =
-                                                                                min a_ b_ <= i_ && i_ <= max a_ b_
-
-                                                                            eq : number -> number -> number -> Bool
-                                                                            eq a_ b_ i_ =
-                                                                                a_ == i_ && i_ == b_
-
-                                                                            cellIdx =
-                                                                                xy i n
-
-                                                                            isMatch =
-                                                                                case sheet.findReplace of
-                                                                                    Just fr ->
-                                                                                        List.member cellIdx fr.matches
-
-                                                                                    Nothing ->
-                                                                                        False
-
-                                                                            isCurrentMatch =
-                                                                                case sheet.findReplace of
-                                                                                    Just fr ->
-                                                                                        fr.matches
-                                                                                            |> List.drop fr.currentMatch
-                                                                                            |> List.head
-                                                                                            |> (==) (Just cellIdx)
-
-                                                                                    Nothing ->
-                                                                                        False
-                                                                        in
-                                                                        [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
-                                                                        , ( "r0", n == 0 )
-                                                                        , ( "match-highlight", isMatch && not isCurrentMatch )
-                                                                        , ( "match-current", isCurrentMatch )
-                                                                        ]
-                                                                    , case col.typ of
-                                                                        Create ->
-                                                                            S.textAlignRight
-
-                                                                        SheetId ->
-                                                                            S.textAlignCenter
-
-                                                                        Boolean ->
-                                                                            S.textAlignCenter
-
-                                                                        Usd ->
-                                                                            S.textAlignRight
-
-                                                                        Number ->
-                                                                            S.textAlignRight
-
-                                                                        Percentage ->
-                                                                            S.textAlignRight
-
-                                                                        Delete ->
-                                                                            S.textAlignCenter
-
-                                                                        Form _ ->
-                                                                            S.textAlignCenter
-
-                                                                        _ ->
-                                                                            S.textAlignLeft
-                                                                    , case col.typ of
-                                                                        Create ->
-                                                                            S.widthRem 10
-
-                                                                        SheetId ->
-                                                                            S.widthRem 3
-
-                                                                        Boolean ->
-                                                                            S.widthRem 2
-
-                                                                        Number ->
-                                                                            S.widthRem 5
-
-                                                                        Usd ->
-                                                                            S.widthRem 5
-
-                                                                        Percentage ->
-                                                                            S.widthRem 4
-
-                                                                        Delete ->
-                                                                            S.widthRem 4
-
-                                                                        _ ->
-                                                                            S.widthAuto
-                                                                    ]
-                                                                <|
-                                                                    case ( String.fromInt n, sheet.write /= Nothing && sheet.select == rect i n i n ) of
-                                                                        ( _, True ) ->
-                                                                            case col.typ of
-                                                                                Enum options ->
-                                                                                    [ H.select
-                                                                                        [ A.id "new-cell"
-                                                                                        , A.value (Maybe.withDefault "" sheet.write)
-                                                                                        , A.onInput (InputChange CellWrite)
-                                                                                        , A.onBlur (DocMsg (SheetWrite sheet.select.a))
-                                                                                        , S.width "100%"
-                                                                                        , S.height "100%"
-                                                                                        ]
-                                                                                        (H.option [ A.value "" ] [ text "-- select --" ]
-                                                                                            :: List.map
-                                                                                                (\opt ->
-                                                                                                    H.option
-                                                                                                        [ A.value opt
-                                                                                                        , A.selected (Just opt == sheet.write)
-                                                                                                        ]
-                                                                                                        [ text opt ]
-                                                                                                )
-                                                                                                options
-                                                                                        )
-                                                                                    ]
-
-                                                                                _ ->
-                                                                                    [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
-
-                                                                        ( "-2", _ ) ->
-                                                                            case Maybe.andThen (Array.get i) (Result.toMaybe stats) of
-                                                                                Just (Numeric stat) ->
-                                                                                    [ H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gapRem 0, S.gridColumnGapRem 0.5, S.justifyContentFlexStart, S.opacity "0.5" ]
-                                                                                        [ H.span [] [ text "min" ]
-                                                                                        , H.span [] [ text (Maybe.withDefault "" (Maybe.map (String.fromFloat << round2) stat.min)) ]
-                                                                                        , H.span [] [ text "max" ]
-                                                                                        , H.span [] [ text (Maybe.withDefault "" (Maybe.map (String.fromFloat << round2) stat.max)) ]
-                                                                                        , H.span [] [ text "mean" ]
-                                                                                        , H.span [] [ text (iif (stat.count == 0) "" (String.fromInt (round (stat.sum / toFloat stat.count)))) ]
-                                                                                        , H.span [] [ text "count" ]
-                                                                                        , H.span [] [ text (String.fromInt stat.count) ]
-                                                                                        ]
-                                                                                    ]
-
-                                                                                Just (Descriptive stat) ->
-                                                                                    [ H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gapRem 0, S.gridColumnGapRem 0.5, S.justifyContentFlexStart, S.opacity "0.5" ]
-                                                                                        [ H.span [] [ text "min" ]
-                                                                                        , H.span [] [ text (Maybe.withDefault "" (Maybe.map String.fromInt stat.min)) ]
-                                                                                        , H.span [] [ text "max" ]
-                                                                                        , H.span [] [ text (String.fromInt stat.max) ]
-                                                                                        , H.span [] [ text "mean" ]
-                                                                                        , H.span [] [ text (iif (stat.count == 0) "" (String.fromInt (stat.sum // stat.count))) ]
-                                                                                        , H.span [] [ text "count" ]
-                                                                                        , H.span [] [ text (String.fromInt stat.count) ]
-                                                                                        , H.span [] [ text "keywords" ]
-                                                                                        , H.span [] [ text (String.join " " (Dict.keys (Dict.filter (\k v -> String.length k >= 4 && v >= 2) stat.keywords))) ]
-                                                                                        ]
-                                                                                    ]
-
-                                                                                Just (Enumerative stat) ->
-                                                                                    -- TODO:
-                                                                                    []
-
-                                                                                Nothing ->
-                                                                                    []
-
-                                                                        ( "-1", _ ) ->
-                                                                            [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.opacity "0.5", S.fontSizeSmall ]
-                                                                                [ text (typeName col.typ)
-                                                                                ]
-                                                                            ]
-
-                                                                        ( "0", _ ) ->
-                                                                            case col.name of
-                                                                                "" ->
-                                                                                    []
-
-                                                                                _ ->
-                                                                                    let
-                                                                                        sortIndicator =
-                                                                                            case sheet.sort of
-                                                                                                Just ( sortKey, Ascending ) ->
-                                                                                                    if sortKey == col.key then
-                                                                                                        " ▲"
-
-                                                                                                    else
-                                                                                                        ""
-
-                                                                                                Just ( sortKey, Descending ) ->
-                                                                                                    if sortKey == col.key then
-                                                                                                        " ▼"
-
-                                                                                                    else
-                                                                                                        ""
-
-                                                                                                Nothing ->
-                                                                                                    ""
-
-                                                                                        hasFilter =
-                                                                                            Dict.member col.key sheet.filters
-
-                                                                                        filterIndicator =
-                                                                                            if hasFilter then
-                                                                                                " ⧩"
-
-                                                                                            else
-                                                                                                ""
-
-                                                                                        isFilterOpen =
-                                                                                            sheet.filterOpen == Just col.key
-
-                                                                                        currentFilterValue =
-                                                                                            case Dict.get col.key sheet.filters of
-                                                                                                Just (TextContains v) ->
-                                                                                                    v
-
-                                                                                                _ ->
-                                                                                                    ""
-                                                                                    in
-                                                                                    [ H.div [ S.displayFlex, S.flexDirectionColumn, S.positionRelative ]
-                                                                                        [ H.div [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ]
-                                                                                            [ H.span
-                                                                                                [ S.textOverflowEllipsis
-                                                                                                , S.overflowHidden
-                                                                                                , S.whiteSpaceNowrap
-                                                                                                , S.fontWeight "600"
-                                                                                                , S.cursorPointer
-                                                                                                , A.onClick (ColumnSort col.key)
-                                                                                                ]
-                                                                                                [ text (col.name ++ sortIndicator) ]
-                                                                                            , H.span
-                                                                                                [ S.cursorPointer
-                                                                                                , S.opacity (iif hasFilter "1" "0.3")
-                                                                                                , S.fontSizeRem 0.7
-                                                                                                , A.onClick (FilterToggle col.key)
-                                                                                                , A.title "Filter"
-                                                                                                ]
-                                                                                                [ text (iif hasFilter "⧩" "▽") ]
-                                                                                            ]
-                                                                                        , if isFilterOpen then
-                                                                                            H.div
-                                                                                                [ S.positionAbsolute
-                                                                                                , S.top "100%"
-                                                                                                , S.left "0"
-                                                                                                , S.backgroundColor "#fff"
-                                                                                                , S.border "1px solid #ccc"
-                                                                                                , S.borderRadius "4px"
-                                                                                                , S.padding "0.5rem"
-                                                                                                , S.zIndex "100"
-                                                                                                , S.boxShadow "0 2px 8px rgba(0,0,0,0.15)"
-                                                                                                , S.minWidth "150px"
-                                                                                                ]
-                                                                                                [ H.input
-                                                                                                    [ A.placeholder "contains..."
-                                                                                                    , A.value currentFilterValue
-                                                                                                    , A.onInput (FilterInput col.key)
-                                                                                                    , S.width "100%"
-                                                                                                    , S.padding "0.25rem"
-                                                                                                    , S.border "1px solid #ddd"
-                                                                                                    , S.borderRadius "2px"
-                                                                                                    , S.fontSizeRem 0.8
-                                                                                                    ]
-                                                                                                    []
-                                                                                                , if hasFilter then
-                                                                                                    H.button
-                                                                                                        [ A.onClick (FilterClear col.key)
-                                                                                                        , S.marginTop "0.25rem"
-                                                                                                        , S.padding "0.25rem 0.5rem"
-                                                                                                        , S.fontSizeRem 0.7
-                                                                                                        , S.background "#f0f0f0"
-                                                                                                        , S.border "1px solid #ccc"
-                                                                                                        , S.borderRadius "2px"
-                                                                                                        , S.cursorPointer
-                                                                                                        ]
-                                                                                                        [ text "Clear" ]
-
-                                                                                                  else
-                                                                                                    text ""
-                                                                                                ]
-
-                                                                                          else
-                                                                                            text ""
-                                                                                        ]
-                                                                                    ]
-
-                                                                        _ ->
-                                                                            [ row
-                                                                                |> Dict.get col.key
-                                                                                |> Maybe.withDefault (E.string "")
-                                                                                |> D.decodeValue
-                                                                                    (D.maybe
-                                                                                        (case col.typ of
-                                                                                            Unknown ->
-                                                                                                D.map text string
-
-                                                                                            SheetId ->
-                                                                                                D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.overflowVisible, S.whiteSpaceNowrap, S.paddingRightRem 0.5 ] [ text "view" ])
-
-                                                                                            Link ->
-                                                                                                D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.wordBreakKeepAll, S.hyphensNone ] [ text "link" ])
-
-                                                                                            Image ->
-                                                                                                D.string |> D.map (\src -> H.img [ A.src src ] [])
-
-                                                                                            Text ->
-                                                                                                D.map text string
-
-                                                                                            Boolean ->
-                                                                                                boolean |> D.map (\c -> H.input [ A.type_ "checkbox", A.checked c, A.onCheck (DocMsg << CellCheck { x = i, y = n }) ] [])
-
-                                                                                            Number ->
-                                                                                                D.oneOf
-                                                                                                    [ D.map (text << String.fromFloat << round2) number
-                                                                                                    , D.map text string
-                                                                                                    ]
-
-                                                                                            Usd ->
-                                                                                                D.oneOf
-                                                                                                    [ D.map (text << usd) number
-                                                                                                    , D.map text string
-                                                                                                    ]
-
-                                                                                            Percentage ->
-                                                                                                D.oneOf
-                                                                                                    [ D.map (text << formatPercentage) number
-                                                                                                    , D.map text string
-                                                                                                    ]
-
-                                                                                            Date ->
-                                                                                                D.oneOf
-                                                                                                    [ D.map text string
-                                                                                                    ]
-
-                                                                                            Enum _ ->
-                                                                                                D.map text string
-
-                                                                                            Delete ->
-                                                                                                D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])
-
-                                                                                            Create ->
-                                                                                                D.value |> D.map (\val -> H.button [ A.onClick (DocNew val) ] [ text "add to library" ])
-
-                                                                                            Form form ->
-                                                                                                D.map3
-                                                                                                    (\method action fields ->
-                                                                                                        -- TODO: Change this to displayGrid
-                                                                                                        H.form [ A.onSubmit NoOp, S.displayGrid, S.gridTemplateColumns "auto 1fr", S.paddingRem 1 ] <|
-                                                                                                            List.concat
-                                                                                                                [ List.concatMap
-                                                                                                                    (\field ->
-                                                                                                                        [ H.label [] [ text field.label ]
-                                                                                                                        , H.input [] []
-                                                                                                                        ]
-                                                                                                                    )
-                                                                                                                    fields
-                                                                                                                , [ H.span [] []
-                                                                                                                  , H.button [ A.type_ "submit" ] [ text method ]
-                                                                                                                  ]
-                                                                                                                ]
-                                                                                                    )
-                                                                                                    (D.field "method" D.string)
-                                                                                                    (D.field "action" D.string)
-                                                                                                    (D.field "fields"
-                                                                                                        (D.list
-                                                                                                            (D.map (\label -> { label = label })
-                                                                                                                (D.field "label" D.string)
-                                                                                                            )
-                                                                                                        )
-                                                                                                    )
-
-                                                                                            _ ->
-                                                                                                D.map text string
-                                                                                        )
-                                                                                    )
-                                                                                |> Result.map (Maybe.withDefault (text ""))
-                                                                                |> Result.mapError (D.errorToString >> text)
-                                                                                |> result
-                                                                            ]
-                                                            )
-                                                            (Array.toList cols)
-                                                            ++ [ case sheet.doc of
-                                                                    -- TODO: on rightmost column, add a tiny column for mobile "select entire row" which can be used for reordering and deletion too. the library sheet should have this column too. double click to expand row into its own detail table
-                                                                    Ok (Tab _) ->
-                                                                        H.th
-                                                                            [ A.onClick (DocMsg SheetColumnPush)
-                                                                            , S.textAlignLeft
-                                                                            , S.widthRem 0.001
-                                                                            , S.whiteSpaceNowrap
-                                                                            , S.opacity "0.5"
-                                                                            ]
-                                                                            [ text (iif (n == 0) "→" "") ]
-
-                                                                    _ ->
-                                                                        text ""
-                                                               ]
-                                                )
-                                            <|
-                                                Array.append (Array.initialize 3 (always Dict.empty)) <|
-                                                    sortedRows
-                                        ]
-
-                                -- TODO: These rows should always be stuck to the bottom of the window.
-                                , H.tfoot [] <|
-                                    case sheet.doc of
-                                        Ok Library ->
-                                            List.map
-                                                (\( label, msg ) ->
-                                                    H.tr [ A.onClick msg ] <|
-                                                        (::) (H.td [ S.opacity "0.25" ] [ text label ]) <|
-                                                            List.map (\typ -> H.td [ S.opacity "0.25" ] [ text typ ])
-                                                                [ "text"
-                                                                , "list text"
-                                                                , ""
-                                                                ]
-                                                )
-                                                [ ( "table:...", DocNewTable )
-                                                , ( "query:...", DocNewQuery )
-                                                ]
-                                                ++ [ H.tr [] <|
-                                                        (::)
-                                                            (H.td [ S.opacity "0.25" ]
-                                                                [ H.label [ S.cursorPointer ]
-                                                                    [ text "import csv..."
-                                                                    , H.input
-                                                                        [ A.type_ "file"
-                                                                        , A.accept ".csv,text/csv"
-                                                                        , A.on "change"
-                                                                            (D.at [ "target", "files" ] (D.index 0 File.decoder)
-                                                                                |> D.map CsvImportFile
-                                                                            )
-                                                                        , S.display "none"
-                                                                        ]
-                                                                        []
-                                                                    ]
-                                                                ]
-                                                            )
-                                                        <|
-                                                            List.map (\typ -> H.td [ S.opacity "0.25" ] [ text typ ])
-                                                                [ "text"
-                                                                , "list text"
-                                                                , ""
-                                                                ]
-                                                   ]
-
-                                        Ok (Tab _) ->
-                                            [ H.tr [ A.onClick (DocMsg (SheetRowPush (Array.length rows))) ] <|
-                                                List.concat
-                                                    [ List.indexedMap (\i col -> H.td [ S.opacity "0.25" ] [ text (typeName col.typ) ]) <|
-                                                        Array.toList cols
-                                                    , case sheet.doc of
-                                                        Ok (Tab _) ->
-                                                            [ H.th
-                                                                [ S.widthRem 0.001
-                                                                , S.whiteSpaceNowrap
-                                                                , S.opacity "0.5"
-                                                                ]
-                                                                [ text "↴"
-                                                                ]
-                                                            ]
-
-                                                        _ ->
-                                                            []
-                                                    ]
-                                            ]
-
-                                        _ ->
-                                            []
-                                ]
+                                    [ H.thead [] []
+                                    , H.tbody [] <|
+                                        Array.toList <|
+                                            Array.indexedMap (\n_ row -> viewTableRow sheet doc stats cols (n_ - 2) row) <|
+                                                Array.append (Array.initialize 3 (always Dict.empty)) sortedRows
+                                    , viewTableFooter sheet cols (Array.length rows)
+                                    ]
                                 ]
                     ]
                 ]
             , H.aside [ A.id "aside", S.displayFlex, S.flexDirectionColumn, S.height "100%", S.backgroundColor "#fff" ] <|
                 case sheet.doc of
-                    Ok (Tab _) ->
-                        -- -- TODO: Conversational AI interface.
-                        -- [ H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 1, S.marginBottomRem 1.5, S.opacity "0.8" ]
-                        --     [ H.p [ S.textAlignRight ] [ text "Vivamus dapibus porttitor eros, et semper mi ultricies sit amet." ]
-                        --     , H.p [] [ text "Fusce euismod neque et elit vulputate commodo. Donec tempor eu justo vitae porttitor. Integer eget sem faucibus, ullamcorper turpis a, pretium enim." ]
-                        --     , H.p [ S.textAlignRight ] [ text "Morbi nec metus pretium, laoreet tortor in, blandit ipsum." ]
-                        --     , H.p [] [ text "Interdum et malesuada fames ac ante ipsum primis in faucibus. Cras egestas est dolor, vel euismod urna convallis vitae. " ]
-                        --     ]
-                        -- , H.textarea [] []
-                        -- , H.button [] [ text "send (⌘⏎)" ]
-                        -- ]
-                        []
-
-                    Ok (Query query) ->
-                        let
-                            codeLines =
-                                String.lines (String.trim query.code)
-
-                            lineCount =
-                                max 1 (List.length codeLines)
-
-                            -- Available sheet references for hints
-                            sheetRefs =
-                                model.library
-                                    |> Dict.keys
-                                    |> List.filter (\k -> String.startsWith "table:" k || String.startsWith "query:" k)
-                                    |> List.take 5
-                        in
-                        [ H.div [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%", S.minWidth "25vw" ]
-                            [ -- Editor with line numbers
-                              H.div [ S.displayFlex, S.flexGrow "1", S.minHeightRem 8, S.overflowAuto, S.backgroundColor "#f8f8f8" ]
-                                [ -- Line numbers gutter
-                                  H.div
-                                    [ S.paddingRem 1
-                                    , S.paddingRight "0.5rem"
-                                    , S.backgroundColor "#eee"
-                                    , S.borderRight "1px solid #ddd"
-                                    , S.fontFamily "monospace"
-                                    , S.fontSizeRem 0.75
-                                    , S.lineHeightRem 1.5
-                                    , S.color "#999"
-                                    , S.textAlign "right"
-                                    , S.userSelect "none"
-                                    , S.minWidthRem 2.5
-                                    ]
-                                    (List.range 1 lineCount
-                                        |> List.map (\n -> H.div [] [ text (String.fromInt n) ])
-                                    )
-
-                                -- Code textarea with autocomplete
-                                , H.div [ S.positionRelative, S.flexGrow "1", S.height "100%" ]
-                                    [ H.textarea
-                                        [ A.id "code"
-                                        , A.onInput (InputChange QueryCode)
-                                        , A.spellcheck False
-                                        , S.height "100%"
-                                        , S.width "100%"
-                                        , S.whiteSpacePre
-                                        , S.fontFamily "monospace"
-                                        , S.fontSizeRem 0.75
-                                        , S.border "none"
-                                        , S.backgroundColor "transparent"
-                                        , S.paddingRem 1
-                                        , S.paddingLeft "0.5rem"
-                                        , S.lineHeightRem 1.5
-                                        , S.resize "none"
-                                        , S.outline "none"
-                                        ]
-                                        [ text (String.trim query.code) ]
-
-                                    -- Autocomplete dropdown
-                                    , case sheet.queryAutocomplete of
-                                        Nothing ->
-                                            text ""
-
-                                        Just ac ->
-                                            H.div
-                                                [ S.positionAbsolute
-                                                , S.top "2rem"
-                                                , S.left "0.5rem"
-                                                , S.backgroundColor "#fff"
-                                                , S.border "1px solid #ccc"
-                                                , S.borderRadius "4px"
-                                                , S.boxShadow "0 2px 8px rgba(0,0,0,0.15)"
-                                                , S.zIndex "100"
-                                                , S.maxHeightRem 12
-                                                , S.overflowYAuto
-                                                , S.minWidthRem 15
-                                                ]
-                                                (ac.suggestions
-                                                    |> List.indexedMap
-                                                        (\i ref ->
-                                                            H.div
-                                                                [ A.onClick (AutocompleteSelect ref)
-                                                                , S.padding "0.5rem 0.75rem"
-                                                                , S.cursorPointer
-                                                                , S.fontFamily "monospace"
-                                                                , S.fontSizeRem 0.75
-                                                                , S.backgroundColor
-                                                                    (if i == ac.selectedIndex then
-                                                                        "#e8f4ff"
-
-                                                                     else
-                                                                        "transparent"
-                                                                    )
-                                                                , S.borderBottom "1px solid #eee"
-                                                                ]
-                                                                [ H.span [ S.color "#888" ] [ text "@" ]
-                                                                , text ref
-                                                                ]
-                                                        )
-                                                )
-                                    ]
-                                ]
-
-                            -- Query error display (inline, below editor)
-                            , case model.error of
-                                "" ->
-                                    text ""
-
-                                err ->
-                                    H.div
-                                        [ S.backgroundColor "#fee"
-                                        , S.borderTop "2px solid #c66"
-                                        , S.padding "0.75rem"
-                                        , S.fontFamily "monospace"
-                                        , S.fontSizeRem 0.75
-                                        , S.whiteSpacePre
-                                        , S.overflowXAuto
-                                        , S.maxHeightRem 8
-                                        , S.overflowYAuto
-                                        ]
-                                        [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsStart ]
-                                            [ H.span [ S.color "#c00" ] [ text err ]
-                                            , H.button
-                                                [ A.onClick (DocError "")
-                                                , S.border "none"
-                                                , S.background "transparent"
-                                                , S.cursorPointer
-                                                , S.color "#c00"
-                                                , S.fontSizeRem 1
-                                                , S.marginLeft "0.5rem"
-                                                ]
-                                                [ text "×" ]
-                                            ]
-                                        ]
-
-                            -- Sheet reference hints
-                            , if List.isEmpty sheetRefs then
-                                text ""
-
-                              else
-                                H.div
-                                    [ S.padding "0.5rem 0.75rem"
-                                    , S.backgroundColor "#f0f0f0"
-                                    , S.borderTop "1px solid #ddd"
-                                    , S.fontSizeRem 0.7
-                                    , S.color "#666"
-                                    ]
-                                    [ H.span [ S.fontWeight "600" ] [ text "Sheet refs: " ]
-                                    , text (String.join ", " (List.map (\s -> "@" ++ s) sheetRefs))
-                                    , if Dict.size model.library > 5 then
-                                        H.span [ S.color "#999" ] [ text " ..." ]
-
-                                      else
-                                        text ""
-                                    ]
-                            ]
-                        ]
-
-                    _ ->
-                        []
+                    Ok (Query query) -> [ viewQueryEditor model query ]
+                    _ -> []
             ]
         ]
     }

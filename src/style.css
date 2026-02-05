@@ -129,6 +129,40 @@ table a {
   display: inline-block;
 }
 
+/* Scrapsheets app styles (moved from Elm inline) */
+body {
+  font-family: sans-serif;
+  font-optical-sizing: auto;
+  height: 100vh;
+  width: 100vw;
+}
+body * { gap: 1rem; }
+table { background: #fff; line-height: 1; }
+td a, td button { opacity: 0.8; }
+td a:hover, td button:hover { opacity: 1; }
+th, td {
+  padding: 0.25rem;
+  padding-bottom: 0.15rem;
+  font-weight: normal;
+  border: 1px solid #aaa;
+  height: 0.8rem;
+  vertical-align: top;
+}
+tr > :first-child { border-left: none; padding-left: 0.5rem; }
+tr > :last-child { border-right: none; padding-right: 0.5rem; }
+th > *, td > * { max-height: 6rem; text-overflow: ellipsis; overflow: hidden; }
+td:hover { background: rgba(0,0,0,0.025); }
+.r0 { position: sticky; top: -1px; background: #f6f6f6; z-index: 1; border-bottom: 0px; }
+.r0::after { content: ""; display: block; position: absolute; width: 100%; left: 0; bottom: -1px; border-bottom: 1px solid #aaa; }
+.selected { background: rgba(0,0,0,0.05); }
+.match-highlight { background: rgba(255,200,0,0.3); }
+.match-current { background: rgba(255,150,0,0.5); }
+#code { font-family: monospace; background: #fff; }
+#account > * { padding: 0.25rem 0.5rem; border: 1px solid #aaa; border-radius: 2px; font-size: 0.875rem; }
+@media (min-width: 768px) { body > div { grid-template-columns: 1fr auto; } #aside { border-left: 1px solid #aaa; } }
+@media (max-width: 768px) { body > div { grid-template-rows: 1fr auto; } #aside { border-top: 1px solid #aaa; } }
+@media (max-width: 768px) { #title { display: none; } }
+
 /* Drag and drop styles */
 body.drag-over {
   position: relative;
