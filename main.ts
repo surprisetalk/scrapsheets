@@ -676,6 +676,366 @@ app.get(
   }),
 );
 
+app.get(
+  "/portal/dice/sync",
+  upgradeWebSocket(async (c) => {
+    const { auth } = c.req.query();
+    const usr_id = await verifyWsAuth(auth);
+    const dice: Record<string, number> = {
+      d4: 4,
+      d6: 6,
+      d8: 8,
+      d10: 10,
+      d12: 12,
+      d20: 20,
+      d100: 100,
+      coin: 2,
+    };
+    const state: Record<string, { roll: number; total: number; rolls: number }> = {};
+    for (const d in dice) state[d] = { roll: 0, total: 0, rolls: 0 };
+    let interval: ReturnType<typeof setInterval> | undefined;
+    return {
+      onOpen: (_event, ws) => {
+        console.log(`Dice portal connected, auth: ${usr_id ? "yes" : "no"}`);
+        interval = setInterval(() => {
+          for (const d in dice) {
+            state[d].roll = Math.ceil(Math.random() * dice[d]);
+            state[d].total += state[d].roll;
+            state[d].rolls++;
+          }
+          const rows = Object.entries(state)
+            .sort((a, b) => b[1].roll - a[1].roll)
+            .map(([name, s]) => ({
+              0: name,
+              1: s.roll,
+              2: s.total,
+              3: s.rolls,
+              4: s.total / s.rolls / dice[name],
+            }));
+          ws.send(
+            JSON.stringify({
+              type: "table",
+              data: [
+                [
+                  { key: 0, name: "die", type: "text" },
+                  { key: 1, name: "roll", type: "int" },
+                  { key: 2, name: "total", type: "int" },
+                  { key: 3, name: "rolls", type: "int" },
+                  { key: 4, name: "average", type: "percentage" },
+                ],
+                ...rows,
+              ],
+            }),
+          );
+        }, 500);
+      },
+      onMessage: undefined,
+      onClose: () => clearInterval(interval),
+      onError: undefined,
+    };
+  }),
+);
+
+app.get(
+  "/portal/orbit/sync",
+  upgradeWebSocket(async (c) => {
+    const { auth } = c.req.query();
+    const usr_id = await verifyWsAuth(auth);
+    const planets: [string, number, number][] = [
+      ["Mercury", 40, 4],
+      ["Venus", 55, 7],
+      ["Earth", 75, 12],
+      ["Mars", 95, 20],
+      ["Jupiter", 130, 50],
+      ["Saturn", 170, 80],
+      ["Uranus", 210, 140],
+      ["Neptune", 260, 250],
+    ];
+    const seasons = ["spring", "summer", "autumn", "winter"];
+    let interval: ReturnType<typeof setInterval> | undefined;
+    return {
+      onOpen: (_event, ws) => {
+        console.log(`Orbit portal connected, auth: ${usr_id ? "yes" : "no"}`);
+        interval = setInterval(() => {
+          const now = Date.now();
+          const rows = planets.map(([name, dist, period]) => {
+            const angle = (now / (period * 1000)) * 2 * Math.PI;
+            const pct = (angle % (2 * Math.PI)) / (2 * Math.PI);
+            return {
+              0: name,
+              1: dist,
+              2: Math.round(dist * Math.cos(angle)),
+              3: Math.round(dist * Math.sin(angle)),
+              4: pct,
+              5: seasons[Math.floor(pct * 4) % 4],
+            };
+          });
+          ws.send(
+            JSON.stringify({
+              type: "table",
+              data: [
+                [
+                  { key: 0, name: "planet", type: "text" },
+                  { key: 1, name: "distance", type: "int" },
+                  { key: 2, name: "x", type: "int" },
+                  { key: 3, name: "y", type: "int" },
+                  { key: 4, name: "year", type: "percentage" },
+                  { key: 5, name: "season", type: "text" },
+                ],
+                ...rows,
+              ],
+            }),
+          );
+        }, 100);
+      },
+      onMessage: undefined,
+      onClose: () => clearInterval(interval),
+      onError: undefined,
+    };
+  }),
+);
+
+app.get(
+  "/portal/cafe/sync",
+  upgradeWebSocket(async (c) => {
+    const { auth } = c.req.query();
+    const usr_id = await verifyWsAuth(auth);
+    const names = [
+      "Ada",
+      "Grace",
+      "Alan",
+      "Linus",
+      "Matz",
+      "Guido",
+      "Bjarne",
+      "Haskell",
+      "Elm",
+      "Rust",
+    ];
+    const drinks: [string, number][] = [
+      ["espresso", 3.5],
+      ["latte", 5.0],
+      ["cappuccino", 4.5],
+      ["cortado", 4.0],
+      ["cold brew", 4.5],
+      ["matcha", 5.5],
+      ["chai", 4.0],
+      ["americano", 3.0],
+    ];
+    type Order = {
+      customer: string;
+      drink: string;
+      price: number;
+      wait: number;
+      status: string;
+    };
+    const orders: Order[] = [];
+    let tick = 0;
+    let interval: ReturnType<typeof setInterval> | undefined;
+    return {
+      onOpen: (_event, ws) => {
+        console.log(`Cafe portal connected, auth: ${usr_id ? "yes" : "no"}`);
+        interval = setInterval(() => {
+          tick++;
+          for (const o of orders) o.wait = tick - (o as Order & { _t: number })._t;
+          if (Math.random() < 0.3) {
+            const brewing = orders.find((o) => o.status === "ordered");
+            if (brewing) brewing.status = "brewing";
+          }
+          if (Math.random() < 0.3) {
+            const ready = orders.find((o) => o.status === "brewing");
+            if (ready) ready.status = "ready";
+          }
+          for (let i = orders.length - 1; i >= 0; i--) {
+            if (orders[i].status === "ready" && orders[i].wait > 6)
+              orders.splice(i, 1);
+          }
+          if (Math.random() < 0.4 && orders.length < 8) {
+            const [drink, price] = drinks[Math.floor(Math.random() * drinks.length)];
+            const o: Order & { _t: number } = {
+              customer: names[Math.floor(Math.random() * names.length)],
+              drink,
+              price,
+              wait: 0,
+              status: "ordered",
+              _t: tick,
+            };
+            orders.push(o);
+          }
+          const statusOrder: Record<string, number> = { ordered: 0, brewing: 1, ready: 2 };
+          const sorted = [...orders].sort(
+            (a, b) => (statusOrder[a.status] ?? 3) - (statusOrder[b.status] ?? 3),
+          );
+          ws.send(
+            JSON.stringify({
+              type: "table",
+              data: [
+                [
+                  { key: 0, name: "customer", type: "text" },
+                  { key: 1, name: "drink", type: "text" },
+                  { key: 2, name: "price", type: "usd" },
+                  { key: 3, name: "wait", type: "int" },
+                  { key: 4, name: "status", type: "text" },
+                ],
+                ...sorted.map((o) => ({
+                  0: o.customer,
+                  1: o.drink,
+                  2: o.price,
+                  3: o.wait,
+                  4: o.status,
+                })),
+              ],
+            }),
+          );
+        }, 500);
+      },
+      onMessage: undefined,
+      onClose: () => clearInterval(interval),
+      onError: undefined,
+    };
+  }),
+);
+
+app.get(
+  "/portal/forest/sync",
+  upgradeWebSocket(async (c) => {
+    const { auth } = c.req.query();
+    const usr_id = await verifyWsAuth(auth);
+    const species = [
+      "oak",
+      "pine",
+      "maple",
+      "birch",
+      "willow",
+      "cedar",
+      "elm",
+      "ash",
+      "cherry",
+      "palm",
+      "bamboo",
+      "cactus",
+    ];
+    const trees = species.map((name) => ({
+      name,
+      age: Math.floor(Math.random() * 100),
+      health: 0.5 + Math.random() * 0.5,
+    }));
+    let interval: ReturnType<typeof setInterval> | undefined;
+    return {
+      onOpen: (_event, ws) => {
+        console.log(`Forest portal connected, auth: ${usr_id ? "yes" : "no"}`);
+        interval = setInterval(() => {
+          for (const t of trees) {
+            t.age++;
+            t.health += (Math.random() - 0.45) * 0.1;
+            t.health = Math.max(0.05, Math.min(1.0, t.health));
+            if (Math.random() < 0.01) {
+              t.age = 0;
+              t.health = 0.3;
+            }
+          }
+          ws.send(
+            JSON.stringify({
+              type: "table",
+              data: [
+                [
+                  { key: 0, name: "tree", type: "text" },
+                  { key: 1, name: "age", type: "int" },
+                  { key: 2, name: "height", type: "text" },
+                  { key: 3, name: "health", type: "percentage" },
+                  { key: 4, name: "status", type: "text" },
+                ],
+                ...trees.map((t) => ({
+                  0: t.name,
+                  1: t.age,
+                  2: ".".repeat(Math.min(20, Math.floor(t.age / 10))),
+                  3: t.health,
+                  4: t.age < 10 ? "seed" : t.age < 50 ? "sapling" : t.age < 200 ? "mature" : "ancient",
+                })),
+              ],
+            }),
+          );
+        }, 1000);
+      },
+      onMessage: undefined,
+      onClose: () => clearInterval(interval),
+      onError: undefined,
+    };
+  }),
+);
+
+app.get(
+  "/portal/words/sync",
+  upgradeWebSocket(async (c) => {
+    const { auth } = c.req.query();
+    const usr_id = await verifyWsAuth(auth);
+    const targets = ["cat", "dog", "hi", "elm", "yes", "no", "go", "ok"];
+    let target = targets[Math.floor(Math.random() * targets.length)];
+    let targetAge = 0;
+    const monkeys = ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank"].map(
+      (name) => ({ name, attempt: "", match: 0, attempts: 0, best: 0 }),
+    );
+    let interval: ReturnType<typeof setInterval> | undefined;
+    return {
+      onOpen: (_event, ws) => {
+        console.log(`Words portal connected, auth: ${usr_id ? "yes" : "no"}`);
+        interval = setInterval(() => {
+          targetAge++;
+          if (targetAge > 150) {
+            target = targets[Math.floor(Math.random() * targets.length)];
+            targetAge = 0;
+          }
+          let solved = false;
+          for (const m of monkeys) {
+            m.attempt = Array.from(
+              { length: target.length },
+              () => String.fromCharCode(97 + Math.floor(Math.random() * 26)),
+            ).join("");
+            let hits = 0;
+            for (let i = 0; i < target.length; i++)
+              if (m.attempt[i] === target[i]) hits++;
+            m.match = hits / target.length;
+            m.attempts++;
+            if (m.match > m.best) m.best = m.match;
+            if (m.match === 1) solved = true;
+          }
+          if (solved) {
+            target = targets[Math.floor(Math.random() * targets.length)];
+            targetAge = 0;
+            for (const m of monkeys) m.best = 0;
+          }
+          ws.send(
+            JSON.stringify({
+              type: "table",
+              data: [
+                [
+                  { key: 0, name: "monkey", type: "text" },
+                  { key: 1, name: "target", type: "text" },
+                  { key: 2, name: "attempt", type: "text" },
+                  { key: 3, name: "match", type: "percentage" },
+                  { key: 4, name: "attempts", type: "int" },
+                  { key: 5, name: "best", type: "percentage" },
+                ],
+                ...monkeys.map((m) => ({
+                  0: m.name,
+                  1: target,
+                  2: m.attempt,
+                  3: m.match,
+                  4: m.attempts,
+                  5: m.best,
+                })),
+              ],
+            }),
+          );
+        }, 200);
+      },
+      onMessage: undefined,
+      onClose: () => clearInterval(interval),
+      onError: undefined,
+    };
+  }),
+);
+
 app.use("*", cors());
 
 app.use(async (c, next) => {
