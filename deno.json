@@ -12,7 +12,7 @@
       "env": true,
       "read": true,
       "write": true,
-      "net": true,
+      "net": ["127.0.0.1"],
       "run": true,
       "sys": true
     }

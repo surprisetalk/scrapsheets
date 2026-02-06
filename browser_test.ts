@@ -40,12 +40,12 @@ Deno.test("index.html has correct WASM initialization", async () => {
 Deno.test("WASM file is served with correct headers", async () => {
   const controller = new AbortController();
   const server = Deno.serve(
-    { port: 0, signal: controller.signal, onListen: () => {} },
+    { hostname: "127.0.0.1", port: 0, signal: controller.signal, onListen: () => {} },
     (req) => serveDir(req, { fsRoot: "dist", quiet: true }),
   );
   const port = server.addr.port;
 
-  const wasmRes = await fetch(`http://localhost:${port}/automerge.wasm`);
+  const wasmRes = await fetch(`http://127.0.0.1:${port}/automerge.wasm`);
   assertEquals(wasmRes.ok, true, "WASM file should be served");
 
   // Verify it's valid WASM (magic bytes: 0x00 0x61 0x73 0x6d)
@@ -63,7 +63,7 @@ Deno.test("WASM file is served with correct headers", async () => {
 Deno.test("page loads and Elm initializes", async () => {
   const controller = new AbortController();
   const server = Deno.serve(
-    { port: 0, signal: controller.signal, onListen: () => {} },
+    { hostname: "127.0.0.1", port: 0, signal: controller.signal, onListen: () => {} },
     (req) => serveDir(req, { fsRoot: "dist", quiet: true }),
   );
   const port = server.addr.port;
@@ -77,7 +77,7 @@ Deno.test("page loads and Elm initializes", async () => {
     errors.push(e.detail.message);
   });
 
-  await page.goto(`http://localhost:${port}/`);
+  await page.goto(`http://127.0.0.1:${port}/`);
 
   // Wait briefly for initial page load
   await new Promise((r) => setTimeout(r, 3000));
