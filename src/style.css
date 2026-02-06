@@ -147,6 +147,7 @@ th, td {
   border: 1px solid #aaa;
   height: 0.8rem;
   vertical-align: top;
+  transition: width 300ms ease-out;
 }
 tr > :first-child { border-left: none; padding-left: 0.5rem; }
 tr > :last-child { border-right: none; padding-right: 0.5rem; }

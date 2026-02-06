@@ -2903,7 +2903,7 @@ viewStatCell maybeStat =
                     ++ kv "max" (String.fromInt stat.max)
                     ++ kv "mean" (iif (stat.count == 0) "" (String.fromInt (stat.sum // stat.count)))
                     ++ kv "count" (String.fromInt stat.count)
-                    ++ kv "keywords" (String.join " " (Dict.keys (Dict.filter (\k v -> String.length k >= 4 && v >= 2) stat.keywords)))
+                    ++ [ H.span [] [ text "keywords" ], H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.maxWidthRem 12, S.displayBlock ] [ text (String.join " " (Dict.keys (Dict.filter (\k v -> String.length k >= 4 && v >= 2) stat.keywords))) ] ]
             ]
 
         _ ->
