@@ -2,9 +2,11 @@ import { assertEquals } from "@std/assert";
 import { launch } from "astral";
 import { serveDir } from "jsr:@std/http@^1/file-server";
 
+const dir = new URL(".", import.meta.url).pathname;
+
 // Test 1: Static analysis of index.html
 Deno.test("index.html has correct WASM initialization", async () => {
-  const html = await Deno.readTextFile("src/index.html");
+  const html = await Deno.readTextFile(dir + "src/index.html");
 
   // Check for import map with slim redirects
   assertEquals(
@@ -41,7 +43,7 @@ Deno.test("WASM file is served with correct headers", async () => {
   const controller = new AbortController();
   const server = Deno.serve(
     { hostname: "127.0.0.1", port: 0, signal: controller.signal, onListen: () => {} },
-    (req) => serveDir(req, { fsRoot: "dist", quiet: true }),
+    (req) => serveDir(req, { fsRoot: dir + "dist", quiet: true }),
   );
   const port = server.addr.port;
 
@@ -64,7 +66,7 @@ Deno.test("page loads and Elm initializes", async () => {
   const controller = new AbortController();
   const server = Deno.serve(
     { hostname: "127.0.0.1", port: 0, signal: controller.signal, onListen: () => {} },
-    (req) => serveDir(req, { fsRoot: "dist", quiet: true }),
+    (req) => serveDir(req, { fsRoot: dir + "dist", quiet: true }),
   );
   const port = server.addr.port;
 
