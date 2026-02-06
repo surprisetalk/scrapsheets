@@ -524,7 +524,8 @@
           }
           alasql.from.SHEET = (id, params = {}) => {
             // TODO: Grab sheet (e.g. portal) with given params.
-            throw new Error("TODO");
+            console.warn("SHEET() not yet implemented, returning empty result");
+            return [];
           };
           alasql.fn.http = (url, qs = {}) => {
             const atomToJson = (xmlString) => {
@@ -922,8 +923,18 @@
                         else d.data[y][x][action](...value);
                         break;
                       }
-                      default:
-                        throw new Error("TODO: path");
+                      default: {
+                        let target = d.data;
+                        for (let i = 0; i < path.length - 1; i++) {
+                          if (!target[path[i]]) target[path[i]] = {};
+                          target = target[path[i]];
+                        }
+                        const last = path[path.length - 1];
+                        if (action === "set") target[last] = value;
+                        else if (action === "del") delete target[last];
+                        else target[last][action](...value);
+                        break;
+                      }
                     }
                   }
                   app.ports.docChanged.send({
@@ -960,8 +971,18 @@
                       else d.data[y][x][action](...value);
                       break;
                     }
-                    default:
-                      throw new Error("TODO: path");
+                    default: {
+                      let target = d.data;
+                      for (let i = 0; i < path.length - 1; i++) {
+                        if (!target[path[i]]) target[path[i]] = {};
+                        target = target[path[i]];
+                      }
+                      const last = path[path.length - 1];
+                      if (action === "set") target[last] = value;
+                      else if (action === "del") delete target[last];
+                      else target[last][action](...value);
+                      break;
+                    }
                   }
                 }
               });

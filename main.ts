@@ -18,6 +18,8 @@ import * as path from "@std/path";
 
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
 const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
+if (!Deno.env.get("JWT_SECRET")) console.warn("WARNING: JWT_SECRET not set, using random value. Tokens will break on restart.");
+if (!Deno.env.get("TOKEN_SECRET")) console.warn("WARNING: TOKEN_SECRET not set, using random value. Tokens will break on restart.");
 
 // Simple in-memory rate limiter (token bucket algorithm)
 const rateLimitBuckets = new Map<string, { tokens: number; lastRefill: number }>();
@@ -69,6 +71,9 @@ export type Type =
   | "create"
   | "usd"
   | "int"
+  | "num"
+  | "bool"
+  | "float"
   | ["array", Type]
   | ["tuple", Type[]]
   | { [k: string]: Type };
@@ -1487,6 +1492,7 @@ app.post("/import/csv", async (c) => {
 // CSV Export - downloads sheet data as CSV file
 app.get("/export/:id.csv", async (c) => {
   const sheet_id = c.req.param("id");
+  if (!sheet_id) throw new HTTPException(400, { message: "Sheet ID required." });
   const usr_id = c.get("usr_id");
 
   // Verify user has access to this sheet
@@ -1816,7 +1822,7 @@ app.get("/stats/:id", async (c) => {
 
 app.all("/mcp/:id", (c) => {
   // TODO: mcp server
-  return c.json(null, 500);
+  return c.json({ error: "Not implemented" }, 501);
 });
 
 export default app;
