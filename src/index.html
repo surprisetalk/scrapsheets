@@ -741,35 +741,44 @@
               if (type === "query") queryDoc(id, data.doc.data[0]);
             });
             if (type === "portal") {
-              ws = new WebSocket(
-                `wss://api.sheets.scrap.land/${type}/${doc_id}/sync`,
-              );
-              const portalTimeout = setTimeout(() => {
-                app.ports.docErrored.send("Live data connection timed out. Try refreshing.");
-                ws?.close();
-              }, 10000);
-              ws.onmessage = (msg) => {
-                clearTimeout(portalTimeout);
-                app.ports.docChanged.send({
-                  id,
-                  data: {
-                    doc: JSON.parse(msg.data),
-                    handle: null,
-                    patchInfo: null,
-                    patches: [],
-                  },
-                });
+              const portalUrl = `wss://api.sheets.scrap.land/${type}/${doc_id}/sync`;
+              let retries = 0;
+              const maxRetries = 5;
+              const connect = () => {
+                ws = new WebSocket(portalUrl);
+                const portalTimeout = setTimeout(() => {
+                  app.ports.docErrored.send("Live data connection timed out. Try refreshing.");
+                  ws?.close();
+                }, 10000);
+                ws.onmessage = (msg) => {
+                  clearTimeout(portalTimeout);
+                  retries = 0;
+                  app.ports.docChanged.send({
+                    id,
+                    data: {
+                      doc: JSON.parse(msg.data),
+                      handle: null,
+                      patchInfo: null,
+                      patches: [],
+                    },
+                  });
+                };
+                ws.onerror = () => {
+                  clearTimeout(portalTimeout);
+                };
+                ws.onclose = (e) => {
+                  clearTimeout(portalTimeout);
+                  if (e.code === 1000) return;
+                  if (retries < maxRetries) {
+                    const delay = Math.min(1000 * 2 ** retries, 30000);
+                    retries++;
+                    setTimeout(connect, delay);
+                  } else {
+                    app.ports.docErrored.send("Live data connection lost.");
+                  }
+                };
               };
-              ws.onerror = () => {
-                clearTimeout(portalTimeout);
-                app.ports.docErrored.send("Could not connect to live data source.");
-              };
-              ws.onclose = (e) => {
-                clearTimeout(portalTimeout);
-                if (e.code !== 1000) {
-                  app.ports.docErrored.send("Live data connection lost.");
-                }
-              };
+              connect();
             }
           }, 'selectDoc');
 
