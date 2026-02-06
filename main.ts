@@ -1130,6 +1130,9 @@ app.post("/net/:id", async (c) => {
     sql({
       sheet_id: c.req.param("id"),
       body: await c.req.text(),
+      method: c.req.method,
+      req_headers: JSON.stringify(Object.fromEntries(c.req.raw.headers)),
+      query_params: JSON.stringify(c.req.query()),
     })
   }`;
   return c.json(null, 200);
@@ -1198,7 +1201,7 @@ app.post("/buy/:id", async (c) => {
     if (!sheet) throw new HTTPException(404, { message: "Not found." });
     if (!sheet.sell_type)
       throw new HTTPException(400, { message: "Not for sale." });
-    const row_0 = sheet.type === "template" ? sheet.row_0.data : {};
+    const row_0 = sheet.type === "template" ? sheet.row_0.data : [];
     const doc_id = sheet.sell_type.startsWith("codex-")
       ? Math.random().toString().slice(2)
       : automerge.create({ data: row_0 }).documentId;
@@ -1544,9 +1547,13 @@ app.get("/export/:id.csv", async (c) => {
   });
 });
 
-// TODO: This currently takes sheet_id, but we want it to take doc_id.
 app.get("/net/:id", async (c) => {
-  return page(c)(await sheet(c, c.req.param("id"), c.req.query()));
+  const id = c.req.param("id");
+  const sheet_id = id.includes(":")
+    ? id
+    : await sql`select sheet_id from sheet where doc_id = ${id}`.then(([s]) => s?.sheet_id);
+  if (!sheet_id) throw new HTTPException(404, { message: "Not found." });
+  return page(c)(await sheet(c, sheet_id, c.req.query()));
 });
 
 app.post("/query", async (c) => {
@@ -1554,6 +1561,8 @@ app.post("/query", async (c) => {
 });
 
 app.get("/codex/:id", async (c) => {
+  if (!rateLimit(`codex:${c.get("usr_id")}`))
+    throw new HTTPException(429, { message: "Too many codex queries. Please slow down." });
   const sheet_id = c.req.param("id");
   const [type, _doc_id] = sheet_id.split(":");
   switch (type) {
@@ -1564,10 +1573,27 @@ app.get("/codex/:id", async (c) => {
           message: `No DSN found.`,
         });
       }
-      // TODO: Be really careful about arbitrary DB access! Don't let them access our DB haha
+      // Block connections to the application's own database
+      const appDbUrl = Deno.env.get("DATABASE_URL") ?? "postgresql://postgres@127.0.0.1:5434/postgres";
+      try {
+        const app_ = new URL(appDbUrl);
+        const ext = new URL(db.dsn);
+        const blockedHosts = ["localhost", "127.0.0.1", "0.0.0.0", "::1"];
+        const appHost = blockedHosts.includes(app_.hostname) ? "127.0.0.1" : app_.hostname;
+        const extHost = blockedHosts.includes(ext.hostname) ? "127.0.0.1" : ext.hostname;
+        if (extHost === appHost && (ext.port || "5432") === (app_.port || "5432"))
+          throw new HTTPException(403, { message: "Cannot connect to this database." });
+      } catch (e) {
+        if (e instanceof HTTPException) throw e;
+        throw new HTTPException(400, { message: "Invalid DSN." });
+      }
       const sql_ = pg(db.dsn, {
         onnotice: (msg) => msg.severity !== "DEBUG" && console.log(msg),
+        connect_timeout: 5,
+        idle_timeout: 10,
       });
+      await sql_`SET statement_timeout = '10s'`;
+      await sql_`SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`;
       const rows = await sql_`
         select 
           table_name as name,

@@ -11,14 +11,14 @@
 Close the gaps that prevent daily use and public demo.
 
 - [ ] **DocDelta efficiency**: send actual Automerge deltas instead of full doc on every change (Main.elm:194, index.html docChanged handler)
-- [ ] **Boolean cell editing guard**: don't open text editor on boolean/non-editable cells; toggle checkbox instead (Main.elm:1389)
+- [x] **Boolean cell editing guard**: don't open text editor on boolean/non-editable cells; toggle checkbox instead (Main.elm:1389)
 - [ ] **DSN encryption**: encrypt external database connection strings with pgcrypto (db.sql:30)
 - [ ] **Automerge WebSocket adapter**: replace custom HonoWebSocketAdapter with official NodeWebSocketAdapter (main.ts:465)
-- [ ] **Net sheet ID normalization**: accept doc_id instead of sheet_id for /net/:id endpoint (main.ts:1547)
+- [x] **Net sheet ID normalization**: accept doc_id instead of sheet_id for /net/:id endpoint (main.ts:1547)
 - [ ] **Sheet preview thumbnails**: generate mini sparkline/heatmap SVG for library view (Main.elm:335)
 - [ ] **URL query operators**: support ?q=+any, ?q=-any, ?q==any for bookmarkable filtered views (Main.elm:902)
-- [ ] **row_0 validation**: add check constraint ensuring row_0 is a JSONB array (db.sql:24)
-- [ ] **Net table headers**: store req/res metadata and HTTP headers alongside webhook body (db.sql:40)
+- [x] **row_0 validation**: add check constraint ensuring row_0 is a JSONB array (db.sql:24)
+- [x] **Net table headers**: store req/res metadata and HTTP headers alongside webhook body (db.sql:40)
 
 ---
 
@@ -51,10 +51,10 @@ Make Scrapsheets reliable enough to be someone's primary data tool.
 
 ### Security
 
-- [ ] **Codex DSN validation**: block connections resolving to application's own database (main.ts:1567)
-- [ ] **Codex read-only mode**: SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY for external DBs
-- [ ] **Codex query timeout**: add connection and statement timeouts for external DB queries
-- [ ] **Codex rate limiting**: per-user query rate limits for external database access
+- [x] **Codex DSN validation**: block connections resolving to application's own database (main.ts:1567)
+- [x] **Codex read-only mode**: SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY for external DBs
+- [x] **Codex query timeout**: add connection and statement timeouts for external DB queries
+- [x] **Codex rate limiting**: per-user query rate limits for external database access
 
 ---
 

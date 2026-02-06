@@ -1385,18 +1385,22 @@ update msg ({ sheet, auth } as model) =
 
         CellMouseDoubleClick write ->
             let
-                a =
-                    -- TODO: Don't set .write if it's a Boolean or non-editable cell.
+                openEditor =
                     ( { model | sheet = { sheet | write = Just write } }
                     , Task.attempt (always NoOp) (Dom.focus "new-cell")
                     )
             in
             case sheet.doc of
                 Ok Library ->
-                    a
+                    openEditor
 
-                Ok (Tab _) ->
-                    a
+                Ok (Tab table) ->
+                    case Array.get sheet.hover.x table.cols |> Maybe.map .typ of
+                        Just Boolean ->
+                            ( model, Cmd.none )
+
+                        _ ->
+                            openEditor
 
                 _ ->
                     ( model, Cmd.none )

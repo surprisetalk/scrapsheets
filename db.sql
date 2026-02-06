@@ -21,7 +21,7 @@ create table sheet
 , sell_price numeric check (sell_price >= 0)
 , buy_id text references sheet(sell_id)
 , buy_price numeric check (buy_price >= 0)
-, row_0 jsonb not null default '[]'::jsonb -- TODO: check is array
+, row_0 jsonb not null default '[]'::jsonb check (jsonb_typeof(row_0) = 'array')
 , check (not (sell_price is not null and buy_price is not null))
 );
 
@@ -37,10 +37,12 @@ create table sheet_usr
 , primary key (sheet_id, usr_id)
 );
 
--- TODO: Add req/res data, headers, etc.
 create table net
 ( sheet_id text not null references sheet(sheet_id) check (sheet_id ilike 'net-%')
 , created_at timestamp default now()
+, method text not null default 'POST'
+, req_headers jsonb not null default '{}'::jsonb
+, query_params jsonb not null default '{}'::jsonb
 , body text not null
 );
 
