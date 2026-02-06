@@ -10,13 +10,13 @@
 
 Close the gaps that prevent daily use and public demo.
 
-- [ ] **DocDelta efficiency**: send actual Automerge deltas instead of full doc on every change (Main.elm:194, index.html docChanged handler)
+- [x] **DocDelta efficiency**: send actual Automerge deltas instead of full doc on every change (Main.elm:194, index.html docChanged handler)
 - [x] **Boolean cell editing guard**: don't open text editor on boolean/non-editable cells; toggle checkbox instead (Main.elm:1389)
-- [ ] **DSN encryption**: encrypt external database connection strings with pgcrypto (db.sql:30)
+- [x] **DSN encryption**: encrypt external database connection strings with pgcrypto (db.sql:30)
 - [ ] **Automerge WebSocket adapter**: replace custom HonoWebSocketAdapter with official NodeWebSocketAdapter (main.ts:465)
 - [x] **Net sheet ID normalization**: accept doc_id instead of sheet_id for /net/:id endpoint (main.ts:1547)
 - [ ] **Sheet preview thumbnails**: generate mini sparkline/heatmap SVG for library view (Main.elm:335)
-- [ ] **URL query operators**: support ?q=+any, ?q=-any, ?q==any for bookmarkable filtered views (Main.elm:902)
+- [x] **URL query operators**: support ?q=+any, ?q=-any, ?q==any for bookmarkable filtered views (Main.elm:902)
 - [x] **row_0 validation**: add check constraint ensuring row_0 is a JSONB array (db.sql:24)
 - [x] **Net table headers**: store req/res metadata and HTTP headers alongside webhook body (db.sql:40)
 

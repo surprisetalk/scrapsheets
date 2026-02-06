@@ -1,4 +1,5 @@
 create extension if not exists citext;
+create extension if not exists pgcrypto;
 
 create table usr
 ( usr_id bigint not null generated always as identity primary key
@@ -27,7 +28,7 @@ create table sheet
 
 create table db
 ( sheet_id text not null primary key references sheet (sheet_id)
-, dsn text not null -- TODO: Encrypt this.
+, dsn text not null
 );
 
 create table sheet_usr

@@ -18,8 +18,10 @@ import * as path from "@std/path";
 
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
 const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
+const DSN_KEY = Deno.env.get("DSN_ENCRYPTION_KEY") ?? Math.random().toString();
 if (!Deno.env.get("JWT_SECRET")) console.warn("WARNING: JWT_SECRET not set, using random value. Tokens will break on restart.");
 if (!Deno.env.get("TOKEN_SECRET")) console.warn("WARNING: TOKEN_SECRET not set, using random value. Tokens will break on restart.");
+if (!Deno.env.get("DSN_ENCRYPTION_KEY")) console.warn("WARNING: DSN_ENCRYPTION_KEY not set, using random value. Encrypted DSNs will break on restart.");
 
 // Simple in-memory rate limiter (token bucket algorithm)
 const rateLimitBuckets = new Map<string, { tokens: number; lastRefill: number }>();
@@ -1567,7 +1569,7 @@ app.get("/codex/:id", async (c) => {
   const [type, _doc_id] = sheet_id.split(":");
   switch (type) {
     case "codex-db": {
-      const [db] = await sql`select dsn from db where sheet_id = ${sheet_id}`;
+      const [db] = await sql`select pgp_sym_decrypt(dsn::bytea, ${DSN_KEY}) as dsn from db where sheet_id = ${sheet_id}`;
       if (!db) {
         throw new HTTPException(400, {
           message: `No DSN found.`,
@@ -1664,9 +1666,10 @@ app.get("/codex/:id", async (c) => {
 
 app.post("/codex-db/:id", async (c) => {
   const sheet_id = `codex-db:${c.req.param("id")}`;
+  const dsn = await c.req.json();
   await sql`
-    insert into db (sheet_id, dsn) 
-    select ${sheet_id}, ${await c.req.json()}
+    insert into db (sheet_id, dsn)
+    select ${sheet_id}, pgp_sym_encrypt(${dsn}, ${DSN_KEY})::text
     where exists (select true from sheet_usr su where (su.sheet_id,su.usr_id) = (${sheet_id},${
     c.get(
       "usr_id",

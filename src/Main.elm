@@ -191,7 +191,6 @@ port insertAtCursor : String -> Cmd msg
 
 
 type alias DocDelta =
-    -- TODO: This should only include the deltas and not the full doc.
     { doc : D.Value
     , handle : D.Value
     , patchInfo : D.Value
@@ -899,7 +898,6 @@ update msg ({ sheet, auth } as model) =
             )
 
         LinkClick (Browser.Internal url) ->
-            -- TODO: ?q=+any ?q=-any ?q==any
             ( model, Nav.pushUrl model.nav (Url.toString url) )
 
         LinkClick (Browser.External url) ->
@@ -958,11 +956,20 @@ update msg ({ sheet, auth } as model) =
             )
 
         DocChange data ->
-            ( iif (data.id /= model.sheet.id)
+            ( if data.id /= model.sheet.id then
                 model
-                (let parsedDoc = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString
-                 in { model | sheet = { sheet | doc = parsedDoc, stats = Result.andThen computeStats parsedDoc } })
-              -- TODO: Fetch table rows depending on type, e.g. portal:123
+
+              else
+                case applyCellPatches data.data.patches sheet.doc of
+                    Just updatedDoc ->
+                        { model | sheet = { sheet | doc = updatedDoc, stats = Result.andThen computeStats updatedDoc } }
+
+                    Nothing ->
+                        let
+                            parsedDoc =
+                                data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString
+                        in
+                        { model | sheet = { sheet | doc = parsedDoc, stats = Result.andThen computeStats parsedDoc } }
             , Cmd.none
             )
 
@@ -2732,6 +2739,60 @@ resolveTable model =
             Err err
 
 
+applyCellPatches : List D.Value -> Result String Doc -> Maybe (Result String Doc)
+applyCellPatches patches doc =
+    case ( patches, doc ) of
+        ( [], _ ) ->
+            Nothing
+
+        ( _, Ok (Tab table) ) ->
+            List.foldl
+                (\patch acc ->
+                    acc
+                        |> Maybe.andThen
+                            (\t ->
+                                let
+                                    rowIdx =
+                                        D.decodeValue (D.field "path" (D.index 0 D.int)) patch |> Result.toMaybe
+
+                                    colKey =
+                                        D.decodeValue (D.field "path" (D.index 1 D.string)) patch |> Result.toMaybe
+
+                                    action =
+                                        D.decodeValue (D.field "action" D.string) patch |> Result.toMaybe
+
+                                    value =
+                                        D.decodeValue (D.field "value" D.value) patch |> Result.toMaybe
+                                in
+                                case ( action, rowIdx ) of
+                                    ( Just "set", Just ri ) ->
+                                        case ( colKey, value ) of
+                                            ( Just ck, Just val ) ->
+                                                if ri >= 1 then
+                                                    Array.get (ri - 1) t.rows
+                                                        |> Maybe.map
+                                                            (\row ->
+                                                                { t | rows = Array.set (ri - 1) (Dict.insert ck val row) t.rows }
+                                                            )
+
+                                                else
+                                                    Nothing
+
+                                            _ ->
+                                                Nothing
+
+                                    _ ->
+                                        Nothing
+                            )
+                )
+                (Just table)
+                patches
+                |> Maybe.map (\t -> Ok (Tab t))
+
+        _ ->
+            Nothing
+
+
 applyFilter : Filter -> String -> Row -> Bool
 applyFilter filter key row =
     let
@@ -2761,11 +2822,39 @@ applyFilter filter key row =
             (String.toLower val == "true" || val == "1") == b
 
 
-filterAndSort : Sheet -> Array Row -> Array Row
-filterAndSort sheet rows =
+matchesSearch : String -> Row -> Bool
+matchesSearch search row =
+    if String.isEmpty search then
+        True
+
+    else
+        let
+            vals =
+                Dict.values row |> List.filterMap (D.decodeValue string >> Result.toMaybe)
+
+            lower =
+                String.toLower
+        in
+        case String.uncons search of
+            Just ( '+', term ) ->
+                List.any (\v -> String.contains (lower term) (lower v)) vals
+
+            Just ( '-', term ) ->
+                not (List.any (\v -> String.contains (lower term) (lower v)) vals)
+
+            Just ( '=', term ) ->
+                List.any (\v -> lower v == lower term) vals
+
+            _ ->
+                List.any (\v -> String.contains (lower search) (lower v)) vals
+
+
+filterAndSort : String -> Sheet -> Array Row -> Array Row
+filterAndSort search sheet rows =
     let
         passes row =
-            Dict.foldl (\key filter acc -> acc && applyFilter filter key row) True sheet.filters
+            matchesSearch search row
+                && Dict.foldl (\key filter acc -> acc && applyFilter filter key row) True sheet.filters
 
         filtered =
             Array.filter passes rows
@@ -3234,7 +3323,7 @@ view ({ sheet } as model) =
                         Ok { cols, rows } ->
                             let
                                 sortedRows =
-                                    filterAndSort sheet rows
+                                    filterAndSort model.search sheet rows
 
                                 doc =
                                     sheet.doc |> Result.withDefault Library
