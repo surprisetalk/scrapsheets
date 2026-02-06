@@ -744,7 +744,12 @@
               ws = new WebSocket(
                 `wss://api.sheets.scrap.land/${type}/${doc_id}/sync`,
               );
-              ws.onmessage = (msg) =>
+              const portalTimeout = setTimeout(() => {
+                app.ports.docErrored.send("Live data connection timed out. Try refreshing.");
+                ws?.close();
+              }, 10000);
+              ws.onmessage = (msg) => {
+                clearTimeout(portalTimeout);
                 app.ports.docChanged.send({
                   id,
                   data: {
@@ -754,6 +759,17 @@
                     patches: [],
                   },
                 });
+              };
+              ws.onerror = () => {
+                clearTimeout(portalTimeout);
+                app.ports.docErrored.send("Could not connect to live data source.");
+              };
+              ws.onclose = (e) => {
+                clearTimeout(portalTimeout);
+                if (e.code !== 1000) {
+                  app.ports.docErrored.send("Live data connection lost.");
+                }
+              };
             }
           }, 'selectDoc');
 
@@ -877,10 +893,23 @@
                   const d = { ...doc };
                   for (const { path, action, value } of patches) {
                     switch (path.length) {
+                      case 0: {
+                        if (action === "push") d.data.push(...value);
+                        else if (action === "splice") d.data.splice(...value);
+                        break;
+                      }
+                      case 1: {
+                        const [y] = path;
+                        if (action === "set") d.data[y] = value;
+                        else if (action === "push") d.data[y].push(...value);
+                        else if (action === "splice") d.data[y].splice(...value);
+                        break;
+                      }
                       case 2: {
                         const [y, x] = path;
                         if (!d.data[y]) d.data[y] = {};
                         if (action === "set") d.data[y][x] = value;
+                        else if (action === "del") delete d.data[y][x];
                         else d.data[y][x][action](...value);
                         break;
                       }
@@ -918,6 +947,7 @@
                       const [y, x] = path;
                       if (!d.data[y]) d.data[y] = {};
                       if (action === "set") d.data[y][x] = value;
+                      else if (action === "del") delete d.data[y][x];
                       else d.data[y][x][action](...value);
                       break;
                     }
