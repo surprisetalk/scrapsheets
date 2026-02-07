@@ -15,11 +15,12 @@ import (
 var (
 	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	headerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("8"))
-	cursorStyle = lipgloss.NewStyle().Background(lipgloss.Color("4")).Foreground(lipgloss.Color("15"))
+	cursorStyle = lipgloss.NewStyle().Background(lipgloss.Color("4")).Foreground(lipgloss.Color("15")).Bold(true)
 	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	rowCurStyle = lipgloss.NewStyle().Background(lipgloss.Color("236"))
+	libHdrStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Bold(true)
 )
 
 type view int
@@ -337,8 +338,45 @@ func (m model) viewLibrary() string {
 
 	help := dimStyle.Render(" j/k navigate  enter open  q quit")
 
-	// rows available for doc list = total height - title - help - blank line before help
-	listHeight := m.height - len(lines) - 2
+	// column layout: type, id, cols, rows, size, modified
+	// compute widths to fill terminal
+	const (
+		colPad     = 2 // spaces between columns
+		fixedCols  = 4 // cols, rows, size, date have fixed widths
+		colsCW     = 4
+		rowsCW     = 5
+		sizeCW     = 6
+		dateCW     = 6
+	)
+	fixedW := colsCW + rowsCW + sizeCW + dateCW + (5 * colPad) // 5 gaps between 6 cols
+	typeW := 0
+	for _, d := range m.docs {
+		if len(d.docType) > typeW {
+			typeW = len(d.docType)
+		}
+	}
+	if typeW < 4 {
+		typeW = 4
+	}
+	idW := m.width - fixedW - typeW
+	if idW < 10 {
+		idW = 10
+	}
+
+	// header
+	hdr := fmt.Sprintf("  %-*s  %-*s  %*s  %*s  %*s  %-*s",
+		typeW, "TYPE", idW, "ID", colsCW, "COLS", rowsCW, "ROWS", sizeCW, "SIZE", dateCW, "DATE")
+	if len(hdr) < m.width {
+		hdr += strings.Repeat(" ", m.width-len(hdr))
+	}
+	lines = append(lines, libHdrStyle.Render(hdr))
+
+	// separator
+	sep := "  " + strings.Repeat("─", m.width-2)
+	lines = append(lines, dimStyle.Render(sep))
+
+	// available list height
+	listHeight := m.height - len(lines) - 2 // -2 for help + status
 	if listHeight < 1 {
 		listHeight = 1
 	}
@@ -352,20 +390,19 @@ func (m model) viewLibrary() string {
 
 	for i := m.libScroll; i < len(m.docs) && i < m.libScroll+listHeight; i++ {
 		d := m.docs[i]
-		cursor := "  "
-		if i == m.libCursor {
-			cursor = "> "
-		}
 
 		id := d.id
-		if len(id) > 16 {
-			id = id[:16] + ".."
+		if len(id) > idW {
+			id = id[:idW-2] + ".."
 		}
 
-		line := fmt.Sprintf("%s%-12s %-18s %3dx%-4d %s",
-			cursor, d.docType, id, d.nCols, d.nRows, d.modTime.Format("Jan 02"))
+		size := formatSize(d.size)
 
-		// pad to full width
+		line := fmt.Sprintf("  %-*s  %-*s  %*d  %*d  %*s  %-*s",
+			typeW, d.docType, idW, id,
+			colsCW, d.nCols, rowsCW, d.nRows,
+			sizeCW, size, dateCW, d.modTime.Format("Jan 02"))
+
 		if len(line) < m.width {
 			line += strings.Repeat(" ", m.width-len(line))
 		}
@@ -377,16 +414,27 @@ func (m model) viewLibrary() string {
 		}
 	}
 
-	// pad remaining lines
-	rendered := len(lines)
-	target := m.height - 1 // -1 for help
-	for rendered < target {
+	// pad to fill
+	for len(lines) < m.height-2 {
 		lines = append(lines, "")
-		rendered++
 	}
+
+	// position indicator
+	pos := ""
+	if len(m.docs) > 0 {
+		pos = dimStyle.Render(fmt.Sprintf(" %d/%d", m.libCursor+1, len(m.docs)))
+	}
+	lines = append(lines, pos)
 	lines = append(lines, help)
 
 	return strings.Join(lines, "\n")
+}
+
+func formatSize(b int64) string {
+	if b < 1024 {
+		return fmt.Sprintf("%dB", b)
+	}
+	return fmt.Sprintf("%.1fK", float64(b)/1024)
 }
 
 func (m model) viewTable() string {
