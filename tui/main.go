@@ -45,21 +45,29 @@ type model struct {
 	err     error
 
 	// library
-	docs      []docInfo
-	libCursor int
-	libScroll int
+	docs       []docInfo
+	libCursor  int
+	libScroll  int
+	filterBuf  string
+	filterMode bool
 
 	// table
-	doc     *automerge.Doc
-	docPath string
-	docID   string
-	cols    []col
-	rows    []map[string]any
-	cx, cy  int
-	scrollX int
-	scrollY int
-	mode    mode
-	editBuf string
+	doc        *automerge.Doc
+	docPath    string
+	docID      string
+	cols       []col
+	rows       []map[string]any
+	cx, cy     int
+	scrollX    int
+	scrollY    int
+	mode       mode
+	editBuf    string
+	isMetadata bool
+
+	// vim state
+	pending  string
+	yank     any
+	yankType string
 }
 
 func initialModel(dataDir string) model {
@@ -98,7 +106,62 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // --- Library ---
 
+func (m model) visibleDocs() []docInfo {
+	if m.filterBuf == "" {
+		return m.docs
+	}
+	q := strings.ToLower(m.filterBuf)
+	var out []docInfo
+	for _, d := range m.docs {
+		if strings.Contains(strings.ToLower(d.id), q) ||
+			strings.Contains(strings.ToLower(d.docType), q) {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
 func (m model) updateLibrary(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.filterMode {
+		switch msg.String() {
+		case "enter":
+			m.filterMode = false
+		case "esc":
+			m.filterMode = false
+			m.filterBuf = ""
+		case "backspace":
+			if len(m.filterBuf) > 0 {
+				m.filterBuf = m.filterBuf[:len(m.filterBuf)-1]
+			}
+		case "ctrl+u":
+			m.filterBuf = ""
+		default:
+			if len(msg.String()) == 1 || msg.String() == " " {
+				m.filterBuf += msg.String()
+			}
+		}
+		visible := m.visibleDocs()
+		if m.libCursor >= len(visible) {
+			m.libCursor = max(len(visible)-1, 0)
+		}
+		return m, nil
+	}
+
+	visible := m.visibleDocs()
+	last := max(len(visible)-1, 0)
+
+	// pending key sequences
+	if m.pending != "" {
+		combo := m.pending + msg.String()
+		m.pending = ""
+		switch combo {
+		case "gg":
+			m.libCursor = 0
+			return m, nil
+		}
+		// no match — fall through
+	}
+
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
@@ -107,12 +170,22 @@ func (m model) updateLibrary(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.libCursor--
 		}
 	case "down", "j":
-		if m.libCursor < len(m.docs)-1 {
+		if m.libCursor < last {
 			m.libCursor++
 		}
-	case "enter":
-		if m.libCursor < len(m.docs) {
-			return m.openDoc(m.docs[m.libCursor])
+	case "G":
+		m.libCursor = last
+	case "g":
+		m.pending = "g"
+	case "ctrl+d":
+		m.libCursor = min(m.libCursor+m.height/2, last)
+	case "ctrl+u":
+		m.libCursor = max(m.libCursor-m.height/2, 0)
+	case "/":
+		m.filterMode = true
+	case "enter", "l":
+		if m.libCursor >= 0 && m.libCursor < len(visible) {
+			return m.openDoc(visible[m.libCursor])
 		}
 	}
 	return m, nil
@@ -129,6 +202,19 @@ func (m model) openDoc(info docInfo) (tea.Model, tea.Cmd) {
 		m.err = err
 		return m, nil
 	}
+
+	// detect metadata format for correct mutation paths
+	m.isMetadata = false
+	dataVal, err := doc.Path("data").Get()
+	if err == nil && dataVal.Kind() == automerge.KindList {
+		if first, err := dataVal.List().Get(0); err == nil && first.Kind() == automerge.KindMap {
+			keys, _ := first.Map().Keys()
+			if hasKey(keys, "data") && hasKey(keys, "type") {
+				m.isMetadata = true
+			}
+		}
+	}
+
 	m.view = viewTable
 	m.doc = doc
 	m.docPath = info.path
@@ -138,6 +224,7 @@ func (m model) openDoc(info docInfo) (tea.Model, tea.Cmd) {
 	m.cx, m.cy = 0, 0
 	m.scrollX, m.scrollY = 0, 0
 	m.mode = modeNormal
+	m.pending = ""
 	m.err = nil
 	return m, nil
 }
@@ -145,19 +232,42 @@ func (m model) openDoc(info docInfo) (tea.Model, tea.Cmd) {
 // --- Table (normal) ---
 
 func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	lastRow := max(len(m.rows)-1, 0)
+	lastCol := max(len(m.cols)-1, 0)
+
+	// pending key sequences
+	if m.pending != "" {
+		combo := m.pending + msg.String()
+		m.pending = ""
+		switch combo {
+		case "gg":
+			m.cy, m.cx = 0, 0
+			return m, nil
+		case "dd":
+			return m.deleteRow()
+		case "dw":
+			m.setCellValue(nil)
+			return m, nil
+		}
+		// no match — fall through
+	}
+
 	switch msg.String() {
 	case "q", "esc":
 		m.view = viewLibrary
 		m.doc = nil
+		m.pending = ""
 		return m, nil
 	case "ctrl+c":
 		return m, tea.Quit
+
+	// -- cursor movement --
 	case "left", "h":
 		if m.cx > 0 {
 			m.cx--
 		}
 	case "right", "l":
-		if m.cx < len(m.cols)-1 {
+		if m.cx < lastCol {
 			m.cx++
 		}
 	case "up", "k":
@@ -165,43 +275,95 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cy--
 		}
 	case "down", "j":
-		if m.cy < len(m.rows)-1 {
+		if m.cy < lastRow {
 			m.cy++
 		}
-	case "home":
-		m.cx = 0
-	case "end":
-		m.cx = len(m.cols) - 1
-	case "ctrl+home":
-		m.cx, m.cy = 0, 0
-	case "ctrl+end":
-		m.cx = len(m.cols) - 1
-		m.cy = len(m.rows) - 1
-	case "tab":
-		m.cx++
-		if m.cx >= len(m.cols) {
+	case "w":
+		if m.cx < lastCol {
+			m.cx++
+		} else if m.cy < lastRow {
 			m.cx = 0
 			m.cy++
-			if m.cy >= len(m.rows) {
-				m.cy = len(m.rows) - 1
-			}
+		}
+	case "b":
+		if m.cx > 0 {
+			m.cx--
+		} else if m.cy > 0 {
+			m.cx = lastCol
+			m.cy--
+		}
+	case "0", "home", "^":
+		m.cx = 0
+	case "$", "end":
+		m.cx = lastCol
+	case "G":
+		m.cy = lastRow
+	case "g":
+		m.pending = "g"
+	case "ctrl+d":
+		m.cy = min(m.cy+m.height/2, lastRow)
+	case "ctrl+u":
+		m.cy = max(m.cy-m.height/2, 0)
+	case "H":
+		m.cy = m.scrollY
+	case "M":
+		dataH := max(m.height-6, 1)
+		m.cy = min(m.scrollY+dataH/2, lastRow)
+	case "L":
+		dataH := max(m.height-6, 1)
+		m.cy = min(m.scrollY+dataH-1, lastRow)
+	case "tab":
+		m.cx++
+		if m.cx > lastCol {
+			m.cx = 0
+			m.cy = min(m.cy+1, lastRow)
 		}
 	case "shift+tab":
 		m.cx--
 		if m.cx < 0 {
-			m.cx = len(m.cols) - 1
-			m.cy--
-			if m.cy < 0 {
-				m.cy = 0
-			}
+			m.cx = lastCol
+			m.cy = max(m.cy-1, 0)
 		}
-	case "enter":
+
+	// -- editing --
+	case "enter", "i":
 		if len(m.rows) > 0 && m.cx < len(m.cols) {
 			m.mode = modeEdit
 			m.editBuf = formatCell(m.cellValue(), m.cols[m.cx].typ)
 		}
 	case "a":
-		return m.appendRow()
+		if len(m.rows) > 0 && m.cx < len(m.cols) {
+			m.mode = modeEdit
+			m.editBuf = formatCell(m.cellValue(), m.cols[m.cx].typ)
+		}
+	case "c":
+		if len(m.rows) > 0 && m.cx < len(m.cols) {
+			m.mode = modeEdit
+			m.editBuf = ""
+		}
+	case "x":
+		m.setCellValue(nil)
+
+	// -- yank / paste --
+	case "y":
+		if len(m.rows) > 0 && m.cx < len(m.cols) {
+			m.yank = m.cellValue()
+			m.yankType = m.cols[m.cx].typ
+		}
+	case "p":
+		if m.yank != nil && len(m.rows) > 0 && m.cx < len(m.cols) {
+			m.setCellValue(m.yank)
+		}
+
+	// -- row operations --
+	case "o":
+		return m.insertRowAt(m.cy + 1)
+	case "O":
+		return m.insertRowAt(m.cy)
+	case "d":
+		m.pending = "d"
+
+	// -- column operations --
 	case "A":
 		return m.appendCol()
 	}
@@ -224,16 +386,30 @@ func (m model) updateEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.editBuf) > 0 {
 			m.editBuf = m.editBuf[:len(m.editBuf)-1]
 		}
+	case "ctrl+u":
+		m.editBuf = ""
+	case "ctrl+w":
+		buf := strings.TrimRight(m.editBuf, " ")
+		if i := strings.LastIndex(buf, " "); i >= 0 {
+			m.editBuf = buf[:i+1]
+		} else {
+			m.editBuf = ""
+		}
 	case "tab":
 		m.commitEdit()
 		m.mode = modeNormal
 		m.cx++
 		if m.cx >= len(m.cols) {
 			m.cx = 0
-			m.cy++
-			if m.cy >= len(m.rows) {
-				m.cy = len(m.rows) - 1
-			}
+			m.cy = min(m.cy+1, len(m.rows)-1)
+		}
+	case "shift+tab":
+		m.commitEdit()
+		m.mode = modeNormal
+		m.cx--
+		if m.cx < 0 {
+			m.cx = len(m.cols) - 1
+			m.cy = max(m.cy-1, 0)
 		}
 	default:
 		if len(msg.String()) == 1 || msg.String() == " " {
@@ -243,6 +419,8 @@ func (m model) updateEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// --- Mutations ---
+
 func (m *model) commitEdit() {
 	if m.cy >= len(m.rows) || m.cx >= len(m.cols) {
 		return
@@ -250,10 +428,27 @@ func (m *model) commitEdit() {
 	c := m.cols[m.cx]
 	val := parseCell(m.editBuf, c.typ)
 	m.rows[m.cy][c.key] = val
-
-	rowIdx := m.cy + 1
-	m.doc.Path("data", rowIdx, c.key).Set(val)
+	m.setDocCell(m.cy, c.key, val)
 	m.persist()
+}
+
+func (m *model) setCellValue(val any) {
+	if m.cy >= len(m.rows) || m.cx >= len(m.cols) {
+		return
+	}
+	c := m.cols[m.cx]
+	m.rows[m.cy][c.key] = val
+	m.setDocCell(m.cy, c.key, val)
+	m.persist()
+}
+
+func (m *model) setDocCell(rowIdx int, colKey string, val any) {
+	dataIdx := rowIdx + 1
+	if m.isMetadata {
+		m.doc.Path("data", 0, "data", dataIdx, colKey).Set(val)
+	} else {
+		m.doc.Path("data", dataIdx, colKey).Set(val)
+	}
 }
 
 func (m *model) persist() {
@@ -272,18 +467,42 @@ func (m model) cellValue() any {
 
 // --- Row/Column ops ---
 
-func (m model) appendRow() (tea.Model, tea.Cmd) {
+func (m model) deleteRow() (tea.Model, tea.Cmd) {
+	if len(m.rows) == 0 {
+		return m, nil
+	}
+	dataIdx := m.cy + 1
+	dataList := resolveDataList(m.doc)
+	if dataList != nil {
+		dataList.Delete(dataIdx)
+	}
+	m.rows = append(m.rows[:m.cy], m.rows[m.cy+1:]...)
+	if m.cy >= len(m.rows) && m.cy > 0 {
+		m.cy--
+	}
+	m.persist()
+	return m, nil
+}
+
+func (m model) insertRowAt(idx int) (tea.Model, tea.Cmd) {
+	if idx > len(m.rows) {
+		idx = len(m.rows)
+	}
 	row := make(map[string]any)
 	for _, c := range m.cols {
 		row[c.key] = nil
 	}
-	m.rows = append(m.rows, row)
+	// splice into local rows
+	m.rows = append(m.rows, nil)
+	copy(m.rows[idx+1:], m.rows[idx:])
+	m.rows[idx] = row
 
-	dataList := m.doc.Path("data").List()
+	dataIdx := idx + 1
+	dataList := resolveDataList(m.doc)
 	if dataList != nil {
-		dataList.Append(automerge.NewMap())
+		dataList.Insert(dataIdx, automerge.NewMap())
 	}
-	m.cy = len(m.rows) - 1
+	m.cy = idx
 	m.persist()
 	return m, nil
 }
@@ -294,10 +513,17 @@ func (m model) appendCol() (tea.Model, tea.Cmd) {
 	m.cols = append(m.cols, c)
 
 	colDef := automerge.NewMap()
-	m.doc.Path("data", 0, newKey).Set(colDef)
-	m.doc.Path("data", 0, newKey, "name").Set(c.name)
-	m.doc.Path("data", 0, newKey, "type").Set(c.typ)
-	m.doc.Path("data", 0, newKey, "key").Set(newKey)
+	if m.isMetadata {
+		m.doc.Path("data", 0, "data", 0, newKey).Set(colDef)
+		m.doc.Path("data", 0, "data", 0, newKey, "name").Set(c.name)
+		m.doc.Path("data", 0, "data", 0, newKey, "type").Set(c.typ)
+		m.doc.Path("data", 0, "data", 0, newKey, "key").Set(newKey)
+	} else {
+		m.doc.Path("data", 0, newKey).Set(colDef)
+		m.doc.Path("data", 0, newKey, "name").Set(c.name)
+		m.doc.Path("data", 0, newKey, "type").Set(c.typ)
+		m.doc.Path("data", 0, newKey, "key").Set(newKey)
+	}
 
 	for _, row := range m.rows {
 		row[newKey] = nil
@@ -331,39 +557,38 @@ func (m model) viewLibrary() string {
 		lines = append(lines, errorStyle.Render(" error: "+m.err.Error()))
 	}
 
-	if len(m.docs) == 0 {
+	visible := m.visibleDocs()
+
+	if len(visible) == 0 && m.filterBuf == "" {
 		lines = append(lines, dimStyle.Render(" no documents found"))
 		lines = append(lines, dimStyle.Render(fmt.Sprintf(" (searched %s)", m.dataDir)))
 	}
 
-	help := dimStyle.Render(" j/k navigate  enter open  q quit")
+	// filter bar
+	if m.filterMode {
+		lines = append(lines, statusStyle.Render(fmt.Sprintf(" /%s_", m.filterBuf)))
+	} else if m.filterBuf != "" {
+		lines = append(lines, dimStyle.Render(fmt.Sprintf(" /%s", m.filterBuf)))
+	}
 
-	// column layout: type, id, cols, rows, size, modified
-	// compute widths to fill terminal
+	// column layout
 	const (
-		colPad     = 2 // spaces between columns
-		fixedCols  = 4 // cols, rows, size, date have fixed widths
-		colsCW     = 4
-		rowsCW     = 5
-		sizeCW     = 6
-		dateCW     = 6
+		colPad = 2
+		colsCW = 4
+		rowsCW = 5
+		sizeCW = 6
+		dateCW = 6
 	)
-	fixedW := colsCW + rowsCW + sizeCW + dateCW + (5 * colPad) // 5 gaps between 6 cols
+	fixedW := colsCW + rowsCW + sizeCW + dateCW + (5 * colPad)
 	typeW := 0
-	for _, d := range m.docs {
+	for _, d := range visible {
 		if len(d.docType) > typeW {
 			typeW = len(d.docType)
 		}
 	}
-	if typeW < 4 {
-		typeW = 4
-	}
-	idW := m.width - fixedW - typeW
-	if idW < 10 {
-		idW = 10
-	}
+	typeW = max(typeW, 4)
+	idW := max(m.width-fixedW-typeW, 10)
 
-	// header
 	hdr := fmt.Sprintf("  %-*s  %-*s  %*s  %*s  %*s  %-*s",
 		typeW, "TYPE", idW, "ID", colsCW, "COLS", rowsCW, "ROWS", sizeCW, "SIZE", dateCW, "DATE")
 	if len(hdr) < m.width {
@@ -371,14 +596,23 @@ func (m model) viewLibrary() string {
 	}
 	lines = append(lines, libHdrStyle.Render(hdr))
 
-	// separator
-	sep := "  " + strings.Repeat("─", m.width-2)
+	sep := "  " + strings.Repeat("─", max(m.width-2, 0))
 	lines = append(lines, dimStyle.Render(sep))
 
-	// available list height
-	listHeight := m.height - len(lines) - 2 // -2 for help + status
-	if listHeight < 1 {
-		listHeight = 1
+	var helpText string
+	if m.filterMode {
+		helpText = " type to filter  enter confirm  esc cancel  ctrl+u clear"
+	} else {
+		helpText = " j/k move  enter open  / filter  gg top  G end  q quit"
+	}
+	help := dimStyle.Render(helpText)
+
+	listHeight := max(m.height-len(lines)-2, 1)
+
+	// clamp cursor
+	last := max(len(visible)-1, 0)
+	if m.libCursor > last {
+		m.libCursor = last
 	}
 
 	if m.libCursor < m.libScroll {
@@ -388,8 +622,8 @@ func (m model) viewLibrary() string {
 		m.libScroll = m.libCursor - listHeight + 1
 	}
 
-	for i := m.libScroll; i < len(m.docs) && i < m.libScroll+listHeight; i++ {
-		d := m.docs[i]
+	for i := m.libScroll; i < len(visible) && i < m.libScroll+listHeight; i++ {
+		d := visible[i]
 
 		id := d.id
 		if len(id) > idW {
@@ -414,15 +648,13 @@ func (m model) viewLibrary() string {
 		}
 	}
 
-	// pad to fill
 	for len(lines) < m.height-2 {
 		lines = append(lines, "")
 	}
 
-	// position indicator
 	pos := ""
-	if len(m.docs) > 0 {
-		pos = dimStyle.Render(fmt.Sprintf(" %d/%d", m.libCursor+1, len(m.docs)))
+	if len(visible) > 0 {
+		pos = dimStyle.Render(fmt.Sprintf(" %d/%d", m.libCursor+1, len(visible)))
 	}
 	lines = append(lines, pos)
 	lines = append(lines, help)
@@ -440,7 +672,6 @@ func formatSize(b int64) string {
 func (m model) viewTable() string {
 	var lines []string
 
-	// title bar
 	title := m.docID
 	if len(title) > 30 {
 		title = title[:30] + ".."
@@ -460,15 +691,9 @@ func (m model) viewTable() string {
 		return strings.Join(lines, "\n")
 	}
 
-	// compute column widths, then expand to fill terminal
 	colWidths := m.computeColWidths()
 
-	// status + help = 2 lines at bottom
-	// header + separator = 2 lines
-	dataHeight := m.height - len(lines) - 4
-	if dataHeight < 1 {
-		dataHeight = 1
-	}
+	dataHeight := max(m.height-len(lines)-4, 1)
 
 	if m.cy < m.scrollY {
 		m.scrollY = m.cy
@@ -478,8 +703,6 @@ func (m model) viewTable() string {
 	}
 
 	visStart, visEnd := m.visibleColRange(colWidths)
-
-	// expand visible columns to fill terminal width
 	colWidths = m.expandColWidths(colWidths, visStart, visEnd)
 
 	// header
@@ -496,7 +719,6 @@ func (m model) viewTable() string {
 			hdr.WriteString(headerStyle.Render("│"))
 		}
 	}
-	// pad header to full width
 	hdrStr := hdr.String()
 	hdrVisLen := lipgloss.Width(hdrStr)
 	if hdrVisLen < m.width {
@@ -520,10 +742,7 @@ func (m model) viewTable() string {
 	lines = append(lines, dimStyle.Render(sepStr))
 
 	// data rows
-	endRow := m.scrollY + dataHeight
-	if endRow > len(m.rows) {
-		endRow = len(m.rows)
-	}
+	endRow := min(m.scrollY+dataHeight, len(m.rows))
 	for ri := m.scrollY; ri < endRow; ri++ {
 		row := m.rows[ri]
 		var rowBuf strings.Builder
@@ -558,7 +777,6 @@ func (m model) viewTable() string {
 			}
 		}
 
-		// pad row to full width
 		rowStr := rowBuf.String()
 		rowVisLen := lipgloss.Width(rowStr)
 		if rowVisLen < m.width {
@@ -572,20 +790,26 @@ func (m model) viewTable() string {
 		lines = append(lines, rowStr)
 	}
 
-	// pad empty rows to fill data area
 	for len(lines) < m.height-2 {
 		lines = append(lines, "")
 	}
 
-	// status bar (full width)
+	// status bar
 	modeStr := "NORMAL"
 	if m.mode == modeEdit {
 		modeStr = "EDIT"
 	}
-	status := fmt.Sprintf(" [%d,%d] %s", m.cx, m.cy, modeStr)
+	if m.pending != "" {
+		modeStr += " " + m.pending
+	}
+	yankInd := ""
+	if m.yank != nil {
+		yankInd = " [y]"
+	}
+	status := fmt.Sprintf(" [%d,%d] %s%s", m.cx, m.cy, modeStr, yankInd)
 	lines = append(lines, statusStyle.Render(status))
 
-	help := " hjkl move  enter edit  a row  A col  esc back"
+	help := " hjkl/wb move  0/$ ends  gg/G top/bot  i edit  c clear  dd del  o/O row  y/p yank  esc back"
 	lines = append(lines, dimStyle.Render(help))
 	return strings.Join(lines, "\n")
 }
@@ -593,15 +817,9 @@ func (m model) viewTable() string {
 func (m model) computeColWidths() []int {
 	widths := make([]int, len(m.cols))
 	for i, c := range m.cols {
-		widths[i] = len(c.name)
-		if widths[i] < 3 {
-			widths[i] = 3
-		}
+		widths[i] = max(len(c.name), 3)
 	}
-	sampleEnd := len(m.rows)
-	if sampleEnd > 100 {
-		sampleEnd = 100
-	}
+	sampleEnd := min(len(m.rows), 100)
 	for _, row := range m.rows[:sampleEnd] {
 		for i, c := range m.cols {
 			s := formatCell(row[c.key], c.typ)
@@ -611,14 +829,11 @@ func (m model) computeColWidths() []int {
 		}
 	}
 	for i := range widths {
-		if widths[i] > 40 {
-			widths[i] = 40
-		}
+		widths[i] = min(widths[i], 40)
 	}
 	return widths
 }
 
-// expandColWidths distributes remaining terminal width across visible columns
 func (m model) expandColWidths(widths []int, visStart, visEnd int) []int {
 	out := make([]int, len(widths))
 	copy(out, widths)
@@ -628,12 +843,11 @@ func (m model) expandColWidths(widths []int, visStart, visEnd int) []int {
 		return out
 	}
 
-	// total used = sum of (width + 2 padding + 1 separator) per col, minus last separator
 	used := 0
 	for ci := visStart; ci < visEnd; ci++ {
 		used += out[ci] + 2
 		if ci < visEnd-1 {
-			used++ // separator
+			used++
 		}
 	}
 	slack := m.width - used
@@ -641,7 +855,6 @@ func (m model) expandColWidths(widths []int, visStart, visEnd int) []int {
 		return out
 	}
 
-	// distribute evenly, remainder goes to leftmost columns
 	per := slack / nVis
 	rem := slack % nVis
 	for ci := visStart; ci < visEnd; ci++ {
