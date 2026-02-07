@@ -1,4 +1,27 @@
-port module Main exposing (main)
+port module Main exposing
+    ( ClipboardData
+    , ClipboardFormat(..)
+    , Index
+    , Rect
+    , SortOrder(..)
+    , TableBounds
+    , clampIndex
+    , detectFormat
+    , expandSelection
+    , main
+    , moveSelection
+    , nextSortOrder
+    , normalizeRect
+    , parseCsv
+    , parseJson
+    , parseTsv
+    , rect
+    , rectToIndices
+    , selectAll
+    , serializeToTsv
+    , sortWithOrder
+    , xy
+    )
 
 ---- IMPORTS ------------------------------------------------------------------
 
@@ -7,7 +30,6 @@ import Browser
 import Browser.Dom as Dom
 import Browser.Events as Browser
 import Browser.Navigation as Nav
-import Clipboard
 import Date exposing (Date)
 import Dict exposing (Dict)
 import File exposing (File)
@@ -19,12 +41,276 @@ import Html.Style as S
 import Http
 import Json.Decode as D
 import Json.Encode as E
-import Navigation as Nav2 exposing (Index, Rect, SortOrder(..), TableBounds, xy, rect)
 import Set exposing (Set)
 import Task exposing (Task)
 import Url exposing (Url)
 import Url.Parser as UrlP exposing ((</>), (<?>))
 import Url.Parser.Query as UrlQ
+
+
+
+---- NAVIGATION ---------------------------------------------------------------
+
+
+type alias Index =
+    { x : Int, y : Int }
+
+
+type alias Rect =
+    { a : Index, b : Index }
+
+
+type alias TableBounds =
+    { maxX : Int
+    , maxY : Int
+    }
+
+
+type SortOrder
+    = Ascending
+    | Descending
+
+
+xy : Int -> Int -> Index
+xy x y =
+    Index x y
+
+
+rect : Int -> Int -> Int -> Int -> Rect
+rect ax ay bx by =
+    Rect (xy ax ay) (xy bx by)
+
+
+clampIndex : TableBounds -> Index -> Index
+clampIndex bounds idx =
+    { x = clamp 0 bounds.maxX idx.x
+    , y = clamp 1 bounds.maxY idx.y
+    }
+
+
+moveSelection : TableBounds -> Int -> Int -> Index -> Rect
+moveSelection bounds dx dy current =
+    let
+        newIdx =
+            clampIndex bounds { x = current.x + dx, y = current.y + dy }
+    in
+    Rect newIdx newIdx
+
+
+nextSortOrder : Maybe SortOrder -> Maybe SortOrder
+nextSortOrder current =
+    case current of
+        Nothing ->
+            Just Ascending
+
+        Just Ascending ->
+            Just Descending
+
+        Just Descending ->
+            Nothing
+
+
+sortWithOrder : SortOrder -> (a -> a -> Order) -> List a -> List a
+sortWithOrder order compare list =
+    let
+        sorted =
+            List.sortWith compare list
+    in
+    case order of
+        Ascending ->
+            sorted
+
+        Descending ->
+            List.reverse sorted
+
+
+normalizeRect : Rect -> Rect
+normalizeRect r =
+    { a =
+        { x = min r.a.x r.b.x
+        , y = min r.a.y r.b.y
+        }
+    , b =
+        { x = max r.a.x r.b.x
+        , y = max r.a.y r.b.y
+        }
+    }
+
+
+expandSelection : TableBounds -> Int -> Int -> Rect -> Rect
+expandSelection bounds dx dy sel =
+    let
+        newB =
+            clampIndex bounds { x = sel.b.x + dx, y = sel.b.y + dy }
+    in
+    { sel | b = newB }
+
+
+selectAll : TableBounds -> Rect
+selectAll bounds =
+    Rect (xy 0 1) (xy bounds.maxX bounds.maxY)
+
+
+rectToIndices : Rect -> List Index
+rectToIndices r =
+    let
+        normalized =
+            normalizeRect r
+
+        xs =
+            List.range normalized.a.x normalized.b.x
+
+        ys =
+            List.range normalized.a.y normalized.b.y
+    in
+    List.concatMap (\y -> List.map (\x -> xy x y) xs) ys
+
+
+
+---- CLIPBOARD ----------------------------------------------------------------
+
+
+type alias ClipboardData =
+    List (List String)
+
+
+type ClipboardFormat
+    = Tsv
+    | Csv
+    | JsonArray
+    | PlainText
+
+
+detectFormat : String -> ClipboardFormat
+detectFormat clipText =
+    let
+        trimmed =
+            String.trim clipText
+
+        hasTab =
+            String.contains "\t" clipText
+
+        hasComma =
+            String.contains "," clipText
+
+        hasNewline =
+            String.contains "\n" clipText
+    in
+    if String.startsWith "[" trimmed then
+        JsonArray
+
+    else if hasTab then
+        Tsv
+
+    else if hasComma && hasNewline then
+        Csv
+
+    else
+        PlainText
+
+
+parseTsv : String -> ClipboardData
+parseTsv clipText =
+    clipText
+        |> String.lines
+        |> List.filter (not << String.isEmpty)
+        |> List.map (String.split "\t")
+
+
+parseCsv : String -> ClipboardData
+parseCsv clipText =
+    clipText
+        |> String.lines
+        |> List.filter (not << String.isEmpty)
+        |> List.map parseCsvRow
+
+
+parseCsvRow : String -> List String
+parseCsvRow row =
+    parseCsvRowHelper row "" False []
+
+
+parseCsvRowHelper : String -> String -> Bool -> List String -> List String
+parseCsvRowHelper remaining current inQuotes acc =
+    case String.uncons remaining of
+        Nothing ->
+            List.reverse (String.trim current :: acc)
+
+        Just ( char, rest ) ->
+            if char == '"' then
+                if inQuotes then
+                    case String.uncons rest of
+                        Just ( '"', restAfterQuote ) ->
+                            parseCsvRowHelper restAfterQuote (current ++ "\"") True acc
+
+                        _ ->
+                            parseCsvRowHelper rest current False acc
+
+                else
+                    parseCsvRowHelper rest current True acc
+
+            else if char == ',' && not inQuotes then
+                parseCsvRowHelper rest "" False (String.trim current :: acc)
+
+            else
+                parseCsvRowHelper rest (current ++ String.fromChar char) inQuotes acc
+
+
+parseJson : String -> Result String ClipboardData
+parseJson jsonText =
+    let
+        arrayOfArrays =
+            D.list (D.list stringOrValue)
+
+        arrayOfObjects =
+            D.list (D.dict stringOrValue)
+                |> D.map
+                    (\objs ->
+                        case objs of
+                            [] ->
+                                []
+
+                            first :: _ ->
+                                let
+                                    keys =
+                                        first
+                                            |> Dict.keys
+                                            |> List.sort
+                                in
+                                List.map
+                                    (\obj ->
+                                        List.map
+                                            (\k -> Dict.get k obj |> Maybe.withDefault "")
+                                            keys
+                                    )
+                                    objs
+                    )
+
+        stringOrValue =
+            D.oneOf
+                [ D.string
+                , D.int |> D.map String.fromInt
+                , D.float |> D.map String.fromFloat
+                , D.bool |> D.map (\b -> if b then "true" else "false")
+                , D.null ""
+                , D.value |> D.map (E.encode 0)
+                ]
+    in
+    jsonText
+        |> D.decodeString
+            (D.oneOf
+                [ arrayOfArrays
+                , arrayOfObjects
+                ]
+            )
+        |> Result.mapError D.errorToString
+
+
+serializeToTsv : List (List String) -> String
+serializeToTsv rows =
+    rows
+        |> List.map (String.join "\t")
+        |> String.join "\n"
 
 
 
@@ -1869,7 +2155,7 @@ update msg ({ sheet, auth } as model) =
                     expand dx dy =
                         let
                             newSelect =
-                                Nav2.expandSelection bounds dx dy sheet.select
+                                expandSelection bounds dx dy sheet.select
                         in
                         ( { model | sheet = { sheet | select = newSelect } }, Cmd.none )
 
@@ -1877,7 +2163,7 @@ update msg ({ sheet, auth } as model) =
                     selectedRows =
                         let
                             norm =
-                                Nav2.normalizeRect sheet.select
+                                normalizeRect sheet.select
                         in
                         List.range norm.a.y norm.b.y
 
@@ -1885,13 +2171,13 @@ update msg ({ sheet, auth } as model) =
                     selectedCols =
                         let
                             norm =
-                                Nav2.normalizeRect sheet.select
+                                normalizeRect sheet.select
                         in
                         List.range norm.a.x norm.b.x
 
                     -- Get all selected cell indices for clearing
                     selectedCells =
-                        Nav2.rectToIndices sheet.select
+                        rectToIndices sheet.select
                 in
                 case event.key of
                     "ArrowUp" ->
@@ -2177,7 +2463,7 @@ update msg ({ sheet, auth } as model) =
                 Ok (Tab tbl) ->
                     let
                         sel =
-                            Nav2.normalizeRect sheet.select
+                            normalizeRect sheet.select
 
                         -- Extract selected cells as 2D list of strings
                         rows =
@@ -2199,7 +2485,7 @@ update msg ({ sheet, auth } as model) =
                                     )
 
                         tsv =
-                            Clipboard.serializeToTsv rows
+                            serializeToTsv rows
                     in
                     ( model, copyToClipboard tsv )
 
@@ -2216,18 +2502,18 @@ update msg ({ sheet, auth } as model) =
 
                         -- Detect format and parse
                         data =
-                            case Clipboard.detectFormat text of
-                                Clipboard.Tsv ->
-                                    Clipboard.parseTsv text
+                            case detectFormat text of
+                                Tsv ->
+                                    parseTsv text
 
-                                Clipboard.Csv ->
-                                    Clipboard.parseCsv text
+                                Csv ->
+                                    parseCsv text
 
-                                Clipboard.JsonArray ->
-                                    Clipboard.parseJson text
+                                JsonArray ->
+                                    parseJson text
                                         |> Result.withDefault [ [ text ] ]
 
-                                Clipboard.PlainText ->
+                                PlainText ->
                                     [ [ text ] ]
 
                         -- Calculate required dimensions
@@ -2340,7 +2626,7 @@ update msg ({ sheet, auth } as model) =
                             }
 
                         newSelect =
-                            Nav2.selectAll bounds
+                            selectAll bounds
                     in
                     ( { model | sheet = { sheet | select = newSelect } }, Cmd.none )
 
