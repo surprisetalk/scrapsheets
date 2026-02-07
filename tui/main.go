@@ -12,7 +12,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// styles
 var (
 	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	headerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("8"))
@@ -20,6 +19,7 @@ var (
 	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	rowCurStyle = lipgloss.NewStyle().Background(lipgloss.Color("236"))
 )
 
 type view int
@@ -44,9 +44,9 @@ type model struct {
 	err     error
 
 	// library
-	docs       []docInfo
-	libCursor  int
-	libScroll  int
+	docs      []docInfo
+	libCursor int
+	libScroll int
 
 	// table
 	doc     *automerge.Doc
@@ -54,12 +54,11 @@ type model struct {
 	docID   string
 	cols    []col
 	rows    []map[string]any
-	cx, cy  int // cursor x, y (y=0 is first data row)
+	cx, cy  int
 	scrollX int
 	scrollY int
 	mode    mode
 	editBuf string
-	dirty   bool
 }
 
 func initialModel(dataDir string) model {
@@ -68,7 +67,6 @@ func initialModel(dataDir string) model {
 	if err != nil {
 		m.err = err
 	}
-	// filter to interesting docs (skip empty/unknown)
 	for _, d := range allDocs {
 		if d.docType != "empty" && d.docType != "unknown" {
 			m.docs = append(m.docs, d)
@@ -139,7 +137,6 @@ func (m model) openDoc(info docInfo) (tea.Model, tea.Cmd) {
 	m.cx, m.cy = 0, 0
 	m.scrollX, m.scrollY = 0, 0
 	m.mode = modeNormal
-	m.dirty = false
 	m.err = nil
 	return m, nil
 }
@@ -206,10 +203,6 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.appendRow()
 	case "A":
 		return m.appendCol()
-	case "d":
-		// TODO: dd for delete row
-	case "ctrl+s":
-		return m.save()
 	}
 	return m, nil
 }
@@ -221,7 +214,6 @@ func (m model) updateEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		m.commitEdit()
 		m.mode = modeNormal
-		// move down after confirm
 		if m.cy < len(m.rows)-1 {
 			m.cy++
 		}
@@ -258,10 +250,16 @@ func (m *model) commitEdit() {
 	val := parseCell(m.editBuf, c.typ)
 	m.rows[m.cy][c.key] = val
 
-	// update automerge doc
-	rowIdx := m.cy + 1 // data rows start at index 1
+	rowIdx := m.cy + 1
 	m.doc.Path("data", rowIdx, c.key).Set(val)
-	m.dirty = true
+	m.persist()
+}
+
+func (m *model) persist() {
+	m.doc.Commit("tui edit")
+	if err := saveDoc(m.doc, m.docPath); err != nil {
+		m.err = err
+	}
 }
 
 func (m model) cellValue() any {
@@ -280,15 +278,12 @@ func (m model) appendRow() (tea.Model, tea.Cmd) {
 	}
 	m.rows = append(m.rows, row)
 
-	newIdx := len(m.rows) // 1-indexed in automerge data list
 	dataList := m.doc.Path("data").List()
 	if dataList != nil {
-		newMap := automerge.NewMap()
-		dataList.Append(newMap)
-		_ = newIdx // row is appended as empty map
+		dataList.Append(automerge.NewMap())
 	}
 	m.cy = len(m.rows) - 1
-	m.dirty = true
+	m.persist()
 	return m, nil
 }
 
@@ -297,31 +292,16 @@ func (m model) appendCol() (tea.Model, tea.Cmd) {
 	c := col{key: newKey, name: "col" + newKey, typ: "text"}
 	m.cols = append(m.cols, c)
 
-	// update automerge row 0
 	colDef := automerge.NewMap()
 	m.doc.Path("data", 0, newKey).Set(colDef)
 	m.doc.Path("data", 0, newKey, "name").Set(c.name)
 	m.doc.Path("data", 0, newKey, "type").Set(c.typ)
 	m.doc.Path("data", 0, newKey, "key").Set(newKey)
 
-	for i, row := range m.rows {
+	for _, row := range m.rows {
 		row[newKey] = nil
-		_ = i
 	}
-	m.dirty = true
-	return m, nil
-}
-
-func (m model) save() (tea.Model, tea.Cmd) {
-	if !m.dirty {
-		return m, nil
-	}
-	m.doc.Commit("tui edit")
-	if err := saveDoc(m.doc, m.docPath); err != nil {
-		m.err = err
-		return m, nil
-	}
-	m.dirty = false
+	m.persist()
 	return m, nil
 }
 
@@ -341,33 +321,36 @@ func (m model) View() string {
 }
 
 func (m model) viewLibrary() string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render(" Scrapsheets TUI"))
-	b.WriteString("\n")
+	var lines []string
+
+	title := titleStyle.Render(" Scrapsheets TUI")
+	lines = append(lines, title)
 
 	if m.err != nil {
-		b.WriteString(errorStyle.Render(" error: "+m.err.Error()) + "\n")
+		lines = append(lines, errorStyle.Render(" error: "+m.err.Error()))
 	}
 
 	if len(m.docs) == 0 {
-		b.WriteString(dimStyle.Render(" no documents found\n"))
-		b.WriteString(dimStyle.Render(fmt.Sprintf(" (searched %s)\n", m.dataDir)))
+		lines = append(lines, dimStyle.Render(" no documents found"))
+		lines = append(lines, dimStyle.Render(fmt.Sprintf(" (searched %s)", m.dataDir)))
 	}
 
-	visibleRows := m.height - 4
-	if visibleRows < 1 {
-		visibleRows = 1
+	help := dimStyle.Render(" j/k navigate  enter open  q quit")
+
+	// rows available for doc list = total height - title - help - blank line before help
+	listHeight := m.height - len(lines) - 2
+	if listHeight < 1 {
+		listHeight = 1
 	}
 
-	// adjust scroll to keep cursor visible
 	if m.libCursor < m.libScroll {
 		m.libScroll = m.libCursor
 	}
-	if m.libCursor >= m.libScroll+visibleRows {
-		m.libScroll = m.libCursor - visibleRows + 1
+	if m.libCursor >= m.libScroll+listHeight {
+		m.libScroll = m.libCursor - listHeight + 1
 	}
 
-	for i := m.libScroll; i < len(m.docs) && i < m.libScroll+visibleRows; i++ {
+	for i := m.libScroll; i < len(m.docs) && i < m.libScroll+listHeight; i++ {
 		d := m.docs[i]
 		cursor := "  "
 		if i == m.libCursor {
@@ -375,56 +358,70 @@ func (m model) viewLibrary() string {
 		}
 
 		id := d.id
-		if len(id) > 12 {
-			id = id[:12] + ".."
+		if len(id) > 16 {
+			id = id[:16] + ".."
 		}
 
-		line := fmt.Sprintf("%s%-8s %-14s %3dx%-3d %s",
+		line := fmt.Sprintf("%s%-12s %-18s %3dx%-4d %s",
 			cursor, d.docType, id, d.nCols, d.nRows, d.modTime.Format("Jan 02"))
 
-		if i == m.libCursor {
-			b.WriteString(cursorStyle.Render(line))
-		} else {
-			b.WriteString(line)
+		// pad to full width
+		if len(line) < m.width {
+			line += strings.Repeat(" ", m.width-len(line))
 		}
-		b.WriteString("\n")
+
+		if i == m.libCursor {
+			lines = append(lines, cursorStyle.Render(line))
+		} else {
+			lines = append(lines, line)
+		}
 	}
 
-	b.WriteString("\n")
-	b.WriteString(dimStyle.Render(" j/k navigate  enter open  q quit"))
-	return b.String()
+	// pad remaining lines
+	rendered := len(lines)
+	target := m.height - 1 // -1 for help
+	for rendered < target {
+		lines = append(lines, "")
+		rendered++
+	}
+	lines = append(lines, help)
+
+	return strings.Join(lines, "\n")
 }
 
 func (m model) viewTable() string {
-	var b strings.Builder
+	var lines []string
 
-	// title
+	// title bar
 	title := m.docID
-	if len(title) > 20 {
-		title = title[:20] + ".."
+	if len(title) > 30 {
+		title = title[:30] + ".."
 	}
-	b.WriteString(titleStyle.Render(" " + title))
-	if m.dirty {
-		b.WriteString(" *")
-	}
-	b.WriteString("\n")
+	titleLine := titleStyle.Render(" "+title) + dimStyle.Render(fmt.Sprintf("  %dx%d", len(m.cols), len(m.rows)))
+	lines = append(lines, titleLine)
 
 	if m.err != nil {
-		b.WriteString(errorStyle.Render(" error: "+m.err.Error()) + "\n")
+		lines = append(lines, errorStyle.Render(" error: "+m.err.Error()))
 	}
 
 	if len(m.cols) == 0 {
-		b.WriteString(dimStyle.Render(" (empty table)\n"))
-		return b.String()
+		lines = append(lines, dimStyle.Render(" (empty table)"))
+		for len(lines) < m.height {
+			lines = append(lines, "")
+		}
+		return strings.Join(lines, "\n")
 	}
 
-	// compute column widths
+	// compute column widths, then expand to fill terminal
 	colWidths := m.computeColWidths()
 
-	// available height for data rows
-	dataHeight := m.height - 5 // title + header + status + help + border
+	// status + help = 2 lines at bottom
+	// header + separator = 2 lines
+	dataHeight := m.height - len(lines) - 4
+	if dataHeight < 1 {
+		dataHeight = 1
+	}
 
-	// adjust scroll
 	if m.cy < m.scrollY {
 		m.scrollY = m.cy
 	}
@@ -432,8 +429,10 @@ func (m model) viewTable() string {
 		m.scrollY = m.cy - dataHeight + 1
 	}
 
-	// visible column range
 	visStart, visEnd := m.visibleColRange(colWidths)
+
+	// expand visible columns to fill terminal width
+	colWidths = m.expandColWidths(colWidths, visStart, visEnd)
 
 	// header
 	var hdr strings.Builder
@@ -446,23 +445,31 @@ func (m model) viewTable() string {
 		cell := fmt.Sprintf(" %-*s ", w, name)
 		hdr.WriteString(headerStyle.Render(cell))
 		if ci < visEnd-1 {
-			hdr.WriteString(dimStyle.Render("|"))
+			hdr.WriteString(headerStyle.Render("│"))
 		}
 	}
-	b.WriteString(hdr.String())
-	b.WriteString("\n")
+	// pad header to full width
+	hdrStr := hdr.String()
+	hdrVisLen := lipgloss.Width(hdrStr)
+	if hdrVisLen < m.width {
+		hdrStr += headerStyle.Render(strings.Repeat(" ", m.width-hdrVisLen))
+	}
+	lines = append(lines, hdrStr)
 
 	// separator
 	var sep strings.Builder
 	for ci := visStart; ci < visEnd; ci++ {
 		w := colWidths[ci]
-		sep.WriteString(dimStyle.Render(strings.Repeat("─", w+2)))
+		sep.WriteString(strings.Repeat("─", w+2))
 		if ci < visEnd-1 {
-			sep.WriteString(dimStyle.Render("┼"))
+			sep.WriteString("┼")
 		}
 	}
-	b.WriteString(sep.String())
-	b.WriteString("\n")
+	sepStr := sep.String()
+	if len(sepStr) < m.width {
+		sepStr += strings.Repeat("─", m.width-len(sepStr))
+	}
+	lines = append(lines, dimStyle.Render(sepStr))
 
 	// data rows
 	endRow := m.scrollY + dataHeight
@@ -471,6 +478,7 @@ func (m model) viewTable() string {
 	}
 	for ri := m.scrollY; ri < endRow; ri++ {
 		row := m.rows[ri]
+		var rowBuf strings.Builder
 		for ci := visStart; ci < visEnd; ci++ {
 			w := colWidths[ci]
 			c := m.cols[ci]
@@ -484,43 +492,64 @@ func (m model) viewTable() string {
 			}
 
 			aligned := alignCell(display, c.typ, w)
-			cell := fmt.Sprintf(" %s ", aligned)
+			cell := " " + aligned + " "
 
 			if ri == m.cy && ci == m.cx {
-				b.WriteString(cursorStyle.Render(cell))
+				rowBuf.WriteString(cursorStyle.Render(cell))
+			} else if ri == m.cy {
+				rowBuf.WriteString(rowCurStyle.Render(cell))
 			} else {
-				b.WriteString(cell)
+				rowBuf.WriteString(cell)
 			}
 			if ci < visEnd-1 {
-				b.WriteString(dimStyle.Render("│"))
+				if ri == m.cy {
+					rowBuf.WriteString(rowCurStyle.Render("│"))
+				} else {
+					rowBuf.WriteString(dimStyle.Render("│"))
+				}
 			}
 		}
-		b.WriteString("\n")
+
+		// pad row to full width
+		rowStr := rowBuf.String()
+		rowVisLen := lipgloss.Width(rowStr)
+		if rowVisLen < m.width {
+			pad := strings.Repeat(" ", m.width-rowVisLen)
+			if ri == m.cy {
+				rowStr += rowCurStyle.Render(pad)
+			} else {
+				rowStr += pad
+			}
+		}
+		lines = append(lines, rowStr)
 	}
 
-	// status bar
+	// pad empty rows to fill data area
+	for len(lines) < m.height-2 {
+		lines = append(lines, "")
+	}
+
+	// status bar (full width)
 	modeStr := "NORMAL"
 	if m.mode == modeEdit {
 		modeStr = "EDIT"
 	}
-	status := fmt.Sprintf(" [%d,%d] %s  %dx%d", m.cx, m.cy, modeStr, len(m.cols), len(m.rows))
-	b.WriteString(statusStyle.Render(status))
-	b.WriteString("\n")
+	status := fmt.Sprintf(" [%d,%d] %s", m.cx, m.cy, modeStr)
+	lines = append(lines, statusStyle.Render(status))
 
-	help := " hjkl move  enter edit  a row  A col  ctrl+s save  esc back"
-	b.WriteString(dimStyle.Render(help))
-	return b.String()
+	help := " hjkl move  enter edit  a row  A col  esc back"
+	lines = append(lines, dimStyle.Render(help))
+	return strings.Join(lines, "\n")
 }
 
 func (m model) computeColWidths() []int {
 	widths := make([]int, len(m.cols))
 	for i, c := range m.cols {
 		widths[i] = len(c.name)
-		if widths[i] < 4 {
-			widths[i] = 4
+		if widths[i] < 3 {
+			widths[i] = 3
 		}
 	}
-	// sample rows for width
 	sampleEnd := len(m.rows)
 	if sampleEnd > 100 {
 		sampleEnd = 100
@@ -533,17 +562,51 @@ func (m model) computeColWidths() []int {
 			}
 		}
 	}
-	// cap at reasonable max
 	for i := range widths {
-		if widths[i] > 30 {
-			widths[i] = 30
+		if widths[i] > 40 {
+			widths[i] = 40
 		}
 	}
 	return widths
 }
 
+// expandColWidths distributes remaining terminal width across visible columns
+func (m model) expandColWidths(widths []int, visStart, visEnd int) []int {
+	out := make([]int, len(widths))
+	copy(out, widths)
+
+	nVis := visEnd - visStart
+	if nVis <= 0 {
+		return out
+	}
+
+	// total used = sum of (width + 2 padding + 1 separator) per col, minus last separator
+	used := 0
+	for ci := visStart; ci < visEnd; ci++ {
+		used += out[ci] + 2
+		if ci < visEnd-1 {
+			used++ // separator
+		}
+	}
+	slack := m.width - used
+	if slack <= 0 {
+		return out
+	}
+
+	// distribute evenly, remainder goes to leftmost columns
+	per := slack / nVis
+	rem := slack % nVis
+	for ci := visStart; ci < visEnd; ci++ {
+		out[ci] += per
+		if ci-visStart < rem {
+			out[ci]++
+		}
+	}
+	return out
+}
+
 func (m model) visibleColRange(widths []int) (int, int) {
-	avail := m.width - 2
+	avail := m.width
 	start := m.scrollX
 	if start >= len(widths) {
 		start = 0
@@ -551,14 +614,13 @@ func (m model) visibleColRange(widths []int) (int, int) {
 	used := 0
 	end := start
 	for end < len(widths) {
-		w := widths[end] + 3 // padding + separator
+		w := widths[end] + 3
 		if used+w > avail && end > start {
 			break
 		}
 		used += w
 		end++
 	}
-	// ensure cursor column is visible
 	if m.cx >= end {
 		end = m.cx + 1
 		used = 0
@@ -640,7 +702,6 @@ func alignCell(s string, typ string, width int) string {
 	}
 	switch typ {
 	case "usd", "num", "int", "float", "percentage":
-		// right-align numbers
 		return fmt.Sprintf("%*s", width, s)
 	default:
 		return fmt.Sprintf("%-*s", width, s)
