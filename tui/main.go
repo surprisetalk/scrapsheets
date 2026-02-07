@@ -14,19 +14,25 @@ import (
 )
 
 var (
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	headerStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
-	cursorStyle   = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("255"))
-	editCurStyle  = lipgloss.NewStyle().Background(lipgloss.Color("29")).Foreground(lipgloss.Color("15"))
-	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	cellDimStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
-	colHLStyle    = lipgloss.NewStyle().Background(lipgloss.Color("234")).Foreground(lipgloss.Color("242"))
-	statusStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
-	editStatStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("29"))
-	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	rowCurStyle   = lipgloss.NewStyle().Background(lipgloss.Color("235")).Foreground(lipgloss.Color("242"))
-	editRowStyle  = lipgloss.NewStyle().Background(lipgloss.Color("235"))
-	libHdrStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Bold(true)
+	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	headerStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+	cursorStyle     = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("255"))
+	editCurStyle    = lipgloss.NewStyle().Background(lipgloss.Color("0")).Foreground(lipgloss.Color("15"))
+	editBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
+	dimStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	cellDimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
+	colHLStyle      = lipgloss.NewStyle().Background(lipgloss.Color("234")).Foreground(lipgloss.Color("242"))
+	gutterStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("239"))
+	gutterSelStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+	statusStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+	editStatStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
+	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	rowCurStyle     = lipgloss.NewStyle().Background(lipgloss.Color("235")).Foreground(lipgloss.Color("242"))
+	editRowStyle    = lipgloss.NewStyle().Background(lipgloss.Color("235"))
+	libHdrStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Bold(true)
+	libDimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
+	visualSelStyle  = lipgloss.NewStyle().Background(lipgloss.Color("24")).Foreground(lipgloss.Color("255"))
+	visualStatStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
 )
 
 type view int
@@ -41,6 +47,7 @@ type mode int
 const (
 	modeNormal mode = iota
 	modeEdit
+	modeVisual
 )
 
 type sortMode int
@@ -85,15 +92,19 @@ type model struct {
 	mode       mode
 	editBuf    string
 	isMetadata bool
+	rowOrigIdx []int
+	selected   map[int]bool // keyed by original row index (1-based)
 
 	// table sort
 	sortCol int // column index to sort by (-1 = unsorted)
 	sortAsc bool
 
+	// visual mode
+	anchorX, anchorY int
+
 	// vim state
-	pending  string
-	yank     any
-	yankType string
+	pending string
+	yankBuf [][]any // 2D clipboard (region or single cell)
 }
 
 func initialModel(dataDir string) model {
@@ -124,6 +135,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.mode == modeEdit {
 			return m.updateEdit(msg)
+		}
+		if m.mode == modeVisual {
+			return m.updateVisual(msg)
 		}
 		return m.updateTable(msg)
 	}
@@ -288,6 +302,11 @@ func (m model) openDoc(info docInfo) (tea.Model, tea.Cmd) {
 	m.docID = info.id
 	m.cols = cols
 	m.rows = rows
+	m.rowOrigIdx = make([]int, len(rows))
+	for i := range rows {
+		m.rowOrigIdx[i] = i + 1
+	}
+	m.selected = map[int]bool{}
 	m.cx, m.cy = 0, 0
 	m.scrollX, m.scrollY = 0, 0
 	m.mode = modeNormal
@@ -373,14 +392,17 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cy = min(m.cy+m.height/2, lastRow)
 	case "ctrl+u":
 		m.cy = max(m.cy-m.height/2, 0)
+	case "J":
+		return m.moveRowDown()
+	case "K":
+		return m.moveRowUp()
 	case "H":
-		m.cy = m.scrollY
+		return m.moveColLeft()
+	case "L":
+		return m.moveColRight()
 	case "M":
 		dataH := max(m.height-6, 1)
 		m.cy = min(m.scrollY+dataH/2, lastRow)
-	case "L":
-		dataH := max(m.height-6, 1)
-		m.cy = min(m.scrollY+dataH-1, lastRow)
 	case "tab":
 		m.cx++
 		if m.cx > lastCol {
@@ -416,13 +438,15 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// -- yank / paste --
 	case "y":
 		if len(m.rows) > 0 && m.cx < len(m.cols) {
-			m.yank = m.cellValue()
-			m.yankType = m.cols[m.cx].typ
+			m.yankBuf = [][]any{{m.cellValue()}}
 		}
 	case "p":
-		if m.yank != nil && len(m.rows) > 0 && m.cx < len(m.cols) {
-			m.setCellValue(m.yank)
-		}
+		m.pasteYankBuf()
+
+	// -- visual mode --
+	case "v":
+		m.mode = modeVisual
+		m.anchorX, m.anchorY = m.cx, m.cy
 
 	// -- row operations --
 	case "o":
@@ -431,6 +455,17 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.insertRowAt(m.cy)
 	case "d":
 		m.pending = "d"
+
+	// -- selection --
+	case " ":
+		if m.cy < len(m.rowOrigIdx) {
+			orig := m.rowOrigIdx[m.cy]
+			if m.selected[orig] {
+				delete(m.selected, orig)
+			} else {
+				m.selected[orig] = true
+			}
+		}
 
 	// -- column sort --
 	case ">", ".":
@@ -452,6 +487,8 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// -- column operations --
 	case "A":
 		return m.appendCol()
+	case "X":
+		return m.deleteCol()
 	}
 	return m, nil
 }
@@ -503,6 +540,159 @@ func (m model) updateEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// --- Visual mode ---
+
+func (m model) updateVisual(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	lastRow := max(len(m.rows)-1, 0)
+	lastCol := max(len(m.cols)-1, 0)
+
+	switch msg.String() {
+	case "esc", "v":
+		m.mode = modeNormal
+	case "ctrl+c":
+		return m, tea.Quit
+
+	// movement
+	case "left", "h":
+		if m.cx > 0 {
+			m.cx--
+		}
+	case "right", "l":
+		if m.cx < lastCol {
+			m.cx++
+		}
+	case "up", "k":
+		if m.cy > 0 {
+			m.cy--
+		}
+	case "down", "j":
+		if m.cy < lastRow {
+			m.cy++
+		}
+	case "w":
+		if m.cx < lastCol {
+			m.cx++
+		} else if m.cy < lastRow {
+			m.cx = 0
+			m.cy++
+		}
+	case "b":
+		if m.cx > 0 {
+			m.cx--
+		} else if m.cy > 0 {
+			m.cx = lastCol
+			m.cy--
+		}
+	case "0", "home":
+		m.cx = 0
+	case "$", "end":
+		m.cx = lastCol
+	case "G":
+		m.cy = lastRow
+	case "ctrl+d":
+		m.cy = min(m.cy+m.height/2, lastRow)
+	case "ctrl+u":
+		m.cy = max(m.cy-m.height/2, 0)
+
+	// actions
+	case "y":
+		m.yankVisual()
+		m.mode = modeNormal
+	case "d", "x":
+		m.yankVisual()
+		m.clearVisual()
+		m.mode = modeNormal
+	case "D":
+		// delete entire selected rows
+		m.yankVisual()
+		_, y1, _, y2 := m.visualRect()
+		m.selected = map[int]bool{}
+		for ri := y1; ri <= y2 && ri < len(m.rowOrigIdx); ri++ {
+			m.selected[m.rowOrigIdx[ri]] = true
+		}
+		m.mode = modeNormal
+		return m.deleteRow()
+	case "p":
+		// paste into selection region
+		m.pasteYankBuf()
+		m.mode = modeNormal
+	case "f":
+		// fill: replicate top-left cell to entire selection
+		x1, y1, x2, y2 := m.visualRect()
+		if y1 < len(m.rows) && x1 < len(m.cols) {
+			val := m.rows[y1][m.cols[x1].key]
+			for ri := y1; ri <= y2 && ri < len(m.rows); ri++ {
+				for ci := x1; ci <= x2 && ci < len(m.cols); ci++ {
+					m.rows[ri][m.cols[ci].key] = val
+					m.setDocCell(ri, m.cols[ci].key, val)
+				}
+			}
+			m.persist()
+		}
+		m.mode = modeNormal
+	}
+	return m, nil
+}
+
+func (m model) visualRect() (x1, y1, x2, y2 int) {
+	x1, x2 = m.anchorX, m.cx
+	if x1 > x2 {
+		x1, x2 = x2, x1
+	}
+	y1, y2 = m.anchorY, m.cy
+	if y1 > y2 {
+		y1, y2 = y2, y1
+	}
+	return
+}
+
+func (m *model) yankVisual() {
+	x1, y1, x2, y2 := m.visualRect()
+	h := y2 - y1 + 1
+	w := x2 - x1 + 1
+	m.yankBuf = make([][]any, h)
+	for ri := 0; ri < h; ri++ {
+		m.yankBuf[ri] = make([]any, w)
+		for ci := 0; ci < w; ci++ {
+			if y1+ri < len(m.rows) && x1+ci < len(m.cols) {
+				m.yankBuf[ri][ci] = m.rows[y1+ri][m.cols[x1+ci].key]
+			}
+		}
+	}
+}
+
+func (m *model) clearVisual() {
+	x1, y1, x2, y2 := m.visualRect()
+	for ri := y1; ri <= y2 && ri < len(m.rows); ri++ {
+		for ci := x1; ci <= x2 && ci < len(m.cols); ci++ {
+			m.rows[ri][m.cols[ci].key] = nil
+			m.setDocCell(ri, m.cols[ci].key, nil)
+		}
+	}
+	m.persist()
+}
+
+func (m *model) pasteYankBuf() {
+	if m.yankBuf == nil || len(m.rows) == 0 || len(m.cols) == 0 {
+		return
+	}
+	for ri, row := range m.yankBuf {
+		ry := m.cy + ri
+		if ry >= len(m.rows) {
+			break
+		}
+		for ci, val := range row {
+			cx := m.cx + ci
+			if cx >= len(m.cols) {
+				break
+			}
+			m.rows[ry][m.cols[cx].key] = val
+			m.setDocCell(ry, m.cols[cx].key, val)
+		}
+	}
+	m.persist()
 }
 
 // --- Mutations ---
@@ -557,10 +747,22 @@ func (m *model) sortTableRows() {
 	}
 	key := m.cols[m.sortCol].key
 	asc := m.sortAsc
-	sort.SliceStable(m.rows, func(i, j int) bool {
-		a, b := m.rows[i][key], m.rows[j][key]
-		return compareCells(a, b, asc)
+	// build index pairs so we can sort rows + origIdx together
+	type pair struct {
+		row     map[string]any
+		origIdx int
+	}
+	pairs := make([]pair, len(m.rows))
+	for i := range m.rows {
+		pairs[i] = pair{m.rows[i], m.rowOrigIdx[i]}
+	}
+	sort.SliceStable(pairs, func(i, j int) bool {
+		return compareCells(pairs[i].row[key], pairs[j].row[key], asc)
 	})
+	for i := range pairs {
+		m.rows[i] = pairs[i].row
+		m.rowOrigIdx[i] = pairs[i].origIdx
+	}
 }
 
 func compareCells(a, b any, asc bool) bool {
@@ -598,20 +800,125 @@ func toFloat(v any) (float64, bool) {
 	return 0, false
 }
 
+// --- Move row/column ---
+
+func (m model) moveRowDown() (tea.Model, tea.Cmd) {
+	if m.cy >= len(m.rows)-1 {
+		return m, nil
+	}
+	m.swapRows(m.cy, m.cy+1)
+	m.cy++
+	m.persist()
+	return m, nil
+}
+
+func (m model) moveRowUp() (tea.Model, tea.Cmd) {
+	if m.cy <= 0 {
+		return m, nil
+	}
+	m.swapRows(m.cy, m.cy-1)
+	m.cy--
+	m.persist()
+	return m, nil
+}
+
+func (m model) moveColLeft() (tea.Model, tea.Cmd) {
+	if m.cx <= 0 {
+		return m, nil
+	}
+	m.swapCols(m.cx, m.cx-1)
+	m.cx--
+	m.persist()
+	return m, nil
+}
+
+func (m model) moveColRight() (tea.Model, tea.Cmd) {
+	if m.cx >= len(m.cols)-1 {
+		return m, nil
+	}
+	m.swapCols(m.cx, m.cx+1)
+	m.cx++
+	m.persist()
+	return m, nil
+}
+
+func (m *model) swapRows(a, b int) {
+	m.rows[a], m.rows[b] = m.rows[b], m.rows[a]
+	m.rowOrigIdx[a], m.rowOrigIdx[b] = m.rowOrigIdx[b], m.rowOrigIdx[a]
+	for _, c := range m.cols {
+		m.setDocCell(a, c.key, m.rows[a][c.key])
+		m.setDocCell(b, c.key, m.rows[b][c.key])
+	}
+}
+
+func (m *model) swapCols(a, b int) {
+	ka, kb := m.cols[a].key, m.cols[b].key
+	m.cols[a].name, m.cols[b].name = m.cols[b].name, m.cols[a].name
+	m.cols[a].typ, m.cols[b].typ = m.cols[b].typ, m.cols[a].typ
+	for _, ci := range []int{a, b} {
+		c := m.cols[ci]
+		if m.isMetadata {
+			m.doc.Path("data", 0, "data", 0, c.key, "name").Set(c.name)
+			m.doc.Path("data", 0, "data", 0, c.key, "type").Set(c.typ)
+		} else {
+			m.doc.Path("data", 0, c.key, "name").Set(c.name)
+			m.doc.Path("data", 0, c.key, "type").Set(c.typ)
+		}
+	}
+	for ri := range m.rows {
+		m.rows[ri][ka], m.rows[ri][kb] = m.rows[ri][kb], m.rows[ri][ka]
+		m.setDocCell(ri, ka, m.rows[ri][ka])
+		m.setDocCell(ri, kb, m.rows[ri][kb])
+	}
+}
+
 // --- Row/Column ops ---
 
 func (m model) deleteRow() (tea.Model, tea.Cmd) {
 	if len(m.rows) == 0 {
 		return m, nil
 	}
-	dataIdx := m.cy + 1
-	dataList := resolveDataList(m.doc)
-	if dataList != nil {
-		dataList.Delete(dataIdx)
+
+	// if any rows selected, delete those; else delete current row
+	toDelete := map[int]bool{}
+	if len(m.selected) > 0 {
+		for origIdx := range m.selected {
+			toDelete[origIdx] = true
+		}
+	} else {
+		toDelete[m.rowOrigIdx[m.cy]] = true
 	}
-	m.rows = append(m.rows[:m.cy], m.rows[m.cy+1:]...)
+
+	// delete from automerge in reverse order (highest index first)
+	dataList := resolveDataList(m.doc)
+	var delIndices []int
+	for i, origIdx := range m.rowOrigIdx {
+		if toDelete[origIdx] {
+			delIndices = append(delIndices, i)
+		}
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(delIndices)))
+	for _, i := range delIndices {
+		if dataList != nil {
+			dataList.Delete(i + 1) // +1 for column def row
+		}
+	}
+
+	// rebuild rows and origIdx
+	var newRows []map[string]any
+	var newIdx []int
+	for i, origIdx := range m.rowOrigIdx {
+		if !toDelete[origIdx] {
+			newRows = append(newRows, m.rows[i])
+			newIdx = append(newIdx, origIdx)
+		}
+	}
+	m.rows = newRows
+	m.rowOrigIdx = newIdx
+	m.selected = map[int]bool{}
+
 	if m.cy >= len(m.rows) && m.cy > 0 {
-		m.cy--
+		m.cy = len(m.rows) - 1
 	}
 	m.persist()
 	return m, nil
@@ -625,10 +932,22 @@ func (m model) insertRowAt(idx int) (tea.Model, tea.Cmd) {
 	for _, c := range m.cols {
 		row[c.key] = nil
 	}
-	// splice into local rows
+
+	// new origIdx = max existing + 1
+	maxOrig := 0
+	for _, o := range m.rowOrigIdx {
+		if o > maxOrig {
+			maxOrig = o
+		}
+	}
+
+	// splice into local rows + origIdx
 	m.rows = append(m.rows, nil)
 	copy(m.rows[idx+1:], m.rows[idx:])
 	m.rows[idx] = row
+	m.rowOrigIdx = append(m.rowOrigIdx, 0)
+	copy(m.rowOrigIdx[idx+1:], m.rowOrigIdx[idx:])
+	m.rowOrigIdx[idx] = maxOrig + 1
 
 	dataIdx := idx + 1
 	dataList := resolveDataList(m.doc)
@@ -636,6 +955,38 @@ func (m model) insertRowAt(idx int) (tea.Model, tea.Cmd) {
 		dataList.Insert(dataIdx, automerge.NewMap())
 	}
 	m.cy = idx
+	m.persist()
+	return m, nil
+}
+
+func (m model) deleteCol() (tea.Model, tea.Cmd) {
+	if len(m.cols) == 0 || m.cx >= len(m.cols) {
+		return m, nil
+	}
+	c := m.cols[m.cx]
+
+	// remove from automerge doc row 0 (column defs)
+	if m.isMetadata {
+		m.doc.Path("data", 0, "data", 0, c.key).Delete()
+	} else {
+		m.doc.Path("data", 0, c.key).Delete()
+	}
+	// remove from each data row in automerge
+	for ri := range m.rows {
+		dataIdx := ri + 1
+		if m.isMetadata {
+			m.doc.Path("data", 0, "data", dataIdx, c.key).Delete()
+		} else {
+			m.doc.Path("data", dataIdx, c.key).Delete()
+		}
+		delete(m.rows[ri], c.key)
+	}
+
+	// remove from local cols
+	m.cols = append(m.cols[:m.cx], m.cols[m.cx+1:]...)
+	if m.cx >= len(m.cols) && m.cx > 0 {
+		m.cx--
+	}
 	m.persist()
 	return m, nil
 }
@@ -834,7 +1185,7 @@ func (m model) viewLibrary() string {
 		if i == m.libCursor {
 			lines = append(lines, cursorStyle.Render(line))
 		} else {
-			lines = append(lines, line)
+			lines = append(lines, libDimStyle.Render(line))
 		}
 	}
 
@@ -881,6 +1232,18 @@ func (m model) viewTable() string {
 		return strings.Join(lines, "\n")
 	}
 
+	// gutter: marker + row number + separator
+	digits := len(strconv.Itoa(len(m.rows)))
+	if digits < 2 {
+		digits = 2
+	}
+	gutterW := digits + 3 // "◆ NN " or "  NN "
+	gutterPad := strings.Repeat(" ", gutterW)
+
+	// subtract gutter from available width for column layout
+	savedWidth := m.width
+	m.width -= gutterW
+
 	colWidths := m.computeColWidths()
 
 	dataHeight := max(m.height-len(lines)-4, 1)
@@ -895,9 +1258,12 @@ func (m model) viewTable() string {
 	visStart, visEnd := m.visibleColRange(colWidths)
 	colWidths = m.expandColWidths(colWidths, visStart, visEnd)
 
+	m.width = savedWidth
+
 	// header
 	sortHdrSt := headerStyle.Copy().Foreground(lipgloss.Color("14"))
 	var hdr strings.Builder
+	hdr.WriteString(gutterStyle.Render(fmt.Sprintf("%*s ", digits+2, "#")))
 	for ci := visStart; ci < visEnd; ci++ {
 		w := colWidths[ci]
 		name := m.cols[ci].name
@@ -931,6 +1297,7 @@ func (m model) viewTable() string {
 
 	// separator
 	var sep strings.Builder
+	sep.WriteString(strings.Repeat("─", gutterW))
 	for ci := visStart; ci < visEnd; ci++ {
 		w := colWidths[ci]
 		sep.WriteString(strings.Repeat("─", w+2))
@@ -948,16 +1315,71 @@ func (m model) viewTable() string {
 	cellCur := cursorStyle
 	rowHL := rowCurStyle
 	colHL := colHLStyle
+	inVisual := m.mode == modeVisual
+	var vx1, vy1, vx2, vy2 int
+	if inVisual {
+		vx1, vy1, vx2, vy2 = m.visualRect()
+	}
 	if m.mode == modeEdit {
 		cellCur = editCurStyle
 		rowHL = editRowStyle
 	}
 
-	// data rows
+	// helper: render a border line (top or bottom) for the edit cell
+	editBorderLine := func(top bool) string {
+		var buf strings.Builder
+		buf.WriteString(gutterPad)
+		for ci := visStart; ci < visEnd; ci++ {
+			w := colWidths[ci]
+			if ci == m.cx {
+				if top {
+					buf.WriteString(editBorderStyle.Render("╭" + strings.Repeat("─", w) + "╮"))
+				} else {
+					buf.WriteString(editBorderStyle.Render("╰" + strings.Repeat("─", w) + "╯"))
+				}
+			} else {
+				buf.WriteString(strings.Repeat(" ", w+2))
+			}
+			if ci < visEnd-1 {
+				buf.WriteString(" ")
+			}
+		}
+		return buf.String()
+	}
+
+	// data rows — edit border overlays adjacent rows instead of inserting blank lines
 	endRow := min(m.scrollY+dataHeight, len(m.rows))
 	for ri := m.scrollY; ri < endRow; ri++ {
 		row := m.rows[ri]
+
+		// is this row used as the edit border overlay?
+		isTopBorderRow := m.mode == modeEdit && ri == m.cy-1 && m.cy > m.scrollY
+		isBotBorderRow := m.mode == modeEdit && ri == m.cy+1 && m.cy < endRow-1
+
+		if isTopBorderRow {
+			lines = append(lines, editBorderLine(true))
+			continue
+		}
+		if isBotBorderRow {
+			lines = append(lines, editBorderLine(false))
+			continue
+		}
+
+		// gutter
+		origIdx := 0
+		if ri < len(m.rowOrigIdx) {
+			origIdx = m.rowOrigIdx[ri]
+		}
+		var gutter string
+		if m.selected[origIdx] {
+			gutter = gutterSelStyle.Render(fmt.Sprintf("◆ %*d ", digits, origIdx))
+		} else {
+			gutter = gutterStyle.Render(fmt.Sprintf("  %*d ", digits, origIdx))
+		}
+
+		// row cells
 		var rowBuf strings.Builder
+		rowBuf.WriteString(gutter)
 		for ci := visStart; ci < visEnd; ci++ {
 			w := colWidths[ci]
 			c := m.cols[ci]
@@ -971,19 +1393,31 @@ func (m model) viewTable() string {
 			}
 
 			aligned := alignCell(display, c.typ, w)
-			cell := " " + aligned + " "
+			isVisSel := inVisual && ri >= vy1 && ri <= vy2 && ci >= vx1 && ci <= vx2
 
-			if ri == m.cy && ci == m.cx {
-				rowBuf.WriteString(cellCur.Render(cell))
-			} else if ri == m.cy {
-				rowBuf.WriteString(rowHL.Render(cell))
-			} else if ci == m.cx {
-				rowBuf.WriteString(colHL.Render(cell))
+			if m.mode == modeEdit && ri == m.cy && ci == m.cx {
+				rowBuf.WriteString(editBorderStyle.Render("│"))
+				rowBuf.WriteString(cellCur.Render(aligned))
+				rowBuf.WriteString(editBorderStyle.Render("│"))
 			} else {
-				rowBuf.WriteString(cellDimStyle.Render(cell))
+				cell := " " + aligned + " "
+				if ri == m.cy && ci == m.cx {
+					rowBuf.WriteString(cellCur.Render(cell))
+				} else if isVisSel {
+					rowBuf.WriteString(visualSelStyle.Render(cell))
+				} else if !inVisual && ri == m.cy {
+					rowBuf.WriteString(rowHL.Render(cell))
+				} else if !inVisual && ci == m.cx {
+					rowBuf.WriteString(colHL.Render(cell))
+				} else {
+					rowBuf.WriteString(cellDimStyle.Render(cell))
+				}
 			}
 			if ci < visEnd-1 {
-				if ri == m.cy {
+				nextVisSel := inVisual && ri >= vy1 && ri <= vy2 && ci >= vx1 && (ci+1) <= vx2
+				if isVisSel && nextVisSel {
+					rowBuf.WriteString(visualSelStyle.Render("│"))
+				} else if !inVisual && ri == m.cy {
 					rowBuf.WriteString(rowHL.Render("│"))
 				} else {
 					rowBuf.WriteString(cellDimStyle.Render("│"))
@@ -995,7 +1429,7 @@ func (m model) viewTable() string {
 		rowVisLen := lipgloss.Width(rowStr)
 		if rowVisLen < m.width {
 			pad := strings.Repeat(" ", m.width-rowVisLen)
-			if ri == m.cy {
+			if !inVisual && ri == m.cy {
 				rowStr += rowHL.Render(pad)
 			} else {
 				rowStr += pad
@@ -1011,21 +1445,30 @@ func (m model) viewTable() string {
 	// status bar
 	modeStr := "NORMAL"
 	stStyle := statusStyle
-	if m.mode == modeEdit {
+	switch m.mode {
+	case modeEdit:
 		modeStr = "EDIT"
 		stStyle = editStatStyle
+	case modeVisual:
+		vx1, vy1, vx2, vy2 := m.visualRect()
+		modeStr = fmt.Sprintf("VISUAL %dx%d", vx2-vx1+1, vy2-vy1+1)
+		stStyle = visualStatStyle
 	}
 	if m.pending != "" {
 		modeStr += " " + m.pending
 	}
 	yankInd := ""
-	if m.yank != nil {
+	if m.yankBuf != nil {
 		yankInd = " [y]"
 	}
-	status := fmt.Sprintf(" [%d,%d] %s%s", m.cx, m.cy, modeStr, yankInd)
+	selInd := ""
+	if len(m.selected) > 0 {
+		selInd = fmt.Sprintf(" sel:%d", len(m.selected))
+	}
+	status := fmt.Sprintf(" [%d,%d] %s%s%s", m.cx, m.cy, modeStr, yankInd, selInd)
 	lines = append(lines, stStyle.Render(status))
 
-	help := " hjkl move  i edit  dd del  o row  y/p yank  </> sort  ^ reverse  esc back"
+	help := " hjkl move  JKHL move row/col  v visual  i edit  dd del  o row  A/X col  </> sort"
 	lines = append(lines, dimStyle.Render(help))
 	return strings.Join(lines, "\n")
 }
