@@ -14,17 +14,19 @@ import (
 )
 
 var (
-	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	headerStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("8"))
-	cursorStyle  = lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15")).Bold(true)
-	editCurStyle = lipgloss.NewStyle().Background(lipgloss.Color("29")).Foreground(lipgloss.Color("15")).Bold(true)
-	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	statusStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	headerStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+	cursorStyle   = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("255"))
+	editCurStyle  = lipgloss.NewStyle().Background(lipgloss.Color("29")).Foreground(lipgloss.Color("15"))
+	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	cellDimStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
+	colHLStyle    = lipgloss.NewStyle().Background(lipgloss.Color("234")).Foreground(lipgloss.Color("242"))
+	statusStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 	editStatStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("29"))
-	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	rowCurStyle  = lipgloss.NewStyle().Background(lipgloss.Color("236"))
-	editRowStyle = lipgloss.NewStyle().Background(lipgloss.Color("236"))
-	libHdrStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Bold(true)
+	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	rowCurStyle   = lipgloss.NewStyle().Background(lipgloss.Color("235")).Foreground(lipgloss.Color("242"))
+	editRowStyle  = lipgloss.NewStyle().Background(lipgloss.Color("235"))
+	libHdrStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Bold(true)
 )
 
 type view int
@@ -83,6 +85,10 @@ type model struct {
 	mode       mode
 	editBuf    string
 	isMetadata bool
+
+	// table sort
+	sortCol int // column index to sort by (-1 = unsorted)
+	sortAsc bool
 
 	// vim state
 	pending  string
@@ -285,6 +291,8 @@ func (m model) openDoc(info docInfo) (tea.Model, tea.Cmd) {
 	m.cx, m.cy = 0, 0
 	m.scrollX, m.scrollY = 0, 0
 	m.mode = modeNormal
+	m.sortCol = -1
+	m.sortAsc = true
 	m.pending = ""
 	m.err = nil
 	return m, nil
@@ -353,7 +361,7 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cx = lastCol
 			m.cy--
 		}
-	case "0", "home", "^":
+	case "0", "home":
 		m.cx = 0
 	case "$", "end":
 		m.cx = lastCol
@@ -423,6 +431,23 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.insertRowAt(m.cy)
 	case "d":
 		m.pending = "d"
+
+	// -- column sort --
+	case ">", ".":
+		if len(m.cols) > 0 {
+			m.sortCol = (m.sortCol + 1) % len(m.cols)
+			m.sortTableRows()
+		}
+	case "<", ",":
+		if len(m.cols) > 0 {
+			m.sortCol = (m.sortCol + len(m.cols) - 1) % len(m.cols)
+			m.sortTableRows()
+		}
+	case "^":
+		m.sortAsc = !m.sortAsc
+		if m.sortCol >= 0 {
+			m.sortTableRows()
+		}
 
 	// -- column operations --
 	case "A":
@@ -524,6 +549,53 @@ func (m model) cellValue() any {
 		return nil
 	}
 	return m.rows[m.cy][m.cols[m.cx].key]
+}
+
+func (m *model) sortTableRows() {
+	if m.sortCol < 0 || m.sortCol >= len(m.cols) || len(m.rows) == 0 {
+		return
+	}
+	key := m.cols[m.sortCol].key
+	asc := m.sortAsc
+	sort.SliceStable(m.rows, func(i, j int) bool {
+		a, b := m.rows[i][key], m.rows[j][key]
+		return compareCells(a, b, asc)
+	})
+}
+
+func compareCells(a, b any, asc bool) bool {
+	fa, oka := toFloat(a)
+	fb, okb := toFloat(b)
+	if oka && okb {
+		if asc {
+			return fa < fb
+		}
+		return fa > fb
+	}
+	sa := fmt.Sprintf("%v", a)
+	sb := fmt.Sprintf("%v", b)
+	if a == nil {
+		sa = ""
+	}
+	if b == nil {
+		sb = ""
+	}
+	if asc {
+		return sa < sb
+	}
+	return sa > sb
+}
+
+func toFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int64:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	}
+	return 0, false
 }
 
 // --- Row/Column ops ---
@@ -824,15 +896,28 @@ func (m model) viewTable() string {
 	colWidths = m.expandColWidths(colWidths, visStart, visEnd)
 
 	// header
+	sortHdrSt := headerStyle.Copy().Foreground(lipgloss.Color("14"))
 	var hdr strings.Builder
 	for ci := visStart; ci < visEnd; ci++ {
 		w := colWidths[ci]
 		name := m.cols[ci].name
+		sorted := ci == m.sortCol
+		if sorted {
+			arrow := "▼"
+			if m.sortAsc {
+				arrow = "▲"
+			}
+			name = name + arrow
+		}
 		if len(name) > w {
 			name = name[:w-1] + "."
 		}
 		cell := fmt.Sprintf(" %-*s ", w, name)
-		hdr.WriteString(headerStyle.Render(cell))
+		if sorted {
+			hdr.WriteString(sortHdrSt.Render(cell))
+		} else {
+			hdr.WriteString(headerStyle.Render(cell))
+		}
 		if ci < visEnd-1 {
 			hdr.WriteString(headerStyle.Render("│"))
 		}
@@ -862,6 +947,7 @@ func (m model) viewTable() string {
 	// pick styles based on mode
 	cellCur := cursorStyle
 	rowHL := rowCurStyle
+	colHL := colHLStyle
 	if m.mode == modeEdit {
 		cellCur = editCurStyle
 		rowHL = editRowStyle
@@ -891,14 +977,16 @@ func (m model) viewTable() string {
 				rowBuf.WriteString(cellCur.Render(cell))
 			} else if ri == m.cy {
 				rowBuf.WriteString(rowHL.Render(cell))
+			} else if ci == m.cx {
+				rowBuf.WriteString(colHL.Render(cell))
 			} else {
-				rowBuf.WriteString(cell)
+				rowBuf.WriteString(cellDimStyle.Render(cell))
 			}
 			if ci < visEnd-1 {
 				if ri == m.cy {
 					rowBuf.WriteString(rowHL.Render("│"))
 				} else {
-					rowBuf.WriteString(dimStyle.Render("│"))
+					rowBuf.WriteString(cellDimStyle.Render("│"))
 				}
 			}
 		}
@@ -937,7 +1025,7 @@ func (m model) viewTable() string {
 	status := fmt.Sprintf(" [%d,%d] %s%s", m.cx, m.cy, modeStr, yankInd)
 	lines = append(lines, stStyle.Render(status))
 
-	help := " hjkl/wb move  0/$ ends  gg/G top/bot  i edit  c clear  dd del  o/O row  y/p yank  esc back"
+	help := " hjkl move  i edit  dd del  o row  y/p yank  </> sort  ^ reverse  esc back"
 	lines = append(lines, dimStyle.Render(help))
 	return strings.Join(lines, "\n")
 }
