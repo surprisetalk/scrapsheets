@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/automerge/automerge-go"
@@ -14,6 +15,7 @@ import (
 type docInfo struct {
 	id      string
 	docType string
+	title   string
 	path    string // directory path containing snapshot/incremental
 	modTime time.Time
 	size    int64
@@ -61,11 +63,12 @@ func discoverDocs(baseDir string) ([]docInfo, error) {
 				continue
 			}
 
-			docType, nCols, nRows := inspectDoc(doc)
+			docType, nCols, nRows, title := inspectDoc(doc)
 
 			docs = append(docs, docInfo{
 				id:      docID,
 				docType: docType,
+				title:   title,
 				path:    docPath,
 				modTime: info.ModTime(),
 				size:    size,
@@ -135,7 +138,7 @@ func loadDoc(docPath string) (*automerge.Doc, int64, error) {
 	return doc, totalSize, nil
 }
 
-func inspectDoc(doc *automerge.Doc) (docType string, nCols int, nRows int) {
+func inspectDoc(doc *automerge.Doc) (docType string, nCols int, nRows int, title string) {
 	docType = "unknown"
 
 	// check root "type" (set by CSV import path)
@@ -193,7 +196,9 @@ func inspectDoc(doc *automerge.Doc) (docType string, nCols int, nRows int) {
 			if innerLen > 0 {
 				nRows = innerLen - 1
 				if firstRow, err := inner.Get(0); err == nil && firstRow.Kind() == automerge.KindMap {
-					nCols = firstRow.Map().Len()
+					fm := firstRow.Map()
+					nCols = fm.Len()
+					title = colNamesTitle(fm)
 				}
 			}
 		}
@@ -211,6 +216,7 @@ func inspectDoc(doc *automerge.Doc) (docType string, nCols int, nRows int) {
 			}
 			nCols = len(keys)
 			nRows = total - 1
+			title = colNamesTitle(row0Map)
 			return
 		}
 	}
@@ -218,14 +224,45 @@ func inspectDoc(doc *automerge.Doc) (docType string, nCols int, nRows int) {
 	// infer by keys
 	if hasKey(keys, "code") && hasKey(keys, "lang") {
 		docType = "query"
+		title = getStr(row0Map, "code")
+		if i := strings.Index(title, "\n"); i >= 0 {
+			title = title[:i]
+		}
 	} else if hasKey(keys, "url") {
 		if hasKey(keys, "interval") {
 			docType = "net-http"
 		} else {
 			docType = "net-socket"
 		}
+		title = getStr(row0Map, "url")
 	}
 	return
+}
+
+func colNamesTitle(colDefsMap *automerge.Map) string {
+	keys, _ := colDefsMap.Keys()
+	sortedKeys := make([]string, len(keys))
+	copy(sortedKeys, keys)
+	sort.Slice(sortedKeys, func(i, j int) bool {
+		a, _ := strconv.Atoi(sortedKeys[i])
+		b, _ := strconv.Atoi(sortedKeys[j])
+		return a < b
+	})
+	var names []string
+	for _, k := range sortedKeys {
+		v, err := colDefsMap.Get(k)
+		if err != nil || v.Kind() != automerge.KindMap {
+			continue
+		}
+		name := getStr(v.Map(), "name")
+		if name != "" {
+			names = append(names, name)
+		}
+		if len(names) >= 5 {
+			break
+		}
+	}
+	return strings.Join(names, ", ")
 }
 
 func getStr(m *automerge.Map, key string) string {

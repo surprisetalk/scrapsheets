@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -13,14 +14,17 @@ import (
 )
 
 var (
-	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	headerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("8"))
-	cursorStyle = lipgloss.NewStyle().Background(lipgloss.Color("4")).Foreground(lipgloss.Color("15")).Bold(true)
-	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
-	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	rowCurStyle = lipgloss.NewStyle().Background(lipgloss.Color("236"))
-	libHdrStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Bold(true)
+	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	headerStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("8"))
+	cursorStyle  = lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15")).Bold(true)
+	editCurStyle = lipgloss.NewStyle().Background(lipgloss.Color("29")).Foreground(lipgloss.Color("15")).Bold(true)
+	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	statusStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+	editStatStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("29"))
+	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	rowCurStyle  = lipgloss.NewStyle().Background(lipgloss.Color("236"))
+	editRowStyle = lipgloss.NewStyle().Background(lipgloss.Color("236"))
+	libHdrStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Bold(true)
 )
 
 type view int
@@ -37,6 +41,20 @@ const (
 	modeEdit
 )
 
+type sortMode int
+
+// order matches display columns: TYPE ID TITLE COLS ROWS SIZE DATE
+const (
+	sortType sortMode = iota
+	sortID
+	sortTitle
+	sortCols
+	sortRows
+	sortSize
+	sortDate
+	sortModeCount
+)
+
 type model struct {
 	view    view
 	dataDir string
@@ -48,6 +66,8 @@ type model struct {
 	docs       []docInfo
 	libCursor  int
 	libScroll  int
+	libSort    sortMode
+	libSortAsc bool
 	filterBuf  string
 	filterMode bool
 
@@ -71,7 +91,7 @@ type model struct {
 }
 
 func initialModel(dataDir string) model {
-	m := model{dataDir: dataDir, view: viewLibrary}
+	m := model{dataDir: dataDir, view: viewLibrary, libSort: sortDate}
 	allDocs, err := discoverDocs(dataDir)
 	if err != nil {
 		m.err = err
@@ -107,17 +127,49 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // --- Library ---
 
 func (m model) visibleDocs() []docInfo {
-	if m.filterBuf == "" {
-		return m.docs
-	}
-	q := strings.ToLower(m.filterBuf)
 	var out []docInfo
-	for _, d := range m.docs {
-		if strings.Contains(strings.ToLower(d.id), q) ||
-			strings.Contains(strings.ToLower(d.docType), q) {
-			out = append(out, d)
+	if m.filterBuf == "" {
+		out = make([]docInfo, len(m.docs))
+		copy(out, m.docs)
+	} else {
+		q := strings.ToLower(m.filterBuf)
+		for _, d := range m.docs {
+			if strings.Contains(strings.ToLower(d.id), q) ||
+				strings.Contains(strings.ToLower(d.docType), q) ||
+				strings.Contains(strings.ToLower(d.title), q) {
+				out = append(out, d)
+			}
 		}
 	}
+	asc := m.libSortAsc
+	cmp := func(less, greater bool) bool {
+		if asc {
+			return less
+		}
+		return greater
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		switch m.libSort {
+		case sortType:
+			if a.docType != b.docType {
+				return cmp(a.docType < b.docType, a.docType > b.docType)
+			}
+			return a.modTime.After(b.modTime)
+		case sortID:
+			return cmp(a.id < b.id, a.id > b.id)
+		case sortTitle:
+			return cmp(a.title < b.title, a.title > b.title)
+		case sortCols:
+			return cmp(a.nCols < b.nCols, a.nCols > b.nCols)
+		case sortRows:
+			return cmp(a.nRows < b.nRows, a.nRows > b.nRows)
+		case sortSize:
+			return cmp(a.size < b.size, a.size > b.size)
+		default: // sortDate
+			return cmp(a.modTime.Before(b.modTime), a.modTime.After(b.modTime))
+		}
+	})
 	return out
 }
 
@@ -183,6 +235,15 @@ func (m model) updateLibrary(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.libCursor = max(m.libCursor-m.height/2, 0)
 	case "/":
 		m.filterMode = true
+	case ">", ".":
+		m.libSort = (m.libSort + 1) % sortModeCount
+		m.libCursor = 0
+	case "<", ",":
+		m.libSort = (m.libSort + sortModeCount - 1) % sortModeCount
+		m.libCursor = 0
+	case "^":
+		m.libSortAsc = !m.libSortAsc
+		m.libCursor = 0
 	case "enter", "l":
 		if m.libCursor >= 0 && m.libCursor < len(visible) {
 			return m.openDoc(visible[m.libCursor])
@@ -571,7 +632,7 @@ func (m model) viewLibrary() string {
 		lines = append(lines, dimStyle.Render(fmt.Sprintf(" /%s", m.filterBuf)))
 	}
 
-	// column layout
+	// column layout: TYPE ID TITLE COLS ROWS SIZE DATE
 	const (
 		colPad = 2
 		colsCW = 4
@@ -579,7 +640,7 @@ func (m model) viewLibrary() string {
 		sizeCW = 6
 		dateCW = 6
 	)
-	fixedW := colsCW + rowsCW + sizeCW + dateCW + (5 * colPad)
+	fixedW := colsCW + rowsCW + sizeCW + dateCW + (6 * colPad) // 6 gaps between 7 cols
 	typeW := 0
 	for _, d := range visible {
 		if len(d.docType) > typeW {
@@ -587,14 +648,57 @@ func (m model) viewLibrary() string {
 		}
 	}
 	typeW = max(typeW, 4)
-	idW := max(m.width-fixedW-typeW, 10)
+	// split remaining space: 1/3 to ID, 2/3 to TITLE
+	remain := max(m.width-fixedW-typeW, 20)
+	idW := max(remain/3, 8)
+	titleW := remain - idW
 
-	hdr := fmt.Sprintf("  %-*s  %-*s  %*s  %*s  %*s  %-*s",
-		typeW, "TYPE", idW, "ID", colsCW, "COLS", rowsCW, "ROWS", sizeCW, "SIZE", dateCW, "DATE")
-	if len(hdr) < m.width {
-		hdr += strings.Repeat(" ", m.width-len(hdr))
+	arrow := "▼"
+	if m.libSortAsc {
+		arrow = "▲"
 	}
-	lines = append(lines, libHdrStyle.Render(hdr))
+	sortHdr := libHdrStyle.Copy().Foreground(lipgloss.Color("14"))
+	fmtHdr := func(label string, w int, active bool, rightAlign bool) string {
+		tag := label
+		if active {
+			tag = label + arrow
+		}
+		if rightAlign {
+			txt := fmt.Sprintf("%*s", w, tag)
+			if active {
+				return sortHdr.Render(txt)
+			}
+			return libHdrStyle.Render(txt)
+		}
+		txt := fmt.Sprintf("%-*s", w, tag)
+		if active {
+			return sortHdr.Render(txt)
+		}
+		return libHdrStyle.Render(txt)
+	}
+
+	var hdrBuf strings.Builder
+	hdrBuf.WriteString(libHdrStyle.Render("  "))
+	hdrBuf.WriteString(fmtHdr("TYPE", typeW, m.libSort == sortType, false))
+	hdrBuf.WriteString(libHdrStyle.Render("  "))
+	hdrBuf.WriteString(fmtHdr("ID", idW, m.libSort == sortID, false))
+	hdrBuf.WriteString(libHdrStyle.Render("  "))
+	hdrBuf.WriteString(fmtHdr("TITLE", titleW, m.libSort == sortTitle, false))
+	hdrBuf.WriteString(libHdrStyle.Render("  "))
+	hdrBuf.WriteString(fmtHdr("COLS", colsCW, m.libSort == sortCols, true))
+	hdrBuf.WriteString(libHdrStyle.Render("  "))
+	hdrBuf.WriteString(fmtHdr("ROWS", rowsCW, m.libSort == sortRows, true))
+	hdrBuf.WriteString(libHdrStyle.Render("  "))
+	hdrBuf.WriteString(fmtHdr("SIZE", sizeCW, m.libSort == sortSize, true))
+	hdrBuf.WriteString(libHdrStyle.Render("  "))
+	hdrBuf.WriteString(fmtHdr("DATE", dateCW, m.libSort == sortDate, false))
+
+	hdrStr := hdrBuf.String()
+	hdrVisLen := lipgloss.Width(hdrStr)
+	if hdrVisLen < m.width {
+		hdrStr += libHdrStyle.Render(strings.Repeat(" ", m.width-hdrVisLen))
+	}
+	lines = append(lines, hdrStr)
 
 	sep := "  " + strings.Repeat("─", max(m.width-2, 0))
 	lines = append(lines, dimStyle.Render(sep))
@@ -603,7 +707,7 @@ func (m model) viewLibrary() string {
 	if m.filterMode {
 		helpText = " type to filter  enter confirm  esc cancel  ctrl+u clear"
 	} else {
-		helpText = " j/k move  enter open  / filter  gg top  G end  q quit"
+		helpText = " j/k move  enter open  / filter  </> sort col  ^ reverse  gg top  G end  q quit"
 	}
 	help := dimStyle.Render(helpText)
 
@@ -622,23 +726,37 @@ func (m model) viewLibrary() string {
 		m.libScroll = m.libCursor - listHeight + 1
 	}
 
+	prevType := ""
 	for i := m.libScroll; i < len(visible) && i < m.libScroll+listHeight; i++ {
 		d := visible[i]
+
+		// when sorted by type, dim repeated type names for visual grouping
+		typeStr := d.docType
+		if m.libSort == sortType && typeStr == prevType && i != m.libCursor {
+			typeStr = dimStyle.Render(fmt.Sprintf("%-*s", typeW, typeStr))
+		} else {
+			typeStr = fmt.Sprintf("%-*s", typeW, typeStr)
+		}
+		prevType = d.docType
 
 		id := d.id
 		if len(id) > idW {
 			id = id[:idW-2] + ".."
 		}
+		t := d.title
+		if len(t) > titleW {
+			t = t[:titleW-2] + ".."
+		}
 
 		size := formatSize(d.size)
 
-		line := fmt.Sprintf("  %-*s  %-*s  %*d  %*d  %*s  %-*s",
-			typeW, d.docType, idW, id,
+		line := fmt.Sprintf("  %s  %-*s  %-*s  %*d  %*d  %*s  %-*s",
+			typeStr, idW, id, titleW, t,
 			colsCW, d.nCols, rowsCW, d.nRows,
 			sizeCW, size, dateCW, d.modTime.Format("Jan 02"))
 
-		if len(line) < m.width {
-			line += strings.Repeat(" ", m.width-len(line))
+		if lipgloss.Width(line) < m.width {
+			line += strings.Repeat(" ", m.width-lipgloss.Width(line))
 		}
 
 		if i == m.libCursor {
@@ -741,6 +859,14 @@ func (m model) viewTable() string {
 	}
 	lines = append(lines, dimStyle.Render(sepStr))
 
+	// pick styles based on mode
+	cellCur := cursorStyle
+	rowHL := rowCurStyle
+	if m.mode == modeEdit {
+		cellCur = editCurStyle
+		rowHL = editRowStyle
+	}
+
 	// data rows
 	endRow := min(m.scrollY+dataHeight, len(m.rows))
 	for ri := m.scrollY; ri < endRow; ri++ {
@@ -762,15 +888,15 @@ func (m model) viewTable() string {
 			cell := " " + aligned + " "
 
 			if ri == m.cy && ci == m.cx {
-				rowBuf.WriteString(cursorStyle.Render(cell))
+				rowBuf.WriteString(cellCur.Render(cell))
 			} else if ri == m.cy {
-				rowBuf.WriteString(rowCurStyle.Render(cell))
+				rowBuf.WriteString(rowHL.Render(cell))
 			} else {
 				rowBuf.WriteString(cell)
 			}
 			if ci < visEnd-1 {
 				if ri == m.cy {
-					rowBuf.WriteString(rowCurStyle.Render("│"))
+					rowBuf.WriteString(rowHL.Render("│"))
 				} else {
 					rowBuf.WriteString(dimStyle.Render("│"))
 				}
@@ -782,7 +908,7 @@ func (m model) viewTable() string {
 		if rowVisLen < m.width {
 			pad := strings.Repeat(" ", m.width-rowVisLen)
 			if ri == m.cy {
-				rowStr += rowCurStyle.Render(pad)
+				rowStr += rowHL.Render(pad)
 			} else {
 				rowStr += pad
 			}
@@ -796,8 +922,10 @@ func (m model) viewTable() string {
 
 	// status bar
 	modeStr := "NORMAL"
+	stStyle := statusStyle
 	if m.mode == modeEdit {
 		modeStr = "EDIT"
+		stStyle = editStatStyle
 	}
 	if m.pending != "" {
 		modeStr += " " + m.pending
@@ -807,7 +935,7 @@ func (m model) viewTable() string {
 		yankInd = " [y]"
 	}
 	status := fmt.Sprintf(" [%d,%d] %s%s", m.cx, m.cy, modeStr, yankInd)
-	lines = append(lines, statusStyle.Render(status))
+	lines = append(lines, stStyle.Render(status))
 
 	help := " hjkl/wb move  0/$ ends  gg/G top/bot  i edit  c clear  dd del  o/O row  y/p yank  esc back"
 	lines = append(lines, dimStyle.Render(help))
