@@ -382,85 +382,32 @@ class HonoWebSocketAdapter extends AM.NetworkAdapter {
     return Promise.resolve();
   }
   connect(peerId: AM.PeerId, peerMetadata?: AM.PeerMetadata): void {
-    // Connection already established via WebSocket
-    console.log(`HonoAdapter.connect() called for peer: ${peerId}`);
     this.emit("peer-candidate", { peerId, peerMetadata: peerMetadata || {} });
   }
   disconnect(): void {
-    for (const [peerId, ws] of this.connections) {
-      try {
-        ws.close();
-      } catch (error) {
-        console.error(`Error closing connection for ${peerId}:`, error);
-      }
+    for (const [, ws] of this.connections) {
+      try { ws.close(); } catch { /* ignore */ }
     }
     this.connections.clear();
-    // Don't emit peer-disconnected for server itself on general disconnect
   }
   send(message: AM.Message): void {
-    console.log(`HonoAdapter sending message to ${message.targetId}:`, {
-      type: message.type,
-      senderId: message.senderId,
-      targetId: message.targetId,
-      connectionExists: this.connections.has(message.targetId),
-    });
     const connection = this.connections.get(message.targetId);
     if (connection && connection.readyState === WebSocket.OPEN) {
-      // Send the message data as binary if it has a data property, otherwise JSON
-      if ("data" in message && message.data instanceof Uint8Array) {
-        console.log(
-          `Sending binary data (${message.data.length} bytes) to ${message.targetId}`,
-        );
-        connection.send(message.data);
-      } else {
-        console.log(`Sending JSON message to ${message.targetId}`);
-        connection.send(JSON.stringify(message));
-      }
-      console.log(`Message sent successfully to ${message.targetId}`);
-    } else {
-      console.warn(`No open connection for peer ${message.targetId}`);
-      console.log(
-        `Available connections:`,
-        Array.from(this.connections.keys()),
-      );
+      if ("data" in message && message.data instanceof Uint8Array) connection.send(message.data);
+      else connection.send(JSON.stringify(message));
     }
   }
   addConnection(peerId: AM.PeerId, ws: WebSocketLike): void {
-    console.log(`Adding connection for peer: ${peerId}`);
     this.connections.set(peerId, ws);
-    console.log(`Total connections: ${this.connections.size}`);
-
-    // Emit peer-candidate event to let automerge know about the new peer
-    console.log(`Emitting peer-candidate for: ${peerId}`);
-    this.emit("peer-candidate", {
-      peerId,
-      peerMetadata: {},
-    });
+    this.emit("peer-candidate", { peerId, peerMetadata: {} });
   }
   removeConnection(peerId: AM.PeerId): void {
-    console.log(`Removing connection for peer: ${peerId}`);
     this.connections.delete(peerId);
-    console.log(`Total connections: ${this.connections.size}`);
-    console.log(`Emitting peer-disconnected for: ${peerId}`);
     this.emit("peer-disconnected", { peerId });
   }
   handleMessage(peerId: AM.PeerId, data: Uint8Array): void {
-    console.log(`Received binary message from ${peerId}:`, {
-      length: data.length,
-      type: data.constructor.name,
-    });
-    try {
-      // Automerge expects raw binary data, not parsed JSON
-      // The message format is handled internally by automerge
-      console.log(`Emitting raw binary message for automerge processing`);
-      // deno-lint-ignore no-explicit-any
-      this.emit("message", { data, senderId: peerId } as any);
-    } catch (error) {
-      console.error(
-        `Failed to handle automerge message from ${peerId}:`,
-        error,
-      );
-    }
+    // deno-lint-ignore no-explicit-any
+    this.emit("message", { data, senderId: peerId } as any);
   }
 }
 
@@ -506,71 +453,24 @@ app.get(
   "/library/sync",
   upgradeWebSocket(async (c) => {
     const { auth } = c.req.query();
-    let usr_id: string | null = null;
-    if (auth) {
-      try {
-        const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
-        const payload = await verify(token, JWT_SECRET);
-        usr_id = payload.sub as string;
-      } catch (error) {
-        console.error("JWT verification failed:", error);
-      }
-    }
-
-    const peerId = (
-      usr_id ? `user-${usr_id}` : `anonymous-${Math.random().toString(36).substr(2, 9)}`
-    ) as AM.PeerId;
+    const usr_id = await verifyWsAuth(auth);
+    const peerId = (usr_id ? `user-${usr_id}` : `anonymous-${Math.random().toString(36).substr(2, 9)}`) as AM.PeerId;
 
     return {
       onOpen(_event, ws) {
-        console.log(`WebSocket connected: ${peerId}`);
-        console.log(`Auth status: ${usr_id ? "authenticated" : "anonymous"}`);
-        // Register the peer's user ID for share policy checks
         peerUserMap.set(peerId, usr_id);
         honoAdapter.addConnection(peerId, ws);
       },
-      onMessage(event, _ws) {
-        console.log(`WebSocket message received from ${peerId}`, {
-          dataType: typeof event.data,
-          dataLength: (() => {
-            if (typeof event.data === "string") return event.data.length;
-            if (event.data instanceof ArrayBuffer) return event.data.byteLength;
-            if (event.data instanceof Uint8Array) return event.data.length;
-            return 0;
-          })(),
-          constructor: event.data?.constructor?.name,
-        });
-        let messageData: Uint8Array;
-        if (typeof event.data === "string") {
-          // Convert string to Uint8Array
-          messageData = new TextEncoder().encode(event.data);
-          console.log(`Converted string to Uint8Array for ${peerId}`);
-        } else if (event.data instanceof ArrayBuffer) {
-          // Convert ArrayBuffer to Uint8Array
-          messageData = new Uint8Array(event.data);
-          console.log(`Converted ArrayBuffer to Uint8Array for ${peerId}`);
-        } else if (event.data instanceof Uint8Array) {
-          // Already Uint8Array, use directly
-          messageData = event.data;
-          console.log(`Using Uint8Array directly for ${peerId}`);
-        } else {
-          console.warn(
-            `Unsupported data type from ${peerId}:`,
-            typeof event.data,
-            event.data?.constructor?.name,
-          );
-          return;
-        }
-
-        honoAdapter.handleMessage(peerId, messageData);
+      onMessage(event) {
+        const raw = event.data;
+        const data = typeof raw === "string" ? new TextEncoder().encode(raw) : new Uint8Array(raw as ArrayBuffer);
+        honoAdapter.handleMessage(peerId, data);
       },
-      onClose(_event, _ws) {
-        console.log(`WebSocket disconnected: ${peerId}`);
+      onClose() {
         peerUserMap.delete(peerId);
         honoAdapter.removeConnection(peerId);
       },
-      onError(event, _ws) {
-        console.error(`WebSocket error for ${peerId}:`, event);
+      onError() {
         peerUserMap.delete(peerId);
         honoAdapter.removeConnection(peerId);
       },
@@ -590,468 +490,168 @@ const verifyWsAuth = async (auth: string | undefined): Promise<string | null> =>
   }
 };
 
-app.get(
-  "/portal/time/sync",
-  upgradeWebSocket(async (c) => {
-    const { auth } = c.req.query();
-    const usr_id = await verifyWsAuth(auth);
-    // Time portal is public, but we log auth status
-    let interval: ReturnType<typeof setInterval> | undefined;
-    return {
-      onOpen: (_event, ws) => {
-        console.log(`Time portal connected, auth: ${usr_id ? "yes" : "no"}`);
-        interval = setInterval(
-          () =>
-            ws.send(
-              JSON.stringify({
-                type: "table",
-                data: [
-                  [{ key: 0, name: "time", type: "int" }],
-                  { 0: new Date().getTime() },
-                ],
-              }),
-            ),
-          10,
-        );
-      },
-      onMessage: undefined,
-      onClose: () => clearInterval(interval),
-      onError: undefined,
-    };
-  }),
-);
+// deno-lint-ignore no-explicit-any
+const portal = (name: string, ms: number, init: () => any, tick: (s: any) => { cols: any[]; rows: any[] }) =>
+  app.get(
+    `/portal/${name}/sync`,
+    upgradeWebSocket(async (c) => {
+      const { auth } = c.req.query();
+      await verifyWsAuth(auth);
+      const state = init();
+      let interval: ReturnType<typeof setInterval> | undefined;
+      return {
+        onOpen: (_event, ws) => {
+          interval = setInterval(() => {
+            const { cols, rows } = tick(state);
+            ws.send(JSON.stringify({ type: "table", data: [cols, ...rows] }));
+          }, ms);
+        },
+        onClose: () => clearInterval(interval),
+      };
+    }),
+  );
 
-app.get(
-  "/portal/stonks/sync",
-  upgradeWebSocket(async (c) => {
-    const { auth } = c.req.query();
-    const usr_id = await verifyWsAuth(auth);
-    // Stonks portal is public, but we log auth status
-    const stonks: Record<string, number> = {
-      AAPL: 645.32,
-      MSFT: 412.78,
-      GOOGL: 823.45,
-      AMZN: 567.91,
-      NVDA: 789.23,
-      META: 345.67,
-      TSLA: 892.14,
-      BRKB: 234.56,
-      JPM: 478.9,
-      V: 656.23,
-      JNJ: 321.45,
-      WMT: 754.89,
-      PG: 423.67,
-      UNH: 587.12,
-      HD: 698.34,
-      DIS: 276.45,
-      MA: 812.56,
-      PYPL: 389.78,
-      BAC: 523.91,
-      NFLX: 734.23,
-      ADBE: 456.78,
-      CRM: 621.34,
-      PFE: 298.56,
-      ABT: 865.23,
-      CSCO: 342.67,
-      CVX: 778.9,
-      PEP: 512.34,
-    };
-    let interval: ReturnType<typeof setInterval> | undefined;
-    return {
-      onOpen: (_event, ws) => {
-        console.log(`Stonks portal connected, auth: ${usr_id ? "yes" : "no"}`);
-        interval = setInterval(() => {
-          for (const i in stonks) stonks[i] += 0.5 - Math.random();
-          ws.send(
-            JSON.stringify({
-              type: "table",
-              data: [
-                [
-                  { key: 1, name: "price", type: "usd" },
-                  { key: 0, name: "ticker", type: "text" },
-                ],
-                ...Object.entries(stonks),
-              ],
-            }),
-          );
-        }, 100);
-      },
-      onMessage: undefined,
-      onClose: () => clearInterval(interval),
-      onError: undefined,
-    };
-  }),
-);
+portal("time", 10, () => null, () => ({
+  cols: [{ key: 0, name: "time", type: "int" }],
+  rows: [{ 0: new Date().getTime() }],
+}));
 
-app.get(
-  "/portal/dice/sync",
-  upgradeWebSocket(async (c) => {
-    const { auth } = c.req.query();
-    const usr_id = await verifyWsAuth(auth);
-    const dice: Record<string, number> = {
-      d4: 4,
-      d6: 6,
-      d8: 8,
-      d10: 10,
-      d12: 12,
-      d20: 20,
-      d100: 100,
-      coin: 2,
-    };
-    const state: Record<string, { roll: number; total: number; rolls: number }> = {};
-    for (const d in dice) state[d] = { roll: 0, total: 0, rolls: 0 };
-    let interval: ReturnType<typeof setInterval> | undefined;
-    return {
-      onOpen: (_event, ws) => {
-        console.log(`Dice portal connected, auth: ${usr_id ? "yes" : "no"}`);
-        interval = setInterval(() => {
-          for (const d in dice) {
-            state[d].roll = Math.ceil(Math.random() * dice[d]);
-            state[d].total += state[d].roll;
-            state[d].rolls++;
-          }
-          const rows = Object.entries(state)
-            .sort((a, b) => b[1].roll - a[1].roll)
-            .map(([name, s]) => ({
-              0: name,
-              1: s.roll,
-              2: s.total,
-              3: s.rolls,
-              4: s.total / s.rolls / dice[name],
-            }));
-          ws.send(
-            JSON.stringify({
-              type: "table",
-              data: [
-                [
-                  { key: 0, name: "die", type: "text" },
-                  { key: 1, name: "roll", type: "int" },
-                  { key: 2, name: "total", type: "int" },
-                  { key: 3, name: "rolls", type: "int" },
-                  { key: 4, name: "average", type: "percentage" },
-                ],
-                ...rows,
-              ],
-            }),
-          );
-        }, 500);
-      },
-      onMessage: undefined,
-      onClose: () => clearInterval(interval),
-      onError: undefined,
-    };
-  }),
-);
+portal("stonks", 100, () => ({
+  AAPL: 645.32, MSFT: 412.78, GOOGL: 823.45, AMZN: 567.91, NVDA: 789.23, META: 345.67, TSLA: 892.14,
+  BRKB: 234.56, JPM: 478.9, V: 656.23, JNJ: 321.45, WMT: 754.89, PG: 423.67, UNH: 587.12, HD: 698.34,
+  DIS: 276.45, MA: 812.56, PYPL: 389.78, BAC: 523.91, NFLX: 734.23, ADBE: 456.78, CRM: 621.34,
+  PFE: 298.56, ABT: 865.23, CSCO: 342.67, CVX: 778.9, PEP: 512.34,
+}), (stonks) => {
+  for (const i in stonks) stonks[i] += 0.5 - Math.random();
+  return {
+    cols: [{ key: 1, name: "price", type: "usd" }, { key: 0, name: "ticker", type: "text" }],
+    rows: Object.entries(stonks) as unknown as Row[],
+  };
+});
 
-app.get(
-  "/portal/orbit/sync",
-  upgradeWebSocket(async (c) => {
-    const { auth } = c.req.query();
-    const usr_id = await verifyWsAuth(auth);
-    const planets: [string, number, number][] = [
-      ["Mercury", 40, 4],
-      ["Venus", 55, 7],
-      ["Earth", 75, 12],
-      ["Mars", 95, 20],
-      ["Jupiter", 130, 50],
-      ["Saturn", 170, 80],
-      ["Uranus", 210, 140],
-      ["Neptune", 260, 250],
-    ];
-    const seasons = ["spring", "summer", "autumn", "winter"];
-    let interval: ReturnType<typeof setInterval> | undefined;
-    return {
-      onOpen: (_event, ws) => {
-        console.log(`Orbit portal connected, auth: ${usr_id ? "yes" : "no"}`);
-        interval = setInterval(() => {
-          const now = Date.now();
-          const rows = planets.map(([name, dist, period]) => {
-            const angle = (now / (period * 1000)) * 2 * Math.PI;
-            const pct = (angle % (2 * Math.PI)) / (2 * Math.PI);
-            return {
-              0: name,
-              1: dist,
-              2: Math.round(dist * Math.cos(angle)),
-              3: Math.round(dist * Math.sin(angle)),
-              4: pct,
-              5: seasons[Math.floor(pct * 4) % 4],
-            };
-          });
-          ws.send(
-            JSON.stringify({
-              type: "table",
-              data: [
-                [
-                  { key: 0, name: "planet", type: "text" },
-                  { key: 1, name: "distance", type: "int" },
-                  { key: 2, name: "x", type: "int" },
-                  { key: 3, name: "y", type: "int" },
-                  { key: 4, name: "year", type: "percentage" },
-                  { key: 5, name: "season", type: "text" },
-                ],
-                ...rows,
-              ],
-            }),
-          );
-        }, 100);
-      },
-      onMessage: undefined,
-      onClose: () => clearInterval(interval),
-      onError: undefined,
-    };
-  }),
-);
+portal("dice", 500, () => {
+  const dice: Record<string, number> = { d4: 4, d6: 6, d8: 8, d10: 10, d12: 12, d20: 20, d100: 100, coin: 2 };
+  const state: Record<string, { roll: number; total: number; rolls: number }> = {};
+  for (const d in dice) state[d] = { roll: 0, total: 0, rolls: 0 };
+  return { dice, state };
+}, ({ dice, state }) => {
+  for (const d in dice) {
+    state[d].roll = Math.ceil(Math.random() * dice[d]);
+    state[d].total += state[d].roll;
+    state[d].rolls++;
+  }
+  return {
+    cols: [
+      { key: 0, name: "die", type: "text" }, { key: 1, name: "roll", type: "int" },
+      { key: 2, name: "total", type: "int" }, { key: 3, name: "rolls", type: "int" },
+      { key: 4, name: "average", type: "percentage" },
+    ],
+    rows: (Object.entries(state) as [string, { roll: number; total: number; rolls: number }][])
+      .sort((a, b) => b[1].roll - a[1].roll)
+      .map(([name, s]) => ({ 0: name, 1: s.roll, 2: s.total, 3: s.rolls, 4: s.total / s.rolls / dice[name] })),
+  };
+});
 
-app.get(
-  "/portal/cafe/sync",
-  upgradeWebSocket(async (c) => {
-    const { auth } = c.req.query();
-    const usr_id = await verifyWsAuth(auth);
-    const names = [
-      "Ada",
-      "Grace",
-      "Alan",
-      "Linus",
-      "Matz",
-      "Guido",
-      "Bjarne",
-      "Haskell",
-      "Elm",
-      "Rust",
-    ];
-    const drinks: [string, number][] = [
-      ["espresso", 3.5],
-      ["latte", 5.0],
-      ["cappuccino", 4.5],
-      ["cortado", 4.0],
-      ["cold brew", 4.5],
-      ["matcha", 5.5],
-      ["chai", 4.0],
-      ["americano", 3.0],
-    ];
-    type Order = {
-      customer: string;
-      drink: string;
-      price: number;
-      wait: number;
-      status: string;
-    };
-    const orders: Order[] = [];
-    let tick = 0;
-    let interval: ReturnType<typeof setInterval> | undefined;
-    return {
-      onOpen: (_event, ws) => {
-        console.log(`Cafe portal connected, auth: ${usr_id ? "yes" : "no"}`);
-        interval = setInterval(() => {
-          tick++;
-          for (const o of orders) o.wait = tick - (o as Order & { _t: number })._t;
-          if (Math.random() < 0.3) {
-            const brewing = orders.find((o) => o.status === "ordered");
-            if (brewing) brewing.status = "brewing";
-          }
-          if (Math.random() < 0.3) {
-            const ready = orders.find((o) => o.status === "brewing");
-            if (ready) ready.status = "ready";
-          }
-          for (let i = orders.length - 1; i >= 0; i--) {
-            if (orders[i].status === "ready" && orders[i].wait > 6)
-              orders.splice(i, 1);
-          }
-          if (Math.random() < 0.4 && orders.length < 8) {
-            const [drink, price] = drinks[Math.floor(Math.random() * drinks.length)];
-            const o: Order & { _t: number } = {
-              customer: names[Math.floor(Math.random() * names.length)],
-              drink,
-              price,
-              wait: 0,
-              status: "ordered",
-              _t: tick,
-            };
-            orders.push(o);
-          }
-          const statusOrder: Record<string, number> = { ordered: 0, brewing: 1, ready: 2 };
-          const sorted = [...orders].sort(
-            (a, b) => (statusOrder[a.status] ?? 3) - (statusOrder[b.status] ?? 3),
-          );
-          ws.send(
-            JSON.stringify({
-              type: "table",
-              data: [
-                [
-                  { key: 0, name: "customer", type: "text" },
-                  { key: 1, name: "drink", type: "text" },
-                  { key: 2, name: "price", type: "usd" },
-                  { key: 3, name: "wait", type: "int" },
-                  { key: 4, name: "status", type: "text" },
-                ],
-                ...sorted.map((o) => ({
-                  0: o.customer,
-                  1: o.drink,
-                  2: o.price,
-                  3: o.wait,
-                  4: o.status,
-                })),
-              ],
-            }),
-          );
-        }, 500);
-      },
-      onMessage: undefined,
-      onClose: () => clearInterval(interval),
-      onError: undefined,
-    };
-  }),
-);
+portal("orbit", 100, () => ({
+  planets: [["Mercury", 40, 4], ["Venus", 55, 7], ["Earth", 75, 12], ["Mars", 95, 20],
+    ["Jupiter", 130, 50], ["Saturn", 170, 80], ["Uranus", 210, 140], ["Neptune", 260, 250]] as [string, number, number][],
+  seasons: ["spring", "summer", "autumn", "winter"],
+}), ({ planets, seasons }) => {
+  const now = Date.now();
+  return {
+    cols: [
+      { key: 0, name: "planet", type: "text" }, { key: 1, name: "distance", type: "int" },
+      { key: 2, name: "x", type: "int" }, { key: 3, name: "y", type: "int" },
+      { key: 4, name: "year", type: "percentage" }, { key: 5, name: "season", type: "text" },
+    ],
+    rows: planets.map(([name, dist, period]: [string, number, number]) => {
+      const angle = (now / (period * 1000)) * 2 * Math.PI;
+      const pct = (angle % (2 * Math.PI)) / (2 * Math.PI);
+      return { 0: name, 1: dist, 2: Math.round(dist * Math.cos(angle)), 3: Math.round(dist * Math.sin(angle)), 4: pct, 5: seasons[Math.floor(pct * 4) % 4] };
+    }),
+  };
+});
 
-app.get(
-  "/portal/forest/sync",
-  upgradeWebSocket(async (c) => {
-    const { auth } = c.req.query();
-    const usr_id = await verifyWsAuth(auth);
-    const species = [
-      "oak",
-      "pine",
-      "maple",
-      "birch",
-      "willow",
-      "cedar",
-      "elm",
-      "ash",
-      "cherry",
-      "palm",
-      "bamboo",
-      "cactus",
-    ];
-    const trees = species.map((name) => ({
-      name,
-      age: Math.floor(Math.random() * 100),
-      health: 0.5 + Math.random() * 0.5,
-    }));
-    let interval: ReturnType<typeof setInterval> | undefined;
-    return {
-      onOpen: (_event, ws) => {
-        console.log(`Forest portal connected, auth: ${usr_id ? "yes" : "no"}`);
-        interval = setInterval(() => {
-          for (const t of trees) {
-            t.age++;
-            t.health += (Math.random() - 0.45) * 0.1;
-            t.health = Math.max(0.05, Math.min(1.0, t.health));
-            if (Math.random() < 0.01) {
-              t.age = 0;
-              t.health = 0.3;
-            }
-          }
-          ws.send(
-            JSON.stringify({
-              type: "table",
-              data: [
-                [
-                  { key: 0, name: "tree", type: "text" },
-                  { key: 1, name: "age", type: "int" },
-                  { key: 2, name: "height", type: "text" },
-                  { key: 3, name: "health", type: "percentage" },
-                  { key: 4, name: "status", type: "text" },
-                ],
-                ...trees.map((t) => ({
-                  0: t.name,
-                  1: t.age,
-                  2: ".".repeat(Math.min(20, Math.floor(t.age / 10))),
-                  3: t.health,
-                  4: t.age < 10 ? "seed" : t.age < 50 ? "sapling" : t.age < 200 ? "mature" : "ancient",
-                })),
-              ],
-            }),
-          );
-        }, 1000);
-      },
-      onMessage: undefined,
-      onClose: () => clearInterval(interval),
-      onError: undefined,
-    };
-  }),
-);
+portal("cafe", 500, () => ({
+  names: ["Ada", "Grace", "Alan", "Linus", "Matz", "Guido", "Bjarne", "Haskell", "Elm", "Rust"],
+  drinks: [["espresso", 3.5], ["latte", 5.0], ["cappuccino", 4.5], ["cortado", 4.0], ["cold brew", 4.5], ["matcha", 5.5], ["chai", 4.0], ["americano", 3.0]] as [string, number][],
+  orders: [] as { customer: string; drink: string; price: number; wait: number; status: string; _t: number }[],
+  tick: 0,
+}), (s) => {
+  s.tick++;
+  for (const o of s.orders) o.wait = s.tick - o._t;
+  if (Math.random() < 0.3) { const b = s.orders.find((o: { status: string }) => o.status === "ordered"); if (b) b.status = "brewing"; }
+  if (Math.random() < 0.3) { const r = s.orders.find((o: { status: string }) => o.status === "brewing"); if (r) r.status = "ready"; }
+  for (let i = s.orders.length - 1; i >= 0; i--) if (s.orders[i].status === "ready" && s.orders[i].wait > 6) s.orders.splice(i, 1);
+  if (Math.random() < 0.4 && s.orders.length < 8) {
+    const [drink, price] = s.drinks[Math.floor(Math.random() * s.drinks.length)];
+    s.orders.push({ customer: s.names[Math.floor(Math.random() * s.names.length)], drink, price, wait: 0, status: "ordered", _t: s.tick });
+  }
+  const rank: Record<string, number> = { ordered: 0, brewing: 1, ready: 2 };
+  const sorted = [...s.orders].sort((a, b) => (rank[a.status] ?? 3) - (rank[b.status] ?? 3));
+  return {
+    cols: [
+      { key: 0, name: "customer", type: "text" }, { key: 1, name: "drink", type: "text" },
+      { key: 2, name: "price", type: "usd" }, { key: 3, name: "wait", type: "int" }, { key: 4, name: "status", type: "text" },
+    ],
+    rows: sorted.map((o) => ({ 0: o.customer, 1: o.drink, 2: o.price, 3: o.wait, 4: o.status })),
+  };
+});
 
-app.get(
-  "/portal/words/sync",
-  upgradeWebSocket(async (c) => {
-    const { auth } = c.req.query();
-    const usr_id = await verifyWsAuth(auth);
-    const targets = ["cat", "dog", "hi", "elm", "yes", "no", "go", "ok"];
-    let target = targets[Math.floor(Math.random() * targets.length)];
-    let targetAge = 0;
-    const monkeys = ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank"].map(
-      (name) => ({ name, attempt: "", match: 0, attempts: 0, best: 0 }),
-    );
-    let interval: ReturnType<typeof setInterval> | undefined;
-    return {
-      onOpen: (_event, ws) => {
-        console.log(`Words portal connected, auth: ${usr_id ? "yes" : "no"}`);
-        interval = setInterval(() => {
-          targetAge++;
-          if (targetAge > 150) {
-            target = targets[Math.floor(Math.random() * targets.length)];
-            targetAge = 0;
-          }
-          let solved = false;
-          for (const m of monkeys) {
-            m.attempt = Array.from(
-              { length: target.length },
-              () => String.fromCharCode(97 + Math.floor(Math.random() * 26)),
-            ).join("");
-            let hits = 0;
-            for (let i = 0; i < target.length; i++)
-              if (m.attempt[i] === target[i]) hits++;
-            m.match = hits / target.length;
-            m.attempts++;
-            if (m.match > m.best) m.best = m.match;
-            if (m.match === 1) solved = true;
-          }
-          if (solved) {
-            target = targets[Math.floor(Math.random() * targets.length)];
-            targetAge = 0;
-            for (const m of monkeys) m.best = 0;
-          }
-          ws.send(
-            JSON.stringify({
-              type: "table",
-              data: [
-                [
-                  { key: 0, name: "monkey", type: "text" },
-                  { key: 1, name: "target", type: "text" },
-                  { key: 2, name: "attempt", type: "text" },
-                  { key: 3, name: "match", type: "percentage" },
-                  { key: 4, name: "attempts", type: "int" },
-                  { key: 5, name: "best", type: "percentage" },
-                ],
-                ...monkeys.map((m) => ({
-                  0: m.name,
-                  1: target,
-                  2: m.attempt,
-                  3: m.match,
-                  4: m.attempts,
-                  5: m.best,
-                })),
-              ],
-            }),
-          );
-        }, 200);
-      },
-      onMessage: undefined,
-      onClose: () => clearInterval(interval),
-      onError: undefined,
-    };
-  }),
-);
+portal("forest", 1000, () =>
+  ["oak", "pine", "maple", "birch", "willow", "cedar", "elm", "ash", "cherry", "palm", "bamboo", "cactus"]
+    .map((name) => ({ name, age: Math.floor(Math.random() * 100), health: 0.5 + Math.random() * 0.5 })),
+(trees) => {
+  for (const t of trees) {
+    t.age++;
+    t.health = Math.max(0.05, Math.min(1.0, t.health + (Math.random() - 0.45) * 0.1));
+    if (Math.random() < 0.01) { t.age = 0; t.health = 0.3; }
+  }
+  return {
+    cols: [
+      { key: 0, name: "tree", type: "text" }, { key: 1, name: "age", type: "int" },
+      { key: 2, name: "height", type: "text" }, { key: 3, name: "health", type: "percentage" }, { key: 4, name: "status", type: "text" },
+    ],
+    rows: trees.map((t: { name: string; age: number; health: number }) => ({
+      0: t.name, 1: t.age, 2: ".".repeat(Math.min(20, Math.floor(t.age / 10))), 3: t.health,
+      4: t.age < 10 ? "seed" : t.age < 50 ? "sapling" : t.age < 200 ? "mature" : "ancient",
+    })),
+  };
+});
+
+portal("words", 200, () => {
+  const targets = ["cat", "dog", "hi", "elm", "yes", "no", "go", "ok"];
+  return {
+    targets,
+    target: targets[Math.floor(Math.random() * targets.length)],
+    targetAge: 0,
+    monkeys: ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank"].map((name) => ({ name, attempt: "", match: 0, attempts: 0, best: 0 })),
+  };
+}, (s) => {
+  s.targetAge++;
+  if (s.targetAge > 150) { s.target = s.targets[Math.floor(Math.random() * s.targets.length)]; s.targetAge = 0; }
+  let solved = false;
+  for (const m of s.monkeys) {
+    m.attempt = Array.from({ length: s.target.length }, () => String.fromCharCode(97 + Math.floor(Math.random() * 26))).join("");
+    let hits = 0;
+    for (let i = 0; i < s.target.length; i++) if (m.attempt[i] === s.target[i]) hits++;
+    m.match = hits / s.target.length;
+    m.attempts++;
+    if (m.match > m.best) m.best = m.match;
+    if (m.match === 1) solved = true;
+  }
+  if (solved) { s.target = s.targets[Math.floor(Math.random() * s.targets.length)]; s.targetAge = 0; for (const m of s.monkeys) m.best = 0; }
+  return {
+    cols: [
+      { key: 0, name: "monkey", type: "text" }, { key: 1, name: "target", type: "text" },
+      { key: 2, name: "attempt", type: "text" }, { key: 3, name: "match", type: "percentage" },
+      { key: 4, name: "attempts", type: "int" }, { key: 5, name: "best", type: "percentage" },
+    ],
+    rows: s.monkeys.map((m: { name: string; attempt: string; match: number; attempts: number; best: number }) => ({ 0: m.name, 1: s.target, 2: m.attempt, 3: m.match, 4: m.attempts, 5: m.best })),
+  };
+});
 
 app.use("*", cors());
-
-app.use(async (c, next) => {
-  await next();
-  if (c.res.headers.get("Content-Type")?.startsWith("application/json")) {
-    const obj = await c.res.json();
-    c.res = new Response(JSON.stringify(obj, null, 2), c.res);
-  }
-});
 
 app.notFound(() => {
   throw new HTTPException(404, { message: "Not found." });

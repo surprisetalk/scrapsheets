@@ -46,6 +46,7 @@
     "npm:@types/node@*": "22.10.2",
     "npm:alasql@*": "4.6.6",
     "npm:alasql@^4.6.6": "4.6.6",
+    "npm:elm-format@*": "0.8.8",
     "npm:elm-format@~0.8.8": "0.8.8",
     "npm:elm-review@*": "2.13.2",
     "npm:elm-review@^2.13.2": "2.13.2",
@@ -1970,8 +1971,7 @@
       "npm:elm-test@~0.19.1-revision15",
       "npm:elm@~0.19.1-6",
       "npm:pg-gateway@~0.3.0-beta.4",
-      "npm:prql-js@~0.12.1",
-      "npm:ws@^8.18.2"
+      "npm:prql-js@~0.12.1"
     ]
   }
 }

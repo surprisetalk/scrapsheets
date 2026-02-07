@@ -15,7 +15,6 @@ import File.Select as Select
 import Html as H exposing (Html, text)
 import Html.Attributes as A
 import Html.Events as A
-import Html.Lazy as H
 import Html.Style as S
 import Http
 import Json.Decode as D
@@ -32,11 +31,6 @@ import Url.Parser.Query as UrlQ
 ---- HELPERS ------------------------------------------------------------------
 
 
-ls : a -> List a
-ls =
-    List.singleton
-
-
 flip : (a -> b -> c) -> (b -> a -> c)
 flip f a b =
     f b a
@@ -49,16 +43,6 @@ iif c a b =
 
     else
         b
-
-
-result : Result a a -> a
-result x =
-    case x of
-        Ok x_ ->
-            x_
-
-        Err x_ ->
-            x_
 
 
 round2 : Float -> Float
@@ -3106,7 +3090,14 @@ viewCell sheet stats i n col row =
                         |> D.decodeValue (cellDecoder col.typ i n)
                         |> Result.map (Maybe.withDefault (text ""))
                         |> Result.mapError (D.errorToString >> text)
-                        |> result
+                        |> (\r ->
+                                case r of
+                                    Ok x ->
+                                        x
+
+                                    Err x ->
+                                        x
+                           )
                     ]
 
 

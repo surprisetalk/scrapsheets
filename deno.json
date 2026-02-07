@@ -41,9 +41,6 @@
     "elm-format": "npm:elm-format@^0.8.8",
     "elm-review": "npm:elm-review@^2.13.2",
     "elm-test": "npm:elm-test@^0.19.1-revision15",
-    "pg-gateway": "npm:pg-gateway@^0.3.0-beta.4",
-    "ws": "npm:ws@^8.18.2",
-    "node-buffer": "https://esm.sh/node/buffer.mjs",
-    "node-process": "https://esm.sh/node/process.mjs"
+    "pg-gateway": "npm:pg-gateway@^0.3.0-beta.4"
   }
 }

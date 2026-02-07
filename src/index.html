@@ -120,62 +120,10 @@
                 system: true,
                 doc: { type: "shop" },
               },
-              "portal:time": {
-                name: "time demo",
-                system: true,
-                doc: {
-                  type: "portal",
-                  data: null,
-                },
-              },
-              "portal:stonks": {
-                name: "stonks demo",
-                system: true,
-                doc: {
-                  type: "portal",
-                  data: null,
-                },
-              },
-              "portal:dice": {
-                name: "dice demo",
-                system: true,
-                doc: {
-                  type: "portal",
-                  data: null,
-                },
-              },
-              "portal:orbit": {
-                name: "orbit demo",
-                system: true,
-                doc: {
-                  type: "portal",
-                  data: null,
-                },
-              },
-              "portal:cafe": {
-                name: "cafe demo",
-                system: true,
-                doc: {
-                  type: "portal",
-                  data: null,
-                },
-              },
-              "portal:forest": {
-                name: "forest demo",
-                system: true,
-                doc: {
-                  type: "portal",
-                  data: null,
-                },
-              },
-              "portal:words": {
-                name: "words demo",
-                system: true,
-                doc: {
-                  type: "portal",
-                  data: null,
-                },
-              },
+              ...Object.fromEntries(
+                ["time","stonks","dice","orbit","cafe","forest","words"]
+                  .map(p => [`portal:${p}`, { name: `${p} demo`, system: true, doc: { type: "portal", data: null } }])
+              ),
               "table:tutorial": {
                 name: "tutorial",
                 scratch: true,
@@ -894,98 +842,52 @@
             }, 'importCsv'),
           );
 
-          app.ports.changeDoc.subscribe(
-            catchy(async ({ id, data: patches }) => {
-              const [type, doc_id] = id.split(":");
-              {
-                const doc = Library.get()[id]?.doc;
-                if (doc) {
-                  const d = { ...doc };
-                  for (const { path, action, value } of patches) {
-                    switch (path.length) {
-                      case 0: {
-                        if (action === "push") d.data.push(...value);
-                        else if (action === "splice") d.data.splice(...value);
-                        break;
-                      }
-                      case 1: {
-                        const [y] = path;
-                        if (action === "set") d.data[y] = value;
-                        else if (action === "push") d.data[y].push(...value);
-                        else if (action === "splice") d.data[y].splice(...value);
-                        break;
-                      }
-                      case 2: {
-                        const [y, x] = path;
-                        if (!d.data[y]) d.data[y] = {};
-                        if (action === "set") d.data[y][x] = value;
-                        else if (action === "del") delete d.data[y][x];
-                        else d.data[y][x][action](...value);
-                        break;
-                      }
-                      default: {
-                        let target = d.data;
-                        for (let i = 0; i < path.length - 1; i++) {
-                          if (!target[path[i]]) target[path[i]] = {};
-                          target = target[path[i]];
-                        }
-                        const last = path[path.length - 1];
-                        if (action === "set") target[last] = value;
-                        else if (action === "del") delete target[last];
-                        else target[last][action](...value);
-                        break;
-                      }
-                    }
+          const applyPatches = (data, patches) => {
+            for (const { path, action, value } of patches) {
+              switch (path.length) {
+                case 0: data[action](...value); break;
+                case 1: {
+                  const [y] = path;
+                  if (action === "set") data[y] = value;
+                  else data[y][action](...value);
+                  break;
+                }
+                case 2: {
+                  const [y, x] = path;
+                  if (!data[y]) data[y] = {};
+                  if (action === "set") data[y][x] = value;
+                  else if (action === "del") delete data[y][x];
+                  else data[y][x][action](...value);
+                  break;
+                }
+                default: {
+                  let target = data;
+                  for (let i = 0; i < path.length - 1; i++) {
+                    if (!target[path[i]]) target[path[i]] = {};
+                    target = target[path[i]];
                   }
-                  app.ports.docChanged.send({
-                    id,
-                    data: {
-                      doc: d,
-                      handle: null,
-                      patchInfo: null,
-                      patches,
-                    },
-                  });
-                  if (type === "query") queryDoc(id, d.data[0]);
-                  return;
+                  const last = path[path.length - 1];
+                  if (action === "set") target[last] = value;
+                  else if (action === "del") delete target[last];
+                  else target[last][action](...value);
+                  break;
                 }
               }
-              sheet?.change((d) => {
-                for (const { path, action, value } of patches) {
-                  switch (path.length) {
-                    case 0: {
-                      d.data[action](...value);
-                      break;
-                    }
-                    case 1: {
-                      const [y] = path;
-                      if (action === "set") d.data[y] = value;
-                      else d.data[y][action](...value);
-                      break;
-                    }
-                    case 2: {
-                      const [y, x] = path;
-                      if (!d.data[y]) d.data[y] = {};
-                      if (action === "set") d.data[y][x] = value;
-                      else if (action === "del") delete d.data[y][x];
-                      else d.data[y][x][action](...value);
-                      break;
-                    }
-                    default: {
-                      let target = d.data;
-                      for (let i = 0; i < path.length - 1; i++) {
-                        if (!target[path[i]]) target[path[i]] = {};
-                        target = target[path[i]];
-                      }
-                      const last = path[path.length - 1];
-                      if (action === "set") target[last] = value;
-                      else if (action === "del") delete target[last];
-                      else target[last][action](...value);
-                      break;
-                    }
-                  }
-                }
-              });
+            }
+          };
+
+          app.ports.changeDoc.subscribe(
+            catchy(async ({ id, data: patches }) => {
+              const [type] = id.split(":");
+              const doc = Library.get()[id]?.doc;
+              if (doc) {
+                const d = { ...doc };
+                applyPatches(d.data, patches);
+                app.ports.docChanged.send({ id, data: { doc: d, handle: null, patchInfo: null, patches } });
+                if (type === "query") queryDoc(id, d.data[0]);
+                return;
+              }
+              sheet?.change((d) => applyPatches(d.data, patches));
             }, 'changeDoc'),
           );
         }
