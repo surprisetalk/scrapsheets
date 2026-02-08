@@ -19,7 +19,7 @@ type editorDoneMsg struct{ err error }
 var (
 	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	headerStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
-	colHdrSelStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Underline(true)
+	colHdrSelStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
 	cursorStyle     = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("255"))
 	editCurStyle    = lipgloss.NewStyle().Background(lipgloss.Color("237")).Foreground(lipgloss.Color("255"))
 	dimStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
@@ -31,7 +31,6 @@ var (
 	editStatStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
 	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	rowCurStyle     = lipgloss.NewStyle().Background(lipgloss.Color("235")).Foreground(lipgloss.Color("242"))
-	editRowStyle    = lipgloss.NewStyle().Background(lipgloss.Color("235"))
 	libHdrStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Bold(true)
 	libDimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
 	visualSelStyle  = lipgloss.NewStyle().Background(lipgloss.Color("24")).Foreground(lipgloss.Color("255"))
@@ -1696,11 +1695,7 @@ func (m model) viewTable() string {
 			}
 		}
 		if ci < visEnd-1 {
-			st := headerStyle
-			if isSel || ci+1 == m.cx {
-				st = colHdrSelStyle
-			}
-			hdr.WriteString(st.Render("│"))
+			hdr.WriteString(dimStyle.Render("│"))
 		}
 	}
 	hdrStr := hdr.String()
@@ -1738,7 +1733,7 @@ func (m model) viewTable() string {
 	editCell := m.mode == modeEdit && !m.colRename
 	if m.mode == modeEdit {
 		cellCur = editCurStyle
-		rowHL = editRowStyle
+		rowHL = cellDimStyle
 		colHL = cellDimStyle
 	}
 
@@ -1791,14 +1786,13 @@ func (m model) viewTable() string {
 				}
 			}
 			if ci < visEnd-1 {
-				// separator inherits row/visual highlight
-				sepStyle := cellDimStyle
+				borderSt := dimStyle
 				if isVisSel && inVisual && ci+1 >= vx1 && ci+1 <= vx2 {
-					sepStyle = visualSelStyle
+					borderSt = dimStyle.Copy().Background(lipgloss.Color("24"))
 				} else if !inVisual && isRowCur {
-					sepStyle = rowHL
+					borderSt = dimStyle.Copy().Background(rowHL.GetBackground())
 				}
-				rowBuf.WriteString(sepStyle.Render("│"))
+				rowBuf.WriteString(borderSt.Render("│"))
 			}
 		}
 
