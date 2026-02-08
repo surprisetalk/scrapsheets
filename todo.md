@@ -6,6 +6,14 @@
 
 ---
 
+## Misc
+
+- [ ] https://github.com/bgreenwell/xleak
+- [ ] https://github.com/CodeOne45/vex-tui
+- [ ] https://github.com/vkobinski/CacTui
+
+---
+
 ## Phase 0 — Patch
 
 Close the gaps that prevent daily use and public demo.
