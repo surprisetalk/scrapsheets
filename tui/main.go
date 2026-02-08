@@ -17,7 +17,7 @@ var (
 	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	headerStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
 	cursorStyle     = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("255"))
-	editCurStyle    = lipgloss.NewStyle().Background(lipgloss.Color("0")).Foreground(lipgloss.Color("15"))
+	editCurStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
 	editBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
 	dimStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	cellDimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
@@ -91,6 +91,7 @@ type model struct {
 	scrollY    int
 	mode       mode
 	editBuf    string
+	colRename  bool
 	isMetadata bool
 	rowOrigIdx []int
 	selected   map[int]bool // keyed by original row index (1-based)
@@ -432,6 +433,12 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.mode = modeEdit
 			m.editBuf = ""
 		}
+	case "r":
+		if len(m.cols) > 0 && m.cx < len(m.cols) {
+			m.mode = modeEdit
+			m.colRename = true
+			m.editBuf = m.cols[m.cx].name
+		}
 	case "x":
 		m.setCellValue(nil)
 
@@ -498,13 +505,16 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) updateEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
+		wasRename := m.colRename
 		m.commitEdit()
 		m.mode = modeNormal
-		if m.cy < len(m.rows)-1 {
+		m.colRename = false
+		if !wasRename && m.cy < len(m.rows)-1 {
 			m.cy++
 		}
 	case "esc":
 		m.mode = modeNormal
+		m.colRename = false
 	case "backspace":
 		if len(m.editBuf) > 0 {
 			m.editBuf = m.editBuf[:len(m.editBuf)-1]
@@ -698,6 +708,19 @@ func (m *model) pasteYankBuf() {
 // --- Mutations ---
 
 func (m *model) commitEdit() {
+	if m.colRename {
+		if m.cx < len(m.cols) {
+			m.cols[m.cx].name = m.editBuf
+			c := m.cols[m.cx]
+			if m.isMetadata {
+				m.doc.Path("data", 0, "data", 0, c.key, "name").Set(m.editBuf)
+			} else {
+				m.doc.Path("data", 0, c.key, "name").Set(m.editBuf)
+			}
+			m.persist()
+		}
+		return
+	}
 	if m.cy >= len(m.rows) || m.cx >= len(m.cols) {
 		return
 	}
@@ -1238,8 +1261,6 @@ func (m model) viewTable() string {
 		digits = 2
 	}
 	gutterW := digits + 3 // "◆ NN " or "  NN "
-	gutterPad := strings.Repeat(" ", gutterW)
-
 	// subtract gutter from available width for column layout
 	savedWidth := m.width
 	m.width -= gutterW
@@ -1266,23 +1287,34 @@ func (m model) viewTable() string {
 	hdr.WriteString(gutterStyle.Render(fmt.Sprintf("%*s ", digits+2, "#")))
 	for ci := visStart; ci < visEnd; ci++ {
 		w := colWidths[ci]
-		name := m.cols[ci].name
-		sorted := ci == m.sortCol
-		if sorted {
-			arrow := "▼"
-			if m.sortAsc {
-				arrow = "▲"
+		if m.mode == modeEdit && m.colRename && ci == m.cx {
+			display := m.editBuf + "_"
+			if len(display) > w {
+				display = display[:w]
 			}
-			name = name + arrow
-		}
-		if len(name) > w {
-			name = name[:w-1] + "."
-		}
-		cell := fmt.Sprintf(" %-*s ", w, name)
-		if sorted {
-			hdr.WriteString(sortHdrSt.Render(cell))
+			aligned := fmt.Sprintf("%-*s", w, display)
+			hdr.WriteString(editBorderStyle.Render("│"))
+			hdr.WriteString(editCurStyle.Render(aligned))
+			hdr.WriteString(editBorderStyle.Render("│"))
 		} else {
-			hdr.WriteString(headerStyle.Render(cell))
+			name := m.cols[ci].name
+			sorted := ci == m.sortCol
+			if sorted {
+				arrow := "▼"
+				if m.sortAsc {
+					arrow = "▲"
+				}
+				name = name + arrow
+			}
+			if len(name) > w {
+				name = name[:w-1] + "."
+			}
+			cell := fmt.Sprintf(" %-*s ", w, name)
+			if sorted {
+				hdr.WriteString(sortHdrSt.Render(cell))
+			} else {
+				hdr.WriteString(headerStyle.Render(cell))
+			}
 		}
 		if ci < visEnd-1 {
 			hdr.WriteString(headerStyle.Render("│"))
@@ -1322,48 +1354,35 @@ func (m model) viewTable() string {
 	}
 	if m.mode == modeEdit {
 		cellCur = editCurStyle
-		rowHL = editRowStyle
+		rowHL = cellDimStyle
+		colHL = cellDimStyle
 	}
 
-	// helper: render a border line (top or bottom) for the edit cell
-	editBorderLine := func(top bool) string {
-		var buf strings.Builder
-		buf.WriteString(gutterPad)
+	// data rows
+	editCell := m.mode == modeEdit && !m.colRename
+
+	// edge-case: top border when cursor is first visible row
+	if editCell && m.cy == m.scrollY {
+		var bdr strings.Builder
+		bdr.WriteString(strings.Repeat(" ", gutterW))
 		for ci := visStart; ci < visEnd; ci++ {
 			w := colWidths[ci]
 			if ci == m.cx {
-				if top {
-					buf.WriteString(editBorderStyle.Render("╭" + strings.Repeat("─", w) + "╮"))
-				} else {
-					buf.WriteString(editBorderStyle.Render("╰" + strings.Repeat("─", w) + "╯"))
-				}
+				bdr.WriteString(editBorderStyle.Render("╭" + strings.Repeat("─", w) + "╮"))
 			} else {
-				buf.WriteString(strings.Repeat(" ", w+2))
+				bdr.WriteString(strings.Repeat(" ", w+2))
 			}
 			if ci < visEnd-1 {
-				buf.WriteString(" ")
+				bdr.WriteString(" ")
 			}
 		}
-		return buf.String()
+		lines = append(lines, bdr.String())
+		dataHeight--
 	}
 
-	// data rows — edit border overlays adjacent rows instead of inserting blank lines
 	endRow := min(m.scrollY+dataHeight, len(m.rows))
 	for ri := m.scrollY; ri < endRow; ri++ {
 		row := m.rows[ri]
-
-		// is this row used as the edit border overlay?
-		isTopBorderRow := m.mode == modeEdit && ri == m.cy-1 && m.cy > m.scrollY
-		isBotBorderRow := m.mode == modeEdit && ri == m.cy+1 && m.cy < endRow-1
-
-		if isTopBorderRow {
-			lines = append(lines, editBorderLine(true))
-			continue
-		}
-		if isBotBorderRow {
-			lines = append(lines, editBorderLine(false))
-			continue
-		}
 
 		// gutter
 		origIdx := 0
@@ -1385,21 +1404,24 @@ func (m model) viewTable() string {
 			c := m.cols[ci]
 			val := row[c.key]
 
-			var display string
-			if m.mode == modeEdit && ri == m.cy && ci == m.cx {
-				display = m.editBuf + "_"
-			} else {
-				display = formatCell(val, c.typ)
-			}
-
-			aligned := alignCell(display, c.typ, w)
+			// edit border overlays: top/bottom of cursor in edit column
+			isBorderAbove := editCell && ci == m.cx && ri == m.cy-1
+			isBorderBelow := editCell && ci == m.cx && ri == m.cy+1
 			isVisSel := inVisual && ri >= vy1 && ri <= vy2 && ci >= vx1 && ci <= vx2
 
-			if m.mode == modeEdit && ri == m.cy && ci == m.cx {
+			if isBorderAbove {
+				rowBuf.WriteString(editBorderStyle.Render("╭" + strings.Repeat("─", w) + "╮"))
+			} else if isBorderBelow {
+				rowBuf.WriteString(editBorderStyle.Render("╰" + strings.Repeat("─", w) + "╯"))
+			} else if editCell && ri == m.cy && ci == m.cx {
+				display := m.editBuf + "_"
+				aligned := alignCell(display, c.typ, w)
 				rowBuf.WriteString(editBorderStyle.Render("│"))
-				rowBuf.WriteString(cellCur.Render(aligned))
+				rowBuf.WriteString(editCurStyle.Render(aligned))
 				rowBuf.WriteString(editBorderStyle.Render("│"))
 			} else {
+				display := formatCell(val, c.typ)
+				aligned := alignCell(display, c.typ, w)
 				cell := " " + aligned + " "
 				if ri == m.cy && ci == m.cx {
 					rowBuf.WriteString(cellCur.Render(cell))
@@ -1414,14 +1436,7 @@ func (m model) viewTable() string {
 				}
 			}
 			if ci < visEnd-1 {
-				nextVisSel := inVisual && ri >= vy1 && ri <= vy2 && ci >= vx1 && (ci+1) <= vx2
-				if isVisSel && nextVisSel {
-					rowBuf.WriteString(visualSelStyle.Render("│"))
-				} else if !inVisual && ri == m.cy {
-					rowBuf.WriteString(rowHL.Render("│"))
-				} else {
-					rowBuf.WriteString(cellDimStyle.Render("│"))
-				}
+				rowBuf.WriteString(cellDimStyle.Render("│"))
 			}
 		}
 
@@ -1438,6 +1453,24 @@ func (m model) viewTable() string {
 		lines = append(lines, rowStr)
 	}
 
+	// edge-case: bottom border when cursor is last visible row
+	if editCell && m.cy >= endRow-1 {
+		var bdr strings.Builder
+		bdr.WriteString(strings.Repeat(" ", gutterW))
+		for ci := visStart; ci < visEnd; ci++ {
+			w := colWidths[ci]
+			if ci == m.cx {
+				bdr.WriteString(editBorderStyle.Render("╰" + strings.Repeat("─", w) + "╯"))
+			} else {
+				bdr.WriteString(strings.Repeat(" ", w+2))
+			}
+			if ci < visEnd-1 {
+				bdr.WriteString(" ")
+			}
+		}
+		lines = append(lines, bdr.String())
+	}
+
 	for len(lines) < m.height-2 {
 		lines = append(lines, "")
 	}
@@ -1447,7 +1480,11 @@ func (m model) viewTable() string {
 	stStyle := statusStyle
 	switch m.mode {
 	case modeEdit:
-		modeStr = "EDIT"
+		if m.colRename {
+			modeStr = "RENAME"
+		} else {
+			modeStr = "EDIT"
+		}
 		stStyle = editStatStyle
 	case modeVisual:
 		vx1, vy1, vx2, vy2 := m.visualRect()
@@ -1468,7 +1505,7 @@ func (m model) viewTable() string {
 	status := fmt.Sprintf(" [%d,%d] %s%s%s", m.cx, m.cy, modeStr, yankInd, selInd)
 	lines = append(lines, stStyle.Render(status))
 
-	help := " hjkl move  JKHL move row/col  v visual  i edit  dd del  o row  A/X col  </> sort"
+	help := " hjkl move  JKHL shift  v visual  i edit  r rename  dd del  o row  A/X col  </> sort"
 	lines = append(lines, dimStyle.Render(help))
 	return strings.Join(lines, "\n")
 }
