@@ -623,6 +623,32 @@ func scanQueryResults(sqlRows *sql.Rows) ([]col, []map[string]any, error) {
 	return resultCols, resultRows, sqlRows.Err()
 }
 
+func setQueryCode(doc *automerge.Doc, code string) {
+	dataList := resolveDataList(doc)
+	if dataList == nil || dataList.Len() == 0 {
+		return
+	}
+	row0, err := dataList.Get(0)
+	if err != nil || row0.Kind() != automerge.KindMap {
+		return
+	}
+	v, err := row0.Map().Get("code")
+	if err != nil {
+		return
+	}
+	if v.Kind() == automerge.KindText {
+		txt := v.Text()
+		if txt.Len() > 0 {
+			txt.Delete(0, txt.Len())
+		}
+		if code != "" {
+			txt.Insert(0, code)
+		}
+	} else {
+		doc.Path("data", 0, "code").Set(code)
+	}
+}
+
 func saveDoc(doc *automerge.Doc, docPath string) error {
 	data := doc.Save()
 	snapDir := filepath.Join(docPath, "snapshot")

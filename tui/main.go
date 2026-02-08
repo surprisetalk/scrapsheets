@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -12,6 +13,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+type editorDoneMsg struct{ err error }
 
 var (
 	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
@@ -96,6 +99,8 @@ type model struct {
 	isQuery    bool
 	queryCode  string
 	queryLang  string
+	queryDirty bool
+	editTmpFile string
 	rowOrigIdx []int
 	selected   map[int]bool // keyed by original row index (1-based)
 
@@ -137,6 +142,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		return m, nil
+	case editorDoneMsg:
+		if msg.err != nil {
+			m.err = fmt.Errorf("editor: %w", msg.err)
+			return m, nil
+		}
+		if m.editTmpFile != "" {
+			data, err := os.ReadFile(m.editTmpFile)
+			os.Remove(m.editTmpFile)
+			m.editTmpFile = ""
+			if err != nil {
+				m.err = fmt.Errorf("read edited query: %w", err)
+				return m, nil
+			}
+			newCode := string(data)
+			if newCode != m.queryCode {
+				m.queryCode = newCode
+				m.queryDirty = true
+				setQueryCode(m.doc, newCode)
+				m.persist()
+			}
+		}
 		return m, nil
 	case tea.KeyMsg:
 		if m.view == viewLibrary {
@@ -573,7 +600,11 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.deleteCol()
 		}
 
-	// -- query execution --
+	// -- query --
+	case "e":
+		if m.isQuery {
+			return m.editQueryExternal()
+		}
 	case "E":
 		if m.isQuery {
 			return m.execQuery()
@@ -908,6 +939,31 @@ func (m model) redo() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m model) editQueryExternal() (tea.Model, tea.Cmd) {
+	tmpFile, err := os.CreateTemp("", "scrapsheets-query-*.sql")
+	if err != nil {
+		m.err = fmt.Errorf("create temp file: %w", err)
+		return m, nil
+	}
+	if _, err := tmpFile.WriteString(m.queryCode); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		m.err = fmt.Errorf("write temp file: %w", err)
+		return m, nil
+	}
+	tmpFile.Close()
+
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vi"
+	}
+	m.editTmpFile = tmpFile.Name()
+	c := exec.Command(editor, m.editTmpFile)
+	return m, tea.ExecProcess(c, func(err error) tea.Msg {
+		return editorDoneMsg{err: err}
+	})
+}
+
 func (m model) execQuery() (tea.Model, tea.Cmd) {
 	cols, rows, err := executeQuery(m.queryCode, m.dataDir)
 	if err != nil {
@@ -926,6 +982,7 @@ func (m model) execQuery() (tea.Model, tea.Cmd) {
 	m.cx, m.cy = 0, 0
 	m.scrollX, m.scrollY = 0, 0
 	m.err = nil
+	m.queryDirty = false
 
 	// write results back into the automerge doc
 	m.writeQueryResults(cols, rows)
@@ -971,6 +1028,56 @@ func (m model) cellValue() any {
 		return nil
 	}
 	return m.rows[m.cy][m.cols[m.cx].key]
+}
+
+func (m model) colStats(ci int) string {
+	if ci >= len(m.cols) || len(m.rows) == 0 {
+		return ""
+	}
+	c := m.cols[ci]
+	isNum := c.typ == "num" || c.typ == "int" || c.typ == "float" || c.typ == "usd" || c.typ == "percentage"
+
+	if isNum {
+		var sum, mn, mx float64
+		count := 0
+		for _, row := range m.rows {
+			f, ok := toFloat(row[c.key])
+			if !ok {
+				continue
+			}
+			count++
+			sum += f
+			if count == 1 || f < mn {
+				mn = f
+			}
+			if count == 1 || f > mx {
+				mx = f
+			}
+		}
+		if count == 0 {
+			return fmt.Sprintf("n:%d", len(m.rows))
+		}
+		return fmt.Sprintf("n:%d Σ:%.4g μ:%.4g ↓:%.4g ↑:%.4g", count, sum, sum/float64(count), mn, mx)
+	}
+
+	count := 0
+	empty := 0
+	unique := map[string]bool{}
+	for _, row := range m.rows {
+		v := row[c.key]
+		count++
+		if v == nil {
+			empty++
+			continue
+		}
+		s := fmt.Sprintf("%v", v)
+		if s == "" {
+			empty++
+		} else {
+			unique[s] = true
+		}
+	}
+	return fmt.Sprintf("n:%d ∅:%d ≠:%d", count, empty, len(unique))
 }
 
 func (m *model) sortTableRows() {
@@ -1273,6 +1380,24 @@ func (m model) viewLibrary() string {
 		lines = append(lines, errorStyle.Render(" error: "+m.err.Error()))
 	}
 
+	// type summary
+	if len(m.docs) > 0 {
+		types := map[string]int{}
+		for _, d := range m.docs {
+			types[d.docType]++
+		}
+		var typeNames []string
+		for t := range types {
+			typeNames = append(typeNames, t)
+		}
+		sort.Strings(typeNames)
+		var parts []string
+		for _, t := range typeNames {
+			parts = append(parts, fmt.Sprintf("%d %s", types[t], t))
+		}
+		lines = append(lines, dimStyle.Render(fmt.Sprintf(" %d docs: %s", len(m.docs), strings.Join(parts, ", "))))
+	}
+
 	visible := m.visibleDocs()
 
 	if len(visible) == 0 && m.filterBuf == "" {
@@ -1465,17 +1590,28 @@ func (m model) viewTable() string {
 	if m.isQuery && m.queryCode != "" {
 		codeLines := strings.Split(m.queryCode, "\n")
 		maxShow := min(len(codeLines), 8)
+		lineNumW := len(strconv.Itoa(len(codeLines)))
+		if lineNumW < 2 {
+			lineNumW = 2
+		}
+		maxLineW := m.width - lineNumW - 4
 		for i := 0; i < maxShow; i++ {
+			lineNum := gutterStyle.Render(fmt.Sprintf(" %*d ", lineNumW, i+1))
 			line := codeLines[i]
-			if len(line) > m.width-4 {
-				line = line[:m.width-5] + "."
+			if len(line) > maxLineW {
+				line = line[:maxLineW-1] + "."
 			}
-			lines = append(lines, dimStyle.Render("  "+line))
+			lines = append(lines, lineNum+renderQueryLine(line))
 		}
 		if len(codeLines) > maxShow {
-			lines = append(lines, dimStyle.Render(fmt.Sprintf("  ... +%d lines", len(codeLines)-maxShow)))
+			lines = append(lines, dimStyle.Render(fmt.Sprintf(" %*s +%d lines", lineNumW, "", len(codeLines)-maxShow)))
 		}
-		lines = append(lines, dimStyle.Render("  "+strings.Repeat("─", max(m.width-4, 0))))
+		sep := strings.Repeat("─", max(m.width-4, 0))
+		if m.queryDirty {
+			lines = append(lines, dimStyle.Render("  ")+errorStyle.Render("*")+dimStyle.Render(sep[:max(len(sep)-1, 0)]))
+		} else {
+			lines = append(lines, dimStyle.Render("  "+sep))
+		}
 	}
 
 	if len(m.cols) == 0 {
@@ -1502,7 +1638,7 @@ func (m model) viewTable() string {
 
 	colWidths := m.computeColWidths()
 
-	dataHeight := max(m.height-len(lines)-4, 1)
+	dataHeight := max(m.height-len(lines)-5, 1)
 
 	if m.cy < m.scrollY {
 		m.scrollY = m.cy
@@ -1706,14 +1842,43 @@ func (m model) viewTable() string {
 		lines = append(lines, bdr.String())
 	}
 
-	for len(lines) < m.height-2 {
+	for len(lines) < m.height-3 {
+		lines = append(lines, "")
+	}
+
+	// info line: column name, type, full cell value, stats
+	if len(m.cols) > 0 && m.cx < len(m.cols) {
+		c := m.cols[m.cx]
+		fullVal := formatCell(m.cellValue(), c.typ)
+		if fullVal == "" {
+			fullVal = "(empty)"
+		}
+		info := fmt.Sprintf(" %s (%s) = %s", c.name, c.typ, fullVal)
+		stats := m.colStats(m.cx)
+		if stats != "" {
+			combined := info + "  │  " + stats
+			if len(combined) <= m.width {
+				info = combined
+			} else if len(info)+7 < m.width {
+				info = combined[:m.width-1] + "."
+			}
+		}
+		if len(info) > m.width {
+			info = info[:m.width-1] + "."
+		}
+		lines = append(lines, dimStyle.Render(info))
+	} else {
 		lines = append(lines, "")
 	}
 
 	// status bar
 	modeStr := "NORMAL"
 	if m.isQuery && m.mode == modeNormal {
-		modeStr = "QUERY"
+		if m.queryDirty {
+			modeStr = "QUERY*"
+		} else {
+			modeStr = "QUERY"
+		}
 	}
 	stStyle := statusStyle
 	switch m.mode {
@@ -1749,12 +1914,34 @@ func (m model) viewTable() string {
 
 	var help string
 	if m.isQuery {
-		help = " hjkl move  v visual  y yank  </> sort  E execute  q back"
+		help = " hjkl move  v visual  y yank  </> sort  e edit  E execute  q back"
 	} else {
 		help = " hjkl move  JKHL shift  v visual  i edit  r rename  dd del  o row  A/X col  </> sort  u undo  ^R redo"
 	}
 	lines = append(lines, dimStyle.Render(help))
 	return strings.Join(lines, "\n")
+}
+
+var refStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+
+func renderQueryLine(line string) string {
+	indices := sheetRefRe.FindAllStringIndex(line, -1)
+	if len(indices) == 0 {
+		return dimStyle.Render(line)
+	}
+	var buf strings.Builder
+	prev := 0
+	for _, loc := range indices {
+		if loc[0] > prev {
+			buf.WriteString(dimStyle.Render(line[prev:loc[0]]))
+		}
+		buf.WriteString(refStyle.Render(line[loc[0]:loc[1]]))
+		prev = loc[1]
+	}
+	if prev < len(line) {
+		buf.WriteString(dimStyle.Render(line[prev:]))
+	}
+	return buf.String()
 }
 
 func (m model) computeColWidths() []int {
