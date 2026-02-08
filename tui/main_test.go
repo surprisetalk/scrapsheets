@@ -80,6 +80,58 @@ func TestDiscoverAndReadDocs(t *testing.T) {
 	}
 }
 
+func TestExecuteQueryBasic(t *testing.T) {
+	// pure in-memory test — no automerge docs needed
+	cols, rows, err := executeQuery("SELECT 1 as a, 'hello' as b", ".")
+	if err != nil {
+		t.Fatalf("executeQuery: %v", err)
+	}
+	if len(cols) != 2 {
+		t.Fatalf("expected 2 cols, got %d", len(cols))
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	fmt.Printf("basic query: cols=%v row=%v\n", cols, rows[0])
+}
+
+func TestExecuteQueryWithSheetRef(t *testing.T) {
+	dataDir := filepath.Join("..", "data", "automerge")
+	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
+		t.Skip("data/automerge not found, skipping")
+	}
+
+	// find a table doc to reference
+	docs, err := discoverDocs(dataDir)
+	if err != nil {
+		t.Fatalf("discoverDocs: %v", err)
+	}
+	var target docInfo
+	for _, d := range docs {
+		if d.docType == "table" && d.nCols > 0 && d.nRows > 0 {
+			target = d
+			break
+		}
+	}
+	if target.id == "" {
+		t.Skip("no non-empty table doc found")
+	}
+
+	// execute a query referencing this sheet
+	query := fmt.Sprintf("SELECT count(*) as cnt FROM @table:%s", target.id)
+	cols, rows, err := executeQuery(query, dataDir)
+	if err != nil {
+		t.Fatalf("executeQuery(%q): %v", query, err)
+	}
+	if len(cols) != 1 || cols[0].name != "cnt" {
+		t.Fatalf("expected 1 col named 'cnt', got %v", cols)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	fmt.Printf("sheet ref query on @table:%s: result=%v\n", target.id, rows[0])
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

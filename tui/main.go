@@ -573,6 +573,12 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.deleteCol()
 		}
 
+	// -- query execution --
+	case "E":
+		if m.isQuery {
+			return m.execQuery()
+		}
+
 	// -- undo/redo --
 	case "u":
 		return m.undo()
@@ -900,6 +906,64 @@ func (m model) redo() (tea.Model, tea.Cmd) {
 		m.err = err
 	}
 	return m, nil
+}
+
+func (m model) execQuery() (tea.Model, tea.Cmd) {
+	cols, rows, err := executeQuery(m.queryCode, m.dataDir)
+	if err != nil {
+		m.err = err
+		return m, nil
+	}
+	m.cols = cols
+	m.rows = rows
+	m.rowOrigIdx = make([]int, len(rows))
+	for i := range rows {
+		m.rowOrigIdx[i] = i + 1
+	}
+	m.selected = map[int]bool{}
+	m.sortCol = -1
+	m.sortAsc = true
+	m.cx, m.cy = 0, 0
+	m.scrollX, m.scrollY = 0, 0
+	m.err = nil
+
+	// write results back into the automerge doc
+	m.writeQueryResults(cols, rows)
+	return m, nil
+}
+
+func (m *model) writeQueryResults(cols []col, rows []map[string]any) {
+	dataList := resolveDataList(m.doc)
+	if dataList == nil {
+		return
+	}
+
+	// clear cached results (everything after row 0 metadata)
+	for dataList.Len() > 1 {
+		dataList.Delete(dataList.Len() - 1)
+	}
+
+	// row 1: column definitions
+	dataList.Insert(1, automerge.NewMap())
+	for i, c := range cols {
+		key := strconv.Itoa(i)
+		m.doc.Path("data", 1, key).Set(automerge.NewMap())
+		m.doc.Path("data", 1, key, "name").Set(c.name)
+		m.doc.Path("data", 1, key, "type").Set(c.typ)
+		m.doc.Path("data", 1, key, "key").Set(key)
+	}
+
+	// rows 2+: result data
+	for i, row := range rows {
+		idx := i + 2
+		dataList.Insert(idx, automerge.NewMap())
+		for j, c := range cols {
+			key := strconv.Itoa(j)
+			m.doc.Path("data", idx, key).Set(row[c.key])
+		}
+	}
+
+	m.persist()
 }
 
 func (m model) cellValue() any {
@@ -1685,7 +1749,7 @@ func (m model) viewTable() string {
 
 	var help string
 	if m.isQuery {
-		help = " hjkl move  v visual  y yank  </> sort  q back"
+		help = " hjkl move  v visual  y yank  </> sort  E execute  q back"
 	} else {
 		help = " hjkl move  JKHL shift  v visual  i edit  r rename  dd del  o row  A/X col  </> sort  u undo  ^R redo"
 	}

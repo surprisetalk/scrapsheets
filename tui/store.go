@@ -1,15 +1,18 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/automerge/automerge-go"
+	_ "modernc.org/sqlite"
 )
 
 type docInfo struct {
@@ -449,6 +452,175 @@ func readTableFromListOffset(dataList *automerge.List, colDefIdx int) ([]col, []
 	}
 
 	return cols, rows, nil
+}
+
+var sheetRefRe = regexp.MustCompile(`@[a-zA-Z0-9_:.-]+`)
+
+func executeQuery(code string, dataDir string) ([]col, []map[string]any, error) {
+	refs := sheetRefRe.FindAllString(code, -1)
+
+	type sheet struct {
+		cols      []col
+		rows      []map[string]any
+		tableName string
+	}
+	loaded := map[string]*sheet{}
+
+	for _, ref := range refs {
+		id := ref[1:] // strip @
+		if _, ok := loaded[id]; ok {
+			continue
+		}
+
+		// sheet_id = type:doc_id — we need the doc_id for filesystem lookup
+		docID := id
+		if i := strings.Index(id, ":"); i >= 0 {
+			docID = id[i+1:]
+		}
+
+		docPath := docPathFromID(dataDir, docID)
+		doc, _, err := loadDoc(docPath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("load @%s (%s): %w", id, docPath, err)
+		}
+		cols, rows, err := readTable(doc)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read @%s: %w", id, err)
+		}
+
+		tableName := sanitizeIdent(id)
+		loaded[id] = &sheet{cols: cols, rows: rows, tableName: tableName}
+	}
+
+	// rewrite SQL: @type:doc_id → "type_doc_id"
+	rewritten := code
+	for id, s := range loaded {
+		rewritten = strings.ReplaceAll(rewritten, "@"+id, `"`+s.tableName+`"`)
+	}
+
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		return nil, nil, fmt.Errorf("sqlite: %w", err)
+	}
+	defer db.Close()
+
+	for _, s := range loaded {
+		if err := loadIntoSQLite(db, s.tableName, s.cols, s.rows); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	sqlRows, err := db.Query(rewritten)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer sqlRows.Close()
+	return scanQueryResults(sqlRows)
+}
+
+func docPathFromID(dataDir, docID string) string {
+	if len(docID) < 2 {
+		return filepath.Join(dataDir, docID)
+	}
+	return filepath.Join(dataDir, docID[:2], docID[2:])
+}
+
+func sanitizeIdent(s string) string {
+	var b strings.Builder
+	for _, c := range s {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			b.WriteRune(c)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
+func loadIntoSQLite(db *sql.DB, tableName string, cols []col, rows []map[string]any) error {
+	// CREATE TABLE with column names
+	colDefs := make([]string, len(cols))
+	for i, c := range cols {
+		sqlType := "TEXT"
+		switch c.typ {
+		case "num", "int", "float", "usd", "percentage":
+			sqlType = "REAL"
+		case "bool":
+			sqlType = "INTEGER"
+		}
+		colDefs[i] = fmt.Sprintf(`"%s" %s`, c.name, sqlType)
+	}
+	_, err := db.Exec(fmt.Sprintf(`CREATE TABLE "%s" (%s)`, tableName, strings.Join(colDefs, ", ")))
+	if err != nil {
+		return fmt.Errorf("create table %s: %w", tableName, err)
+	}
+
+	if len(rows) == 0 {
+		return nil
+	}
+
+	// batch INSERT
+	placeholders := make([]string, len(cols))
+	for i := range placeholders {
+		placeholders[i] = "?"
+	}
+	insertSQL := fmt.Sprintf(`INSERT INTO "%s" VALUES (%s)`, tableName, strings.Join(placeholders, ","))
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(insertSQL)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	for _, row := range rows {
+		vals := make([]any, len(cols))
+		for i, c := range cols {
+			vals[i] = row[c.key]
+		}
+		if _, err := stmt.Exec(vals...); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("insert into %s: %w", tableName, err)
+		}
+	}
+	stmt.Close()
+	return tx.Commit()
+}
+
+func scanQueryResults(sqlRows *sql.Rows) ([]col, []map[string]any, error) {
+	colNames, err := sqlRows.Columns()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	resultCols := make([]col, len(colNames))
+	for i, name := range colNames {
+		resultCols[i] = col{key: strconv.Itoa(i), name: name, typ: "text"}
+	}
+
+	var resultRows []map[string]any
+	for sqlRows.Next() {
+		ptrs := make([]any, len(colNames))
+		for i := range ptrs {
+			ptrs[i] = new(any)
+		}
+		if err := sqlRows.Scan(ptrs...); err != nil {
+			return nil, nil, err
+		}
+		row := make(map[string]any)
+		for i := range colNames {
+			v := *(ptrs[i].(*any))
+			// sqlite driver returns int64/float64/string/[]byte/nil
+			if b, ok := v.([]byte); ok {
+				v = string(b)
+			}
+			row[strconv.Itoa(i)] = v
+		}
+		resultRows = append(resultRows, row)
+	}
+	return resultCols, resultRows, sqlRows.Err()
 }
 
 func saveDoc(doc *automerge.Doc, docPath string) error {
