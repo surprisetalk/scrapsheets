@@ -19,7 +19,7 @@ type editorDoneMsg struct{ err error }
 var (
 	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	headerStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
-	colHdrSelStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("236"))
+	colHdrSelStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Underline(true)
 	cursorStyle     = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("255"))
 	editCurStyle    = lipgloss.NewStyle().Background(lipgloss.Color("237")).Foreground(lipgloss.Color("255"))
 	dimStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
