@@ -58,4 +58,31 @@ func TestDiscoverAndReadDocs(t *testing.T) {
 		}
 		break
 	}
+
+	// try reading a query doc
+	for _, d := range docs {
+		if d.docType != "query" {
+			continue
+		}
+		doc, _, err := loadDoc(d.path)
+		if err != nil {
+			t.Fatalf("loadDoc query %s: %v", d.id, err)
+		}
+		code, lang, cols, rows, err := readQueryDoc(doc)
+		if err != nil {
+			t.Fatalf("readQueryDoc %s: %v", d.id, err)
+		}
+		fmt.Printf("query %s: lang=%q code=%q cols=%d rows=%d\n", d.id, lang, truncate(code, 60), len(cols), len(rows))
+		if code == "" {
+			t.Fatalf("expected non-empty code in query %s", d.id)
+		}
+		break
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

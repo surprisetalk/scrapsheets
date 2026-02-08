@@ -290,6 +290,47 @@ func hasKey(keys []string, key string) bool {
 	return false
 }
 
+func readQueryDoc(doc *automerge.Doc) (code, lang string, cols []col, rows []map[string]any, err error) {
+	dataList := resolveDataList(doc)
+	if dataList == nil || dataList.Len() == 0 {
+		return "", "", nil, nil, fmt.Errorf("doc has no data")
+	}
+
+	row0, e := dataList.Get(0)
+	if e != nil || row0.Kind() != automerge.KindMap {
+		return "", "", nil, nil, fmt.Errorf("query row 0: not a map")
+	}
+	row0Map := row0.Map()
+	code = getStr(row0Map, "code")
+	lang = getStr(row0Map, "lang")
+
+	// check for cached results: data[1] should be column defs if present
+	if dataList.Len() < 2 {
+		return code, lang, nil, nil, nil
+	}
+	row1, e := dataList.Get(1)
+	if e != nil || row1.Kind() != automerge.KindMap {
+		return code, lang, nil, nil, nil
+	}
+	row1Map := row1.Map()
+	keys, _ := row1Map.Keys()
+	if len(keys) == 0 {
+		return code, lang, nil, nil, nil
+	}
+	firstVal, e := row1Map.Get(keys[0])
+	if e != nil || firstVal.Kind() != automerge.KindMap {
+		return code, lang, nil, nil, nil
+	}
+	fkeys, _ := firstVal.Map().Keys()
+	if !hasKey(fkeys, "name") {
+		return code, lang, nil, nil, nil
+	}
+
+	// data[1] is column defs, data[2..] are result rows — read as offset table
+	cols, rows, _ = readTableFromListOffset(dataList, 1)
+	return code, lang, cols, rows, nil
+}
+
 func readTable(doc *automerge.Doc) ([]col, []map[string]any, error) {
 	dataList := resolveDataList(doc)
 	if dataList == nil {
@@ -329,23 +370,26 @@ func resolveDataList(doc *automerge.Doc) *automerge.List {
 }
 
 func readTableFromList(dataList *automerge.List) ([]col, []map[string]any, error) {
+	return readTableFromListOffset(dataList, 0)
+}
+
+func readTableFromListOffset(dataList *automerge.List, colDefIdx int) ([]col, []map[string]any, error) {
 	total := dataList.Len()
-	if total == 0 {
+	if total <= colDefIdx {
 		return nil, nil, fmt.Errorf("data list is empty")
 	}
 
-	// row 0: column definitions
-	row0Val, err := dataList.Get(0)
+	row0Val, err := dataList.Get(colDefIdx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("get row 0: %w", err)
+		return nil, nil, fmt.Errorf("get row %d: %w", colDefIdx, err)
 	}
 	if row0Val.Kind() != automerge.KindMap {
-		return nil, nil, fmt.Errorf("row 0 is %s, expected map", row0Val.Kind())
+		return nil, nil, fmt.Errorf("row %d is %s, expected map", colDefIdx, row0Val.Kind())
 	}
 	row0 := row0Val.Map()
 	keys, err := row0.Keys()
 	if err != nil {
-		return nil, nil, fmt.Errorf("row 0 keys: %w", err)
+		return nil, nil, fmt.Errorf("row %d keys: %w", colDefIdx, err)
 	}
 
 	var cols []col
@@ -364,16 +408,14 @@ func readTableFromList(dataList *automerge.List) ([]col, []map[string]any, error
 		cols = append(cols, c)
 	}
 
-	// sort cols by numeric key so column order is stable
 	sort.Slice(cols, func(i, j int) bool {
 		a, _ := strconv.Atoi(cols[i].key)
 		b, _ := strconv.Atoi(cols[j].key)
 		return a < b
 	})
 
-	// rows 1+: data
 	var rows []map[string]any
-	for i := 1; i < total; i++ {
+	for i := colDefIdx + 1; i < total; i++ {
 		rowVal, err := dataList.Get(i)
 		if err != nil || rowVal.Kind() != automerge.KindMap {
 			continue

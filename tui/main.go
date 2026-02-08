@@ -93,6 +93,9 @@ type model struct {
 	editBuf    string
 	colRename  bool
 	isMetadata bool
+	isQuery    bool
+	queryCode  string
+	queryLang  string
 	rowOrigIdx []int
 	selected   map[int]bool // keyed by original row index (1-based)
 
@@ -296,9 +299,32 @@ func (m model) openDoc(info docInfo) (tea.Model, tea.Cmd) {
 	m.err = nil
 	m.undoStack = nil
 	m.redoStack = nil
-	if err := m.reloadTable(); err != nil {
-		m.err = err
-		return m, nil
+	m.isQuery = info.docType == "query"
+
+	if m.isQuery {
+		code, lang, cols, rows, err := readQueryDoc(doc)
+		if err != nil {
+			m.err = err
+			return m, nil
+		}
+		m.queryCode = code
+		m.queryLang = lang
+		m.cols = cols
+		m.rows = rows
+		m.rowOrigIdx = make([]int, len(rows))
+		for i := range rows {
+			m.rowOrigIdx[i] = i + 1
+		}
+		m.selected = map[int]bool{}
+		m.sortCol = -1
+		m.sortAsc = true
+	} else {
+		m.queryCode = ""
+		m.queryLang = ""
+		if err := m.reloadTable(); err != nil {
+			m.err = err
+			return m, nil
+		}
 	}
 	m.lastSaved = doc.Save()
 	return m, nil
@@ -420,13 +446,21 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+u":
 		m.cy = max(m.cy-m.height/2, 0)
 	case "J":
-		return m.moveRowDown()
+		if !m.isQuery {
+			return m.moveRowDown()
+		}
 	case "K":
-		return m.moveRowUp()
+		if !m.isQuery {
+			return m.moveRowUp()
+		}
 	case "H":
-		return m.moveColLeft()
+		if !m.isQuery {
+			return m.moveColLeft()
+		}
 	case "L":
-		return m.moveColRight()
+		if !m.isQuery {
+			return m.moveColRight()
+		}
 	case "M":
 		dataH := max(m.height-6, 1)
 		m.cy = min(m.scrollY+dataH/2, lastRow)
@@ -445,28 +479,30 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// -- editing --
 	case "enter", "i":
-		if len(m.rows) > 0 && m.cx < len(m.cols) {
+		if !m.isQuery && len(m.rows) > 0 && m.cx < len(m.cols) {
 			m.mode = modeEdit
 			m.editBuf = formatCell(m.cellValue(), m.cols[m.cx].typ)
 		}
 	case "a":
-		if len(m.rows) > 0 && m.cx < len(m.cols) {
+		if !m.isQuery && len(m.rows) > 0 && m.cx < len(m.cols) {
 			m.mode = modeEdit
 			m.editBuf = formatCell(m.cellValue(), m.cols[m.cx].typ)
 		}
 	case "c":
-		if len(m.rows) > 0 && m.cx < len(m.cols) {
+		if !m.isQuery && len(m.rows) > 0 && m.cx < len(m.cols) {
 			m.mode = modeEdit
 			m.editBuf = ""
 		}
 	case "r":
-		if len(m.cols) > 0 && m.cx < len(m.cols) {
+		if !m.isQuery && len(m.cols) > 0 && m.cx < len(m.cols) {
 			m.mode = modeEdit
 			m.colRename = true
 			m.editBuf = m.cols[m.cx].name
 		}
 	case "x":
-		m.setCellValue(nil)
+		if !m.isQuery {
+			m.setCellValue(nil)
+		}
 
 	// -- yank / paste --
 	case "y":
@@ -474,20 +510,30 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.yankBuf = [][]any{{m.cellValue()}}
 		}
 	case "p":
-		m.pasteYankBuf()
+		if !m.isQuery {
+			m.pasteYankBuf()
+		}
 
 	// -- visual mode --
 	case "v":
-		m.mode = modeVisual
-		m.anchorX, m.anchorY = m.cx, m.cy
+		if len(m.cols) > 0 {
+			m.mode = modeVisual
+			m.anchorX, m.anchorY = m.cx, m.cy
+		}
 
 	// -- row operations --
 	case "o":
-		return m.insertRowAt(m.cy + 1)
+		if !m.isQuery {
+			return m.insertRowAt(m.cy + 1)
+		}
 	case "O":
-		return m.insertRowAt(m.cy)
+		if !m.isQuery {
+			return m.insertRowAt(m.cy)
+		}
 	case "d":
-		m.pending = "d"
+		if !m.isQuery {
+			m.pending = "d"
+		}
 
 	// -- selection --
 	case " ":
@@ -519,9 +565,13 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// -- column operations --
 	case "A":
-		return m.appendCol()
+		if !m.isQuery {
+			return m.appendCol()
+		}
 	case "X":
-		return m.deleteCol()
+		if !m.isQuery {
+			return m.deleteCol()
+		}
 
 	// -- undo/redo --
 	case "u":
@@ -644,34 +694,40 @@ func (m model) updateVisual(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeNormal
 	case "d", "x":
 		m.yankVisual()
-		m.clearVisual()
-		m.mode = modeNormal
-	case "D":
-		// delete entire selected rows
-		m.yankVisual()
-		_, y1, _, y2 := m.visualRect()
-		m.selected = map[int]bool{}
-		for ri := y1; ri <= y2 && ri < len(m.rowOrigIdx); ri++ {
-			m.selected[m.rowOrigIdx[ri]] = true
+		if !m.isQuery {
+			m.clearVisual()
 		}
 		m.mode = modeNormal
-		return m.deleteRow()
+	case "D":
+		if !m.isQuery {
+			m.yankVisual()
+			_, y1, _, y2 := m.visualRect()
+			m.selected = map[int]bool{}
+			for ri := y1; ri <= y2 && ri < len(m.rowOrigIdx); ri++ {
+				m.selected[m.rowOrigIdx[ri]] = true
+			}
+			m.mode = modeNormal
+			return m.deleteRow()
+		}
+		m.mode = modeNormal
 	case "p":
-		// paste into selection region
-		m.pasteYankBuf()
+		if !m.isQuery {
+			m.pasteYankBuf()
+		}
 		m.mode = modeNormal
 	case "f":
-		// fill: replicate top-left cell to entire selection
-		x1, y1, x2, y2 := m.visualRect()
-		if y1 < len(m.rows) && x1 < len(m.cols) {
-			val := m.rows[y1][m.cols[x1].key]
-			for ri := y1; ri <= y2 && ri < len(m.rows); ri++ {
-				for ci := x1; ci <= x2 && ci < len(m.cols); ci++ {
-					m.rows[ri][m.cols[ci].key] = val
-					m.setDocCell(ri, m.cols[ci].key, val)
+		if !m.isQuery {
+			x1, y1, x2, y2 := m.visualRect()
+			if y1 < len(m.rows) && x1 < len(m.cols) {
+				val := m.rows[y1][m.cols[x1].key]
+				for ri := y1; ri <= y2 && ri < len(m.rows); ri++ {
+					for ci := x1; ci <= x2 && ci < len(m.cols); ci++ {
+						m.rows[ri][m.cols[ci].key] = val
+						m.setDocCell(ri, m.cols[ci].key, val)
+					}
 				}
+				m.persist()
 			}
-			m.persist()
 		}
 		m.mode = modeNormal
 	}
@@ -1329,15 +1385,41 @@ func (m model) viewTable() string {
 	if len(title) > 30 {
 		title = title[:30] + ".."
 	}
-	titleLine := titleStyle.Render(" "+title) + dimStyle.Render(fmt.Sprintf("  %dx%d", len(m.cols), len(m.rows)))
-	lines = append(lines, titleLine)
+	if m.isQuery {
+		titleLine := titleStyle.Render(" "+title) + dimStyle.Render(fmt.Sprintf("  %s  %dx%d", m.queryLang, len(m.cols), len(m.rows)))
+		lines = append(lines, titleLine)
+	} else {
+		titleLine := titleStyle.Render(" "+title) + dimStyle.Render(fmt.Sprintf("  %dx%d", len(m.cols), len(m.rows)))
+		lines = append(lines, titleLine)
+	}
 
 	if m.err != nil {
 		lines = append(lines, errorStyle.Render(" error: "+m.err.Error()))
 	}
 
+	// query code pane
+	if m.isQuery && m.queryCode != "" {
+		codeLines := strings.Split(m.queryCode, "\n")
+		maxShow := min(len(codeLines), 8)
+		for i := 0; i < maxShow; i++ {
+			line := codeLines[i]
+			if len(line) > m.width-4 {
+				line = line[:m.width-5] + "."
+			}
+			lines = append(lines, dimStyle.Render("  "+line))
+		}
+		if len(codeLines) > maxShow {
+			lines = append(lines, dimStyle.Render(fmt.Sprintf("  ... +%d lines", len(codeLines)-maxShow)))
+		}
+		lines = append(lines, dimStyle.Render("  "+strings.Repeat("─", max(m.width-4, 0))))
+	}
+
 	if len(m.cols) == 0 {
-		lines = append(lines, dimStyle.Render(" (empty table)"))
+		if m.isQuery {
+			lines = append(lines, dimStyle.Render(" (no cached results)"))
+		} else {
+			lines = append(lines, dimStyle.Render(" (empty table)"))
+		}
 		for len(lines) < m.height {
 			lines = append(lines, "")
 		}
@@ -1566,6 +1648,9 @@ func (m model) viewTable() string {
 
 	// status bar
 	modeStr := "NORMAL"
+	if m.isQuery && m.mode == modeNormal {
+		modeStr = "QUERY"
+	}
 	stStyle := statusStyle
 	switch m.mode {
 	case modeEdit:
@@ -1598,7 +1683,12 @@ func (m model) viewTable() string {
 	status := fmt.Sprintf(" [%d,%d] %s%s%s%s", m.cx, m.cy, modeStr, yankInd, selInd, undoInd)
 	lines = append(lines, stStyle.Render(status))
 
-	help := " hjkl move  JKHL shift  v visual  i edit  r rename  dd del  o row  A/X col  </> sort  u undo  ^R redo"
+	var help string
+	if m.isQuery {
+		help = " hjkl move  v visual  y yank  </> sort  q back"
+	} else {
+		help = " hjkl move  JKHL shift  v visual  i edit  r rename  dd del  o row  A/X col  </> sort  u undo  ^R redo"
+	}
 	lines = append(lines, dimStyle.Render(help))
 	return strings.Join(lines, "\n")
 }
