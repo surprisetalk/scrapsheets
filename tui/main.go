@@ -106,6 +106,11 @@ type model struct {
 	// vim state
 	pending string
 	yankBuf [][]any // 2D clipboard (region or single cell)
+
+	// undo/redo
+	undoStack [][]byte
+	redoStack [][]byte
+	lastSaved []byte
 }
 
 func initialModel(dataDir string) model {
@@ -279,15 +284,44 @@ func (m model) openDoc(info docInfo) (tea.Model, tea.Cmd) {
 		m.err = err
 		return m, nil
 	}
-	cols, rows, err := readTable(doc)
-	if err != nil {
+
+	m.view = viewTable
+	m.doc = doc
+	m.docPath = info.path
+	m.docID = info.id
+	m.cx, m.cy = 0, 0
+	m.scrollX, m.scrollY = 0, 0
+	m.mode = modeNormal
+	m.pending = ""
+	m.err = nil
+	m.undoStack = nil
+	m.redoStack = nil
+	if err := m.reloadTable(); err != nil {
 		m.err = err
 		return m, nil
 	}
+	m.lastSaved = doc.Save()
+	return m, nil
+}
 
-	// detect metadata format for correct mutation paths
+func (m *model) reloadTable() error {
+	cols, rows, err := readTable(m.doc)
+	if err != nil {
+		return err
+	}
+	m.cols = cols
+	m.rows = rows
+	m.rowOrigIdx = make([]int, len(rows))
+	for i := range rows {
+		m.rowOrigIdx[i] = i + 1
+	}
+	m.selected = map[int]bool{}
+	m.sortCol = -1
+	m.sortAsc = true
+
+	// detect metadata format
 	m.isMetadata = false
-	dataVal, err := doc.Path("data").Get()
+	dataVal, err := m.doc.Path("data").Get()
 	if err == nil && dataVal.Kind() == automerge.KindList {
 		if first, err := dataVal.List().Get(0); err == nil && first.Kind() == automerge.KindMap {
 			keys, _ := first.Map().Keys()
@@ -297,25 +331,14 @@ func (m model) openDoc(info docInfo) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	m.view = viewTable
-	m.doc = doc
-	m.docPath = info.path
-	m.docID = info.id
-	m.cols = cols
-	m.rows = rows
-	m.rowOrigIdx = make([]int, len(rows))
-	for i := range rows {
-		m.rowOrigIdx[i] = i + 1
+	// clamp cursor
+	if m.cy >= len(m.rows) {
+		m.cy = max(len(m.rows)-1, 0)
 	}
-	m.selected = map[int]bool{}
-	m.cx, m.cy = 0, 0
-	m.scrollX, m.scrollY = 0, 0
-	m.mode = modeNormal
-	m.sortCol = -1
-	m.sortAsc = true
-	m.pending = ""
-	m.err = nil
-	return m, nil
+	if m.cx >= len(m.cols) {
+		m.cx = max(len(m.cols)-1, 0)
+	}
+	return nil
 }
 
 // --- Table (normal) ---
@@ -346,6 +369,9 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.view = viewLibrary
 		m.doc = nil
 		m.pending = ""
+		m.undoStack = nil
+		m.redoStack = nil
+		m.lastSaved = nil
 		return m, nil
 	case "ctrl+c":
 		return m, tea.Quit
@@ -496,6 +522,12 @@ func (m model) updateTable(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.appendCol()
 	case "X":
 		return m.deleteCol()
+
+	// -- undo/redo --
+	case "u":
+		return m.undo()
+	case "ctrl+r":
+		return m.redo()
 	}
 	return m, nil
 }
@@ -751,10 +783,67 @@ func (m *model) setDocCell(rowIdx int, colKey string, val any) {
 }
 
 func (m *model) persist() {
+	if m.lastSaved != nil {
+		m.undoStack = append(m.undoStack, m.lastSaved)
+		if len(m.undoStack) > 50 {
+			m.undoStack = m.undoStack[len(m.undoStack)-50:]
+		}
+		m.redoStack = nil
+	}
 	m.doc.Commit("tui edit")
 	if err := saveDoc(m.doc, m.docPath); err != nil {
 		m.err = err
+		return
 	}
+	m.lastSaved = m.doc.Save()
+}
+
+func (m model) undo() (tea.Model, tea.Cmd) {
+	if len(m.undoStack) == 0 {
+		return m, nil
+	}
+	m.redoStack = append(m.redoStack, m.doc.Save())
+	snapshot := m.undoStack[len(m.undoStack)-1]
+	m.undoStack = m.undoStack[:len(m.undoStack)-1]
+	doc, err := automerge.Load(snapshot)
+	if err != nil {
+		m.err = fmt.Errorf("undo: %w", err)
+		return m, nil
+	}
+	m.doc = doc
+	m.lastSaved = snapshot
+	if err := m.reloadTable(); err != nil {
+		m.err = fmt.Errorf("undo: %w", err)
+		return m, nil
+	}
+	if err := saveDoc(m.doc, m.docPath); err != nil {
+		m.err = err
+	}
+	return m, nil
+}
+
+func (m model) redo() (tea.Model, tea.Cmd) {
+	if len(m.redoStack) == 0 {
+		return m, nil
+	}
+	m.undoStack = append(m.undoStack, m.doc.Save())
+	snapshot := m.redoStack[len(m.redoStack)-1]
+	m.redoStack = m.redoStack[:len(m.redoStack)-1]
+	doc, err := automerge.Load(snapshot)
+	if err != nil {
+		m.err = fmt.Errorf("redo: %w", err)
+		return m, nil
+	}
+	m.doc = doc
+	m.lastSaved = snapshot
+	if err := m.reloadTable(); err != nil {
+		m.err = fmt.Errorf("redo: %w", err)
+		return m, nil
+	}
+	if err := saveDoc(m.doc, m.docPath); err != nil {
+		m.err = err
+	}
+	return m, nil
 }
 
 func (m model) cellValue() any {
@@ -1502,10 +1591,14 @@ func (m model) viewTable() string {
 	if len(m.selected) > 0 {
 		selInd = fmt.Sprintf(" sel:%d", len(m.selected))
 	}
-	status := fmt.Sprintf(" [%d,%d] %s%s%s", m.cx, m.cy, modeStr, yankInd, selInd)
+	undoInd := ""
+	if len(m.undoStack) > 0 {
+		undoInd = fmt.Sprintf(" u:%d", len(m.undoStack))
+	}
+	status := fmt.Sprintf(" [%d,%d] %s%s%s%s", m.cx, m.cy, modeStr, yankInd, selInd, undoInd)
 	lines = append(lines, stStyle.Render(status))
 
-	help := " hjkl move  JKHL shift  v visual  i edit  r rename  dd del  o row  A/X col  </> sort"
+	help := " hjkl move  JKHL shift  v visual  i edit  r rename  dd del  o row  A/X col  </> sort  u undo  ^R redo"
 	lines = append(lines, dimStyle.Render(help))
 	return strings.Join(lines, "\n")
 }
