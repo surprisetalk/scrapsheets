@@ -42,6 +42,7 @@ type view int
 const (
 	viewLibrary view = iota
 	viewTable
+	viewShop
 )
 
 type mode int
@@ -81,6 +82,9 @@ type model struct {
 	libSortAsc bool
 	filterBuf  string
 	filterMode bool
+
+	// shop
+	shopCursor int
 
 	// table
 	doc        *automerge.Doc
@@ -172,6 +176,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		if m.view == viewLibrary {
 			return m.updateLibrary(msg)
+		}
+		if m.view == viewShop {
+			return m.updateShop(msg)
 		}
 		if m.mode == modeEdit {
 			return m.updateEdit(msg)
@@ -341,9 +348,44 @@ func (m model) updateLibrary(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.docs = append(m.docs, info)
 		return m.openDoc(info)
+	case "s":
+		m.view = viewShop
+		m.shopCursor = 0
+		return m, nil
 	case "enter", "l":
 		if m.libCursor >= 0 && m.libCursor < len(visible) {
 			return m.openDoc(visible[m.libCursor])
+		}
+	}
+	return m, nil
+}
+
+func (m model) updateShop(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	last := len(shopTemplates) - 1
+	switch msg.String() {
+	case "q", "esc":
+		m.view = viewLibrary
+	case "up", "k":
+		if m.shopCursor > 0 {
+			m.shopCursor--
+		}
+	case "down", "j":
+		if m.shopCursor < last {
+			m.shopCursor++
+		}
+	case "G":
+		m.shopCursor = last
+	case "enter", "l":
+		if m.shopCursor >= 0 && m.shopCursor < len(shopTemplates) {
+			tmpl := shopTemplates[m.shopCursor]
+			info, err := createDocFromTemplate(m.dataDir, tmpl)
+			if err != nil {
+				m.err = err
+				m.view = viewLibrary
+				return m, nil
+			}
+			m.docs = append(m.docs, info)
+			return m.openDoc(info)
 		}
 	}
 	return m, nil
@@ -1405,6 +1447,8 @@ func (m model) View() string {
 	switch m.view {
 	case viewLibrary:
 		return m.viewLibrary()
+	case viewShop:
+		return m.viewShop()
 	case viewTable:
 		return m.viewTable()
 	}
@@ -1528,7 +1572,7 @@ func (m model) viewLibrary() string {
 	if m.filterMode {
 		helpText = " type to filter  enter confirm  esc cancel  ctrl+u clear"
 	} else {
-		helpText = " j/k move  enter open  n new  dd del  / filter  </> sort  ^ reverse  q quit"
+		helpText = " j/k move  enter open  n new  s shop  dd del  / filter  </> sort  q quit"
 	}
 	help := dimStyle.Render(helpText)
 
@@ -1600,6 +1644,40 @@ func (m model) viewLibrary() string {
 	}
 	lines = append(lines, pos)
 	lines = append(lines, help)
+
+	return strings.Join(lines, "\n")
+}
+
+func (m model) viewShop() string {
+	var lines []string
+	lines = append(lines, titleStyle.Render(" Shop"))
+	lines = append(lines, dimStyle.Render(" Pick a template to create a new sheet"))
+	lines = append(lines, "")
+
+	nameW := 0
+	for _, t := range shopTemplates {
+		if len(t.name) > nameW {
+			nameW = len(t.name)
+		}
+	}
+	nameW += 2
+
+	for i, t := range shopTemplates {
+		line := fmt.Sprintf("  %-*s  %s", nameW, t.name, t.desc)
+		if lipgloss.Width(line) < m.width {
+			line += strings.Repeat(" ", m.width-lipgloss.Width(line))
+		}
+		if i == m.shopCursor {
+			lines = append(lines, cursorStyle.Render(line))
+		} else {
+			lines = append(lines, libDimStyle.Render(line))
+		}
+	}
+
+	for len(lines) < m.height-1 {
+		lines = append(lines, "")
+	}
+	lines = append(lines, dimStyle.Render(" j/k move  enter create  q back"))
 
 	return strings.Join(lines, "\n")
 }

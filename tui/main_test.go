@@ -214,6 +214,49 @@ func TestCreateDemoTable(t *testing.T) {
 	}
 }
 
+func TestCreateFromTemplate(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// table template with sample data
+	tmpl := shopTemplates[2] // Budget
+	info, err := createDocFromTemplate(tmpDir, tmpl)
+	if err != nil {
+		t.Fatalf("createDocFromTemplate: %v", err)
+	}
+	doc, _, err := loadDoc(info.path)
+	if err != nil {
+		t.Fatalf("loadDoc: %v", err)
+	}
+	cols, rows, err := readTable(doc)
+	if err != nil {
+		t.Fatalf("readTable: %v", err)
+	}
+	if len(cols) != 3 || cols[0].name != "item" {
+		t.Fatalf("expected 3 cols starting with 'item', got %v", cols)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rows))
+	}
+
+	// query template (no cols)
+	qTmpl := shopTemplates[len(shopTemplates)-1] // SQL query
+	qInfo, err := createDocFromTemplate(tmpDir, qTmpl)
+	if err != nil {
+		t.Fatalf("createDocFromTemplate query: %v", err)
+	}
+	qDoc, _, err := loadDoc(qInfo.path)
+	if err != nil {
+		t.Fatalf("loadDoc query: %v", err)
+	}
+	code, lang, _, _, err := readQueryDoc(qDoc)
+	if err != nil {
+		t.Fatalf("readQueryDoc: %v", err)
+	}
+	if code != "select 1" || lang != "sql" {
+		t.Fatalf("expected select 1/sql, got %q/%q", code, lang)
+	}
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

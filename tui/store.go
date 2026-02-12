@@ -733,6 +733,100 @@ func deleteDocDir(docPath string) error {
 	return os.RemoveAll(docPath)
 }
 
+type template struct {
+	name string
+	desc string
+	cols []struct{ name, typ string }
+	rows [][]string
+}
+
+var shopTemplates = []template{
+	{
+		name: "Empty table",
+		desc: "Blank sheet with one column",
+		cols: []struct{ name, typ string }{{"a", "text"}},
+	},
+	{
+		name: "Todo list",
+		desc: "Tasks with done checkboxes",
+		cols: []struct{ name, typ string }{{"task", "text"}, {"done", "bool"}, {"notes", "text"}},
+		rows: [][]string{{"Try the TUI", "true", ""}, {"Add more tasks", "false", ""}},
+	},
+	{
+		name: "Budget",
+		desc: "Income and expense tracker",
+		cols: []struct{ name, typ string }{{"item", "text"}, {"amount", "usd"}, {"category", "text"}},
+		rows: [][]string{{"Salary", "5000", "income"}, {"Rent", "-1500", "housing"}, {"Groceries", "-400", "food"}},
+	},
+	{
+		name: "Contacts",
+		desc: "People and their info",
+		cols: []struct{ name, typ string }{{"name", "text"}, {"email", "text"}, {"phone", "text"}, {"notes", "text"}},
+	},
+	{
+		name: "Inventory",
+		desc: "Items with quantity and price",
+		cols: []struct{ name, typ string }{{"item", "text"}, {"qty", "num"}, {"price", "usd"}, {"category", "text"}},
+	},
+	{
+		name: "SQL query",
+		desc: "Query your sheets with SQL",
+	},
+}
+
+func createDocFromTemplate(dataDir string, tmpl template) (docInfo, error) {
+	if tmpl.cols == nil {
+		return createDoc(dataDir, "query")
+	}
+
+	id := genDocID()
+	docPath := filepath.Join(dataDir, id[:2], id[2:])
+	os.MkdirAll(filepath.Join(docPath, "snapshot"), 0755)
+
+	doc := automerge.New()
+	doc.Path("data").Set(automerge.NewList())
+	v, _ := doc.Path("data").Get()
+	dataList := v.List()
+
+	dataList.Insert(0, automerge.NewMap())
+	for i, def := range tmpl.cols {
+		k := strconv.Itoa(i)
+		doc.Path("data", 0, k).Set(automerge.NewMap())
+		doc.Path("data", 0, k, "name").Set(def.name)
+		doc.Path("data", 0, k, "type").Set(def.typ)
+		doc.Path("data", 0, k, "key").Set(k)
+	}
+
+	for i, row := range tmpl.rows {
+		idx := i + 1
+		dataList.Insert(idx, automerge.NewMap())
+		for j, val := range row {
+			doc.Path("data", idx, strconv.Itoa(j)).Set(val)
+		}
+	}
+
+	var colNames []string
+	for _, c := range tmpl.cols {
+		colNames = append(colNames, c.name)
+	}
+
+	doc.Commit("create from template")
+	if err := saveDoc(doc, docPath); err != nil {
+		return docInfo{}, err
+	}
+
+	return docInfo{
+		id:      id,
+		docType: "table",
+		title:   strings.Join(colNames, ", "),
+		path:    docPath,
+		modTime: time.Now(),
+		size:    int64(len(doc.Save())),
+		nCols:   len(tmpl.cols),
+		nRows:   len(tmpl.rows),
+	}, nil
+}
+
 func createDemoTable(dataDir string) (docInfo, error) {
 	id := genDocID()
 	docPath := filepath.Join(dataDir, id[:2], id[2:])
