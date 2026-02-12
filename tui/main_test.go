@@ -132,6 +132,88 @@ func TestExecuteQueryWithSheetRef(t *testing.T) {
 	fmt.Printf("sheet ref query on @table:%s: result=%v\n", target.id, rows[0])
 }
 
+func TestCreateAndDeleteDoc(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	info, err := createDoc(tmpDir, "table")
+	if err != nil {
+		t.Fatalf("createDoc table: %v", err)
+	}
+	if info.docType != "table" || info.nCols != 1 {
+		t.Fatalf("unexpected table info: type=%s cols=%d", info.docType, info.nCols)
+	}
+
+	doc, _, err := loadDoc(info.path)
+	if err != nil {
+		t.Fatalf("loadDoc: %v", err)
+	}
+	cols, rows, err := readTable(doc)
+	if err != nil {
+		t.Fatalf("readTable: %v", err)
+	}
+	if len(cols) != 1 || cols[0].name != "a" {
+		t.Fatalf("expected 1 col named 'a', got %v", cols)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("expected 0 rows, got %d", len(rows))
+	}
+
+	// create query
+	qInfo, err := createDoc(tmpDir, "query")
+	if err != nil {
+		t.Fatalf("createDoc query: %v", err)
+	}
+	qDoc, _, err := loadDoc(qInfo.path)
+	if err != nil {
+		t.Fatalf("loadDoc query: %v", err)
+	}
+	code, lang, _, _, err := readQueryDoc(qDoc)
+	if err != nil {
+		t.Fatalf("readQueryDoc: %v", err)
+	}
+	if code != "select 1" || lang != "sql" {
+		t.Fatalf("expected code='select 1' lang='sql', got code=%q lang=%q", code, lang)
+	}
+
+	// delete
+	if err := deleteDocDir(info.path); err != nil {
+		t.Fatalf("deleteDocDir: %v", err)
+	}
+	if _, err := os.Stat(info.path); !os.IsNotExist(err) {
+		t.Fatal("expected path to not exist after delete")
+	}
+}
+
+func TestCreateDemoTable(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	info, err := createDemoTable(tmpDir)
+	if err != nil {
+		t.Fatalf("createDemoTable: %v", err)
+	}
+	if info.nCols != 3 || info.nRows != 9 {
+		t.Fatalf("unexpected demo: %d cols, %d rows", info.nCols, info.nRows)
+	}
+
+	doc, _, err := loadDoc(info.path)
+	if err != nil {
+		t.Fatalf("loadDoc: %v", err)
+	}
+	cols, rows, err := readTable(doc)
+	if err != nil {
+		t.Fatalf("readTable: %v", err)
+	}
+	if len(cols) != 3 {
+		t.Fatalf("expected 3 cols, got %d", len(cols))
+	}
+	if cols[0].name != "key" || cols[1].name != "value" || cols[2].name != "notes" {
+		t.Fatalf("unexpected col names: %v", cols)
+	}
+	if len(rows) != 9 {
+		t.Fatalf("expected 9 rows, got %d", len(rows))
+	}
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -671,4 +673,123 @@ func saveDoc(doc *automerge.Doc, docPath string) error {
 
 	// write new snapshot with a simple name
 	return os.WriteFile(filepath.Join(snapDir, "tui-save"), data, 0644)
+}
+
+func genDocID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func createDoc(dataDir, docType string) (docInfo, error) {
+	id := genDocID()
+	docPath := filepath.Join(dataDir, id[:2], id[2:])
+	os.MkdirAll(filepath.Join(docPath, "snapshot"), 0755)
+
+	doc := automerge.New()
+	doc.Path("data").Set(automerge.NewList())
+	v, _ := doc.Path("data").Get()
+	dataList := v.List()
+
+	var nCols, nRows int
+	var title string
+
+	switch docType {
+	case "table":
+		dataList.Insert(0, automerge.NewMap())
+		doc.Path("data", 0, "0").Set(automerge.NewMap())
+		doc.Path("data", 0, "0", "name").Set("a")
+		doc.Path("data", 0, "0", "type").Set("text")
+		doc.Path("data", 0, "0", "key").Set("0")
+		nCols = 1
+		title = "a"
+	case "query":
+		dataList.Insert(0, automerge.NewMap())
+		doc.Path("data", 0, "code").Set("select 1")
+		doc.Path("data", 0, "lang").Set("sql")
+		title = "select 1"
+	default:
+		return docInfo{}, fmt.Errorf("unsupported doc type: %s", docType)
+	}
+
+	doc.Commit("create " + docType)
+	if err := saveDoc(doc, docPath); err != nil {
+		return docInfo{}, err
+	}
+
+	return docInfo{
+		id:      id,
+		docType: docType,
+		title:   title,
+		path:    docPath,
+		modTime: time.Now(),
+		size:    int64(len(doc.Save())),
+		nCols:   nCols,
+		nRows:   nRows,
+	}, nil
+}
+
+func deleteDocDir(docPath string) error {
+	return os.RemoveAll(docPath)
+}
+
+func createDemoTable(dataDir string) (docInfo, error) {
+	id := genDocID()
+	docPath := filepath.Join(dataDir, id[:2], id[2:])
+	os.MkdirAll(filepath.Join(docPath, "snapshot"), 0755)
+
+	doc := automerge.New()
+	doc.Path("data").Set(automerge.NewList())
+	v, _ := doc.Path("data").Get()
+	dataList := v.List()
+
+	// column definitions
+	colDefs := []struct{ name, typ string }{
+		{"key", "text"},
+		{"value", "text"},
+		{"notes", "text"},
+	}
+	dataList.Insert(0, automerge.NewMap())
+	for i, def := range colDefs {
+		k := strconv.Itoa(i)
+		doc.Path("data", 0, k).Set(automerge.NewMap())
+		doc.Path("data", 0, k, "name").Set(def.name)
+		doc.Path("data", 0, k, "type").Set(def.typ)
+		doc.Path("data", 0, k, "key").Set(k)
+	}
+
+	rows := [][]string{
+		{"hjkl", "move cursor", "arrows work too"},
+		{"i / enter", "edit cell", "esc to cancel"},
+		{"o / O", "insert row below/above", ""},
+		{"dd", "delete row", "space to select multiple"},
+		{"A", "add column", "X to delete column"},
+		{"r", "rename column", ""},
+		{"v", "visual select", "y/d/f on selection"},
+		{"u / ctrl+r", "undo / redo", ""},
+		{"q / esc", "back to library", ""},
+	}
+	for i, row := range rows {
+		idx := i + 1
+		dataList.Insert(idx, automerge.NewMap())
+		for j, val := range row {
+			doc.Path("data", idx, strconv.Itoa(j)).Set(val)
+		}
+	}
+
+	doc.Commit("demo table")
+	if err := saveDoc(doc, docPath); err != nil {
+		return docInfo{}, err
+	}
+
+	return docInfo{
+		id:      id,
+		docType: "table",
+		title:   "key, value, notes",
+		path:    docPath,
+		modTime: time.Now(),
+		size:    int64(len(doc.Save())),
+		nCols:   len(colDefs),
+		nRows:   len(rows),
+	}, nil
 }

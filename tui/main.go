@@ -131,6 +131,11 @@ func initialModel(dataDir string) model {
 			m.docs = append(m.docs, d)
 		}
 	}
+	if len(m.docs) == 0 {
+		if info, err := createDemoTable(dataDir); err == nil {
+			m.docs = append(m.docs, info)
+		}
+	}
 	return m
 }
 
@@ -265,6 +270,25 @@ func (m model) updateLibrary(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "gg":
 			m.libCursor = 0
 			return m, nil
+		case "dd":
+			if m.libCursor >= 0 && m.libCursor < len(visible) {
+				target := visible[m.libCursor]
+				if err := deleteDocDir(target.path); err != nil {
+					m.err = err
+					return m, nil
+				}
+				for i, d := range m.docs {
+					if d.path == target.path {
+						m.docs = append(m.docs[:i], m.docs[i+1:]...)
+						break
+					}
+				}
+				visible = m.visibleDocs()
+				if m.libCursor >= len(visible) {
+					m.libCursor = max(len(visible)-1, 0)
+				}
+			}
+			return m, nil
 		}
 		// no match — fall through
 	}
@@ -284,6 +308,8 @@ func (m model) updateLibrary(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.libCursor = last
 	case "g":
 		m.pending = "g"
+	case "d":
+		m.pending = "d"
 	case "ctrl+d":
 		m.libCursor = min(m.libCursor+m.height/2, last)
 	case "ctrl+u":
@@ -299,6 +325,22 @@ func (m model) updateLibrary(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "^":
 		m.libSortAsc = !m.libSortAsc
 		m.libCursor = 0
+	case "n":
+		info, err := createDoc(m.dataDir, "table")
+		if err != nil {
+			m.err = err
+			return m, nil
+		}
+		m.docs = append(m.docs, info)
+		return m.openDoc(info)
+	case "N":
+		info, err := createDoc(m.dataDir, "query")
+		if err != nil {
+			m.err = err
+			return m, nil
+		}
+		m.docs = append(m.docs, info)
+		return m.openDoc(info)
 	case "enter", "l":
 		if m.libCursor >= 0 && m.libCursor < len(visible) {
 			return m.openDoc(visible[m.libCursor])
@@ -1486,7 +1528,7 @@ func (m model) viewLibrary() string {
 	if m.filterMode {
 		helpText = " type to filter  enter confirm  esc cancel  ctrl+u clear"
 	} else {
-		helpText = " j/k move  enter open  / filter  </> sort col  ^ reverse  gg top  G end  q quit"
+		helpText = " j/k move  enter open  n new  dd del  / filter  </> sort  ^ reverse  q quit"
 	}
 	help := dimStyle.Render(helpText)
 
