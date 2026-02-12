@@ -1,6 +1,10 @@
 / / 200
 /index.html / 200
 /index.js /index.js 200
+/automerge.js /automerge.js 200
 /automerge.wasm /automerge.wasm 200
+/automerge-repo.mjs /automerge-repo.mjs 200
+/automerge-repo-idb.mjs /automerge-repo-idb.mjs 200
+/automerge-repo-ws.mjs /automerge-repo-ws.mjs 200
 /style.css /style.css 200
 /* / 200
