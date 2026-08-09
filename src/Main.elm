@@ -7,7 +7,10 @@ port module Main exposing
     , TableBounds
     , clampIndex
     , detectFormat
+    , displayYToDocY
+    , emptySheet
     , expandSelection
+    , filterAndSortIndexed
     , main
     , moveSelection
     , nextSortOrder
@@ -569,6 +572,26 @@ type alias Sheet =
     }
 
 
+emptySheet : Sheet
+emptySheet =
+    { id = ""
+    , select = Rect (xy -1 -1) (xy -1 -1)
+    , hover = xy -1 -1
+    , drag = False
+    , write = Nothing
+    , doc = Err ""
+    , table = Err ""
+    , stats = Err ""
+    , sort = Nothing
+    , filters = Dict.empty
+    , filterOpen = Nothing
+    , findReplace = Nothing
+    , queryAutocomplete = Nothing
+    , undoStack = []
+    , redoStack = []
+    }
+
+
 type alias UndoEntry =
     { forward : List Patch -- Patches to redo
     , backward : List Patch -- Patches to undo (inverse)
@@ -866,7 +889,7 @@ docDecoder =
                                         -- TODO
                                         (D.maybe (D.field "args" (D.succeed Dict.empty)) |> D.map (Maybe.withDefault Dict.empty))
                                         (D.maybe (D.field "examples" (D.list D.string)) |> D.map (Maybe.withDefault []))
-                                        (D.field "cols" D.value)
+                                        (D.maybe (D.field "cols" D.value) |> D.map (Maybe.withDefault (E.object [])))
                                     )
 
                     typ_ ->
@@ -968,23 +991,7 @@ init _ url nav =
                 , search = ""
                 , error = ""
                 , library = Dict.empty
-                , sheet =
-                    { id = ""
-                    , select = Rect (xy -1 -1) (xy -1 -1)
-                    , hover = xy -1 -1
-                    , drag = False
-                    , write = Nothing
-                    , doc = Err ""
-                    , table = Err ""
-                    , stats = Err ""
-                    , sort = Nothing
-                    , filters = Dict.empty
-                    , filterOpen = Nothing
-                    , findReplace = Nothing
-                    , queryAutocomplete = Nothing
-                    , undoStack = []
-                    , redoStack = []
-                    }
+                , sheet = emptySheet
                 , auth =
                     { state = Anonymous
                     , email = ""
@@ -1318,7 +1325,12 @@ update msg ({ sheet, auth } as model) =
 
                 Ok (Tab table) ->
                     let
-                        -- Helper to get old cell value as E.Value
+                        -- Map a display row coordinate to its document row coordinate (accounts for sort/filter/search)
+                        toDoc : Int -> Int
+                        toDoc y =
+                            displayYToDocY model.search sheet table.rows y
+
+                        -- Helper to get old cell value as E.Value (rowIdx is a document coordinate)
                         getOldValue : Int -> String -> E.Value
                         getOldValue rowIdx key =
                             table.rows
@@ -1362,21 +1374,24 @@ update msg ({ sheet, auth } as model) =
                                             ( forward, backward )
 
                                         ( rowY, Just col ) ->
-                                            -- Editing data cell
+                                            -- Editing data cell (translate display row to document row)
                                             let
+                                                docY =
+                                                    toDoc rowY
+
                                                 oldValue =
-                                                    getOldValue rowY col.key
+                                                    getOldValue docY col.key
 
                                                 forward =
                                                     [ { action = "set"
-                                                      , path = [ E.int rowY, E.string col.key ]
+                                                      , path = [ E.int docY, E.string col.key ]
                                                       , value = sheet.write |> Maybe.map E.string |> Maybe.withDefault E.null
                                                       }
                                                     ]
 
                                                 backward =
                                                     [ { action = "set"
-                                                      , path = [ E.int rowY, E.string col.key ]
+                                                      , path = [ E.int docY, E.string col.key ]
                                                       , value = oldValue
                                                       }
                                                     ]
@@ -1433,6 +1448,7 @@ update msg ({ sheet, auth } as model) =
                                     let
                                         forward =
                                             indices
+                                                |> List.map toDoc
                                                 |> List.sort
                                                 |> List.reverse
                                                 |> List.map
@@ -1491,13 +1507,17 @@ update msg ({ sheet, auth } as model) =
                                                         Array.get idx.x table.cols
                                                             |> Maybe.map
                                                                 (\col ->
+                                                                    let
+                                                                        docY =
+                                                                            toDoc idx.y
+                                                                    in
                                                                     ( { action = "set"
-                                                                      , path = [ E.int idx.y, E.string col.key ]
+                                                                      , path = [ E.int docY, E.string col.key ]
                                                                       , value = E.string ""
                                                                       }
                                                                     , { action = "set"
-                                                                      , path = [ E.int idx.y, E.string col.key ]
-                                                                      , value = getOldValue idx.y col.key
+                                                                      , path = [ E.int docY, E.string col.key ]
+                                                                      , value = getOldValue docY col.key
                                                                       }
                                                                     )
                                                                 )
@@ -1515,19 +1535,22 @@ update msg ({ sheet, auth } as model) =
                                     case Array.get i.x table.cols of
                                         Just col ->
                                             let
+                                                docY =
+                                                    toDoc i.y
+
                                                 oldValue =
-                                                    getOldValue i.y col.key
+                                                    getOldValue docY col.key
 
                                                 forward =
                                                     [ { action = "set"
-                                                      , path = [ E.int i.y, E.string col.key ]
+                                                      , path = [ E.int docY, E.string col.key ]
                                                       , value = E.bool c
                                                       }
                                                     ]
 
                                                 backward =
                                                     [ { action = "set"
-                                                      , path = [ E.int i.y, E.string col.key ]
+                                                      , path = [ E.int docY, E.string col.key ]
                                                       , value = oldValue
                                                       }
                                                     ]
@@ -1794,7 +1817,7 @@ update msg ({ sheet, auth } as model) =
             case sheet.findReplace of
                 Just fr ->
                     let
-                        -- Find all matching cells
+                        -- Find all matching cells, in display coordinates so selection and highlighting line up
                         matches =
                             case sheet.doc of
                                 Ok (Tab tbl) ->
@@ -1802,10 +1825,10 @@ update msg ({ sheet, auth } as model) =
                                         []
 
                                     else
-                                        tbl.rows
+                                        filterAndSortIndexed model.search sheet tbl.rows
                                             |> Array.toIndexedList
                                             |> List.concatMap
-                                                (\( rowIdx, row ) ->
+                                                (\( dispIdx, ( _, row ) ) ->
                                                     tbl.cols
                                                         |> Array.toIndexedList
                                                         |> List.filterMap
@@ -1817,7 +1840,7 @@ update msg ({ sheet, auth } as model) =
                                                                             |> Maybe.withDefault ""
                                                                 in
                                                                 if String.contains (String.toLower findText) (String.toLower cellVal) then
-                                                                    Just (xy colIdx (rowIdx + 1))
+                                                                    Just (xy colIdx (dispIdx + 1))
 
                                                                 else
                                                                     Nothing
@@ -1925,7 +1948,7 @@ update msg ({ sheet, auth } as model) =
                                         { id = sheet.id
                                         , data =
                                             [ { action = "set"
-                                              , path = [ E.int matchIdx.y, E.string col.key ]
+                                              , path = [ E.int (displayYToDocY model.search sheet tbl.rows matchIdx.y), E.string col.key ]
                                               , value = E.string fr.replaceText
                                               }
                                             ]
@@ -1953,7 +1976,7 @@ update msg ({ sheet, auth } as model) =
                                             |> Maybe.map
                                                 (\col ->
                                                     { action = "set"
-                                                    , path = [ E.int matchIdx.y, E.string col.key ]
+                                                    , path = [ E.int (displayYToDocY model.search sheet tbl.rows matchIdx.y), E.string col.key ]
                                                     , value = E.string fr.replaceText
                                                     }
                                                 )
@@ -2078,7 +2101,7 @@ update msg ({ sheet, auth } as model) =
                                         Array.get sel.x tbl.cols
 
                                     row =
-                                        Array.get (sel.y - 1) tbl.rows
+                                        Array.get (displayYToDocY model.search sheet tbl.rows sel.y - 1) tbl.rows
                                 in
                                 case ( col, row ) of
                                     ( Just c, Just r ) ->
@@ -2159,13 +2182,13 @@ update msg ({ sheet, auth } as model) =
                         in
                         ( { model | sheet = { sheet | select = newSelect } }, Cmd.none )
 
-                    -- Get selected row indices for deletion
+                    -- Get selected row indices for deletion (never the header/type rows y <= 0)
                     selectedRows =
                         let
                             norm =
                                 normalizeRect sheet.select
                         in
-                        List.range norm.a.y norm.b.y
+                        List.range norm.a.y norm.b.y |> List.filter (\y -> y >= 1)
 
                     -- Get selected column indices for deletion
                     selectedCols =
@@ -2175,9 +2198,9 @@ update msg ({ sheet, auth } as model) =
                         in
                         List.range norm.a.x norm.b.x
 
-                    -- Get all selected cell indices for clearing
+                    -- Get all selected cell indices for clearing (data rows only)
                     selectedCells =
-                        rectToIndices sheet.select
+                        rectToIndices sheet.select |> List.filter (\i -> i.y >= 1)
                 in
                 case event.key of
                     "ArrowUp" ->
@@ -2465,7 +2488,7 @@ update msg ({ sheet, auth } as model) =
                         sel =
                             normalizeRect sheet.select
 
-                        -- Extract selected cells as 2D list of strings
+                        -- Extract selected cells as 2D list of strings (map display rows to document rows)
                         rows =
                             List.range sel.a.y sel.b.y
                                 |> List.map
@@ -2476,7 +2499,7 @@ update msg ({ sheet, auth } as model) =
                                                     Array.get x tbl.cols
                                                         |> Maybe.andThen
                                                             (\col ->
-                                                                Array.get (y - 1) tbl.rows
+                                                                Array.get (displayYToDocY model.search sheet tbl.rows y - 1) tbl.rows
                                                                     |> Maybe.andThen (Dict.get col.key)
                                                                     |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
                                                             )
@@ -2497,8 +2520,9 @@ update msg ({ sheet, auth } as model) =
             case sheet.doc of
                 Ok (Tab tbl) ->
                     let
+                        -- Clamp paste target to a data cell so an empty/header selection never overwrites column defs
                         sel =
-                            sheet.select.a
+                            { x = max 0 sheet.select.a.x, y = max 1 sheet.select.a.y }
 
                         -- Detect format and parse
                         data =
@@ -2529,12 +2553,25 @@ update msg ({ sheet, auth } as model) =
                         currentRowCount =
                             Array.length tbl.rows
 
+                        -- Rows currently visible (after sort/filter/search); paste targets display positions
+                        visibleCount =
+                            Array.length (filterAndSortIndexed model.search sheet tbl.rows)
+
+                        -- Map a display row to its document row; positions past the visible set become appended rows
+                        docRowFor : Int -> Int
+                        docRowFor dispY =
+                            if dispY <= visibleCount then
+                                displayYToDocY model.search sheet tbl.rows dispY
+
+                            else
+                                currentRowCount + (dispY - visibleCount)
+
                         -- How many new columns/rows needed?
                         neededCols =
                             max 0 (sel.x + pasteWidth - currentColCount)
 
                         neededRows =
-                            max 0 (sel.y + pasteHeight - 1 - currentRowCount)
+                            max 0 (sel.y + pasteHeight - 1 - visibleCount)
 
                         -- Generate patches to add new columns
                         newColPatches =
@@ -2593,7 +2630,7 @@ update msg ({ sheet, auth } as model) =
                                                             sel.x + colOffset
 
                                                         y =
-                                                            sel.y + rowOffset
+                                                            docRowFor (sel.y + rowOffset)
                                                     in
                                                     { action = "set"
                                                     , path = [ E.int y, E.string (colKey x) ]
@@ -3121,18 +3158,23 @@ matchesSearch search row =
 
 filterAndSort : String -> Sheet -> Array Row -> Array Row
 filterAndSort search sheet rows =
+    filterAndSortIndexed search sheet rows |> Array.map Tuple.second
+
+
+filterAndSortIndexed : String -> Sheet -> Array Row -> Array ( Int, Row )
+filterAndSortIndexed search sheet rows =
     let
-        passes row =
+        passes ( _, row ) =
             matchesSearch search row
                 && Dict.foldl (\key filter acc -> acc && applyFilter filter key row) True sheet.filters
 
         filtered =
-            Array.filter passes rows
+            Array.indexedMap Tuple.pair rows |> Array.filter passes
     in
     case sheet.sort of
         Just ( sortKey, sortOrder ) ->
             let
-                cmp r1 r2 =
+                cmp ( _, r1 ) ( _, r2 ) =
                     let
                         v1 =
                             Dict.get sortKey r1 |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
@@ -3149,6 +3191,18 @@ filterAndSort search sheet rows =
 
         Nothing ->
             filtered
+
+
+displayYToDocY : String -> Sheet -> Array Row -> Int -> Int
+displayYToDocY search sheet rows y =
+    if y < 1 then
+        y
+
+    else
+        filterAndSortIndexed search sheet rows
+            |> Array.get (y - 1)
+            |> Maybe.map (\( orig, _ ) -> orig + 1)
+            |> Maybe.withDefault y
 
 
 typeAlign : Type -> H.Attribute Msg

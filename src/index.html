@@ -820,8 +820,7 @@
               }
               try {
                 const formData = new FormData();
-                formData.append('filename', filename);
-                formData.append('content', content);
+                formData.append('file', new File([content], filename, { type: 'text/csv' }));
                 const res = await fetch('https://api.sheets.scrap.land/import/csv', {
                   method: 'POST',
                   headers: {
@@ -841,6 +840,62 @@
               }
             }, 'importCsv'),
           );
+
+          // Restore a logged-in session from a previous visit so the UI shows LoggedIn on load.
+          try {
+            const stored = JSON.parse(localStorage.getItem('scrapsheets-user') || 'null');
+            if (stored?.usr_id) app.ports.authResult.send({ usr_id: String(stored.usr_id) });
+          } catch { /* ignore malformed storage */ }
+
+          // Signup: request a verification email. Never leaves the form locked.
+          app.ports.signup.subscribe(async (email) => {
+            try {
+              const res = await fetch(
+                `https://api.sheets.scrap.land/signup?email=${encodeURIComponent(email)}`,
+                { method: 'POST' },
+              );
+              app.ports.authResult.send({});
+              app.ports.docErrored.send(
+                res.ok
+                  ? `Verification email sent to ${email} — check your inbox to set a password.`
+                  : 'Signup failed. Please try again.',
+              );
+            } catch (err) {
+              app.ports.authResult.send({});
+              app.ports.docErrored.send(`Signup failed: ${err?.message ?? 'unknown error'}`);
+            }
+          });
+
+          // Login: store { usr_id, jwt } then reload so the sync socket reconnects authenticated.
+          app.ports.login.subscribe(async ({ email, password }) => {
+            try {
+              const res = await fetch('https://api.sheets.scrap.land/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, password }),
+              });
+              if (!res.ok) {
+                app.ports.authResult.send({ error: 'Invalid email or password.' });
+                app.ports.docErrored.send('Invalid email or password.');
+                return;
+              }
+              const { data } = await res.json();
+              localStorage.setItem(
+                'scrapsheets-user',
+                JSON.stringify({ usr_id: data.usr_id, jwt: data.jwt }),
+              );
+              location.reload();
+            } catch (err) {
+              app.ports.authResult.send({ error: err?.message ?? 'Login failed.' });
+              app.ports.docErrored.send(`Login failed: ${err?.message ?? 'unknown error'}`);
+            }
+          });
+
+          // Logout: drop the token and reload so the sync socket reconnects anonymously.
+          app.ports.logout.subscribe(() => {
+            localStorage.removeItem('scrapsheets-user');
+            location.reload();
+          });
 
           const applyPatches = (data, patches) => {
             for (const { path, action, value } of patches) {

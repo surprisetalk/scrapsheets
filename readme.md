@@ -1,7 +1,12 @@
 ```nu
-mkdir dist
+deno task build
+deno task dev
+deno task test
+```
+
+```nu
+# watch mode
 watch src { try { cp -vu src/* dist ; elm make src/Main.elm --debug --output=dist/index.js } }
-deno run -A npm:serve dist -s -C -S -n
 ```
 
 - [Twinkling lights and nested loops: distributed

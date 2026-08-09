@@ -1,5 +1,4 @@
 create extension if not exists citext;
-create extension if not exists pgcrypto;
 
 create table usr
 ( usr_id bigint not null generated always as identity primary key
@@ -22,7 +21,7 @@ create table sheet
 , sell_price numeric check (sell_price >= 0)
 , buy_id text references sheet(sell_id)
 , buy_price numeric check (buy_price >= 0)
-, row_0 jsonb not null default '[]'::jsonb check (jsonb_typeof(row_0) = 'array')
+, row_0 jsonb not null default '[]'::jsonb check (jsonb_typeof(row_0) in ('array','object'))
 , check (not (sell_price is not null and buy_price is not null))
 );
 

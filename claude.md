@@ -26,10 +26,10 @@ technologies. It uses a hybrid architecture with:
 
 ### Building and Running
 
-- **Development server**: `deno run -A npm:serve dist -s -C -S -n`
-- **Build frontend**: `elm make src/Main.elm --debug --output=dist/index.js`
+- **Build frontend**: `deno task build` (copies src/* to dist and runs elm make)
+- **Development server**: `deno task dev`
+- **Run all tests**: `deno task test` (or `deno test --allow-all`; browser tests build dist themselves)
 - **Watch and build**: `watch src { try { cp -vu src/* dist ; elm make src/Main.elm --debug --output=dist/index.js } }`
-- **Setup dist directory**: `mkdir dist`
 
 ### Elm Commands (via deno.json imports)
 
@@ -41,6 +41,8 @@ technologies. It uses a hybrid architecture with:
 
 - Initialize database schema: `psql < db.sql`
 - Default connection: `postgresql://postgres@127.0.0.1:5434/postgres`
+- Tests run against an in-process PGlite over a local pg-gateway on port 5434 (no real Postgres needed)
+- External-DB DSNs are encrypted at the application level (AES-GCM via DSN_ENCRYPTION_KEY) before storage
 
 ## Architecture Overview
 

@@ -9,21 +9,14 @@
 Close the gaps that prevent daily use and public demo.
 
 - [ ] **Codebase refactor**: the code has grown stale; consolidate before building on top of it
-- [x] **DocDelta efficiency**: send actual Automerge deltas instead of full doc on every change (Main.elm:194,
-      index.html docChanged handler)
-- [x] **Boolean cell editing guard**: don't open text editor on boolean/non-editable cells; toggle checkbox instead
-      (Main.elm:1389)
-- [x] **DSN encryption**: encrypt external database connection strings with pgcrypto (db.sql:30)
 - [ ] **Automerge WebSocket adapter**: replace custom HonoWebSocketAdapter with official NodeWebSocketAdapter
       (main.ts:465)
-- [x] **Net sheet ID normalization**: accept doc_id instead of sheet_id for /net/:id endpoint (main.ts:1547)
 - [ ] **Sheet preview thumbnails**: generate mini sparkline/heatmap SVG for library view (Main.elm:335)
-- [x] **URL query operators**: support ?q=+any, ?q=-any, ?q==any for bookmarkable filtered views (Main.elm:902)
-- [x] **row_0 validation**: add check constraint ensuring row_0 is a JSONB array (db.sql:24)
-- [x] **Net table headers**: store req/res metadata and HTTP headers alongside webhook body (db.sql:40)
 - [ ] **Library examples**: ship a handful of real sheets that demo table/query/net/portal in the default library
 - [ ] **Keyboard shortcuts**: define and document key bindings; show a shortcut sheet in the library
 - [ ] **Tutorial**: guided first-run walkthrough from empty library to a working query sheet
+- [ ] **Edit-mode keys dead**: keyEventDecoder returns NoOp for INPUT/TEXTAREA, so Enter/Escape/Tab in the cell editor
+      and find box never fire; handle them with element-level `on "keydown"` instead (Main.elm:1142)
 
 ---
 
@@ -45,10 +38,6 @@ Make Scrapsheets reliable enough to be someone's primary data tool.
 - [ ] **net-socket config view**: WebSocket URL input, connection status indicator
 - [ ] **net-hook log view**: table of incoming webhook payloads from `net` table
 - [ ] **Net sheet creation**: add net-hook/http/socket options to "new sheet" menu
-- [x] **Codex DSN validation**: block connections resolving to application's own database (main.ts:1567)
-- [x] **Codex read-only mode**: SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY for external DBs
-- [x] **Codex query timeout**: add connection and statement timeouts for external DB queries
-- [x] **Codex rate limiting**: per-user query rate limits for external database access
 
 ---
 

@@ -1,6 +1,9 @@
 module MainTest exposing (..)
 
+import Array
+import Dict
 import Expect
+import Json.Encode as E
 import Main exposing (..)
 import Test exposing (..)
 
@@ -153,6 +156,62 @@ suite =
                     \_ ->
                         selectAll { maxX = 0, maxY = 1 }
                             |> Expect.equal { a = { x = 0, y = 1 }, b = { x = 0, y = 1 } }
+                ]
+            , describe "displayYToDocY / filterAndSortIndexed"
+                [ test "identity without sort, filter, or search" <|
+                    \_ ->
+                        let
+                            rows =
+                                Array.fromList
+                                    [ Dict.fromList [ ( "0", E.string "x" ) ]
+                                    , Dict.fromList [ ( "0", E.string "y" ) ]
+                                    , Dict.fromList [ ( "0", E.string "z" ) ]
+                                    ]
+                        in
+                        List.map (displayYToDocY "" emptySheet rows) [ 1, 2, 3 ]
+                            |> Expect.equal [ 1, 2, 3 ]
+                , test "sorted display rows map back to their document rows" <|
+                    \_ ->
+                        let
+                            rows =
+                                Array.fromList
+                                    [ Dict.fromList [ ( "0", E.string "banana" ) ]
+                                    , Dict.fromList [ ( "0", E.string "apple" ) ]
+                                    , Dict.fromList [ ( "0", E.string "cherry" ) ]
+                                    ]
+
+                            sheet =
+                                { emptySheet | sort = Just ( "0", Ascending ) }
+                        in
+                        -- display order apple, banana, cherry -> document rows 2, 1, 3
+                        List.map (displayYToDocY "" sheet rows) [ 1, 2, 3 ]
+                            |> Expect.equal [ 2, 1, 3 ]
+                , test "search hides rows but preserves original document indices" <|
+                    \_ ->
+                        let
+                            rows =
+                                Array.fromList
+                                    [ Dict.fromList [ ( "0", E.string "apple" ) ]
+                                    , Dict.fromList [ ( "0", E.string "banana" ) ]
+                                    , Dict.fromList [ ( "0", E.string "avocado" ) ]
+                                    ]
+                        in
+                        -- only avocado (document row 3) contains "av"
+                        ( filterAndSortIndexed "av" emptySheet rows |> Array.map Tuple.first |> Array.toList
+                        , displayYToDocY "av" emptySheet rows 1
+                        )
+                            |> Expect.equal ( [ 2 ], 3 )
+                , test "header rows (y <= 0) are never remapped" <|
+                    \_ ->
+                        let
+                            rows =
+                                Array.fromList [ Dict.fromList [ ( "0", E.string "a" ) ] ]
+
+                            sheet =
+                                { emptySheet | sort = Just ( "0", Descending ) }
+                        in
+                        List.map (displayYToDocY "" sheet rows) [ 0, -1, -2 ]
+                            |> Expect.equal [ 0, -1, -2 ]
                 ]
             , describe "rectToIndices"
                 [ test "converts single cell rect to list" <|

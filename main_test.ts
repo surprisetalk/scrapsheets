@@ -2,7 +2,7 @@ import { assert, assertEquals } from "@std/assert";
 import { PGlite } from "@electric-sql/pglite";
 import { PostgresConnection } from "pg-gateway";
 import { citext } from "@electric-sql/pglite/contrib/citext";
-import { app, arrayify, automerge, createJwt, sql } from "./main.ts";
+import { app, arrayify, automerge, createJwt, createToken, sql } from "./main.ts";
 import type { Sheet, Table, Template } from "./main.ts";
 import dbSql from "./db.sql" with { type: "text" };
 import examplesSql from "./examples.sql" with { type: "text" };
@@ -84,6 +84,28 @@ Deno.test(async function allTests(_t) {
   await pglite.waitReady;
   await pglite.exec(dbSql);
   await pglite.exec(examplesSql);
+
+  // Signup completion + login round-trip (app-level password hashing, no pgcrypto).
+  {
+    const email = "carol@example.com";
+    const password = "s3cret-pass";
+    const token = await createToken(email);
+    await post("", `/signup/${token}`, { email, password });
+    const { data } = await post("", `/login`, { email, password });
+    assert(data.jwt, "login should return a jwt");
+    assert(data.usr_id, "login should return usr_id");
+    // Wrong password is rejected.
+    await reject("", `/login`, {
+      method: "POST",
+      body: JSON.stringify({ email, password: "wrong" }),
+    });
+    // Re-signup updates the password (on conflict do update).
+    const newPassword = "rotated-pass";
+    await post("", `/signup/${await createToken(email)}`, { email, password: newPassword });
+    await reject("", `/login`, { method: "POST", body: JSON.stringify({ email, password }) });
+    const { data: data2 } = await post("", `/login`, { email, password: newPassword });
+    assert(data2.jwt, "login with rotated password should succeed");
+  }
 
   {
     const { jwt } = await usr("alice@example.com");
@@ -198,6 +220,13 @@ Deno.test(async function allTests(_t) {
       // Verify Bob's library grew
       const [, ...bobRows] = await get<Table>(jwt, `/library`);
       assertEquals(bobRows.length, toBuy.length);
+
+      // A purchased sheet cannot be resold (buy_price and sell_price are mutually exclusive).
+      const [{ type, doc_id }] = bobRows;
+      await reject(jwt, `/sell/${type}:${doc_id}`, {
+        method: "POST",
+        body: JSON.stringify({ price: 5 }),
+      });
     }
 
     // Buying with invalid sell_id returns 404.
@@ -251,6 +280,33 @@ Deno.test(async function allTests(_t) {
       const [cols_] = res.data;
       assert(cols_, "Expected columns in response");
     }
+  }
+
+  // CSV import -> export round-trip.
+  {
+    const { jwt } = await usr("dave@example.com");
+    const csv = "name,age\nAlice,30\nBob,25";
+    const form = new FormData();
+    form.append("file", new File([csv], "people.csv", { type: "text/csv" }));
+    const importRes = await app.request("/import/csv", {
+      method: "POST",
+      headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+      body: form,
+    });
+    assert(importRes.ok, `import failed: ${importRes.status} ${importRes.statusText}`);
+    const { sheet_id } = await importRes.json();
+    assert(sheet_id, "import should return a sheet_id");
+
+    const exportRes = await app.request(`/export/${sheet_id}.csv`, {
+      headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+    });
+    assert(exportRes.ok, `export failed: ${exportRes.status} ${exportRes.statusText}`);
+    assertEquals(exportRes.headers.get("content-type"), "text/csv; charset=utf-8");
+    const lines = (await exportRes.text()).split("\n");
+    assertEquals(lines[0], "name,age");
+    assertEquals(lines.length, 3);
+    assertEquals(lines[1], "Alice,30");
+    assertEquals(lines[2], "Bob,25");
   }
 
   await sql.end();

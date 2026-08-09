@@ -1,8 +1,22 @@
 import { assertEquals } from "@std/assert";
 import { launch } from "astral";
-import { serveDir } from "jsr:@std/http@^1/file-server";
+import { serveDir } from "@std/http/file-server";
 
 const dir = new URL(".", import.meta.url).pathname;
+
+Deno.test("build dist", async () => {
+  const { code, stdout, stderr } = await new Deno.Command(Deno.execPath(), {
+    args: ["task", "build"],
+    cwd: dir,
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  if (code !== 0) {
+    throw new Error(
+      `deno task build failed:\n${new TextDecoder().decode(stdout)}\n${new TextDecoder().decode(stderr)}`,
+    );
+  }
+});
 
 // Test 1: Static analysis of index.html
 Deno.test("index.html has correct WASM initialization", async () => {
@@ -89,7 +103,8 @@ Deno.test("page loads and Elm initializes", async () => {
   assertEquals(elmExists, true, "Elm global should exist");
 
   // Check if Elm.Main exists
-  const elmMainExists = (await page.evaluate(`typeof Elm !== 'undefined' && typeof Elm.Main !== 'undefined'`)) as boolean;
+  const elmMainExists =
+    (await page.evaluate(`typeof Elm !== 'undefined' && typeof Elm.Main !== 'undefined'`)) as boolean;
   assertEquals(elmMainExists, true, "Elm.Main should exist");
 
   console.log("Page errors:", errors);

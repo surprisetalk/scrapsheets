@@ -19,9 +19,79 @@ import * as path from "@std/path";
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
 const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
 const DSN_KEY = Deno.env.get("DSN_ENCRYPTION_KEY") ?? Math.random().toString();
-if (!Deno.env.get("JWT_SECRET")) console.warn("WARNING: JWT_SECRET not set, using random value. Tokens will break on restart.");
-if (!Deno.env.get("TOKEN_SECRET")) console.warn("WARNING: TOKEN_SECRET not set, using random value. Tokens will break on restart.");
-if (!Deno.env.get("DSN_ENCRYPTION_KEY")) console.warn("WARNING: DSN_ENCRYPTION_KEY not set, using random value. Encrypted DSNs will break on restart.");
+
+const b64 = (buf: Uint8Array): string => {
+  let s = "";
+  for (const byte of buf) s += String.fromCharCode(byte);
+  return btoa(s);
+};
+const unb64 = (s: string): Uint8Array<ArrayBuffer> => {
+  const bin = atob(s);
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf;
+};
+
+const dsnAesKey = crypto.subtle
+  .digest("SHA-256", new TextEncoder().encode(DSN_KEY))
+  .then((bits) => crypto.subtle.importKey("raw", bits, "AES-GCM", false, ["encrypt", "decrypt"]));
+
+const encryptDsn = async (plain: string): Promise<string> => {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const cipher = new Uint8Array(
+    await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await dsnAesKey, new TextEncoder().encode(plain)),
+  );
+  const buf = new Uint8Array(iv.length + cipher.length);
+  buf.set(iv);
+  buf.set(cipher, iv.length);
+  return b64(buf);
+};
+
+const decryptDsn = async (stored: string): Promise<string> => {
+  try {
+    const buf = unb64(stored);
+    const plain = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: buf.slice(0, 12) },
+      await dsnAesKey,
+      buf.slice(12),
+    );
+    return new TextDecoder().decode(plain);
+  } catch {
+    throw new HTTPException(500, {
+      message: "Could not decrypt DSN. Was DSN_ENCRYPTION_KEY changed? Re-save the connection string.",
+    });
+  }
+};
+
+const PBKDF2_ITERS = 210_000;
+const hashPassword = async (password: string): Promise<string> => {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = new Uint8Array(
+    await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: PBKDF2_ITERS }, key, 256),
+  );
+  return `pbkdf2$${PBKDF2_ITERS}$${b64(salt)}$${b64(bits)}`;
+};
+const verifyPassword = async (password: string, stored: string | null): Promise<boolean> => {
+  if (!stored) return false;
+  const [scheme, iters, salt, want] = stored.split("$");
+  if (scheme !== "pbkdf2") return false;
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = new Uint8Array(
+    await crypto.subtle.deriveBits(
+      { name: "PBKDF2", hash: "SHA-256", salt: unb64(salt), iterations: parseInt(iters) },
+      key,
+      256,
+    ),
+  );
+  return b64(bits) === want;
+};
+if (!Deno.env.get("JWT_SECRET"))
+  console.warn("WARNING: JWT_SECRET not set, using random value. Tokens will break on restart.");
+if (!Deno.env.get("TOKEN_SECRET"))
+  console.warn("WARNING: TOKEN_SECRET not set, using random value. Tokens will break on restart.");
+if (!Deno.env.get("DSN_ENCRYPTION_KEY"))
+  console.warn("WARNING: DSN_ENCRYPTION_KEY not set, using random value. Encrypted DSNs will break on restart.");
 
 // Simple in-memory rate limiter (token bucket algorithm)
 const rateLimitBuckets = new Map<string, { tokens: number; lastRefill: number }>();
@@ -122,6 +192,10 @@ const sheet = async (
   { limit, offset, ...qs }: Record<string, string>,
 ): Promise<Page> => {
   const [type, doc_id] = sheet_id.split(":");
+  const [access] = await sql`
+    select true from sheet_usr where sheet_id = ${sheet_id} and usr_id = ${c.get("usr_id")}
+  `;
+  if (!access) throw new HTTPException(403, { message: "You don't have access to this sheet." });
   const hand = await automerge
     .find<{ data: Sheet["data"] }>(doc_id as AnyDocumentId)
     .catch(() => ({
@@ -167,12 +241,20 @@ const executeSql = async (
   c: Context,
   sqlCode: string,
 ): Promise<Page> => {
-  // Extract sheet references (@sheet_id) and replace with placeholders
+  // Extract sheet references (@sheet_id) outside string literals and replace with positional placeholders
   const sheet_ids: string[] = [];
-  const code_ = sqlCode.replace(
-    /@[^ ]+/g,
-    (ref) => (sheet_ids.push(ref.slice(1)), "?"),
-  );
+  let code_ = "";
+  let inStr = false;
+  for (let i = 0; i < sqlCode.length; i++) {
+    const ch = sqlCode[i];
+    if (ch === "'") inStr = !inStr;
+    const ref = !inStr && ch === "@" ? sqlCode.slice(i).match(/^@[A-Za-z0-9:_-]+/)?.[0] : undefined;
+    if (ref) {
+      sheet_ids.push(ref.slice(1));
+      code_ += "?";
+      i += ref.length - 1;
+    } else { code_ += ch; }
+  }
 
   // Load referenced sheets
   const docs: Record<string, Record<string, unknown>[]> = {};
@@ -249,7 +331,7 @@ export const createJwt = async (usr_id: string) =>
     JWT_SECRET,
   );
 
-const createToken = async (
+export const createToken = async (
   email: string,
   ts: Date = new Date(),
 ): Promise<string> => {
@@ -295,9 +377,10 @@ export const sql = pg(
     "postgresql://postgres@127.0.0.1:5434/postgres",
   {
     fetch_types: true,
-    onnotice: (msg) => msg.severity !== "DEBUG" && console.log(msg),
+    onnotice: (msg: { severity?: string }) => msg.severity !== "DEBUG" && console.log(msg),
   },
 );
+type Sql = typeof sql;
 
 // deno-lint-ignore no-explicit-any
 type SqlFragment = any;
@@ -386,7 +469,9 @@ class HonoWebSocketAdapter extends AM.NetworkAdapter {
   }
   disconnect(): void {
     for (const [, ws] of this.connections) {
-      try { ws.close(); } catch { /* ignore */ }
+      try {
+        ws.close();
+      } catch { /* ignore */ }
     }
     this.connections.clear();
   }
@@ -517,10 +602,33 @@ portal("time", 10, () => null, () => ({
 }));
 
 portal("stonks", 100, () => ({
-  AAPL: 645.32, MSFT: 412.78, GOOGL: 823.45, AMZN: 567.91, NVDA: 789.23, META: 345.67, TSLA: 892.14,
-  BRKB: 234.56, JPM: 478.9, V: 656.23, JNJ: 321.45, WMT: 754.89, PG: 423.67, UNH: 587.12, HD: 698.34,
-  DIS: 276.45, MA: 812.56, PYPL: 389.78, BAC: 523.91, NFLX: 734.23, ADBE: 456.78, CRM: 621.34,
-  PFE: 298.56, ABT: 865.23, CSCO: 342.67, CVX: 778.9, PEP: 512.34,
+  AAPL: 645.32,
+  MSFT: 412.78,
+  GOOGL: 823.45,
+  AMZN: 567.91,
+  NVDA: 789.23,
+  META: 345.67,
+  TSLA: 892.14,
+  BRKB: 234.56,
+  JPM: 478.9,
+  V: 656.23,
+  JNJ: 321.45,
+  WMT: 754.89,
+  PG: 423.67,
+  UNH: 587.12,
+  HD: 698.34,
+  DIS: 276.45,
+  MA: 812.56,
+  PYPL: 389.78,
+  BAC: 523.91,
+  NFLX: 734.23,
+  ADBE: 456.78,
+  CRM: 621.34,
+  PFE: 298.56,
+  ABT: 865.23,
+  CSCO: 342.67,
+  CVX: 778.9,
+  PEP: 512.34,
 }), (stonks) => {
   for (const i in stonks) stonks[i] += 0.5 - Math.random();
   return {
@@ -542,8 +650,10 @@ portal("dice", 500, () => {
   }
   return {
     cols: [
-      { key: 0, name: "die", type: "text" }, { key: 1, name: "roll", type: "int" },
-      { key: 2, name: "total", type: "int" }, { key: 3, name: "rolls", type: "int" },
+      { key: 0, name: "die", type: "text" },
+      { key: 1, name: "roll", type: "int" },
+      { key: 2, name: "total", type: "int" },
+      { key: 3, name: "rolls", type: "int" },
       { key: 4, name: "average", type: "percentage" },
     ],
     rows: (Object.entries(state) as [string, { roll: number; total: number; rolls: number }][])
@@ -553,71 +663,128 @@ portal("dice", 500, () => {
 });
 
 portal("orbit", 100, () => ({
-  planets: [["Mercury", 40, 4], ["Venus", 55, 7], ["Earth", 75, 12], ["Mars", 95, 20],
-    ["Jupiter", 130, 50], ["Saturn", 170, 80], ["Uranus", 210, 140], ["Neptune", 260, 250]] as [string, number, number][],
+  planets: [
+    ["Mercury", 40, 4],
+    ["Venus", 55, 7],
+    ["Earth", 75, 12],
+    ["Mars", 95, 20],
+    ["Jupiter", 130, 50],
+    ["Saturn", 170, 80],
+    ["Uranus", 210, 140],
+    ["Neptune", 260, 250],
+  ] as [string, number, number][],
   seasons: ["spring", "summer", "autumn", "winter"],
 }), ({ planets, seasons }) => {
   const now = Date.now();
   return {
     cols: [
-      { key: 0, name: "planet", type: "text" }, { key: 1, name: "distance", type: "int" },
-      { key: 2, name: "x", type: "int" }, { key: 3, name: "y", type: "int" },
-      { key: 4, name: "year", type: "percentage" }, { key: 5, name: "season", type: "text" },
+      { key: 0, name: "planet", type: "text" },
+      { key: 1, name: "distance", type: "int" },
+      { key: 2, name: "x", type: "int" },
+      { key: 3, name: "y", type: "int" },
+      { key: 4, name: "year", type: "percentage" },
+      { key: 5, name: "season", type: "text" },
     ],
     rows: planets.map(([name, dist, period]: [string, number, number]) => {
       const angle = (now / (period * 1000)) * 2 * Math.PI;
       const pct = (angle % (2 * Math.PI)) / (2 * Math.PI);
-      return { 0: name, 1: dist, 2: Math.round(dist * Math.cos(angle)), 3: Math.round(dist * Math.sin(angle)), 4: pct, 5: seasons[Math.floor(pct * 4) % 4] };
+      return {
+        0: name,
+        1: dist,
+        2: Math.round(dist * Math.cos(angle)),
+        3: Math.round(dist * Math.sin(angle)),
+        4: pct,
+        5: seasons[Math.floor(pct * 4) % 4],
+      };
     }),
   };
 });
 
 portal("cafe", 500, () => ({
   names: ["Ada", "Grace", "Alan", "Linus", "Matz", "Guido", "Bjarne", "Haskell", "Elm", "Rust"],
-  drinks: [["espresso", 3.5], ["latte", 5.0], ["cappuccino", 4.5], ["cortado", 4.0], ["cold brew", 4.5], ["matcha", 5.5], ["chai", 4.0], ["americano", 3.0]] as [string, number][],
+  drinks: [
+    ["espresso", 3.5],
+    ["latte", 5.0],
+    ["cappuccino", 4.5],
+    ["cortado", 4.0],
+    ["cold brew", 4.5],
+    ["matcha", 5.5],
+    ["chai", 4.0],
+    ["americano", 3.0],
+  ] as [string, number][],
   orders: [] as { customer: string; drink: string; price: number; wait: number; status: string; _t: number }[],
   tick: 0,
 }), (s) => {
   s.tick++;
   for (const o of s.orders) o.wait = s.tick - o._t;
-  if (Math.random() < 0.3) { const b = s.orders.find((o: { status: string }) => o.status === "ordered"); if (b) b.status = "brewing"; }
-  if (Math.random() < 0.3) { const r = s.orders.find((o: { status: string }) => o.status === "brewing"); if (r) r.status = "ready"; }
-  for (let i = s.orders.length - 1; i >= 0; i--) if (s.orders[i].status === "ready" && s.orders[i].wait > 6) s.orders.splice(i, 1);
+  if (Math.random() < 0.3) {
+    const b = s.orders.find((o: { status: string }) => o.status === "ordered");
+    if (b) b.status = "brewing";
+  }
+  if (Math.random() < 0.3) {
+    const r = s.orders.find((o: { status: string }) => o.status === "brewing");
+    if (r) r.status = "ready";
+  }
+  for (let i = s.orders.length - 1; i >= 0; i--)
+    if (s.orders[i].status === "ready" && s.orders[i].wait > 6) s.orders.splice(i, 1);
   if (Math.random() < 0.4 && s.orders.length < 8) {
     const [drink, price] = s.drinks[Math.floor(Math.random() * s.drinks.length)];
-    s.orders.push({ customer: s.names[Math.floor(Math.random() * s.names.length)], drink, price, wait: 0, status: "ordered", _t: s.tick });
+    s.orders.push({
+      customer: s.names[Math.floor(Math.random() * s.names.length)],
+      drink,
+      price,
+      wait: 0,
+      status: "ordered",
+      _t: s.tick,
+    });
   }
   const rank: Record<string, number> = { ordered: 0, brewing: 1, ready: 2 };
   const sorted = [...s.orders].sort((a, b) => (rank[a.status] ?? 3) - (rank[b.status] ?? 3));
   return {
     cols: [
-      { key: 0, name: "customer", type: "text" }, { key: 1, name: "drink", type: "text" },
-      { key: 2, name: "price", type: "usd" }, { key: 3, name: "wait", type: "int" }, { key: 4, name: "status", type: "text" },
+      { key: 0, name: "customer", type: "text" },
+      { key: 1, name: "drink", type: "text" },
+      { key: 2, name: "price", type: "usd" },
+      { key: 3, name: "wait", type: "int" },
+      { key: 4, name: "status", type: "text" },
     ],
     rows: sorted.map((o) => ({ 0: o.customer, 1: o.drink, 2: o.price, 3: o.wait, 4: o.status })),
   };
 });
 
-portal("forest", 1000, () =>
-  ["oak", "pine", "maple", "birch", "willow", "cedar", "elm", "ash", "cherry", "palm", "bamboo", "cactus"]
-    .map((name) => ({ name, age: Math.floor(Math.random() * 100), health: 0.5 + Math.random() * 0.5 })),
-(trees) => {
-  for (const t of trees) {
-    t.age++;
-    t.health = Math.max(0.05, Math.min(1.0, t.health + (Math.random() - 0.45) * 0.1));
-    if (Math.random() < 0.01) { t.age = 0; t.health = 0.3; }
-  }
-  return {
-    cols: [
-      { key: 0, name: "tree", type: "text" }, { key: 1, name: "age", type: "int" },
-      { key: 2, name: "height", type: "text" }, { key: 3, name: "health", type: "percentage" }, { key: 4, name: "status", type: "text" },
-    ],
-    rows: trees.map((t: { name: string; age: number; health: number }) => ({
-      0: t.name, 1: t.age, 2: ".".repeat(Math.min(20, Math.floor(t.age / 10))), 3: t.health,
-      4: t.age < 10 ? "seed" : t.age < 50 ? "sapling" : t.age < 200 ? "mature" : "ancient",
-    })),
-  };
-});
+portal(
+  "forest",
+  1000,
+  () =>
+    ["oak", "pine", "maple", "birch", "willow", "cedar", "elm", "ash", "cherry", "palm", "bamboo", "cactus"]
+      .map((name) => ({ name, age: Math.floor(Math.random() * 100), health: 0.5 + Math.random() * 0.5 })),
+  (trees) => {
+    for (const t of trees) {
+      t.age++;
+      t.health = Math.max(0.05, Math.min(1.0, t.health + (Math.random() - 0.45) * 0.1));
+      if (Math.random() < 0.01) {
+        t.age = 0;
+        t.health = 0.3;
+      }
+    }
+    return {
+      cols: [
+        { key: 0, name: "tree", type: "text" },
+        { key: 1, name: "age", type: "int" },
+        { key: 2, name: "height", type: "text" },
+        { key: 3, name: "health", type: "percentage" },
+        { key: 4, name: "status", type: "text" },
+      ],
+      rows: trees.map((t: { name: string; age: number; health: number }) => ({
+        0: t.name,
+        1: t.age,
+        2: ".".repeat(Math.min(20, Math.floor(t.age / 10))),
+        3: t.health,
+        4: t.age < 10 ? "seed" : t.age < 50 ? "sapling" : t.age < 200 ? "mature" : "ancient",
+      })),
+    };
+  },
+);
 
 portal("words", 200, () => {
   const targets = ["cat", "dog", "hi", "elm", "yes", "no", "go", "ok"];
@@ -625,14 +792,24 @@ portal("words", 200, () => {
     targets,
     target: targets[Math.floor(Math.random() * targets.length)],
     targetAge: 0,
-    monkeys: ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank"].map((name) => ({ name, attempt: "", match: 0, attempts: 0, best: 0 })),
+    monkeys: ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank"].map((name) => ({
+      name,
+      attempt: "",
+      match: 0,
+      attempts: 0,
+      best: 0,
+    })),
   };
 }, (s) => {
   s.targetAge++;
-  if (s.targetAge > 150) { s.target = s.targets[Math.floor(Math.random() * s.targets.length)]; s.targetAge = 0; }
+  if (s.targetAge > 150) {
+    s.target = s.targets[Math.floor(Math.random() * s.targets.length)];
+    s.targetAge = 0;
+  }
   let solved = false;
   for (const m of s.monkeys) {
-    m.attempt = Array.from({ length: s.target.length }, () => String.fromCharCode(97 + Math.floor(Math.random() * 26))).join("");
+    m.attempt = Array.from({ length: s.target.length }, () => String.fromCharCode(97 + Math.floor(Math.random() * 26)))
+      .join("");
     let hits = 0;
     for (let i = 0; i < s.target.length; i++) if (m.attempt[i] === s.target[i]) hits++;
     m.match = hits / s.target.length;
@@ -640,14 +817,28 @@ portal("words", 200, () => {
     if (m.match > m.best) m.best = m.match;
     if (m.match === 1) solved = true;
   }
-  if (solved) { s.target = s.targets[Math.floor(Math.random() * s.targets.length)]; s.targetAge = 0; for (const m of s.monkeys) m.best = 0; }
+  if (solved) {
+    s.target = s.targets[Math.floor(Math.random() * s.targets.length)];
+    s.targetAge = 0;
+    for (const m of s.monkeys) m.best = 0;
+  }
   return {
     cols: [
-      { key: 0, name: "monkey", type: "text" }, { key: 1, name: "target", type: "text" },
-      { key: 2, name: "attempt", type: "text" }, { key: 3, name: "match", type: "percentage" },
-      { key: 4, name: "attempts", type: "int" }, { key: 5, name: "best", type: "percentage" },
+      { key: 0, name: "monkey", type: "text" },
+      { key: 1, name: "target", type: "text" },
+      { key: 2, name: "attempt", type: "text" },
+      { key: 3, name: "match", type: "percentage" },
+      { key: 4, name: "attempts", type: "int" },
+      { key: 5, name: "best", type: "percentage" },
     ],
-    rows: s.monkeys.map((m: { name: string; attempt: string; match: number; attempts: number; best: number }) => ({ 0: m.name, 1: s.target, 2: m.attempt, 3: m.match, 4: m.attempts, 5: m.best })),
+    rows: s.monkeys.map((m: { name: string; attempt: string; match: number; attempts: number; best: number }) => ({
+      0: m.name,
+      1: s.target,
+      2: m.attempt,
+      3: m.match,
+      4: m.attempts,
+      5: m.best,
+    })),
   };
 });
 
@@ -680,21 +871,16 @@ app.post("/signup/:token{.+}", async (c) => {
   if (token !== (await createToken(email, new Date(epoch * 1000))))
     return c.json(null, 401);
   await sql`
-    insert into usr ${
-    sql({
-      email,
-      password: sql`crypt(${password}, gen_salt('bf', 8))` as unknown as string,
-    })
-  } 
-    on conflict do update set password = excluded.password
+    insert into usr ${sql({ email, password: await hashPassword(password) })}
+    on conflict (email) do update set password = excluded.password
   `;
   return c.json(null, 200);
 });
 
 app.post("/login", async (c) => {
   const { email, password } = await c.req.json();
-  const [usr] = await sql`select usr_id from usr where email = ${email} and crypt(${password}, password)`;
-  if (!usr) return c.json(null, 401);
+  const [usr] = await sql`select usr_id, password from usr where email = ${email}`;
+  if (!usr || !(await verifyPassword(password, usr.password))) return c.json(null, 401);
   return c.json(
     { data: { usr_id: usr.usr_id, jwt: await createJwt(usr.usr_id) } },
     200,
@@ -718,7 +904,7 @@ app.get("/shop", async (c) => {
         qs.name && sql`name ilike ${qs.name + "%"}`,
         qs.sell_type && sql`sell_type = ${qs.sell_type}`,
         qs.sell_price &&
-        sql`sell_price between ${qs.sell_type.split("-")[0]}::numeric and ${qs.sell_type.split("-")[1]}::numeric`,
+        sql`sell_price between ${qs.sell_price.split("-")[0]}::numeric and ${qs.sell_price.split("-")[1]}::numeric`,
       ],
       order: sql`order by name`,
       limit,
@@ -740,28 +926,52 @@ app.post("/net/:id", async (c) => {
   return c.json(null, 200);
 });
 
+// Reject loopback, private, link-local (incl. cloud metadata 169.254.169.254), CGNAT, and IPv6 ULA/link-local ranges.
+const ipBlocked = (ipRaw: string): boolean => {
+  const mapped = ipRaw.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  const ip = mapped ? mapped[1] : ipRaw;
+  if (ip.includes(".")) {
+    const [a, b] = ip.split(".").map(Number);
+    return a === 0 || a === 127 || a === 10 || a === 169 && b === 254 ||
+      a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 || a === 100 && b >= 64 && b <= 127;
+  }
+  const v6 = ip.toLowerCase();
+  return v6 === "::" || v6 === "::1" || /^f[cd]/.test(v6) || /^fe[89ab]/.test(v6);
+};
+
+// SSRF guard: block internal hosts by literal IP and by resolved DNS; follow redirects manually re-validating each hop.
+const safeFetch = async (start: string): Promise<Response> => {
+  let url = start;
+  for (let hop = 0; hop < 5; hop++) {
+    const u = new URL(url);
+    if (!["http:", "https:"].includes(u.protocol))
+      throw new HTTPException(400, { message: "Only HTTP(S) URLs allowed." });
+    const host = u.hostname.replace(/^\[|\]$/g, "");
+    if (host === "localhost" || host.endsWith(".local"))
+      throw new HTTPException(400, { message: "Internal URLs not allowed." });
+    const isLiteral = /^[0-9.]+$/.test(host) || host.includes(":");
+    const ips = isLiteral ? [host] : (await Promise.all(
+      (["A", "AAAA"] as const).map((t) => Deno.resolveDns(host, t).catch(() => [] as string[])),
+    )).flat();
+    if (ips.some(ipBlocked)) throw new HTTPException(400, { message: "Internal URLs not allowed." });
+    const res = await fetch(url, {
+      redirect: "manual",
+      headers: {
+        "User-Agent": "Scrapsheets/1.0",
+        "Accept": "application/json, application/xml, text/xml, application/atom+xml, */*",
+      },
+    });
+    const location = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+    if (!location) return res;
+    url = new URL(location, url).href;
+  }
+  throw new HTTPException(400, { message: "Too many redirects." });
+};
+
 // CORS proxy for external data sources (unauthenticated, rate-limited)
 app.get("/proxy", async (c) => {
   const url = c.req.query("url");
-  if (!url)
-    return c.json({ error: "Missing url parameter" }, 400);
-
-  // Validate URL
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return c.json({ error: "Invalid URL" }, 400);
-  }
-
-  // Only allow http/https
-  if (!["http:", "https:"].includes(parsed.protocol))
-    return c.json({ error: "Only HTTP(S) URLs allowed" }, 400);
-
-  // Block internal addresses
-  const blockedHosts = ["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"];
-  if (blockedHosts.includes(parsed.hostname) || parsed.hostname.endsWith(".local"))
-    return c.json({ error: "Internal URLs not allowed" }, 400);
+  if (!url) return c.json({ error: "Missing url parameter" }, 400);
 
   // Rate limit by IP
   const ip = c.req.header("x-forwarded-for")?.split(",")[0] || "unknown";
@@ -769,12 +979,7 @@ app.get("/proxy", async (c) => {
     return c.json({ error: "Rate limit exceeded" }, 429);
 
   try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": "Scrapsheets/1.0",
-        "Accept": "application/json, application/xml, text/xml, application/atom+xml, */*",
-      },
-    });
+    const res = await safeFetch(url);
     const contentType = res.headers.get("content-type") || "application/octet-stream";
     const body = await res.text();
     return c.text(body, res.status as 200, {
@@ -782,6 +987,7 @@ app.get("/proxy", async (c) => {
       "X-Proxy-Status": String(res.status),
     });
   } catch (err) {
+    if (err instanceof HTTPException) return c.json({ error: err.message }, err.status);
     return c.json({ error: `Fetch failed: ${err instanceof Error ? err.message : "Unknown error"}` }, 502);
   }
 });
@@ -794,7 +1000,7 @@ app.use("*", async (c, next) => {
 });
 
 app.post("/buy/:id", async (c) => {
-  const sheet_id = await sql.begin(async (sql) => {
+  const sheet_id = await sql.begin(async (sql: Sql) => {
     const [sheet] = await sql`select * from sheet where sell_id = ${
       c.req.param(
         "id",
@@ -839,12 +1045,16 @@ app.post("/sell/:id", async (c) => {
   const { price } = await c.req.json();
   if (price === undefined)
     throw new HTTPException(400, { message: "Price required." });
-  await sql`
-    update sheet set sell_price = ${price} 
+  const updated = await sql`
+    update sheet set sell_price = ${price}
     where true
-      and sheet_id = ${c.req.param("id")} 
+      and sheet_id = ${c.req.param("id")}
       and created_by = ${c.get("usr_id")}
+      and buy_price is null
+    returning sheet_id
   `;
+  if (!updated.length)
+    throw new HTTPException(400, { message: "Cannot sell this sheet. Purchased sheets cannot be resold." });
   return c.json(null, 200);
 });
 
@@ -1095,8 +1305,8 @@ app.post("/import/csv", async (c) => {
 });
 
 // CSV Export - downloads sheet data as CSV file
-app.get("/export/:id.csv", async (c) => {
-  const sheet_id = c.req.param("id");
+app.get("/export/:id{.+\\.csv}", async (c) => {
+  const sheet_id = c.req.param("id").replace(/\.csv$/, "");
   if (!sheet_id) throw new HTTPException(400, { message: "Sheet ID required." });
   const usr_id = c.get("usr_id");
 
@@ -1153,7 +1363,7 @@ app.get("/net/:id", async (c) => {
   const id = c.req.param("id");
   const sheet_id = id.includes(":")
     ? id
-    : await sql`select sheet_id from sheet where doc_id = ${id}`.then(([s]) => s?.sheet_id);
+    : await sql`select sheet_id from sheet where doc_id = ${id}`.then(([s]: [{ sheet_id: string }?]) => s?.sheet_id);
   if (!sheet_id) throw new HTTPException(404, { message: "Not found." });
   return page(c)(await sheet(c, sheet_id, c.req.query()));
 });
@@ -1169,12 +1379,13 @@ app.get("/codex/:id", async (c) => {
   const [type, _doc_id] = sheet_id.split(":");
   switch (type) {
     case "codex-db": {
-      const [db] = await sql`select pgp_sym_decrypt(dsn::bytea, ${DSN_KEY}) as dsn from db where sheet_id = ${sheet_id}`;
+      const [db] = await sql`select dsn from db where sheet_id = ${sheet_id}`;
       if (!db) {
         throw new HTTPException(400, {
           message: `No DSN found.`,
         });
       }
+      db.dsn = await decryptDsn(db.dsn);
       // Block connections to the application's own database
       const appDbUrl = Deno.env.get("DATABASE_URL") ?? "postgresql://postgres@127.0.0.1:5434/postgres";
       try {
@@ -1190,28 +1401,31 @@ app.get("/codex/:id", async (c) => {
         throw new HTTPException(400, { message: "Invalid DSN." });
       }
       const sql_ = pg(db.dsn, {
-        onnotice: (msg) => msg.severity !== "DEBUG" && console.log(msg),
+        onnotice: (msg: { severity?: string }) => msg.severity !== "DEBUG" && console.log(msg),
         connect_timeout: 5,
         idle_timeout: 10,
       });
-      await sql_`SET statement_timeout = '10s'`;
-      await sql_`SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`;
-      const rows = await sql_`
-        select 
-          table_name as name,
-          '[[{"name":"name","type":"text","key":"column_name"},{"name":"type","type":"text","key":"data_type"},{"name":"key","type":"int","key":"ordinal_position"}]]'::jsonb || jsonb_agg(t)::jsonb as columns
-        from information_schema.tables t
-        inner join information_schema.columns c using (table_catalog,table_schema,table_name)
-        where table_schema = 'public'
-        group by table_name, table_type
-      `;
-      const cols = rows.columns.map((col) => ({
-        name: col.name,
-        type: "text",
-        key: col.name,
-      })); // TODO:
-      await sql_.end();
-      return c.json({ data: [cols, ...rows] }, 200);
+      try {
+        await sql_`SET statement_timeout = '10s'`;
+        await sql_`SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`;
+        const rows = await sql_`
+          select
+            table_name as name,
+            '[[{"name":"name","type":"text","key":"column_name"},{"name":"type","type":"text","key":"data_type"},{"name":"key","type":"int","key":"ordinal_position"}]]'::jsonb || jsonb_agg(t)::jsonb as columns
+          from information_schema.tables t
+          inner join information_schema.columns c using (table_catalog,table_schema,table_name)
+          where table_schema = 'public'
+          group by table_name, table_type
+        `;
+        const cols = rows.columns.map((col: { name: string }) => ({
+          name: col.name,
+          type: "text",
+          key: col.name,
+        })); // TODO:
+        return c.json({ data: [cols, ...rows] }, 200);
+      } finally {
+        await sql_.end();
+      }
     }
     case "codex-scrapsheets": {
       return c.json(
@@ -1269,7 +1483,7 @@ app.post("/codex-db/:id", async (c) => {
   const dsn = await c.req.json();
   await sql`
     insert into db (sheet_id, dsn)
-    select ${sheet_id}, pgp_sym_encrypt(${dsn}, ${DSN_KEY})::text
+    select ${sheet_id}, ${await encryptDsn(dsn)}
     where exists (select true from sheet_usr su where (su.sheet_id,su.usr_id) = (${sheet_id},${
     c.get(
       "usr_id",
