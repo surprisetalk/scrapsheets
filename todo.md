@@ -15,8 +15,6 @@ Close the gaps that prevent daily use and public demo.
 - [ ] **Library examples**: ship a handful of real sheets that demo table/query/net/portal in the default library
 - [ ] **Keyboard shortcuts**: define and document key bindings; show a shortcut sheet in the library
 - [ ] **Tutorial**: guided first-run walkthrough from empty library to a working query sheet
-- [ ] **Edit-mode keys dead**: keyEventDecoder returns NoOp for INPUT/TEXTAREA, so Enter/Escape/Tab in the cell editor
-      and find box never fire; handle them with element-level `on "keydown"` instead (Main.elm:1142)
 
 ---
 

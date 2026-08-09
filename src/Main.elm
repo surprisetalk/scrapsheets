@@ -1051,6 +1051,8 @@ type Msg
     | SettingsNameChange String
     | SettingsTagsChange String
     | KeyDown KeyEvent
+    | EditCommitMove Int Int
+    | EditCancel
     | CellMouseClick
     | CellMouseDoubleClick String
     | CellMouseDown
@@ -1159,8 +1161,65 @@ keyEventDecoder =
         (D.at [ "target", "tagName" ] D.string |> D.maybe |> D.map (Maybe.withDefault ""))
 
 
+{-| Cell editor keys. The global onKeyDown ignores INPUT/SELECT focus, so
+Enter/Tab/Escape are handled here, on the editor element itself.
+-}
+onEditorKeydown : H.Attribute Msg
+onEditorKeydown =
+    A.preventDefaultOn "keydown"
+        (D.map2 Tuple.pair (D.field "key" D.string) (D.field "shiftKey" D.bool)
+            |> D.andThen
+                (\( key, shift ) ->
+                    case key of
+                        "Enter" ->
+                            D.succeed ( EditCommitMove 0 1, True )
+
+                        "Tab" ->
+                            D.succeed ( EditCommitMove (iif shift -1 1) 0, True )
+
+                        "Escape" ->
+                            D.succeed ( EditCancel, True )
+
+                        _ ->
+                            D.fail "unhandled"
+                )
+        )
+
+
+onFindKeydown : H.Attribute Msg
+onFindKeydown =
+    A.preventDefaultOn "keydown"
+        (D.field "key" D.string
+            |> D.andThen
+                (\key ->
+                    case key of
+                        "Enter" ->
+                            D.succeed ( FindNext, True )
+
+                        "Escape" ->
+                            D.succeed ( FindClose, True )
+
+                        _ ->
+                            D.fail "unhandled"
+                )
+        )
+
+
 
 ---- UPDATE -------------------------------------------------------------------
+
+
+tableBounds : Model -> TableBounds
+tableBounds model =
+    case model.sheet.doc of
+        Ok (Tab tbl) ->
+            { maxX = Array.length tbl.cols - 1, maxY = Array.length tbl.rows }
+
+        Ok Library ->
+            { maxX = Array.length libraryCols - 1, maxY = Dict.size model.library }
+
+        _ ->
+            { maxX = 0, maxY = 0 }
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -1374,29 +1433,32 @@ update msg ({ sheet, auth } as model) =
                                             ( forward, backward )
 
                                         ( rowY, Just col ) ->
-                                            -- Editing data cell (translate display row to document row)
-                                            let
-                                                docY =
-                                                    toDoc rowY
+                                            -- Editing data cell (translate display row to document row).
+                                            -- No write means a cancelled edit or a blur after cancel: leave the cell untouched.
+                                            case sheet.write of
+                                                Nothing ->
+                                                    ( [], [] )
 
-                                                oldValue =
-                                                    getOldValue docY col.key
+                                                Just write ->
+                                                    let
+                                                        docY =
+                                                            toDoc rowY
 
-                                                forward =
-                                                    [ { action = "set"
-                                                      , path = [ E.int docY, E.string col.key ]
-                                                      , value = sheet.write |> Maybe.map E.string |> Maybe.withDefault E.null
-                                                      }
-                                                    ]
+                                                        forward =
+                                                            [ { action = "set"
+                                                              , path = [ E.int docY, E.string col.key ]
+                                                              , value = E.string write
+                                                              }
+                                                            ]
 
-                                                backward =
-                                                    [ { action = "set"
-                                                      , path = [ E.int docY, E.string col.key ]
-                                                      , value = oldValue
-                                                      }
-                                                    ]
-                                            in
-                                            ( forward, backward )
+                                                        backward =
+                                                            [ { action = "set"
+                                                              , path = [ E.int docY, E.string col.key ]
+                                                              , value = getOldValue docY col.key
+                                                              }
+                                                            ]
+                                                    in
+                                                    ( forward, backward )
 
                                         _ ->
                                             ( [], [] )
@@ -2025,6 +2087,29 @@ update msg ({ sheet, auth } as model) =
                     , changeDoc { id = sheet.id, data = entry.forward }
                     )
 
+        EditCommitMove dx dy ->
+            -- Commit the in-progress edit to the current cell, then move the selection
+            let
+                ( committed, cmd ) =
+                    update (DocMsg (SheetWrite sheet.select.a)) model
+
+                cs =
+                    committed.sheet
+
+                bounds =
+                    tableBounds committed
+
+                sel =
+                    cs.select.a
+
+                newSel =
+                    xy (clamp 0 bounds.maxX (sel.x + dx)) (clamp 1 bounds.maxY (sel.y + dy))
+            in
+            ( { committed | sheet = { cs | select = Rect newSel newSel } }, cmd )
+
+        EditCancel ->
+            ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
+
         KeyDown event ->
             -- Handle global shortcuts first (Ctrl+F, Ctrl+H, Escape for find/replace)
             if (event.ctrl || event.meta) && event.key == "f" then
@@ -2050,30 +2135,11 @@ update msg ({ sheet, auth } as model) =
 
             else
                 let
-                    isEditing =
-                        sheet.write /= Nothing
-
-                    isFindOpen =
-                        sheet.findReplace /= Nothing
-
                     sel =
                         sheet.select.a
 
-                    -- Get table bounds for navigation
                     bounds =
-                        case sheet.doc of
-                            Ok (Tab tbl) ->
-                                { maxX = Array.length tbl.cols - 1
-                                , maxY = Array.length tbl.rows
-                                }
-
-                            Ok Library ->
-                                { maxX = Array.length libraryCols - 1
-                                , maxY = Dict.size model.library
-                                }
-
-                            _ ->
-                                { maxX = 0, maxY = 0 }
+                        tableBounds model
 
                     -- Move selection, clamping to bounds
                     move : Int -> Int -> ( Model, Cmd Msg )
@@ -2126,50 +2192,9 @@ update msg ({ sheet, auth } as model) =
                             _ ->
                                 ( model, Cmd.none )
                 in
-                if isEditing then
-                    -- When editing a cell
-                    case event.key of
-                    "Enter" ->
-                        -- Confirm edit and move down
-                        let
-                            newY =
-                                clamp 1 bounds.maxY (sel.y + 1)
-
-                            newSel =
-                                xy sel.x newY
-                        in
-                        ( { model | sheet = { sheet | select = Rect newSel newSel } }
-                        , Task.attempt (always NoOp) (Dom.blur "new-cell")
-                        )
-
-                    "Escape" ->
-                        -- Cancel edit (discard changes)
-                        ( { model | sheet = { sheet | write = Nothing } }
-                        , Cmd.none
-                        )
-
-                    "Tab" ->
-                        -- Confirm and move horizontally
-                        let
-                            dx =
-                                iif event.shift -1 1
-
-                            newX =
-                                clamp 0 bounds.maxX (sel.x + dx)
-
-                            newSel =
-                                xy newX sel.y
-                        in
-                        ( { model | sheet = { sheet | select = Rect newSel newSel } }
-                        , Task.attempt (always NoOp) (Dom.blur "new-cell")
-                        )
-
-                    _ ->
-                        ( model, Cmd.none )
-
-            else if sel.x < 0 || sel.y < 0 then
-                -- No selection yet, ignore navigation
-                ( model, Cmd.none )
+                if sel.x < 0 || sel.y < 0 then
+                    -- No selection yet, ignore navigation
+                    ( model, Cmd.none )
 
             else
                 -- When not editing, navigate with keys
@@ -2864,6 +2889,7 @@ viewFindReplace maybeFindReplace =
                         , A.value fr.findText
                         , A.onInput FindTextChange
                         , A.id "find-input"
+                        , onFindKeydown
                         , S.padding "0.25rem 0.5rem"
                         , S.border "1px solid #ccc"
                         , S.borderRadius "2px"
@@ -3378,14 +3404,14 @@ viewEditCell sheet col =
     case col.typ of
         Enum options ->
             [ H.select
-                [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%" ]
+                [ A.id "new-cell", onEditorKeydown, A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%" ]
                 (H.option [ A.value "" ] [ text "-- select --" ]
                     :: List.map (\opt -> H.option [ A.value opt, A.selected (Just opt == sheet.write) ] [ text opt ]) options
                 )
             ]
 
         _ ->
-            [ H.input [ A.id "new-cell", A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
+            [ H.input [ A.id "new-cell", onEditorKeydown, A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
 
 
 viewCell : Sheet -> Result String (Array Stat) -> Int -> Int -> Col -> Row -> Html Msg
