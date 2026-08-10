@@ -43,6 +43,7 @@ Make Scrapsheets reliable enough to be someone's primary data tool.
 
 Build the features that create network effects. This is where the spreadsheet OS vision comes alive.
 
+- [ ] 100 daily active users
 - [ ] **Scrapscript WASM runtime**: compile Scrapscript interpreter to WASM for browser execution
 - [ ] **Scrapscript query language**: wire up the existing `Scrapscript` lang type (Main.elm:380) to execute Scrapscript
       programs against sheet data

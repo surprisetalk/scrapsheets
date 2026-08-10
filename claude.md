@@ -68,7 +68,9 @@ technologies. It uses a hybrid architecture with:
 ### Frontend Architecture (src/Main.elm)
 
 - **Architecture**: Elm Architecture (Model-Update-View)
-- **Document types**: Library, Shop, Tab (table), Net, Query, Codex, Portal
+- **Document types**: Library, Shop, Tab (table), Query. Every other server type (net-_, portal, template, codex-_)
+  decodes to `Unviewable typ`, which the view reports as an error naming the type and a query that can read the sheet.
+  Give a type a real view by replacing its `Unviewable` branch in `docDecoder`.
 - **Real-time sync**: Ports for Automerge integration
 - **UI**: Table-based interface with cell editing, selection, and statistics
 - **Automerge loading**: `src/index.html` maps `@automerge/automerge` to the esm.sh slim build and calls

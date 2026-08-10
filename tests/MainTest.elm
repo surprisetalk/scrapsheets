@@ -3,6 +3,7 @@ module MainTest exposing (..)
 import Array
 import Dict
 import Expect
+import Json.Decode as D
 import Json.Encode as E
 import Main exposing (..)
 import Test exposing (..)
@@ -344,5 +345,41 @@ suite =
                         serializeToTsv []
                             |> Expect.equal ""
                 ]
+            ]
+        , describe "docDecoder"
+            [ test "net-http decodes to Unviewable, keeping its shape validated" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60}]}"""
+                        |> Expect.equal (Ok (Unviewable "net-http"))
+            , test "net-http without interval is still rejected" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test"}]}"""
+                        |> Result.toMaybe
+                        |> Expect.equal Nothing
+            , test "net-socket decodes to Unviewable" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"net-socket","data":[{"url":"wss://x.test"}]}"""
+                        |> Expect.equal (Ok (Unviewable "net-socket"))
+            , test "net-hook decodes to Unviewable" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"net-hook"}"""
+                        |> Expect.equal (Ok (Unviewable "net-hook"))
+            , test "portal decodes to Unviewable" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"portal","data":[]}"""
+                        |> Expect.equal (Ok (Unviewable "portal"))
+            , test "template decodes to Unviewable" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"template"}"""
+                        |> Expect.equal (Ok (Unviewable "template"))
+            , test "any codex-* type decodes to Unviewable" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"codex-db"}"""
+                        |> Expect.equal (Ok (Unviewable "codex-db"))
+            , test "an unrecognized type fails to decode" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"wat"}"""
+                        |> Result.toMaybe
+                        |> Expect.equal Nothing
             ]
         ]

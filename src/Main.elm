@@ -1,6 +1,7 @@
 port module Main exposing
     ( ClipboardData
     , ClipboardFormat(..)
+    , Doc(..)
     , Index
     , Rect
     , SortOrder(..)
@@ -8,6 +9,7 @@ port module Main exposing
     , clampIndex
     , detectFormat
     , displayYToDocY
+    , docDecoder
     , emptySheet
     , expandSelection
     , filterAndSortIndexed
@@ -647,9 +649,8 @@ type Doc
     = Library
     | Shop
     | Tab Table
-    | Net
     | Query Query_
-    | Portal
+    | Unviewable String
 
 
 type alias Table =
@@ -846,24 +847,27 @@ docDecoder =
                             D.map Tab tableDecoder
 
                     "net-hook" ->
-                        D.succeed Net
+                        D.succeed (Unviewable typ)
 
                     "portal" ->
                         D.field "data" <|
-                            D.succeed Portal
+                            D.succeed (Unviewable typ)
 
                     "net-socket" ->
                         D.field "data" <|
                             D.index 0 <|
-                                D.map (always Net)
+                                D.map (always (Unviewable typ))
                                     (D.field "url" D.string)
 
                     "net-http" ->
                         D.field "data" <|
                             D.index 0 <|
-                                D.map2 (\_ _ -> Net)
+                                D.map2 (\_ _ -> Unviewable typ)
                                     (D.field "url" D.string)
                                     (D.field "interval" D.int)
+
+                    "template" ->
+                        D.succeed (Unviewable typ)
 
                     "query" ->
                         D.field "data" <|
@@ -878,8 +882,12 @@ docDecoder =
                                         (D.maybe (D.field "cols" D.value) |> D.map (Maybe.withDefault (E.object [])))
                                     )
 
-                    typ_ ->
-                        D.fail ("Bad table type: " ++ typ_)
+                    _ ->
+                        if String.startsWith "codex-" typ then
+                            D.succeed (Unviewable typ)
+
+                        else
+                            D.fail ("Unknown sheet type: " ++ typ)
             )
 
 
@@ -3005,6 +3013,13 @@ resolveTable model =
         ( Ok (Tab tbl), _ ) ->
             Ok tbl
 
+        ( Ok (Unviewable typ), _ ) ->
+            Err
+                (typ
+                    ++ " sheets sync but have no view yet. Read this one from a query sheet with: select * from @"
+                    ++ model.sheet.id
+                )
+
         ( Ok Library, _ ) ->
             Ok
                 { cols = libraryCols
@@ -3029,7 +3044,8 @@ resolveTable model =
             Ok tbl
 
         ( Err err1, Err err2 ) ->
-            Err (err1 ++ " " ++ err2)
+            -- Both empty means nothing has loaded yet, which the view shows as "loading"
+            Err (String.trim (err1 ++ " " ++ err2))
 
         ( _, Err err ) ->
             Err err
