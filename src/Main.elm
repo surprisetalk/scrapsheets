@@ -294,7 +294,15 @@ parseJson jsonText =
                 [ D.string
                 , D.int |> D.map String.fromInt
                 , D.float |> D.map String.fromFloat
-                , D.bool |> D.map (\b -> if b then "true" else "false")
+                , D.bool
+                    |> D.map
+                        (\b ->
+                            if b then
+                                "true"
+
+                            else
+                                "false"
+                        )
                 , D.null ""
                 , D.value |> D.map (E.encode 0)
                 ]
@@ -2196,162 +2204,162 @@ update msg ({ sheet, auth } as model) =
                     -- No selection yet, ignore navigation
                     ( model, Cmd.none )
 
-            else
-                -- When not editing, navigate with keys
-                let
-                    -- Expand selection instead of moving when shift is held
-                    expand dx dy =
-                        let
-                            newSelect =
-                                expandSelection bounds dx dy sheet.select
-                        in
-                        ( { model | sheet = { sheet | select = newSelect } }, Cmd.none )
+                else
+                    -- When not editing, navigate with keys
+                    let
+                        -- Expand selection instead of moving when shift is held
+                        expand dx dy =
+                            let
+                                newSelect =
+                                    expandSelection bounds dx dy sheet.select
+                            in
+                            ( { model | sheet = { sheet | select = newSelect } }, Cmd.none )
 
-                    -- Get selected row indices for deletion (never the header/type rows y <= 0)
-                    selectedRows =
-                        let
-                            norm =
-                                normalizeRect sheet.select
-                        in
-                        List.range norm.a.y norm.b.y |> List.filter (\y -> y >= 1)
+                        -- Get selected row indices for deletion (never the header/type rows y <= 0)
+                        selectedRows =
+                            let
+                                norm =
+                                    normalizeRect sheet.select
+                            in
+                            List.range norm.a.y norm.b.y |> List.filter (\y -> y >= 1)
 
-                    -- Get selected column indices for deletion
-                    selectedCols =
-                        let
-                            norm =
-                                normalizeRect sheet.select
-                        in
-                        List.range norm.a.x norm.b.x
+                        -- Get selected column indices for deletion
+                        selectedCols =
+                            let
+                                norm =
+                                    normalizeRect sheet.select
+                            in
+                            List.range norm.a.x norm.b.x
 
-                    -- Get all selected cell indices for clearing (data rows only)
-                    selectedCells =
-                        rectToIndices sheet.select |> List.filter (\i -> i.y >= 1)
-                in
-                case event.key of
-                    "ArrowUp" ->
-                        if event.shift then
-                            expand 0 -1
+                        -- Get all selected cell indices for clearing (data rows only)
+                        selectedCells =
+                            rectToIndices sheet.select |> List.filter (\i -> i.y >= 1)
+                    in
+                    case event.key of
+                        "ArrowUp" ->
+                            if event.shift then
+                                expand 0 -1
 
-                        else
-                            move 0 -1
+                            else
+                                move 0 -1
 
-                    "ArrowDown" ->
-                        if event.shift then
-                            expand 0 1
+                        "ArrowDown" ->
+                            if event.shift then
+                                expand 0 1
 
-                        else
-                            move 0 1
+                            else
+                                move 0 1
 
-                    "ArrowLeft" ->
-                        if event.shift then
-                            expand -1 0
+                        "ArrowLeft" ->
+                            if event.shift then
+                                expand -1 0
 
-                        else
-                            move -1 0
+                            else
+                                move -1 0
 
-                    "ArrowRight" ->
-                        if event.shift then
-                            expand 1 0
+                        "ArrowRight" ->
+                            if event.shift then
+                                expand 1 0
 
-                        else
-                            move 1 0
+                            else
+                                move 1 0
 
-                    "Tab" ->
-                        move (iif event.shift -1 1) 0
+                        "Tab" ->
+                            move (iif event.shift -1 1) 0
 
-                    "Enter" ->
-                        -- Start editing current cell
-                        startEdit
+                        "Enter" ->
+                            -- Start editing current cell
+                            startEdit
 
-                    "Delete" ->
-                        -- Clear selected cells (or delete row if Ctrl)
-                        if event.ctrl || event.meta then
-                            update (DocMsg (SheetRowDelete selectedRows)) model
+                        "Delete" ->
+                            -- Clear selected cells (or delete row if Ctrl)
+                            if event.ctrl || event.meta then
+                                update (DocMsg (SheetRowDelete selectedRows)) model
 
-                        else
+                            else
+                                update (DocMsg (SheetClearCells selectedCells)) model
+
+                        "Backspace" ->
+                            -- Clear selected cells
                             update (DocMsg (SheetClearCells selectedCells)) model
 
-                    "Backspace" ->
-                        -- Clear selected cells
-                        update (DocMsg (SheetClearCells selectedCells)) model
+                        "a" ->
+                            -- Ctrl+A to select all
+                            if event.ctrl || event.meta then
+                                update SelectAll model
 
-                    "a" ->
-                        -- Ctrl+A to select all
-                        if event.ctrl || event.meta then
-                            update SelectAll model
+                            else
+                                -- Start editing with 'a'
+                                case sheet.doc of
+                                    Ok (Tab tbl) ->
+                                        case Array.get sel.x tbl.cols of
+                                            Just _ ->
+                                                ( { model | sheet = { sheet | write = Just "a" } }
+                                                , Task.attempt (always NoOp) (Dom.focus "new-cell")
+                                                )
 
-                        else
-                            -- Start editing with 'a'
-                            case sheet.doc of
-                                Ok (Tab tbl) ->
-                                    case Array.get sel.x tbl.cols of
-                                        Just _ ->
-                                            ( { model | sheet = { sheet | write = Just "a" } }
-                                            , Task.attempt (always NoOp) (Dom.focus "new-cell")
-                                            )
+                                            _ ->
+                                                ( model, Cmd.none )
 
-                                        _ ->
-                                            ( model, Cmd.none )
+                                    _ ->
+                                        ( model, Cmd.none )
 
-                                _ ->
-                                    ( model, Cmd.none )
+                        "Home" ->
+                            -- Jump to beginning of row, or top-left with Ctrl
+                            if event.ctrl || event.meta then
+                                let
+                                    newSel =
+                                        xy 0 1
+                                in
+                                ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
 
-                    "Home" ->
-                        -- Jump to beginning of row, or top-left with Ctrl
-                        if event.ctrl || event.meta then
-                            let
-                                newSel =
-                                    xy 0 1
-                            in
-                            ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
+                            else
+                                let
+                                    newSel =
+                                        xy 0 sel.y
+                                in
+                                ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
 
-                        else
-                            let
-                                newSel =
-                                    xy 0 sel.y
-                            in
-                            ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
+                        "End" ->
+                            -- Jump to end of row, or bottom-right with Ctrl
+                            if event.ctrl || event.meta then
+                                let
+                                    newSel =
+                                        xy bounds.maxX bounds.maxY
+                                in
+                                ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
 
-                    "End" ->
-                        -- Jump to end of row, or bottom-right with Ctrl
-                        if event.ctrl || event.meta then
-                            let
-                                newSel =
-                                    xy bounds.maxX bounds.maxY
-                            in
-                            ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
+                            else
+                                let
+                                    newSel =
+                                        xy bounds.maxX sel.y
+                                in
+                                ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
 
-                        else
-                            let
-                                newSel =
-                                    xy bounds.maxX sel.y
-                            in
-                            ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
+                        _ ->
+                            -- If it's a single printable character, start editing with it
+                            if String.length event.key == 1 && not event.ctrl && not event.meta then
+                                case sheet.doc of
+                                    Ok (Tab tbl) ->
+                                        let
+                                            col =
+                                                Array.get sel.x tbl.cols
+                                        in
+                                        case col of
+                                            Just c ->
+                                                -- Start editing with the typed character
+                                                ( { model | sheet = { sheet | write = Just event.key } }
+                                                , Task.attempt (always NoOp) (Dom.focus "new-cell")
+                                                )
 
-                    _ ->
-                        -- If it's a single printable character, start editing with it
-                        if String.length event.key == 1 && not event.ctrl && not event.meta then
-                            case sheet.doc of
-                                Ok (Tab tbl) ->
-                                    let
-                                        col =
-                                            Array.get sel.x tbl.cols
-                                    in
-                                    case col of
-                                        Just c ->
-                                            -- Start editing with the typed character
-                                            ( { model | sheet = { sheet | write = Just event.key } }
-                                            , Task.attempt (always NoOp) (Dom.focus "new-cell")
-                                            )
+                                            _ ->
+                                                ( model, Cmd.none )
 
-                                        _ ->
-                                            ( model, Cmd.none )
+                                    _ ->
+                                        ( model, Cmd.none )
 
-                                _ ->
-                                    ( model, Cmd.none )
-
-                        else
-                            ( model, Cmd.none )
+                            else
+                                ( model, Cmd.none )
 
         QueryEditorUpdate { cursorPos, textBeforeCursor } ->
             -- Handle special keyboard navigation signals
@@ -3234,28 +3242,60 @@ displayYToDocY search sheet rows y =
 typeAlign : Type -> H.Attribute Msg
 typeAlign typ =
     case typ of
-        Create -> S.textAlignRight
-        SheetId -> S.textAlignCenter
-        Boolean -> S.textAlignCenter
-        Usd -> S.textAlignRight
-        Number -> S.textAlignRight
-        Percentage -> S.textAlignRight
-        Delete -> S.textAlignCenter
-        Form _ -> S.textAlignCenter
-        _ -> S.textAlignLeft
+        Create ->
+            S.textAlignRight
+
+        SheetId ->
+            S.textAlignCenter
+
+        Boolean ->
+            S.textAlignCenter
+
+        Usd ->
+            S.textAlignRight
+
+        Number ->
+            S.textAlignRight
+
+        Percentage ->
+            S.textAlignRight
+
+        Delete ->
+            S.textAlignCenter
+
+        Form _ ->
+            S.textAlignCenter
+
+        _ ->
+            S.textAlignLeft
 
 
 typeWidth : Type -> H.Attribute Msg
 typeWidth typ =
     case typ of
-        Create -> S.widthRem 10
-        SheetId -> S.widthRem 3
-        Boolean -> S.widthRem 2
-        Number -> S.widthRem 5
-        Usd -> S.widthRem 5
-        Percentage -> S.widthRem 4
-        Delete -> S.widthRem 4
-        _ -> S.widthAuto
+        Create ->
+            S.widthRem 10
+
+        SheetId ->
+            S.widthRem 3
+
+        Boolean ->
+            S.widthRem 2
+
+        Number ->
+            S.widthRem 5
+
+        Usd ->
+            S.widthRem 5
+
+        Percentage ->
+            S.widthRem 4
+
+        Delete ->
+            S.widthRem 4
+
+        _ ->
+            S.widthAuto
 
 
 cellClasses : Sheet -> Int -> Int -> H.Attribute Msg
@@ -3275,13 +3315,19 @@ cellClasses sheet i n =
 
         isMatch =
             case sheet.findReplace of
-                Just fr -> List.member cellIdx fr.matches
-                Nothing -> False
+                Just fr ->
+                    List.member cellIdx fr.matches
+
+                Nothing ->
+                    False
 
         isCurrentMatch =
             case sheet.findReplace of
-                Just fr -> fr.matches |> List.drop fr.currentMatch |> List.head |> (==) (Just cellIdx)
-                Nothing -> False
+                Just fr ->
+                    fr.matches |> List.drop fr.currentMatch |> List.head |> (==) (Just cellIdx)
+
+                Nothing ->
+                    False
     in
     A.classList
         [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
@@ -3295,19 +3341,45 @@ cellDecoder : Type -> Int -> Int -> D.Decoder (Maybe (Html Msg))
 cellDecoder typ i n =
     D.maybe
         (case typ of
-            Unknown -> D.map text string
-            SheetId -> D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.overflowVisible, S.whiteSpaceNowrap, S.paddingRightRem 0.5 ] [ text "view" ])
-            Link -> D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.wordBreakKeepAll, S.hyphensNone ] [ text "link" ])
-            Image -> D.string |> D.map (\src -> H.img [ A.src src ] [])
-            Text -> D.map text string
-            Boolean -> boolean |> D.map (\c -> H.input [ A.type_ "checkbox", A.checked c, A.onCheck (DocMsg << CellCheck { x = i, y = n }) ] [])
-            Number -> D.oneOf [ D.map (text << String.fromFloat << round2) number, D.map text string ]
-            Usd -> D.oneOf [ D.map (text << usd) number, D.map text string ]
-            Percentage -> D.oneOf [ D.map (text << formatPercentage) number, D.map text string ]
-            Date -> D.map text string
-            Enum _ -> D.map text string
-            Delete -> D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])
-            Create -> D.value |> D.map (\val -> H.button [ A.onClick (DocNew val) ] [ text "add to library" ])
+            Unknown ->
+                D.map text string
+
+            SheetId ->
+                D.string |> D.map (\id -> H.a [ A.href ("/" ++ id), S.overflowVisible, S.whiteSpaceNowrap, S.paddingRightRem 0.5 ] [ text "view" ])
+
+            Link ->
+                D.string |> D.map (\href -> H.a [ A.href href, A.target "_blank", A.rel "noopener noreferrer", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.wordBreakKeepAll, S.hyphensNone ] [ text "link" ])
+
+            Image ->
+                D.string |> D.map (\src -> H.img [ A.src src ] [])
+
+            Text ->
+                D.map text string
+
+            Boolean ->
+                boolean |> D.map (\c -> H.input [ A.type_ "checkbox", A.checked c, A.onCheck (DocMsg << CellCheck { x = i, y = n }) ] [])
+
+            Number ->
+                D.oneOf [ D.map (text << String.fromFloat << round2) number, D.map text string ]
+
+            Usd ->
+                D.oneOf [ D.map (text << usd) number, D.map text string ]
+
+            Percentage ->
+                D.oneOf [ D.map (text << formatPercentage) number, D.map text string ]
+
+            Date ->
+                D.map text string
+
+            Enum _ ->
+                D.map text string
+
+            Delete ->
+                D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])
+
+            Create ->
+                D.value |> D.map (\val -> H.button [ A.onClick (DocNew val) ] [ text "add to library" ])
+
             Form _ ->
                 D.map3
                     (\method _ fields ->
@@ -3318,7 +3390,9 @@ cellDecoder typ i n =
                     (D.field "method" D.string)
                     (D.field "action" D.string)
                     (D.field "fields" (D.list (D.map (\label -> { label = label }) (D.field "label" D.string))))
-            _ -> D.map text string
+
+            _ ->
+                D.map text string
         )
 
 
@@ -3363,9 +3437,14 @@ viewHeaderCell sheet col =
             let
                 sortIndicator =
                     case sheet.sort of
-                        Just ( sortKey, Ascending ) -> iif (sortKey == col.key) " ▲" ""
-                        Just ( sortKey, Descending ) -> iif (sortKey == col.key) " ▼" ""
-                        Nothing -> ""
+                        Just ( sortKey, Ascending ) ->
+                            iif (sortKey == col.key) " ▲" ""
+
+                        Just ( sortKey, Descending ) ->
+                            iif (sortKey == col.key) " ▼" ""
+
+                        Nothing ->
+                            ""
 
                 hasFilter =
                     Dict.member col.key sheet.filters
@@ -3375,8 +3454,11 @@ viewHeaderCell sheet col =
 
                 currentFilterValue =
                     case Dict.get col.key sheet.filters of
-                        Just (TextContains v) -> v
-                        _ -> ""
+                        Just (TextContains v) ->
+                            v
+
+                        _ ->
+                            ""
             in
             [ H.div [ S.displayFlex, S.flexDirectionColumn, S.positionRelative ]
                 [ H.div [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ]
@@ -3390,9 +3472,11 @@ viewHeaderCell sheet col =
                         [ H.input [ A.placeholder "contains...", A.value currentFilterValue, A.onInput (FilterInput col.key), S.width "100%", S.padding "0.25rem", S.border "1px solid #ddd", S.borderRadius "2px", S.fontSizeRem 0.8 ] []
                         , if hasFilter then
                             H.button [ A.onClick (FilterClear col.key), S.marginTop "0.25rem", S.padding "0.25rem 0.5rem", S.fontSizeRem 0.7, S.background "#f0f0f0", S.border "1px solid #ccc", S.borderRadius "2px", S.cursorPointer ] [ text "Clear" ]
+
                           else
                             text ""
                         ]
+
                   else
                     text ""
                 ]
@@ -3421,10 +3505,17 @@ viewCell sheet stats i n col row =
         , A.onDoubleClick <|
             CellMouseDoubleClick <|
                 case String.fromInt n of
-                    "0" -> col.name
-                    "-1" -> typeName col.typ
-                    "-2" -> typeName col.typ
-                    _ -> row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
+                    "0" ->
+                        col.name
+
+                    "-1" ->
+                        typeName col.typ
+
+                    "-2" ->
+                        typeName col.typ
+
+                    _ ->
+                        row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
         , A.onMouseDown CellMouseDown
         , A.onMouseUp CellMouseUp
         , A.onMouseEnter (CellHover (xy i n))
@@ -3471,19 +3562,32 @@ viewTableRow : Sheet -> Doc -> Result String (Array Stat) -> Array Col -> Int ->
 viewTableRow sheet doc stats cols n row =
     H.tr
         [ case String.fromInt n of
-            "-2" -> S.backgroundColor "#ececec"
-            "-1" -> S.backgroundColor "#f6f6f6"
-            "0" -> S.backgroundColor "#f6f6f6"
-            _ -> S.backgroundColor "#fff"
+            "-2" ->
+                S.backgroundColor "#ececec"
+
+            "-1" ->
+                S.backgroundColor "#f6f6f6"
+
+            "0" ->
+                S.backgroundColor "#f6f6f6"
+
+            _ ->
+                S.backgroundColor "#fff"
         , case ( String.fromInt n, stats ) of
-            ( "-2", Err _ ) -> S.displayNone
-            _ -> S.displayTableRow
+            ( "-2", Err _ ) ->
+                S.displayNone
+
+            _ ->
+                S.displayTableRow
         ]
     <|
         List.indexedMap (\i col -> viewCell sheet stats i n col row) (Array.toList cols)
             ++ [ case doc of
-                    Tab _ -> H.th [ A.onClick (DocMsg SheetColumnPush), S.textAlignLeft, S.widthRem 0.001, S.whiteSpaceNowrap, S.opacity "0.5" ] [ text (iif (n == 0) "→" "") ]
-                    _ -> text ""
+                    Tab _ ->
+                        H.th [ A.onClick (DocMsg SheetColumnPush), S.textAlignLeft, S.widthRem 0.001, S.whiteSpaceNowrap, S.opacity "0.5" ] [ text (iif (n == 0) "→" "") ]
+
+                    _ ->
+                        text ""
                ]
 
 
@@ -3575,8 +3679,11 @@ viewToolbar model info =
               , text "/"
               ]
             , case model.auth.state of
-                LoggedIn { usrId } -> [ H.span [ A.onClick (AuthMsg AuthLogout), S.cursorPointer ] [ text ("user:" ++ usrId) ], text "/" ]
-                _ -> [ H.span [] [ text "anon" ], text "/" ]
+                LoggedIn { usrId } ->
+                    [ H.span [ A.onClick (AuthMsg AuthLogout), S.cursorPointer ] [ text ("user:" ++ usrId) ], text "/" ]
+
+                _ ->
+                    [ H.span [] [ text "anon" ], text "/" ]
             , iif (sheet.id == "")
                 [ H.span [] [ text "library" ] ]
                 [ H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ] ]
@@ -3624,7 +3731,9 @@ viewQueryEditor model query =
                 ]
             ]
         , case model.error of
-            "" -> text ""
+            "" ->
+                text ""
+
             err ->
                 H.div [ S.backgroundColor "#fee", S.borderTop "2px solid #c66", S.padding "0.75rem", S.fontFamily "monospace", S.fontSizeRem 0.75, S.whiteSpacePre, S.overflowXAuto, S.maxHeightRem 8, S.overflowYAuto ]
                     [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsStart ]
@@ -3634,6 +3743,7 @@ viewQueryEditor model query =
                     ]
         , if List.isEmpty sheetRefs then
             text ""
+
           else
             H.div [ S.padding "0.5rem 0.75rem", S.backgroundColor "#f0f0f0", S.borderTop "1px solid #ddd", S.fontSizeRem 0.7, S.color "#666" ]
                 [ H.span [ S.fontWeight "600" ] [ text "Sheet refs: " ]
@@ -3700,8 +3810,11 @@ view ({ sheet } as model) =
                 ]
             , H.aside [ A.id "aside", S.displayFlex, S.flexDirectionColumn, S.height "100%", S.backgroundColor "#fff" ] <|
                 case sheet.doc of
-                    Ok (Query query) -> [ viewQueryEditor model query ]
-                    _ -> []
+                    Ok (Query query) ->
+                        [ viewQueryEditor model query ]
+
+                    _ ->
+                        []
             ]
         ]
     }
