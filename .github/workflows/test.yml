@@ -28,6 +28,9 @@ jobs:
       - name: Type check
         run: deno check main.ts
 
+      - name: Elm review
+        run: deno task review
+
       - name: Run all tests (including backend)
         run: deno test --allow-all
         env:

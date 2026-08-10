@@ -31,13 +31,14 @@ technologies. It uses a hybrid architecture with:
 - **Development server**: `deno task dev`
 - **Run all tests**: `deno task test` (or `deno test --allow-all`; browser tests build dist themselves)
 - **Re-vendor automerge**: `deno task vendor` (after bumping the versions at the top of `vendor.ts`)
+- **Elm review**: `deno task review`. Runs clean with zero suppressions; keep it that way.
 - **Watch and build**: `watch src { try { cp -vu src/* dist ; elm make src/Main.elm --debug --output=dist/index.js } }`
 
 ### Elm Commands (via deno.json imports)
 
 - **Format Elm code**: `deno run -A npm:elm-format`
 - **Run Elm tests**: `deno run -A npm:elm-test`
-- **Elm review**: `deno run -A npm:elm-review`
+- **Elm review**: `deno task review` (also runs in CI)
 
 ### Database Setup
 
@@ -77,7 +78,8 @@ technologies. It uses a hybrid architecture with:
 ### Key Frontend Features
 
 - **Live editing**: In-place cell editing with type-aware rendering
-- **Statistics**: Real-time column statistics (numeric, text, enumeration)
+- **Statistics**: Real-time column statistics for Number/Usd (numeric) and Text (descriptive); other column types get no
+  stats
 - **Query interface**: Embedded SQL editor for query sheets
 - **Type system**: Rich type system including USD, links, images, forms
 

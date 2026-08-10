@@ -33,10 +33,8 @@ import Browser
 import Browser.Dom as Dom
 import Browser.Events as Browser
 import Browser.Navigation as Nav
-import Date exposing (Date)
 import Dict exposing (Dict)
 import File exposing (File)
-import File.Select as Select
 import Html as H exposing (Html, text)
 import Html.Attributes as A
 import Html.Events as A
@@ -44,8 +42,7 @@ import Html.Style as S
 import Http
 import Json.Decode as D
 import Json.Encode as E
-import Set exposing (Set)
-import Task exposing (Task)
+import Task
 import Url exposing (Url)
 import Url.Parser as UrlP exposing ((</>), (<?>))
 import Url.Parser.Query as UrlQ
@@ -420,9 +417,6 @@ port deleteDoc : String -> Cmd msg
 port changeDoc : Idd (List Patch) -> Cmd msg
 
 
-port notifyDoc : Idd E.Value -> Cmd msg
-
-
 port queryDoc : Idd { lang : String, code : String, cols : D.Value } -> Cmd msg
 
 
@@ -557,8 +551,7 @@ type alias SheetInfo =
 
 
 type Peers
-    = Private (Set Id)
-    | Public
+    = Public
 
 
 type alias Sheet =
@@ -624,11 +617,6 @@ type alias FindReplace =
 
 type Filter
     = TextContains String
-    | TextEquals String
-    | NumberGreaterThan Float
-    | NumberLessThan Float
-    | NumberBetween Float Float
-    | BooleanIs Bool
 
 
 type alias Svg =
@@ -645,8 +633,6 @@ type Stat
         , max : Maybe Float
         }
     | Enumerative
-        { histogram : Dict String Int
-        }
     | Descriptive
         { lengths : Dict Int Int
         , keywords : Dict String Int
@@ -661,10 +647,9 @@ type Doc
     = Library
     | Shop
     | Tab Table
-    | Net Net
+    | Net
     | Query Query_
-    | Codex
-    | Portal Args
+    | Portal
 
 
 type alias Table =
@@ -712,12 +697,6 @@ type alias Row =
     Dict String D.Value
 
 
-type Net
-    = Hook
-    | Http { url : String, interval : Int }
-    | Socket { url : String }
-
-
 type alias Args =
     Dict String Type
 
@@ -754,7 +733,7 @@ type
     | Image
     | Delete
     | Create
-    | Form (Dict String String)
+    | Form
     | Enum (List String)
 
 
@@ -806,7 +785,7 @@ typeName typ =
         Delete ->
             "delete"
 
-        Form _ ->
+        Form ->
             "form"
 
         Enum options ->
@@ -867,23 +846,22 @@ docDecoder =
                             D.map Tab tableDecoder
 
                     "net-hook" ->
-                        D.succeed (Net Hook)
+                        D.succeed Net
 
                     "portal" ->
                         D.field "data" <|
-                            D.map Portal <|
-                                D.succeed Dict.empty
+                            D.succeed Portal
 
                     "net-socket" ->
                         D.field "data" <|
                             D.index 0 <|
-                                D.map (\url -> Net (Socket { url = url }))
+                                D.map (always Net)
                                     (D.field "url" D.string)
 
                     "net-http" ->
                         D.field "data" <|
                             D.index 0 <|
-                                D.map2 (\url interval -> Net (Http { url = url, interval = interval }))
+                                D.map2 (\_ _ -> Net)
                                     (D.field "url" D.string)
                                     (D.field "interval" D.int)
 
@@ -937,7 +915,7 @@ colDecoder =
                 , ( "sheet_id", SheetId )
                 , ( "link", Link )
                 , ( "image", Image )
-                , ( "form", Form Dict.empty )
+                , ( "form", Form )
                 , ( "timestamp", Timestamp )
                 , ( "datetime", Timestamp )
                 , ( "date", Date )
@@ -1054,7 +1032,6 @@ type Msg
     | DocDelete Id
     | DocDeleteConfirm Id
     | DocDeleteCancel
-    | SettingsOpen
     | SettingsClose
     | SettingsNameChange String
     | SettingsTagsChange String
@@ -1068,7 +1045,6 @@ type Msg
     | CellHover Index
     | ColumnSort String
     | FilterToggle String
-    | FilterSet String Filter
     | FilterClear String
     | FilterInput String String
     | FindOpen Bool
@@ -1083,7 +1059,6 @@ type Msg
     | Redo
     | InputChange Input String
     | ShopFetch (Result Http.Error Table)
-    | CsvImportSelect
     | CsvImportFile File
     | CsvImportUpload String String
     | AuthMsg AuthMsg
@@ -1106,15 +1081,13 @@ type alias KeyEvent =
 
 
 type AuthMsg
-    = AuthEmailChange String
-    | AuthPasswordChange String
-    | AuthSubmit
+    = AuthSubmit
     | AuthLogout
 
 
 type DocMsg
     = SheetWrite Index
-    | SheetRowPush Int
+    | SheetRowPush
     | SheetColumnPush
     | SheetRowDelete (List Int)
     | SheetColumnDelete (List Int)
@@ -1135,7 +1108,7 @@ type Input
 
 
 subs : Model -> Sub Msg
-subs model =
+subs _ =
     Sub.batch
         [ librarySynced LibrarySync
         , docSelected DocSelect
@@ -1471,7 +1444,7 @@ update msg ({ sheet, auth } as model) =
                                         _ ->
                                             ( [], [] )
 
-                                SheetRowPush _ ->
+                                SheetRowPush ->
                                     let
                                         rowCount =
                                             Array.length table.rows + 1
@@ -1675,9 +1648,6 @@ update msg ({ sheet, auth } as model) =
         DocDeleteCancel ->
             ( { model | deleteConfirm = Nothing }, Cmd.none )
 
-        SettingsOpen ->
-            ( { model | showSettings = True }, Cmd.none )
-
         SettingsClose ->
             ( { model | showSettings = False }, Nav.replaceUrl model.nav ("/" ++ model.sheet.id) )
 
@@ -1705,9 +1675,6 @@ update msg ({ sheet, auth } as model) =
 
         ShopFetch x ->
             ( { model | sheet = { sheet | table = Result.mapError (always "Something went wrong.") x } }, Cmd.none )
-
-        CsvImportSelect ->
-            ( model, Select.file [ "text/csv", ".csv" ] CsvImportFile )
 
         CsvImportFile file ->
             ( model
@@ -1827,17 +1794,6 @@ update msg ({ sheet, auth } as model) =
                         Just key
             in
             ( { model | sheet = { sheet | filterOpen = newFilterOpen } }, Cmd.none )
-
-        FilterSet key filter ->
-            ( { model
-                | sheet =
-                    { sheet
-                        | filters = Dict.insert key filter sheet.filters
-                        , filterOpen = Nothing
-                    }
-              }
-            , Cmd.none
-            )
 
         FilterClear key ->
             ( { model
@@ -2272,7 +2228,7 @@ update msg ({ sheet, auth } as model) =
                             startEdit
 
                         "Delete" ->
-                            -- Clear selected cells (or delete row if Ctrl)
+                            -- Ctrl+Delete deletes the selected rows, plain Delete clears the cells
                             if event.ctrl || event.meta then
                                 update (DocMsg (SheetRowDelete selectedRows)) model
 
@@ -2280,8 +2236,13 @@ update msg ({ sheet, auth } as model) =
                                 update (DocMsg (SheetClearCells selectedCells)) model
 
                         "Backspace" ->
-                            -- Clear selected cells
-                            update (DocMsg (SheetClearCells selectedCells)) model
+                            -- Ctrl+Backspace deletes the selected columns. Ctrl+Shift+Delete would be
+                            -- the symmetric key, but Chrome keeps it for "Clear browsing data".
+                            if event.ctrl || event.meta then
+                                update (DocMsg (SheetColumnDelete selectedCols)) model
+
+                            else
+                                update (DocMsg (SheetClearCells selectedCells)) model
 
                         "a" ->
                             -- Ctrl+A to select all
@@ -2346,7 +2307,7 @@ update msg ({ sheet, auth } as model) =
                                                 Array.get sel.x tbl.cols
                                         in
                                         case col of
-                                            Just c ->
+                                            Just _ ->
                                                 -- Start editing with the typed character
                                                 ( { model | sheet = { sheet | write = Just event.key } }
                                                 , Task.attempt (always NoOp) (Dom.focus "new-cell")
@@ -2361,7 +2322,7 @@ update msg ({ sheet, auth } as model) =
                             else
                                 ( model, Cmd.none )
 
-        QueryEditorUpdate { cursorPos, textBeforeCursor } ->
+        QueryEditorUpdate { textBeforeCursor } ->
             -- Handle special keyboard navigation signals
             case textBeforeCursor of
                 "__NAV_DOWN__" ->
@@ -2470,12 +2431,6 @@ update msg ({ sheet, auth } as model) =
 
         AuthMsg authMsg ->
             case authMsg of
-                AuthEmailChange email ->
-                    ( { model | auth = { auth | email = email } }, Cmd.none )
-
-                AuthPasswordChange password ->
-                    ( { model | auth = { auth | password = password } }, Cmd.none )
-
                 AuthSubmit ->
                     if String.isEmpty auth.password then
                         -- Signup flow: send verification email
@@ -3036,7 +2991,7 @@ computeStats doc =
                                 computeTextStats tbl.rows col.key
 
                             _ ->
-                                Enumerative { histogram = Dict.empty }
+                                Enumerative
                     )
                     tbl.cols
 
@@ -3139,28 +3094,10 @@ applyFilter filter key row =
     let
         val =
             Dict.get key row |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
-
-        numVal =
-            String.toFloat val
     in
     case filter of
         TextContains substr ->
             String.contains (String.toLower substr) (String.toLower val)
-
-        TextEquals exact ->
-            String.toLower val == String.toLower exact
-
-        NumberGreaterThan n ->
-            Maybe.map (\v -> v > n) numVal |> Maybe.withDefault False
-
-        NumberLessThan n ->
-            Maybe.map (\v -> v < n) numVal |> Maybe.withDefault False
-
-        NumberBetween lo hi ->
-            Maybe.map (\v -> v >= lo && v <= hi) numVal |> Maybe.withDefault False
-
-        BooleanIs b ->
-            (String.toLower val == "true" || val == "1") == b
 
 
 matchesSearch : String -> Row -> Bool
@@ -3263,7 +3200,7 @@ typeAlign typ =
         Delete ->
             S.textAlignCenter
 
-        Form _ ->
+        Form ->
             S.textAlignCenter
 
         _ ->
@@ -3380,7 +3317,7 @@ cellDecoder typ i n =
             Create ->
                 D.value |> D.map (\val -> H.button [ A.onClick (DocNew val) ] [ text "add to library" ])
 
-            Form _ ->
+            Form ->
                 D.map3
                     (\method _ fields ->
                         H.form [ A.onSubmit NoOp, S.displayGrid, S.gridTemplateColumns "auto 1fr", S.paddingRem 1 ] <|
@@ -3603,8 +3540,8 @@ viewFilterBar sheet filteredCount totalCount =
             ]
 
 
-viewTableFooter : Sheet -> Array Col -> Int -> Html Msg
-viewTableFooter sheet cols rowCount =
+viewTableFooter : Sheet -> Array Col -> Html Msg
+viewTableFooter sheet cols =
     H.tfoot [] <|
         case sheet.doc of
             Ok Library ->
@@ -3626,8 +3563,8 @@ viewTableFooter sheet cols rowCount =
                        ]
 
             Ok (Tab _) ->
-                [ H.tr [ A.onClick (DocMsg (SheetRowPush rowCount)) ] <|
-                    List.indexedMap (\_ col -> H.td [ S.opacity "0.25" ] [ text (typeName col.typ) ]) (Array.toList cols)
+                [ H.tr [ A.onClick (DocMsg SheetRowPush) ] <|
+                    List.map (\col -> H.td [ S.opacity "0.25" ] [ text (typeName col.typ) ]) (Array.toList cols)
                         ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap, S.opacity "0.5" ] [ text "↴" ] ]
                 ]
 
@@ -3802,8 +3739,8 @@ view ({ sheet } as model) =
                                     , H.tbody [] <|
                                         Array.toList <|
                                             Array.indexedMap (\n_ row -> viewTableRow sheet doc stats cols (n_ - 2) row) <|
-                                                Array.append (Array.initialize 3 (always Dict.empty)) sortedRows
-                                    , viewTableFooter sheet cols (Array.length rows)
+                                                Array.append (Array.repeat 3 Dict.empty) sortedRows
+                                    , viewTableFooter sheet cols
                                     ]
                                 ]
                     ]
