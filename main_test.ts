@@ -309,6 +309,53 @@ Deno.test(async function allTests(_t) {
     assertEquals(lines[2], "Bob,25");
   }
 
+  // Proxy guards. Each rejection must name its own cause, never a bare status.
+  {
+    const proxy = async (url?: string) => {
+      const res = await app.request(
+        "/proxy" + (url === undefined ? "" : `?url=${encodeURIComponent(url)}`),
+      );
+      return { status: res.status, ...(await res.json()) };
+    };
+    assertEquals(await proxy(), { status: 400, error: "Missing url parameter" });
+    assertEquals(await proxy("ftp://example.com/x"), {
+      status: 400,
+      error: "Only HTTP(S) URLs allowed.",
+    });
+    for (
+      const url of [
+        "http://localhost/x",
+        "http://foo.local/x",
+        "http://127.0.0.1/x",
+        "http://169.254.169.254/latest/meta-data",
+      ]
+    ) {
+      assertEquals(await proxy(url), { status: 400, error: "Internal URLs not allowed." }, url);
+    }
+    const { status, error } = await proxy("notaurl");
+    assertEquals(status, 502);
+    assert(
+      error.includes("Invalid URL") && error.includes("notaurl"),
+      `A malformed url should say which url is malformed, got: ${error}`,
+    );
+  }
+
+  // Every seeded example must survive a visit with no ?q= param: a free-text
+  // search that interpolates a null @params builds a request its API rejects.
+  {
+    const lines = examplesSql.split("\n");
+    assert(
+      lines.filter((line) => line.includes("@params->('')")).length > 10,
+      "expected to find the seeded example queries",
+    );
+    assertEquals(
+      lines.flatMap((line, i) => /(?<!coalesce\()@params->\(''\)/.test(line) ? [i + 1] : []),
+      [],
+      `examples.sql interpolates @params->('') with no default on these lines, so opening ` +
+        `those sheets without ?q= sends an empty search term. Wrap it in coalesce(...).`,
+    );
+  }
+
   await sql.end();
   listener.close();
   await pglite.close();

@@ -475,6 +475,26 @@
             console.warn("SHEET() not yet implemented, returning empty result");
             return [];
           };
+          // Pull the origin's own words out of an error body so the message names a cause,
+          // not just a status code (arxiv hides it in <entry><summary>, most APIs in JSON).
+          const httpErrorDetail = (text, contentType) => {
+            if (/xml/.test(contentType)) {
+              const detail = new DOMParser()
+                .parseFromString(text, "text/xml")
+                .querySelector("entry > summary, error, message")
+                ?.textContent?.trim();
+              if (detail) return detail;
+            }
+            if (/json/.test(contentType)) {
+              try {
+                const body = JSON.parse(text);
+                const detail = body?.error?.info ?? body?.error?.message ?? body?.error ??
+                  body?.message;
+                if (detail) return typeof detail === "string" ? detail : JSON.stringify(detail);
+              } catch { /* not actually json; fall through to the raw body */ }
+            }
+            return text.trim().slice(0, 300) || "(empty body)";
+          };
           alasql.fn.http = (url, qs = {}) => {
             const atomToJson = (xmlString) => {
               const parser = new DOMParser();
@@ -522,9 +542,10 @@
             // Route external URLs through proxy to avoid CORS issues
             const apiBase = "https://api.sheets.scrap.land";
             const isExternal = !url.startsWith(window.location.origin) && !url.startsWith(apiBase);
+            const fullUrl = url + "?" + new URLSearchParams(qs);
             const targetUrl = isExternal
-              ? `${apiBase}/proxy?url=${encodeURIComponent(url + "?" + new URLSearchParams(qs))}`
-              : url + "?" + new URLSearchParams(qs);
+              ? `${apiBase}/proxy?url=${encodeURIComponent(fullUrl)}`
+              : fullUrl;
             const request = new XMLHttpRequest();
             request.open(
               "GET",
@@ -532,25 +553,52 @@
               false,
             ); // `false` makes the request synchronous
             request.send(null);
-            return {
-              status: request.status,
-              res: (
-                parsers?.[
-                  request
-                    .getResponseHeader("Content-Type")
-                    ?.replace(/;.*$/, "") || "application/json"
-                ] ?? JSON.parse
-              )?.(request.responseText) || null,
-            };
-          };
-          alasql.from.HTTP = (url, qs = {}) => {
-            const { status, res } = alasql.fn.http(url, qs);
-            if (status >= 400) {
-              const msg = res?.error || `HTTP ${status}`;
-              throw new Error(`Failed to fetch data: ${msg}`);
+            const contentType = request
+              .getResponseHeader("Content-Type")
+              ?.replace(/;.*$/, "") || "application/json";
+            if (!request.status)
+              throw new Error([
+                `I could not reach this server:`,
+                ``,
+                `  ${fullUrl}`,
+                ``,
+                `The request failed before a response arrived. The host may be down, or it`,
+                `may refuse cross-origin requests.`,
+              ].join("\n"));
+            // The proxy forwards the origin status verbatim, so X-Proxy-Status tells
+            // us whether the origin or the proxy itself rejected the request.
+            if (request.status >= 400)
+              throw new Error([
+                isExternal && !request.getResponseHeader("X-Proxy-Status")
+                  ? `The scrapsheets proxy rejected this request with ${request.status}:`
+                  : `This server responded with ${request.status}:`,
+                ``,
+                `  ${fullUrl}`,
+                ``,
+                `It said:`,
+                ``,
+                `  ${httpErrorDetail(request.responseText, contentType)}`,
+              ].join("\n"));
+            try {
+              return {
+                status: request.status,
+                res: (parsers[contentType] ?? JSON.parse)(request.responseText) || null,
+              };
+            } catch (err) {
+              throw new Error([
+                `This server sent ${contentType}, which I could not parse:`,
+                ``,
+                `  ${fullUrl}`,
+                ``,
+                `  ${err.message}`,
+                ``,
+                `The response starts with:`,
+                ``,
+                `  ${request.responseText.trim().slice(0, 200) || "(empty body)"}`,
+              ].join("\n"));
             }
-            return res;
           };
+          alasql.from.HTTP = (url, qs = {}) => alasql.fn.http(url, qs).res;
           // Parse SQL error to extract position info
           const parseQueryError = (error, code) => {
             const msg = error?.message || String(error);

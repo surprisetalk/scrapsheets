@@ -89,6 +89,64 @@ Deno.test("WASM file is served with correct headers", async () => {
   await server.finished;
 });
 
+// Test 2b: a 4xx from an origin must surface that origin's own words, not "HTTP 400".
+// Regression: `from http('https://export.arxiv.org/api/query', @{search_query:'all:'})`
+// used to report only `Failed to fetch data: HTTP 400`.
+Deno.test("a failing HTTP() names the url and the origin's error text", async () => {
+  const controller = new AbortController();
+  const arxivError = `<?xml version='1.0' encoding='UTF-8'?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>Error</title>
+    <summary>Either a search_query or id_list must be specified for the classic API.</summary>
+  </entry>
+</feed>`;
+  const server = Deno.serve(
+    { hostname: "127.0.0.1", port: 0, signal: controller.signal, onListen: () => {} },
+    (req) =>
+      new URL(req.url).pathname === "/api/query"
+        ? new Response(arxivError, {
+          status: 400,
+          headers: { "Content-Type": "application/atom+xml; charset=utf-8" },
+        })
+        : serveDir(req, { fsRoot: dir + "dist", quiet: true }),
+  );
+  const port = server.addr.port;
+
+  const browser = await launch({ args: ["--disable-web-security", "--incognito"] });
+  const page = await browser.newPage();
+  await page.goto(`http://127.0.0.1:${port}/`);
+  for (let i = 0; i < 100; i++) {
+    if (await page.evaluate(`typeof globalThis.alasql?.from?.HTTP === 'function'`)) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  const message = await page.evaluate(`(() => {
+    try {
+      alasql.from.HTTP("http://127.0.0.1:${port}/api/query", { search_query: "all:", max_results: 25 });
+      return "(HTTP() returned without throwing)";
+    } catch (err) { return err.message; }
+  })()`) as string;
+
+  for (
+    const want of [
+      "400",
+      "search_query=all%3A",
+      "Either a search_query or id_list must be specified",
+    ]
+  ) {
+    assertEquals(
+      message.includes(want),
+      true,
+      `error should mention ${JSON.stringify(want)}, got:\n${message}`,
+    );
+  }
+
+  await browser.close();
+  controller.abort();
+  await server.finished;
+});
+
 // Test 3: Basic page loads without fatal errors
 Deno.test("page loads, Elm initializes, and automerge boots", async () => {
   const controller = new AbortController();

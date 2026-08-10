@@ -166,7 +166,7 @@ from jsonb_to_recordset(replace($$[
     "cat": "text"
   },
   "code":
-  "\n  search entries / return (\n    id,\n    categories as cat,\n    title,\n    summary,\n    authors,\n    published,\n    updated\n  )\n  from http(\n    'https://export.arxiv.org/api/query',\n    @{search_query:('all:' || (@params->(''))), max_results:25}\n  )\n  "
+  "\n  search entries / return (\n    id,\n    categories as cat,\n    title,\n    summary,\n    authors,\n    published,\n    updated\n  )\n  from http(\n    'https://export.arxiv.org/api/query',\n    @{search_query:('all:' || coalesce(@params->(''),'example')), max_results:25}\n  )\n  "
 },
 
 {
@@ -177,7 +177,7 @@ from jsonb_to_recordset(replace($$[
     "url": "link"
   },
   "code":
-  "\n  search `query` pages / return (\n    thumbnail->source as thumb,\n    title,\n    fullurl as url\n  )\n  from http(\n    'https://en.wikipedia.org/w/api.php',\n    @{\n       action:'query',\n       generator:'search',\n       prop:'pageimages|info',\n       piprop:'thumbnail',\n       pithumbsize:100,\n       inprop:'url',\n       exintro:'',\n       explaintext:'',\n       `gsrsearch`:(@params->('')),\n       gsrlimit:25,\n       format:'json',\n       origin:'*'\n     }\n  )\n  "
+  "\n  search `query` pages / return (\n    thumbnail->source as thumb,\n    title,\n    fullurl as url\n  )\n  from http(\n    'https://en.wikipedia.org/w/api.php',\n    @{\n       action:'query',\n       generator:'search',\n       prop:'pageimages|info',\n       piprop:'thumbnail',\n       pithumbsize:100,\n       inprop:'url',\n       exintro:'',\n       explaintext:'',\n       `gsrsearch`:(coalesce(@params->(''),'example')),\n       gsrlimit:25,\n       format:'json',\n       origin:'*'\n     }\n  )\n  "
 },
 {
   "name": "reddit search",
@@ -201,7 +201,7 @@ from jsonb_to_recordset(replace($$[
     "dest_url": "link"
   },
   "code":
-  "\n  search data children / data return (\n    thumbnail,\n    title,\n    'https://old.reddit.com'||permalink as reddit_url,\n    url,\n    url_overridden_by_dest as dest_url,\n    domain,\n    post_hint as type,\n    ups,\n    downs,\n    is_self,\n    spoiler,\n    num_comments as comms,\n    author,\n    subreddit,\n    subreddit_subscribers as subs,\n    created\n  )\n  from http(\n    'https://www.reddit.com/search.json',\n    @{q:(@params->('')), limit:25}\n  )\n  "
+  "\n  search data children / data return (\n    thumbnail,\n    title,\n    'https://old.reddit.com'||permalink as reddit_url,\n    url,\n    url_overridden_by_dest as dest_url,\n    domain,\n    post_hint as type,\n    ups,\n    downs,\n    is_self,\n    spoiler,\n    num_comments as comms,\n    author,\n    subreddit,\n    subreddit_subscribers as subs,\n    created\n  )\n  from http(\n    'https://www.reddit.com/search.json',\n    @{q:(coalesce(@params->(''),'example')), limit:25}\n  )\n  "
 },
 
 {
@@ -246,7 +246,7 @@ from jsonb_to_recordset(replace($$[
     "pool": "text"
   },
   "code":
-  "\n  search / return (\n    url,\n    question,\n    creatorUsername,\n    createdTime,\n    closeTime,\n    resolutionTime,\n    resolution,\n    volume24Hours,\n    volume,\n    totalLiquidity,\n    uniqueBettorCount as uniqes,\n    pool\n  )\n  from http(\n    'https://api.manifold.markets/v0/search-markets',\n    @{term:(@params->('')), limit:25}\n  )\n  "
+  "\n  search / return (\n    url,\n    question,\n    creatorUsername,\n    createdTime,\n    closeTime,\n    resolutionTime,\n    resolution,\n    volume24Hours,\n    volume,\n    totalLiquidity,\n    uniqueBettorCount as uniqes,\n    pool\n  )\n  from http(\n    'https://api.manifold.markets/v0/search-markets',\n    @{term:(coalesce(@params->(''),'example')), limit:25}\n  )\n  "
 },
 
 {
@@ -282,7 +282,7 @@ from jsonb_to_recordset(replace($$[
     "tickers": "text"
   },
   "code":
-  "\n  search news / return (\n    link,\n    thumbnail->resolutions->(1)->url as thumb,\n    title,\n    publisher,\n    providerPublishTime as publishedAt,\n    relatedTickers as tickers\n  )\n  from http(\n    'https://corsproxy.io/?url=https://query1.finance.yahoo.com/v1/finance/search',\n    @{q:(@params->(''))}\n  )\n  "
+  "\n  search news / return (\n    link,\n    thumbnail->resolutions->(1)->url as thumb,\n    title,\n    publisher,\n    providerPublishTime as publishedAt,\n    relatedTickers as tickers\n  )\n  from http(\n    'https://corsproxy.io/?url=https://query1.finance.yahoo.com/v1/finance/search',\n    @{q:(coalesce(@params->(''),'example'))}\n  )\n  "
 },
 
 {
@@ -295,7 +295,7 @@ from jsonb_to_recordset(replace($$[
     "discord": "link"
   },
   "code":
-  "\n  search data / return (\n    weblink as url,\n    assets->`cover-tiny`->uri as thumb,\n    names->international as title,\n    `release-date` as release,\n    discord\n  )\n  from http('https://www.speedrun.com/api/v1/games', @{name:(@params->(''))})\n  "
+  "\n  search data / return (\n    weblink as url,\n    assets->`cover-tiny`->uri as thumb,\n    names->international as title,\n    `release-date` as release,\n    discord\n  )\n  from http('https://www.speedrun.com/api/v1/games', @{name:(coalesce(@params->(''),'example'))})\n  "
 },
 
 {
@@ -313,7 +313,7 @@ from jsonb_to_recordset(replace($$[
     "live": "link"
   },
   "code":
-  "\n  search data / return (\n    weblink as url,\n    assets->image->uri as thumb,\n    names->international as name,\n    location->region->code as location,\n    twitch->uri as twitch,\n    hitbox->uri as hitbox,\n    youtube->uri as youtube,\n    twitter->uri as twitter,\n    speedrunslive->uri as live,\n    signup\n  )\n  from http('https://www.speedrun.com/api/v1/users', @{name:(@params->(''))})\n  "
+  "\n  search data / return (\n    weblink as url,\n    assets->image->uri as thumb,\n    names->international as name,\n    location->region->code as location,\n    twitch->uri as twitch,\n    hitbox->uri as hitbox,\n    youtube->uri as youtube,\n    twitter->uri as twitter,\n    speedrunslive->uri as live,\n    signup\n  )\n  from http('https://www.speedrun.com/api/v1/users', @{name:(coalesce(@params->(''),'example'))})\n  "
 },
 
 {
@@ -328,7 +328,7 @@ from jsonb_to_recordset(replace($$[
     "genre": "text"
   },
   "code":
-  "\n  search results / return (\n    feedUrl,\n    trackViewUrl as trackUrl,\n    artworkUrl100,\n    artistName,\n    trackName,\n    primaryGenreName as genre,\n    releaseDate\n  )\n  from http(\n    'https://itunes.apple.com/search',\n    @{term:(@params->('')), media:'podcast', limit:25}\n  )\n  "
+  "\n  search results / return (\n    feedUrl,\n    trackViewUrl as trackUrl,\n    artworkUrl100,\n    artistName,\n    trackName,\n    primaryGenreName as genre,\n    releaseDate\n  )\n  from http(\n    'https://itunes.apple.com/search',\n    @{term:(coalesce(@params->(''),'example')), media:'podcast', limit:25}\n  )\n  "
 },
 
 {
@@ -345,7 +345,7 @@ from jsonb_to_recordset(replace($$[
     "contributors": "text"
   },
   "code":
-  "\n  search data `rows` / return (\n    repo_name as repo,\n    description as `desc`,\n    primary_language as lang,\n    contributor_logins as contributors,\n    stars,\n    forks,\n    pull_requests as prs,\n    pushes,\n    total_score\n  )\n  from http(\n    'https://api.ossinsight.io/v1/trends/repos',\n    @{keyword:(@params->(''))}\n  )\n  "
+  "\n  search data `rows` / return (\n    repo_name as repo,\n    description as `desc`,\n    primary_language as lang,\n    contributor_logins as contributors,\n    stars,\n    forks,\n    pull_requests as prs,\n    pushes,\n    total_score\n  )\n  from http(\n    'https://api.ossinsight.io/v1/trends/repos',\n    @{keyword:(coalesce(@params->(''),'example'))}\n  )\n  "
 }
 
 ]$$,$$
