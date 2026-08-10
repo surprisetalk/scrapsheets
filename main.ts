@@ -17,6 +17,7 @@ import * as prql from "prql-js";
 import * as path from "@std/path";
 
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
+const JWT_ALG = "HS256";
 const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
 const DSN_KEY = Deno.env.get("DSN_ENCRYPTION_KEY") ?? Math.random().toString();
 
@@ -329,6 +330,7 @@ export const createJwt = async (usr_id: string) =>
       exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7,
     },
     JWT_SECRET,
+    JWT_ALG,
   );
 
 export const createToken = async (
@@ -568,7 +570,7 @@ const verifyWsAuth = async (auth: string | undefined): Promise<string | null> =>
   if (!auth) return null;
   try {
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
-    const payload = await verify(token, JWT_SECRET);
+    const payload = await verify(token, JWT_SECRET, JWT_ALG);
     return payload.sub as string;
   } catch {
     return null;
@@ -992,7 +994,7 @@ app.get("/proxy", async (c) => {
   }
 });
 
-app.use("*", jwt({ secret: JWT_SECRET }));
+app.use("*", jwt({ secret: JWT_SECRET, alg: JWT_ALG }));
 
 app.use("*", async (c, next) => {
   c.set("usr_id", c.get("jwtPayload")?.sub);

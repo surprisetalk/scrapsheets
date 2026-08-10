@@ -20,6 +20,7 @@ technologies. It uses a hybrid architecture with:
 - `db.sql` - Database schema and initial data
 - `deno.json` - Dependencies and import map
 - `src/index.html` - Frontend HTML entry point
+- `vendor.ts` - Regenerates the browser-side automerge assets in `src/`
 - `data/automerge/` - Document storage directory
 
 ## Development Commands
@@ -29,6 +30,7 @@ technologies. It uses a hybrid architecture with:
 - **Build frontend**: `deno task build` (copies src/* to dist and runs elm make)
 - **Development server**: `deno task dev`
 - **Run all tests**: `deno task test` (or `deno test --allow-all`; browser tests build dist themselves)
+- **Re-vendor automerge**: `deno task vendor` (after bumping the versions at the top of `vendor.ts`)
 - **Watch and build**: `watch src { try { cp -vu src/* dist ; elm make src/Main.elm --debug --output=dist/index.js } }`
 
 ### Elm Commands (via deno.json imports)
@@ -68,6 +70,9 @@ technologies. It uses a hybrid architecture with:
 - **Document types**: Library, Shop, Tab (table), Net, Query, Codex, Portal
 - **Real-time sync**: Ports for Automerge integration
 - **UI**: Table-based interface with cell editing, selection, and statistics
+- **Automerge loading**: `src/index.html` maps `@automerge/automerge` to the esm.sh slim build and calls
+  `initializeWasm(fetch("/automerge.wasm"))`. The vendored `src/automerge-repo*.mjs` bundles must import automerge by
+  bare specifier, or the browser loads a second copy with no WASM. `deno task vendor` enforces this.
 
 ### Key Frontend Features
 

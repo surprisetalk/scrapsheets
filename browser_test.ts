@@ -52,6 +52,20 @@ Deno.test("index.html has correct WASM initialization", async () => {
   assertEquals(html.includes("new Repo"), true, "Should create a Repo instance");
 });
 
+// Test 1b: vendored bundles must defer to the import map for automerge
+Deno.test("vendored automerge bundles keep bare automerge specifiers", async () => {
+  for (const name of ["automerge-repo.mjs", "automerge-repo-ws.mjs", "automerge-repo-idb.mjs"]) {
+    const src = await Deno.readTextFile(dir + "src/" + name);
+    const bad = src.match(/"(\/npm\/[^"]*|[^"]*@automerge\/[^"]*@[\d.][^"]*)"/g);
+    assertEquals(
+      bad,
+      null,
+      `src/${name} must import automerge as a bare specifier so the import map picks the WASM-initialized copy. ` +
+        `Run \`deno task vendor\` to regenerate. Offending imports: ${bad?.join(", ")}`,
+    );
+  }
+});
+
 // Test 2: WASM file is served correctly
 Deno.test("WASM file is served with correct headers", async () => {
   const controller = new AbortController();
@@ -76,7 +90,7 @@ Deno.test("WASM file is served with correct headers", async () => {
 });
 
 // Test 3: Basic page loads without fatal errors
-Deno.test("page loads and Elm initializes", async () => {
+Deno.test("page loads, Elm initializes, and automerge boots", async () => {
   const controller = new AbortController();
   const server = Deno.serve(
     { hostname: "127.0.0.1", port: 0, signal: controller.signal, onListen: () => {} },
@@ -107,7 +121,19 @@ Deno.test("page loads and Elm initializes", async () => {
     (await page.evaluate(`typeof Elm !== 'undefined' && typeof Elm.Main !== 'undefined'`)) as boolean;
   assertEquals(elmMainExists, true, "Elm.Main should exist");
 
-  console.log("Page errors:", errors);
+  // window.__scrapsheets is only assigned after the module script imports
+  // @automerge/automerge, initializes the WASM, and constructs a Repo, so it is
+  // proof the whole vendored automerge graph in src/automerge* resolved.
+  const repoBooted = (await page.evaluate(
+    `typeof window.__scrapsheets?.repo?.find === 'function'`,
+  )) as boolean;
+  assertEquals(
+    repoBooted,
+    true,
+    `automerge Repo should be constructed on window.__scrapsheets.repo. Page errors: ${
+      errors.length ? errors.join(" | ") : "(none)"
+    }`,
+  );
 
   await browser.close();
   controller.abort();
