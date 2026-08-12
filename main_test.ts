@@ -128,8 +128,8 @@ Deno.test(async function allTests(_t) {
     assertEquals(req!.headers.get("authorization"), "Bearer re_test_key");
     const body = await req!.json();
     assertEquals(body.to, "dave@example.com");
-    assertEquals(body.from, "hello@scrap.land");
-    assert(body.text.includes("/password?email=dave%40example.com&token="));
+    assertEquals(body.from, "hello@sheets.scrap.land");
+    assert(body.text.includes("https://sheets.scrap.land/password?email=dave%40example.com&token="));
   }
 
   {

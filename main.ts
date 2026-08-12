@@ -387,13 +387,13 @@ const sendVerificationEmail = async (email: string) => {
     },
     body: JSON.stringify({
       to: email,
-      from: "hello@scrap.land",
+      from: "hello@sheets.scrap.land",
       subject: "Verify your email",
       text: `` +
         `Welcome to scrap.land` +
         `\n\n` +
         `Please verify your email: ` +
-        `https://scrap.land/password` +
+        `https://sheets.scrap.land/password` +
         `?email=${encodeURIComponent(email)}` +
         `&token=${encodeURIComponent(token)}`,
     }),
