@@ -16,6 +16,7 @@
     "review/",
     "tui/",
     "src/automerge*",
+    "src/examples.mjs",
     "src/index.html",
     "src/style.css",
     "elm.json"

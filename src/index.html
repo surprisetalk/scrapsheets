@@ -34,6 +34,7 @@
       import { Repo } from "@automerge/automerge-repo";
       import { IndexedDBStorageAdapter } from "/automerge-repo-idb.mjs";
       import { BrowserWebSocketClientAdapter } from "/automerge-repo-ws.mjs";
+      import { Col, EXAMPLES, Table } from "/examples.mjs";
 
       function debounce(func, timeout = 300) {
         let timer;
@@ -48,8 +49,16 @@
       try {
         const app = Elm.Main.init({
           node: document.getElementById("elm"),
-          flags: {},
+          flags: {
+            tutorial: ((v) => (Number.isFinite(v) ? v : 0))(
+              parseInt(localStorage.getItem("scrapsheets-tutorial") ?? "0", 10),
+            ),
+          },
         });
+
+        app.ports.saveTutorial.subscribe((n) =>
+          localStorage.setItem("scrapsheets-tutorial", String(n)),
+        );
 
         // Debug logging - set localStorage.debug = 'scrapsheets' to enable verbose logging
         const VERBOSE = localStorage.getItem('debug')?.includes('scrapsheets');
@@ -77,36 +86,34 @@
           };
         }
 
-        const Col = (val, key) => {
-          const [name, type] = val.split("::");
-          return {
-            name: name,
-            type: type ?? "text",
-            key: key.toString(),
-          };
+        const docThumb = (doc) => {
+          if (doc?.type !== "table" || !Array.isArray(doc.data))
+            return { kind: doc?.type ?? "unknown", cols: 0, rows: 0, spark: [] };
+          const cols = Object.values(doc.data[0] ?? {});
+          let spark = [];
+          for (const col of cols) {
+            const nums = doc.data
+              .slice(1, 21)
+              .map((row) => parseFloat(row[col.key]))
+              .filter(Number.isFinite);
+            if (nums.length < 3) continue;
+            const take = nums.slice(0, 16);
+            const min = Math.min(...take);
+            const max = Math.max(...take);
+            spark = take.map((n) =>
+              Math.round((max === min ? 0.5 : (n - min) / (max - min)) * 1000) / 1000,
+            );
+            break;
+          }
+          return { kind: "table", cols: cols.length, rows: doc.data.length - 1, spark };
         };
 
-        const Table = (cols, ...rows) => ({
-          type: "table",
-          data: [cols, ...rows],
-        });
-
-        const QuerySql = (cols, code, ...examples) => ({
-          type: "query",
-          data: [
-            {
-              lang: "sql",
-              code,
-              cols,
-              args: {},
-              examples,
-            },
-          ],
-        });
-
         const Library = {
+          // Memoized: docThumb over the bundled datasets is too costly per call.
+          cache: null,
           get: () => {
-            return {
+            if (Library.cache) return Library.cache;
+            const merged = {
               ...JSON.parse(
                 localStorage.getItem("scrapsheets-library") ?? "{}",
               ),
@@ -124,18 +131,28 @@
                 ["time","stonks","dice","orbit","cafe","forest","words"]
                   .map(p => [`portal:${p}`, { name: `${p} demo`, system: true, doc: { type: "portal", data: null } }])
               ),
+              ...EXAMPLES,
               "table:tutorial": {
                 name: "tutorial",
-                scratch: true,
                 system: true,
                 doc: Table(
-                  ["text::text", "examples::text"].map(Col),
-                  ["chapter 1", []],
-                  ["chapter 2", []],
-                  ["chapter 3", []],
+                  ["step::text", "how::text"].map(Col),
+                  ["create a table", "click table:... below"],
+                  ["edit a cell", "click a cell and type"],
+                  ["create a query", "click query:... below"],
+                  ["reference a sheet with @", "type @ in the editor and pick a table"],
+                  ["see live results", "try: select * from @table:countries limit 5"],
                 ),
               },
             };
+            return Library.cache = Object.fromEntries(
+              Object.entries(merged).map(([id, entry]) => [
+                id,
+                entry.doc && !entry.thumb
+                  ? { ...entry, thumb: docThumb(entry.doc) }
+                  : entry,
+              ]),
+            );
           },
           set: (id, info) => {
             for (const i in info) if (info[i] === null) delete info[i];
@@ -149,6 +166,7 @@
                 [id]: { ...library[id], ...info },
               }),
             );
+            Library.cache = null;
             app.ports.librarySynced.send(Library.get());
           },
           delete: (id) => {
@@ -159,6 +177,7 @@
               "scrapsheets-library",
               JSON.stringify({ ...library, [id]: undefined }),
             );
+            Library.cache = null;
             app.ports.librarySynced.send(Library.get());
           },
         };
@@ -470,10 +489,59 @@
           ) {
             alasql.fn[type] = (data) => ({ type, data });
           }
-          alasql.from.SHEET = (id, params = {}) => {
-            // TODO: Grab sheet (e.g. portal) with given params.
-            console.warn("SHEET() not yet implemented, returning empty result");
-            return [];
+          // @type:doc_id references resolve in two steps: resolveSheets rewrites
+          // them to SHEET('id') and pre-loads each doc (repo.find is async but
+          // alasql from-functions are synchronous), then SHEET serves the rows.
+          const sheetCache = new Map();
+          const toRecords = ([cols, ...rows]) =>
+            rows.map((row) => Object.fromEntries(Object.values(cols).map((c) => [c.name, row[c.key]])));
+          alasql.from.SHEET = (id, opts, cb, idx, query) => {
+            let res = sheetCache.get(id) ??
+              (Library.get()[id]?.doc?.data && toRecords(Library.get()[id].doc.data));
+            if (!res) {
+              throw new Error([
+                `I could not load the sheet "${id}".`,
+                ``,
+                `Reference it as @${id} so it loads before the query runs.`,
+              ].join("\n"));
+            }
+            if (cb) res = cb(res, idx, query);
+            return res;
+          };
+          const resolveSheets = async (code, depth = 0) => {
+            if (depth > 2) throw new Error("Query references nested too deeply (max 2 levels of @query).");
+            let out = "";
+            let inStr = false;
+            const ids = [];
+            for (let i = 0; i < code.length; i++) {
+              const ch = code[i];
+              if (ch === "'") inStr = !inStr;
+              const ref = !inStr && ch === "@" ? code.slice(i).match(/^@[a-z-]+:[A-Za-z0-9._-]+/)?.[0] : undefined;
+              if (ref) {
+                ids.push(ref.slice(1));
+                out += `SHEET('${ref.slice(1)}')`;
+                i += ref.length - 1;
+              } else out += ch;
+            }
+            for (const id of new Set(ids)) {
+              const [type, ref_id] = id.split(":");
+              if (!["table", "query"].includes(type)) {
+                throw new Error(`@${id}: only table and query sheets can be referenced in queries.`);
+              }
+              const doc = Library.get()[id]?.doc ??
+                (await repo.find(ref_id).then(async (h) => (await h.whenReady?.(), h.doc())));
+              if (!doc?.data) throw new Error(`@${id}: this sheet has no data.`);
+              sheetCache.set(
+                id,
+                type === "query"
+                  ? (await alasql([
+                    [`set @params = ?`, [{ "": null }]],
+                    await resolveSheets(doc.data[0].code, depth + 1),
+                  ]))[1].data
+                  : toRecords(doc.data),
+              );
+            }
+            return out;
           };
           // Pull the origin's own words out of an error body so the message names a cause,
           // not just a status code (arxiv hides it in <entry><summary>, most APIs in JSON).
@@ -670,7 +738,7 @@
                       ) ?? { "": null };
                     const [, { columns: cols, data: rows } = {}] = await alasql([
                       [`set @params = ?`, [params]],
-                      code,
+                      await resolveSheets(code),
                     ]);
                     // TODO: If doc contains cols data, use that names and types.
                     app.ports.docQueried.send({
@@ -698,6 +766,12 @@
           app.ports.queryDoc.subscribe(({ id, data }) => queryDoc(id, data));
 
           let ws;
+          let netInterval;
+          const storedThumb = (id, doc) => {
+            if (JSON.parse(localStorage.getItem("scrapsheets-library") ?? "{}")[id])
+              Library.set(id, { thumb: docThumb(doc) });
+          };
+          const storedThumbDebounced = debounce(storedThumb, 500);
           const selectDoc = catchy(async (id, sheetHandle) => {
             const [type, doc_id] = id.split(":");
             debug.log('selectDoc:', id);
@@ -728,6 +802,7 @@
               id,
               data: { doc: doc && { ...doc } },
             });
+            storedThumb(id, doc);
             if (!type || !doc_id) return;
             if (type === "query") queryDoc(id, doc.data[0]);
             sheetHandle?.on?.("change", (data) => {
@@ -736,6 +811,7 @@
                 data,
               });
               if (type === "query") queryDoc(id, data.doc.data[0]);
+              storedThumbDebounced(id, data.doc);
             });
             if (type === "portal") {
               const portalUrl = `wss://api.sheets.scrap.land/${type}/${doc_id}/sync`;
@@ -777,16 +853,74 @@
               };
               connect();
             }
+            if (type.startsWith("net-")) {
+              const fetchNet = catchy(async () => {
+                const token = getAuthToken();
+                if (!token) {
+                  app.ports.docQueried.send({
+                    id,
+                    data: [[
+                      { key: "created_at", name: "created_at", type: "timestamp" },
+                      { key: "body", name: "body", type: "json" },
+                    ]],
+                  });
+                  return;
+                }
+                const res = await fetch(`https://api.sheets.scrap.land/net/${id}`, {
+                  headers: { Authorization: `Bearer ${token}` },
+                });
+                if (!res.ok) {
+                  throw new Error(
+                    `Could not load net data (${res.status}): ${httpErrorDetail(
+                      await res.text(),
+                      res.headers.get("Content-Type") ?? "",
+                    )}`,
+                  );
+                }
+                const body = await res.json();
+                app.ports.docQueried.send({
+                  id,
+                  data: [Object.values(body.data[0]), ...body.data.slice(1)],
+                });
+              }, 'fetchNet');
+              fetchNet();
+              netInterval = setInterval(fetchNet, 10000);
+              if (type === "net-socket") {
+                const url = doc.data?.[0]?.url ?? "";
+                const notify = (message) =>
+                  app.ports.docNotified.send({
+                    id,
+                    data: { type: "net-status", message },
+                  });
+                if (/^wss?:\/\//.test(url)) {
+                  ws = new WebSocket(url);
+                  ws.onopen = () => notify("connected");
+                  ws.onclose = () => notify("disconnected");
+                  ws.onerror = () => notify(`error connecting to ${url}`);
+                } else if (url) {
+                  notify("url must start with ws:// or wss://");
+                }
+              }
+            }
           }, 'selectDoc');
 
           const changeId = catchy(async (id) => {
             const [type, doc_id = ""] = id.split(":");
             if (doc_id === sheet?.documentId) return;
             ws?.close?.();
+            clearInterval(netInterval);
 
             debug.log('changeId:', id);
 
             if (!doc_id) {
+              sheet = null;
+              await selectDoc(id, null);
+              return;
+            }
+
+            // System sheets (bundled examples, tutorial, portals) live in the
+            // library entry itself; their ids are not automerge document ids.
+            if (Library.get()[id]?.doc) {
               sheet = null;
               await selectDoc(id, null);
               return;
@@ -850,7 +984,11 @@
 
               // Save to localStorage and register with server
               Library.set(id, { name: name ?? "", tags: [] });
-              await registerDocWithRetry(id, name);
+              const registered = await registerDocWithRetry(id, name);
+              if (!registered)
+                app.ports.docErrored.send(
+                  `This sheet was created locally but the server rejected its registration, so it will not sync or receive data. Reload and try again.`,
+                );
 
               // Load document without page reload (key fix: keeps sheet handle in memory)
               window.history.pushState({}, '', `/${id}`);

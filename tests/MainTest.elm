@@ -347,23 +347,27 @@ suite =
                 ]
             ]
         , describe "docDecoder"
-            [ test "net-http decodes to Unviewable, keeping its shape validated" <|
+            [ test "net-http decodes url and interval, headers default to empty" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60}]}"""
-                        |> Expect.equal (Ok (Unviewable "net-http"))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "" }))
+            , test "net-http decodes a headers string" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"headers":"X-Key: abc"}]}"""
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "X-Key: abc" }))
             , test "net-http without interval is still rejected" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test"}]}"""
                         |> Result.toMaybe
                         |> Expect.equal Nothing
-            , test "net-socket decodes to Unviewable" <|
+            , test "net-socket decodes its url" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-socket","data":[{"url":"wss://x.test"}]}"""
-                        |> Expect.equal (Ok (Unviewable "net-socket"))
-            , test "net-hook decodes to Unviewable" <|
+                        |> Expect.equal (Ok (NetSocket { url = "wss://x.test" }))
+            , test "net-hook decodes" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-hook"}"""
-                        |> Expect.equal (Ok (Unviewable "net-hook"))
+                        |> Expect.equal (Ok NetHook)
             , test "portal decodes to Unviewable" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"portal","data":[]}"""
@@ -381,5 +385,20 @@ suite =
                     D.decodeString docDecoder """{"type":"wat"}"""
                         |> Result.toMaybe
                         |> Expect.equal Nothing
+            ]
+        , describe "shortcutGroups"
+            [ test "is non-empty and every group has non-empty key/description pairs" <|
+                \_ ->
+                    shortcutGroups
+                        |> Expect.all
+                            [ List.isEmpty >> Expect.equal False
+                            , List.all
+                                (\( group, keys ) ->
+                                    (group /= "")
+                                        && not (List.isEmpty keys)
+                                        && List.all (\( key, description ) -> key /= "" && description /= "") keys
+                                )
+                                >> Expect.equal True
+                            ]
             ]
         ]

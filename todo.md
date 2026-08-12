@@ -4,20 +4,6 @@
 
 ---
 
-## Phase 0 — Patch
-
-Close the gaps that prevent daily use and public demo.
-
-- [ ] **Codebase refactor**: the code has grown stale; consolidate before building on top of it
-- [ ] **Automerge WebSocket adapter**: replace custom HonoWebSocketAdapter with official NodeWebSocketAdapter
-      (main.ts:465)
-- [ ] **Sheet preview thumbnails**: generate mini sparkline/heatmap SVG for library view (Main.elm:335)
-- [ ] **Library examples**: ship a handful of real sheets that demo table/query/net/portal in the default library
-- [ ] **Keyboard shortcuts**: define and document key bindings; show a shortcut sheet in the library
-- [ ] **Tutorial**: guided first-run walkthrough from empty library to a working query sheet
-
----
-
 ## Phase 1 — Foundation
 
 Make Scrapsheets reliable enough to be someone's primary data tool.
@@ -27,15 +13,6 @@ Make Scrapsheets reliable enough to be someone's primary data tool.
 - [ ] **Payment table**: add `payment` table tracking buyer, seller, amount, sheet, timestamp
 - [ ] **stripe_customer_id on usr**: link users to Stripe customers for future payouts
 - [ ] **Seller payouts**: Stripe Connect for marketplace payouts (can defer, collect platform-side first)
-- [ ] **MCP endpoint**: replace the 501 stub at /mcp/:id with a Model Context Protocol server (main.ts:1824)
-- [ ] **MCP read_sheet tool**: return sheet data as structured JSON
-- [ ] **MCP write_cells tool**: update specific cells
-- [ ] **MCP query_sheet tool**: execute SQL/PRQL against sheets
-- [ ] **MCP list_sheets tool**: enumerate user's library
-- [ ] **net-http config view**: URL input, polling interval selector, header editor
-- [ ] **net-socket config view**: WebSocket URL input, connection status indicator
-- [ ] **net-hook log view**: table of incoming webhook payloads from `net` table
-- [ ] **Net sheet creation**: add net-hook/http/socket options to "new sheet" menu
 
 ---
 
@@ -45,14 +22,13 @@ Build the features that create network effects. This is where the spreadsheet OS
 
 - [ ] 100 daily active users
 - [ ] **Scrapscript WASM runtime**: compile Scrapscript interpreter to WASM for browser execution
-- [ ] **Scrapscript query language**: wire up the existing `Scrapscript` lang type (Main.elm:380) to execute Scrapscript
+- [ ] **Scrapscript query language**: wire up the existing `Scrapscript` lang type in Main.elm to execute Scrapscript
       programs against sheet data
 - [ ] **Scrapscript cell formulas**: `=#` prefix in cells triggers Scrapscript evaluation
 - [ ] **Content-addressable formulas**: cross-sheet references via Scrapscript hashes instead of fragile @sheet_id
       strings
 - [ ] **Scrapscript marketplace**: sell/share self-contained Scrapscript functions as composable sheet utilities
-- [ ] **Formula parser**: `=` prefix in cells triggers formula mode using the existing `Formula` lang type
-      (Main.elm:379)
+- [ ] **Formula parser**: `=` prefix in cells triggers formula mode using the existing `Formula` lang type in Main.elm
 - [ ] **Basic arithmetic**: =A1 + B1, =SUM(A1:A10), =AVERAGE, =COUNT, =MIN, =MAX
 - [ ] **Cross-sheet references**: =@table:abc123.A1
 - [ ] **Dependency tracking**: topological sort for evaluation order, cycle detection
@@ -61,12 +37,12 @@ Build the features that create network effects. This is where the spreadsheet OS
 - [ ] **Share dialog UI**: email input + role selector in sheet settings
 - [ ] **Public/private toggle**: wire up existing Peers = Private | Public type in Elm
 - [ ] **Shareable view-only links**: unauthenticated read access via signed URLs
-- [ ] **Role-aware sync policy**: extend sharePolicy (main.ts:471) to respect viewer vs editor
+- [ ] **Role-aware sync policy**: extend canSync/sharePolicy in main.ts to respect viewer vs editor
 - [ ] **Schedule field on sheet**: cron expression or interval for recurring query execution
 - [ ] **Server-side query runner**: Deno cron job executing scheduled queries
 - [ ] **Pipeline composition**: net-http (extract) -> query (transform) -> table (load)
 - [ ] **Execution log**: track pipeline runs, successes, failures per sheet
-- [ ] **Google Sheets codex**: OAuth flow for reading Google Sheets as codex data source (main.ts:1683)
+- [ ] **Google Sheets codex**: OAuth flow for reading Google Sheets as codex data source
 - [ ] **Airtable codex**: OAuth flow for reading Airtable bases as codex data source
 - [ ] **Notion codex**: OAuth flow for reading Notion databases as codex data source
 - [ ] **Bidirectional sync**: write Scrapsheet data back to external sources
@@ -165,7 +141,8 @@ Trains of thought worth chasing; each should end in either a checklist item or a
 Scrapscript (2) is the moat no one can replicate -> pipelines (2) make sheets self-updating -> sheet-as-API (3) makes
 every sheet a microservice.
 
-**What ships at 70%**: Phase 0 + Stripe + MCP is enough to launch publicly. Everything else compounds on top.
+**What ships at 70%**: Phase 0 and MCP are done; Stripe is the last piece before a public launch. Everything else
+compounds on top.
 
 **The unique position**: Scrapsheets is not Google Sheets. It is not Airtable. It is a programmable data OS where every
 table is a queryable database, every query result is a shareable table, every portal is a live data stream, every sheet

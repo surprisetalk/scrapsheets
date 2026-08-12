@@ -33,6 +33,7 @@
     "jsr:@zip-js/zip-js@^2.7.52": "2.8.36",
     "npm:@automerge/automerge-repo-network-websocket@^2.5.6": "2.5.6",
     "npm:@automerge/automerge-repo-storage-nodefs@^2.5.6": "2.5.6",
+    "npm:@automerge/automerge-repo@2.5.6": "2.5.6",
     "npm:@automerge/automerge-repo@^2.5.6": "2.5.6",
     "npm:@automerge/automerge@^3.4.0": "3.4.0",
     "npm:@electric-sql/pglite@~0.5.4": "0.5.4",

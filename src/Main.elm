@@ -24,6 +24,7 @@ port module Main exposing
     , rectToIndices
     , selectAll
     , serializeToTsv
+    , shortcutGroups
     , sortWithOrder
     , xy
     )
@@ -467,6 +468,9 @@ port queryEditorState : ({ cursorPos : Int, textBeforeCursor : String } -> msg) 
 port insertAtCursor : String -> Cmd msg
 
 
+port saveTutorial : Int -> Cmd msg
+
+
 type alias DocDelta =
     { doc : D.Value
     , handle : D.Value
@@ -526,6 +530,8 @@ type alias Model =
     , auth : Auth
     , deleteConfirm : Maybe String
     , showSettings : Bool
+    , showShortcuts : Bool
+    , tutorial : Maybe Int
     }
 
 
@@ -547,7 +553,7 @@ type alias SheetInfo =
     , tags : List String
     , scratch : Bool
     , system : Bool
-    , thumb : Svg
+    , thumb : D.Value
     , peers : Peers
     }
 
@@ -572,6 +578,7 @@ type alias Sheet =
     , queryAutocomplete : Maybe QueryAutocomplete
     , undoStack : List UndoEntry
     , redoStack : List UndoEntry
+    , netStatus : Maybe String
     }
 
 
@@ -592,6 +599,7 @@ emptySheet =
     , queryAutocomplete = Nothing
     , undoStack = []
     , redoStack = []
+    , netStatus = Nothing
     }
 
 
@@ -621,11 +629,6 @@ type Filter
     = TextContains String
 
 
-type alias Svg =
-    -- TODO: Generate nice preview Svg based on sheet contents.
-    ()
-
-
 type Stat
     = Numeric
         { histogram : Dict String Int
@@ -650,6 +653,9 @@ type Doc
     | Shop
     | Tab Table
     | Query Query_
+    | NetHook
+    | NetHttp { url : String, interval : Int, headers : String }
+    | NetSocket { url : String }
     | Unviewable String
 
 
@@ -736,6 +742,7 @@ type
     | Create
     | Form
     | Enum (List String)
+    | Thumb
 
 
 typeName : Type -> String
@@ -792,6 +799,9 @@ typeName typ =
         Enum options ->
             "enum:" ++ String.join "," options
 
+        Thumb ->
+            "thumb"
+
 
 
 ---- PARSER -------------------------------------------------------------------
@@ -847,7 +857,7 @@ docDecoder =
                             D.map Tab tableDecoder
 
                     "net-hook" ->
-                        D.succeed (Unviewable typ)
+                        D.succeed NetHook
 
                     "portal" ->
                         D.field "data" <|
@@ -856,15 +866,16 @@ docDecoder =
                     "net-socket" ->
                         D.field "data" <|
                             D.index 0 <|
-                                D.map (always (Unviewable typ))
+                                D.map (\url -> NetSocket { url = url })
                                     (D.field "url" D.string)
 
                     "net-http" ->
                         D.field "data" <|
                             D.index 0 <|
-                                D.map2 (\_ _ -> Unviewable typ)
+                                D.map3 (\url interval headers -> NetHttp { url = url, interval = interval, headers = headers })
                                     (D.field "url" D.string)
                                     (D.field "interval" D.int)
+                                    (D.oneOf [ D.field "headers" D.string, D.succeed "" ])
 
                     "template" ->
                         D.succeed (Unviewable typ)
@@ -971,12 +982,16 @@ shopDecoder =
 
 
 type alias Flags =
-    {}
+    D.Value
 
 
 init : Flags -> Url -> Nav.Key -> ( Model, Cmd Msg )
-init _ url nav =
+init flags url nav =
     let
+        tutorialStep : Int
+        tutorialStep =
+            D.decodeValue (D.field "tutorial" D.int) flags |> Result.withDefault 0
+
         model : Model
         model =
             route url
@@ -993,6 +1008,8 @@ init _ url nav =
                     }
                 , deleteConfirm = Nothing
                 , showSettings = False
+                , showShortcuts = False
+                , tutorial = iif (tutorialStep < 0) Nothing (Just (clamp 0 4 tutorialStep))
                 }
     in
     ( model, changeId model.id )
@@ -1041,6 +1058,7 @@ type Msg
     | DocDeleteConfirm Id
     | DocDeleteCancel
     | SettingsClose
+    | ShortcutsToggle Bool
     | SettingsNameChange String
     | SettingsTagsChange String
     | KeyDown KeyEvent
@@ -1073,6 +1091,8 @@ type Msg
     | AuthResult D.Value
     | ClipboardCopy
     | ClipboardPaste String
+    | CopyText String
+    | TutorialDismiss
     | SelectAll
     | QueryEditorUpdate { cursorPos : Int, textBeforeCursor : String }
     | AutocompleteSelect String
@@ -1109,6 +1129,9 @@ type Input
     | QueryCode
     | AuthEmail
     | AuthPassword
+    | NetUrl
+    | NetInterval
+    | NetHeaders
 
 
 
@@ -1198,6 +1221,16 @@ onFindKeydown =
 ---- UPDATE -------------------------------------------------------------------
 
 
+libraryIdAtRow : Model -> Int -> String
+libraryIdAtRow model y =
+    model.library
+        |> Dict.filter (\k v -> k /= "" && not v.scratch && List.any (String.contains model.search) (k :: v.name :: v.tags))
+        |> Dict.keys
+        |> List.drop (y - 1)
+        |> List.head
+        |> Maybe.withDefault ""
+
+
 tableBounds : Model -> TableBounds
 tableBounds model =
     case model.sheet.doc of
@@ -1209,6 +1242,19 @@ tableBounds model =
 
         _ ->
             { maxX = 0, maxY = 0 }
+
+
+advanceTutorial : Int -> ( Model, Cmd Msg ) -> ( Model, Cmd Msg )
+advanceTutorial n ( model, cmd ) =
+    if model.tutorial == Just n then
+        if n == 4 then
+            ( { model | tutorial = Nothing }, Cmd.batch [ cmd, saveTutorial -1 ] )
+
+        else
+            ( { model | tutorial = Just (n + 1) }, Cmd.batch [ cmd, saveTutorial (n + 1) ] )
+
+    else
+        ( model, cmd )
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
@@ -1229,24 +1275,25 @@ update msg ({ sheet, auth } as model) =
             ( model, Nav.load url )
 
         LibrarySync data ->
-            ( { model
-                | library =
+            case
+                D.decodeValue
+                    (D.dict
+                        (D.map6 SheetInfo
+                            (D.oneOf [ D.field "name" D.string, D.succeed "" ])
+                            (D.oneOf [ D.field "tags" (D.list D.string), D.succeed [] ])
+                            (D.oneOf [ D.field "scratch" D.bool, D.succeed False ])
+                            (D.oneOf [ D.field "system" D.bool, D.succeed False ])
+                            (D.oneOf [ D.field "thumb" D.value, D.succeed E.null ])
+                            (D.succeed Public)
+                        )
+                    )
                     data
-                        |> D.decodeValue
-                            (D.dict
-                                (D.map6 SheetInfo
-                                    (D.oneOf [ D.field "name" D.string, D.succeed "" ])
-                                    (D.oneOf [ D.field "tags" (D.list D.string), D.succeed [] ])
-                                    (D.oneOf [ D.field "scratch" D.bool, D.succeed False ])
-                                    (D.oneOf [ D.field "system" D.bool, D.succeed False ])
-                                    (D.succeed ())
-                                    (D.succeed Public)
-                                )
-                            )
-                        |> Result.withDefault model.library
-              }
-            , Cmd.none
-            )
+            of
+                Ok library ->
+                    ( { model | library = library }, Cmd.none )
+
+                Err err ->
+                    ( { model | error = "The library failed to sync: " ++ D.errorToString err }, Cmd.none )
 
         DocSelect data ->
             ( { model
@@ -1267,6 +1314,7 @@ update msg ({ sheet, auth } as model) =
                     , queryAutocomplete = Nothing
                     , undoStack = []
                     , redoStack = []
+                    , netStatus = Nothing
                     }
               }
             , case data.data.doc |> D.decodeValue docDecoder of
@@ -1316,6 +1364,19 @@ update msg ({ sheet, auth } as model) =
                         -- Request a fresh copy of the document
                         ( model, changeId model.sheet.id )
 
+                    "net-status" ->
+                        ( { model
+                            | sheet =
+                                { sheet
+                                    | netStatus =
+                                        data.data
+                                            |> D.decodeValue (D.field "message" D.string)
+                                            |> Result.toMaybe
+                                }
+                          }
+                        , Cmd.none
+                        )
+
                     "error" ->
                         let
                             errorMsg =
@@ -1325,16 +1386,27 @@ update msg ({ sheet, auth } as model) =
                         in
                         ( { model | error = errorMsg }, Cmd.none )
 
-                    _ ->
-                        -- Unknown notification type, ignore
-                        ( model, Cmd.none )
+                    other ->
+                        ( { model | error = "Unknown notification type: " ++ other }, Cmd.none )
 
         DocQuery data ->
-            ( iif (data.id /= model.sheet.id)
-                model
-                { model | error = "", sheet = { sheet | table = data.data |> D.decodeValue tableDecoder |> Result.mapError D.errorToString } }
-            , Cmd.none
-            )
+            if data.id /= model.sheet.id then
+                ( model, Cmd.none )
+
+            else
+                let
+                    table =
+                        data.data |> D.decodeValue tableDecoder |> Result.mapError D.errorToString
+
+                    advance =
+                        case ( table, sheet.doc ) of
+                            ( Ok _, Ok (Query _) ) ->
+                                advanceTutorial 4
+
+                            _ ->
+                                identity
+                in
+                advance ( { model | error = "", sheet = { sheet | table = table } }, Cmd.none )
 
         DocError error ->
             ( { model | error = error }
@@ -1350,12 +1422,7 @@ update msg ({ sheet, auth } as model) =
                             let
                                 id : String
                                 id =
-                                    model.library
-                                        |> Dict.filter (\k v -> k /= "" && not v.scratch && List.any (String.contains model.search) (k :: v.name :: v.tags))
-                                        |> Dict.keys
-                                        |> List.drop (y - 1)
-                                        |> List.head
-                                        |> Maybe.withDefault ""
+                                    libraryIdAtRow model y
                             in
                             case Maybe.map .name (Array.get x libraryCols) of
                                 Just "name" ->
@@ -1631,16 +1698,17 @@ update msg ({ sheet, auth } as model) =
                         ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
 
                     else
-                        ( { model
-                            | sheet =
-                                { sheet
-                                    | write = Nothing
-                                    , undoStack = newUndoStack
-                                    , redoStack = newRedoStack
-                                }
-                          }
-                        , changeDoc { id = sheet.id, data = forwardPatches }
-                        )
+                        advanceTutorial 1
+                            ( { model
+                                | sheet =
+                                    { sheet
+                                        | write = Nothing
+                                        , undoStack = newUndoStack
+                                        , redoStack = newRedoStack
+                                    }
+                              }
+                            , changeDoc { id = sheet.id, data = forwardPatches }
+                            )
 
                 _ ->
                     ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
@@ -1659,6 +1727,9 @@ update msg ({ sheet, auth } as model) =
         SettingsClose ->
             ( { model | showSettings = False }, Nav.replaceUrl model.nav ("/" ++ model.sheet.id) )
 
+        ShortcutsToggle show ->
+            ( { model | showShortcuts = show }, Cmd.none )
+
         SettingsNameChange newName ->
             ( model, updateLibrary (Idd sheet.id { name = Just newName, tags = Nothing }) )
 
@@ -1676,10 +1747,10 @@ update msg ({ sheet, auth } as model) =
             ( model, newDoc x )
 
         DocNewTable ->
-            ( model, newDoc <| E.object [ ( "type", E.string "table" ), ( "data", E.list identity [ E.list identity [ E.object [ ( "name", E.string "a" ), ( "type", E.string "text" ), ( "key", E.string "a" ) ] ] ] ) ] )
+            advanceTutorial 0 ( model, newDoc <| E.object [ ( "type", E.string "table" ), ( "data", E.list identity [ E.list identity [ E.object [ ( "name", E.string "a" ), ( "type", E.string "text" ), ( "key", E.string "a" ) ] ] ] ) ] )
 
         DocNewQuery ->
-            ( model, newDoc <| E.object [ ( "type", E.string "query" ), ( "data", E.list identity [ E.object [ ( "lang", E.string "sql" ), ( "code", E.string "select 1" ) ] ] ) ] )
+            advanceTutorial 2 ( model, newDoc <| E.object [ ( "type", E.string "query" ), ( "data", E.list identity [ E.object [ ( "lang", E.string "sql" ), ( "code", E.string "select 1" ) ] ] ) ] )
 
         ShopFetch x ->
             ( { model | sheet = { sheet | table = Result.mapError (always "Something went wrong.") x } }, Cmd.none )
@@ -1716,17 +1787,74 @@ update msg ({ sheet, auth } as model) =
             ( { model | auth = { auth | password = x } }, Cmd.none )
 
         InputChange QueryCode x ->
+            iif (String.contains "@" x) (advanceTutorial 3) identity <|
+                ( model
+                , changeDoc
+                    { id = sheet.id
+                    , data =
+                        [ { action = "set"
+                          , path = [ E.int 0, E.string "code" ]
+                          , value = E.string x
+                          }
+                        ]
+                    }
+                )
+
+        InputChange NetUrl x ->
             ( model
             , changeDoc
                 { id = sheet.id
                 , data =
                     [ { action = "set"
-                      , path = [ E.int 0, E.string "code" ]
+                      , path = [ E.int 0, E.string "url" ]
                       , value = E.string x
                       }
                     ]
                 }
             )
+
+        InputChange NetInterval x ->
+            case String.toInt x of
+                Just n ->
+                    ( model
+                    , changeDoc
+                        { id = sheet.id
+                        , data =
+                            [ { action = "set"
+                              , path = [ E.int 0, E.string "interval" ]
+                              , value = E.int n
+                              }
+                            ]
+                        }
+                    )
+
+                Nothing ->
+                    if String.isEmpty x then
+                        ( model, Cmd.none )
+
+                    else
+                        ( { model | error = "The poll interval must be a whole number of seconds, got: " ++ x }
+                        , Cmd.none
+                        )
+
+        InputChange NetHeaders x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data =
+                    [ { action = "set"
+                      , path = [ E.int 0, E.string "headers" ]
+                      , value = E.string x
+                      }
+                    ]
+                }
+            )
+
+        CopyText str ->
+            ( model, copyToClipboard str )
+
+        TutorialDismiss ->
+            ( { model | tutorial = Nothing }, saveTutorial -1 )
 
         CellMouseDoubleClick write ->
             let
@@ -2084,11 +2212,39 @@ update msg ({ sheet, auth } as model) =
 
         KeyDown event ->
             -- Handle global shortcuts first (Ctrl+F, Ctrl+H, Escape for find/replace)
-            if (event.ctrl || event.meta) && event.key == "f" then
+            if (event.ctrl || event.meta) && event.key == "/" then
+                update (ShortcutsToggle (not model.showShortcuts)) model
+
+            else if
+                event.key
+                    == "?"
+                    && (case sheet.doc of
+                            Ok (Tab _) ->
+                                False
+
+                            _ ->
+                                True
+                       )
+            then
+                update (ShortcutsToggle True) model
+
+            else if (event.ctrl || event.meta) && event.key == "f" then
                 update (FindOpen False) model
 
             else if (event.ctrl || event.meta) && event.key == "h" then
                 update (FindOpen True) model
+
+            else if event.key == "Escape" && model.showShortcuts then
+                update (ShortcutsToggle False) model
+
+            else if event.key == "Escape" && model.showSettings then
+                update SettingsClose model
+
+            else if event.key == "Escape" && model.deleteConfirm /= Nothing then
+                update DocDeleteCancel model
+
+            else if event.key == "Escape" && sheet.filterOpen /= Nothing then
+                ( { model | sheet = { sheet | filterOpen = Nothing } }, Cmd.none )
 
             else if event.key == "Escape" && sheet.findReplace /= Nothing then
                 update FindClose model
@@ -2158,8 +2314,12 @@ update msg ({ sheet, auth } as model) =
                                         ( model, Cmd.none )
 
                             Ok Library ->
-                                -- Library editing handled differently
-                                ( model, Cmd.none )
+                                case libraryIdAtRow model sel.y of
+                                    "" ->
+                                        ( model, Cmd.none )
+
+                                    id ->
+                                        ( model, Nav.pushUrl model.nav ("/" ++ id) )
 
                             _ ->
                                 ( model, Cmd.none )
@@ -2675,11 +2835,40 @@ libraryCols : Array Col
 libraryCols =
     Array.fromList
         [ Col "sheet_id" "" SheetId
+        , Col "thumb" "" Thumb
 
         -- , Col "type" "type" Text
         , Col "name" "name" Text
         , Col "tags" "tags" (Many Text)
         , Col "delete" "" Delete
+        ]
+
+
+viewModal : Msg -> List (Html Msg) -> Html Msg
+viewModal closeMsg content =
+    H.div
+        [ S.positionFixed
+        , S.top "0"
+        , S.left "0"
+        , S.right "0"
+        , S.bottom "0"
+        , S.backgroundColor "rgba(0,0,0,0.5)"
+        , S.displayFlex
+        , S.alignItemsCenter
+        , S.justifyContentCenter
+        , S.zIndex "1000"
+        , A.onClick closeMsg
+        ]
+        [ H.div
+            [ S.backgroundColor "#fff"
+            , S.border "1px solid #aaa"
+            , S.borderRadius "4px"
+            , S.padding "1rem"
+            , S.minWidthRem 20
+            , S.boxShadow "0 2px 8px rgba(0,0,0,0.15)"
+            , A.stopPropagationOn "click" (D.succeed ( NoOp, True ))
+            ]
+            content
         ]
 
 
@@ -2689,81 +2878,59 @@ viewSettings show info =
         text ""
 
     else
-        H.div
-            [ S.positionFixed
-            , S.top "0"
-            , S.left "0"
-            , S.right "0"
-            , S.bottom "0"
-            , S.backgroundColor "rgba(0,0,0,0.5)"
-            , S.displayFlex
-            , S.alignItemsCenter
-            , S.justifyContentCenter
-            , S.zIndex "1000"
-            , A.onClick SettingsClose
-            ]
-            [ H.div
-                [ S.backgroundColor "#fff"
-                , S.border "1px solid #aaa"
-                , S.borderRadius "4px"
-                , S.padding "1rem"
-                , S.minWidthRem 20
-                , S.boxShadow "0 2px 8px rgba(0,0,0,0.15)"
-                , A.stopPropagationOn "click" (D.succeed ( NoOp, True ))
-                ]
-                [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter, S.marginBottom "1rem" ]
-                    [ H.h3 [ S.margin "0" ] [ text "Sheet Settings" ]
-                    , H.button
-                        [ A.onClick SettingsClose
-                        , S.border "none"
-                        , S.background "transparent"
-                        , S.cursorPointer
-                        , S.fontSizeRem 1.2
-                        ]
-                        [ text "×" ]
-                    ]
-                , H.div [ S.marginBottom "1rem" ]
-                    [ H.label [ S.display "block", S.marginBottom "0.25rem", S.fontWeight "600" ] [ text "Name" ]
-                    , H.input
-                        [ A.type_ "text"
-                        , A.value info.name
-                        , A.onInput SettingsNameChange
-                        , A.placeholder "Sheet name"
-                        , A.attribute "onfocus" "this.select()"
-                        , S.width "100%"
-                        , S.padding "0.5rem"
-                        , S.border "1px solid #ccc"
-                        , S.borderRadius "4px"
-                        ]
-                        []
-                    ]
-                , H.div [ S.marginBottom "1rem" ]
-                    [ H.label [ S.display "block", S.marginBottom "0.25rem", S.fontWeight "600" ] [ text "Tags" ]
-                    , H.input
-                        [ A.type_ "text"
-                        , A.value (String.join ", " info.tags)
-                        , A.onInput SettingsTagsChange
-                        , A.placeholder "tag1, tag2, tag3"
-                        , S.width "100%"
-                        , S.padding "0.5rem"
-                        , S.border "1px solid #ccc"
-                        , S.borderRadius "4px"
-                        ]
-                        []
-                    , H.small [ S.color "#666" ] [ text "Separate tags with commas" ]
-                    ]
+        viewModal SettingsClose
+            [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter, S.marginBottom "1rem" ]
+                [ H.h3 [ S.margin "0" ] [ text "Sheet Settings" ]
                 , H.button
                     [ A.onClick SettingsClose
-                    , S.width "100%"
-                    , S.padding "0.5rem 1rem"
                     , S.border "none"
-                    , S.borderRadius "4px"
-                    , S.background "#007bff"
-                    , S.color "#fff"
+                    , S.background "transparent"
                     , S.cursorPointer
+                    , S.fontSizeRem 1.2
                     ]
-                    [ text "Done" ]
+                    [ text "×" ]
                 ]
+            , H.div [ S.marginBottom "1rem" ]
+                [ H.label [ S.display "block", S.marginBottom "0.25rem", S.fontWeight "600" ] [ text "Name" ]
+                , H.input
+                    [ A.type_ "text"
+                    , A.value info.name
+                    , A.onInput SettingsNameChange
+                    , A.placeholder "Sheet name"
+                    , A.attribute "onfocus" "this.select()"
+                    , S.width "100%"
+                    , S.padding "0.5rem"
+                    , S.border "1px solid #ccc"
+                    , S.borderRadius "4px"
+                    ]
+                    []
+                ]
+            , H.div [ S.marginBottom "1rem" ]
+                [ H.label [ S.display "block", S.marginBottom "0.25rem", S.fontWeight "600" ] [ text "Tags" ]
+                , H.input
+                    [ A.type_ "text"
+                    , A.value (String.join ", " info.tags)
+                    , A.onInput SettingsTagsChange
+                    , A.placeholder "tag1, tag2, tag3"
+                    , S.width "100%"
+                    , S.padding "0.5rem"
+                    , S.border "1px solid #ccc"
+                    , S.borderRadius "4px"
+                    ]
+                    []
+                , H.small [ S.color "#666" ] [ text "Separate tags with commas" ]
+                ]
+            , H.button
+                [ A.onClick SettingsClose
+                , S.width "100%"
+                , S.padding "0.5rem 1rem"
+                , S.border "none"
+                , S.borderRadius "4px"
+                , S.background "#007bff"
+                , S.color "#fff"
+                , S.cursorPointer
+                ]
+                [ text "Done" ]
             ]
 
 
@@ -2774,51 +2941,107 @@ viewDeleteConfirm maybeId =
             text ""
 
         Just id ->
-            H.div
-                [ S.positionFixed
-                , S.top "0"
-                , S.left "0"
-                , S.right "0"
-                , S.bottom "0"
-                , S.backgroundColor "rgba(0,0,0,0.5)"
-                , S.displayFlex
-                , S.alignItemsCenter
-                , S.justifyContentCenter
-                , S.zIndex "1000"
-                ]
-                [ H.div
-                    [ S.backgroundColor "#fff"
-                    , S.border "1px solid #aaa"
-                    , S.borderRadius "4px"
-                    , S.padding "1rem"
-                    , S.maxWidthRem 20
-                    , S.boxShadow "0 2px 8px rgba(0,0,0,0.15)"
-                    ]
-                    [ H.p [ S.marginBottom "1rem" ]
-                        [ text "Are you sure you want to delete this sheet? This cannot be undone." ]
-                    , H.div [ S.displayFlex, S.gapRem 0.5, S.justifyContentFlexEnd ]
-                        [ H.button
-                            [ A.onClick DocDeleteCancel
-                            , S.padding "0.5rem 1rem"
-                            , S.border "1px solid #ccc"
-                            , S.borderRadius "4px"
-                            , S.background "#f0f0f0"
-                            , S.cursorPointer
-                            ]
-                            [ text "Cancel" ]
-                        , H.button
-                            [ A.onClick (DocDeleteConfirm id)
-                            , S.padding "0.5rem 1rem"
-                            , S.border "none"
-                            , S.borderRadius "4px"
-                            , S.background "#dc3545"
-                            , S.color "#fff"
-                            , S.cursorPointer
-                            ]
-                            [ text "Delete" ]
+            viewModal DocDeleteCancel
+                [ H.p [ S.marginBottom "1rem" ]
+                    [ text "Are you sure you want to delete this sheet? This cannot be undone." ]
+                , H.div [ S.displayFlex, S.gapRem 0.5, S.justifyContentFlexEnd ]
+                    [ H.button
+                        [ A.onClick DocDeleteCancel
+                        , S.padding "0.5rem 1rem"
+                        , S.border "1px solid #ccc"
+                        , S.borderRadius "4px"
+                        , S.background "#f0f0f0"
+                        , S.cursorPointer
                         ]
+                        [ text "Cancel" ]
+                    , H.button
+                        [ A.onClick (DocDeleteConfirm id)
+                        , S.padding "0.5rem 1rem"
+                        , S.border "none"
+                        , S.borderRadius "4px"
+                        , S.background "#dc3545"
+                        , S.color "#fff"
+                        , S.cursorPointer
+                        ]
+                        [ text "Delete" ]
                     ]
                 ]
+
+
+shortcutGroups : List ( String, List ( String, String ) )
+shortcutGroups =
+    [ ( "Navigate"
+      , [ ( "↑ ↓ ← →", "move" )
+        , ( "Shift+arrows", "extend selection" )
+        , ( "Tab / Shift+Tab", "next/prev cell" )
+        , ( "Home / End", "row start/end" )
+        , ( "Ctrl/⌘+Home / Ctrl/⌘+End", "sheet corners" )
+        ]
+      )
+    , ( "Edit"
+      , [ ( "Enter", "edit cell" )
+        , ( "any character", "edit with that character" )
+        , ( "Enter", "commit + down" )
+        , ( "Tab", "commit + right" )
+        , ( "Esc", "cancel edit" )
+        ]
+      )
+    , ( "Cells"
+      , [ ( "Delete / Backspace", "clear cells" )
+        , ( "Ctrl/⌘+Delete", "delete rows" )
+        , ( "Ctrl/⌘+Backspace", "delete columns" )
+        ]
+      )
+    , ( "Select & clipboard"
+      , [ ( "Ctrl/⌘+A", "select all" )
+        , ( "Ctrl/⌘+C / Ctrl/⌘+V", "copy / paste" )
+        ]
+      )
+    , ( "Find"
+      , [ ( "Ctrl/⌘+F", "find" )
+        , ( "Ctrl/⌘+H", "replace" )
+        , ( "Enter", "next match" )
+        , ( "Esc", "close" )
+        ]
+      )
+    , ( "History"
+      , [ ( "Ctrl/⌘+Z", "undo" )
+        , ( "Ctrl/⌘+Shift+Z / Ctrl/⌘+Y", "redo" )
+        ]
+      )
+    , ( "Library"
+      , [ ( "Enter", "open selected sheet" ) ]
+      )
+    , ( "Help"
+      , [ ( "Ctrl/⌘+/ or ?", "shortcut sheet" )
+        , ( "Esc", "close dialogs" )
+        ]
+      )
+    ]
+
+
+viewShortcuts : Bool -> Html Msg
+viewShortcuts show =
+    if not show then
+        text ""
+
+    else
+        viewModal (ShortcutsToggle False) <|
+            H.h3 [ S.marginTop "0" ] [ text "Keyboard shortcuts" ]
+                :: List.concatMap
+                    (\( group, keys ) ->
+                        [ H.h4 [ S.marginBottom "0.25rem" ] [ text group ]
+                        , H.div [ S.displayGrid, S.gridTemplateColumns "auto 1fr", S.gridColumnGapRem 1, S.fontSizeRem 0.875 ] <|
+                            List.concatMap
+                                (\( key, description ) ->
+                                    [ H.span [ S.fontFamilyMonospace ] [ text key ]
+                                    , H.span [] [ text description ]
+                                    ]
+                                )
+                                keys
+                        ]
+                    )
+                    shortcutGroups
 
 
 viewFindReplace : Maybe FindReplace -> Html Msg
@@ -3007,6 +3230,13 @@ computeStats doc =
             Err ""
 
 
+emptyNetTable : Table
+emptyNetTable =
+    { cols = Array.fromList [ Col "created_at" "created_at" Timestamp, Col "body" "body" Json ]
+    , rows = Array.empty
+    }
+
+
 resolveTable : Model -> Result String Table
 resolveTable model =
     case ( model.sheet.doc, model.sheet.table ) of
@@ -3031,6 +3261,7 @@ resolveTable model =
                             (\( k, v ) ->
                                 Dict.fromList
                                     [ ( "sheet_id", E.string k )
+                                    , ( "thumb", v.thumb )
                                     , ( "type", E.string (Maybe.withDefault "" <| List.head <| String.split ":" k) )
                                     , ( "name", E.string (iif (String.isEmpty (String.trim v.name)) "(untitled)" v.name) )
                                     , ( "tags", E.list E.string v.tags )
@@ -3042,6 +3273,15 @@ resolveTable model =
 
         ( _, Ok tbl ) ->
             Ok tbl
+
+        ( Ok NetHook, Err "" ) ->
+            Ok emptyNetTable
+
+        ( Ok (NetHttp _), Err "" ) ->
+            Ok emptyNetTable
+
+        ( Ok (NetSocket _), Err "" ) ->
+            Ok emptyNetTable
 
         ( Err err1, Err err2 ) ->
             -- Both empty means nothing has loaded yet, which the view shows as "loading"
@@ -3247,6 +3487,9 @@ typeWidth typ =
         Delete ->
             S.widthRem 4
 
+        Thumb ->
+            S.widthRem 4
+
         _ ->
             S.widthAuto
 
@@ -3330,6 +3573,12 @@ cellDecoder typ i n =
             Delete ->
                 D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])
 
+            Thumb ->
+                D.map3 viewThumb
+                    (D.field "cols" D.int)
+                    (D.field "rows" D.int)
+                    (D.oneOf [ D.field "spark" (D.list D.float), D.succeed [] ])
+
             Create ->
                 D.value |> D.map (\val -> H.button [ A.onClick (DocNew val) ] [ text "add to library" ])
 
@@ -3347,6 +3596,19 @@ cellDecoder typ i n =
             _ ->
                 D.map text string
         )
+
+
+viewThumb : Int -> Int -> List Float -> Html Msg
+viewThumb cols rows spark =
+    if not (List.isEmpty spark) then
+        H.div [ S.displayFlex, S.alignItemsFlexEnd, S.gap "1px", S.heightPx 14 ] <|
+            List.map (\h -> H.div [ S.widthPx 3, S.height (String.fromFloat (4 + h * 10) ++ "px"), S.backgroundColor "#bbb" ] []) spark
+
+    else if cols > 0 then
+        H.span [ S.opacity "0.5", S.fontSizeSmall ] [ text (String.fromInt cols ++ "×" ++ String.fromInt rows) ]
+
+    else
+        text ""
 
 
 viewStatCell : Maybe Stat -> List (Html Msg)
@@ -3567,7 +3829,12 @@ viewTableFooter sheet cols =
                             H.td [ S.opacity "0.25" ] [ text label ]
                                 :: List.map (\typ -> H.td [ S.opacity "0.25" ] [ text typ ]) [ "text", "list text", "" ]
                     )
-                    [ ( "table:...", DocNewTable ), ( "query:...", DocNewQuery ) ]
+                    [ ( "table:...", DocNewTable )
+                    , ( "query:...", DocNewQuery )
+                    , ( "net-hook:...", DocNew <| E.object [ ( "type", E.string "net-hook" ), ( "data", E.list identity [] ) ] )
+                    , ( "net-http:...", DocNew <| E.object [ ( "type", E.string "net-http" ), ( "data", E.list identity [ E.object [ ( "url", E.string "" ), ( "interval", E.int 3600 ) ] ] ) ] )
+                    , ( "net-socket:...", DocNew <| E.object [ ( "type", E.string "net-socket" ), ( "data", E.list identity [ E.object [ ( "url", E.string "" ) ] ] ) ] )
+                    ]
                     ++ [ H.tr [] <|
                             H.td [ S.opacity "0.25" ]
                                 [ H.label [ S.cursorPointer ]
@@ -3640,13 +3907,118 @@ viewToolbar model info =
             , iif (sheet.id == "")
                 [ H.span [] [ text "library" ] ]
                 [ H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ] ]
+            , [ H.span [ A.onClick (ShortcutsToggle True), S.cursorPointer, S.marginLeftAuto, S.backgroundColor "#e8e8e8", S.padding "2px 8px", S.borderRadius "2px", S.fontSizeRem 0.75 ] [ text "keys" ] ]
             , case sheet.doc of
                 Ok (Tab _) ->
-                    [ H.a [ A.href ("https://api.sheets.scrap.land/export/" ++ sheet.id ++ ".csv"), A.download (sheet.id ++ ".csv"), S.marginLeftAuto, S.backgroundColor "#e8e8e8", S.padding "2px 8px", S.borderRadius "2px", S.fontSizeRem 0.75 ] [ text "export csv" ] ]
+                    [ H.a [ A.href ("https://api.sheets.scrap.land/export/" ++ sheet.id ++ ".csv"), A.download (sheet.id ++ ".csv"), S.backgroundColor "#e8e8e8", S.padding "2px 8px", S.borderRadius "2px", S.fontSizeRem 0.75 ] [ text "export csv" ] ]
 
                 _ ->
                     []
             ]
+
+
+viewTutorial : Maybe Int -> Html Msg
+viewTutorial tutorial =
+    case tutorial of
+        Nothing ->
+            text ""
+
+        Just step ->
+            H.div [ S.positionFixed, S.bottomRem 3, S.rightRem 1, S.backgroundColor "#fff", S.border "1px solid #aaa", S.borderRadius "4px", S.paddingRem 1, S.boxShadow "0 2px 8px rgba(0,0,0,0.15)", S.zIndex "90", S.maxWidthRem 18 ]
+                [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter, S.gapRem 1, S.marginBottomRem 0.5 ]
+                    [ H.strong [] [ text "get started" ]
+                    , H.button [ A.onClick TutorialDismiss, S.border "none", S.background "transparent", S.cursorPointer, S.fontSizeRem 1 ] [ text "×" ]
+                    ]
+                , H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.8 ] <|
+                    List.indexedMap
+                        (\i ( label, hint ) ->
+                            if i < step then
+                                H.div [ S.opacity "0.5" ] [ text ("✓ " ++ label) ]
+
+                            else if i == step then
+                                H.div []
+                                    [ H.div [ S.fontWeight "700" ] [ text label ]
+                                    , H.div [ S.fontSizeRem 0.7, S.color "#666" ] [ text hint ]
+                                    ]
+
+                            else
+                                H.div [ S.opacity "0.3" ] [ text label ]
+                        )
+                        [ ( "create a table", "click table:... below" )
+                        , ( "edit a cell", "click a cell and type" )
+                        , ( "create a query", "click query:... below" )
+                        , ( "reference a sheet with @", "type @ in the editor and pick a table" )
+                        , ( "see live results", "results update as you type" )
+                        ]
+                ]
+
+
+viewNetWarning : Model -> Html Msg
+viewNetWarning model =
+    case model.auth.state of
+        Anonymous ->
+            H.div [ S.backgroundColor "#fff8e0", S.border "1px solid #e0d8a0", S.borderRadius "4px", S.padding "0.5rem", S.fontSizeRem 0.75 ]
+                [ text "Net sheets need an account: log in so the server can store this sheet's data." ]
+
+        _ ->
+            text ""
+
+
+viewNetHook : Model -> Html Msg
+viewNetHook model =
+    let
+        url =
+            "https://api.sheets.scrap.land/net/" ++ model.sheet.id
+    in
+    H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
+        [ viewNetWarning model
+        , H.h3 [ S.margin "0" ] [ text "webhook inbox" ]
+        , H.div [ S.fontFamily "monospace", S.fontSizeRem 0.75, S.backgroundColor "#f0f0f0", S.padding "0.5rem", S.borderRadius "4px", S.overflowXAuto ]
+            [ text url ]
+        , H.button [ A.onClick (CopyText url), S.cursorPointer ] [ text "copy" ]
+        , H.p [ S.margin "0", S.fontSizeRem 0.75, S.color "#666" ] [ text "POST any payload to this URL; rows appear in the table." ]
+        ]
+
+
+viewNetHttp : Model -> { url : String, interval : Int, headers : String } -> Html Msg
+viewNetHttp model cfg =
+    H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
+        [ viewNetWarning model
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.75 ]
+            [ text "URL"
+            , H.input [ A.type_ "text", A.value cfg.url, A.onInput (InputChange NetUrl) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.75 ]
+            [ text "poll every (seconds)"
+            , H.input [ A.type_ "number", A.value (String.fromInt cfg.interval), A.onInput (InputChange NetInterval) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.75 ]
+            [ text "headers"
+            , H.textarea [ A.value cfg.headers, A.placeholder "Name: value\none per line", A.onInput (InputChange NetHeaders), S.fontFamily "monospace" ] []
+            ]
+        , H.p [ S.margin "0", S.fontSizeRem 0.75, S.color "#666" ]
+            [ text <|
+                case model.sheet.table of
+                    Ok tbl ->
+                        String.fromInt (Array.length tbl.rows) ++ " payloads"
+
+                    Err _ ->
+                        "no payloads yet"
+            ]
+        ]
+
+
+viewNetSocket : Model -> { url : String } -> Html Msg
+viewNetSocket model cfg =
+    H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
+        [ viewNetWarning model
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.75 ]
+            [ text "URL"
+            , H.input [ A.type_ "text", A.value cfg.url, A.onInput (InputChange NetUrl) ] []
+            ]
+        , H.p [ S.margin "0", S.fontSizeRem 0.75, S.color "#666" ]
+            [ text (Maybe.withDefault "—" model.sheet.netStatus) ]
+        ]
 
 
 viewQueryEditor : Model -> Query_ -> Html Msg
@@ -3694,6 +4066,18 @@ viewQueryEditor model query =
                         , H.button [ A.onClick (DocError ""), S.border "none", S.background "transparent", S.cursorPointer, S.color "#c00", S.fontSizeRem 1, S.marginLeft "0.5rem" ] [ text "×" ]
                         ]
                     ]
+        , if List.isEmpty query.examples then
+            text ""
+
+          else
+            H.div [ S.displayFlex, S.flexWrapWrap, S.gapRem 0.25, S.padding "0.5rem 0.75rem", S.backgroundColor "#f0f0f0", S.borderTop "1px solid #ddd" ]
+                (List.map
+                    (\example ->
+                        H.button [ A.onClick (InputChange QueryCode example), S.fontSizeRem 0.7, S.cursorPointer, S.fontFamily "monospace", S.border "1px solid #ccc", S.borderRadius "2px", S.background "#fff", S.padding "0.125rem 0.375rem" ]
+                            [ text (iif (String.length example > 40) (String.left 40 example ++ "…") example) ]
+                    )
+                    query.examples
+                )
         , if List.isEmpty sheetRefs then
             text ""
 
@@ -3710,7 +4094,7 @@ view : Model -> Browser.Document Msg
 view ({ sheet } as model) =
     let
         info =
-            model.library |> Dict.get sheet.id |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = (), peers = Public }
+            model.library |> Dict.get sheet.id |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = E.null, peers = Public }
 
         stats =
             sheet.stats
@@ -3724,6 +4108,8 @@ view ({ sheet } as model) =
         , viewFindReplace sheet.findReplace
         , viewDeleteConfirm model.deleteConfirm
         , viewSettings model.showSettings info
+        , viewShortcuts model.showShortcuts
+        , viewTutorial model.tutorial
         , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
                 [ viewToolbar model info
@@ -3765,6 +4151,15 @@ view ({ sheet } as model) =
                 case sheet.doc of
                     Ok (Query query) ->
                         [ viewQueryEditor model query ]
+
+                    Ok NetHook ->
+                        [ viewNetHook model ]
+
+                    Ok (NetHttp cfg) ->
+                        [ viewNetHttp model cfg ]
+
+                    Ok (NetSocket cfg) ->
+                        [ viewNetSocket model cfg ]
 
                     _ ->
                         []

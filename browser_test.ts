@@ -147,6 +147,89 @@ Deno.test("a failing HTTP() names the url and the origin's error text", async ()
   await server.finished;
 });
 
+// Mirrors src/_redirects: extension-less paths (like /table:countries) load the app shell.
+const serveSpa = async (req: Request): Promise<Response> => {
+  const { pathname } = new URL(req.url);
+  if (pathname !== "/" && !/\.[a-z0-9]+$/i.test(pathname)) {
+    return new Response(await Deno.readFile(dir + "dist/index.html"), {
+      headers: { "content-type": "text/html; charset=utf-8" },
+    });
+  }
+  return serveDir(req, { fsRoot: dir + "dist", quiet: true });
+};
+
+// Test 2c: bundled example datasets render, @refs join across sheets in-browser,
+// and the library chrome (tutorial, new-sheet menu, shortcut sheet) is present.
+Deno.test("bundled examples render and cross-sheet queries join", async () => {
+  const controller = new AbortController();
+  const server = Deno.serve(
+    { hostname: "127.0.0.1", port: 0, signal: controller.signal, onListen: () => {} },
+    serveSpa,
+  );
+  const port = server.addr.port;
+
+  const browser = await launch({ args: ["--incognito"] });
+  const page = await browser.newPage();
+
+  const waitForText = async (wants: string[], context: string) => {
+    let text = "";
+    for (let i = 0; i < 100; i++) {
+      text = (await page.evaluate(`document.body.innerText`)) as string;
+      if (wants.some((want) => text.includes(want))) return;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    throw new Error(`${context}: expected one of ${JSON.stringify(wants)} in page text, got:\n${text.slice(0, 2000)}`);
+  };
+
+  // A bundled dataset renders straight from the library entry (no repo.find).
+  await page.goto(`http://127.0.0.1:${port}/table:countries`);
+  await waitForText(["China"], "/table:countries");
+
+  // SHEET() resolves system docs synchronously.
+  for (let i = 0; i < 100; i++) {
+    if (await page.evaluate(`typeof globalThis.alasql?.from?.SHEET === 'function'`)) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  const count = await page.evaluate(
+    `alasql("select count(*) as n from SHEET('table:countries')").data[0].n`,
+  ) as number;
+  assertEquals(count >= 195, true, `expected >=195 countries, got ${count}`);
+
+  // The flagship join: @table:events x @table:us-states resolves and renders.
+  await page.goto(`http://127.0.0.1:${port}/query:events-by-state`);
+  await waitForText(
+    ["Texas", "California", "Nevada", "Illinois", "Kentucky", "Iowa", "Florida", "New Mexico"],
+    "/query:events-by-state",
+  );
+
+  // A query built on another query (@query recursion).
+  await page.goto(`http://127.0.0.1:${port}/query:festival-season`);
+  await waitForText(["2026-06", "2026-07", "2026-08"], "/query:festival-season");
+
+  // Library chrome: tutorial checklist, net-* creation rows, shortcut sheet.
+  await page.goto(`http://127.0.0.1:${port}/`);
+  await waitForText(["get started"], "tutorial card");
+  await waitForText(["create a table"], "tutorial step 0");
+  await waitForText(["net-hook:..."], "net creation rows");
+  await page.evaluate(
+    `document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "/", ctrlKey: true, bubbles: true }))`,
+  );
+  await waitForText(["Keyboard shortcuts"], "shortcut sheet after Ctrl+/");
+  await page.evaluate(
+    `document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`,
+  );
+  for (let i = 0; i < 100; i++) {
+    const text = (await page.evaluate(`document.body.innerText`)) as string;
+    if (!text.includes("Keyboard shortcuts")) break;
+    if (i === 99) throw new Error("Escape should close the shortcut sheet");
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  await browser.close();
+  controller.abort();
+  await server.finished;
+});
+
 // Test 3: Basic page loads without fatal errors
 Deno.test("page loads, Elm initializes, and automerge boots", async () => {
   const controller = new AbortController();

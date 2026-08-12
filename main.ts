@@ -10,11 +10,15 @@ import { upgradeWebSocket } from "@hono/hono/deno";
 import { Repo } from "@automerge/automerge-repo";
 import * as AM from "@automerge/automerge-repo";
 import type { AnyDocumentId } from "@automerge/automerge-repo";
-// import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket";
+import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import ala from "alasql";
 import * as prql from "prql-js";
 import * as path from "@std/path";
+import examplesSql from "./examples.sql" with { type: "text" };
+import { DATASETS } from "./src/examples.mjs";
+
+// --- secrets & crypto
 
 const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
 const JWT_ALG = "HS256";
@@ -96,8 +100,8 @@ if (!Deno.env.get("DSN_ENCRYPTION_KEY"))
 
 // Simple in-memory rate limiter (token bucket algorithm)
 const rateLimitBuckets = new Map<string, { tokens: number; lastRefill: number }>();
-const RATE_LIMIT_MAX_TOKENS = 100; // Max requests per window
-const RATE_LIMIT_REFILL_RATE = 10; // Tokens per second
+const RATE_LIMIT_MAX_TOKENS = 1000; // Max burst per IP (debounced queries fire per keystroke)
+const RATE_LIMIT_REFILL_RATE = 100; // Tokens per second
 const RATE_LIMIT_WINDOW_MS = 60_000; // Cleanup old entries after 1 minute of inactivity
 
 const rateLimit = (identifier: string): boolean => {
@@ -137,6 +141,8 @@ export type Tag<T extends string, X extends Row[]> = {
   data: X;
 };
 
+// --- types
+
 export type Type =
   // TODO: Consider using JSONSchema?
   | "type"
@@ -147,6 +153,8 @@ export type Type =
   | "num"
   | "bool"
   | "float"
+  | "percentage"
+  | "json"
   | ["array", Type]
   | ["tuple", Type[]]
   | { [k: string]: Type };
@@ -163,7 +171,7 @@ export type Template =
   | Tag<"net-socket", [NetSocket]>
   | Tag<`codex-${string}`, []>;
 export type Query = { lang: "sql" | "prql"; code: string; args: Args };
-export type NetHttp = { url: string; interval: number };
+export type NetHttp = { url: string; interval: number; headers?: string };
 export type NetSocket = { url: string };
 export type Sheet =
   | Tag<"template", [Template]>
@@ -187,16 +195,33 @@ export const arrayify = <T>(arr: Array<T>): Record<number, T> => {
   return obj;
 };
 
+// --- sheet & query core
+
+// Direct access, or derived access through a purchase (the buyer's sheet
+// points back at the seller's via buy_id = sell_id).
+const assertSheetAccess = async (c: Context, sheet_id: string): Promise<void> => {
+  const [access] = await sql`
+    select true from sheet_usr su
+    where su.usr_id = ${c.get("usr_id")}
+      and (
+        su.sheet_id = ${sheet_id}
+        or exists (
+          select 1 from sheet b
+          inner join sheet s on s.sell_id = b.buy_id
+          where b.sheet_id = su.sheet_id and s.sheet_id = ${sheet_id}
+        )
+      )
+  `;
+  if (!access) throw new HTTPException(403, { message: "You don't have access to this sheet." });
+};
+
 const sheet = async (
   c: Context,
   sheet_id: string,
   { limit, offset, ...qs }: Record<string, string>,
 ): Promise<Page> => {
   const [type, doc_id] = sheet_id.split(":");
-  const [access] = await sql`
-    select true from sheet_usr where sheet_id = ${sheet_id} and usr_id = ${c.get("usr_id")}
-  `;
-  if (!access) throw new HTTPException(403, { message: "You don't have access to this sheet." });
+  await assertSheetAccess(c, sheet_id);
   const hand = await automerge
     .find<{ data: Sheet["data"] }>(doc_id as AnyDocumentId)
     .catch(() => ({
@@ -257,11 +282,13 @@ const executeSql = async (
     } else { code_ += ch; }
   }
 
-  // Load referenced sheets
+  // Load referenced sheets, remembering source column types by name.
   const docs: Record<string, Record<string, unknown>[]> = {};
+  const nameToType: Record<string, Type> = {};
   for (const sheet_id of sheet_ids) {
     if (docs[sheet_id]) continue;
     const [cols, ...rows] = (await sheet(c, sheet_id, {})).data;
+    for (const col of Object.values(cols)) nameToType[col.name] = col.type;
     docs[sheet_id] = rows.map((row) =>
       Object.fromEntries(
         Object.values(cols).map((col) => [col.name, row[col.key]]),
@@ -287,7 +314,7 @@ const executeSql = async (
           i,
           {
             name: col.columnid,
-            type: "text",
+            type: nameToType[col.columnid] ?? "text",
             key: col.columnid,
           },
         ]),
@@ -374,10 +401,15 @@ const sendVerificationEmail = async (email: string) => {
     });
 };
 
+// --- database
+
 export const sql = pg(
   Deno.env.get("DATABASE_URL") ??
     "postgresql://postgres@127.0.0.1:5434/postgres",
   {
+    // The default (test) gateway is a single PGlite session, so concurrent
+    // queries must serialize onto one connection.
+    max: Deno.env.get("DATABASE_URL") ? 10 : 1,
     fetch_types: true,
     onnotice: (msg: { severity?: string }) => msg.severity !== "DEBUG" && console.log(msg),
   },
@@ -435,6 +467,8 @@ const page = (c: Context) => ({ data, offset, count }: Page) => {
   return c.json({ data }, 200);
 };
 
+// --- app & middleware
+
 export const app = new Hono<{
   Variables: JwtVariables & { usr_id: string };
 }>();
@@ -454,70 +488,110 @@ app.use("*", async (c, next) => {
   await next();
 });
 
-// deno-lint-ignore no-explicit-any
-type WebSocketLike = any;
+// --- seeding
 
-class HonoWebSocketAdapter extends AM.NetworkAdapter {
-  private connections = new Map<AM.PeerId, WebSocketLike>();
-  private _isReady = true;
-  isReady(): boolean {
-    return this._isReady;
+// Idempotent: examples.sql and every dataset upsert on doc_id.
+export const seed = async () => {
+  await sql.unsafe(examplesSql);
+  for (
+    const { doc_id, name, tags, doc } of [
+      ...DATASETS,
+      { doc_id: "webhook-inbox", name: "webhook inbox", tags: ["example", "net"], doc: { type: "net-hook", data: [] } },
+    ]
+  ) {
+    await sql`
+      insert into sheet (sell_price, created_by, type, name, tags, doc_id, row_0)
+      values (0, (select usr_id from usr where email = ''), 'template', ${name}, ${tags},
+              ${"dataset-" + doc_id}, ${sql.json({ name, ...doc })})
+      on conflict (doc_id) do update set name = excluded.name, tags = excluded.tags, row_0 = excluded.row_0
+    `;
   }
-  whenReady(): Promise<void> {
-    return Promise.resolve();
+};
+
+let seeded: Promise<unknown> | undefined;
+app.use("*", async (_c, next) => {
+  await (seeded ??= seed().catch((err) => {
+    seeded = undefined;
+    throw new Error(`seed() failed applying examples.sql/DATASETS: ${err instanceof Error ? err.message : err}`);
+  }));
+  await next();
+});
+
+// --- automerge sync
+
+// The official NodeWSServerAdapter drives node-ws-shaped sockets; these shims
+// make Hono/Deno WebSockets fit that shape.
+type WsEventHandler = (...args: unknown[]) => void;
+
+class WsSocketShim {
+  isAlive = true;
+  private handlers: Record<string, WsEventHandler[]> = {};
+  // deno-lint-ignore no-explicit-any
+  constructor(private ws: any) {}
+  on(event: string, handler: WsEventHandler): void {
+    (this.handlers[event] ??= []).push(handler);
   }
-  connect(peerId: AM.PeerId, peerMetadata?: AM.PeerMetadata): void {
-    this.emit("peer-candidate", { peerId, peerMetadata: peerMetadata || {} });
+  emit(event: string, ...args: unknown[]): void {
+    for (const handler of this.handlers[event] ?? []) handler(...args);
   }
-  disconnect(): void {
-    for (const [, ws] of this.connections) {
-      try {
-        ws.close();
-      } catch { /* ignore */ }
-    }
-    this.connections.clear();
+  send(data: ArrayBuffer | Uint8Array): void {
+    this.ws.send(data);
   }
-  send(message: AM.Message): void {
-    const connection = this.connections.get(message.targetId);
-    if (connection && connection.readyState === WebSocket.OPEN) {
-      if ("data" in message && message.data instanceof Uint8Array) connection.send(message.data);
-      else connection.send(JSON.stringify(message));
-    }
+  close(): void {
+    this.ws.close();
   }
-  addConnection(peerId: AM.PeerId, ws: WebSocketLike): void {
-    this.connections.set(peerId, ws);
-    this.emit("peer-candidate", { peerId, peerMetadata: {} });
+  terminate(): void {
+    this.ws.close();
   }
-  removeConnection(peerId: AM.PeerId): void {
-    this.connections.delete(peerId);
-    this.emit("peer-disconnected", { peerId });
+  ping(): void {
+    // Deno reaps dead sockets itself; answer the adapter's keepalive locally.
+    this.emit("pong");
   }
-  handleMessage(peerId: AM.PeerId, data: Uint8Array): void {
-    // deno-lint-ignore no-explicit-any
-    this.emit("message", { data, senderId: peerId } as any);
+  get readyState(): number {
+    return this.ws.readyState;
   }
 }
 
-// TODO: Replace this with AM.NodeWebSocketAdapter. Try to grab hono's websocket server and pass it in. Use automerge.networkSubsystem.add...?
-const honoAdapter = new HonoWebSocketAdapter();
+const wss = {
+  clients: new Set<WsSocketShim>(),
+  handlers: {} as Record<string, WsEventHandler[]>,
+  on(event: string, handler: WsEventHandler): void {
+    (this.handlers[event] ??= []).push(handler);
+  },
+  emit(event: string, ...args: unknown[]): void {
+    const handlers = this.handlers[event] ?? [];
+    if (event === "connection" && !handlers.length)
+      throw new Error("A WebSocket connected before the automerge adapter subscribed to the server.");
+    for (const handler of handlers) handler(...args);
+  },
+};
 
-// Cache of peer ID to user ID mappings for share policy checks
-const peerUserMap = new Map<AM.PeerId, string | null>();
+// deno-lint-ignore no-explicit-any
+const wsAdapter = new NodeWSServerAdapter(wss as any);
 
-const sharePolicy = async (peerId: AM.PeerId, documentId?: AM.DocumentId): Promise<boolean> => {
-  // Server always has access
-  if (peerId.startsWith("server-")) return true;
+// senderId (client-chosen peer ID from the join message) -> authenticated usr + owning socket
+const peerUserMap = new Map<AM.PeerId, { usr_id: string | null; shim: WsSocketShim }>();
 
-  // If no document specified, deny
-  if (!documentId) return false;
+// Per-document access for sync. sharePolicy only governs proactive announcements
+// in automerge-repo; explicit requests are enforced in the /library/sync message
+// path below, so both call this.
+const syncAccessCache = new Map<string, { ok: boolean; expires: number }>();
 
-  // Extract user ID from peer ID (format: "user-{usr_id}" or "anonymous-{random}")
-  const usr_id = peerUserMap.get(peerId);
+// PUT /library/:id must fetch a client-created doc over sync BEFORE its sheet
+// row exists; grantSync bridges that window (and clears any cached denial).
+const pendingSync = new Map<string, number>();
+const grantSync = (usr_id: string, documentId: string): void => {
+  pendingSync.set(`${usr_id}/${documentId}`, Date.now() + 30_000);
+  syncAccessCache.delete(`${usr_id}/${documentId}`);
+};
 
-  // Anonymous users can't access documents via sync
+const canSync = async (usr_id: string | null, documentId: string): Promise<boolean> => {
   if (!usr_id) return false;
-
-  // Check if user has access to this document in the database
+  const key = `${usr_id}/${documentId}`;
+  if ((pendingSync.get(key) ?? 0) > Date.now()) return true;
+  const hit = syncAccessCache.get(key);
+  if (hit && hit.expires > Date.now()) return hit.ok;
+  if (syncAccessCache.size > 10_000) syncAccessCache.clear();
   const [access] = await sql`
     select true as has_access
     from sheet_usr su
@@ -525,42 +599,91 @@ const sharePolicy = async (peerId: AM.PeerId, documentId?: AM.DocumentId): Promi
     where s.doc_id = ${documentId}
       and su.usr_id = ${usr_id}
   `;
-
-  return !!access?.has_access;
+  const ok = !!access?.has_access;
+  syncAccessCache.set(key, { ok, expires: Date.now() + 30_000 });
+  return ok;
 };
 
+const peerCanSync = (peerId: AM.PeerId, documentId?: AM.DocumentId): Promise<boolean> =>
+  documentId ? canSync(peerUserMap.get(peerId)?.usr_id ?? null, documentId) : Promise.resolve(false);
+
+const SERVER_PEER_ID = `server-${Deno.hostname()}` as AM.PeerId;
+
 export const automerge = new Repo({
-  network: [honoAdapter],
+  network: [wsAdapter],
   storage: new NodeFSStorageAdapter(`${path.dirname(path.fromFileUrl(Deno.mainModule))}/data/automerge`),
-  peerId: `server-${Deno.hostname()}` as AM.PeerId,
-  sharePolicy,
+  peerId: SERVER_PEER_ID,
+  // access gates the synchronizer's outbound sharing too, not just announcements.
+  shareConfig: { announce: peerCanSync, access: peerCanSync },
 });
 
 app.get(
   "/library/sync",
   upgradeWebSocket(async (c) => {
-    const { auth } = c.req.query();
-    const usr_id = await verifyWsAuth(auth);
-    const peerId = (usr_id ? `user-${usr_id}` : `anonymous-${Math.random().toString(36).substr(2, 9)}`) as AM.PeerId;
-
+    const usr_id = await verifyWsAuth(c.req.query().auth);
+    let shim: WsSocketShim | undefined;
+    let joined: AM.PeerId | undefined;
+    let queue = Promise.resolve();
+    const cleanup = () => {
+      if (!shim) return;
+      wss.clients.delete(shim);
+      if (joined && peerUserMap.get(joined)?.shim === shim) peerUserMap.delete(joined);
+      shim.emit("close");
+      shim = undefined;
+    };
     return {
       onOpen(_event, ws) {
-        peerUserMap.set(peerId, usr_id);
-        honoAdapter.addConnection(peerId, ws);
+        if (ws.raw) ws.raw.binaryType = "arraybuffer";
+        shim = new WsSocketShim(ws);
+        wss.clients.add(shim);
+        wss.emit("connection", shim);
       },
       onMessage(event) {
+        if (!shim) throw new Error("Sync frame arrived with no open socket (already closed or never opened).");
         const raw = event.data;
-        const data = typeof raw === "string" ? new TextEncoder().encode(raw) : new Uint8Array(raw as ArrayBuffer);
-        honoAdapter.handleMessage(peerId, data);
+        const data = typeof raw === "string"
+          ? new TextEncoder().encode(raw)
+          : raw instanceof Uint8Array
+          ? raw
+          : raw instanceof ArrayBuffer
+          ? new Uint8Array(raw)
+          : null;
+        if (!data) throw new Error(`Unsupported WebSocket frame: ${raw?.constructor?.name}`);
+        // Messages queue so the async access check cannot reorder the sync protocol.
+        queue = queue.then(async () => {
+          if (!shim) return;
+          let msg: { type?: string; senderId?: string; documentId?: string } | undefined;
+          try {
+            msg = AM.cbor.decode(data) as typeof msg;
+          } catch {
+            // Not CBOR; the adapter closes invalid connections itself.
+            shim.emit("message", data);
+            return;
+          }
+          if (!joined && msg?.type === "join" && msg.senderId) {
+            joined = msg.senderId as AM.PeerId;
+            peerUserMap.set(joined, { usr_id, shim });
+          }
+          if (msg?.documentId && !(await canSync(usr_id, msg.documentId))) {
+            if (!shim) return;
+            shim.send(AM.cbor.encode({
+              type: "doc-unavailable",
+              senderId: SERVER_PEER_ID,
+              targetId: msg.senderId,
+              documentId: msg.documentId,
+            }));
+            return;
+          }
+          if (shim) shim.emit("message", data);
+        }).catch((err) => {
+          // A dropped sync message wedges the stateful protocol; close so the
+          // client reconnects with fresh state instead of waiting forever.
+          console.error(`/library/sync (usr ${usr_id}):`, err);
+          shim?.close();
+        });
       },
-      onClose() {
-        peerUserMap.delete(peerId);
-        honoAdapter.removeConnection(peerId);
-      },
-      onError() {
-        peerUserMap.delete(peerId);
-        honoAdapter.removeConnection(peerId);
-      },
+      onClose: cleanup,
+      onError: cleanup,
     };
   }),
 );
@@ -576,6 +699,8 @@ const verifyWsAuth = async (auth: string | undefined): Promise<string | null> =>
     return null;
   }
 };
+
+// --- live portals
 
 // deno-lint-ignore no-explicit-any
 const portal = (name: string, ms: number, init: () => any, tick: (s: any) => { cols: any[]; rows: any[] }) =>
@@ -844,6 +969,8 @@ portal("words", 200, () => {
   };
 });
 
+// --- public routes
+
 app.use("*", cors());
 
 app.notFound(() => {
@@ -942,7 +1069,7 @@ const ipBlocked = (ipRaw: string): boolean => {
 };
 
 // SSRF guard: block internal hosts by literal IP and by resolved DNS; follow redirects manually re-validating each hop.
-const safeFetch = async (start: string): Promise<Response> => {
+const safeFetch = async (start: string, headers: Record<string, string> = {}): Promise<Response> => {
   let url = start;
   for (let hop = 0; hop < 5; hop++) {
     const u = new URL(url);
@@ -958,9 +1085,13 @@ const safeFetch = async (start: string): Promise<Response> => {
     if (ips.some(ipBlocked)) throw new HTTPException(400, { message: "Internal URLs not allowed." });
     const res = await fetch(url, {
       redirect: "manual",
+      signal: AbortSignal.timeout(30_000),
       headers: {
         "User-Agent": "Scrapsheets/1.0",
         "Accept": "application/json, application/xml, text/xml, application/atom+xml, */*",
+        // Caller headers may carry credentials: never replay them to a host an
+        // origin redirected to.
+        ...(u.origin === new URL(start).origin ? headers : {}),
       },
     });
     const location = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
@@ -969,6 +1100,69 @@ const safeFetch = async (start: string): Promise<Response> => {
   }
   throw new HTTPException(400, { message: "Too many redirects." });
 };
+
+// --- net-http polling
+
+export const parseNetHeaders = (raw = ""): Record<string, string> =>
+  Object.fromEntries(
+    raw.split("\n").filter((line) => line.trim()).map((line) => {
+      const m = line.match(/^([^:\s]+):\s*(.+)$/);
+      if (!m) throw new Error(`Header line is not "Name: value": ${JSON.stringify(line)}`);
+      return [m[1], m[2].trim()];
+    }),
+  );
+
+const netDue = new Map<string, number>();
+
+// Read at most `cap` bytes, then abandon the rest of the body.
+const readCapped = async (res: Response, cap: number): Promise<string> => {
+  const reader = res.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (size < cap) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    size += value.byteLength;
+  }
+  await reader.cancel().catch(() => {});
+  const buf = new Uint8Array(Math.min(size, cap));
+  let offset = 0;
+  for (const chunk of chunks) {
+    if (offset >= buf.length) break;
+    buf.set(chunk.subarray(0, Math.min(chunk.byteLength, buf.length - offset)), offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(buf);
+};
+
+export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promise<void> => {
+  const sheets = await sql`select sheet_id, doc_id from sheet where type = 'net-http'`;
+  for (const { sheet_id, doc_id } of sheets) {
+    if ((netDue.get(sheet_id) ?? 0) > now) continue;
+    netDue.set(sheet_id, now + 3600_000);
+    try {
+      const config = (await automerge.find<{ data: [NetHttp] }>(doc_id)).doc()?.data?.[0];
+      if (!config) throw new Error("The document has no config in data[0].");
+      netDue.set(sheet_id, now + Math.max(60, Number(config.interval) || 3600) * 1000);
+      if (!config.url) continue;
+      const res = await fetcher(config.url, parseNetHeaders(config.headers));
+      const text = await readCapped(res, 65536);
+      // Errors become log rows too: the user who typed the URL must see them.
+      const body = res.ok ? text : JSON.stringify({ error: `HTTP ${res.status}`, body: text.slice(0, 1000) });
+      await sql`insert into net (sheet_id, method, body) values (${sheet_id}, 'GET', ${body})`;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`net-http poll ${sheet_id}:`, message);
+      await sql`
+        insert into net (sheet_id, method, body) values (${sheet_id}, 'GET', ${JSON.stringify({ error: message })})
+      `.catch((dbErr: unknown) => console.error(`net-http poll ${sheet_id}: could not record the error:`, dbErr));
+    }
+  }
+};
+
+setInterval(() => pollNetOnce().catch((err) => console.error("net-http poll:", err)), 15_000);
 
 // CORS proxy for external data sources (unauthenticated, rate-limited)
 app.get("/proxy", async (c) => {
@@ -994,6 +1188,8 @@ app.get("/proxy", async (c) => {
   }
 });
 
+// --- authenticated routes
+
 app.use("*", jwt({ secret: JWT_SECRET, alg: JWT_ALG }));
 
 app.use("*", async (c, next) => {
@@ -1014,7 +1210,7 @@ app.post("/buy/:id", async (c) => {
     const row_0 = sheet.type === "template" ? sheet.row_0.data : [];
     const doc_id = sheet.sell_type.startsWith("codex-")
       ? Math.random().toString().slice(2)
-      : automerge.create({ data: row_0 }).documentId;
+      : automerge.create({ type: sheet.sell_type, data: row_0 }).documentId;
     const [{ sheet_id }] = await sql`
       with sell as (
         select * from sheet where sell_id = ${
@@ -1040,6 +1236,7 @@ app.post("/buy/:id", async (c) => {
     // TODO: Charge usr on stripe, etc.
     return sheet_id;
   });
+  syncAccessCache.delete(`${c.get("usr_id")}/${sheet_id.split(":")[1]}`);
   return c.json({ data: sheet_id }, 201);
 });
 
@@ -1122,7 +1319,9 @@ app.put("/library/:id", async (c) => {
   if (!type || !doc_id)
     throw new HTTPException(400, { message: "Invalid sheet_id format." });
 
-  // Verify the automerge document exists
+  // Verify the automerge document exists. The doc may live only on the caller's
+  // client, so grant sync access for the fetch window.
+  grantSync(usr_id, doc_id);
   const row_0 = await automerge
     .find<{ data: Table }>(doc_id as AnyDocumentId)
     .then((hand) => hand.doc()?.data?.[0] ?? {})
@@ -1146,11 +1345,14 @@ app.put("/library/:id", async (c) => {
     )
     insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s
   `;
+  syncAccessCache.delete(`${usr_id}/${doc_id}`);
 
   return c.json(null, 201);
 });
 
 // CSV Import - parse CSV and create a new table sheet
+// --- import/export
+
 app.post("/import/csv", async (c) => {
   const usr_id = c.get("usr_id");
   const contentType = c.req.header("content-type") || "";
@@ -1373,6 +1575,8 @@ app.get("/net/:id", async (c) => {
 app.post("/query", async (c) => {
   return page(c)(await querify(c, await c.req.json(), c.req.query()));
 });
+
+// --- codex (external databases)
 
 app.get("/codex/:id", async (c) => {
   if (!rateLimit(`codex:${c.get("usr_id")}`))
@@ -1665,9 +1869,223 @@ app.get("/stats/:id", async (c) => {
   }, 200);
 });
 
-app.all("/mcp/:id", (c) => {
-  // TODO: mcp server
-  return c.json({ error: "Not implemented" }, 501);
+// --- mcp
+// Hand-rolled Model Context Protocol server (JSON-RPC 2.0 over POST, no
+// streaming). :id is the default sheet scope; tools may override via sheet_id.
+
+type McpTool = {
+  description: string;
+  inputSchema: Record<string, unknown>;
+  handler: (c: Context, args: Record<string, unknown>) => Promise<unknown>;
+};
+
+const mcpSheetId = (c: Context, args: Record<string, unknown>): string =>
+  typeof args.sheet_id === "string" ? args.sheet_id : c.req.param("id") ?? "";
+
+const mcpTools: Record<string, McpTool> = {
+  read_sheet: {
+    description: "Read a sheet's columns and rows.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sheet_id: { type: "string", description: "type:doc_id; defaults to the sheet in the URL" },
+        limit: { type: "integer" },
+        offset: { type: "integer" },
+      },
+    },
+    handler: async (c, args) => {
+      const qs: Record<string, string> = {};
+      if (args.limit !== undefined) qs.limit = String(args.limit);
+      if (args.offset !== undefined) qs.offset = String(args.offset);
+      const { data, count, offset } = await sheet(c, mcpSheetId(c, args), qs);
+      const [cols, ...rows] = data;
+      return { cols: Object.values(cols), rows, count, offset };
+    },
+  },
+  query_sheet: {
+    description: "Run SQL (AlaSQL dialect; reference sheets as @type:doc_id) or PRQL.",
+    inputSchema: {
+      type: "object",
+      required: ["code"],
+      properties: {
+        lang: { type: "string", enum: ["sql", "prql"], default: "sql" },
+        code: { type: "string" },
+      },
+    },
+    handler: async (c, args) => {
+      if (typeof args.code !== "string") {
+        throw new HTTPException(400, {
+          message: `query_sheet needs a "code" string, got: ${JSON.stringify(args.code)}`,
+        });
+      }
+      const lang = args.lang ?? "sql";
+      if (lang !== "sql" && lang !== "prql") {
+        throw new HTTPException(400, {
+          message: `query_sheet lang must be "sql" or "prql", got: ${JSON.stringify(lang)}`,
+        });
+      }
+      const { data, count } = await querify(c, { lang, code: args.code, args: [] }, {});
+      const [cols, ...rows] = data;
+      return { cols: Object.values(cols), rows, count };
+    },
+  },
+  list_sheets: {
+    description: "List the sheets in the caller's library.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async (c) => {
+      const sheets = await sql`
+        select s.sheet_id, s.type, s.doc_id, s.name, s.tags, s.created_at
+        from sheet_usr su
+        inner join sheet s using (sheet_id)
+        where su.usr_id = ${c.get("usr_id")}
+        order by s.created_at
+      `;
+      return { sheets: [...sheets] };
+    },
+  },
+  write_cells: {
+    description:
+      "Write cells in a table sheet. row is a 0-based data-row index; row equal to the current row count appends one new row.",
+    inputSchema: {
+      type: "object",
+      required: ["cells"],
+      properties: {
+        sheet_id: { type: "string", description: "type:doc_id; defaults to the sheet in the URL" },
+        cells: {
+          type: "array",
+          items: {
+            type: "object",
+            required: ["row", "col", "value"],
+            properties: {
+              row: { type: "integer", minimum: 0 },
+              col: { type: "string", description: "column key or column name" },
+              value: {
+                description:
+                  "must match the column type: number for num/int/float/usd, boolean for bool, string otherwise",
+              },
+            },
+          },
+        },
+      },
+    },
+    handler: async (c, args) => {
+      const sheet_id = mcpSheetId(c, args);
+      const [type, doc_id] = sheet_id.split(":");
+      if (type !== "table")
+        throw new HTTPException(400, { message: `write_cells only works on table sheets, got: ${sheet_id}` });
+      if (!Array.isArray(args.cells) || !args.cells.length)
+        throw new HTTPException(400, { message: `write_cells needs a non-empty "cells" array.` });
+      await assertSheetAccess(c, sheet_id);
+      const hand = await automerge.find<{ type: string; data: Table }>(doc_id as AnyDocumentId).catch(() => {
+        throw new HTTPException(404, { message: "Sheet not found." });
+      });
+      const doc = hand.doc();
+      if (!doc?.data) throw new HTTPException(500, { message: `Sheet ${sheet_id} has no data.` });
+      const [colsRow, ...rows] = doc.data;
+      if (!colsRow) throw new HTTPException(500, { message: `Sheet ${sheet_id} has no columns row.` });
+      const cols = Object.values(colsRow);
+      // Validate every cell before mutating anything: no partial writes.
+      const writes: { rowIndex: number; key: string | number; value: unknown }[] = [];
+      for (const [i, cell] of args.cells.entries()) {
+        const { row, col, value } = cell as { row: unknown; col: unknown; value: unknown };
+        const target = cols.find((x) => x.key === col) ?? cols.find((x) => x.name === col);
+        if (!target) {
+          throw new HTTPException(400, {
+            message: `cells[${i}]: no column ${JSON.stringify(col)}. Columns: ` +
+              cols.map((x) => `${x.name} (key ${JSON.stringify(x.key)})`).join(", "),
+          });
+        }
+        if (typeof row !== "number" || !Number.isInteger(row) || row < 0 || row > rows.length) {
+          throw new HTTPException(400, {
+            message: `cells[${i}]: row ${JSON.stringify(row)} is out of range. The sheet has ${rows.length} rows` +
+              ` (row ${rows.length} appends one new row).`,
+          });
+        }
+        if (typeof target.type !== "string") {
+          throw new HTTPException(400, {
+            message:
+              `cells[${i}]: column ${target.name} has a structured type; write_cells only writes scalar columns.`,
+          });
+        }
+        const t = target.type;
+        const bad = ["num", "int", "float", "usd", "percentage"].includes(t)
+          ? typeof value !== "number" || (t === "int" && !Number.isInteger(value))
+          : t === "bool"
+          ? typeof value !== "boolean"
+          : t === "json"
+          ? value === undefined
+          : typeof value !== "string";
+        if (bad) {
+          throw new HTTPException(400, {
+            message: `cells[${i}] (row ${row}, ${target.name}): expected ${t}, got ${typeof value} ${
+              JSON.stringify(value)
+            }`,
+          });
+        }
+        writes.push({ rowIndex: row, key: target.key, value });
+      }
+      const appends = writes.some((w) => w.rowIndex === rows.length);
+      hand.change((doc) => {
+        if (appends) doc.data.push({});
+        for (const { rowIndex, key, value } of writes) doc.data[rowIndex + 1][key] = value;
+      });
+      return { written: writes.length, rows: rows.length + (appends ? 1 : 0) };
+    },
+  },
+};
+
+app.post("/mcp/:id", async (c) => {
+  const msg: {
+    jsonrpc?: string;
+    id?: unknown;
+    method?: string;
+    params?: { name?: string; arguments?: Record<string, unknown>; protocolVersion?: string };
+  } = await c.req.json().catch(() => {
+    throw new HTTPException(400, { message: "MCP requests must be JSON." });
+  });
+  if (msg?.jsonrpc !== "2.0")
+    throw new HTTPException(400, { message: `Expected JSON-RPC 2.0, got: ${JSON.stringify(msg?.jsonrpc)}` });
+  if (msg.id === undefined) return c.body(null, 202);
+  const rpc = (result: unknown) => c.json({ jsonrpc: "2.0", id: msg.id, result });
+  const rpcErr = (code: number, message: string) => c.json({ jsonrpc: "2.0", id: msg.id, error: { code, message } });
+  switch (msg.method) {
+    case "initialize":
+      return rpc({
+        protocolVersion: ["2025-06-18", "2025-03-26"].includes(msg.params?.protocolVersion ?? "")
+          ? msg.params?.protocolVersion
+          : "2025-06-18",
+        capabilities: { tools: {} },
+        serverInfo: { name: "scrapsheets", version: "0" },
+      });
+    case "ping":
+      return rpc({});
+    case "tools/list":
+      return rpc({
+        tools: Object.entries(mcpTools).map(([name, tool]) => ({
+          name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+        })),
+      });
+    case "tools/call": {
+      const tool = mcpTools[msg.params?.name ?? ""];
+      if (!tool)
+        return rpcErr(-32602, `Unknown tool: ${msg.params?.name}. Available: ${Object.keys(mcpTools).join(", ")}`);
+      try {
+        const out = await tool.handler(c, msg.params?.arguments ?? {});
+        return rpc({ content: [{ type: "text", text: JSON.stringify(out) }], structuredContent: out, isError: false });
+      } catch (err) {
+        if (!(err instanceof HTTPException)) console.error(`mcp tools/call ${msg.params?.name}:`, err);
+        return rpc({
+          content: [{ type: "text", text: err instanceof HTTPException ? err.message : String(err) }],
+          isError: true,
+        });
+      }
+    }
+    default:
+      return rpcErr(-32601, `Method not found: ${msg.method}`);
+  }
 });
+app.all("/mcp/:id", (c) => c.body(null, 405, { Allow: "POST" }));
 
 export default app;

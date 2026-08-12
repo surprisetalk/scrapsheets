@@ -17,7 +17,9 @@ technologies. It uses a hybrid architecture with:
 
 - `main.ts` - Main server application and API routes
 - `src/Main.elm` - Frontend application
+- `src/examples.mjs` - Bundled example datasets and queries (imported by both the page and the server seeder)
 - `db.sql` - Database schema and initial data
+- `examples.sql` - Shop catalogue of query templates (applied by `seed()` on first request)
 - `deno.json` - Dependencies and import map
 - `src/index.html` - Frontend HTML entry point
 - `vendor.ts` - Regenerates the browser-side automerge assets in `src/`
@@ -52,10 +54,17 @@ technologies. It uses a hybrid architecture with:
 ### Backend Architecture (main.ts)
 
 - **Framework**: Hono web framework with JWT middleware
-- **Database**: PostgreSQL via postgresjs
-- **Real-time sync**: Custom WebSocket adapter for Automerge
+- **Database**: PostgreSQL via postgresjs (pool capped at one connection: the test gateway is a single PGlite session)
+- **Real-time sync**: official automerge NodeWSServerAdapter behind a small ws-shim over Hono's upgradeWebSocket;
+  per-document access is enforced in the /library/sync message path (`canSync`), not just sharePolicy
 - **Authentication**: JWT-based with email verification via SendGrid
 - **Document types**: table, query, net-hook, net-http, net-socket, portal, codex-*
+- **Seeding**: a lazy-once middleware runs `seed()` (examples.sql + src/examples.mjs datasets) on the first request;
+  idempotent via `on conflict (doc_id) do update`
+- **net-http polling**: `pollNetOnce` scans net-http sheets every 15s, fetches due URLs through the safeFetch SSRF
+  guard, and appends bodies to the `net` table
+- **MCP server**: POST /mcp/:id is a hand-rolled JSON-RPC 2.0 endpoint (initialize, tools/list, tools/call) with tools
+  read_sheet, write_cells, query_sheet, list_sheets; :id is the default sheet scope
 
 ### Key Backend Features
 
@@ -68,9 +77,15 @@ technologies. It uses a hybrid architecture with:
 ### Frontend Architecture (src/Main.elm)
 
 - **Architecture**: Elm Architecture (Model-Update-View)
-- **Document types**: Library, Shop, Tab (table), Query. Every other server type (net-_, portal, template, codex-_)
-  decodes to `Unviewable typ`, which the view reports as an error naming the type and a query that can read the sheet.
-  Give a type a real view by replacing its `Unviewable` branch in `docDecoder`.
+- **Document types**: Library, Shop, Tab (table), Query, NetHook, NetHttp, NetSocket. Remaining server types (portal,
+  template, codex-_) decode to `Unviewable typ`, which the view reports as an error naming the type and a query that can
+  read the sheet. Give a type a real view by replacing its `Unviewable` branch in `docDecoder`.
+- **Default library**: client-side (localStorage) system entries merge bundled examples from `src/examples.mjs` (6
+  datasets + example queries), 7 live portals, and the tutorial sheet; system ids skip `repo.find` in `changeId`
+- **Cross-sheet queries in the browser**: `resolveSheets` rewrites `@type:doc_id` to `SHEET('id')` and pre-loads each
+  doc (library entry or `repo.find`) before AlaSQL runs; `@query:` refs recurse (depth cap 2)
+- **UI chrome**: keyboard shortcut sheet (Ctrl/⌘+/ or "?"), library sparkline thumbnails (computed JS-side into
+  localStorage entries), five-step first-run tutorial (localStorage `scrapsheets-tutorial`, -1 = dismissed)
 - **Real-time sync**: Ports for Automerge integration
 - **UI**: Table-based interface with cell editing, selection, and statistics
 - **Automerge loading**: `src/index.html` maps `@automerge/automerge` to the esm.sh slim build and calls
