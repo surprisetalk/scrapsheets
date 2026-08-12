@@ -2847,25 +2847,11 @@ libraryCols =
 viewModal : Msg -> List (Html Msg) -> Html Msg
 viewModal closeMsg content =
     H.div
-        [ S.positionFixed
-        , S.top "0"
-        , S.left "0"
-        , S.right "0"
-        , S.bottom "0"
-        , S.backgroundColor "rgba(0,0,0,0.5)"
-        , S.displayFlex
-        , S.alignItemsCenter
-        , S.justifyContentCenter
-        , S.zIndex "1000"
-        , A.onClick closeMsg
-        ]
+        [ A.class "scrim", A.onClick closeMsg ]
         [ H.div
-            [ S.backgroundColor "#fff"
-            , S.border "1px solid #aaa"
-            , S.borderRadius "4px"
-            , S.padding "1rem"
+            [ A.class "panel"
+            , S.paddingRem 1
             , S.minWidthRem 20
-            , S.boxShadow "0 2px 8px rgba(0,0,0,0.15)"
             , A.stopPropagationOn "click" (D.succeed ( NoOp, True ))
             ]
             content
@@ -2880,15 +2866,8 @@ viewSettings show info =
     else
         viewModal SettingsClose
             [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter, S.marginBottom "1rem" ]
-                [ H.h3 [ S.margin "0" ] [ text "Sheet Settings" ]
-                , H.button
-                    [ A.onClick SettingsClose
-                    , S.border "none"
-                    , S.background "transparent"
-                    , S.cursorPointer
-                    , S.fontSizeRem 1.2
-                    ]
-                    [ text "×" ]
+                [ H.h3 [] [ text "Sheet Settings" ]
+                , H.button [ A.class "x", A.onClick SettingsClose ] [ text "×" ]
                 ]
             , H.div [ S.marginBottom "1rem" ]
                 [ H.label [ S.display "block", S.marginBottom "0.25rem", S.fontWeight "600" ] [ text "Name" ]
@@ -2899,9 +2878,6 @@ viewSettings show info =
                     , A.placeholder "Sheet name"
                     , A.attribute "onfocus" "this.select()"
                     , S.width "100%"
-                    , S.padding "0.5rem"
-                    , S.border "1px solid #ccc"
-                    , S.borderRadius "4px"
                     ]
                     []
                 ]
@@ -2913,9 +2889,6 @@ viewSettings show info =
                     , A.onInput SettingsTagsChange
                     , A.placeholder "tag1, tag2, tag3"
                     , S.width "100%"
-                    , S.padding "0.5rem"
-                    , S.border "1px solid #ccc"
-                    , S.borderRadius "4px"
                     ]
                     []
                 , H.small [ S.color "#666" ] [ text "Separate tags with commas" ]
@@ -2925,10 +2898,8 @@ viewSettings show info =
                 , S.width "100%"
                 , S.padding "0.5rem 1rem"
                 , S.border "none"
-                , S.borderRadius "4px"
-                , S.background "#007bff"
+                , S.background "#0a58ca"
                 , S.color "#fff"
-                , S.cursorPointer
                 ]
                 [ text "Done" ]
             ]
@@ -2945,23 +2916,13 @@ viewDeleteConfirm maybeId =
                 [ H.p [ S.marginBottom "1rem" ]
                     [ text "Are you sure you want to delete this sheet? This cannot be undone." ]
                 , H.div [ S.displayFlex, S.gapRem 0.5, S.justifyContentFlexEnd ]
-                    [ H.button
-                        [ A.onClick DocDeleteCancel
-                        , S.padding "0.5rem 1rem"
-                        , S.border "1px solid #ccc"
-                        , S.borderRadius "4px"
-                        , S.background "#f0f0f0"
-                        , S.cursorPointer
-                        ]
-                        [ text "Cancel" ]
+                    [ H.button [ A.onClick DocDeleteCancel, S.padding "0.5rem 1rem" ] [ text "Cancel" ]
                     , H.button
                         [ A.onClick (DocDeleteConfirm id)
                         , S.padding "0.5rem 1rem"
                         , S.border "none"
-                        , S.borderRadius "4px"
                         , S.background "#dc3545"
                         , S.color "#fff"
-                        , S.cursorPointer
                         ]
                         [ text "Delete" ]
                     ]
@@ -3027,14 +2988,14 @@ viewShortcuts show =
 
     else
         viewModal (ShortcutsToggle False) <|
-            H.h3 [ S.marginTop "0" ] [ text "Keyboard shortcuts" ]
+            H.h3 [] [ text "Keyboard shortcuts" ]
                 :: List.concatMap
                     (\( group, keys ) ->
-                        [ H.h4 [ S.marginBottom "0.25rem" ] [ text group ]
-                        , H.div [ S.displayGrid, S.gridTemplateColumns "auto 1fr", S.gridColumnGapRem 1, S.fontSizeRem 0.875 ] <|
+                        [ H.h4 [ S.marginTop "0.75rem", S.marginBottom "0.25rem" ] [ text group ]
+                        , H.div [ S.displayGrid, S.gridTemplateColumns "auto 1fr", S.gap "0.25rem 1rem", S.fontSizeRem 0.875 ] <|
                             List.concatMap
                                 (\( key, description ) ->
-                                    [ H.span [ S.fontFamilyMonospace ] [ text key ]
+                                    [ H.span [ A.class "mono" ] [ text key ]
                                     , H.span [] [ text description ]
                                     ]
                                 )
@@ -3052,30 +3013,21 @@ viewFindReplace maybeFindReplace =
 
         Just fr ->
             H.div
-                [ S.positionFixed
+                [ A.class "panel"
+                , S.positionFixed
                 , S.topRem 3
                 , S.rightRem 1
-                , S.backgroundColor "#fff"
-                , S.border "1px solid #aaa"
-                , S.borderRadius "4px"
                 , S.padding "0.5rem"
                 , S.displayFlex
                 , S.flexDirectionColumn
                 , S.gapRem 0.5
                 , S.zIndex "100"
-                , S.boxShadow "0 2px 8px rgba(0,0,0,0.15)"
+                , S.fontSizeRem 0.875
                 ]
                 [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter ]
-                    [ H.span [ S.fontWeight "600", S.fontSizeRem 0.875 ]
+                    [ H.span [ S.fontWeight "600" ]
                         [ text (iif fr.showReplace "Find & Replace" "Find") ]
-                    , H.button
-                        [ A.onClick FindClose
-                        , S.border "none"
-                        , S.background "transparent"
-                        , S.cursorPointer
-                        , S.fontSizeRem 1
-                        ]
-                        [ text "×" ]
+                    , H.button [ A.class "x", A.onClick FindClose ] [ text "×" ]
                     ]
                 , H.div [ S.displayFlex, S.gapRem 0.25 ]
                     [ H.input
@@ -3084,30 +3036,13 @@ viewFindReplace maybeFindReplace =
                         , A.onInput FindTextChange
                         , A.id "find-input"
                         , onFindKeydown
-                        , S.padding "0.25rem 0.5rem"
-                        , S.border "1px solid #ccc"
-                        , S.borderRadius "2px"
                         , S.widthRem 12
                         ]
                         []
-                    , H.button
-                        [ A.onClick FindPrev
-                        , S.padding "0.25rem 0.5rem"
-                        , S.border "1px solid #ccc"
-                        , S.borderRadius "2px"
-                        , S.cursorPointer
-                        ]
-                        [ text "◀" ]
-                    , H.button
-                        [ A.onClick FindNext
-                        , S.padding "0.25rem 0.5rem"
-                        , S.border "1px solid #ccc"
-                        , S.borderRadius "2px"
-                        , S.cursorPointer
-                        ]
-                        [ text "▶" ]
+                    , H.button [ A.onClick FindPrev, A.title "previous match" ] [ text "◀" ]
+                    , H.button [ A.onClick FindNext, A.title "next match" ] [ text "▶" ]
                     ]
-                , H.div [ S.fontSizeRem 0.75, S.opacity "0.7" ]
+                , H.div [ S.fontSizeRem 0.75, S.color "#666" ]
                     [ text
                         (if List.isEmpty fr.matches then
                             iif (String.isEmpty fr.findText) "" "No matches"
@@ -3124,31 +3059,12 @@ viewFindReplace maybeFindReplace =
                             [ A.placeholder "Replace with..."
                             , A.value fr.replaceText
                             , A.onInput ReplaceTextChange
-                            , S.padding "0.25rem 0.5rem"
-                            , S.border "1px solid #ccc"
-                            , S.borderRadius "2px"
                             , S.widthRem 12
                             ]
                             []
                         , H.div [ S.displayFlex, S.gapRem 0.25 ]
-                            [ H.button
-                                [ A.onClick ReplaceOne
-                                , S.padding "0.25rem 0.5rem"
-                                , S.border "1px solid #ccc"
-                                , S.borderRadius "2px"
-                                , S.cursorPointer
-                                , S.fontSizeRem 0.75
-                                ]
-                                [ text "Replace" ]
-                            , H.button
-                                [ A.onClick ReplaceAll
-                                , S.padding "0.25rem 0.5rem"
-                                , S.border "1px solid #ccc"
-                                , S.borderRadius "2px"
-                                , S.cursorPointer
-                                , S.fontSizeRem 0.75
-                                ]
-                                [ text "Replace All" ]
+                            [ H.button [ A.onClick ReplaceOne ] [ text "Replace" ]
+                            , H.button [ A.onClick ReplaceAll ] [ text "Replace All" ]
                             ]
                         ]
 
@@ -3481,6 +3397,9 @@ typeWidth typ =
         Usd ->
             S.widthRem 5
 
+        Date ->
+            S.widthRem 7
+
         Percentage ->
             S.widthRem 4
 
@@ -3605,7 +3524,7 @@ viewThumb cols rows spark =
             List.map (\h -> H.div [ S.widthPx 3, S.height (String.fromFloat (4 + h * 10) ++ "px"), S.backgroundColor "#bbb" ] []) spark
 
     else if cols > 0 then
-        H.span [ S.opacity "0.5", S.fontSizeSmall ] [ text (String.fromInt cols ++ "×" ++ String.fromInt rows) ]
+        H.span [ S.color "#666", S.fontSizeRem 0.75 ] [ text (String.fromInt cols ++ "×" ++ String.fromInt rows) ]
 
     else
         text ""
@@ -3615,7 +3534,7 @@ viewStatCell : Maybe Stat -> List (Html Msg)
 viewStatCell maybeStat =
     let
         grid =
-            H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gapRem 0, S.gridColumnGapRem 0.5, S.justifyContentFlexStart, S.opacity "0.5" ]
+            H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gap "0 0.5rem", S.justifyContentFlexStart, S.fontSizeRem 0.75 ]
 
         kv k v =
             [ H.span [] [ text k ], H.span [] [ text v ] ]
@@ -3677,16 +3596,16 @@ viewHeaderCell sheet col =
             in
             [ H.div [ S.displayFlex, S.flexDirectionColumn, S.positionRelative ]
                 [ H.div [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ]
-                    [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600", S.cursorPointer, A.onClick (ColumnSort col.key) ]
+                    [ H.span [ A.class "sort", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600", S.cursorPointer, A.onClick (ColumnSort col.key), A.title "sort" ]
                         [ text (col.name ++ sortIndicator) ]
-                    , H.span [ S.cursorPointer, S.opacity (iif hasFilter "1" "0.3"), S.fontSizeRem 0.7, A.onClick (FilterToggle col.key), A.title "Filter" ]
+                    , H.span [ A.classList [ ( "funnel", True ), ( "on", hasFilter ) ], S.cursorPointer, S.fontSizeRem 0.75, A.onClick (FilterToggle col.key), A.title "filter" ]
                         [ text (iif hasFilter "⧩" "▽") ]
                     ]
                 , if isFilterOpen then
-                    H.div [ S.positionAbsolute, S.top "100%", S.left "0", S.backgroundColor "#fff", S.border "1px solid #ccc", S.borderRadius "4px", S.padding "0.5rem", S.zIndex "100", S.boxShadow "0 2px 8px rgba(0,0,0,0.15)", S.minWidth "150px" ]
-                        [ H.input [ A.placeholder "contains...", A.value currentFilterValue, A.onInput (FilterInput col.key), S.width "100%", S.padding "0.25rem", S.border "1px solid #ddd", S.borderRadius "2px", S.fontSizeRem 0.8 ] []
+                    H.div [ A.class "panel", S.positionAbsolute, S.top "100%", S.left "0", S.padding "0.5rem", S.zIndex "100", S.minWidth "150px", S.fontSizeRem 0.875 ]
+                        [ H.input [ A.placeholder "contains...", A.value currentFilterValue, A.onInput (FilterInput col.key), S.width "100%" ] []
                         , if hasFilter then
-                            H.button [ A.onClick (FilterClear col.key), S.marginTop "0.25rem", S.padding "0.25rem 0.5rem", S.fontSizeRem 0.7, S.background "#f0f0f0", S.border "1px solid #ccc", S.borderRadius "2px", S.cursorPointer ] [ text "Clear" ]
+                            H.button [ A.onClick (FilterClear col.key), S.marginTop "0.25rem" ] [ text "Clear" ]
 
                           else
                             text ""
@@ -3703,14 +3622,14 @@ viewEditCell sheet col =
     case col.typ of
         Enum options ->
             [ H.select
-                [ A.id "new-cell", onEditorKeydown, A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%" ]
+                [ A.id "new-cell", onEditorKeydown, A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.border "none", S.borderRadius "0", S.padding "0" ]
                 (H.option [ A.value "" ] [ text "-- select --" ]
                     :: List.map (\opt -> H.option [ A.value opt, A.selected (Just opt == sheet.write) ] [ text opt ]) options
                 )
             ]
 
         _ ->
-            [ H.input [ A.id "new-cell", onEditorKeydown, A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.minWidthRem 8 ] [] ]
+            [ H.input [ A.id "new-cell", onEditorKeydown, A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.minWidthRem 8, S.border "none", S.borderRadius "0", S.padding "0" ] [] ]
 
 
 viewCell : Sheet -> Result String (Array Stat) -> Int -> Int -> Col -> Row -> Html Msg
@@ -3734,8 +3653,7 @@ viewCell sheet stats i n col row =
         , A.onMouseDown CellMouseDown
         , A.onMouseUp CellMouseUp
         , A.onMouseEnter (CellHover (xy i n))
-        , S.heightRem 1.25
-        , S.lineHeight (iif (n == 0) "1.75" "")
+        , iif (n == 0 && sheet.filterOpen == Just col.key) (S.zIndex "2") (A.classList [])
         , cellClasses sheet i n
         , typeAlign col.typ
         , typeWidth col.typ
@@ -3750,7 +3668,7 @@ viewCell sheet stats i n col row =
                     viewStatCell (Maybe.andThen (Array.get i) (Result.toMaybe stats))
 
                 "-1" ->
-                    [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.opacity "0.5", S.fontSizeSmall ] [ text (typeName col.typ) ] ]
+                    [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontSizeRem 0.75 ] [ text (typeName col.typ) ] ]
 
                 "0" ->
                     viewHeaderCell sheet col
@@ -3776,18 +3694,7 @@ viewCell sheet stats i n col row =
 viewTableRow : Sheet -> Doc -> Result String (Array Stat) -> Array Col -> Int -> Row -> Html Msg
 viewTableRow sheet doc stats cols n row =
     H.tr
-        [ case String.fromInt n of
-            "-2" ->
-                S.backgroundColor "#ececec"
-
-            "-1" ->
-                S.backgroundColor "#f6f6f6"
-
-            "0" ->
-                S.backgroundColor "#f6f6f6"
-
-            _ ->
-                S.backgroundColor "#fff"
+        [ A.classList [ ( "meta", n < 0 ) ]
         , case ( String.fromInt n, stats ) of
             ( "-2", Err _ ) ->
                 S.displayNone
@@ -3799,7 +3706,7 @@ viewTableRow sheet doc stats cols n row =
         List.indexedMap (\i col -> viewCell sheet stats i n col row) (Array.toList cols)
             ++ [ case doc of
                     Tab _ ->
-                        H.th [ A.onClick (DocMsg SheetColumnPush), S.textAlignLeft, S.widthRem 0.001, S.whiteSpaceNowrap, S.opacity "0.5" ] [ text (iif (n == 0) "→" "") ]
+                        H.th [ A.onClick (DocMsg SheetColumnPush), A.title "add column", S.widthRem 0.001, S.whiteSpaceNowrap ] [ text (iif (n == 0) "→" "") ]
 
                     _ ->
                         text ""
@@ -3812,9 +3719,9 @@ viewFilterBar sheet filteredCount totalCount =
         text ""
 
     else
-        H.div [ S.padding "0.25rem 0.5rem", S.backgroundColor "#fff8e0", S.borderBottom "1px solid #e0d8a0", S.fontSizeRem 0.75, S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter ]
+        H.div [ S.padding "0.25rem 0.5rem", S.backgroundColor "#fff8e0", S.borderBottom "1px solid #e0d8a0", S.fontSizeRem 0.875, S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter ]
             [ H.span [] [ text ("Showing " ++ String.fromInt filteredCount ++ " of " ++ String.fromInt totalCount ++ " rows") ]
-            , H.button [ A.onClick (FilterClear ""), S.padding "0.125rem 0.5rem", S.fontSizeRem 0.7, S.background "#fff", S.border "1px solid #ccc", S.borderRadius "2px", S.cursorPointer ] [ text "Clear all filters" ]
+            , H.button [ A.onClick (FilterClear ""), S.padding "0.125rem 0.5rem" ] [ text "Clear all filters" ]
             ]
 
 
@@ -3825,9 +3732,9 @@ viewTableFooter sheet cols =
             Ok Library ->
                 List.map
                     (\( label, msg ) ->
-                        H.tr [ A.onClick msg ] <|
-                            H.td [ S.opacity "0.25" ] [ text label ]
-                                :: List.map (\typ -> H.td [ S.opacity "0.25" ] [ text typ ]) [ "text", "list text", "" ]
+                        H.tr [ A.onClick msg, A.title ("new " ++ label) ] <|
+                            H.td [] [ text label ]
+                                :: List.map (\typ -> H.td [] [ text typ ]) [ "text", "list text", "" ]
                     )
                     [ ( "table:...", DocNewTable )
                     , ( "query:...", DocNewQuery )
@@ -3836,19 +3743,19 @@ viewTableFooter sheet cols =
                     , ( "net-socket:...", DocNew <| E.object [ ( "type", E.string "net-socket" ), ( "data", E.list identity [ E.object [ ( "url", E.string "" ) ] ] ) ] )
                     ]
                     ++ [ H.tr [] <|
-                            H.td [ S.opacity "0.25" ]
-                                [ H.label [ S.cursorPointer ]
+                            H.td []
+                                [ H.label []
                                     [ text "import csv..."
                                     , H.input [ A.type_ "file", A.accept ".csv,text/csv", A.on "change" (D.at [ "target", "files" ] (D.index 0 File.decoder) |> D.map CsvImportFile), S.display "none" ] []
                                     ]
                                 ]
-                                :: List.map (\typ -> H.td [ S.opacity "0.25" ] [ text typ ]) [ "text", "list text", "" ]
+                                :: List.map (\typ -> H.td [] [ text typ ]) [ "text", "list text", "" ]
                        ]
 
             Ok (Tab _) ->
-                [ H.tr [ A.onClick (DocMsg SheetRowPush) ] <|
-                    List.map (\col -> H.td [ S.opacity "0.25" ] [ text (typeName col.typ) ]) (Array.toList cols)
-                        ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap, S.opacity "0.5" ] [ text "↴" ] ]
+                [ H.tr [ A.onClick (DocMsg SheetRowPush), A.title "add row" ] <|
+                    List.map (\col -> H.td [] [ text (typeName col.typ) ]) (Array.toList cols)
+                        ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [ text "↴" ] ]
                 ]
 
             _ ->
@@ -3862,10 +3769,10 @@ viewError error =
             text ""
 
         _ ->
-            H.div [ S.backgroundColor "#fee", S.border "1px solid #c88", S.borderRadius "4px", S.padding "0.75rem", S.margin "0.5rem", S.fontFamily "monospace", S.fontSizeRem 0.8, S.whiteSpacePre, S.overflowXAuto ]
+            H.div [ A.class "mono", S.backgroundColor "#fee", S.border "1px solid #c88", S.borderRadius "4px", S.padding "0.75rem", S.margin "0.5rem", S.fontSizeRem 0.8125, S.whiteSpacePre, S.overflowXAuto ]
                 [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.marginBottomRem 0.5 ]
                     [ H.strong [] [ text "Error" ]
-                    , H.button [ A.onClick (DocError ""), S.border "none", S.background "transparent", S.cursorPointer, S.fontSizeRem 1 ] [ text "×" ]
+                    , H.button [ A.class "x", A.onClick (DocError "") ] [ text "×" ]
                     ]
                 , text error
                 ]
@@ -3878,10 +3785,10 @@ viewAuthForm auth =
             text ""
 
         _ ->
-            H.form [ A.id "account", A.onSubmit (AuthMsg AuthSubmit), S.displayGrid, S.gapRem 0.5, S.maxWidth "100vw", S.width "100%", S.gridTemplateColumns "1fr 1fr auto", S.paddingRem 0.5, S.borderTop "1px solid #aaa", S.backgroundColor "#ccc", S.positionAbsolute, S.bottomPx 0, S.zIndex "10" ]
+            H.form [ A.id "account", A.onSubmit (AuthMsg AuthSubmit), S.displayGrid, S.gapRem 0.5, S.maxWidth "100vw", S.width "100%", S.gridTemplateColumns "1fr 1fr auto", S.paddingRem 0.5, S.borderTop "1px solid #aaa", S.backgroundColor "#f0f0f0", S.positionAbsolute, S.bottomPx 0, S.zIndex "10" ]
                 [ H.input [ S.minWidthRem 2, A.placeholder "email", A.type_ "email", A.name "email", A.value auth.email, A.onInput (InputChange AuthEmail), A.disabled (auth.state == LoggingIn) ] []
                 , H.input [ S.minWidthRem 2, A.placeholder "password", A.type_ "password", A.name "password", A.value auth.password, A.onInput (InputChange AuthPassword), A.disabled (auth.state == LoggingIn) ] []
-                , H.button [ A.type_ "submit", S.background "#eee", A.disabled (auth.state == LoggingIn) ]
+                , H.button [ A.type_ "submit", A.disabled (auth.state == LoggingIn) ]
                     [ text (iif (auth.state == LoggingIn) "..." (iif (String.isEmpty auth.password) "signup" "login")) ]
                 ]
 
@@ -3894,23 +3801,29 @@ viewToolbar model info =
     in
     H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsCenter, S.whiteSpaceNowrap, S.gapRem 0.5, S.paddingRem 0.5, S.borderBottom "1px solid #aaa", S.background "#f0f0f0" ] <|
         List.concat
-            [ [ H.a [ A.href "/", S.fontWeight "900", S.fontSizeRem 1.5, S.heightRem 1, S.lineHeight "0.55" ] [ text "⊞" ]
-              , H.a [ A.href "/", S.fontWeight "900", A.id "title", S.marginLeftRem -0.25 ] [ text "scrapsheets" ]
+            [ [ H.a [ A.href "/", A.title "library", S.fontWeight "900", S.fontSizeRem 1.25, S.lineHeight "1" ] [ text "⊞" ]
+              , H.a [ A.href "/", A.id "title", S.fontWeight "900", S.marginLeftRem -0.25 ] [ text "scrapsheets" ]
               , text "/"
               ]
             , case model.auth.state of
                 LoggedIn { usrId } ->
-                    [ H.span [ A.onClick (AuthMsg AuthLogout), S.cursorPointer ] [ text ("user:" ++ usrId) ], text "/" ]
+                    [ H.span [] [ text ("user:" ++ usrId) ], text "/" ]
 
                 _ ->
                     [ H.span [] [ text "anon" ], text "/" ]
             , iif (sheet.id == "")
                 [ H.span [] [ text "library" ] ]
-                [ H.a [ A.href "#settings" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ] ]
-            , [ H.span [ A.onClick (ShortcutsToggle True), S.cursorPointer, S.marginLeftAuto, S.backgroundColor "#e8e8e8", S.padding "2px 8px", S.borderRadius "2px", S.fontSizeRem 0.75 ] [ text "keys" ] ]
+                [ H.a [ A.href "#settings", A.title "sheet settings", S.textDecoration "underline dotted" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ] ]
+            , [ H.button [ A.class "chip", A.onClick (ShortcutsToggle True), S.marginLeftAuto ] [ text "keys" ] ]
             , case sheet.doc of
                 Ok (Tab _) ->
-                    [ H.a [ A.href ("https://api.sheets.scrap.land/export/" ++ sheet.id ++ ".csv"), A.download (sheet.id ++ ".csv"), S.backgroundColor "#e8e8e8", S.padding "2px 8px", S.borderRadius "2px", S.fontSizeRem 0.75 ] [ text "export csv" ] ]
+                    [ H.a [ A.class "chip", A.href ("https://api.sheets.scrap.land/export/" ++ sheet.id ++ ".csv"), A.download (sheet.id ++ ".csv") ] [ text "export csv" ] ]
+
+                _ ->
+                    []
+            , case model.auth.state of
+                LoggedIn _ ->
+                    [ H.button [ A.class "chip", A.onClick (AuthMsg AuthLogout) ] [ text "log out" ] ]
 
                 _ ->
                     []
@@ -3924,25 +3837,25 @@ viewTutorial tutorial =
             text ""
 
         Just step ->
-            H.div [ S.positionFixed, S.bottomRem 3, S.rightRem 1, S.backgroundColor "#fff", S.border "1px solid #aaa", S.borderRadius "4px", S.paddingRem 1, S.boxShadow "0 2px 8px rgba(0,0,0,0.15)", S.zIndex "90", S.maxWidthRem 18 ]
+            H.div [ A.class "panel", S.positionFixed, S.bottomRem 3, S.rightRem 1, S.paddingRem 1, S.zIndex "90", S.maxWidthRem 18 ]
                 [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter, S.gapRem 1, S.marginBottomRem 0.5 ]
                     [ H.strong [] [ text "get started" ]
-                    , H.button [ A.onClick TutorialDismiss, S.border "none", S.background "transparent", S.cursorPointer, S.fontSizeRem 1 ] [ text "×" ]
+                    , H.button [ A.class "x", A.onClick TutorialDismiss ] [ text "×" ]
                     ]
-                , H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.8 ] <|
+                , H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ] <|
                     List.indexedMap
                         (\i ( label, hint ) ->
                             if i < step then
-                                H.div [ S.opacity "0.5" ] [ text ("✓ " ++ label) ]
+                                H.div [ S.color "#666" ] [ text ("✓ " ++ label) ]
 
                             else if i == step then
                                 H.div []
                                     [ H.div [ S.fontWeight "700" ] [ text label ]
-                                    , H.div [ S.fontSizeRem 0.7, S.color "#666" ] [ text hint ]
+                                    , H.div [ S.fontSizeRem 0.75, S.color "#666" ] [ text hint ]
                                     ]
 
                             else
-                                H.div [ S.opacity "0.3" ] [ text label ]
+                                H.div [ S.color "#666" ] [ text label ]
                         )
                         [ ( "create a table", "click table:... below" )
                         , ( "edit a cell", "click a cell and type" )
@@ -3957,7 +3870,7 @@ viewNetWarning : Model -> Html Msg
 viewNetWarning model =
     case model.auth.state of
         Anonymous ->
-            H.div [ S.backgroundColor "#fff8e0", S.border "1px solid #e0d8a0", S.borderRadius "4px", S.padding "0.5rem", S.fontSizeRem 0.75 ]
+            H.div [ S.backgroundColor "#fff8e0", S.border "1px solid #e0d8a0", S.borderRadius "4px", S.padding "0.5rem", S.fontSizeRem 0.875 ]
                 [ text "Net sheets need an account: log in so the server can store this sheet's data." ]
 
         _ ->
@@ -3972,11 +3885,11 @@ viewNetHook model =
     in
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ viewNetWarning model
-        , H.h3 [ S.margin "0" ] [ text "webhook inbox" ]
-        , H.div [ S.fontFamily "monospace", S.fontSizeRem 0.75, S.backgroundColor "#f0f0f0", S.padding "0.5rem", S.borderRadius "4px", S.overflowXAuto ]
+        , H.h3 [] [ text "webhook inbox" ]
+        , H.div [ A.class "mono", S.fontSizeRem 0.8125, S.backgroundColor "#f0f0f0", S.padding "0.5rem", S.borderRadius "4px", S.overflowXAuto ]
             [ text url ]
-        , H.button [ A.onClick (CopyText url), S.cursorPointer ] [ text "copy" ]
-        , H.p [ S.margin "0", S.fontSizeRem 0.75, S.color "#666" ] [ text "POST any payload to this URL; rows appear in the table." ]
+        , H.button [ A.onClick (CopyText url) ] [ text "copy" ]
+        , H.p [ S.fontSizeRem 0.875, S.color "#666" ] [ text "POST any payload to this URL; rows appear in the table." ]
         ]
 
 
@@ -3984,19 +3897,19 @@ viewNetHttp : Model -> { url : String, interval : Int, headers : String } -> Htm
 viewNetHttp model cfg =
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ viewNetWarning model
-        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.75 ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "URL"
             , H.input [ A.type_ "text", A.value cfg.url, A.onInput (InputChange NetUrl) ] []
             ]
-        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.75 ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "poll every (seconds)"
             , H.input [ A.type_ "number", A.value (String.fromInt cfg.interval), A.onInput (InputChange NetInterval) ] []
             ]
-        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.75 ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "headers"
-            , H.textarea [ A.value cfg.headers, A.placeholder "Name: value\none per line", A.onInput (InputChange NetHeaders), S.fontFamily "monospace" ] []
+            , H.textarea [ A.class "mono", A.value cfg.headers, A.placeholder "Name: value\none per line", A.onInput (InputChange NetHeaders) ] []
             ]
-        , H.p [ S.margin "0", S.fontSizeRem 0.75, S.color "#666" ]
+        , H.p [ S.fontSizeRem 0.875, S.color "#666" ]
             [ text <|
                 case model.sheet.table of
                     Ok tbl ->
@@ -4012,11 +3925,11 @@ viewNetSocket : Model -> { url : String } -> Html Msg
 viewNetSocket model cfg =
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ viewNetWarning model
-        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.75 ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "URL"
             , H.input [ A.type_ "text", A.value cfg.url, A.onInput (InputChange NetUrl) ] []
             ]
-        , H.p [ S.margin "0", S.fontSizeRem 0.75, S.color "#666" ]
+        , H.p [ S.fontSizeRem 0.875, S.color "#666" ]
             [ text (Maybe.withDefault "—" model.sheet.netStatus) ]
         ]
 
@@ -4035,22 +3948,22 @@ viewQueryEditor model query =
     in
     H.div [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%", S.minWidth "25vw" ]
         [ H.div [ S.displayFlex, S.flexGrow "1", S.minHeightRem 8, S.overflowAuto, S.backgroundColor "#f8f8f8" ]
-            [ H.div [ S.paddingRem 1, S.paddingRight "0.5rem", S.backgroundColor "#eee", S.borderRight "1px solid #ddd", S.fontFamily "monospace", S.fontSizeRem 0.75, S.lineHeightRem 1.5, S.color "#999", S.textAlign "right", S.userSelect "none", S.minWidthRem 2.5 ]
+            [ H.div [ A.class "lines" ]
                 (List.range 1 lineCount |> List.map (\n -> H.div [] [ text (String.fromInt n) ]))
             , H.div [ S.positionRelative, S.flexGrow "1", S.height "100%" ]
-                [ H.textarea [ A.id "code", A.onInput (InputChange QueryCode), A.spellcheck False, S.height "100%", S.width "100%", S.whiteSpacePre, S.fontFamily "monospace", S.fontSizeRem 0.75, S.border "none", S.backgroundColor "transparent", S.paddingRem 1, S.paddingLeft "0.5rem", S.lineHeightRem 1.5, S.resize "none", S.outline "none" ]
+                [ H.textarea [ A.id "code", A.onInput (InputChange QueryCode), A.spellcheck False, S.height "100%", S.width "100%" ]
                     [ text (String.trim query.code) ]
                 , case sheet.queryAutocomplete of
                     Nothing ->
                         text ""
 
                     Just ac ->
-                        H.div [ S.positionAbsolute, S.top "2rem", S.left "0.5rem", S.backgroundColor "#fff", S.border "1px solid #ccc", S.borderRadius "4px", S.boxShadow "0 2px 8px rgba(0,0,0,0.15)", S.zIndex "100", S.maxHeightRem 12, S.overflowYAuto, S.minWidthRem 15 ]
+                        H.div [ A.class "panel mono", S.positionAbsolute, S.top "2rem", S.left "0.5rem", S.zIndex "100", S.maxHeightRem 12, S.overflowYAuto, S.minWidthRem 15, S.fontSizeRem 0.8125 ]
                             (ac.suggestions
                                 |> List.indexedMap
                                     (\i ref ->
-                                        H.div [ A.onClick (AutocompleteSelect ref), S.padding "0.5rem 0.75rem", S.cursorPointer, S.fontFamily "monospace", S.fontSizeRem 0.75, S.backgroundColor (iif (i == ac.selectedIndex) "#e8f4ff" "transparent"), S.borderBottom "1px solid #eee" ]
-                                            [ H.span [ S.color "#888" ] [ text "@" ], text ref ]
+                                        H.div [ A.onClick (AutocompleteSelect ref), S.padding "0.5rem 0.75rem", S.cursorPointer, S.backgroundColor (iif (i == ac.selectedIndex) "#dce7f7" "transparent"), S.borderBottom "1px solid #eee" ]
+                                            [ H.span [ S.color "#666" ] [ text "@" ], text ref ]
                                     )
                             )
                 ]
@@ -4060,10 +3973,10 @@ viewQueryEditor model query =
                 text ""
 
             err ->
-                H.div [ S.backgroundColor "#fee", S.borderTop "2px solid #c66", S.padding "0.75rem", S.fontFamily "monospace", S.fontSizeRem 0.75, S.whiteSpacePre, S.overflowXAuto, S.maxHeightRem 8, S.overflowYAuto ]
+                H.div [ A.class "mono", S.backgroundColor "#fee", S.borderTop "2px solid #c66", S.padding "0.75rem", S.fontSizeRem 0.8125, S.whiteSpacePre, S.overflowXAuto, S.maxHeightRem 8, S.overflowYAuto ]
                     [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsStart ]
                         [ H.span [ S.color "#c00" ] [ text err ]
-                        , H.button [ A.onClick (DocError ""), S.border "none", S.background "transparent", S.cursorPointer, S.color "#c00", S.fontSizeRem 1, S.marginLeft "0.5rem" ] [ text "×" ]
+                        , H.button [ A.class "x", A.onClick (DocError ""), S.color "#c00", S.marginLeft "0.5rem" ] [ text "×" ]
                         ]
                     ]
         , if List.isEmpty query.examples then
@@ -4073,7 +3986,7 @@ viewQueryEditor model query =
             H.div [ S.displayFlex, S.flexWrapWrap, S.gapRem 0.25, S.padding "0.5rem 0.75rem", S.backgroundColor "#f0f0f0", S.borderTop "1px solid #ddd" ]
                 (List.map
                     (\example ->
-                        H.button [ A.onClick (InputChange QueryCode example), S.fontSizeRem 0.7, S.cursorPointer, S.fontFamily "monospace", S.border "1px solid #ccc", S.borderRadius "2px", S.background "#fff", S.padding "0.125rem 0.375rem" ]
+                        H.button [ A.class "mono", A.onClick (InputChange QueryCode example), S.fontSizeRem 0.75, S.padding "0.125rem 0.375rem" ]
                             [ text (iif (String.length example > 40) (String.left 40 example ++ "…") example) ]
                     )
                     query.examples
@@ -4082,10 +3995,10 @@ viewQueryEditor model query =
             text ""
 
           else
-            H.div [ S.padding "0.5rem 0.75rem", S.backgroundColor "#f0f0f0", S.borderTop "1px solid #ddd", S.fontSizeRem 0.7, S.color "#666" ]
+            H.div [ S.padding "0.5rem 0.75rem", S.backgroundColor "#f0f0f0", S.borderTop "1px solid #ddd", S.fontSizeRem 0.75, S.color "#666" ]
                 [ H.span [ S.fontWeight "600" ] [ text "Sheet refs: " ]
                 , text (String.join ", " (List.map (\s -> "@" ++ s) sheetRefs))
-                , iif (Dict.size model.library > 5) (H.span [ S.color "#999" ] [ text " ..." ]) (text "")
+                , iif (Dict.size model.library > 5) (H.span [] [ text " ..." ]) (text "")
                 ]
         ]
 
@@ -4110,18 +4023,15 @@ view ({ sheet } as model) =
         , viewSettings model.showSettings info
         , viewShortcuts model.showShortcuts
         , viewTutorial model.tutorial
-        , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, S.cursorPointer, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
+        , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
             [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
                 [ viewToolbar model info
-                , H.div [ S.displayFlex, S.flexDirectionRow, S.justifyContentSpaceBetween, S.gapRem 0, S.borderBottom "1px solid #aaa", S.zIndex "2", S.marginBottomPx -1 ]
-                    [ H.div [ S.displayFlex, S.width "100%", S.height "100%" ]
-                        [ H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder "search", S.width "100%", S.border "none", S.backgroundColor "#fff", S.padding "0.25rem 0.5rem", S.fontSizeRem 0.875 ] [] ]
-                    ]
+                , H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder "search", S.width "100%", S.border "none", S.borderRadius "0", S.borderBottom "1px solid #aaa", S.padding "0.25rem 0.5rem", S.fontSizeRem 0.875, S.marginBottomPx -1, S.zIndex "2" ] []
                 , H.div [ S.overflowAuto, S.height "100%", S.backgroundColor "#eee" ]
                     [ viewError model.error
                     , case table of
                         Err "" ->
-                            H.div [ S.displayFlex ] [ H.span [ S.textAlignCenter, S.width "100%", S.paddingRem 2, S.opacity "0.5" ] [ text "loading" ] ]
+                            H.div [ S.textAlignCenter, S.paddingRem 2, S.color "#666" ] [ text "loading" ]
 
                         Err err ->
                             H.p [] [ text err ]
@@ -4136,9 +4046,8 @@ view ({ sheet } as model) =
                             in
                             H.div []
                                 [ viewFilterBar sheet (Array.length sortedRows) (Array.length rows)
-                                , H.table [ S.borderCollapseCollapse, S.width "100%", A.onMouseLeave (CellHover (xy -1 -1)) ]
-                                    [ H.thead [] []
-                                    , H.tbody [] <|
+                                , H.table [ A.onMouseLeave (CellHover (xy -1 -1)) ]
+                                    [ H.tbody [] <|
                                         Array.toList <|
                                             Array.indexedMap (\n_ row -> viewTableRow sheet doc stats cols (n_ - 2) row) <|
                                                 Array.append (Array.repeat 3 Dict.empty) sortedRows
