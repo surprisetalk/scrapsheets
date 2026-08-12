@@ -1,5 +1,4 @@
 import { assert, assertEquals, assertThrows } from "@std/assert";
-import sg from "@sendgrid/mail";
 import { PGlite } from "@electric-sql/pglite";
 import { PostgresConnection } from "pg-gateway";
 import { citext } from "@electric-sql/pglite/contrib/citext";
@@ -111,23 +110,26 @@ Deno.test(async function allTests(_t) {
     assert(data2.jwt, "login with rotated password should succeed");
   }
 
-  // POST /signup must hand the api key to the sendgrid client before sending.
+  // POST /signup must send the verification email through resend with the api key.
   {
-    Deno.env.set("SENDGRID_API_KEY", "SG.test-key");
-    const send = sg.send;
-    let msg: unknown = null;
-    sg.send = ((m: unknown) => {
-      msg = m;
-      return Promise.resolve([{ statusCode: 202, body: {}, headers: {} }, {}]);
-    }) as typeof sg.send;
+    Deno.env.set("RESEND_API_KEY", "re_test_key");
+    const origFetch = globalThis.fetch;
+    let req: Request | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const r = new Request(input, init);
+      if (!r.url.startsWith("https://api.resend.com/")) return origFetch(input, init);
+      req = r;
+      return Promise.resolve(Response.json({ id: "email_1" }));
+    }) as typeof fetch;
     await post("", `/signup?email=dave@example.com`, {});
-    sg.send = send;
-    Deno.env.delete("SENDGRID_API_KEY");
-    assert(msg, "signup should attempt to send a verification email");
-    assertEquals(
-      (sg as unknown as { client: { auth: string } }).client.auth,
-      "Bearer SG.test-key",
-    );
+    globalThis.fetch = origFetch;
+    Deno.env.delete("RESEND_API_KEY");
+    assert(req, "signup should send a verification email");
+    assertEquals(req!.headers.get("authorization"), "Bearer re_test_key");
+    const body = await req!.json();
+    assertEquals(body.to, "dave@example.com");
+    assertEquals(body.from, "hello@scrap.land");
+    assert(body.text.includes("/password?email=dave%40example.com&token="));
   }
 
   {

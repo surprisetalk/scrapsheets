@@ -57,7 +57,7 @@ technologies. It uses a hybrid architecture with:
 - **Database**: PostgreSQL via postgresjs (pool capped at one connection: the test gateway is a single PGlite session)
 - **Real-time sync**: official automerge NodeWSServerAdapter behind a small ws-shim over Hono's upgradeWebSocket;
   per-document access is enforced in the /library/sync message path (`canSync`), not just sharePolicy
-- **Authentication**: JWT-based with email verification via SendGrid
+- **Authentication**: JWT-based with email verification via Resend (plain fetch, RESEND_API_KEY)
 - **Document types**: table, query, net-hook, net-http, net-socket, portal, codex-*
 - **Seeding**: a lazy-once middleware runs `seed()` (examples.sql + src/examples.mjs datasets) on the first request;
   idempotent via `on conflict (doc_id) do update`

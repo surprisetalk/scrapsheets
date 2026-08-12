@@ -4,7 +4,6 @@ import { logger } from "@hono/hono/logger";
 import { cors } from "@hono/hono/cors";
 import { jwt, sign, verify } from "@hono/hono/jwt";
 import type { JwtVariables } from "@hono/hono/jwt";
-import sg from "@sendgrid/mail";
 import pg from "postgresjs";
 import { upgradeWebSocket } from "@hono/hono/deno";
 import { Repo } from "@automerge/automerge-repo";
@@ -377,12 +376,16 @@ export const createToken = async (
 };
 
 const sendVerificationEmail = async (email: string) => {
-  const key = Deno.env.get(`SENDGRID_API_KEY`);
+  const key = Deno.env.get(`RESEND_API_KEY`);
   if (!key) return;
-  sg.setApiKey(key);
   const token = await createToken(email);
-  await sg
-    .send({
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
       to: email,
       from: "hello@scrap.land",
       subject: "Verify your email",
@@ -393,14 +396,16 @@ const sendVerificationEmail = async (email: string) => {
         `https://scrap.land/password` +
         `?email=${encodeURIComponent(email)}` +
         `&token=${encodeURIComponent(token)}`,
-    })
-    .catch((err) => {
-      console.log(`/password?email=${email}&token=${token}`);
-      console.error(
-        `Could not send verification email to ${email}:`,
-        err?.response?.body || err,
-      );
-    });
+    }),
+  });
+  if (!res.ok) {
+    console.log(`/password?email=${email}&token=${token}`);
+    console.error(
+      `Could not send verification email to ${email}:`,
+      res.status,
+      await res.text(),
+    );
+  }
 };
 
 // --- database

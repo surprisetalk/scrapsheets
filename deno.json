@@ -53,7 +53,6 @@
     "@automerge/automerge-repo-storage-nodefs": "npm:@automerge/automerge-repo-storage-nodefs@^2.5.6",
     "@electric-sql/pglite": "npm:@electric-sql/pglite@^0.5.4",
     "@electric-sql/pglite/contrib/citext": "npm:@electric-sql/pglite@^0.5.4/contrib/citext",
-    "@sendgrid/mail": "npm:@sendgrid/mail@^8.1.6",
     "@std/assert": "jsr:@std/assert@^1.0.19",
     "alasql": "npm:alasql@^4.17.3",
     "prql-js": "npm:prql-js@^0.12.1",
