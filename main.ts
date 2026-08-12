@@ -377,7 +377,9 @@ export const createToken = async (
 };
 
 const sendVerificationEmail = async (email: string) => {
-  if (!Deno.env.get(`SENDGRID_API_KEY`)) return;
+  const key = Deno.env.get(`SENDGRID_API_KEY`);
+  if (!key) return;
+  sg.setApiKey(key);
   const token = await createToken(email);
   await sg
     .send({
