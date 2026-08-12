@@ -146,4 +146,4 @@ compounds on top.
 
 **The unique position**: Scrapsheets is not Google Sheets. It is not Airtable. It is a programmable data OS where every
 table is a queryable database, every query result is a shareable table, every portal is a live data stream, every sheet
-is an API, and every formula is a content-addressable program.
+is an API, and every formula is a content-addressable program!
