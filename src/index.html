@@ -8,15 +8,14 @@
     <meta name="color-scheme" content="light" />
     <link href="/style.css" rel="stylesheet" />
     <script src="/index.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/alasql@4"></script>
   </head>
   <body>
     <div id="elm"></div>
     <script type="importmap">
       {
         "imports": {
-          "@automerge/automerge": "https://esm.sh/@automerge/automerge@3.4.0/slim",
-          "@automerge/automerge/slim": "https://esm.sh/@automerge/automerge@3.4.0/slim",
+          "@automerge/automerge": "/automerge.mjs",
+          "@automerge/automerge/slim": "/automerge.mjs",
           "@automerge/automerge-repo": "/automerge-repo.mjs",
           "@automerge/automerge-repo/slim": "/automerge-repo.mjs"
         }
@@ -33,6 +32,10 @@
       import { BrowserWebSocketClientAdapter } from "/automerge-repo-ws.mjs";
       import { Col, EXAMPLES, Table } from "/examples.mjs";
       import { checkRefPath, checkResultColumns, formatQueryError, register, scanRefs } from "/sql.mjs";
+      import alasql from "/alasql.mjs";
+      // Was a CDN <script> that defined a global. Keep the global so query code
+      // and the browser tests can reach it the same way.
+      globalThis.alasql = alasql;
 
       function debounce(func, timeout = 300) {
         let timer;

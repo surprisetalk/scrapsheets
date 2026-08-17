@@ -22,7 +22,7 @@ technologies. It uses a hybrid architecture with:
 - `examples.sql` - Shop catalogue of query templates (applied by `seed()` on first request)
 - `deno.json` - Dependencies and import map
 - `src/index.html` - Frontend HTML entry point
-- `vendor.ts` - Regenerates the browser-side automerge assets in `src/`
+- `vendor.ts` - Rebuilds the vendored browser bundles in `src/` (automerge, automerge-repo, alasql)
 - `data/automerge/` - Document storage directory
 
 ## Development Commands
@@ -32,7 +32,8 @@ technologies. It uses a hybrid architecture with:
 - **Build frontend**: `deno task build` (copies src/* to dist and runs elm make)
 - **Development server**: `deno task dev`
 - **Run all tests**: `deno task test` (or `deno test --allow-all`; browser tests build dist themselves)
-- **Re-vendor automerge**: `deno task vendor` (after bumping the versions at the top of `vendor.ts`)
+- **Re-vendor browser bundles**: `deno task vendor` (after bumping the versions at the top of `vendor.ts`; alasql tracks
+  `deno.json`)
 - **Elm review**: `deno task review`. Runs clean with zero suppressions; keep it that way.
 - **Watch and build**: `watch src { try { cp -vu src/* dist ; elm make src/Main.elm --debug --output=dist/index.js } }`
 
@@ -101,9 +102,15 @@ technologies. It uses a hybrid architecture with:
   localStorage entries), five-step first-run tutorial (localStorage `scrapsheets-tutorial`, -1 = dismissed)
 - **Real-time sync**: Ports for Automerge integration
 - **UI**: Table-based interface with cell editing, selection, and statistics
-- **Automerge loading**: `src/index.html` maps `@automerge/automerge` to the esm.sh slim build and calls
-  `initializeWasm(fetch("/automerge.wasm"))`. The vendored `src/automerge-repo*.mjs` bundles must import automerge by
-  bare specifier, or the browser loads a second copy with no WASM. `deno task vendor` enforces this.
+- **No runtime CDN**: every asset the page loads is served by us. `deno task vendor` uses esbuild to inline each
+  package's dependencies into `src/automerge.mjs`, `src/automerge-repo*.mjs` and `src/alasql.mjs`, and fails the build
+  if a bundle would still fetch something. A CDN in the request path also meant root-relative URLs inside third-party
+  bundles (`/npm/...`, `/sm/....map`) resolving against our origin and hitting the `/*` catch-all.
+- **Automerge loading**: `src/index.html` maps `@automerge/automerge` to the vendored `/automerge.mjs` and calls
+  `initializeWasm(fetch("/automerge.wasm"))`. Automerge stays _external_ in the repo bundles so all three share that one
+  initialized copy; bundling it into each would give the browser three, only one with WASM.
+- **AlaSQL parity**: the page imports `/alasql.mjs`, bundled from the same bare `alasql` specifier the server uses, so
+  both engines resolve one version through `deno.lock`. It used to be a CDN `<script>` on a floating `@4` tag.
 
 ### Key Frontend Features
 

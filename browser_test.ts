@@ -109,28 +109,56 @@ Deno.test("CDN-shaped paths 404 instead of getting the app shell", async () => {
   assertEquals(notFound < shell / 10, true, "404.html should be far smaller than the app shell");
 });
 
-Deno.test("vendored automerge bundles keep bare automerge specifiers", async () => {
-  for (const name of ["automerge-repo.mjs", "automerge-repo-ws.mjs", "automerge-repo-idb.mjs"]) {
+// The page must load nothing from a third party: a CDN outage cannot break the
+// app, and a root-relative URL inside a vendored bundle cannot collide with our
+// /* catch-all. `deno task vendor` rebuilds these self-contained.
+Deno.test("nothing the page loads reaches a CDN at runtime", async () => {
+  const vendored = [
+    "automerge.mjs",
+    "automerge-repo.mjs",
+    "automerge-repo-ws.mjs",
+    "automerge-repo-idb.mjs",
+    "alasql.mjs",
+    "sql.mjs",
+    "examples.mjs",
+  ];
+  for (const name of vendored) {
     const src = await Deno.readTextFile(dir + "src/" + name);
-    const bad = src.match(/"(\/npm\/[^"]*|[^"]*@automerge\/[^"]*@[\d.][^"]*)"/g);
+
+    // import/export ... from "https://..." — the runtime dependency we removed.
+    const remote = src.match(/(?:from|import)\s*\(?\s*["']https?:\/\/[^"']+["']/g);
     assertEquals(
-      bad,
+      remote,
       null,
-      `src/${name} must import automerge as a bare specifier so the import map picks the WASM-initialized copy. ` +
-        `Run \`deno task vendor\` to regenerate. Offending imports: ${bad?.join(", ")}`,
+      `src/${name} fetches from a third party at runtime. Run \`deno task vendor\` to inline it. ` +
+        `Offending: ${remote?.join(", ")}`,
     );
 
-    // A root-relative //# sourceMappingURL=/sm/... resolves against our origin,
-    // where the /* catch-all answers with index.html and the browser reports
-    // "JSON Parse error: Unrecognized token '<'".
-    const rooted = src.match(/sourceMappingURL=\/[^\s]*/g);
+    // Root-relative CDN paths resolve against our origin, where /* answers with
+    // index.html: "'text/html' is not a valid JavaScript MIME type", or for a
+    // source map, "JSON Parse error: Unrecognized token '<'".
+    const rooted = src.match(/(?:sourceMappingURL=|from\s*["'])\/(?:npm|sm|node)\//g);
     assertEquals(
       rooted,
       null,
-      `src/${name} points its source map at our own origin, which serves index.html for it. ` +
-        `Run \`deno task vendor\` to rewrite it to cdn.jsdelivr.net. Offending: ${rooted?.join(", ")}`,
+      `src/${name} keeps root-relative CDN paths, which our /* catch-all answers with index.html. ` +
+        `Run \`deno task vendor\`. Offending: ${rooted?.join(", ")}`,
     );
   }
+
+  // The repo bundles must defer to the import map for automerge, or the browser
+  // ends up with a second copy that never had initializeWasm() called on it.
+  const html = await Deno.readTextFile(dir + "src/index.html");
+  assertEquals(
+    /"@automerge\/automerge":\s*"\/automerge\.mjs"/.test(html),
+    true,
+    "the import map must point @automerge/automerge at the vendored /automerge.mjs",
+  );
+  assertEquals(
+    html.includes("cdn.jsdelivr.net") || html.includes("esm.sh"),
+    false,
+    "src/index.html must not reference a CDN",
+  );
 });
 
 // Test 2: WASM file is served correctly

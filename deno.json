@@ -9,7 +9,7 @@
     "db:plan": "pg-schema-diff plan --from-dsn $DATABASE_URL --to-dir schema --temp-db-dsn $TEMP_DATABASE_URL",
     "db:apply": "pg-schema-diff apply --from-dsn $DATABASE_URL --to-dir schema --temp-db-dsn $TEMP_DATABASE_URL",
     "review": "deno run -A npm:elm-review@2.13.5 && deno run -A npm:elm-review@2.13.5 suppress --check-after-tests",
-    "vendor": "deno run --allow-net --allow-read --allow-write vendor.ts"
+    "vendor": "deno run -A vendor.ts"
   },
   "exclude": [
     "dist/",
@@ -18,6 +18,7 @@
     "review/",
     "tui/",
     "src/automerge*",
+    "src/alasql.mjs",
     "src/examples.mjs",
     "src/index.html",
     "src/style.css",
@@ -40,6 +41,8 @@
   },
   "imports": {
     "astral": "jsr:@astral/astral@^0.5.6",
+    "esbuild": "npm:esbuild@^0.25.10",
+    "@luca/esbuild-deno-loader": "jsr:@luca/esbuild-deno-loader@^0.11.1",
     "@hono/hono": "jsr:@hono/hono@^4.13.1",
     "@hono/hono/http-exception": "jsr:@hono/hono@^4.13.1/http-exception",
     "@hono/hono/logger": "jsr:@hono/hono@^4.13.1/logger",
