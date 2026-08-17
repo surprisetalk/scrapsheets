@@ -8,4 +8,9 @@
 /style.css /style.css 200
 /examples.mjs /examples.mjs 200
 /sql.mjs /sql.mjs 200
+# jsDelivr's /+esm responses carry `link: </npm/...>; rel="modulepreload"`, whose
+# root-relative URL WebKit resolves against this origin. Without these two rules
+# the catch-all answers each phantom preload with the whole 46KB index.html.
+/npm/* /404.html 404
+/sm/* /404.html 404
 /* / 200

@@ -60,7 +60,10 @@ Deno.test("every root-absolute asset index.html loads is listed in _redirects", 
   const html = await Deno.readTextFile(dir + "src/index.html");
   const redirects = await Deno.readTextFile(dir + "src/_redirects");
   const listed = new Set(
-    redirects.split("\n").map((line) => line.trim().split(/\s+/)[0]).filter(Boolean),
+    redirects.split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"))
+      .map((line) => line.split(/\s+/)[0]),
   );
 
   const referenced = new Set(
@@ -75,6 +78,35 @@ Deno.test("every root-absolute asset index.html loads is listed in _redirects", 
         `serve index.html for that URL instead of the file. Add a line: ${path} ${path} 200`,
     );
   }
+});
+
+// jsDelivr answers /+esm with `link: </npm/...>; rel="modulepreload"`, and WebKit
+// resolves that root-relative URL against this origin. The catch-all used to hand
+// back the whole index.html for each one, on every page load.
+Deno.test("CDN-shaped paths 404 instead of getting the app shell", async () => {
+  const redirects = await Deno.readTextFile(dir + "src/_redirects");
+  const shell = (await Deno.readTextFile(dir + "src/index.html")).length;
+  const notFound = (await Deno.readTextFile(dir + "src/404.html")).length;
+
+  // Compare line positions: "/* /" is also a substring of "/npm/* /404.html".
+  const lines = redirects.split("\n").map((line) => line.trim());
+  const catchAll = lines.findIndex((line) => line.split(/\s+/)[0] === "/*");
+
+  for (const prefix of ["/npm/*", "/sm/*"]) {
+    const at = lines.findIndex((line) => line.split(/\s+/)[0] === prefix);
+    assertEquals(
+      lines[at]?.endsWith("404"),
+      true,
+      `src/_redirects must answer ${prefix} with a 404, or the catch-all serves ${shell} bytes ` +
+        `of index.html for every phantom CDN preload. Got: ${lines[at] ?? "(no rule)"}`,
+    );
+    assertEquals(
+      at >= 0 && at < catchAll,
+      true,
+      `${prefix} must come before the /* catch-all on line ${catchAll}: the first matching rule wins`,
+    );
+  }
+  assertEquals(notFound < shell / 10, true, "404.html should be far smaller than the app shell");
 });
 
 Deno.test("vendored automerge bundles keep bare automerge specifiers", async () => {
