@@ -7,6 +7,7 @@ import type { JwtVariables } from "@hono/hono/jwt";
 import pg from "postgresjs";
 import { upgradeWebSocket } from "@hono/hono/deno";
 import { Repo } from "@automerge/automerge-repo";
+import * as Automerge from "@automerge/automerge";
 import * as AM from "@automerge/automerge-repo";
 import type { AnyDocumentId } from "@automerge/automerge-repo";
 import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket";
@@ -16,6 +17,7 @@ import * as prql from "prql-js";
 import * as path from "@std/path";
 import examplesSql from "./examples.sql" with { type: "text" };
 import { DATASETS } from "./src/examples.mjs";
+import { checkRefPath, checkResultColumns, formatQueryError, register, scanRefs } from "./src/sql.mjs";
 
 // --- secrets & crypto
 
@@ -134,6 +136,22 @@ setInterval(() => {
 }, RATE_LIMIT_WINDOW_MS);
 
 ala.options.modifier = "RECORDSET";
+register(ala);
+
+// The page resolves @sheet refs the same way (src/index.html), so both engines
+// run byte-identical SQL. Rows travel in params[0] rather than a module-level
+// cache: the server runs concurrent requests, and params are per-call.
+ala.from.SHEET = (
+  id: unknown,
+  _opts: unknown,
+  cb: unknown,
+  idx: unknown,
+  query: unknown,
+) => {
+  const rows = (query as { params?: Record<string, Row[]>[] })?.params?.[0]?.[id as string];
+  if (!rows) throw new HTTPException(400, { message: `I could not load the sheet "@${id}".` });
+  return typeof cb === "function" ? cb(rows, idx, query) : rows;
+};
 
 export type Tag<T extends string, X extends Row[]> = {
   type: T;
@@ -210,14 +228,33 @@ const assertSheetAccess = async (c: Context, sheet_id: string): Promise<void> =>
           where b.sheet_id = su.sheet_id and s.sheet_id = ${sheet_id}
         )
       )
+    union all
+    select true from sheet where sheet_id = ${sheet_id} and public
   `;
   if (!access) throw new HTTPException(403, { message: "You don't have access to this sheet." });
+};
+
+// Owner-only actions (sharing, publishing) check this rather than created_by, so
+// ownership can be transferred later without touching every call site.
+const assertSheetOwner = async (c: Context, sheet_id: string): Promise<void> => {
+  const [owner] = await sql`
+    select true from sheet_usr su
+    inner join sheet s using (sheet_id)
+    where su.sheet_id = ${sheet_id}
+      and su.usr_id = ${c.get("usr_id")}
+      and (su.role = 'owner' or s.created_by = ${c.get("usr_id")})
+  `;
+  if (!owner)
+    throw new HTTPException(403, { message: "Only the owner of this sheet can change who it is shared with." });
 };
 
 const sheet = async (
   c: Context,
   sheet_id: string,
   { limit, offset, ...qs }: Record<string, string>,
+  // The @sheet refs already being resolved above this call, so a query sheet
+  // that reaches itself is reported as a cycle instead of blowing the stack.
+  path_: string[] = [],
 ): Promise<Page> => {
   const [type, doc_id] = sheet_id.split(":");
   await assertSheetAccess(c, sheet_id);
@@ -252,7 +289,7 @@ const sheet = async (
         limit,
         offset,
         ...qs,
-      });
+      }, path_);
     case "template":
       throw new HTTPException(500, { message: "Bad template." });
     case "portal":
@@ -265,28 +302,22 @@ const sheet = async (
 const executeSql = async (
   c: Context,
   sqlCode: string,
+  path_: string[] = [],
 ): Promise<Page> => {
-  // Extract sheet references (@sheet_id) outside string literals and replace with positional placeholders
-  const sheet_ids: string[] = [];
-  let code_ = "";
-  let inStr = false;
-  for (let i = 0; i < sqlCode.length; i++) {
-    const ch = sqlCode[i];
-    if (ch === "'") inStr = !inStr;
-    const ref = !inStr && ch === "@" ? sqlCode.slice(i).match(/^@[A-Za-z0-9:_-]+/)?.[0] : undefined;
-    if (ref) {
-      sheet_ids.push(ref.slice(1));
-      code_ += "?";
-      i += ref.length - 1;
-    } else { code_ += ch; }
-  }
+  // scanRefs is shared with the page, so @type:doc_id resolves identically here.
+  const { sql: code_, ids: sheet_ids } = scanRefs(sqlCode);
 
   // Load referenced sheets, remembering source column types by name.
   const docs: Record<string, Record<string, unknown>[]> = {};
   const nameToType: Record<string, Type> = {};
   for (const sheet_id of sheet_ids) {
     if (docs[sheet_id]) continue;
-    const [cols, ...rows] = (await sheet(c, sheet_id, {})).data;
+    try {
+      checkRefPath(path_, sheet_id);
+    } catch (err) {
+      throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
+    }
+    const [cols, ...rows] = (await sheet(c, sheet_id, {}, [...path_, sheet_id])).data;
     for (const col of Object.values(cols)) nameToType[col.name] = col.type;
     docs[sheet_id] = rows.map((row) =>
       Object.fromEntries(
@@ -295,16 +326,20 @@ const executeSql = async (
     );
   }
 
-  const {
-    columns: cols,
-    data: rows,
-  }: {
-    columns: { columnid: string }[];
-    data: Record<string, unknown>[];
-  } = await ala(
-    code_,
-    sheet_ids.map((id) => docs[id]),
-  );
+  let result: { columns: { columnid: string }[]; data: Record<string, unknown>[] };
+  try {
+    result = await ala(code_, [docs]);
+  } catch (err) {
+    // An AlaSQL parse error used to surface as a generic 500. Say where it is.
+    if (err instanceof HTTPException) throw err;
+    throw new HTTPException(400, { message: formatQueryError(err, sqlCode) });
+  }
+  const { columns: cols, data: rows } = result;
+  try {
+    checkResultColumns(cols, rows, Object.keys(nameToType), sqlCode);
+  } catch (err) {
+    throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
+  }
 
   return {
     data: [
@@ -329,16 +364,17 @@ const querify = async (
   c: Context,
   { lang, code, args: _args = [] }: Query,
   _reqQuery: Record<string, string>,
+  path_: string[] = [],
 ): Promise<Page> => {
   if (lang === "sql")
-    return await executeSql(c, code);
+    return await executeSql(c, code, path_);
   else if (lang === "prql") {
     // Compile PRQL to SQL, then execute
     try {
       const sqlResult = prql.compile(code);
       if (!sqlResult)
         throw new HTTPException(400, { message: "PRQL compilation returned empty result" });
-      return await executeSql(c, sqlResult);
+      return await executeSql(c, sqlResult, path_);
     } catch (err) {
       if (err instanceof HTTPException) throw err;
       const message = err instanceof Error ? err.message : "PRQL compilation failed";
@@ -499,6 +535,9 @@ app.use("*", async (c, next) => {
 
 // Idempotent: examples.sql and every dataset upsert on doc_id.
 export const seed = async () => {
+  // schema/db.sql is schema only, so pg-schema-diff can diff it. This sentinel
+  // user owns every seeded sheet and must exist before examples.sql runs.
+  await sql`insert into usr (name, email) values ('Scrapsheets', '') on conflict (email) do nothing`;
   await sql.unsafe(examplesSql);
   for (
     const { doc_id, name, tags, doc } of [
@@ -577,42 +616,74 @@ const wss = {
 const wsAdapter = new NodeWSServerAdapter(wss as any);
 
 // senderId (client-chosen peer ID from the join message) -> authenticated usr + owning socket
-const peerUserMap = new Map<AM.PeerId, { usr_id: string | null; shim: WsSocketShim }>();
+const peerUserMap = new Map<AM.PeerId, { auth: WsAuth; shim: WsSocketShim }>();
 
 // Per-document access for sync. sharePolicy only governs proactive announcements
 // in automerge-repo; explicit requests are enforced in the /library/sync message
 // path below, so both call this.
-const syncAccessCache = new Map<string, { ok: boolean; expires: number }>();
+export type Role = "owner" | "editor" | "viewer";
+
+const syncAccessCache = new Map<string, { role: Role | null; expires: number }>();
 
 // PUT /library/:id must fetch a client-created doc over sync BEFORE its sheet
 // row exists; grantSync bridges that window (and clears any cached denial).
+const invalidateSync = (documentId: string): void => {
+  for (const key of syncAccessCache.keys()) if (key.endsWith(`/${documentId}`)) syncAccessCache.delete(key);
+};
+
 const pendingSync = new Map<string, number>();
 const grantSync = (usr_id: string, documentId: string): void => {
   pendingSync.set(`${usr_id}/${documentId}`, Date.now() + 30_000);
-  syncAccessCache.delete(`${usr_id}/${documentId}`);
+  invalidateSync(documentId);
 };
 
-const canSync = async (usr_id: string | null, documentId: string): Promise<boolean> => {
-  if (!usr_id) return false;
-  const key = `${usr_id}/${documentId}`;
-  if ((pendingSync.get(key) ?? 0) > Date.now()) return true;
+// The role a peer holds on a document, or null for no access. Membership,
+// purchase-derived access and public sheets all resolve here, so sync and HTTP
+// stop disagreeing about who may read what.
+const syncRole = async (auth: WsAuth, documentId: string): Promise<Role | null> => {
+  const { usr_id, share } = auth;
+  if (usr_id && (pendingSync.get(`${usr_id}/${documentId}`) ?? 0) > Date.now()) return "owner";
+  const key = `${usr_id ?? "-"}:${share ?? "-"}/${documentId}`;
   const hit = syncAccessCache.get(key);
-  if (hit && hit.expires > Date.now()) return hit.ok;
+  if (hit && hit.expires > Date.now()) return hit.role;
   if (syncAccessCache.size > 10_000) syncAccessCache.clear();
   const [access] = await sql`
-    select true as has_access
-    from sheet_usr su
-    inner join sheet s using (sheet_id)
-    where s.doc_id = ${documentId}
-      and su.usr_id = ${usr_id}
+    select coalesce(
+      (select su.role from sheet_usr su inner join sheet s using (sheet_id)
+        where s.doc_id = ${documentId} and su.usr_id = ${usr_id}),
+      -- A purchased sheet reads the seller's original, but never edits it.
+      (select 'viewer' from sheet_usr su
+         inner join sheet b on b.sheet_id = su.sheet_id
+         inner join sheet s on s.sell_id = b.buy_id
+        where su.usr_id = ${usr_id} and s.doc_id = ${documentId}),
+      (select 'viewer' from sheet s where s.doc_id = ${documentId} and s.public),
+      (select 'viewer' from sheet s where s.doc_id = ${documentId} and s.sheet_id = ${share})
+    ) as role
   `;
-  const ok = !!access?.has_access;
-  syncAccessCache.set(key, { ok, expires: Date.now() + 30_000 });
-  return ok;
+  const role = (access?.role ?? null) as Role | null;
+  syncAccessCache.set(key, { role, expires: Date.now() + 30_000 });
+  return role;
 };
 
-const peerCanSync = (peerId: AM.PeerId, documentId?: AM.DocumentId): Promise<boolean> =>
-  documentId ? canSync(peerUserMap.get(peerId)?.usr_id ?? null, documentId) : Promise.resolve(false);
+// True when a sync frame would actually mutate the document. Read-only sync
+// traffic (heads, "have you got this?") carries no changes and must keep
+// flowing, or a viewer could never load the sheet at all.
+const carriesChanges = (msg: { type?: string; data?: unknown }): boolean => {
+  if (msg.type !== "sync") return false;
+  const bytes = msg.data instanceof Uint8Array ? msg.data : undefined;
+  if (!bytes) return false;
+  try {
+    return Automerge.decodeSyncMessage(bytes).changes.length > 0;
+  } catch {
+    // An unreadable payload from a viewer is not something to forward on faith.
+    return true;
+  }
+};
+
+const peerCanSync = async (peerId: AM.PeerId, documentId?: AM.DocumentId): Promise<boolean> => {
+  const auth = peerUserMap.get(peerId)?.auth;
+  return documentId && auth ? (await syncRole(auth, documentId)) !== null : false;
+};
 
 const SERVER_PEER_ID = `server-${Deno.hostname()}` as AM.PeerId;
 
@@ -627,7 +698,7 @@ export const automerge = new Repo({
 app.get(
   "/library/sync",
   upgradeWebSocket(async (c) => {
-    const usr_id = await verifyWsAuth(c.req.query().auth);
+    const auth = await verifyWsAuth(c.req.query().auth);
     let shim: WsSocketShim | undefined;
     let joined: AM.PeerId | undefined;
     let queue = Promise.resolve();
@@ -669,23 +740,39 @@ app.get(
           }
           if (!joined && msg?.type === "join" && msg.senderId) {
             joined = msg.senderId as AM.PeerId;
-            peerUserMap.set(joined, { usr_id, shim });
+            peerUserMap.set(joined, { auth, shim });
           }
-          if (msg?.documentId && !(await canSync(usr_id, msg.documentId))) {
+          if (msg?.documentId) {
+            const role = await syncRole(auth, msg.documentId);
             if (!shim) return;
-            shim.send(AM.cbor.encode({
-              type: "doc-unavailable",
-              senderId: SERVER_PEER_ID,
-              targetId: msg.senderId,
-              documentId: msg.documentId,
-            }));
-            return;
+            if (role === null) {
+              shim.send(AM.cbor.encode({
+                type: "doc-unavailable",
+                senderId: SERVER_PEER_ID,
+                targetId: msg.senderId,
+                documentId: msg.documentId,
+              }));
+              return;
+            }
+            // shareConfig gates reads. A viewer may still *send*, so the write is
+            // refused here, by looking at whether the payload carries changes.
+            if (role === "viewer" && carriesChanges(msg)) {
+              shim.send(AM.cbor.encode({
+                type: "error",
+                senderId: SERVER_PEER_ID,
+                targetId: msg.senderId,
+                documentId: msg.documentId,
+                message:
+                  `You have viewer access to this sheet, so your edit was not saved. Ask an owner for editor access.`,
+              }));
+              return;
+            }
           }
           if (shim) shim.emit("message", data);
         }).catch((err) => {
           // A dropped sync message wedges the stateful protocol; close so the
           // client reconnects with fresh state instead of waiting forever.
-          console.error(`/library/sync (usr ${usr_id}):`, err);
+          console.error(`/library/sync (usr ${auth.usr_id}):`, err);
           shim?.close();
         });
       },
@@ -696,14 +783,18 @@ app.get(
 );
 
 // Helper to verify WebSocket auth tokens
-const verifyWsAuth = async (auth: string | undefined): Promise<string | null> => {
-  if (!auth) return null;
+// A share link is a JWT claiming one sheet at viewer level, so the read path is
+// the ordinary sync socket rather than a second, parallel way in.
+export type WsAuth = { usr_id: string | null; share: string | null };
+
+const verifyWsAuth = async (auth: string | undefined): Promise<WsAuth> => {
+  if (!auth) return { usr_id: null, share: null };
   try {
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
     const payload = await verify(token, JWT_SECRET, JWT_ALG);
-    return payload.sub as string;
+    return { usr_id: (payload.sub as string) ?? null, share: (payload.share as string) ?? null };
   } catch {
-    return null;
+    return { usr_id: null, share: null };
   }
 };
 
@@ -1235,7 +1326,7 @@ app.post("/buy/:id", async (c) => {
         from sell
         returning sheet_id, created_by
       ), buy_usr as (
-        insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from buy
+        insert into sheet_usr (sheet_id, usr_id, role) select sheet_id, created_by, 'owner' from buy
       )
       select sheet_id from buy
     `;
@@ -1243,7 +1334,7 @@ app.post("/buy/:id", async (c) => {
     // TODO: Charge usr on stripe, etc.
     return sheet_id;
   });
-  syncAccessCache.delete(`${c.get("usr_id")}/${sheet_id.split(":")[1]}`);
+  invalidateSync(sheet_id.split(":")[1]);
   return c.json({ data: sheet_id }, 201);
 });
 
@@ -1350,11 +1441,107 @@ app.put("/library/:id", async (c) => {
       insert into sheet ${sql(sheet, "type", "doc_id", "name", "tags", "created_by", "row_0")}
       returning sheet_id, created_by
     )
-    insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s
+    insert into sheet_usr (sheet_id, usr_id, role) select sheet_id, created_by, 'owner' from s
   `;
-  syncAccessCache.delete(`${usr_id}/${doc_id}`);
+  invalidateSync(doc_id);
 
   return c.json(null, 201);
+});
+
+// --- sharing
+
+const ROLES: Role[] = ["owner", "editor", "viewer"];
+
+app.get("/library/:id/share", async (c) => {
+  const sheet_id = c.req.param("id");
+  await assertSheetAccess(c, sheet_id);
+  const rows = await sql`
+    select u.email, su.role, su.created_at
+    from sheet_usr su inner join usr u using (usr_id)
+    where su.sheet_id = ${sheet_id}
+    order by su.role, u.email
+  `;
+  const [sheet] = await sql`select public from sheet where sheet_id = ${sheet_id}`;
+  if (!sheet) throw new HTTPException(404, { message: "Sheet not found." });
+  return c.json({ data: { members: rows, public: sheet.public } });
+});
+
+app.post("/library/:id/share", async (c) => {
+  const sheet_id = c.req.param("id");
+  await assertSheetOwner(c, sheet_id);
+  const { email, role } = await c.req.json();
+  if (typeof email !== "string" || !email.includes("@")) {
+    throw new HTTPException(400, {
+      message: `Expected an email address to share with, received ${JSON.stringify(email)}.`,
+    });
+  }
+  if (!ROLES.includes(role)) {
+    throw new HTTPException(400, {
+      message: `Expected role to be one of ${ROLES.join(", ")}, received ${JSON.stringify(role)}.`,
+    });
+  }
+
+  const [target] = await sql`select usr_id from usr where email = ${email}`;
+  if (!target) {
+    throw new HTTPException(404, {
+      message: `No account for ${email}. They need to sign up before the sheet can be shared with them.`,
+    });
+  }
+
+  await sql`
+    insert into sheet_usr (sheet_id, usr_id, role) values (${sheet_id}, ${target.usr_id}, ${role})
+    on conflict (sheet_id, usr_id) do update set role = excluded.role
+  `;
+  invalidateSync(sheet_id.split(":")[1]);
+  return c.json(null, 201);
+});
+
+app.delete("/library/:id/share", async (c) => {
+  const sheet_id = c.req.param("id");
+  await assertSheetOwner(c, sheet_id);
+  const { email } = await c.req.json();
+  const [removed] = await sql`
+    delete from sheet_usr
+    where sheet_id = ${sheet_id}
+      and usr_id = (select usr_id from usr where email = ${email})
+      and role <> 'owner'
+    returning usr_id
+  `;
+  if (!removed) {
+    throw new HTTPException(404, {
+      message: `${email} is not a non-owner member of this sheet, so there was nothing to remove.`,
+    });
+  }
+  invalidateSync(sheet_id.split(":")[1]);
+  return c.json(null, 200);
+});
+
+// Public toggles the anonymous read path; both go through syncRole.
+app.post("/library/:id/public", async (c) => {
+  const sheet_id = c.req.param("id");
+  await assertSheetOwner(c, sheet_id);
+  const { public: isPublic } = await c.req.json();
+  if (typeof isPublic !== "boolean") {
+    throw new HTTPException(400, {
+      message: `Expected public to be true or false, received ${JSON.stringify(isPublic)}.`,
+    });
+  }
+  await sql`update sheet set public = ${isPublic} where sheet_id = ${sheet_id}`;
+  invalidateSync(sheet_id.split(":")[1]);
+  return c.json({ data: { public: isPublic } });
+});
+
+// A view-only link is a JWT scoped to one sheet. The sync socket already accepts
+// ?auth=<jwt>, so this needs no new read path.
+app.post("/library/:id/link", async (c) => {
+  const sheet_id = c.req.param("id");
+  await assertSheetOwner(c, sheet_id);
+  const token = await sign(
+    { share: sheet_id, exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 30 },
+    JWT_SECRET,
+    JWT_ALG,
+  );
+  return c.json({ data: { token } });
 });
 
 // CSV Import - parse CSV and create a new table sheet
@@ -1508,7 +1695,7 @@ app.post("/import/csv", async (c) => {
       insert into sheet ${sql(sheet, "type", "doc_id", "name", "tags", "created_by", "row_0")}
       returning sheet_id, created_by
     )
-    insert into sheet_usr (sheet_id, usr_id) select sheet_id, created_by from s
+    insert into sheet_usr (sheet_id, usr_id, role) select sheet_id, created_by, 'owner' from s
     returning sheet_id
   `;
 

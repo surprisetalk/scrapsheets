@@ -9,7 +9,7 @@ technologies. It uses a hybrid architecture with:
 
 - **Backend**: Deno-based server using Hono framework (main.ts)
 - **Frontend**: Elm single-page application (src/Main.elm)
-- **Database**: PostgreSQL with schema defined in db.sql
+- **Database**: PostgreSQL with schema defined in schema/db.sql
 - **Real-time collaboration**: Automerge CRDT for document synchronization (see https://automerge.org/llms-full.txt)
 - **Data storage**: File-based automerge documents in data/automerge/
 
@@ -18,7 +18,7 @@ technologies. It uses a hybrid architecture with:
 - `main.ts` - Main server application and API routes
 - `src/Main.elm` - Frontend application
 - `src/examples.mjs` - Bundled example datasets and queries (imported by both the page and the server seeder)
-- `db.sql` - Database schema and initial data
+- `schema/db.sql` - Declarative database schema (schema only, no data: `pg-schema-diff` diffs a live DB against it)
 - `examples.sql` - Shop catalogue of query templates (applied by `seed()` on first request)
 - `deno.json` - Dependencies and import map
 - `src/index.html` - Frontend HTML entry point
@@ -44,7 +44,11 @@ technologies. It uses a hybrid architecture with:
 
 ### Database Setup
 
-- Initialize database schema: `psql < db.sql`
+- Initialize database schema: `psql < schema/db.sql`
+- Migrate an existing database: edit `schema/db.sql`, then `deno task db:plan` to read the generated migration and
+  `deno task db:apply` to run it. `schema/db.sql` is the desired state; there are no migration files. Both tasks need
+  `DATABASE_URL` and `TEMP_DATABASE_URL` (a scratch DB pg-schema-diff builds the target schema in). DML (backfills) is
+  never generated — splice it in with `--insert-statement 'index=<n> statement="..."'`.
 - Default connection: `postgresql://postgres@127.0.0.1:5434/postgres`
 - Tests run against an in-process PGlite over a local pg-gateway on port 5434 (no real Postgres needed)
 - External-DB DSNs are encrypted at the application level (AES-GCM via DSN_ENCRYPTION_KEY) before storage
@@ -56,7 +60,9 @@ technologies. It uses a hybrid architecture with:
 - **Framework**: Hono web framework with JWT middleware
 - **Database**: PostgreSQL via postgresjs (pool capped at one connection: the test gateway is a single PGlite session)
 - **Real-time sync**: official automerge NodeWSServerAdapter behind a small ws-shim over Hono's upgradeWebSocket;
-  per-document access is enforced in the /library/sync message path (`canSync`), not just sharePolicy
+  per-document access is enforced in the /library/sync message path (`syncRole`), not just sharePolicy. `syncRole`
+  returns owner/editor/viewer or null, covering membership, purchase-derived access, `sheet.public`, and share-link
+  JWTs; a viewer's frames are inspected with `Automerge.decodeSyncMessage` and rejected if they carry changes
 - **Authentication**: JWT-based with email verification via Resend (plain fetch, RESEND_API_KEY)
 - **Document types**: table, query, net-hook, net-http, net-socket, portal, codex-*
 - **Seeding**: a lazy-once middleware runs `seed()` (examples.sql + src/examples.mjs datasets) on the first request;
@@ -69,7 +75,13 @@ technologies. It uses a hybrid architecture with:
 ### Key Backend Features
 
 - **Sheet system**: Polymorphic documents identified by `type:doc_id` format
-- **Query engine**: SQL execution via AlaSQL for cross-sheet queries using `@sheet_id` syntax
+- **Query engine**: SQL execution via AlaSQL for cross-sheet queries using `@sheet_id` syntax. `src/sql.mjs` is shared
+  by both engines (server `npm:alasql`, page CDN `<script>`): `register()` adds the UDFs AlaSQL lacks, `scanRefs()` is
+  the one `@type:doc_id` scanner, and `checkResultColumns()` turns AlaSQL's silent undefined column into an error. The
+  server passes sheet rows through `params[0]` so `alasql.from.SHEET` stays request-scoped
+- **Sharing**: `GET/POST/DELETE /library/:id/share` (owner-only, by email + role), `POST /library/:id/public`, and
+  `POST /library/:id/link` which mints a viewer-scoped JWT. The link rides the sync socket's existing `?auth=`
+  parameter, so there is one read path rather than two
 - **Marketplace**: Buy/sell sheets with pricing system
 - **Real-time data**: WebSocket portals for live data (time, stock prices)
 - **Database codex**: Connect external PostgreSQL databases
@@ -83,7 +95,8 @@ technologies. It uses a hybrid architecture with:
 - **Default library**: client-side (localStorage) system entries merge bundled examples from `src/examples.mjs` (6
   datasets + example queries), 7 live portals, and the tutorial sheet; system ids skip `repo.find` in `changeId`
 - **Cross-sheet queries in the browser**: `resolveSheets` rewrites `@type:doc_id` to `SHEET('id')` and pre-loads each
-  doc (library entry or `repo.find`) before AlaSQL runs; `@query:` refs recurse (depth cap 2)
+  doc (library entry or `repo.find`) before AlaSQL runs; `@query:` refs recurse, bounded by `checkRefPath` which reports
+  a cycle as the path that closes it (`a -> b -> a`) and caps depth at `MAX_REF_DEPTH`
 - **UI chrome**: keyboard shortcut sheet (Ctrl/⌘+/ or "?"), library sparkline thumbnails (computed JS-side into
   localStorage entries), five-step first-run tutorial (localStorage `scrapsheets-tutorial`, -1 = dismissed)
 - **Real-time sync**: Ports for Automerge integration
@@ -95,12 +108,13 @@ technologies. It uses a hybrid architecture with:
 ### Key Frontend Features
 
 - **Live editing**: In-place cell editing with type-aware rendering
-- **Statistics**: Real-time column statistics for Number/Usd (numeric) and Text (descriptive); other column types get no
-  stats
+- **Statistics**: Real-time column statistics for Number/Usd (numeric), Text (descriptive), Date/Timestamp (first, last,
+  span, gaps) and Boolean (true/false/blank); other column types get no stats. A totals row sums numeric columns over
+  the rows actually on screen, so it respects the active filter
 - **Query interface**: Embedded SQL editor for query sheets
 - **Type system**: Rich type system including USD, links, images, forms
 
-### Database Schema (db.sql)
+### Database Schema (schema/db.sql)
 
 #### Core Tables
 
@@ -109,7 +123,8 @@ technologies. It uses a hybrid architecture with:
   - Types: template, table, net-hook, net-http, net-socket, query, portal, codex-*
   - Marketplace fields: sell_id, sell_type, sell_price, buy_id, buy_price
   - Document data: row_0 (jsonb), name, tags (text[])
-- **sheet_usr**: Many-to-many permissions between sheets and users
+  - `public boolean`: anonymous read through `syncRole`
+- **sheet_usr**: Many-to-many permissions between sheets and users, with `role` (owner/editor/viewer)
 - **db**: External database connections (DSN storage for codex sheets)
 - **net**: Webhook data storage for net-* type sheets (body content)
 

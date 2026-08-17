@@ -22,6 +22,7 @@ create table sheet
 , buy_id text references sheet(sell_id)
 , buy_price numeric check (buy_price >= 0)
 , row_0 jsonb not null default '[]'::jsonb check (jsonb_typeof(row_0) in ('array','object'))
+, public boolean not null default false
 , check (not (sell_price is not null and buy_price is not null))
 );
 
@@ -34,6 +35,7 @@ create table sheet_usr
 ( sheet_id text not null references sheet(sheet_id)
 , usr_id bigint not null references usr(usr_id)
 , created_at timestamp default now()
+, role text not null default 'editor' check (role in ('owner','editor','viewer'))
 , primary key (sheet_id, usr_id)
 );
 
@@ -45,6 +47,3 @@ create table net
 , query_params jsonb not null default '{}'::jsonb
 , body text not null
 );
-
-insert into usr (name, email)
-values ('Scrapsheets', '');

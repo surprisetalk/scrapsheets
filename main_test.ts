@@ -5,9 +5,9 @@ import { citext } from "@electric-sql/pglite/contrib/citext";
 import * as AM from "@automerge/automerge-repo";
 import { WebSocketClientAdapter } from "@automerge/automerge-repo-network-websocket";
 import { app, arrayify, automerge, createJwt, createToken, parseNetHeaders, pollNetOnce, seed, sql } from "./main.ts";
-import type { Sheet, Table, Template } from "./main.ts";
+import type { Query, Sheet, Table, Template } from "./main.ts";
 import { DATASETS } from "./src/examples.mjs";
-import dbSql from "./db.sql" with { type: "text" };
+import dbSql from "./schema/db.sql" with { type: "text" };
 import examplesSql from "./examples.sql" with { type: "text" };
 
 const request = async (jwt: string, route: string, options?: object) => {
@@ -313,6 +313,113 @@ Deno.test(async function allTests(_t) {
       adapter.disconnect();
     }
 
+    // Roles: a viewer reads but cannot write; an editor writes.
+    {
+      const sheet_id = `table:${hand.documentId}`;
+      const viewer = await usr("viewer@example.com");
+      const editor = await usr("editor@example.com");
+      await post(jwt, `/library/${sheet_id}/share`, { email: "viewer@example.com", role: "viewer" });
+      await post(jwt, `/library/${sheet_id}/share`, { email: "editor@example.com", role: "editor" });
+
+      // get() unwraps the envelope's .data for us.
+      const share: { members: { email: string; role: string }[]; public: boolean } = await get(
+        jwt,
+        `/library/${sheet_id}/share`,
+      );
+      assertEquals(
+        share.members.filter((m) => m.email !== "erin@example.com").map((m) => `${m.email}=${m.role}`).sort()
+          .join(),
+        "editor@example.com=editor,viewer@example.com=viewer",
+      );
+
+      // A viewer can load the document.
+      const vAdapter = new WebSocketClientAdapter(wsUrl(viewer.jwt), 100);
+      const vRepo = new AM.Repo({ network: [vAdapter], peerId: "client-viewer" as AM.PeerId });
+      const vFound = await Promise.race([
+        vRepo.find<Sheet>(hand.documentId).then(() => "shared", () => "denied"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("timed out"), 2000)),
+      ]);
+      assertEquals(vFound, "shared", "a viewer should be able to read the sheet");
+
+      // ...but the server must not persist the viewer's edit.
+      const before = JSON.stringify((await automerge.find<Sheet>(hand.documentId)).doc());
+      const vHandle = await vRepo.find<Sheet>(hand.documentId);
+      vHandle.change((d: Sheet) => {
+        (d.data as unknown as Record<string, unknown>[])[1] = { 0: 666 };
+      });
+      await new Promise((r) => setTimeout(r, 600));
+      assertEquals(
+        JSON.stringify((await automerge.find<Sheet>(hand.documentId)).doc()),
+        before,
+        "a viewer's edit must not reach the server copy",
+      );
+      // Refusing the write must not tear down the socket: the viewer still reads.
+      const stillReadable = await Promise.race([
+        vRepo.find<Sheet>(hand.documentId).then(() => "shared", () => "denied"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("timed out"), 2000)),
+      ]);
+      assertEquals(stillReadable, "shared", "a viewer should still read after a refused write");
+      vAdapter.disconnect();
+
+      // An editor's write does land.
+      const eAdapter = new WebSocketClientAdapter(wsUrl(editor.jwt), 100);
+      const eRepo = new AM.Repo({ network: [eAdapter], peerId: "client-editor" as AM.PeerId });
+      const eHandle = await eRepo.find<Sheet>(hand.documentId);
+      eHandle.change((d: Sheet) => {
+        (d.data as unknown as Record<string, unknown>[])[1] = { 0: 4242 };
+      });
+      for (let i = 0; i < 50; i++) {
+        const doc = (await automerge.find<Sheet>(hand.documentId)).doc();
+        if (JSON.stringify(doc).includes("4242")) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      assert(
+        JSON.stringify((await automerge.find<Sheet>(hand.documentId)).doc()).includes("4242"),
+        "an editor's write should reach the server copy",
+      );
+      eAdapter.disconnect();
+
+      // Removing a member revokes sync.
+      await request(jwt, `/library/${sheet_id}/share`, {
+        method: "DELETE",
+        body: JSON.stringify({ email: "viewer@example.com" }),
+      });
+      const gone = await sql`
+        select true from sheet_usr su inner join usr u using (usr_id)
+        where su.sheet_id = ${sheet_id} and u.email = 'viewer@example.com'
+      `;
+      assertEquals(gone.length, 0, "the removed member should be gone from sheet_usr");
+    }
+
+    // A share link grants read to a client with no account at all.
+    {
+      const sheet_id = `table:${hand.documentId}`;
+      const { data: { token } }: { data: { token: string } } = await post(jwt, `/library/${sheet_id}/link`, {});
+      const adapter = new WebSocketClientAdapter(wsUrl(token), 100);
+      const repo = new AM.Repo({ network: [adapter], peerId: "client-linked" as AM.PeerId });
+      const outcome = await Promise.race([
+        repo.find<Sheet>(hand.documentId).then(() => "shared", () => "denied"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("timed out"), 2000)),
+      ]);
+      assertEquals(outcome, "shared", "a share-link token should grant read access");
+      adapter.disconnect();
+    }
+
+    // A public sheet is readable with no token at all.
+    {
+      const sheet_id = `table:${hand.documentId}`;
+      await post(jwt, `/library/${sheet_id}/public`, { public: true });
+      const adapter = new WebSocketClientAdapter(wsUrl(undefined), 100);
+      const repo = new AM.Repo({ network: [adapter], peerId: "client-public" as AM.PeerId });
+      const outcome = await Promise.race([
+        repo.find<Sheet>(hand.documentId).then(() => "shared", () => "denied"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("timed out"), 2000)),
+      ]);
+      assertEquals(outcome, "shared", "a public sheet should be readable anonymously");
+      adapter.disconnect();
+      await post(jwt, `/library/${sheet_id}/public`, { public: false });
+    }
+
     await server.shutdown();
   }
 
@@ -454,6 +561,131 @@ Deno.test(async function allTests(_t) {
       assert(res.data, "Expected data in response");
       const [cols_] = res.data;
       assert(cols_, "Expected columns in response");
+    }
+
+    // The UDFs registered by src/sql.mjs. These run in the browser too, from the
+    // same module, so a passing case here is a passing case there.
+    {
+      const run = async (code: string) => {
+        const { data: [, row] }: { data: Table } = await post(jwt, `/query`, { lang: "sql", code, args: [] });
+        return row;
+      };
+      const round = (n: unknown, p = 6) => Math.round(Number(n) * 10 ** p) / 10 ** p;
+
+      // Aggregates: AlaSQL ships these uppercase only, so the lowercase spelling
+      // used to throw "alasql.fn.var is not a function".
+      const stats = await run(
+        `select var(x) v, stdev(x) sd, median(x) m, mode(x) mo, array_agg(x) a
+         from (select 1 as x union all select 3 as x union all select 3 as x)`,
+      );
+      assertEquals(round(stats.v), round(4 / 3));
+      assertEquals(round(stats.m), 3);
+      assertEquals(stats.mo, 3);
+      assertEquals((stats.a as number[]).length, 3);
+
+      const pct = await run(`select percentile(array(x), 0.5) p50 from (select 1 as x union all select 3 as x)`);
+      assertEquals(pct.p50, 2);
+
+      // y = 2x + 1 exactly, so the fit is exact.
+      const reg = await run(
+        `select round(corr(array(x),array(y)),6) c, round(regr_slope(array(x),array(y)),6) sl,
+                round(regr_intercept(array(x),array(y)),6) ic, round(r2(array(x),array(y)),6) r
+         from (select 1 as x, 3 as y union all select 2, 5 union all select 3, 7)`,
+      );
+      assertEquals([reg.c, reg.sl, reg.ic, reg.r], [1, 2, 1, 1]);
+
+      const re = await run(
+        `select regexp_replace('a1b2','[0-9]','#') r, regexp_extract('order-42','([0-9]+)',1) e, regexp_split('a,b',',') s`,
+      );
+      assertEquals([re.r, re.e, (re.s as string[]).join("|")], ["a#b#", "42", "a|b"]);
+
+      const fuzzy = await run(
+        `select levenshtein('kitten','sitting') l, soundex('Robert') s, token_set_ratio('acme corp','corp acme') t`,
+      );
+      assertEquals([fuzzy.l, fuzzy.s, fuzzy.t], [3, "R163", 1]);
+
+      const dates = await run(
+        `select date_trunc('month','2026-08-16T12:00:00Z') m, date_add('day',7,'2026-08-16') a,
+                date_diff('day','2026-01-01','2026-03-01') d, iso_week('2026-01-05') w,
+                business_days('2026-08-10','2026-08-17') b`,
+      );
+      assertEquals(dates.m, "2026-08-01T00:00:00.000Z");
+      assertEquals(dates.a, "2026-08-23T00:00:00.000Z");
+      assertEquals([dates.d, dates.w, dates.b], [59, 2, 5]);
+
+      const json = await run(
+        `select json_extract('{"a":{"b":7}}','$.a.b') v, json_extract('{"xs":[10,20]}','$.xs[1]') x`,
+      );
+      assertEquals([json.v, json.x], [7, 20]);
+
+      // A date spine turns gaps into zero rows instead of missing rows.
+      const spine = await run(`select count(*) n from series('2026-01-01','2026-01-10')`);
+      assertEquals(spine.n, 10);
+    }
+
+    // A malformed query is a 400 naming the line, not a generic 500.
+    {
+      const res = await app.request(`/query`, {
+        method: "POST",
+        headers: new Headers({ Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" }),
+        body: JSON.stringify({ lang: "sql", code: `select * fromm 1`, args: [] }),
+      });
+      assertEquals(res.status, 400);
+      const body = await res.text();
+      assert(body.includes("Line 1"), `expected a caret-positioned error, got: ${body}`);
+    }
+
+    // AlaSQL answers `select populaton from ...` with a column of undefined
+    // rather than an error, so a typo used to read as "no data".
+    {
+      const hand = automerge.create<{ data: Sheet["data"] }>({
+        data: [arrayify([{ name: "population", type: "num", key: 0 }]), { 0: 42 }],
+      });
+      await put(jwt, `/library/table:${hand.documentId}`, {});
+      const res = await app.request(`/query`, {
+        method: "POST",
+        headers: new Headers({ Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" }),
+        body: JSON.stringify({ lang: "sql", code: `select populaton from @table:${hand.documentId}`, args: [] }),
+      });
+      assertEquals(res.status, 400);
+      const body = await res.text();
+      assert(body.includes("populaton"), `expected the bad column named, got: ${body}`);
+      assert(body.includes("population"), `expected a nearest-match suggestion, got: ${body}`);
+
+      // ...but an explicit alias is the author naming the column on purpose.
+      // AlaSQL yields undefined for `null as note` too, and rejecting that would
+      // break working queries.
+      const ok: { data: Table } = await post(jwt, `/query`, {
+        lang: "sql",
+        code: `select population, null as note from @table:${hand.documentId}`,
+        args: [],
+      });
+      assertEquals(Object.values(ok.data[0]).map((c) => c.name).join(), "population,note");
+    }
+
+    // A query sheet that reaches itself used to recurse until the stack blew:
+    // executeSql -> sheet() -> querify -> executeSql had no depth or visited set.
+    {
+      const selfRef = automerge.create<{ data: Sheet["data"] }>({
+        data: [{ lang: "sql", code: "select 1 as a", args: [] }],
+      });
+      await put(jwt, `/library/query:${selfRef.documentId}`, {});
+      selfRef.change((d) => {
+        (d.data[0] as Query).code = `select * from @query:${selfRef.documentId}`;
+      });
+
+      const res = await app.request(`/query`, {
+        method: "POST",
+        headers: new Headers({ Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" }),
+        body: JSON.stringify({ lang: "sql", code: `select * from @query:${selfRef.documentId}`, args: [] }),
+      });
+      assertEquals(res.status, 400);
+      const body = await res.text();
+      assert(body.includes("cycle"), `expected a cycle error, got: ${body}`);
+      assert(
+        body.includes(`@query:${selfRef.documentId} -> @query:${selfRef.documentId}`),
+        `expected the error to name the path that closes the cycle, got: ${body}`,
+      );
     }
   }
 

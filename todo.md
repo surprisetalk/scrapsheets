@@ -33,11 +33,6 @@ Build the features that create network effects. This is where the spreadsheet OS
 - [ ] **Cross-sheet references**: =@table:abc123.A1
 - [ ] **Dependency tracking**: topological sort for evaluation order, cycle detection
 - [ ] **Reactive recalculation**: formulas re-evaluate when referenced cells change
-- [ ] **Role column on sheet_usr**: add owner/editor/viewer roles (currently flat access)
-- [ ] **Share dialog UI**: email input + role selector in sheet settings
-- [ ] **Public/private toggle**: wire up existing Peers = Private | Public type in Elm
-- [ ] **Shareable view-only links**: unauthenticated read access via signed URLs
-- [ ] **Role-aware sync policy**: extend canSync/sharePolicy in main.ts to respect viewer vs editor
 - [ ] **Schedule field on sheet**: cron expression or interval for recurring query execution
 - [ ] **Server-side query runner**: Deno cron job executing scheduled queries
 - [ ] **Pipeline composition**: net-http (extract) -> query (transform) -> table (load)
@@ -471,20 +466,15 @@ sorts it into phases. Where a line deepens something already in Phase 2/3, it sa
 The single biggest gap. Most demos die here first.
 
 - [ ] **Exact decimal arithmetic**: money must not be a float; typed `Decimal` with scale, no silent precision loss
-- [ ] **Window functions**: `over (partition by ... order by ...)`, `lag`/`lead`, `row_number`, `rank`, `first_value`,
-      running totals
-- [ ] **CTEs and recursive CTEs**: multi-level BOM explosion, org hierarchies, date recursion
-- [ ] **Date spine generation**: `generate_series` over dates so gaps become zeros instead of missing rows
-- [ ] **Full date/time library**: truncation, add/subtract intervals, business-day math, fiscal periods, ISO weeks
+- [ ] **Window functions**: AlaSQL parses `over (partition by ...)` but computes it wrong
+      (`sum(x) over (partition by k)` returns 0); only `row_number()` works. Needs a fix upstream or our own evaluation
+      pass
+- [ ] **Fiscal periods**: `date_trunc`, `date_add`, `date_diff`, `business_days` and `iso_week` ship in src/sql.mjs;
+      fiscal-calendar arithmetic does not
 - [ ] **Timezone-correct timestamps**: store UTC, render local, never guess the zone
-- [ ] **Percentile, median, stddev, variance, mode**: the aggregates every analysis needs and AlaSQL lacks
-- [ ] **Correlation and linear regression aggregates**: `corr`, `regr_slope`, `regr_intercept`, `r2`
 - [ ] **Pivot and unpivot**: wide<->long reshaping as first-class syntax, not hand-written case statements
-- [ ] **Regex functions**: match, extract, replace, split, with capture groups
-- [ ] **Fuzzy matching**: levenshtein, trigram similarity, soundex/metaphone, token-set ratio for entity dedupe
-- [ ] **JSON and array functions**: path extraction, `unnest`, aggregation into arrays, object construction
-- [ ] **Set operations**: `union all`, `except`, `intersect` — the core of every reconciliation demo
-- [ ] **Lateral joins and correlated subqueries**: as-of joins for price-at-time-of-trade
+- [ ] **Lateral joins and correlated subqueries**: AlaSQL cannot parse `lateral` at all; as-of joins for
+      price-at-time-of-trade depend on this
 - [ ] **As-of / temporal joins**: join a fact to the row that was current at that timestamp
 - [ ] **Query parameters**: bind a query to cells in another sheet so a sheet becomes a parameterized function
 - [ ] **Deterministic ordering**: unordered results must not shuffle between runs
@@ -499,19 +489,13 @@ The single biggest gap. Most demos die here first.
 - [ ] **Explain / profile**: show which step is slow and how many rows each stage produced
 - [ ] **Schema introspection**: `describe @table:abc` and a browsable column list per referenced sheet
 - [ ] **@sheet autocomplete**: suggest sheets and columns as the user types, from the real schema
-- [ ] **Deeper @query recursion**: current depth cap of 2 blocks realistic pipelines; make the limit a cycle check
-      instead
-- [ ] **Cycle detection with a named path**: report `a -> b -> a`, not a stack overflow
 - [ ] **Saved query snippets / UDFs**: reusable named expressions across sheets (leads into Scrapscript)
-- [ ] **Server-side query execution**: same engine result whether the query runs in the browser or on the server
 
 ### Error messages
 
 Per house style, an ambiguous error is the worst bug in the system.
 
-- [ ] **Caret-positioned SQL errors**: underline the offending token with line/column
-- [ ] **"Did you mean" for columns and sheets**: nearest-match suggestions from the real schema
-- [ ] **Unresolved @sheet ref**: name the ref, list the sheets that do exist, and say which sheet referenced it
+- [ ] **"Did you mean" for sheets**: unknown columns already suggest the nearest real one; unresolved @sheet refs do not
 - [ ] **Type mismatch explanation**: show both types, the offending values, and the row they came from
 - [ ] **Fetch failures with a repro**: status, response snippet, resolved URL, and a copy-pasteable curl line
 - [ ] **Webhook rejection detail**: which signature header failed, expected vs received, clock skew if relevant
@@ -541,29 +525,21 @@ Per house style, an ambiguous error is the worst bug in the system.
 
 The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
-- [ ] **Sort and multi-column sort**: click a header, shift-click for secondary keys
-- [ ] **Filter UI**: per-column filter chips that compile down to a query
+- [ ] **Multi-column sort**: shift-click a header for a secondary key (single-key sort already ships)
 - [ ] **Saved views**: named sort/filter/hidden-column combinations per sheet
-- [ ] **Freeze rows and columns**
-- [ ] **Column resize, reorder, hide, and pin**
+- [ ] **Column reorder, hide, and pin**: drag-resize already ships; these three do not
 - [ ] **Row insert, delete, duplicate, and drag-reorder**
-- [ ] **Undo / redo**: across cell edits, structural changes, and imports
-- [ ] **Range copy/paste**: including paste from Excel and Google Sheets with types preserved
 - [ ] **Fill down and drag-fill series**: dates, numbers, patterns
-- [ ] **Find and replace**: scoped to selection, column, or sheet, with regex
 - [ ] **Number formatting**: decimals, thousands separators, currency symbol, percent, scientific, custom masks
 - [ ] **Conditional formatting**: color scales, data bars, icon sets, rule-based cell coloring
 - [ ] **Group by / outline rows**: collapsible groups with subtotals
-- [ ] **Totals row**: per-column aggregate pinned at the bottom
 - [ ] **Pivot table UI**: drag fields into rows/columns/values without writing SQL
 - [ ] **Data cleaning verbs**: trim, dedupe rows, split column, text-to-columns, change case, remove blanks
 - [ ] **Fuzzy dedupe UI**: cluster near-duplicate rows and merge with a chosen survivor
-- [ ] **Checkbox and dropdown cells**: dropdown options sourced from another sheet
+- [ ] **Dropdown options sourced from another sheet**: checkbox and enum cells already ship
 - [ ] **Cell notes**: distinct from threaded comments in Phase 3
 - [ ] **Sparklines and mini-charts in cells**
 - [ ] **Virtualized rendering**: smooth scrolling on very large sheets
-- [ ] **Keyboard-first navigation**: range select, jump to edge, extend selection, edit-in-place, all without a mouse
-- [ ] **Column stats extension**: dates and booleans currently get nothing; add ranges, gaps, and true/false counts
 
 ### Charts & dashboards
 
@@ -581,8 +557,8 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
 ### Ingest — net-http
 
-- [ ] **Per-sheet polling interval**: the fixed 15s scan is wrong for a daily file and too slow for a market feed
-- [ ] **Authenticated requests**: headers, bearer tokens, basic auth, query-param keys, all from a secret store
+- [ ] **Secrets for authenticated requests**: per-sheet headers already ship, but the values sit in the document in
+      plain text; they belong in a secret store
 - [ ] **OAuth token handling**: authorization code flow plus automatic refresh
 - [ ] **Non-GET requests**: POST/PUT with a templated body
 - [ ] **Response parsers**: JSON path, CSV/TSV, NDJSON, XML, RSS/Atom, HTML with CSS selectors, XLSX, Parquet
@@ -617,8 +593,7 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
 ### Ingest — files & drives
 
-- [ ] **CSV/XLSX/JSON upload**: drag-and-drop with encoding, delimiter, and header detection
-- [ ] **Paste-to-table**: paste a block from Excel or a web page and get a typed sheet
+- [ ] **XLSX and JSON upload**: CSV drag-and-drop with type inference already ships
 - [ ] **Import mapping UI**: map incoming columns to existing ones, remember the mapping for next time
 - [ ] **Multi-sheet XLSX**: pick the tab, handle merged headers and junk header rows
 - [ ] **Cloud drive pull**: Drive, Dropbox, Box, OneDrive, S3/R2, SFTP, with a watched folder
@@ -813,6 +788,8 @@ Extends the Phase 1 Stripe work.
 - [ ] **Server-side pagination and virtual scroll**: for sheets too big to send to the browser
 - [ ] **Background computation with progress**: long queries do not block the UI
 - [ ] **Cold row archiving**: keep history without keeping it hot
+- [ ] **`net` table growth**: no index on `sheet_id`, no primary key, and no retention — every webhook delivery and
+      net-http poll is kept forever
 - [ ] **Per-sheet resource metering**: rows, bytes, compute, and fetches, visible to the user before the limit hits
 
 ### Developer surface
@@ -837,7 +814,6 @@ Extends the Phase 3 API work.
 - [ ] **Sheet duplication and templating from an existing sheet**
 - [ ] **Accessibility**: keyboard-only operation, screen reader support, contrast, focus order
 - [ ] **Locale-aware number and date formatting**: and per-user timezone
-- [ ] **Empty states that teach**: every blank sheet type should show what it is for and one working example
 - [ ] **Trash and restore**: deleting a sheet must be undoable
 
 ### Trust, safety & abuse

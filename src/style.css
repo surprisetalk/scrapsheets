@@ -250,6 +250,48 @@ tr.meta {
   border-bottom: 1px solid var(--chrome);
 }
 
+/* The first column stays put while the table scrolls sideways, so wide sheets
+   keep their row label in view. r0 c0 is the header corner and must win on both
+   axes, hence the higher z-index. */
+.c0 {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: #fff;
+}
+
+tr.meta .c0 {
+  background: #f6f6f6;
+}
+
+.r0.c0 {
+  z-index: 2;
+}
+
+.c0::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: -1px;
+  display: block;
+  height: 100%;
+  border-right: 1px solid var(--chrome);
+}
+
+/* Sits at the right edge of the header cell; widened hit area, hairline look. */
+.grip {
+  margin-left: auto;
+  align-self: stretch;
+  width: 9px;
+  margin-right: -5px;
+  cursor: col-resize;
+  border-right: 1px solid transparent;
+}
+
+.grip:hover {
+  border-right-color: var(--muted);
+}
+
 .sort:hover {
   text-decoration: underline;
 }

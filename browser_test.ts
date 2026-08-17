@@ -195,6 +195,37 @@ Deno.test("bundled examples render and cross-sheet queries join", async () => {
   ) as number;
   assertEquals(count >= 195, true, `expected >=195 countries, got ${count}`);
 
+  // src/sql.mjs registers on the page's CDN alasql too, so the functions the
+  // server tests cover are the same ones available here. Same module, one result.
+  const udfs = await page.evaluate(
+    `JSON.stringify(alasql("select median(x) m, mode(x) mo, levenshtein('kitten','sitting') l, ` +
+      `date_trunc('month','2026-08-16T12:00:00Z') d, percentile(array(x), 0.5) p ` +
+      `from (select 1 as x union all select 3 as x union all select 3 as x)").data[0])`,
+  ) as string;
+  assertEquals(
+    JSON.parse(udfs),
+    { m: 3, mo: 3, l: 3, d: "2026-08-01T00:00:00.000Z", p: 3 },
+    "src/sql.mjs UDFs should be registered in the browser engine",
+  );
+
+  // Totals sum the rows on screen; the first column stays put when scrolled.
+  const totals = await page.evaluate(`document.querySelector("tr.totals")?.innerText ?? ""`) as string;
+  assertEquals(
+    totals.includes("8017560800"),
+    true,
+    `expected the population column to total the world population, got: ${totals}`,
+  );
+  assertEquals(
+    await page.evaluate(`getComputedStyle(document.querySelector("td.c0")).position`),
+    "sticky",
+    "the first column should be frozen",
+  );
+  assertEquals(
+    await page.evaluate(`document.querySelectorAll(".grip").length > 0`),
+    true,
+    "every column header should carry a resize grip",
+  );
+
   // The flagship join: @table:events x @table:us-states resolves and renders.
   await page.goto(`http://127.0.0.1:${port}/query:events-by-state`);
   await waitForText(

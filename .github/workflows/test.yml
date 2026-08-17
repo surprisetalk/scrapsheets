@@ -35,3 +35,50 @@ jobs:
         run: deno test --allow-all
         env:
           CI: true
+
+  schema:
+    runs-on: ubuntu-latest
+
+    # pg-schema-diff builds the target schema in a real Postgres, so schema/
+    # is validated against the engine rather than by parsing it ourselves.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: [5432:5432]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install pg-schema-diff
+        run: go install github.com/stripe/pg-schema-diff/cmd/pg-schema-diff@latest
+
+      - name: Create target and scratch databases
+        run: |
+          psql "$BASE/postgres" -c 'create database target'
+          psql "$BASE/postgres" -c 'create database scratch'
+        env:
+          BASE: postgres://postgres:postgres@127.0.0.1:5432
+
+      # An empty plan proves schema/db.sql round-trips exactly: what psql
+      # creates is what pg-schema-diff would generate, with no drift.
+      - name: Schema applies and round-trips with an empty diff
+        run: |
+          psql -v ON_ERROR_STOP=1 "$BASE/target" -f schema/db.sql
+          pg-schema-diff plan --from-dsn "$BASE/target" --to-dir schema --temp-db-dsn "$BASE/scratch" > plan.sql
+          if [ -s plan.sql ]; then
+            echo "schema/db.sql does not round-trip; pg-schema-diff still wants to change the database:"
+            cat plan.sql
+            exit 1
+          fi
+        env:
+          BASE: postgres://postgres:postgres@127.0.0.1:5432

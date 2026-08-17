@@ -6,6 +6,7 @@ import Expect
 import Json.Decode as D
 import Json.Encode as E
 import Main exposing (..)
+import Set
 import Test exposing (..)
 
 
@@ -386,6 +387,65 @@ suite =
                         |> Result.toMaybe
                         |> Expect.equal Nothing
             ]
+        , describe "Column stats"
+            [ describe "civilDays"
+                [ test "the unix epoch is day zero" <|
+                    \_ -> civilDays 1970 1 1 |> Expect.equal 0
+                , test "counts a leap day" <|
+                    \_ -> civilDays 2024 3 1 - civilDays 2024 2 28 |> Expect.equal 2
+                , test "counts a non-leap February" <|
+                    \_ -> civilDays 2026 3 1 - civilDays 2026 2 28 |> Expect.equal 1
+                , test "a full non-leap year is 365 days" <|
+                    \_ -> civilDays 2027 1 1 - civilDays 2026 1 1 |> Expect.equal 365
+                ]
+            , describe "parseDay"
+                [ test "reads a bare date" <|
+                    \_ -> parseDay "1970-01-02" |> Expect.equal (Just 1)
+                , test "reads the date out of a timestamp" <|
+                    \_ -> parseDay "1970-01-02T13:45:00Z" |> Expect.equal (Just 1)
+                , test "rejects text that is not a date" <|
+                    \_ -> parseDay "hello" |> Expect.equal Nothing
+                , test "rejects an empty string" <|
+                    \_ -> parseDay "" |> Expect.equal Nothing
+                ]
+            , describe "computeTemporalStats"
+                [ test "tracks first, last and the distinct days present" <|
+                    \_ ->
+                        case computeTemporalStats (dateRows [ "2026-01-01", "2026-01-03", "2026-01-01" ]) "d" of
+                            Temporal stat ->
+                                ( stat.count, ( stat.first, stat.last ) )
+                                    |> Expect.equal ( 3, ( Just "2026-01-01", Just "2026-01-03" ) )
+
+                            _ ->
+                                Expect.fail "expected a Temporal stat"
+                , test "a three-day span holding two distinct days has one gap" <|
+                    \_ ->
+                        case computeTemporalStats (dateRows [ "2026-01-01", "2026-01-03" ]) "d" of
+                            Temporal stat ->
+                                Expect.equal 2 (Set.size stat.days)
+
+                            _ ->
+                                Expect.fail "expected a Temporal stat"
+                , test "ignores values that are not dates" <|
+                    \_ ->
+                        case computeTemporalStats (dateRows [ "2026-01-01", "nope" ]) "d" of
+                            Temporal stat ->
+                                Expect.equal 1 stat.count
+
+                            _ ->
+                                Expect.fail "expected a Temporal stat"
+                ]
+            , describe "computeBoolishStats"
+                [ test "counts true, false and blank separately" <|
+                    \_ ->
+                        case computeBoolishStats (boolRows [ E.bool True, E.bool False, E.bool True, E.null ]) "b" of
+                            Boolish stat ->
+                                ( stat.true, stat.false, stat.blank ) |> Expect.equal ( 2, 1, 1 )
+
+                            _ ->
+                                Expect.fail "expected a Boolish stat"
+                ]
+            ]
         , describe "shortcutGroups"
             [ test "is non-empty and every group has non-empty key/description pairs" <|
                 \_ ->
@@ -402,3 +462,13 @@ suite =
                             ]
             ]
         ]
+
+
+dateRows : List String -> Array.Array (Dict.Dict String D.Value)
+dateRows =
+    List.map (\s -> Dict.singleton "d" (E.string s)) >> Array.fromList
+
+
+boolRows : List E.Value -> Array.Array (Dict.Dict String D.Value)
+boolRows =
+    List.map (Dict.singleton "b") >> Array.fromList

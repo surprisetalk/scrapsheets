@@ -5,8 +5,12 @@ port module Main exposing
     , Index
     , Rect
     , SortOrder(..)
+    , Stat(..)
     , TableBounds
+    , civilDays
     , clampIndex
+    , computeBoolishStats
+    , computeTemporalStats
     , detectFormat
     , displayYToDocY
     , docDecoder
@@ -18,6 +22,7 @@ port module Main exposing
     , nextSortOrder
     , normalizeRect
     , parseCsv
+    , parseDay
     , parseJson
     , parseTsv
     , rect
@@ -45,6 +50,7 @@ import Html.Style as S
 import Http
 import Json.Decode as D
 import Json.Encode as E
+import Set exposing (Set)
 import Task
 import Url exposing (Url)
 import Url.Parser as UrlP exposing ((</>), (<?>))
@@ -471,6 +477,15 @@ port insertAtCursor : String -> Cmd msg
 port saveTutorial : Int -> Cmd msg
 
 
+{-| Sharing runs through JS because the JWT lives there, same as changeDoc.
+`action` is one of list, add, remove, public, link.
+-}
+port shareAction : { id : String, action : String, email : String, role : String, public : Bool } -> Cmd msg
+
+
+port shareLoaded : (D.Value -> msg) -> Sub msg
+
+
 type alias DocDelta =
     { doc : D.Value
     , handle : D.Value
@@ -530,6 +545,7 @@ type alias Model =
     , auth : Auth
     , deleteConfirm : Maybe String
     , showSettings : Bool
+    , share : Share
     , showShortcuts : Bool
     , tutorial : Maybe Int
     }
@@ -559,7 +575,29 @@ type alias SheetInfo =
 
 
 type Peers
-    = Public
+    = Private
+    | Public
+
+
+{-| Who a sheet is shared with, as last loaded from the server. `link` holds a
+freshly minted view-only URL, shown only after the owner asks for one.
+-}
+type alias Share =
+    { members : List Member
+    , public : Bool
+    , link : Maybe String
+    , email : String
+    , role : String
+    }
+
+
+type alias Member =
+    { email : String, role : String }
+
+
+emptyShare : Share
+emptyShare =
+    { members = [], public = False, link = Nothing, email = "", role = "viewer" }
 
 
 type alias Sheet =
@@ -579,6 +617,8 @@ type alias Sheet =
     , undoStack : List UndoEntry
     , redoStack : List UndoEntry
     , netStatus : Maybe String
+    , widths : Dict String Int
+    , resizing : Maybe { key : String, startX : Int, startWidth : Int }
     }
 
 
@@ -600,6 +640,8 @@ emptySheet =
     , undoStack = []
     , redoStack = []
     , netStatus = Nothing
+    , widths = Dict.empty
+    , resizing = Nothing
     }
 
 
@@ -645,6 +687,17 @@ type Stat
         , sum : Int
         , min : Maybe Int
         , max : Int
+        }
+    | Temporal
+        { days : Set Int
+        , count : Int
+        , first : Maybe String
+        , last : Maybe String
+        }
+    | Boolish
+        { true : Int
+        , false : Int
+        , blank : Int
         }
 
 
@@ -1008,6 +1061,7 @@ init flags url nav =
                     }
                 , deleteConfirm = Nothing
                 , showSettings = False
+                , share = emptyShare
                 , showShortcuts = False
                 , tutorial = iif (tutorialStep < 0) Nothing (Just (clamp 0 4 tutorialStep))
                 }
@@ -1058,6 +1112,13 @@ type Msg
     | DocDeleteConfirm Id
     | DocDeleteCancel
     | SettingsClose
+    | ShareLoad D.Value
+    | ShareEmailChange String
+    | ShareRoleChange String
+    | ShareAdd
+    | ShareRemove String
+    | SharePublic Bool
+    | ShareLink
     | ShortcutsToggle Bool
     | SettingsNameChange String
     | SettingsTagsChange String
@@ -1070,6 +1131,9 @@ type Msg
     | CellMouseUp
     | CellHover Index
     | ColumnSort String
+    | ColumnResizeStart String Int
+    | ColumnResizeMove Int
+    | ColumnResizeEnd
     | FilterToggle String
     | FilterClear String
     | FilterInput String String
@@ -1139,7 +1203,7 @@ type Input
 
 
 subs : Model -> Sub Msg
-subs _ =
+subs model =
     Sub.batch
         [ librarySynced LibrarySync
         , docSelected DocSelect
@@ -1152,6 +1216,16 @@ subs _ =
         , pasteFromClipboard ClipboardPaste
         , requestCopy (always ClipboardCopy)
         , queryEditorState QueryEditorUpdate
+        , shareLoaded ShareLoad
+        , case model.sheet.resizing of
+            Just _ ->
+                Sub.batch
+                    [ Browser.onMouseMove (D.map ColumnResizeMove (D.field "clientX" (D.map round D.float)))
+                    , Browser.onMouseUp (D.succeed ColumnResizeEnd)
+                    ]
+
+            Nothing ->
+                Sub.none
         ]
 
 
@@ -1264,8 +1338,18 @@ update msg ({ sheet, auth } as model) =
             ( model, Cmd.none )
 
         UrlChange url ->
-            ( route url model
-            , changeId (route url model).id
+            let
+                next =
+                    route url model
+            in
+            ( { next | share = iif next.showSettings next.share emptyShare }
+            , Cmd.batch
+                [ changeId next.id
+                , -- Load the member list the moment the settings modal opens.
+                  iif (next.showSettings && not model.showSettings)
+                    (shareAction { id = next.id, action = "list", email = "", role = "", public = False })
+                    Cmd.none
+                ]
             )
 
         LinkClick (Browser.Internal url) ->
@@ -1284,7 +1368,7 @@ update msg ({ sheet, auth } as model) =
                             (D.oneOf [ D.field "scratch" D.bool, D.succeed False ])
                             (D.oneOf [ D.field "system" D.bool, D.succeed False ])
                             (D.oneOf [ D.field "thumb" D.value, D.succeed E.null ])
-                            (D.succeed Public)
+                            (D.oneOf [ D.field "public" D.bool |> D.map (\p -> iif p Public Private), D.succeed Private ])
                         )
                     )
                     data
@@ -1315,6 +1399,8 @@ update msg ({ sheet, auth } as model) =
                     , undoStack = []
                     , redoStack = []
                     , netStatus = Nothing
+                    , widths = Dict.empty
+                    , resizing = Nothing
                     }
               }
             , case data.data.doc |> D.decodeValue docDecoder of
@@ -1562,12 +1648,12 @@ update msg ({ sheet, auth } as model) =
                                     ( forward, backward )
 
                                 SheetRowDelete indices ->
-                                    -- Delete rows - no undo support for now (would need to store row data)
                                     let
+                                        docYs =
+                                            indices |> List.map toDoc |> List.sort
+
                                         forward =
-                                            indices
-                                                |> List.map toDoc
-                                                |> List.sort
+                                            docYs
                                                 |> List.reverse
                                                 |> List.map
                                                     (\i ->
@@ -1576,11 +1662,26 @@ update msg ({ sheet, auth } as model) =
                                                         , value = E.list E.int [ i, 1 ]
                                                         }
                                                     )
+
+                                        -- Re-insert lowest first, so each row lands back at
+                                        -- its original index. Doc row i is rows[i - 1].
+                                        backward =
+                                            docYs
+                                                |> List.filterMap
+                                                    (\i ->
+                                                        Array.get (i - 1) table.rows
+                                                            |> Maybe.map
+                                                                (\row ->
+                                                                    { action = "splice"
+                                                                    , path = []
+                                                                    , value = E.list identity [ E.int i, E.int 0, E.dict identity identity row ]
+                                                                    }
+                                                                )
+                                                    )
                                     in
-                                    ( forward, [] )
+                                    ( forward, backward )
 
                                 SheetColumnDelete indices ->
-                                    -- Delete columns - no undo support for now (would need to store column data)
                                     let
                                         colKeys =
                                             indices
@@ -1613,8 +1714,53 @@ update msg ({ sheet, auth } as model) =
                                                                     }
                                                                 )
                                                     )
+
+                                        -- Put each column definition back at its own index
+                                        -- (lowest first), then restore the cells it held.
+                                        backColPatches =
+                                            indices
+                                                |> List.sort
+                                                |> List.filterMap
+                                                    (\i ->
+                                                        Array.get i table.cols
+                                                            |> Maybe.map
+                                                                (\col ->
+                                                                    { action = "splice"
+                                                                    , path = [ E.int 0 ]
+                                                                    , value =
+                                                                        E.list identity
+                                                                            [ E.int i
+                                                                            , E.int 0
+                                                                            , E.object
+                                                                                [ ( "name", E.string col.name )
+                                                                                , ( "type", E.string (typeName col.typ) )
+                                                                                , ( "key", E.string col.key )
+                                                                                ]
+                                                                            ]
+                                                                    }
+                                                                )
+                                                    )
+
+                                        backRowPatches =
+                                            table.rows
+                                                |> Array.toIndexedList
+                                                |> List.concatMap
+                                                    (\( rowIdx, row ) ->
+                                                        colKeys
+                                                            |> List.filterMap
+                                                                (\key ->
+                                                                    Dict.get key row
+                                                                        |> Maybe.map
+                                                                            (\v ->
+                                                                                { action = "set"
+                                                                                , path = [ E.int (rowIdx + 1), E.string key ]
+                                                                                , value = v
+                                                                                }
+                                                                            )
+                                                                )
+                                                    )
                                     in
-                                    ( colPatches ++ rowPatches, [] )
+                                    ( colPatches ++ rowPatches, backColPatches ++ backRowPatches )
 
                                 SheetClearCells indices ->
                                     let
@@ -1723,6 +1869,49 @@ update msg ({ sheet, auth } as model) =
 
         DocDeleteCancel ->
             ( { model | deleteConfirm = Nothing }, Cmd.none )
+
+        ShareLoad value ->
+            let
+                share =
+                    model.share
+            in
+            ( { model
+                | share =
+                    { share
+                        | members =
+                            value
+                                |> D.decodeValue (D.field "members" (D.list (D.map2 Member (D.field "email" D.string) (D.field "role" D.string))))
+                                |> Result.withDefault share.members
+                        , public = value |> D.decodeValue (D.field "public" D.bool) |> Result.withDefault share.public
+                        , link = value |> D.decodeValue (D.field "link" D.string) |> Result.toMaybe |> orElse share.link
+                    }
+              }
+            , Cmd.none
+            )
+
+        ShareEmailChange email ->
+            ( { model | share = (\s -> { s | email = email }) model.share }, Cmd.none )
+
+        ShareRoleChange role ->
+            ( { model | share = (\s -> { s | role = role }) model.share }, Cmd.none )
+
+        ShareAdd ->
+            if String.contains "@" model.share.email then
+                ( { model | share = (\s -> { s | email = "" }) model.share }
+                , shareAction { id = model.sheet.id, action = "add", email = model.share.email, role = model.share.role, public = False }
+                )
+
+            else
+                ( { model | error = "Enter the email address of the person to share with." }, Cmd.none )
+
+        ShareRemove email ->
+            ( model, shareAction { id = model.sheet.id, action = "remove", email = email, role = "", public = False } )
+
+        SharePublic isPublic ->
+            ( model, shareAction { id = model.sheet.id, action = "public", email = "", role = "", public = isPublic } )
+
+        ShareLink ->
+            ( model, shareAction { id = model.sheet.id, action = "link", email = "", role = "", public = False } )
 
         SettingsClose ->
             ( { model | showSettings = False }, Nav.replaceUrl model.nav ("/" ++ model.sheet.id) )
@@ -1920,6 +2109,43 @@ update msg ({ sheet, auth } as model) =
             in
             ( { model | sheet = { sheet | sort = newSort } }, Cmd.none )
 
+        ColumnResizeStart key startX ->
+            ( { model
+                | sheet =
+                    { sheet
+                        | resizing =
+                            Just
+                                { key = key
+                                , startX = startX
+                                , startWidth =
+                                    Dict.get key sheet.widths
+                                        |> Maybe.withDefault
+                                            (sheet.table
+                                                |> Result.toMaybe
+                                                |> Maybe.andThen (\t -> t.cols |> Array.filter (\c -> c.key == key) |> Array.get 0)
+                                                |> Maybe.map (.typ >> typeWidthPx)
+                                                |> Maybe.withDefault 140
+                                            )
+                                }
+                    }
+              }
+            , Cmd.none
+            )
+
+        ColumnResizeMove x ->
+            case sheet.resizing of
+                Just r ->
+                    -- 32px floor: a column dragged to nothing cannot be grabbed again.
+                    ( { model | sheet = { sheet | widths = Dict.insert r.key (max 32 (r.startWidth + x - r.startX)) sheet.widths } }
+                    , Cmd.none
+                    )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        ColumnResizeEnd ->
+            ( { model | sheet = { sheet | resizing = Nothing } }, Cmd.none )
+
         FilterToggle key ->
             let
                 newFilterOpen =
@@ -2101,27 +2327,7 @@ update msg ({ sheet, auth } as model) =
         ReplaceOne ->
             case ( sheet.findReplace, sheet.doc ) of
                 ( Just fr, Ok (Tab tbl) ) ->
-                    case fr.matches |> List.drop fr.currentMatch |> List.head of
-                        Just matchIdx ->
-                            case Array.get matchIdx.x tbl.cols of
-                                Just col ->
-                                    ( model
-                                    , changeDoc
-                                        { id = sheet.id
-                                        , data =
-                                            [ { action = "set"
-                                              , path = [ E.int (displayYToDocY model.search sheet tbl.rows matchIdx.y), E.string col.key ]
-                                              , value = E.string fr.replaceText
-                                              }
-                                            ]
-                                        }
-                                    )
-
-                                Nothing ->
-                                    ( model, Cmd.none )
-
-                        Nothing ->
-                            ( model, Cmd.none )
+                    replaceMatches model sheet fr tbl (fr.matches |> List.drop fr.currentMatch |> List.take 1)
 
                 _ ->
                     ( model, Cmd.none )
@@ -2129,28 +2335,7 @@ update msg ({ sheet, auth } as model) =
         ReplaceAll ->
             case ( sheet.findReplace, sheet.doc ) of
                 ( Just fr, Ok (Tab tbl) ) ->
-                    let
-                        patches =
-                            fr.matches
-                                |> List.filterMap
-                                    (\matchIdx ->
-                                        Array.get matchIdx.x tbl.cols
-                                            |> Maybe.map
-                                                (\col ->
-                                                    { action = "set"
-                                                    , path = [ E.int (displayYToDocY model.search sheet tbl.rows matchIdx.y), E.string col.key ]
-                                                    , value = E.string fr.replaceText
-                                                    }
-                                                )
-                                    )
-                    in
-                    if List.isEmpty patches then
-                        ( model, Cmd.none )
-
-                    else
-                        ( model
-                        , changeDoc { id = sheet.id, data = patches }
-                        )
+                    replaceMatches model sheet fr tbl fr.matches
 
                 _ ->
                     ( model, Cmd.none )
@@ -2858,8 +3043,8 @@ viewModal closeMsg content =
         ]
 
 
-viewSettings : Bool -> SheetInfo -> Html Msg
-viewSettings show info =
+viewSettings : Bool -> SheetInfo -> Share -> Html Msg
+viewSettings show info share =
     if not show then
         text ""
 
@@ -2892,6 +3077,57 @@ viewSettings show info =
                     ]
                     []
                 , H.small [ S.color "#666" ] [ text "Separate tags with commas" ]
+                ]
+            , H.div [ S.marginBottom "1rem" ]
+                [ H.label [ S.display "block", S.marginBottom "0.25rem", S.fontWeight "600" ] [ text "Sharing" ]
+                , H.div [ S.displayFlex, S.gapRem 0.25, S.marginBottom "0.5rem" ]
+                    [ H.input
+                        [ A.type_ "email"
+                        , A.value share.email
+                        , A.onInput ShareEmailChange
+                        , A.placeholder "name@example.com"
+                        , S.flexGrow "1"
+                        ]
+                        []
+                    , H.select [ A.onInput ShareRoleChange, A.value share.role ]
+                        (List.map (\r -> H.option [ A.value r, A.selected (r == share.role) ] [ text r ]) [ "viewer", "editor", "owner" ])
+                    , H.button [ A.onClick ShareAdd ] [ text "Share" ]
+                    ]
+                , H.div [ S.fontSizeRem 0.875 ]
+                    (if List.isEmpty share.members then
+                        [ H.small [ S.color "#666" ] [ text "Only you." ] ]
+
+                     else
+                        List.map
+                            (\m ->
+                                H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter, S.gapRem 0.5 ]
+                                    [ H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap ] [ text m.email ]
+                                    , H.span [ S.color "#666" ] [ text m.role ]
+                                    , if m.role == "owner" then
+                                        text ""
+
+                                      else
+                                        H.button [ A.class "x", A.onClick (ShareRemove m.email), A.title ("remove " ++ m.email) ] [ text "×" ]
+                                    ]
+                            )
+                            share.members
+                    )
+                ]
+            , H.div [ S.marginBottom "1rem" ]
+                [ H.label [ S.display "block", S.marginBottom "0.25rem", S.fontWeight "600" ] [ text "Anyone with the link" ]
+                , H.div [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.5 ]
+                    [ H.label [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ]
+                        [ H.input [ A.type_ "checkbox", A.checked share.public, A.onCheck SharePublic ] []
+                        , text (iif share.public "public: anyone can read" "private")
+                        ]
+                    , H.button [ A.onClick ShareLink ] [ text "copy view-only link" ]
+                    ]
+                , case share.link of
+                    Just link ->
+                        H.input [ A.type_ "text", A.value link, A.readonly True, A.attribute "onfocus" "this.select()", S.width "100%", S.marginTop "0.25rem", S.fontSizeRem 0.75 ] []
+
+                    Nothing ->
+                        text ""
                 ]
             , H.button
                 [ A.onClick SettingsClose
@@ -3120,6 +3356,185 @@ computeTextStats rows key =
         |> Descriptive
 
 
+{-| Days since 1970-01-01. Howard Hinnant's days\_from\_civil, so date columns can
+report a span and count their gaps without a date library.
+-}
+civilDays : Int -> Int -> Int -> Int
+civilDays year month day =
+    let
+        y =
+            iif (month <= 2) (year - 1) year
+
+        era =
+            iif (y >= 0) y (y - 399) // 400
+
+        yoe =
+            y - era * 400
+
+        doy =
+            (153 * iif (month > 2) (month - 3) (month + 9) + 2) // 5 + day - 1
+
+        doe =
+            yoe * 365 + yoe // 4 - yoe // 100 + doy
+    in
+    era * 146097 + doe - 719468
+
+
+{-| The YYYY-MM-DD prefix of an ISO date or timestamp. Anything else is not a date.
+-}
+parseDay : String -> Maybe Int
+parseDay s =
+    case String.split "-" (String.left 10 (String.trim s)) of
+        [ y, m, d ] ->
+            Maybe.map3 civilDays (String.toInt y) (String.toInt m) (String.toInt d)
+
+        _ ->
+            Nothing
+
+
+computeTemporalStats : Array Row -> String -> Stat
+computeTemporalStats rows key =
+    rows
+        |> Array.foldl
+            (\row stat ->
+                row
+                    |> Dict.get key
+                    |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
+                    |> Maybe.andThen (\s -> Maybe.map (Tuple.pair s) (parseDay s))
+                    |> Maybe.map
+                        (\( s, day ) ->
+                            { days = Set.insert day stat.days
+                            , count = stat.count + 1
+                            , first = Just (Maybe.withDefault s (Maybe.map (min s) stat.first))
+                            , last = Just (Maybe.withDefault s (Maybe.map (max s) stat.last))
+                            }
+                        )
+                    |> Maybe.withDefault stat
+            )
+            { days = Set.empty, count = 0, first = Nothing, last = Nothing }
+        |> Temporal
+
+
+{-| The shared `boolean` decoder falls back to False for null and for anything it
+cannot read, so it can never report a blank. Counting blanks needs a decoder that
+says Nothing instead of guessing.
+-}
+maybeBoolean : D.Decoder (Maybe Bool)
+maybeBoolean =
+    D.oneOf
+        [ D.map Just D.bool
+        , D.map (\n -> Just (n /= 0)) D.int
+        , D.map
+            (\s ->
+                case String.toLower (String.trim s) of
+                    "true" ->
+                        Just True
+
+                    "t" ->
+                        Just True
+
+                    "1" ->
+                        Just True
+
+                    "false" ->
+                        Just False
+
+                    "f" ->
+                        Just False
+
+                    "0" ->
+                        Just False
+
+                    _ ->
+                        Nothing
+            )
+            D.string
+        , D.succeed Nothing
+        ]
+
+
+computeBoolishStats : Array Row -> String -> Stat
+computeBoolishStats rows key =
+    rows
+        |> Array.foldl
+            (\row stat ->
+                case row |> Dict.get key |> Maybe.andThen (D.decodeValue maybeBoolean >> Result.toMaybe) of
+                    Just (Just True) ->
+                        { stat | true = stat.true + 1 }
+
+                    Just (Just False) ->
+                        { stat | false = stat.false + 1 }
+
+                    _ ->
+                        { stat | blank = stat.blank + 1 }
+            )
+            { true = 0, false = 0, blank = 0 }
+        |> Boolish
+
+
+{-| Replace text at the given matches, recording the inverse so Undo covers it.
+Find/replace used to call changeDoc directly, which left the undo stack silently
+skipping every replacement it made.
+-}
+replaceMatches : Model -> Sheet -> FindReplace -> Table -> List Index -> ( Model, Cmd Msg )
+replaceMatches model sheet fr tbl matches =
+    let
+        patchPairs =
+            matches
+                |> List.filterMap
+                    (\matchIdx ->
+                        Array.get matchIdx.x tbl.cols
+                            |> Maybe.map
+                                (\col ->
+                                    let
+                                        docY =
+                                            displayYToDocY model.search sheet tbl.rows matchIdx.y
+
+                                        old =
+                                            Array.get (docY - 1) tbl.rows
+                                                |> Maybe.andThen (Dict.get col.key)
+                                                |> Maybe.withDefault E.null
+                                    in
+                                    ( { action = "set"
+                                      , path = [ E.int docY, E.string col.key ]
+                                      , value = E.string fr.replaceText
+                                      }
+                                    , { action = "set"
+                                      , path = [ E.int docY, E.string col.key ]
+                                      , value = old
+                                      }
+                                    )
+                                )
+                    )
+
+        forward =
+            List.map Tuple.first patchPairs
+    in
+    if List.isEmpty forward then
+        ( model, Cmd.none )
+
+    else
+        ( { model
+            | sheet =
+                { sheet
+                    | undoStack = { forward = forward, backward = List.map Tuple.second patchPairs } :: sheet.undoStack |> List.take 50
+                    , redoStack = []
+                }
+          }
+        , changeDoc { id = sheet.id, data = forward }
+        )
+
+
+orElse : Maybe a -> Maybe a -> Maybe a
+orElse fallback first =
+    case first of
+        Just _ ->
+            first
+
+        Nothing ->
+            fallback
+
+
 computeStats : Doc -> Result String (Array Stat)
 computeStats doc =
     case doc of
@@ -3136,6 +3551,15 @@ computeStats doc =
 
                             Text ->
                                 computeTextStats tbl.rows col.key
+
+                            Date ->
+                                computeTemporalStats tbl.rows col.key
+
+                            Timestamp ->
+                                computeTemporalStats tbl.rows col.key
+
+                            Boolean ->
+                                computeBoolishStats tbl.rows col.key
 
                             _ ->
                                 Enumerative
@@ -3379,6 +3803,56 @@ typeAlign typ =
             S.textAlignLeft
 
 
+{-| A dragged width wins over the per-type default; without one the column keeps
+whatever typeWidth says, including auto.
+-}
+colWidth : Sheet -> Col -> H.Attribute Msg
+colWidth sheet col =
+    case Dict.get col.key sheet.widths of
+        Just px ->
+            S.width (String.fromInt px ++ "px")
+
+        Nothing ->
+            typeWidth col.typ
+
+
+{-| Starting point for a drag, in px: the rem widths below times the 16px root,
+and a readable default for the columns that size themselves.
+-}
+typeWidthPx : Type -> Int
+typeWidthPx typ =
+    case typ of
+        Create ->
+            160
+
+        SheetId ->
+            48
+
+        Boolean ->
+            32
+
+        Number ->
+            80
+
+        Usd ->
+            80
+
+        Date ->
+            112
+
+        Percentage ->
+            64
+
+        Delete ->
+            64
+
+        Thumb ->
+            64
+
+        _ ->
+            140
+
+
 typeWidth : Type -> H.Attribute Msg
 typeWidth typ =
     case typ of
@@ -3447,6 +3921,7 @@ cellClasses sheet i n =
     A.classList
         [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
         , ( "r0", n == 0 )
+        , ( "c0", i == 0 )
         , ( "match-highlight", isMatch && not isCurrentMatch )
         , ( "match-current", isCurrentMatch )
         ]
@@ -3557,6 +4032,28 @@ viewStatCell maybeStat =
                     ++ [ H.span [] [ text "keywords" ], H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.maxWidthRem 12, S.displayBlock ] [ text (String.join " " (Dict.keys (Dict.filter (\k v -> String.length k >= 4 && v >= 2) stat.keywords))) ] ]
             ]
 
+        Just (Temporal stat) ->
+            let
+                span =
+                    Maybe.map2 (\lo hi -> hi - lo + 1) (List.minimum (Set.toList stat.days)) (List.maximum (Set.toList stat.days))
+            in
+            [ grid <|
+                kv "first" (Maybe.withDefault "" stat.first)
+                    ++ kv "last" (Maybe.withDefault "" stat.last)
+                    ++ kv "span" (Maybe.withDefault "" (Maybe.map (\d -> String.fromInt d ++ "d") span))
+                    -- Days inside the range with no row: the holes a date spine would fill.
+                    ++ kv "gaps" (Maybe.withDefault "" (Maybe.map (\d -> String.fromInt (d - Set.size stat.days)) span))
+                    ++ kv "count" (String.fromInt stat.count)
+            ]
+
+        Just (Boolish stat) ->
+            [ grid <|
+                kv "true" (String.fromInt stat.true)
+                    ++ kv "false" (String.fromInt stat.false)
+                    ++ kv "blank" (String.fromInt stat.blank)
+                    ++ kv "count" (String.fromInt (stat.true + stat.false))
+            ]
+
         _ ->
             []
 
@@ -3600,6 +4097,12 @@ viewHeaderCell sheet col =
                         [ text (col.name ++ sortIndicator) ]
                     , H.span [ A.classList [ ( "funnel", True ), ( "on", hasFilter ) ], S.cursorPointer, S.fontSizeRem 0.75, A.onClick (FilterToggle col.key), A.title "filter" ]
                         [ text (iif hasFilter "⧩" "▽") ]
+                    , H.span
+                        [ A.class "grip"
+                        , A.title "drag to resize"
+                        , A.on "mousedown" (D.map (ColumnResizeStart col.key) (D.field "clientX" (D.map round D.float)))
+                        ]
+                        []
                     ]
                 , if isFilterOpen then
                     H.div [ A.class "panel", S.positionAbsolute, S.top "100%", S.left "0", S.padding "0.5rem", S.zIndex "100", S.minWidth "150px", S.fontSizeRem 0.875 ]
@@ -3656,7 +4159,7 @@ viewCell sheet stats i n col row =
         , iif (n == 0 && sheet.filterOpen == Just col.key) (S.zIndex "2") (A.classList [])
         , cellClasses sheet i n
         , typeAlign col.typ
-        , typeWidth col.typ
+        , colWidth sheet col
         ]
     <|
         if sheet.write /= Nothing && sheet.select == rect i n i n then
@@ -3725,8 +4228,39 @@ viewFilterBar sheet filteredCount totalCount =
             ]
 
 
-viewTableFooter : Sheet -> Array Col -> Html Msg
-viewTableFooter sheet cols =
+{-| Sum of a numeric column over the rows actually on screen. Deliberately not
+`sheet.stats`, which is computed over every document row: a totals line that
+ignored the active filter would contradict the rows above it.
+-}
+columnTotal : Array Row -> Col -> Maybe Float
+columnTotal rows col =
+    case col.typ of
+        Number ->
+            Just (sumColumn rows col.key)
+
+        Usd ->
+            Just (sumColumn rows col.key)
+
+        _ ->
+            Nothing
+
+
+sumColumn : Array Row -> String -> Float
+sumColumn rows key =
+    Array.foldl
+        (\row acc ->
+            row
+                |> Dict.get key
+                |> Maybe.andThen (D.decodeValue number >> Result.toMaybe)
+                |> Maybe.withDefault 0
+                |> (+) acc
+        )
+        0
+        rows
+
+
+viewTableFooter : Sheet -> Array Col -> Array Row -> Html Msg
+viewTableFooter sheet cols rows =
     H.tfoot [] <|
         case sheet.doc of
             Ok Library ->
@@ -3753,7 +4287,15 @@ viewTableFooter sheet cols =
                        ]
 
             Ok (Tab _) ->
-                [ H.tr [ A.onClick (DocMsg SheetRowPush), A.title "add row" ] <|
+                [ H.tr [ A.class "totals", A.title "totals for the rows shown" ] <|
+                    List.map
+                        (\col ->
+                            H.td [ S.textAlignRight, S.fontWeight "600" ]
+                                [ text (Maybe.withDefault "" (Maybe.map (round2 >> String.fromFloat) (columnTotal rows col))) ]
+                        )
+                        (Array.toList cols)
+                        ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [] ]
+                , H.tr [ A.onClick (DocMsg SheetRowPush), A.title "add row" ] <|
                     List.map (\col -> H.td [] [ text (typeName col.typ) ]) (Array.toList cols)
                         ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [ text "↴" ] ]
                 ]
@@ -4007,7 +4549,7 @@ view : Model -> Browser.Document Msg
 view ({ sheet } as model) =
     let
         info =
-            model.library |> Dict.get sheet.id |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = E.null, peers = Public }
+            model.library |> Dict.get sheet.id |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = E.null, peers = Private }
 
         stats =
             sheet.stats
@@ -4020,7 +4562,7 @@ view ({ sheet } as model) =
         [ viewAuthForm model.auth
         , viewFindReplace sheet.findReplace
         , viewDeleteConfirm model.deleteConfirm
-        , viewSettings model.showSettings info
+        , viewSettings model.showSettings info model.share
         , viewShortcuts model.showShortcuts
         , viewTutorial model.tutorial
         , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
@@ -4051,7 +4593,7 @@ view ({ sheet } as model) =
                                         Array.toList <|
                                             Array.indexedMap (\n_ row -> viewTableRow sheet doc stats cols (n_ - 2) row) <|
                                                 Array.append (Array.repeat 3 Dict.empty) sortedRows
-                                    , viewTableFooter sheet cols
+                                    , viewTableFooter sheet cols sortedRows
                                     ]
                                 ]
                     ]

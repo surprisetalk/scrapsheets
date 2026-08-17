@@ -32,6 +32,7 @@
       import { IndexedDBStorageAdapter } from "/automerge-repo-idb.mjs";
       import { BrowserWebSocketClientAdapter } from "/automerge-repo-ws.mjs";
       import { Col, EXAMPLES, Table } from "/examples.mjs";
+      import { checkRefPath, checkResultColumns, formatQueryError, register, scanRefs } from "/sql.mjs";
 
       function debounce(func, timeout = 300) {
         let timer;
@@ -302,6 +303,37 @@
             }
           };
 
+          // Sharing lives here rather than in Elm because the JWT does. Every
+          // action re-reads the member list, so the modal never shows stale state.
+          app.ports.shareAction.subscribe(catchy(async ({ id, action, email, role, public: isPublic }) => {
+            const token = getAuthToken();
+            if (!token) {
+              return app.ports.docErrored.send("Log in to share a sheet.");
+            }
+            const api = `https://api.sheets.scrap.land/library/${id}`;
+            const send = async (path, method, body) => {
+              const res = await fetch(api + path, {
+                method,
+                headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                ...(body ? { body: JSON.stringify(body) } : {}),
+              });
+              if (!res.ok) throw new Error((await res.json().catch(() => ({})))?.error ?? `${method} ${path} failed (${res.status}).`);
+              return await res.json();
+            };
+
+            let link;
+            if (action === "add") await send("/share", "POST", { email, role });
+            else if (action === "remove") await send("/share", "DELETE", { email });
+            else if (action === "public") await send("/public", "POST", { public: isPublic });
+            else if (action === "link") {
+              const { data } = await send("/link", "POST", {});
+              link = `${location.origin}/${id}?share=${data.token}`;
+            }
+
+            const { data } = await send("/share", "GET");
+            app.ports.shareLoaded.send({ members: data.members, public: data.public, ...(link ? { link } : {}) });
+          }, 'shareAction'));
+
           // Register a document with the server, retrying on 404 (sync timing)
           async function registerDocWithRetry(id, name) {
             const token = getAuthToken();
@@ -325,7 +357,10 @@
             return false;
           }
 
-          const token = getAuthToken();
+          // A ?share= token in the URL is a view-only credential for one sheet;
+          // it rides the same ?auth= parameter, so there is one read path.
+          const shareToken = new URLSearchParams(location.search).get("share");
+          const token = getAuthToken() ?? shareToken;
           const syncUrl =
             "wss://api.sheets.scrap.land/library/sync" +
             (token ? `?auth=Bearer%20${encodeURIComponent(token)}` : "");
@@ -473,6 +508,7 @@
           } else { setupDragDrop(); }
 
           alasql.options.modifier = "RECORDSET";
+          register(alasql);
           for (
             const type of [
               "image",
@@ -490,6 +526,11 @@
           // them to SHEET('id') and pre-loads each doc (repo.find is async but
           // alasql from-functions are synchronous), then SHEET serves the rows.
           const sheetCache = new Map();
+          // Every column the referenced sheets actually have: what a typo'd
+          // column name gets matched against.
+          const sheetColumns = () => [
+            ...new Set([...sheetCache.values()].flatMap((rows) => Object.keys(rows?.[0] ?? {}))),
+          ];
           const toRecords = ([cols, ...rows]) =>
             rows.map((row) => Object.fromEntries(Object.values(cols).map((c) => [c.name, row[c.key]])));
           alasql.from.SHEET = (id, opts, cb, idx, query) => {
@@ -505,35 +546,35 @@
             if (cb) res = cb(res, idx, query);
             return res;
           };
-          const resolveSheets = async (code, depth = 0) => {
-            if (depth > 2) throw new Error("Query references nested too deeply (max 2 levels of @query).");
-            let out = "";
-            let inStr = false;
-            const ids = [];
-            for (let i = 0; i < code.length; i++) {
-              const ch = code[i];
-              if (ch === "'") inStr = !inStr;
-              const ref = !inStr && ch === "@" ? code.slice(i).match(/^@[a-z-]+:[A-Za-z0-9._-]+/)?.[0] : undefined;
-              if (ref) {
-                ids.push(ref.slice(1));
-                out += `SHEET('${ref.slice(1)}')`;
-                i += ref.length - 1;
-              } else out += ch;
-            }
+          // scanRefs and checkRefPath are shared with the server (src/sql.mjs), so a
+          // query resolves the same way in the page and in POST /query. `path` carries
+          // the @query chain that led here, which is what names a cycle.
+          const resolveSheets = async (code, path = []) => {
+            const { sql: out, ids } = scanRefs(code);
             for (const id of new Set(ids)) {
+              checkRefPath(path, id);
               const [type, ref_id] = id.split(":");
               if (!["table", "query"].includes(type)) {
                 throw new Error(`@${id}: only table and query sheets can be referenced in queries.`);
               }
               const doc = Library.get()[id]?.doc ??
                 (await repo.find(ref_id).then(async (h) => (await h.whenReady?.(), h.doc())));
-              if (!doc?.data) throw new Error(`@${id}: this sheet has no data.`);
+              if (!doc?.data) {
+                const known = Object.keys(Library.get()).filter((k) => /^(table|query):/.test(k));
+                throw new Error(
+                  [
+                    `@${id}: this sheet has no data.`,
+                    ``,
+                    `These sheets do exist: ${known.slice(0, 12).join(", ") || "(none yet)"}`,
+                  ].join("\n"),
+                );
+              }
               sheetCache.set(
                 id,
                 type === "query"
                   ? (await alasql([
                     [`set @params = ?`, [{ "": null }]],
-                    await resolveSheets(doc.data[0].code, depth + 1),
+                    await resolveSheets(doc.data[0].code, [...path, id]),
                   ]))[1].data
                   : toRecords(doc.data),
               );
@@ -664,59 +705,6 @@
             }
           };
           alasql.from.HTTP = (url, qs = {}) => alasql.fn.http(url, qs).res;
-          // Parse SQL error to extract position info
-          const parseQueryError = (error, code) => {
-            const msg = error?.message || String(error);
-            const lines = code.split('\n');
-
-            // Try to extract line/column from common error patterns
-            // AlaSQL: "Parse error on line X"
-            const lineMatch = msg.match(/line\s+(\d+)/i);
-            // Position in string
-            const posMatch = msg.match(/position\s+(\d+)/i);
-
-            let lineNum = null;
-            let colNum = null;
-            let context = null;
-
-            if (lineMatch) {
-              lineNum = parseInt(lineMatch[1], 10);
-            }
-
-            if (posMatch && !lineNum) {
-              // Convert position to line/column
-              const pos = parseInt(posMatch[1], 10);
-              let charCount = 0;
-              for (let i = 0; i < lines.length; i++) {
-                if (charCount + lines[i].length >= pos) {
-                  lineNum = i + 1;
-                  colNum = pos - charCount;
-                  break;
-                }
-                charCount += lines[i].length + 1; // +1 for newline
-              }
-            }
-
-            // Add context (the offending line)
-            if (lineNum && lineNum <= lines.length) {
-              context = lines[lineNum - 1];
-            }
-
-            // Format error message with line info
-            let formatted = msg;
-            if (lineNum) {
-              formatted = `Line ${lineNum}${colNum ? `:${colNum}` : ''}: ${msg}`;
-              if (context) {
-                formatted += `\n\n  ${lineNum} │ ${context}`;
-                if (colNum) {
-                  formatted += `\n    │ ${' '.repeat(colNum - 1)}^`;
-                }
-              }
-            }
-
-            return formatted;
-          };
-
           const queryDoc = debounce(
             async (id, { code, lang, args, cols: cols_ = {} }) => {
               try {
@@ -737,6 +725,7 @@
                       [`set @params = ?`, [params]],
                       await resolveSheets(code),
                     ]);
+                    checkResultColumns(cols, rows, sheetColumns(), code);
                     // TODO: If doc contains cols data, use that names and types.
                     app.ports.docQueried.send({
                       id,
@@ -754,7 +743,7 @@
                     throw new Error(`Unsupported query language: ${lang}`);
                 }
               } catch (error) {
-                const formatted = parseQueryError(error, code);
+                const formatted = formatQueryError(error, code);
                 app.ports.docErrored.send(formatted);
               }
             },
