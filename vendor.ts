@@ -2,6 +2,9 @@
 // jsDelivr bundles rewrite bare imports to root-relative /npm/ paths, which would
 // resolve against our own origin and load a second copy of automerge. We rewrite
 // them back so the import map in src/index.html decides which copy the browser uses.
+// Their //# sourceMappingURL=/sm/<hash>.map is root-relative for the same reason,
+// and our /* catch-all answers it with index.html, so the browser reports
+// "JSON Parse error: Unrecognized token '<'". Point it at jsDelivr instead.
 
 const AUTOMERGE = "3.4.0";
 const REPO = "2.5.6";
@@ -12,9 +15,12 @@ const bundle = async (pkg: string, version: string, entry: string, out: string) 
   const src = (await res.text())
     .replaceAll(/\/npm\/@automerge\/automerge-repo@[\d.]+(\/slim)?\/\+esm/g, "@automerge/automerge-repo")
     .replaceAll(/\/npm\/@automerge\/automerge@[\d.]+(\/slim)?\/\+esm/g, "@automerge/automerge")
-    .replaceAll(/(?<!jsdelivr\.net)\/npm\//g, "https://cdn.jsdelivr.net/npm/");
+    .replaceAll(/(?<!jsdelivr\.net)\/npm\//g, "https://cdn.jsdelivr.net/npm/")
+    .replaceAll(/sourceMappingURL=\/sm\//g, "sourceMappingURL=https://cdn.jsdelivr.net/sm/");
   const leftover = src.match(/"(\/npm\/[^"]*|[^"]*@automerge\/[^"]*@[\d.][^"]*)"/g);
   if (leftover) throw new Error(`unrewritten imports in ${out}: ${leftover.join(", ")}`);
+  const rooted = src.match(/sourceMappingURL=\/[^\s]*/g);
+  if (rooted) throw new Error(`root-relative source maps in ${out}: ${rooted.join(", ")}`);
   await Deno.writeTextFile(out, src);
   console.log(`${out} <- ${pkg}@${version}`);
 };

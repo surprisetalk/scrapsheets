@@ -87,6 +87,17 @@ Deno.test("vendored automerge bundles keep bare automerge specifiers", async () 
       `src/${name} must import automerge as a bare specifier so the import map picks the WASM-initialized copy. ` +
         `Run \`deno task vendor\` to regenerate. Offending imports: ${bad?.join(", ")}`,
     );
+
+    // A root-relative //# sourceMappingURL=/sm/... resolves against our origin,
+    // where the /* catch-all answers with index.html and the browser reports
+    // "JSON Parse error: Unrecognized token '<'".
+    const rooted = src.match(/sourceMappingURL=\/[^\s]*/g);
+    assertEquals(
+      rooted,
+      null,
+      `src/${name} points its source map at our own origin, which serves index.html for it. ` +
+        `Run \`deno task vendor\` to rewrite it to cdn.jsdelivr.net. Offending: ${rooted?.join(", ")}`,
+    );
   }
 });
 
