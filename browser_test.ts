@@ -53,6 +53,30 @@ Deno.test("index.html has correct WASM initialization", async () => {
 });
 
 // Test 1b: vendored bundles must defer to the import map for automerge
+// src/_redirects is an allowlist ending in `/* / 200`, so an asset that is not
+// listed is served the SPA shell instead of itself. For a module that surfaces
+// only in the browser, as "'text/html' is not a valid JavaScript MIME type".
+Deno.test("every root-absolute asset index.html loads is listed in _redirects", async () => {
+  const html = await Deno.readTextFile(dir + "src/index.html");
+  const redirects = await Deno.readTextFile(dir + "src/_redirects");
+  const listed = new Set(
+    redirects.split("\n").map((line) => line.trim().split(/\s+/)[0]).filter(Boolean),
+  );
+
+  const referenced = new Set(
+    [...html.matchAll(/(?:from|src=|href=)\s*["'](\/[^"']+)["']/g)].map((m) => m[1]),
+  );
+
+  for (const path of referenced) {
+    assertEquals(
+      listed.has(path),
+      true,
+      `src/index.html loads ${path}, but src/_redirects does not list it, so the host will ` +
+        `serve index.html for that URL instead of the file. Add a line: ${path} ${path} 200`,
+    );
+  }
+});
+
 Deno.test("vendored automerge bundles keep bare automerge specifiers", async () => {
   for (const name of ["automerge-repo.mjs", "automerge-repo-ws.mjs", "automerge-repo-idb.mjs"]) {
     const src = await Deno.readTextFile(dir + "src/" + name);
@@ -148,14 +172,28 @@ Deno.test("a failing HTTP() names the url and the origin's error text", async ()
 });
 
 // Mirrors src/_redirects: extension-less paths (like /table:countries) load the app shell.
+// Applies dist/_redirects the way the host does: first matching rule wins, and
+// `/* / 200` serves the SPA shell for everything unlisted. Guessing from the
+// file extension instead would be MORE permissive than production and would hide
+// an asset missing from the allowlist behind a "'text/html' is not a valid
+// JavaScript MIME type" error in the browser only.
+let rules: string[][] | undefined;
 const serveSpa = async (req: Request): Promise<Response> => {
+  rules ??= (await Deno.readTextFile(dir + "dist/_redirects"))
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .map((line) => line.split(/\s+/));
+
   const { pathname } = new URL(req.url);
-  if (pathname !== "/" && !/\.[a-z0-9]+$/i.test(pathname)) {
-    return new Response(await Deno.readFile(dir + "dist/index.html"), {
-      headers: { "content-type": "text/html; charset=utf-8" },
-    });
-  }
-  return serveDir(req, { fsRoot: dir + "dist", quiet: true });
+  const rule = rules.find(([from]) =>
+    from === pathname || (from.endsWith("/*") && pathname.startsWith(from.slice(0, -1)))
+  );
+  const target = rule ? rule[1] : pathname;
+  return serveDir(new Request(new URL(target === "/" ? "/index.html" : target, req.url), req), {
+    fsRoot: dir + "dist",
+    quiet: true,
+  });
 };
 
 // Test 2c: bundled example datasets render, @refs join across sheets in-browser,
