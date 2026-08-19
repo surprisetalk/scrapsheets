@@ -6,6 +6,7 @@ create table usr
 , name text
 , email citext unique not null
 , password text
+, stripe_customer_id text unique
 );
 
 create table sheet
@@ -46,4 +47,17 @@ create table net
 , req_headers jsonb not null default '{}'::jsonb
 , query_params jsonb not null default '{}'::jsonb
 , body text not null
+);
+
+create table payment
+( payment_id bigint not null generated always as identity primary key
+, created_at timestamp default now()
+, buyer_id bigint not null references usr(usr_id)
+, seller_id bigint not null references usr(usr_id)
+, sell_id text not null references sheet(sell_id)
+, sheet_id text references sheet(sheet_id)
+, amount numeric not null check (amount >= 0)
+, stripe_session_id text unique
+, stripe_payment_intent_id text
+, check (stripe_session_id is not null or sheet_id is not null)
 );

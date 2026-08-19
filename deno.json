@@ -6,8 +6,8 @@
     "build": "mkdir -p dist && cp src/* dist && deno run -A npm:elm@0.19.2-0 make src/Main.elm --output=dist/index.js",
     "dev": "deno task build && deno run -A npm:serve dist -s -C -S -n",
     "test": "deno test --allow-all",
-    "db:plan": "pg-schema-diff plan --from-dsn $DATABASE_URL --to-dir schema --temp-db-dsn $TEMP_DATABASE_URL",
-    "db:apply": "pg-schema-diff apply --from-dsn $DATABASE_URL --to-dir schema --temp-db-dsn $TEMP_DATABASE_URL",
+    "db:plan": "deno eval --env-file=.env \"const u = Deno.env.get('DATABASE_URL'); if (!u) throw new Error('Expected DATABASE_URL in .env, received nothing.'); const t = Deno.env.get('TEMP_DATABASE_URL'); const args = ['plan', '--from-dsn', u, '--to-dir', 'schema']; if (t) args.push('--temp-db-dsn', t); Deno.exit((await new Deno.Command('pg-schema-diff', { args, stdout: 'inherit', stderr: 'inherit' }).output()).code)\"",
+    "db:apply": "deno eval --env-file=.env \"const u = Deno.env.get('DATABASE_URL'); if (!u) throw new Error('Expected DATABASE_URL in .env, received nothing.'); Deno.exit((await new Deno.Command('pg-schema-diff', { args: ['apply', '--from-dsn', u, '--to-dir', 'schema'], stdout: 'inherit', stderr: 'inherit' }).output()).code)\"",
     "review": "deno run -A npm:elm-review@2.13.5 && deno run -A npm:elm-review@2.13.5 suppress --check-after-tests",
     "vendor": "deno run -A vendor.ts"
   },
@@ -65,6 +65,7 @@
     "elm-format": "npm:elm-format@^0.8.8",
     "elm-review": "npm:elm-review@^2.13.5",
     "elm-test": "npm:elm-test@0.19.2-0",
-    "pg-gateway": "npm:pg-gateway@^0.3.0-beta.4"
+    "pg-gateway": "npm:pg-gateway@^0.3.0-beta.4",
+    "stripe": "npm:stripe@22.5.0"
   }
 }

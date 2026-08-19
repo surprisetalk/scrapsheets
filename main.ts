@@ -18,6 +18,7 @@ import * as path from "@std/path";
 import examplesSql from "./examples.sql" with { type: "text" };
 import { DATASETS } from "./src/examples.mjs";
 import { checkRefPath, checkResultColumns, formatQueryError, register, scanRefs } from "./src/sql.mjs";
+import Stripe from "stripe";
 
 // --- secrets & crypto
 
@@ -1114,6 +1115,167 @@ app.post("/login", async (c) => {
   );
 });
 
+const stripeCall = async <T>(what: string, run: () => Promise<T>): Promise<T> => {
+  try {
+    return await run();
+  } catch (err) {
+    if (err instanceof HTTPException) throw err;
+    throw new HTTPException(502, {
+      message: `Expected Stripe to ${what}, received ${
+        err instanceof Error ? err.message : err
+      }. Check STRIPE_SECRET_KEY and that api.stripe.com is reachable.`,
+    });
+  }
+};
+
+const fulfillPurchase = async (
+  tx: Sql,
+  {
+    usr_id,
+    sell_id,
+    amount,
+    stripe_session_id,
+    stripe_payment_intent_id,
+  }: {
+    usr_id: string;
+    sell_id: string;
+    amount: number;
+    stripe_session_id: string | null;
+    stripe_payment_intent_id: string | null;
+  },
+): Promise<string> => {
+  // A paid Checkout Session is a contract: deliver even if the seller unsold
+  // after the buyer paid. $0 buys still require a live listing.
+  const live = stripe_session_id ? sql`` : sql`and sell_price >= 0`;
+  const [sheet] = await tx`select * from sheet where sell_id = ${sell_id} ${live}`;
+  if (!sheet) {
+    throw new HTTPException(404, {
+      message: `Expected a shop listing with sell_id ${sell_id}, received none. The listing may have been taken down.`,
+    });
+  }
+  if (stripe_session_id) {
+    await tx`
+      insert into payment (buyer_id, seller_id, sell_id, amount, stripe_session_id, stripe_payment_intent_id)
+      values (
+        ${usr_id}, ${sheet.created_by}, ${sell_id}, ${amount}, ${stripe_session_id}, ${stripe_payment_intent_id}
+      )
+      on conflict (stripe_session_id) do nothing
+    `;
+    const [pay] = await tx`select sheet_id from payment where stripe_session_id = ${stripe_session_id} for update`;
+    if (pay?.sheet_id) return pay.sheet_id;
+  }
+  if (!sheet.sell_type) {
+    throw new HTTPException(400, {
+      message: `Expected sell_type on listing ${sell_id}, received null. Only templates and live sheets can be sold.`,
+    });
+  }
+  const row_0 = sheet.type === "template" ? sheet.row_0.data : [];
+  const doc_id = sheet.sell_type.startsWith("codex-")
+    ? Math.random().toString().slice(2)
+    : automerge.create({ type: sheet.sell_type, data: row_0 }).documentId;
+  const [bought] = await tx`
+    with buy as (
+      insert into sheet (created_by, type, doc_id, name, buy_id, buy_price, row_0)
+      select ${usr_id}, sell_type, ${doc_id}, name, sell_id, ${amount}, ${row_0}
+      from sheet where sell_id = ${sell_id} ${live}
+      returning sheet_id, created_by
+    ), buy_usr as (
+      insert into sheet_usr (sheet_id, usr_id, role) select sheet_id, created_by, 'owner' from buy
+    )
+    select sheet_id from buy
+  `;
+  if (!bought?.sheet_id) throw new HTTPException(500, { message: "Not purchased." });
+  const { sheet_id } = bought;
+  if (stripe_session_id) {
+    await tx`
+      update payment set sheet_id = ${sheet_id}, stripe_payment_intent_id = ${stripe_payment_intent_id}
+      where stripe_session_id = ${stripe_session_id} and sheet_id is null
+    `;
+  } else {
+    await tx`
+      insert into payment (buyer_id, seller_id, sell_id, sheet_id, amount, stripe_session_id, stripe_payment_intent_id)
+      values (${usr_id}, ${sheet.created_by}, ${sell_id}, ${sheet_id}, ${amount}, null, null)
+    `;
+  }
+  return sheet_id;
+};
+
+app.post("/stripe", async (c) => {
+  const secret = Deno.env.get("STRIPE_WEBHOOK_SECRET");
+  if (!secret) {
+    throw new HTTPException(500, {
+      message:
+        "Expected STRIPE_WEBHOOK_SECRET (a Stripe webhook signing secret starting with whsec_), received nothing. Set STRIPE_WEBHOOK_SECRET in the environment.",
+    });
+  }
+  const sig = c.req.header("stripe-signature");
+  if (!sig) {
+    throw new HTTPException(400, {
+      message:
+        "Expected stripe-signature header, received none. Stripe signs every webhook; configure the endpoint and STRIPE_WEBHOOK_SECRET.",
+    });
+  }
+  const raw = await c.req.text();
+  let event: Stripe.Event;
+  try {
+    event = await Stripe.webhooks.constructEventAsync(raw, sig, secret);
+  } catch (err) {
+    throw new HTTPException(400, {
+      message:
+        `Expected a stripe-signature header matching STRIPE_WEBHOOK_SECRET, received a payload that failed verification: ${
+          err instanceof Error ? err.message : err
+        }. Check STRIPE_WEBHOOK_SECRET and that the raw body is not parsed before verification.`,
+    });
+  }
+  if (event.type !== "checkout.session.completed") return c.json(null, 200);
+  const session = event.data.object;
+  if (session.payment_status !== "paid") return c.json(null, 200);
+  if (typeof session.id !== "string" || !session.id) {
+    throw new HTTPException(400, {
+      message: `Expected checkout.session id, received ${
+        JSON.stringify(session.id)
+      }. Create the session through POST /buy/:id.`,
+    });
+  }
+  const usr_id = session.metadata?.usr_id;
+  const sell_id = session.metadata?.sell_id;
+  if (!usr_id || !sell_id) {
+    throw new HTTPException(400, {
+      message: `Expected checkout.session metadata.usr_id and metadata.sell_id, received ${
+        JSON.stringify(session.metadata)
+      }. Create the session through POST /buy/:id.`,
+    });
+  }
+  const [buyer] = await sql`select usr_id from usr where usr_id::text = ${usr_id}`;
+  if (!buyer) {
+    throw new HTTPException(400, {
+      message: `Expected checkout.session metadata.usr_id to be a usr, received ${
+        JSON.stringify(usr_id)
+      }. Create the session through POST /buy/:id.`,
+    });
+  }
+  const amount_total = session.amount_total;
+  if (typeof amount_total !== "number" || !Number.isInteger(amount_total) || amount_total < 1) {
+    throw new HTTPException(400, {
+      message: `Expected checkout.session amount_total in cents, received ${
+        JSON.stringify(amount_total)
+      }. The session must be a paid Checkout Session.`,
+    });
+  }
+  const payment_intent = session.payment_intent;
+  const sheet_id = await sql.begin((tx: Sql) =>
+    fulfillPurchase(tx, {
+      usr_id: String(buyer.usr_id),
+      sell_id,
+      amount: amount_total / 100,
+      stripe_session_id: session.id,
+      stripe_payment_intent_id: typeof payment_intent === "string" ? payment_intent : payment_intent?.id ?? null,
+    })
+  );
+  invalidateSync(sheet_id.split(":")[1]);
+  return c.json({ data: sheet_id }, 200);
+});
+
 app.get("/shop", async (c) => {
   const { limit, offset, ...qs } = c.req.query();
   return page(c)(
@@ -1296,46 +1458,104 @@ app.use("*", async (c, next) => {
 });
 
 app.post("/buy/:id", async (c) => {
-  const sheet_id = await sql.begin(async (sql: Sql) => {
-    const [sheet] = await sql`select * from sheet where sell_id = ${
-      c.req.param(
-        "id",
-      )
-    } and sell_price >= 0`;
-    if (!sheet) throw new HTTPException(404, { message: "Not found." });
-    if (!sheet.sell_type)
-      throw new HTTPException(400, { message: "Not for sale." });
-    const row_0 = sheet.type === "template" ? sheet.row_0.data : [];
-    const doc_id = sheet.sell_type.startsWith("codex-")
-      ? Math.random().toString().slice(2)
-      : automerge.create({ type: sheet.sell_type, data: row_0 }).documentId;
-    const [{ sheet_id }] = await sql`
-      with sell as (
-        select * from sheet where sell_id = ${
-      c.req.param(
-        "id",
-      )
-    } and sell_price >= 0
-      ), buy as (
-        insert into sheet (created_by, type, doc_id, name, buy_id, buy_price, row_0) 
-        select ${
-      c.get(
-        "usr_id",
-      )
-    }, sell_type, ${doc_id}, name, sell_id, sell_price, ${row_0}
-        from sell
-        returning sheet_id, created_by
-      ), buy_usr as (
-        insert into sheet_usr (sheet_id, usr_id, role) select sheet_id, created_by, 'owner' from buy
-      )
-      select sheet_id from buy
+  const sell_id = c.req.param("id");
+  const usr_id = c.get("usr_id");
+  const [sheet] = await sql`select * from sheet where sell_id = ${sell_id} and sell_price >= 0`;
+  if (!sheet) {
+    throw new HTTPException(404, {
+      message: `Expected a shop listing with sell_id ${sell_id}, received none. The listing may have been taken down.`,
+    });
+  }
+  if (!sheet.sell_type) {
+    throw new HTTPException(400, {
+      message: `Expected sell_type on listing ${sell_id}, received null. Only templates and live sheets can be sold.`,
+    });
+  }
+  const dollars = Number(sheet.sell_price);
+  if (!Number.isFinite(dollars)) {
+    throw new HTTPException(400, {
+      message: `Expected sell_price to be a number of dollars, received ${
+        JSON.stringify(sheet.sell_price)
+      } from sheet ${sheet.sheet_id}. Re-list the sheet with a numeric price.`,
+    });
+  }
+  if (dollars === 0) {
+    const sheet_id = await sql.begin((tx: Sql) =>
+      fulfillPurchase(tx, {
+        usr_id,
+        sell_id,
+        amount: 0,
+        stripe_session_id: null,
+        stripe_payment_intent_id: null,
+      })
+    );
+    invalidateSync(sheet_id.split(":")[1]);
+    return c.json({ data: sheet_id }, 201);
+  }
+  const cents = Math.round(dollars * 100);
+  if (cents < 1) {
+    throw new HTTPException(400, {
+      message:
+        `Expected sell_price of at least $0.01, received ${sheet.sell_price} on ${sheet.sheet_id}. Re-list at a whole-cent price or 0.`,
+    });
+  }
+  const key = Deno.env.get("STRIPE_SECRET_KEY");
+  if (!key) {
+    throw new HTTPException(500, {
+      message:
+        "Expected STRIPE_SECRET_KEY (a Stripe secret key starting with sk_), received nothing. Set STRIPE_SECRET_KEY in the environment.",
+    });
+  }
+  const stripe = new Stripe(key);
+  const [usr] = await sql`select email, stripe_customer_id from usr where usr_id = ${usr_id}`;
+  if (!usr) {
+    throw new HTTPException(401, {
+      message: `Expected a usr row for usr_id ${usr_id}, received none. Sign in again.`,
+    });
+  }
+  let { stripe_customer_id } = usr;
+  if (!stripe_customer_id) {
+    const customer = await stripeCall("create a customer", () =>
+      stripe.customers.create({
+        email: usr.email || undefined,
+        metadata: { usr_id: String(usr_id) },
+      }));
+    await sql`
+      update usr set stripe_customer_id = ${customer.id}
+      where usr_id = ${usr_id} and stripe_customer_id is null
     `;
-    if (!sheet_id) throw new HTTPException(500, { message: "Not purchased." });
-    // TODO: Charge usr on stripe, etc.
-    return sheet_id;
-  });
-  invalidateSync(sheet_id.split(":")[1]);
-  return c.json({ data: sheet_id }, 201);
+    const [again] = await sql`select stripe_customer_id from usr where usr_id = ${usr_id}`;
+    stripe_customer_id = again.stripe_customer_id;
+    if (!stripe_customer_id) {
+      throw new HTTPException(500, {
+        message:
+          `Expected usr.stripe_customer_id after creating a Stripe customer, received null for usr_id ${usr_id}. Retry the purchase.`,
+      });
+    }
+  }
+  const session = await stripeCall("create a Checkout Session", () =>
+    stripe.checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: ["card"],
+      customer: stripe_customer_id,
+      line_items: [{
+        quantity: 1,
+        price_data: {
+          currency: "usd",
+          unit_amount: cents,
+          product_data: { name: sheet.name || "Scrapsheet" },
+        },
+      }],
+      metadata: { usr_id: String(usr_id), sell_id },
+      success_url: "https://sheets.scrap.land/",
+      cancel_url: "https://sheets.scrap.land/",
+    }));
+  if (!session.url) {
+    throw new HTTPException(502, {
+      message: `Expected Stripe Checkout Session url, received none for session ${session.id}. Retry the purchase.`,
+    });
+  }
+  return c.json({ data: { checkout_url: session.url } }, 200);
 });
 
 app.post("/sell/:id", async (c) => {

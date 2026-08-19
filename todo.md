@@ -8,11 +8,7 @@
 
 Make Scrapsheets reliable enough to be someone's primary data tool.
 
-- [ ] **Stripe Checkout integration**: create checkout session on /buy/:id with sell_price, redirect to Stripe
-- [ ] **Stripe webhooks**: complete purchase on payment confirmation, record transaction
-- [ ] **Payment table**: add `payment` table tracking buyer, seller, amount, sheet, timestamp
-- [ ] **stripe_customer_id on usr**: link users to Stripe customers for future payouts
-- [ ] **Seller payouts**: Stripe Connect for marketplace payouts (can defer, collect platform-side first)
+- [ ] **Seller payouts**: Stripe Connect for marketplace payouts (platform collects on Checkout today)
 
 ---
 
@@ -1046,8 +1042,8 @@ Trains of thought worth chasing; each should end in either a checklist item or a
 Scrapscript (2) is the moat no one can replicate -> pipelines (2) make sheets self-updating -> sheet-as-API (3) makes
 every sheet a microservice.
 
-**What ships at 70%**: Phase 0 and MCP are done; Stripe is the last piece before a public launch. Everything else
-compounds on top.
+**What ships at 70%**: Phase 0, MCP, and Stripe Checkout (platform-side) are done. Connect payouts are the remaining
+Phase 1 item. Everything else compounds on top.
 
 **The unique position**: Scrapsheets is not Google Sheets. It is not Airtable. It is a programmable data OS where every
 table is a queryable database, every query result is a shareable table, every portal is a live data stream, every sheet

@@ -47,9 +47,9 @@ technologies. It uses a hybrid architecture with:
 
 - Initialize database schema: `psql < schema/db.sql`
 - Migrate an existing database: edit `schema/db.sql`, then `deno task db:plan` to read the generated migration and
-  `deno task db:apply` to run it. `schema/db.sql` is the desired state; there are no migration files. Both tasks need
-  `DATABASE_URL` and `TEMP_DATABASE_URL` (a scratch DB pg-schema-diff builds the target schema in). DML (backfills) is
-  never generated — splice it in with `--insert-statement 'index=<n> statement="..."'`.
+  `deno task db:apply` to run it. Both load `.env` (`DATABASE_URL` required; `TEMP_DATABASE_URL` optional for plan).
+  `schema/db.sql` is the desired state; there are no migration files. DML (backfills) is never generated — splice it in
+  with `--insert-statement 'index=<n> statement="..."'`.
 - Default connection: `postgresql://postgres@127.0.0.1:5434/postgres`
 - Tests run against an in-process PGlite over a local pg-gateway on port 5434 (no real Postgres needed)
 - External-DB DSNs are encrypted at the application level (AES-GCM via DSN_ENCRYPTION_KEY) before storage
@@ -83,6 +83,10 @@ technologies. It uses a hybrid architecture with:
 - **Sharing**: `GET/POST/DELETE /library/:id/share` (owner-only, by email + role), `POST /library/:id/public`, and
   `POST /library/:id/link` which mints a viewer-scoped JWT. The link rides the sync socket's existing `?auth=`
   parameter, so there is one read path rather than two
+- **Marketplace checkout**: `POST /buy/:id` fulfills `$0` listings immediately. A positive `sell_price` creates a
+  Stripe Checkout Session (`STRIPE_SECRET_KEY`) and returns `{ checkout_url }`. `POST /stripe` verifies
+  `stripe-signature` (`STRIPE_WEBHOOK_SECRET`) and fulfills `checkout.session.completed` with `payment_status=paid`.
+  Checkout is card-only. Money lands on the platform account; Connect payouts are not wired.
 - **Marketplace**: Buy/sell sheets with pricing system
 - **Real-time data**: WebSocket portals for live data (time, stock prices)
 - **Database codex**: Connect external PostgreSQL databases
@@ -125,7 +129,7 @@ technologies. It uses a hybrid architecture with:
 
 #### Core Tables
 
-- **usr**: User accounts with identity, name, email (citext), and password
+- **usr**: User accounts with identity, name, email (citext), password, and `stripe_customer_id`
 - **sheet**: Central document table with polymorphic sheet_id format (`type:doc_id`)
   - Types: template, table, net-hook, net-http, net-socket, query, portal, codex-*
   - Marketplace fields: sell_id, sell_type, sell_price, buy_id, buy_price
@@ -134,6 +138,7 @@ technologies. It uses a hybrid architecture with:
 - **sheet_usr**: Many-to-many permissions between sheets and users, with `role` (owner/editor/viewer)
 - **db**: External database connections (DSN storage for codex sheets)
 - **net**: Webhook data storage for net-* type sheets (body content)
+- **payment**: Marketplace transactions (buyer, seller, sell_id, buyer sheet_id, amount, Stripe session)
 
 #### Key Schema Features
 

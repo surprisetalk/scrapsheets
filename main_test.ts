@@ -4,6 +4,7 @@ import { PostgresConnection } from "pg-gateway";
 import { citext } from "@electric-sql/pglite/contrib/citext";
 import * as AM from "@automerge/automerge-repo";
 import { WebSocketClientAdapter } from "@automerge/automerge-repo-network-websocket";
+import Stripe from "stripe";
 import { app, arrayify, automerge, createJwt, createToken, parseNetHeaders, pollNetOnce, seed, sql } from "./main.ts";
 import type { Query, Sheet, Table, Template } from "./main.ts";
 import { DATASETS } from "./src/examples.mjs";
@@ -519,6 +520,172 @@ Deno.test(async function allTests(_t) {
       });
     }
 
+    // A $0 buy writes a payment row with no Stripe session.
+    {
+      const { usr_id: bobId } = await usr("bob@example.com");
+      const pays = await sql`select * from payment where buyer_id = ${bobId} order by payment_id`;
+      assert(pays.length >= 1, "free buys should write payment rows");
+      assert(pays.every((p: { amount: string; stripe_session_id: string | null }) => p.amount === "0"));
+      assert(pays.every((p: { stripe_session_id: string | null }) => p.stripe_session_id === null));
+      assert(pays.every((p: { sheet_id: string | null }) => p.sheet_id));
+    }
+
+    // Paid listings go through Stripe Checkout and fulfill on the signed webhook.
+    {
+      const { jwt: aliceJwt, usr_id: aliceId } = await usr("alice@example.com");
+      const { jwt: bobJwt, usr_id: bobId } = await usr("bob@example.com");
+      const hand = automerge.create<{ type: string; data: unknown[] }>({
+        type: "table",
+        data: [arrayify([{ name: "a", type: "text", key: 0 }])],
+      });
+      await put(aliceJwt, `/library/table:${hand.documentId}`, { name: "Paid table" });
+      await post(aliceJwt, `/sell/table:${hand.documentId}`, { price: 5 });
+      const [, listing] = await get<Table>(bobJwt, `/shop`, { name: "Paid table" });
+      assert(listing?.sell_id, "expected Paid table in the shop");
+
+      const raw = async (path: string, init?: RequestInit) =>
+        await app.request(path, {
+          headers: new Headers({
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${bobJwt}`,
+            ...Object.fromEntries(new Headers(init?.headers).entries()),
+          }),
+          ...init,
+        });
+
+      {
+        const res = await raw(`/buy/${listing.sell_id}`, { method: "POST", body: "{}" });
+        assertEquals(res.status, 500);
+        assert(
+          (await res.text()).includes("STRIPE_SECRET_KEY"),
+          "paid buy without a Stripe key should name STRIPE_SECRET_KEY",
+        );
+        const copies = await sql`select * from sheet where buy_id = ${listing.sell_id}`;
+        assertEquals(copies.length, 0);
+      }
+
+      const stripeCalls: string[] = [];
+      let sessionReq: Request | undefined;
+      const origFetch = globalThis.fetch;
+      Deno.env.set("STRIPE_SECRET_KEY", "sk_test_paid");
+      globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+        const r = new Request(input, init);
+        if (!r.url.startsWith("https://api.stripe.com/")) return origFetch(input, init);
+        stripeCalls.push(new URL(r.url).pathname);
+        if (r.url.includes("/v1/customers"))
+          return Promise.resolve(Response.json({ id: "cus_test_1", object: "customer" }));
+        if (r.url.includes("/v1/checkout/sessions")) {
+          sessionReq = r;
+          return Promise.resolve(Response.json({
+            id: "cs_test_1",
+            object: "checkout.session",
+            url: "https://checkout.stripe.com/c/pay/cs_test_1",
+          }));
+        }
+        return Promise.resolve(Response.json({ error: { message: `unexpected Stripe ${r.url}` } }, { status: 500 }));
+      }) as typeof fetch;
+      const { data: checkout } = await post(bobJwt, `/buy/${listing.sell_id}`, {});
+      globalThis.fetch = origFetch;
+      Deno.env.delete("STRIPE_SECRET_KEY");
+      assertEquals(checkout, { checkout_url: "https://checkout.stripe.com/c/pay/cs_test_1" });
+      assert(stripeCalls.includes("/v1/customers"), `expected customers.create, got ${stripeCalls.join()}`);
+      assert(stripeCalls.includes("/v1/checkout/sessions"), `expected sessions.create, got ${stripeCalls.join()}`);
+      assert(sessionReq, "paid buy should POST a Checkout Session");
+      const sessionBody = new URLSearchParams(await sessionReq!.text());
+      assertEquals(sessionBody.get("line_items[0][price_data][unit_amount]"), "500");
+      assertEquals(sessionBody.get("payment_method_types[0]"), "card");
+      assertEquals(sessionBody.get("metadata[usr_id]"), String(bobId));
+      assertEquals(sessionBody.get("metadata[sell_id]"), listing.sell_id);
+      assertEquals(sessionBody.get("customer"), "cus_test_1");
+      assertEquals((await sql`select * from sheet where buy_id = ${listing.sell_id}`).length, 0);
+      const [bob] = await sql`select stripe_customer_id from usr where usr_id = ${bobId}`;
+      assertEquals(bob.stripe_customer_id, "cus_test_1");
+
+      const webhookSecret = "whsec_test_secret";
+      const payloadFor = (over: Record<string, unknown>) =>
+        JSON.stringify({
+          id: "evt_test_1",
+          object: "event",
+          type: "checkout.session.completed",
+          data: {
+            object: {
+              id: "cs_test_1",
+              object: "checkout.session",
+              payment_status: "paid",
+              payment_intent: "pi_test_1",
+              amount_total: 500,
+              metadata: { usr_id: String(bobId), sell_id: listing.sell_id },
+              ...over,
+            },
+          },
+        });
+      const sign = (payload: string, secret = webhookSecret) =>
+        new Stripe("sk_test_unused").webhooks.generateTestHeaderStringAsync({ payload, secret });
+
+      {
+        const res = await raw("/stripe", {
+          method: "POST",
+          body: payloadFor({}),
+          headers: { "Content-Type": "application/json" },
+        });
+        assertEquals(res.status, 500);
+        assert((await res.text()).includes("STRIPE_WEBHOOK_SECRET"));
+      }
+
+      Deno.env.set("STRIPE_WEBHOOK_SECRET", webhookSecret);
+      {
+        const payload = payloadFor({});
+        const res = await raw("/stripe", {
+          method: "POST",
+          body: payload,
+          headers: { "Content-Type": "application/json", "stripe-signature": "t=1,v1=deadbeef" },
+        });
+        assertEquals(res.status, 400);
+        assert((await res.text()).includes("stripe-signature"));
+      }
+      {
+        const payload = payloadFor({ payment_status: "unpaid" });
+        const res = await raw("/stripe", {
+          method: "POST",
+          body: payload,
+          headers: { "Content-Type": "application/json", "stripe-signature": await sign(payload) },
+        });
+        assertEquals(res.status, 200);
+        assertEquals((await sql`select * from sheet where buy_id = ${listing.sell_id}`).length, 0);
+      }
+      {
+        const payload = payloadFor({});
+        // Stripe signs webhooks; they do not carry our JWT. /stripe is in front of jwt middleware.
+        const res = await app.request("/stripe", {
+          method: "POST",
+          body: payload,
+          headers: { "Content-Type": "application/json", "stripe-signature": await sign(payload) },
+        });
+        assertEquals(res.status, 200);
+        const copies = await sql`select * from sheet where buy_id = ${listing.sell_id}`;
+        assertEquals(copies.length, 1);
+        assertEquals(copies[0].created_by, bobId);
+        assertEquals(copies[0].buy_price, "5");
+        const pays = await sql`select * from payment where stripe_session_id = 'cs_test_1'`;
+        assertEquals(pays.length, 1);
+        assertEquals(pays[0].buyer_id, bobId);
+        assertEquals(pays[0].seller_id, aliceId);
+        assertEquals(pays[0].amount, "5");
+        assertEquals(pays[0].sheet_id, copies[0].sheet_id);
+        assertEquals(pays[0].stripe_payment_intent_id, "pi_test_1");
+
+        const replay = await app.request("/stripe", {
+          method: "POST",
+          body: payload,
+          headers: { "Content-Type": "application/json", "stripe-signature": await sign(payload) },
+        });
+        assertEquals(replay.status, 200);
+        assertEquals((await sql`select * from sheet where buy_id = ${listing.sell_id}`).length, 1);
+        assertEquals((await sql`select * from payment where stripe_session_id = 'cs_test_1'`).length, 1);
+      }
+      Deno.env.delete("STRIPE_WEBHOOK_SECRET");
+    }
+
     // Bob runs a basic SQL query
     {
       const {
@@ -937,6 +1104,146 @@ Deno.test(async function allTests(_t) {
       `examples.sql interpolates @params->('') with no default on these lines, so opening ` +
         `those sheets without ?q= sends an empty search term. Wrap it in coalesce(...).`,
     );
+  }
+
+  // Stripe checkout regressions: only cases that actually broke.
+  {
+    const { jwt: sellerJwt } = await usr("stripe-seller@example.com");
+    const { jwt: buyerJwt, usr_id: buyerId } = await usr("stripe-buyer@example.com");
+    const webhookSecret = "whsec_hunt";
+    const raw = async (path: string, init?: RequestInit) =>
+      await app.request(path, {
+        headers: new Headers({
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${buyerJwt}`,
+          ...Object.fromEntries(new Headers(init?.headers).entries()),
+        }),
+        ...init,
+      });
+    const listPaid = async (name: string) => {
+      const hand = automerge.create<{ type: string; data: unknown[] }>({
+        type: "table",
+        data: [arrayify([{ name: "a", type: "text", key: 0 }])],
+      });
+      await put(sellerJwt, `/library/table:${hand.documentId}`, { name });
+      await post(sellerJwt, `/sell/table:${hand.documentId}`, { price: 5 });
+      const [, listing] = await get<Table>(buyerJwt, `/shop`, { name });
+      assert(listing?.sell_id, `expected ${name} in the shop`);
+      return listing as { sell_id: string };
+    };
+    const sign = (payload: string) =>
+      new Stripe("sk_test_unused").webhooks.generateTestHeaderStringAsync({ payload, secret: webhookSecret });
+    const payloadFor = (over: Record<string, unknown>, sell_id: string, usr_id = String(buyerId)) =>
+      JSON.stringify({
+        id: "evt_hunt",
+        object: "event",
+        type: "checkout.session.completed",
+        data: {
+          object: {
+            id: "cs_hunt",
+            object: "checkout.session",
+            payment_status: "paid",
+            payment_intent: "pi_hunt",
+            amount_total: 500,
+            metadata: { usr_id, sell_id },
+            ...over,
+          },
+        },
+      });
+    const postStripe = async (payload: string) => {
+      Deno.env.set("STRIPE_WEBHOOK_SECRET", webhookSecret);
+      const res = await raw("/stripe", {
+        method: "POST",
+        body: payload,
+        headers: { "Content-Type": "application/json", "stripe-signature": await sign(payload) },
+      });
+      Deno.env.delete("STRIPE_WEBHOOK_SECRET");
+      return res;
+    };
+
+    {
+      const listing = await listPaid("Reject amount_total 0");
+      const res = await postStripe(payloadFor({ id: "cs_amt_zero", amount_total: 0 }, listing.sell_id));
+      assertEquals(res.status, 400);
+      assert((await res.text()).includes("amount_total"));
+      assertEquals((await sql`select * from sheet where buy_id = ${listing.sell_id}`).length, 0);
+    }
+
+    {
+      const listing = await listPaid("Reject amount_total string");
+      const res = await postStripe(payloadFor({ id: "cs_amt_type", amount_total: "500" }, listing.sell_id));
+      assertEquals(res.status, 400);
+      assert((await res.text()).includes("amount_total"));
+      assertEquals((await sql`select * from sheet where buy_id = ${listing.sell_id}`).length, 0);
+    }
+
+    {
+      const listing = await listPaid("Reject missing session id");
+      const res = await postStripe(payloadFor({ id: undefined }, listing.sell_id));
+      assertEquals(res.status, 400);
+      assert((await res.text()).includes("checkout.session id"));
+      assertEquals((await sql`select * from sheet where buy_id = ${listing.sell_id}`).length, 0);
+    }
+
+    {
+      const listing = await listPaid("Reject bad usr_id");
+      const res = await postStripe(payloadFor({ id: "cs_bad_usr" }, listing.sell_id, "not-a-user"));
+      assertEquals(res.status, 400);
+      const text = await res.text();
+      assert(text.includes("usr_id"), `error must name usr_id, got: ${text}`);
+      assertEquals((await sql`select * from sheet where buy_id = ${listing.sell_id}`).length, 0);
+    }
+
+    {
+      const listing = await listPaid("Deliver after unsell");
+      const origFetch = globalThis.fetch;
+      Deno.env.set("STRIPE_SECRET_KEY", "sk_test_hunt");
+      globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+        const r = new Request(input, init);
+        if (!r.url.startsWith("https://api.stripe.com/")) return origFetch(input, init);
+        if (r.url.includes("/v1/customers"))
+          return Promise.resolve(Response.json({ id: "cus_unsold", object: "customer" }));
+        if (r.url.includes("/v1/checkout/sessions")) {
+          return Promise.resolve(Response.json({
+            id: "cs_unsold",
+            object: "checkout.session",
+            url: "https://checkout.stripe.com/c/pay/cs_unsold",
+          }));
+        }
+        return Promise.resolve(Response.json({ error: { message: `unexpected Stripe ${r.url}` } }, { status: 500 }));
+      }) as typeof fetch;
+      const buyRes = await raw(`/buy/${listing.sell_id}`, { method: "POST", body: "{}" });
+      globalThis.fetch = origFetch;
+      Deno.env.delete("STRIPE_SECRET_KEY");
+      assertEquals(buyRes.status, 200, await buyRes.text());
+      const [listed] = await sql`select sheet_id from sheet where sell_id = ${listing.sell_id}`;
+      await post(sellerJwt, `/sell/${listed.sheet_id}`, { price: null });
+      const res = await postStripe(payloadFor({ id: "cs_unsold" }, listing.sell_id));
+      assertEquals(res.status, 200, await res.text());
+      assertEquals((await sql`select * from sheet where buy_id = ${listing.sell_id}`).length, 1);
+    }
+
+    {
+      const listing = await listPaid("Stripe outage names Stripe");
+      const origFetch = globalThis.fetch;
+      Deno.env.set("STRIPE_SECRET_KEY", "sk_test_hunt");
+      globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+        const r = new Request(input, init);
+        if (!r.url.startsWith("https://api.stripe.com/")) return origFetch(input, init);
+        return Promise.resolve(
+          Response.json({ error: { type: "invalid_request_error", message: "Invalid API Key provided" } }, {
+            status: 401,
+          }),
+        );
+      }) as typeof fetch;
+      const res = await raw(`/buy/${listing.sell_id}`, { method: "POST", body: "{}" });
+      globalThis.fetch = origFetch;
+      Deno.env.delete("STRIPE_SECRET_KEY");
+      assertEquals(res.status, 502);
+      const text = await res.text();
+      assert(text.includes("Stripe"), `error must name Stripe, got: ${text}`);
+      assertEquals((await sql`select * from sheet where buy_id = ${listing.sell_id}`).length, 0);
+    }
   }
 
   await sql.end();
