@@ -17,7 +17,7 @@ import * as prql from "prql-js";
 import * as path from "@std/path";
 import examplesSql from "./examples.sql" with { type: "text" };
 import { DATASETS } from "./src/examples.mjs";
-import { checkRefPath, checkResultColumns, formatQueryError, register, scanRefs } from "./src/sql.mjs";
+import { checkRefPath, checkResultColumns, formatQueryError, nearest, register, scanRefs } from "./src/sql.mjs";
 import Stripe from "stripe";
 
 // --- secrets & crypto
@@ -149,8 +149,24 @@ ala.from.SHEET = (
   idx: unknown,
   query: unknown,
 ) => {
-  const rows = (query as { params?: Record<string, Row[]>[] })?.params?.[0]?.[id as string];
-  if (!rows) throw new HTTPException(400, { message: `I could not load the sheet "@${id}".` });
+  const loaded = (query as { params?: Record<string, Row[]>[] })?.params?.[0] ?? {};
+  const rows = loaded[id as string];
+  if (!rows) {
+    const hit = nearest(String(id), Object.keys(loaded));
+    throw new HTTPException(400, {
+      message: [
+        `I could not load the sheet "@${id}".`,
+        ``,
+        hit
+          ? `  Did you mean: @${hit}`
+          : `  Loaded:       ${Object.keys(loaded).join(", ") || "(no @sheet is referenced)"}`,
+        `  Source:       the @sheet refs in this query`,
+        `  Fix:          ${
+          hit ? `write @${hit} instead` : "reference the sheet as @type:doc_id so it loads before the query runs"
+        }`,
+      ].join("\n"),
+    });
+  }
   return typeof cb === "function" ? cb(rows, idx, query) : rows;
 };
 
@@ -232,7 +248,13 @@ const assertSheetAccess = async (c: Context, sheet_id: string): Promise<void> =>
     union all
     select true from sheet where sheet_id = ${sheet_id} and public
   `;
-  if (!access) throw new HTTPException(403, { message: "You don't have access to this sheet." });
+  if (!access) {
+    throw new HTTPException(403, {
+      message: `Expected read access to ${sheet_id} for usr ${
+        c.get("usr_id")
+      }, received none. Source: sheet_usr membership, a purchase of the listing, or sheet.public. Ask an owner to share it with you, or have them make it public.`,
+    });
+  }
 };
 
 // Owner-only actions (sharing, publishing) check this rather than created_by, so
@@ -245,8 +267,13 @@ const assertSheetOwner = async (c: Context, sheet_id: string): Promise<void> => 
       and su.usr_id = ${c.get("usr_id")}
       and (su.role = 'owner' or s.created_by = ${c.get("usr_id")})
   `;
-  if (!owner)
-    throw new HTTPException(403, { message: "Only the owner of this sheet can change who it is shared with." });
+  if (!owner) {
+    throw new HTTPException(403, {
+      message: `Expected usr ${
+        c.get("usr_id")
+      } to own ${sheet_id}, received a non-owner. Source: sheet_usr.role and sheet.created_by. Only an owner can change sharing; ask one to make the change or grant you the owner role.`,
+    });
+  }
 };
 
 const sheet = async (
@@ -263,7 +290,10 @@ const sheet = async (
     .find<{ data: Sheet["data"] }>(doc_id as AnyDocumentId)
     .catch(() => ({
       doc: () => {
-        throw new HTTPException(404, { message: "Sheet not found." });
+        throw new HTTPException(404, {
+          message:
+            `Expected an automerge document for sheet ${sheet_id}, received none. Source: doc_id ${doc_id}. The sheet row exists but its document is missing or unreadable; re-create the sheet, or claim it again with PUT /library/${sheet_id}.`,
+        });
       },
     }));
   switch (type) {
@@ -281,7 +311,8 @@ const sheet = async (
         where: [
           sql`(su.sheet_id,su.usr_id) = (${sheet_id},${c.get("usr_id")})`,
         ],
-        order: undefined,
+        // Without an order the heap decides, so paging a log repeats and skips rows.
+        order: sql`order by n.created_at desc, n.net_id desc`,
         limit,
         offset,
       });
@@ -292,11 +323,21 @@ const sheet = async (
         ...qs,
       }, path_);
     case "template":
-      throw new HTTPException(500, { message: "Bad template." });
+      throw new HTTPException(400, {
+        message:
+          `Expected a readable sheet, received the template ${sheet_id}. A template is a listing, not a sheet with rows. Buy it with POST /buy/:sell_id and read the copy you get back.`,
+      });
     case "portal":
-      throw new HTTPException(500, { message: "Bad sheet recursion." });
+      throw new HTTPException(400, {
+        message:
+          `Expected a readable sheet, received the portal ${sheet_id}. A portal has no stored rows. Read it live over GET /portal/${doc_id}/sync, or through GET /portal/:id if you bought it.`,
+      });
     default:
-      throw new HTTPException(500, { message: "Unknown sheet type." });
+      throw new HTTPException(400, {
+        message: `Expected sheet type table, net-hook, net-http, net-socket, or query, received ${
+          JSON.stringify(type)
+        } from sheet id ${sheet_id}. Fix the type prefix on the id.`,
+      });
   }
 };
 
@@ -318,7 +359,23 @@ const executeSql = async (
     } catch (err) {
       throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
     }
-    const [cols, ...rows] = (await sheet(c, sheet_id, {}, [...path_, sheet_id])).data;
+    const [cols, ...rows] = (await sheet(c, sheet_id, {}, [...path_, sheet_id]).catch(async (err) => {
+      // A mistyped @ref reads as "no access". Name the sheet the author meant.
+      const mine: { sheet_id: string }[] = await sql`
+        select sheet_id from sheet_usr where usr_id = ${c.get("usr_id")}
+      `;
+      const hit = nearest(sheet_id, mine.map((r) => r.sheet_id));
+      if (!hit) throw err;
+      throw new HTTPException(400, {
+        message: [
+          `I could not load the sheet "@${sheet_id}".`,
+          ``,
+          `  Did you mean: @${hit}`,
+          `  Source:       the @sheet refs in this query`,
+          `  Fix:          write @${hit} instead`,
+        ].join("\n"),
+      });
+    })).data;
     for (const col of Object.values(cols)) nameToType[col.name] = col.type;
     docs[sheet_id] = rows.map((row) =>
       Object.fromEntries(
@@ -1072,8 +1129,12 @@ portal("words", 200, () => {
 
 app.use("*", cors());
 
-app.notFound(() => {
-  throw new HTTPException(404, { message: "Not found." });
+app.notFound((c) => {
+  throw new HTTPException(404, {
+    message: `Expected a known route, received ${c.req.method} ${
+      new URL(c.req.url).pathname
+    }. Check the path and the method.`,
+  });
 });
 
 app.onError((err, c) => {
@@ -1184,7 +1245,12 @@ const fulfillPurchase = async (
     )
     select sheet_id from buy
   `;
-  if (!bought?.sheet_id) throw new HTTPException(500, { message: "Not purchased." });
+  if (!bought?.sheet_id) {
+    throw new HTTPException(403, {
+      message:
+        `Expected listing ${sell_id} to be purchasable by usr ${usr_id}, received no row. Source: the insert selects from sheet where sell_id matches and the listing is live. The listing was taken down, or you already own it, or you are its seller.`,
+    });
+  }
   const { sheet_id } = bought;
   if (stripe_session_id) {
     await tx`
@@ -1559,9 +1625,15 @@ app.post("/buy/:id", async (c) => {
 });
 
 app.post("/sell/:id", async (c) => {
-  const { price } = await c.req.json();
-  if (price === undefined)
-    throw new HTTPException(400, { message: "Price required." });
+  const body = await c.req.json();
+  const { price } = body;
+  if (price === undefined) {
+    throw new HTTPException(400, {
+      message: `Expected a "price" field in the body, received ${
+        JSON.stringify(body)
+      }. Post {"price": 0} to list it for free.`,
+    });
+  }
   const updated = await sql`
     update sheet set sell_price = ${price}
     where true
@@ -1628,14 +1700,19 @@ app.put("/library/:id", async (c) => {
   const [existingSheet] = await sql`select sheet_id from sheet where sheet_id = ${sheet_id}`;
 
   if (existingSheet) {
-    // Sheet exists but user doesn't have access - forbidden
-    throw new HTTPException(403, { message: "You don't have access to this sheet." });
+    throw new HTTPException(403, {
+      message:
+        `Expected write access to ${sheet_id} for usr ${usr_id}, received none. Source: sheet_usr membership. The sheet is already claimed by someone else; ask an owner to share it with you.`,
+    });
   }
 
   // Sheet doesn't exist - create it (user is claiming a new automerge doc)
   const [type, doc_id] = sheet_id.split(":");
-  if (!type || !doc_id)
-    throw new HTTPException(400, { message: "Invalid sheet_id format." });
+  if (!type || !doc_id) {
+    throw new HTTPException(400, {
+      message: `Expected a sheet id shaped type:doc_id, received ${JSON.stringify(sheet_id)}. Use e.g. table:abc123.`,
+    });
+  }
 
   // Verify the automerge document exists. The doc may live only on the caller's
   // client, so grant sync access for the fetch window.
@@ -1644,7 +1721,10 @@ app.put("/library/:id", async (c) => {
     .find<{ data: Table }>(doc_id as AnyDocumentId)
     .then((hand) => hand.doc()?.data?.[0] ?? {})
     .catch(() => {
-      throw new HTTPException(404, { message: "Document not found." });
+      throw new HTTPException(404, {
+        message:
+          `Expected automerge document ${doc_id} to be reachable, received none. Source: the sync server, which reads it from your client during the claim. Keep the tab open and retry, so the document can be pushed.`,
+      });
     });
 
   const sheet = {
@@ -1682,7 +1762,12 @@ app.get("/library/:id/share", async (c) => {
     order by su.role, u.email
   `;
   const [sheet] = await sql`select public from sheet where sheet_id = ${sheet_id}`;
-  if (!sheet) throw new HTTPException(404, { message: "Sheet not found." });
+  if (!sheet) {
+    throw new HTTPException(404, {
+      message:
+        `Expected a sheet row for ${sheet_id}, received none. Source: the sheet table. Claim it first with PUT /library/${sheet_id}.`,
+    });
+  }
   return c.json({ data: { members: rows, public: sheet.public } });
 });
 
@@ -1777,8 +1862,13 @@ app.post("/import/csv", async (c) => {
   if (contentType.includes("multipart/form-data")) {
     const formData = await c.req.formData();
     const file = formData.get("file") as File | null;
-    if (!file)
-      throw new HTTPException(400, { message: "No file provided." });
+    if (!file) {
+      throw new HTTPException(400, {
+        message: `Expected a multipart field named "file", received fields: ${
+          [...formData.keys()].join(", ") || "(none)"
+        }. Send the CSV as -F file=@data.csv, or post the raw text with Content-Type: text/csv.`,
+      });
+    }
     csvText = await file.text();
     sheetName = file.name.replace(/\.csv$/i, "") || sheetName;
   } else {
@@ -1786,8 +1876,12 @@ app.post("/import/csv", async (c) => {
     csvText = await c.req.text();
   }
 
-  if (!csvText.trim())
-    throw new HTTPException(400, { message: "Empty CSV content." });
+  if (!csvText.trim()) {
+    throw new HTTPException(400, {
+      message:
+        `Expected CSV text, received ${csvText.length} characters of whitespace. Source: the request body. Send at least a header row.`,
+    });
+  }
 
   // Parse CSV
   const parseCSV = (text: string): string[][] => {
@@ -1836,8 +1930,12 @@ app.post("/import/csv", async (c) => {
   };
 
   const parsed = parseCSV(csvText);
-  if (parsed.length < 1)
-    throw new HTTPException(400, { message: "CSV has no data." });
+  if (parsed.length < 1) {
+    throw new HTTPException(400, {
+      message:
+        `Expected at least a header row, received ${parsed.length} parsed rows from ${csvText.length} characters. Source: the request body. Check the delimiter and the line endings.`,
+    });
+  }
 
   const [headerRow, ...dataRows] = parsed;
 
@@ -1922,67 +2020,55 @@ app.post("/import/csv", async (c) => {
   return c.json({ sheet_id: created.sheet_id, rows: rows.length, cols: cols.length }, 201);
 });
 
-// CSV Export - downloads sheet data as CSV file
 app.get("/export/:id{.+\\.csv}", async (c) => {
   const sheet_id = c.req.param("id").replace(/\.csv$/, "");
-  if (!sheet_id) throw new HTTPException(400, { message: "Sheet ID required." });
-  const usr_id = c.get("usr_id");
-
-  // Verify user has access to this sheet
-  const [access] = await sql`
-    select s.type, s.doc_id
-    from sheet_usr su
-    inner join sheet s using (sheet_id)
-    where su.sheet_id = ${sheet_id} and su.usr_id = ${usr_id}
-  `;
-
-  if (!access)
-    throw new HTTPException(403, { message: "You don't have access to this sheet." });
-
-  if (access.type !== "table")
-    throw new HTTPException(400, { message: "Only table sheets can be exported as CSV." });
-
-  // Fetch the document from Automerge
-  const handle = await automerge.find<{ data: Table }>(access.doc_id as AnyDocumentId);
-  const doc = handle.doc();
-
-  if (!doc?.data || doc.data.length < 1)
-    throw new HTTPException(404, { message: "Document data not found." });
-
-  const [colsRow, ...rows] = doc.data;
+  // sheet() paginates net and query sheets at 50 rows; an export wants the whole sheet.
+  const { data } = await sheet(c, sheet_id, { limit: "100000", ...c.req.query() });
+  const [colsRow, ...rows] = data;
+  if (!colsRow) {
+    throw new HTTPException(400, {
+      message:
+        `Expected sheet ${sheet_id} to have a column row, received a document with no rows at all. Source: data[0] of the automerge document. Add a column before exporting.`,
+    });
+  }
   const cols = Object.values(colsRow) as Col[];
 
-  // Helper to escape CSV values
   const escapeCSV = (val: unknown): string => {
     if (val === null || val === undefined) return "";
     const str = String(val);
-    // Quote if contains comma, quote, or newline
     if (str.includes(",") || str.includes('"') || str.includes("\n"))
       return '"' + str.replace(/"/g, '""') + '"';
     return str;
   };
 
-  // Build CSV content
-  const headerRow = cols.map((col) => escapeCSV(col.name)).join(",");
-  const dataRows = rows.map((row) => cols.map((col) => escapeCSV(row[col.key])).join(","));
-  const csv = [headerRow, ...dataRows].join("\n");
+  const csv = [
+    cols.map((col) => escapeCSV(col.name)).join(","),
+    ...rows.map((row) => cols.map((col) => escapeCSV((row as Row)[col.key])).join(",")),
+  ].join("\n");
 
-  // Return as downloadable CSV
-  const filename = sheet_id.replace(/[^a-zA-Z0-9-_]/g, "_") + ".csv";
   return new Response(csv, {
     headers: {
       "Content-Type": "text/csv; charset=utf-8",
-      "Content-Disposition": `attachment; filename="${filename}"`,
+      "Content-Disposition": `attachment; filename="${sheet_id.replace(/[^a-zA-Z0-9-_]/g, "_")}.csv"`,
     },
   });
 });
+
+// The one stable JSON read: every sheet type, access and pagination inherited from sheet().
+app.get("/sheet/:id", async (c) => page(c)(await sheet(c, c.req.param("id"), c.req.query())));
 
 app.get("/net/:id", async (c) => {
   const id = c.req.param("id");
   const sheet_id = id.includes(":")
     ? id
     : await sql`select sheet_id from sheet where doc_id = ${id}`.then(([s]: [{ sheet_id: string }?]) => s?.sheet_id);
-  if (!sheet_id) throw new HTTPException(404, { message: "Not found." });
+  if (!sheet_id) {
+    throw new HTTPException(404, {
+      message: `Expected a net sheet id or doc_id, received ${
+        JSON.stringify(id)
+      }, which matches no sheet. Source: the sheet table. Pass the full id, e.g. net-hook:abc123.`,
+    });
+  }
   return page(c)(await sheet(c, sheet_id, c.req.query()));
 });
 
@@ -2018,7 +2104,13 @@ app.get("/codex/:id", async (c) => {
           throw new HTTPException(403, { message: "Cannot connect to this database." });
       } catch (e) {
         if (e instanceof HTTPException) throw e;
-        throw new HTTPException(400, { message: "Invalid DSN." });
+        throw new HTTPException(400, {
+          message: `Expected a parseable postgres DSN, received one that failed to parse: ${
+            e instanceof Error ? e.message : String(e)
+          }. Source: the dsn stored for ${
+            c.req.param("id")
+          }. Re-save it as postgresql://user:password@host:port/database.`,
+        });
       }
       const sql_ = pg(db.dsn, {
         onnotice: (msg: { severity?: string }) => msg.severity !== "DEBUG" && console.log(msg),
@@ -2126,8 +2218,13 @@ app.get("/codex/:id/connect", async (c) => {
       and usr_id = ${c.get("usr_id")}
   `;
 
-  if (!access)
-    throw new HTTPException(403, { message: "Access denied to this codex." });
+  if (!access) {
+    throw new HTTPException(403, {
+      message: `Expected membership of codex-${type}:${doc_id} for usr ${
+        c.get("usr_id")
+      }, received none. Source: sheet_usr. Ask an owner to share the codex with you.`,
+    });
+  }
 
   // For now, only support direct PostgreSQL connection strings
   // Future: add OAuth flows for Google Sheets, Airtable, etc.
@@ -2170,8 +2267,13 @@ app.get("/codex/:id/callback", (c) => {
   // OAuth callback handler - placeholder for future OAuth flows
   const { provider, code, state: _state } = c.req.query();
 
-  if (!provider || !code)
-    throw new HTTPException(400, { message: "Missing provider or authorization code." });
+  if (!provider || !code) {
+    throw new HTTPException(400, {
+      message: `Expected both "provider" and "code" query parameters, received provider=${
+        JSON.stringify(provider ?? null)
+      } code=${code ? "(present)" : "(missing)"}. Start the flow at GET /codex/:id/connect.`,
+    });
+  }
 
   // For now, return not implemented
   return c.json({
@@ -2190,7 +2292,13 @@ app.get("/portal/:id", async (c) => {
       and su.usr_id = ${c.get("usr_id")} 
       and su.sheet_id = ${"portal:" + c.req.param("id")}
   `;
-  if (!sheet_) throw new HTTPException(404, { message: "Not found." });
+  if (!sheet_) {
+    throw new HTTPException(404, {
+      message: `Expected a purchased portal for usr ${c.get("usr_id")}, received none for portal:${
+        c.req.param("id")
+      }. Source: your sheet_usr rows joined to the seller's listing. Buy it with POST /buy/:sell_id first.`,
+    });
+  }
   return page(c)(await sheet(c, sheet_.sheet_id, c.req.query()));
 });
 
@@ -2391,7 +2499,10 @@ const mcpTools: Record<string, McpTool> = {
         throw new HTTPException(400, { message: `write_cells needs a non-empty "cells" array.` });
       await assertSheetAccess(c, sheet_id);
       const hand = await automerge.find<{ type: string; data: Table }>(doc_id as AnyDocumentId).catch(() => {
-        throw new HTTPException(404, { message: "Sheet not found." });
+        throw new HTTPException(404, {
+          message:
+            `Expected an automerge document for sheet ${sheet_id}, received none. Source: doc_id ${doc_id}. List the sheets you can reach with the list_sheets tool.`,
+        });
       });
       const doc = hand.doc();
       if (!doc?.data) throw new HTTPException(500, { message: `Sheet ${sheet_id} has no data.` });

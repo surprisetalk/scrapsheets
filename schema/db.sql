@@ -41,13 +41,16 @@ create table sheet_usr
 );
 
 create table net
-( sheet_id text not null references sheet(sheet_id) check (sheet_id ilike 'net-%')
+( net_id bigint not null generated always as identity primary key
+, sheet_id text not null references sheet(sheet_id) check (sheet_id ilike 'net-%')
 , created_at timestamp default now()
 , method text not null default 'POST'
 , req_headers jsonb not null default '{}'::jsonb
 , query_params jsonb not null default '{}'::jsonb
 , body text not null
 );
+
+create index net_sheet_id_created_at_idx on net (sheet_id, created_at desc);
 
 create table payment
 ( payment_id bigint not null generated always as identity primary key

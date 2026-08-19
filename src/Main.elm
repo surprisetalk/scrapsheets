@@ -4,6 +4,7 @@ port module Main exposing
     , Doc(..)
     , Index
     , Rect
+    , Sheet
     , SortOrder(..)
     , Stat(..)
     , TableBounds
@@ -11,6 +12,7 @@ port module Main exposing
     , clampIndex
     , computeBoolishStats
     , computeTemporalStats
+    , cycleSort
     , detectFormat
     , displayYToDocY
     , docDecoder
@@ -27,10 +29,12 @@ port module Main exposing
     , parseTsv
     , rect
     , rectToIndices
+    , rowSplices
     , selectAll
     , serializeToTsv
     , shortcutGroups
-    , sortWithOrder
+    , skipHidden
+    , sortRankOf
     , xy
     )
 
@@ -106,6 +110,72 @@ moveSelection bounds dx dy current =
     Rect newIdx newIdx
 
 
+{-| A plain click drops every other key; shift keeps them. A key that is already
+sorted holds its rank rather than jumping to last.
+-}
+cycleSort : Bool -> String -> List ( String, SortOrder ) -> List ( String, SortOrder )
+cycleSort shift key keys =
+    let
+        existing =
+            iif shift keys []
+    in
+    case ( nextSortOrder (sortOrderOf key keys), sortRankOf key existing ) of
+        ( Nothing, _ ) ->
+            List.filter (\( k, _ ) -> k /= key) existing
+
+        ( Just order, Just _ ) ->
+            List.map (\( k, o ) -> ( k, iif (k == key) order o )) existing
+
+        ( Just order, Nothing ) ->
+            existing ++ [ ( key, order ) ]
+
+
+sortOrderOf : String -> List ( String, SortOrder ) -> Maybe SortOrder
+sortOrderOf key keys =
+    List.filter (\( k, _ ) -> k == key) keys |> List.head |> Maybe.map Tuple.second
+
+
+sortRankOf : String -> List ( String, SortOrder ) -> Maybe Int
+sortRankOf key keys =
+    List.indexedMap (\i ( k, _ ) -> ( i, k )) keys
+        |> List.filter (\( _, k ) -> k == key)
+        |> List.head
+        |> Maybe.map (Tuple.first >> (+) 1)
+
+
+cellText : String -> Row -> String
+cellText key row =
+    Dict.get key row |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
+
+
+compareBySort : List ( String, SortOrder ) -> ( Int, Row ) -> ( Int, Row ) -> Order
+compareBySort keys ( _, r1 ) ( _, r2 ) =
+    case keys of
+        [] ->
+            EQ
+
+        ( key, order ) :: rest ->
+            let
+                ( v1, v2 ) =
+                    ( cellText key r1, cellText key r2 )
+
+                base =
+                    Maybe.map2 compare (String.toFloat v1) (String.toFloat v2) |> Maybe.withDefault (compare v1 v2)
+
+                first =
+                    case ( order, base ) of
+                        ( Descending, LT ) ->
+                            GT
+
+                        ( Descending, GT ) ->
+                            LT
+
+                        _ ->
+                            base
+            in
+            iif (first == EQ) (compareBySort rest ( 0, r1 ) ( 0, r2 )) first
+
+
 nextSortOrder : Maybe SortOrder -> Maybe SortOrder
 nextSortOrder current =
     case current of
@@ -117,20 +187,6 @@ nextSortOrder current =
 
         Just Descending ->
             Nothing
-
-
-sortWithOrder : SortOrder -> (a -> a -> Order) -> List a -> List a
-sortWithOrder order compare list =
-    let
-        sorted =
-            List.sortWith compare list
-    in
-    case order of
-        Ascending ->
-            sorted
-
-        Descending ->
-            List.reverse sorted
 
 
 normalizeRect : Rect -> Rect
@@ -609,7 +665,8 @@ type alias Sheet =
     , doc : Result String Doc
     , table : Result String Table
     , stats : Result String (Array Stat)
-    , sort : Maybe ( String, SortOrder )
+    , hidden : Set String
+    , sort : List ( String, SortOrder )
     , filters : Dict String Filter
     , filterOpen : Maybe String
     , findReplace : Maybe FindReplace
@@ -632,7 +689,8 @@ emptySheet =
     , doc = Err ""
     , table = Err ""
     , stats = Err ""
-    , sort = Nothing
+    , hidden = Set.empty
+    , sort = []
     , filters = Dict.empty
     , filterOpen = Nothing
     , findReplace = Nothing
@@ -1130,7 +1188,9 @@ type Msg
     | CellMouseDown
     | CellMouseUp
     | CellHover Index
-    | ColumnSort String
+    | ColumnSort Bool String
+    | ColumnHide String
+    | ColumnsShowAll
     | ColumnResizeStart String Int
     | ColumnResizeMove Int
     | ColumnResizeEnd
@@ -1181,9 +1241,12 @@ type DocMsg
     = SheetWrite Index
     | SheetRowPush
     | SheetColumnPush
+    | SheetRowInsert (List Int)
+    | SheetRowDuplicate (List Int)
     | SheetRowDelete (List Int)
     | SheetColumnDelete (List Int)
     | SheetClearCells (List Index)
+    | SheetFillDown Rect
     | CellCheck Index Bool
 
 
@@ -1391,7 +1454,8 @@ update msg ({ sheet, auth } as model) =
                     , doc = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString
                     , table = Err ""
                     , stats = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString |> Result.andThen computeStats
-                    , sort = Nothing
+                    , hidden = Set.empty
+                    , sort = []
                     , filters = Dict.empty
                     , filterOpen = Nothing
                     , findReplace = Nothing
@@ -1647,6 +1711,12 @@ update msg ({ sheet, auth } as model) =
                                     in
                                     ( forward, backward )
 
+                                SheetRowInsert indices ->
+                                    rowSplices (\_ -> Just Dict.empty) 0 indices toDoc
+
+                                SheetRowDuplicate indices ->
+                                    rowSplices (\i -> Array.get (i - 1) table.rows) 1 indices toDoc
+
                                 SheetRowDelete indices ->
                                     let
                                         docYs =
@@ -1761,6 +1831,56 @@ update msg ({ sheet, auth } as model) =
                                                     )
                                     in
                                     ( colPatches ++ rowPatches, backColPatches ++ backRowPatches )
+
+                                SheetFillDown r ->
+                                    let
+                                        norm =
+                                            normalizeRect r
+
+                                        -- The seed is the top data row of the selection: a rect
+                                        -- that starts on the header or type row fills from row 1.
+                                        top =
+                                            max 1 norm.a.y
+
+                                        patchPairs =
+                                            List.range norm.a.x norm.b.x
+                                                |> List.concatMap
+                                                    (\x ->
+                                                        case Array.get x table.cols of
+                                                            Nothing ->
+                                                                []
+
+                                                            Just col ->
+                                                                let
+                                                                    seed =
+                                                                        getOldValue (toDoc top) col.key
+                                                                in
+                                                                List.range (top + 1) norm.b.y
+                                                                    |> List.map
+                                                                        (\y ->
+                                                                            let
+                                                                                docY =
+                                                                                    toDoc y
+                                                                            in
+                                                                            ( { action = "set"
+                                                                              , path = [ E.int docY, E.string col.key ]
+                                                                              , value = seed
+                                                                              }
+                                                                            , { action = "set"
+                                                                              , path = [ E.int docY, E.string col.key ]
+                                                                              , value = getOldValue docY col.key
+                                                                              }
+                                                                            )
+                                                                        )
+                                                    )
+
+                                        forward =
+                                            List.map Tuple.first patchPairs
+
+                                        backward =
+                                            List.map Tuple.second patchPairs
+                                    in
+                                    ( forward, backward )
 
                                 SheetClearCells indices ->
                                     let
@@ -2086,28 +2206,14 @@ update msg ({ sheet, auth } as model) =
             in
             ( { model | sheet = { sheet | hover = hover, select = select_ } }, Cmd.none )
 
-        ColumnSort key ->
-            let
-                newSort =
-                    case sheet.sort of
-                        Just ( currentKey, Ascending ) ->
-                            if currentKey == key then
-                                Just ( key, Descending )
+        ColumnHide key ->
+            ( { model | sheet = { sheet | hidden = Set.insert key sheet.hidden, filterOpen = Nothing } }, Cmd.none )
 
-                            else
-                                Just ( key, Ascending )
+        ColumnsShowAll ->
+            ( { model | sheet = { sheet | hidden = Set.empty } }, Cmd.none )
 
-                        Just ( currentKey, Descending ) ->
-                            if currentKey == key then
-                                Nothing
-
-                            else
-                                Just ( key, Ascending )
-
-                        Nothing ->
-                            Just ( key, Ascending )
-            in
-            ( { model | sheet = { sheet | sort = newSort } }, Cmd.none )
+        ColumnSort shift key ->
+            ( { model | sheet = { sheet | sort = cycleSort shift key sheet.sort } }, Cmd.none )
 
         ColumnResizeStart key startX ->
             ( { model
@@ -2419,6 +2525,9 @@ update msg ({ sheet, auth } as model) =
             else if (event.ctrl || event.meta) && event.key == "h" then
                 update (FindOpen True) model
 
+            else if (event.ctrl || event.meta) && event.key == "d" then
+                update (DocMsg (SheetFillDown sheet.select)) model
+
             else if event.key == "Escape" && model.showShortcuts then
                 update (ShortcutsToggle False) model
 
@@ -2454,12 +2563,12 @@ update msg ({ sheet, auth } as model) =
                     bounds =
                         tableBounds model
 
-                    -- Move selection, clamping to bounds
+                    -- Move selection, clamping to bounds and stepping over hidden columns
                     move : Int -> Int -> ( Model, Cmd Msg )
                     move dx dy =
                         let
                             newX =
-                                clamp 0 bounds.maxX (sel.x + dx)
+                                skipHidden sheet bounds dx (clamp 0 bounds.maxX (sel.x + dx))
 
                             newY =
                                 clamp 1 bounds.maxY (sel.y + dy)
@@ -2577,8 +2686,13 @@ update msg ({ sheet, auth } as model) =
                             move (iif event.shift -1 1) 0
 
                         "Enter" ->
-                            -- Start editing current cell
-                            startEdit
+                            -- Ctrl+Enter inserts blank rows above the selection, which is the
+                            -- only way to reach row 1; the footer click appends at the end.
+                            if event.ctrl || event.meta then
+                                update (DocMsg (iif event.shift (SheetRowDuplicate selectedRows) (SheetRowInsert selectedRows))) model
+
+                            else
+                                startEdit
 
                         "Delete" ->
                             -- Ctrl+Delete deletes the selected rows, plain Delete clears the cells
@@ -3187,11 +3301,15 @@ shortcutGroups =
       , [ ( "Delete / Backspace", "clear cells" )
         , ( "Ctrl/⌘+Delete", "delete rows" )
         , ( "Ctrl/⌘+Backspace", "delete columns" )
+        , ( "Ctrl/⌘+Enter", "insert rows above" )
+        , ( "Ctrl/⌘+Shift+Enter", "duplicate rows" )
+        , ( "Ctrl/⌘+D", "fill down" )
         ]
       )
     , ( "Select & clipboard"
       , [ ( "Ctrl/⌘+A", "select all" )
         , ( "Ctrl/⌘+C / Ctrl/⌘+V", "copy / paste" )
+        , ( "click / shift-click header", "sort / add a sort key" )
         ]
       )
     , ( "Find"
@@ -3738,26 +3856,81 @@ filterAndSortIndexed search sheet rows =
         filtered =
             Array.indexedMap Tuple.pair rows |> Array.filter passes
     in
-    case sheet.sort of
-        Just ( sortKey, sortOrder ) ->
-            let
-                cmp ( _, r1 ) ( _, r2 ) =
-                    let
-                        v1 =
-                            Dict.get sortKey r1 |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
+    if List.isEmpty sheet.sort then
+        filtered
 
-                        v2 =
-                            Dict.get sortKey r2 |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
-                    in
-                    Maybe.map2 compare (String.toFloat v1) (String.toFloat v2) |> Maybe.withDefault (compare v1 v2)
+    else
+        Array.fromList (List.sortWith (compareBySort sheet.sort) (Array.toList filtered))
 
-                sorted =
-                    Array.toList filtered |> List.sortWith cmp
-            in
-            Array.fromList (iif (sortOrder == Descending) (List.reverse sorted) sorted)
 
-        Nothing ->
-            filtered
+
+-- Insert rows by splice, the inverse of the splice SheetRowDelete already undoes with.
+-- `offset` 0 puts the new row above its source, 1 below. Doc row i is rows[i - 1].
+
+
+rowSplices : (Int -> Maybe Row) -> Int -> List Int -> (Int -> Int) -> ( List Patch, List Patch )
+rowSplices source offset indices toDoc =
+    let
+        targets =
+            indices
+                |> List.map toDoc
+                |> Set.fromList
+                |> Set.toList
+                |> List.filterMap (\i -> source i |> Maybe.map (\row -> ( i + offset, row )))
+
+        -- Highest first, so an earlier splice never shifts a later target.
+        forward =
+            targets
+                |> List.reverse
+                |> List.map
+                    (\( t, row ) ->
+                        { action = "splice"
+                        , path = []
+                        , value = E.list identity [ E.int t, E.int 0, E.dict identity identity row ]
+                        }
+                    )
+
+        -- Once every insert has landed, the i-th target (ascending) sits at t + i.
+        backward =
+            targets
+                |> List.indexedMap (\i ( t, _ ) -> { action = "splice", path = [], value = E.list E.int [ t + i, 1 ] })
+                |> List.reverse
+    in
+    ( forward, backward )
+
+
+{-| Walk past hidden columns in the direction of travel. Hidden columns keep their
+x coordinate, so navigation is what has to step over them.
+-}
+skipHidden : Sheet -> TableBounds -> Int -> Int -> Int
+skipHidden sheet bounds dx x =
+    let
+        step n candidate =
+            if n <= 0 || not (columnHiddenAt sheet candidate) then
+                candidate
+
+            else
+                let
+                    next =
+                        candidate + iif (dx < 0) -1 1
+                in
+                if next < 0 || next > bounds.maxX then
+                    x
+
+                else
+                    step (n - 1) next
+    in
+    iif (dx == 0) x (step (bounds.maxX + 1) x)
+
+
+columnHiddenAt : Sheet -> Int -> Bool
+columnHiddenAt sheet x =
+    case sheet.doc of
+        Ok (Tab tbl) ->
+            Array.get x tbl.cols |> Maybe.map (\col -> Set.member col.key sheet.hidden) |> Maybe.withDefault False
+
+        _ ->
+            False
 
 
 displayYToDocY : String -> Sheet -> Array Row -> Int -> Int
@@ -4066,15 +4239,15 @@ viewHeaderCell sheet col =
 
         _ ->
             let
+                -- The rank only appears once a second key is active, so a single
+                -- sort still reads as a bare arrow.
                 sortIndicator =
-                    case sheet.sort of
-                        Just ( sortKey, Ascending ) ->
-                            iif (sortKey == col.key) " ▲" ""
+                    case ( sortOrderOf col.key sheet.sort, sortRankOf col.key sheet.sort ) of
+                        ( Just order, Just rank ) ->
+                            iif (order == Ascending) " ▲" " ▼"
+                                ++ iif (List.length sheet.sort > 1) (String.fromInt rank) ""
 
-                        Just ( sortKey, Descending ) ->
-                            iif (sortKey == col.key) " ▼" ""
-
-                        Nothing ->
+                        _ ->
                             ""
 
                 hasFilter =
@@ -4093,7 +4266,7 @@ viewHeaderCell sheet col =
             in
             [ H.div [ S.displayFlex, S.flexDirectionColumn, S.positionRelative ]
                 [ H.div [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ]
-                    [ H.span [ A.class "sort", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600", S.cursorPointer, A.onClick (ColumnSort col.key), A.title "sort" ]
+                    [ H.span [ A.class "sort", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600", S.cursorPointer, A.on "click" (D.map (\shift -> ColumnSort shift col.key) (D.field "shiftKey" D.bool)), A.title "shift-click to add a sort key" ]
                         [ text (col.name ++ sortIndicator) ]
                     , H.span [ A.classList [ ( "funnel", True ), ( "on", hasFilter ) ], S.cursorPointer, S.fontSizeRem 0.75, A.onClick (FilterToggle col.key), A.title "filter" ]
                         [ text (iif hasFilter "⧩" "▽") ]
@@ -4107,6 +4280,7 @@ viewHeaderCell sheet col =
                 , if isFilterOpen then
                     H.div [ A.class "panel", S.positionAbsolute, S.top "100%", S.left "0", S.padding "0.5rem", S.zIndex "100", S.minWidth "150px", S.fontSizeRem 0.875 ]
                         [ H.input [ A.placeholder "contains...", A.value currentFilterValue, A.onInput (FilterInput col.key), S.width "100%" ] []
+                        , H.button [ A.onClick (ColumnHide col.key), S.marginTop "0.25rem" ] [ text "Hide column" ]
                         , if hasFilter then
                             H.button [ A.onClick (FilterClear col.key), S.marginTop "0.25rem" ] [ text "Clear" ]
 
@@ -4160,6 +4334,7 @@ viewCell sheet stats i n col row =
         , cellClasses sheet i n
         , typeAlign col.typ
         , colWidth sheet col
+        , iif (Set.member col.key sheet.hidden) S.displayNone (A.classList [])
         ]
     <|
         if sheet.write /= Nothing && sheet.select == rect i n i n then
@@ -4218,13 +4393,33 @@ viewTableRow sheet doc stats cols n row =
 
 viewFilterBar : Sheet -> Int -> Int -> Html Msg
 viewFilterBar sheet filteredCount totalCount =
-    if Dict.isEmpty sheet.filters then
+    if Dict.isEmpty sheet.filters && Set.isEmpty sheet.hidden then
         text ""
 
     else
         H.div [ S.padding "0.25rem 0.5rem", S.backgroundColor "#fff8e0", S.borderBottom "1px solid #e0d8a0", S.fontSizeRem 0.875, S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter ]
-            [ H.span [] [ text ("Showing " ++ String.fromInt filteredCount ++ " of " ++ String.fromInt totalCount ++ " rows") ]
-            , H.button [ A.onClick (FilterClear ""), S.padding "0.125rem 0.5rem" ] [ text "Clear all filters" ]
+            [ H.span [] [ text (filterBarLabel sheet filteredCount totalCount) ]
+            , H.div [ S.displayFlex, S.gapRem 0.25 ]
+                [ iif (Set.isEmpty sheet.hidden)
+                    (text "")
+                    (H.button [ A.onClick ColumnsShowAll, S.padding "0.125rem 0.5rem" ] [ text "Show all columns" ])
+                , iif (Dict.isEmpty sheet.filters)
+                    (text "")
+                    (H.button [ A.onClick (FilterClear ""), S.padding "0.125rem 0.5rem" ] [ text "Clear all filters" ])
+                ]
+            ]
+
+
+filterBarLabel : Sheet -> Int -> Int -> String
+filterBarLabel sheet filteredCount totalCount =
+    String.join ", " <|
+        List.filterMap identity
+            [ iif (Dict.isEmpty sheet.filters)
+                Nothing
+                (Just ("Showing " ++ String.fromInt filteredCount ++ " of " ++ String.fromInt totalCount ++ " rows"))
+            , iif (Set.isEmpty sheet.hidden)
+                Nothing
+                (Just (String.fromInt (Set.size sheet.hidden) ++ " columns hidden"))
             ]
 
 
@@ -4290,13 +4485,13 @@ viewTableFooter sheet cols rows =
                 [ H.tr [ A.class "totals", A.title "totals for the rows shown" ] <|
                     List.map
                         (\col ->
-                            H.td [ S.textAlignRight, S.fontWeight "600" ]
+                            H.td [ S.textAlignRight, S.fontWeight "600", iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) ]
                                 [ text (Maybe.withDefault "" (Maybe.map (round2 >> String.fromFloat) (columnTotal rows col))) ]
                         )
                         (Array.toList cols)
                         ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [] ]
                 , H.tr [ A.onClick (DocMsg SheetRowPush), A.title "add row" ] <|
-                    List.map (\col -> H.td [] [ text (typeName col.typ) ]) (Array.toList cols)
+                    List.map (\col -> H.td [ iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) ] [ text (typeName col.typ) ]) (Array.toList cols)
                         ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [ text "↴" ] ]
                 ]
 

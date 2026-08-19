@@ -7,7 +7,7 @@
     "dev": "deno task build && deno run -A npm:serve dist -s -C -S -n",
     "test": "deno test --allow-all",
     "db:plan": "deno eval --env-file=.env \"const u = Deno.env.get('DATABASE_URL'); if (!u) throw new Error('Expected DATABASE_URL in .env, received nothing.'); const t = Deno.env.get('TEMP_DATABASE_URL'); const args = ['plan', '--from-dsn', u, '--to-dir', 'schema']; if (t) args.push('--temp-db-dsn', t); Deno.exit((await new Deno.Command('pg-schema-diff', { args, stdout: 'inherit', stderr: 'inherit' }).output()).code)\"",
-    "db:apply": "deno eval --env-file=.env \"const u = Deno.env.get('DATABASE_URL'); if (!u) throw new Error('Expected DATABASE_URL in .env, received nothing.'); Deno.exit((await new Deno.Command('pg-schema-diff', { args: ['apply', '--from-dsn', u, '--to-dir', 'schema'], stdout: 'inherit', stderr: 'inherit' }).output()).code)\"",
+    "db:apply": "deno eval --env-file=.env \"const u = Deno.env.get('DATABASE_URL'); if (!u) throw new Error('Expected DATABASE_URL in .env, received nothing.'); Deno.exit((await new Deno.Command('pg-schema-diff', { args: ['apply', '--from-dsn', u, '--to-dir', 'schema', '--allow-hazards', 'INDEX_BUILD', '--skip-confirm-prompt'], stdout: 'inherit', stderr: 'inherit' }).output()).code)\"",
     "review": "deno run -A npm:elm-review@2.13.5 && deno run -A npm:elm-review@2.13.5 suppress --check-after-tests",
     "vendor": "deno run -A vendor.ts"
   },
@@ -16,7 +16,6 @@
     "data/",
     "elm-stuff/",
     "review/",
-    "tui/",
     "src/automerge*",
     "src/alasql.mjs",
     "src/examples.mjs",

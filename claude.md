@@ -49,7 +49,11 @@ technologies. It uses a hybrid architecture with:
 - Migrate an existing database: edit `schema/db.sql`, then `deno task db:plan` to read the generated migration and
   `deno task db:apply` to run it. Both load `.env` (`DATABASE_URL` required; `TEMP_DATABASE_URL` optional for plan).
   `schema/db.sql` is the desired state; there are no migration files. DML (backfills) is never generated — splice it in
-  with `--insert-statement 'index=<n> statement="..."'`.
+  with `--insert-statement 'index=<n> statement="..."'`. `db:apply` passes `--allow-hazards INDEX_BUILD` (every plan
+  containing a `CREATE INDEX CONCURRENTLY` trips the gate, and concurrent builds cost CPU without locking writes) and
+  `--skip-confirm-prompt` (the prompt needs a TTY). `db:plan` is therefore the only review step — read it before you
+  apply, especially for anything pg-schema-diff does _not_ label a hazard: `add column ... generated always as identity`
+  rewrites the whole table under an access exclusive lock and carries no warning.
 - Default connection: `postgresql://postgres@127.0.0.1:5434/postgres`
 - Tests run against an in-process PGlite over a local pg-gateway on port 5434 (no real Postgres needed)
 - External-DB DSNs are encrypted at the application level (AES-GCM via DSN_ENCRYPTION_KEY) before storage
@@ -77,16 +81,21 @@ technologies. It uses a hybrid architecture with:
 
 - **Sheet system**: Polymorphic documents identified by `type:doc_id` format
 - **Query engine**: SQL execution via AlaSQL for cross-sheet queries using `@sheet_id` syntax. `src/sql.mjs` is shared
-  by both engines (server `npm:alasql`, page CDN `<script>`): `register()` adds the UDFs AlaSQL lacks, `scanRefs()` is
-  the one `@type:doc_id` scanner, and `checkResultColumns()` turns AlaSQL's silent undefined column into an error. The
+  by both engines (server `npm:alasql`, page `/alasql.mjs`): `register()` adds the UDFs AlaSQL lacks — aggregates,
+  regression, fuzzy matching, UTC date arithmetic including `fiscal_year`/`fiscal_quarter`/`fiscal_period` —
+  `scanRefs()` is the one `@type:doc_id` scanner, and `checkResultColumns()` turns AlaSQL's silent undefined column into
+  an error. `nearest()` backs every "did you mean": unknown columns and unresolved `@sheet` refs in both engines. The
   server passes sheet rows through `params[0]` so `alasql.from.SHEET` stays request-scoped
 - **Sharing**: `GET/POST/DELETE /library/:id/share` (owner-only, by email + role), `POST /library/:id/public`, and
   `POST /library/:id/link` which mints a viewer-scoped JWT. The link rides the sync socket's existing `?auth=`
   parameter, so there is one read path rather than two
-- **Marketplace checkout**: `POST /buy/:id` fulfills `$0` listings immediately. A positive `sell_price` creates a
-  Stripe Checkout Session (`STRIPE_SECRET_KEY`) and returns `{ checkout_url }`. `POST /stripe` verifies
-  `stripe-signature` (`STRIPE_WEBHOOK_SECRET`) and fulfills `checkout.session.completed` with `payment_status=paid`.
-  Checkout is card-only. Money lands on the platform account; Connect payouts are not wired.
+- **Marketplace checkout**: `POST /buy/:id` fulfills `$0` listings immediately. A positive `sell_price` creates a Stripe
+  Checkout Session (`STRIPE_SECRET_KEY`) and returns `{ checkout_url }`. `POST /stripe` verifies `stripe-signature`
+  (`STRIPE_WEBHOOK_SECRET`) and fulfills `checkout.session.completed` with `payment_status=paid`. Checkout is card-only.
+  Money lands on the platform account; Connect payouts are not wired.
+- **Reads and export**: `GET /sheet/:id` is the stable JSON read for every sheet type, and `GET /export/:id.csv` the CSV
+  one. Both go through `sheet()`, so they inherit `assertSheetAccess` (membership, purchase, and `public`), pagination,
+  and query-sheet recursion. Export asks for 100000 rows so a net or query sheet is not truncated at the default 50
 - **Marketplace**: Buy/sell sheets with pricing system
 - **Real-time data**: WebSocket portals for live data (time, stock prices)
 - **Database codex**: Connect external PostgreSQL databases
@@ -119,6 +128,11 @@ technologies. It uses a hybrid architecture with:
 ### Key Frontend Features
 
 - **Live editing**: In-place cell editing with type-aware rendering
+- **Table UX**: multi-column sort (click a header to sort, shift-click to add a key; descending flips the comparator per
+  key rather than reversing the list, so ties keep their order), column hide via the filter popover with "show all" in
+  the filter bar, row insert/duplicate (`Ctrl/⌘+Enter`, `Ctrl/⌘+Shift+Enter`) and fill-down (`Ctrl/⌘+D`). A hidden
+  column keeps its x coordinate and only stops rendering — navigation steps over it via `skipHidden`. Filtering the
+  column array instead would shift every selection index in the file
 - **Statistics**: Real-time column statistics for Number/Usd (numeric), Text (descriptive), Date/Timestamp (first, last,
   span, gaps) and Boolean (true/false/blank); other column types get no stats. A totals row sums numeric columns over
   the rows actually on screen, so it respects the active filter
@@ -137,7 +151,9 @@ technologies. It uses a hybrid architecture with:
   - `public boolean`: anonymous read through `syncRole`
 - **sheet_usr**: Many-to-many permissions between sheets and users, with `role` (owner/editor/viewer)
 - **db**: External database connections (DSN storage for codex sheets)
-- **net**: Webhook data storage for net-* type sheets (body content)
+- **net**: Webhook data storage for net-* type sheets (body content). `net_id` identity PK plus an index on
+  `(sheet_id, created_at desc)`; the read orders by both, without which paging a log repeats and skips rows. No
+  retention policy yet — the table still grows without bound
 - **payment**: Marketplace transactions (buyer, seller, sell_id, buyer sheet_id, amount, Stripe session)
 
 #### Key Schema Features

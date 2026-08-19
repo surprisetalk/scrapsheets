@@ -3,6 +3,5 @@
 /node_modules
 CLAUDE.local.md
 /data
-tui/scrapsheets-tui
 .env
 /review/elm-stuff

@@ -31,7 +31,7 @@
       import { IndexedDBStorageAdapter } from "/automerge-repo-idb.mjs";
       import { BrowserWebSocketClientAdapter } from "/automerge-repo-ws.mjs";
       import { Col, EXAMPLES, Table } from "/examples.mjs";
-      import { checkRefPath, checkResultColumns, formatQueryError, register, scanRefs } from "/sql.mjs";
+      import { checkRefPath, checkResultColumns, formatQueryError, nearest, register, scanRefs } from "/sql.mjs";
       import alasql from "/alasql.mjs";
       // Was a CDN <script> that defined a global. Keep the global so query code
       // and the browser tests can reach it the same way.
@@ -540,10 +540,13 @@
             let res = sheetCache.get(id) ??
               (Library.get()[id]?.doc?.data && toRecords(Library.get()[id].doc.data));
             if (!res) {
+              const hit = nearest(id, [...sheetCache.keys(), ...Object.keys(Library.get())]);
               throw new Error([
                 `I could not load the sheet "${id}".`,
                 ``,
-                `Reference it as @${id} so it loads before the query runs.`,
+                hit ? `  Did you mean: @${hit}` : `  Loaded:       ${[...sheetCache.keys()].join(", ") || "(nothing yet)"}`,
+                `  Source:       the @sheet refs in this query`,
+                `  Fix:          ${hit ? `write @${hit} instead` : `reference it as @${id} so it loads before the query runs`}`,
               ].join("\n"));
             }
             if (cb) res = cb(res, idx, query);
@@ -564,11 +567,16 @@
                 (await repo.find(ref_id).then(async (h) => (await h.whenReady?.(), h.doc())));
               if (!doc?.data) {
                 const known = Object.keys(Library.get()).filter((k) => /^(table|query):/.test(k));
+                const hit = nearest(id, known);
                 throw new Error(
                   [
                     `@${id}: this sheet has no data.`,
                     ``,
-                    `These sheets do exist: ${known.slice(0, 12).join(", ") || "(none yet)"}`,
+                    hit
+                      ? `  Did you mean: @${hit}`
+                      : `  Available:    ${known.slice(0, 12).join(", ") || "(none yet)"}`,
+                    `  Source:       the @sheet refs in this query`,
+                    `  Fix:          ${hit ? `write @${hit} instead` : "open the sheet once so it loads, or check the id"}`,
                   ].join("\n"),
                 );
               }

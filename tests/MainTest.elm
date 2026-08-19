@@ -84,16 +84,6 @@ suite =
                         nextSortOrder (Just Descending)
                             |> Expect.equal Nothing
                 ]
-            , describe "sortWithOrder"
-                [ test "sorts ascending" <|
-                    \_ ->
-                        sortWithOrder Ascending compare [ 3, 1, 2 ]
-                            |> Expect.equal [ 1, 2, 3 ]
-                , test "sorts descending" <|
-                    \_ ->
-                        sortWithOrder Descending compare [ 3, 1, 2 ]
-                            |> Expect.equal [ 3, 2, 1 ]
-                ]
             , describe "xy helper"
                 [ test "creates index with x and y" <|
                     \_ ->
@@ -105,16 +95,6 @@ suite =
                     \_ ->
                         rect 1 2 3 4
                             |> Expect.equal { a = { x = 1, y = 2 }, b = { x = 3, y = 4 } }
-                ]
-            , describe "sortWithOrder with strings"
-                [ test "sorts strings ascending" <|
-                    \_ ->
-                        sortWithOrder Ascending compare [ "banana", "apple", "cherry" ]
-                            |> Expect.equal [ "apple", "banana", "cherry" ]
-                , test "sorts strings descending" <|
-                    \_ ->
-                        sortWithOrder Descending compare [ "banana", "apple", "cherry" ]
-                            |> Expect.equal [ "cherry", "banana", "apple" ]
                 ]
             , describe "normalizeRect"
                 [ test "normalizes rect with a < b" <|
@@ -183,7 +163,7 @@ suite =
                                     ]
 
                             sheet =
-                                { emptySheet | sort = Just ( "0", Ascending ) }
+                                { emptySheet | sort = [ ( "0", Ascending ) ] }
                         in
                         -- display order apple, banana, cherry -> document rows 2, 1, 3
                         List.map (displayYToDocY "" sheet rows) [ 1, 2, 3 ]
@@ -210,10 +190,139 @@ suite =
                                 Array.fromList [ Dict.fromList [ ( "0", E.string "a" ) ] ]
 
                             sheet =
-                                { emptySheet | sort = Just ( "0", Descending ) }
+                                { emptySheet | sort = [ ( "0", Descending ) ] }
                         in
                         List.map (displayYToDocY "" sheet rows) [ 0, -1, -2 ]
                             |> Expect.equal [ 0, -1, -2 ]
+                ]
+            , describe "multi-column sort"
+                [ test "a second key breaks ties left by the first" <|
+                    \_ ->
+                        let
+                            rows =
+                                Array.fromList
+                                    [ Dict.fromList [ ( "0", E.string "b" ), ( "1", E.string "2" ) ]
+                                    , Dict.fromList [ ( "0", E.string "a" ), ( "1", E.string "2" ) ]
+                                    , Dict.fromList [ ( "0", E.string "a" ), ( "1", E.string "1" ) ]
+                                    ]
+
+                            sheet =
+                                { emptySheet | sort = [ ( "0", Ascending ), ( "1", Descending ) ] }
+                        in
+                        -- a/2, a/1, b/2 -> document rows 2, 3, 1
+                        filterAndSortIndexed "" sheet rows
+                            |> Array.map Tuple.first
+                            |> Array.toList
+                            |> Expect.equal [ 1, 2, 0 ]
+                , test "descending flips the key without reversing ties" <|
+                    \_ ->
+                        let
+                            rows =
+                                Array.fromList
+                                    [ Dict.fromList [ ( "0", E.string "a" ), ( "1", E.string "first" ) ]
+                                    , Dict.fromList [ ( "0", E.string "a" ), ( "1", E.string "second" ) ]
+                                    , Dict.fromList [ ( "0", E.string "b" ), ( "1", E.string "third" ) ]
+                                    ]
+
+                            sheet =
+                                { emptySheet | sort = [ ( "0", Descending ) ] }
+                        in
+                        -- b first, then the two a rows in their original order
+                        filterAndSortIndexed "" sheet rows
+                            |> Array.map Tuple.first
+                            |> Array.toList
+                            |> Expect.equal [ 2, 0, 1 ]
+                , test "numeric columns compare as numbers, not text" <|
+                    \_ ->
+                        let
+                            rows =
+                                Array.fromList
+                                    [ Dict.fromList [ ( "0", E.string "10" ) ]
+                                    , Dict.fromList [ ( "0", E.string "9" ) ]
+                                    ]
+
+                            sheet =
+                                { emptySheet | sort = [ ( "0", Ascending ) ] }
+                        in
+                        filterAndSortIndexed "" sheet rows
+                            |> Array.map Tuple.first
+                            |> Array.toList
+                            |> Expect.equal [ 1, 0 ]
+                , test "a plain click cycles asc, desc, off and drops the other keys" <|
+                    \_ ->
+                        let
+                            step keys =
+                                cycleSort False "a" keys
+                        in
+                        ( step [ ( "b", Ascending ) ]
+                        , step [ ( "a", Ascending ), ( "b", Ascending ) ]
+                        , step [ ( "a", Descending ), ( "b", Ascending ) ]
+                        )
+                            |> Expect.equal
+                                ( [ ( "a", Ascending ) ]
+                                , [ ( "a", Descending ) ]
+                                , []
+                                )
+                , test "shift-click keeps the other keys and appends a new one" <|
+                    \_ ->
+                        cycleSort True "b" [ ( "a", Ascending ) ]
+                            |> Expect.equal [ ( "a", Ascending ), ( "b", Ascending ) ]
+                , test "shift-clicking an existing key holds its rank" <|
+                    \_ ->
+                        cycleSort True "a" [ ( "a", Ascending ), ( "b", Ascending ) ]
+                            |> Expect.equal [ ( "a", Descending ), ( "b", Ascending ) ]
+                , test "shift-cycling a key off removes only that key" <|
+                    \_ ->
+                        cycleSort True "a" [ ( "a", Descending ), ( "b", Ascending ) ]
+                            |> Expect.equal [ ( "b", Ascending ) ]
+                , test "sortRankOf is 1-based and Nothing when the key is unsorted" <|
+                    \_ ->
+                        ( sortRankOf "a" [ ( "a", Ascending ), ( "b", Descending ) ]
+                        , sortRankOf "b" [ ( "a", Ascending ), ( "b", Descending ) ]
+                        , sortRankOf "c" [ ( "a", Ascending ) ]
+                        )
+                            |> Expect.equal ( Just 1, Just 2, Nothing )
+                ]
+            , describe "rowSplices"
+                [ test "inserting above two rows lands blanks at both, undone highest first" <|
+                    \_ ->
+                        let
+                            ( forward, backward ) =
+                                rowSplices (\_ -> Just Dict.empty) 0 [ 3, 4 ] identity
+                        in
+                        ( List.map (.value >> E.encode 0) forward
+                        , List.map (.value >> E.encode 0) backward
+                        )
+                            |> Expect.equal
+                                ( [ "[4,0,{}]", "[3,0,{}]" ]
+                                , [ "[5,1]", "[3,1]" ]
+                                )
+                , test "duplicating puts each copy below its source" <|
+                    \_ ->
+                        let
+                            source i =
+                                Just (Dict.fromList [ ( "0", E.int i ) ])
+
+                            ( forward, backward ) =
+                                rowSplices source 1 [ 3, 4 ] identity
+                        in
+                        ( List.map (.value >> E.encode 0) forward
+                        , List.map (.value >> E.encode 0) backward
+                        )
+                            |> Expect.equal
+                                ( [ "[5,0,{\"0\":4}]", "[4,0,{\"0\":3}]" ]
+                                , [ "[6,1]", "[4,1]" ]
+                                )
+                , test "duplicate indices collapse to one splice" <|
+                    \_ ->
+                        rowSplices (\_ -> Just Dict.empty) 0 [ 2, 2, 2 ] identity
+                            |> Tuple.first
+                            |> List.length
+                            |> Expect.equal 1
+                , test "a source with no row emits nothing" <|
+                    \_ ->
+                        rowSplices (\_ -> Nothing) 1 [ 1, 2 ] identity
+                            |> Expect.equal ( [], [] )
                 ]
             , describe "rectToIndices"
                 [ test "converts single cell rect to list" <|
@@ -461,7 +570,46 @@ suite =
                                 >> Expect.equal True
                             ]
             ]
+        , describe "Hidden columns"
+            [ test "moving right steps over a hidden column" <|
+                \_ ->
+                    hiddenSheet [ "1" ]
+                        |> (\sheet -> skipHidden sheet { maxX = 3, maxY = 5 } 1 1)
+                        |> Expect.equal 2
+            , test "moving left steps over a run of hidden columns" <|
+                \_ ->
+                    hiddenSheet [ "1", "2" ]
+                        |> (\sheet -> skipHidden sheet { maxX = 3, maxY = 5 } -1 2)
+                        |> Expect.equal 0
+            , test "an edge with nothing visible beyond it stays put" <|
+                \_ ->
+                    hiddenSheet [ "3" ]
+                        |> (\sheet -> skipHidden sheet { maxX = 3, maxY = 5 } 1 3)
+                        |> Expect.equal 3
+            , test "vertical movement never skips" <|
+                \_ ->
+                    hiddenSheet [ "1" ]
+                        |> (\sheet -> skipHidden sheet { maxX = 3, maxY = 5 } 0 1)
+                        |> Expect.equal 1
+            , test "every column hidden terminates instead of looping" <|
+                \_ ->
+                    hiddenSheet [ "0", "1", "2", "3" ]
+                        |> (\sheet -> skipHidden sheet { maxX = 3, maxY = 5 } 1 0)
+                        |> Expect.equal 0
+            ]
         ]
+
+
+{-| A four-column table sheet with the named column keys hidden.
+-}
+hiddenSheet : List String -> Sheet
+hiddenSheet keys =
+    let
+        doc =
+            D.decodeString docDecoder
+                """{"type":"table","data":[[{"name":"a","type":"text","key":"0"},{"name":"b","type":"text","key":"1"},{"name":"c","type":"text","key":"2"},{"name":"d","type":"text","key":"3"}]]}"""
+    in
+    { emptySheet | doc = Result.mapError D.errorToString doc, hidden = Set.fromList keys }
 
 
 dateRows : List String -> Array.Array (Dict.Dict String D.Value)

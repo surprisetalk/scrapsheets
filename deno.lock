@@ -50,6 +50,7 @@
     "npm:elm-review@*": "2.13.5",
     "npm:elm-review@2.13.5": "2.13.5",
     "npm:elm-review@^2.13.5": "2.13.5",
+    "npm:elm-test@*": "0.19.2-0",
     "npm:elm-test@0.19.2-0": "0.19.2-0",
     "npm:elm@0.19.2-0": "0.19.2-0",
     "npm:esbuild@0.25.10": "0.25.10",

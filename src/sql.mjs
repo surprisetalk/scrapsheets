@@ -1,5 +1,5 @@
 // Shared by both AlaSQL engines: the server imports npm:alasql (main.ts), the
-// page loads it from a CDN <script> (index.html). Both call register() with
+// page imports the vendored /alasql.mjs (index.html). Both call register() with
 // their own instance, so a query behaves the same wherever it runs.
 
 // --- errors
@@ -70,6 +70,23 @@ const date = (fn, v) => {
     );
   }
   return d;
+};
+
+// A fiscal year is named for the calendar year it ENDS in, unless it starts in
+// January: US federal FY2027 runs 2026-10-01 to 2027-09-30. `start` is the
+// calendar month the year begins in, 1-12, and is required because no default
+// is right for more than one organisation.
+const fiscal = (fn, ts, start) => {
+  if (!Number.isInteger(start) || start < 1 || start > 12) {
+    throw fail(
+      `${fn}() argument 2`,
+      "a start month from 1 to 12",
+      show(start),
+      `pass the month the fiscal year begins, e.g. ${fn}(created_at, 10) for an October start`,
+    );
+  }
+  const d = date(fn, ts);
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth(), into: (d.getUTCMonth() - (start - 1) + 12) % 12, start };
 };
 
 const unit = (fn, u) => {
@@ -237,7 +254,7 @@ export const checkRefPath = (path, id) => {
 
 // --- error formatting
 
-const nearest = (name, known) => {
+export const nearest = (name, known) => {
   const scored = known
     .filter((k) => k && k !== name)
     .map((k) => ({ k, d: levenshtein(name.toLowerCase(), k.toLowerCase()) }))
@@ -410,6 +427,13 @@ export const register = (alasql) => {
     const jan4 = new Date(Date.UTC(d.getUTCFullYear(), 0, 4));
     return 1 + Math.round((d.getTime() - jan4.getTime()) / (7 * DAY) + ((jan4.getUTCDay() + 6) % 7) / 7);
   };
+  fn.fiscal_year = (ts, start) => {
+    const { year, month, start: s } = fiscal("fiscal_year", ts, start);
+    return s === 1 || month < s - 1 ? year : year + 1;
+  };
+  fn.fiscal_quarter = (ts, start) => Math.floor(fiscal("fiscal_quarter", ts, start).into / 3) + 1;
+  fn.fiscal_period = (ts, start) => fiscal("fiscal_period", ts, start).into + 1;
+
   fn.business_days = (a, b) => {
     let [from, to] = [truncate("day", date("business_days", a)), truncate("day", date("business_days", b))];
     const sign = from <= to ? 1 : -1;

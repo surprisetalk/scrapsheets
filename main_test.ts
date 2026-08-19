@@ -780,6 +780,14 @@ Deno.test(async function allTests(_t) {
       assertEquals(dates.a, "2026-08-23T00:00:00.000Z");
       assertEquals([dates.d, dates.w, dates.b], [59, 2, 5]);
 
+      // A fiscal year is named for the calendar year it ends in, so an October
+      // start puts 2026-10-01 in FY2027 period 1, and 2026-09-30 in FY2026 period 12.
+      const fy = await run(
+        `select fiscal_year('2026-10-01',10) a, fiscal_quarter('2026-10-01',10) b, fiscal_period('2026-10-01',10) c,
+                fiscal_year('2026-09-30',10) d, fiscal_period('2026-09-30',10) e, fiscal_year('2026-12-31',1) f`,
+      );
+      assertEquals([fy.a, fy.b, fy.c, fy.d, fy.e, fy.f], [2027, 1, 1, 2026, 12, 2026]);
+
       const json = await run(
         `select json_extract('{"a":{"b":7}}','$.a.b') v, json_extract('{"xs":[10,20]}','$.xs[1]') x`,
       );
@@ -818,6 +826,23 @@ Deno.test(async function allTests(_t) {
       const body = await res.text();
       assert(body.includes("populaton"), `expected the bad column named, got: ${body}`);
       assert(body.includes("population"), `expected a nearest-match suggestion, got: ${body}`);
+
+      // A mistyped @sheet ref used to read as a bare access denial.
+      const typo = await app.request(`/query`, {
+        method: "POST",
+        headers: new Headers({ Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" }),
+        body: JSON.stringify({
+          lang: "sql",
+          code: `select * from @table:${hand.documentId.slice(0, -1)}x`,
+          args: [],
+        }),
+      });
+      assertEquals(typo.status, 400);
+      const typoBody = await typo.text();
+      assert(
+        typoBody.includes(`table:${hand.documentId}`),
+        `expected the nearest real sheet named, got: ${typoBody}`,
+      );
 
       // ...but an explicit alias is the author naming the column on purpose.
       // AlaSQL yields undefined for `null as note` too, and rejecting that would
@@ -881,6 +906,50 @@ Deno.test(async function allTests(_t) {
     assertEquals(lines.length, 3);
     assertEquals(lines[1], "Alice,30");
     assertEquals(lines[2], "Bob,25");
+
+    // The one stable JSON read. Same access rules, same envelope as every other list route.
+    const [cols_, ...rows] = await get<Table>(jwt, `/sheet/${sheet_id}`);
+    assertEquals(Object.values(cols_).map((col) => col.name).join(), "name,age");
+    assertEquals(rows.length, 2);
+    await reject("", `/sheet/${sheet_id}`);
+
+    // A public sheet exports and reads without membership; it did not before.
+    const { jwt: outsider } = await usr("dave-outsider@example.com");
+    const privateExport = await app.request(`/export/${sheet_id}.csv`, {
+      headers: new Headers({ Authorization: `Bearer ${outsider}` }),
+    });
+    assertEquals(privateExport.status, 403, "a non-member must not export a private sheet");
+    await post(jwt, `/library/${sheet_id}/public`, { public: true });
+    const publicExport = await app.request(`/export/${sheet_id}.csv`, {
+      headers: new Headers({ Authorization: `Bearer ${outsider}` }),
+    });
+    assert(publicExport.ok, `public export failed: ${publicExport.status}`);
+    assert((await publicExport.text()).includes("Alice"), "public export should carry the rows");
+
+    // A query sheet reads and exports through the same path, running its query first.
+    const q = automerge.create<{ data: Sheet["data"] }>({
+      data: [{ lang: "sql", code: `select name from @${sheet_id} order by name`, args: [] }],
+    });
+    await put(jwt, `/library/query:${q.documentId}`, {});
+    const [qCols, ...qRows] = await get<Table>(jwt, `/sheet/query:${q.documentId}`);
+    assertEquals(Object.values(qCols).map((col) => col.name).join(), "name");
+    assertEquals(qRows.map((r) => String(r.name)), ["Alice", "Bob"]);
+    const qCsv = await app.request(`/export/query:${q.documentId}.csv`, {
+      headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+    });
+    assert(qCsv.ok, `query export failed: ${qCsv.status}`);
+
+    // A table with no column row must say so, not fall over inside the CSV builder.
+    const bare = automerge.create<{ data: Sheet["data"] }>({ data: [] });
+    await put(jwt, `/library/table:${bare.documentId}`, {});
+    const bareCsv = await app.request(`/export/table:${bare.documentId}.csv`, {
+      headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+    });
+    assert(
+      400 <= bareCsv.status && bareCsv.status < 500,
+      `an empty sheet should be a 4xx, got ${bareCsv.status}: ${await bareCsv.text()}`,
+    );
+    assertEquals((await qCsv.text()).split("\n"), ["name", "Alice", "Bob"]);
   }
 
   // net-hook ingestion + net-http polling.
@@ -903,6 +972,35 @@ Deno.test(async function allTests(_t) {
       assertEquals(rows.length, 1);
       assert(String(rows[0].body).includes("ping"), JSON.stringify(rows[0]));
       await reject("", `/net/${hookId}`);
+
+      // A net log reads and exports like any other sheet, and pages in a stable order.
+      const [netCols, ...netRows] = await get<Table>(jwt, `/sheet/${hookId}`);
+      assertEquals(Object.values(netCols).map((col) => col.name).join(), "created_at,body");
+      assertEquals(netRows.length, 1);
+      const netCsv = await app.request(`/export/${hookId}.csv`, {
+        headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+      });
+      assert(netCsv.ok, `net export failed: ${netCsv.status}`);
+      const netCsvText = await netCsv.text();
+      assertEquals(netCsvText.split("\n")[0], "created_at,body");
+      assert(netCsvText.includes("ping"), `expected the payload in the csv, got: ${netCsvText}`);
+
+      // Ten more deliveries must page without repeating or skipping a row.
+      for (let i = 0; i < 10; i++) {
+        await app.request(`/net/${hookId}`, {
+          method: "POST",
+          headers: new Headers({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ seq: i }),
+        });
+      }
+      const pageOf = async (offset: number) =>
+        (await get<Table>(jwt, `/net/${hookId}`, { limit: 4, offset })).slice(1).map((r) => String(r.body));
+      const paged = [...await pageOf(0), ...await pageOf(4), ...await pageOf(8)];
+      assertEquals(paged.length, 11);
+      assertEquals(new Set(paged).size, 11, `paging repeated a row: ${JSON.stringify(paged)}`);
+      // Newest first, tie-broken by net_id: all eleven can share a created_at.
+      assert(paged[0].includes(`"seq":9`), `expected the newest delivery first, got: ${paged[0]}`);
+      assert(paged[10].includes("ping"), `expected the oldest delivery last, got: ${paged[10]}`);
     }
 
     // The poller honors intervals, skips empty urls, and forwards headers.

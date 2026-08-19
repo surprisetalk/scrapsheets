@@ -1,4 +1,4 @@
-import { assertEquals } from "@std/assert";
+import { assert, assertEquals } from "@std/assert";
 import { launch } from "astral";
 import { serveDir } from "@std/http/file-server";
 
@@ -275,16 +275,17 @@ Deno.test("bundled examples render and cross-sheet queries join", async () => {
   ) as number;
   assertEquals(count >= 195, true, `expected >=195 countries, got ${count}`);
 
-  // src/sql.mjs registers on the page's CDN alasql too, so the functions the
-  // server tests cover are the same ones available here. Same module, one result.
+  // src/sql.mjs registers on the page's alasql too, so the functions the server
+  // tests cover are the same ones available here. Same module, one result.
   const udfs = await page.evaluate(
     `JSON.stringify(alasql("select median(x) m, mode(x) mo, levenshtein('kitten','sitting') l, ` +
-      `date_trunc('month','2026-08-16T12:00:00Z') d, percentile(array(x), 0.5) p ` +
+      `date_trunc('month','2026-08-16T12:00:00Z') d, percentile(array(x), 0.5) p, ` +
+      `fiscal_year('2026-10-01',10) fy, fiscal_period('2026-10-01',10) fp ` +
       `from (select 1 as x union all select 3 as x union all select 3 as x)").data[0])`,
   ) as string;
   assertEquals(
     JSON.parse(udfs),
-    { m: 3, mo: 3, l: 3, d: "2026-08-01T00:00:00.000Z", p: 3 },
+    { m: 3, mo: 3, l: 3, d: "2026-08-01T00:00:00.000Z", p: 3, fy: 2027, fp: 1 },
     "src/sql.mjs UDFs should be registered in the browser engine",
   );
 
@@ -305,6 +306,66 @@ Deno.test("bundled examples render and cross-sheet queries join", async () => {
     true,
     "every column header should carry a resize grip",
   );
+
+  // Multi-column sort, column hide, and fill-down, driven through the real DOM.
+  {
+    const headerText = () =>
+      page.evaluate(`[...document.querySelectorAll("span.sort")].map((s) => s.innerText).join("|")`) as Promise<string>;
+    const firstCell = () => page.evaluate(`document.querySelector("tbody tr td")?.innerText ?? ""`) as Promise<string>;
+    const clickSort = (n: number, shift: boolean) =>
+      page.evaluate(
+        `document.querySelectorAll("span.sort")[${n}].dispatchEvent(new MouseEvent("click", { shiftKey: ${shift}, bubbles: true }))`,
+      );
+
+    // Elm repaints on the next frame, so every assertion polls rather than reads once.
+    const waitForHeader = async (want: (h: string) => boolean, context: string) => {
+      let h = "";
+      for (let i = 0; i < 100; i++) {
+        h = await headerText();
+        if (want(h)) return;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      throw new Error(`${context}: header was ${h}`);
+    };
+
+    await clickSort(0, false);
+    await waitForText(["Afghanistan"], "ascending sort by the first column");
+    await waitForHeader((h) => h.includes("▲"), "expected an ascending arrow");
+
+    // A second key gets a rank digit; a single key stays a bare arrow.
+    await clickSort(1, true);
+    await waitForHeader((h) => h.includes("▲1") && h.includes("▲2"), "expected ranked arrows");
+
+    // Shift-clicking the primary key again flips it without losing its rank.
+    await clickSort(0, true);
+    await waitForHeader((h) => h.includes("▼1") && h.includes("▲2"), "expected the primary key to hold rank 1");
+    await waitForText(["Zimbabwe"], "descending primary key");
+
+    // Hiding the first column stops it rendering and reports itself in the filter bar.
+    const waitForFirstCell = async (want: (c: string) => boolean, context: string) => {
+      let c = "";
+      for (let i = 0; i < 100; i++) {
+        c = await firstCell();
+        if (want(c)) return;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      throw new Error(`${context}: first cell was ${JSON.stringify(c)}`);
+    };
+
+    const before = await firstCell();
+    await page.evaluate(`document.querySelectorAll("span.funnel")[0].click()`);
+    await waitForText(["Hide column"], "hide control in the filter popover");
+    await page.evaluate(
+      `[...document.querySelectorAll("button")].find((b) => b.innerText === "Hide column").click()`,
+    );
+    await waitForText(["1 columns hidden"], "filter bar after hiding a column");
+    await waitForFirstCell((c) => c !== before, "the hidden column should stop rendering");
+
+    await page.evaluate(
+      `[...document.querySelectorAll("button")].find((b) => b.innerText === "Show all columns").click()`,
+    );
+    await waitForFirstCell((c) => c === before, "show all should bring the column back");
+  }
 
   // The flagship join: @table:events x @table:us-states resolves and renders.
   await page.goto(`http://127.0.0.1:${port}/query:events-by-state`);

@@ -44,7 +44,7 @@ Build the features that create network effects. This is where the spreadsheet OS
 
 Transform Scrapsheets into a platform. Each feature creates a new axis of composability.
 
-- [ ] **Stable REST endpoint**: GET /api/v1/sheet/:id returns JSON, POST writes rows
+- [ ] **REST writes**: `GET /sheet/:id` returns JSON for every sheet type; POST to write rows does not exist
 - [ ] **API key auth**: per-sheet API keys (not just JWT) for programmatic access
 - [ ] **OpenAPI auto-generation**: derive OpenAPI spec from sheet column types
 - [ ] **Change webhooks**: notify external URLs when sheet data changes
@@ -465,8 +465,6 @@ The single biggest gap. Most demos die here first.
 - [ ] **Window functions**: AlaSQL parses `over (partition by ...)` but computes it wrong
       (`sum(x) over (partition by k)` returns 0); only `row_number()` works. Needs a fix upstream or our own evaluation
       pass
-- [ ] **Fiscal periods**: `date_trunc`, `date_add`, `date_diff`, `business_days` and `iso_week` ship in src/sql.mjs;
-      fiscal-calendar arithmetic does not
 - [ ] **Timezone-correct timestamps**: store UTC, render local, never guess the zone
 - [ ] **Pivot and unpivot**: wide<->long reshaping as first-class syntax, not hand-written case statements
 - [ ] **Lateral joins and correlated subqueries**: AlaSQL cannot parse `lateral` at all; as-of joins for
@@ -491,7 +489,6 @@ The single biggest gap. Most demos die here first.
 
 Per house style, an ambiguous error is the worst bug in the system.
 
-- [ ] **"Did you mean" for sheets**: unknown columns already suggest the nearest real one; unresolved @sheet refs do not
 - [ ] **Type mismatch explanation**: show both types, the offending values, and the row they came from
 - [ ] **Fetch failures with a repro**: status, response snippet, resolved URL, and a copy-pasteable curl line
 - [ ] **Webhook rejection detail**: which signature header failed, expected vs received, clock skew if relevant
@@ -521,11 +518,12 @@ Per house style, an ambiguous error is the worst bug in the system.
 
 The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
-- [ ] **Multi-column sort**: shift-click a header for a secondary key (single-key sort already ships)
 - [ ] **Saved views**: named sort/filter/hidden-column combinations per sheet
-- [ ] **Column reorder, hide, and pin**: drag-resize already ships; these three do not
-- [ ] **Row insert, delete, duplicate, and drag-reorder**
-- [ ] **Fill down and drag-fill series**: dates, numbers, patterns
+- [ ] **Column reorder and pin**: drag-resize and hide already ship; these two do not. Both need a persisted column
+      order rather than the display-only hide set
+- [ ] **Row drag-reorder**: insert, delete and duplicate ship (`Ctrl/⌘+Enter`, `Ctrl/⌘+Shift+Enter`, `Ctrl/⌘+Delete`);
+      reorder needs drag state, not a splice
+- [ ] **Drag-fill series**: dates, numbers, patterns. Plain fill-down ships as `Ctrl/⌘+D`
 - [ ] **Number formatting**: decimals, thousands separators, currency symbol, percent, scientific, custom masks
 - [ ] **Conditional formatting**: color scales, data bars, icon sets, rule-based cell coloring
 - [ ] **Group by / outline rows**: collapsible groups with subtotals
@@ -726,7 +724,8 @@ The Excel add-in market lives here (see the add-in research item).
 
 ### Reports & export
 
-- [ ] **Export formats**: CSV, XLSX with formatting, JSON, NDJSON, Parquet, Markdown table
+- [ ] **Export formats**: XLSX with formatting, NDJSON, Parquet, Markdown table. CSV ships for every sheet type, and
+      JSON through `GET /sheet/:id`
 - [ ] **PDF report generation**: a print layout with headers, page breaks, and a title page
 - [ ] **Scheduled report delivery**: emailed on a schedule with the file attached
 - [ ] **Report templates**: prose plus live sheet embeds, so the narrative regenerates with the numbers
@@ -784,8 +783,8 @@ Extends the Phase 1 Stripe work.
 - [ ] **Server-side pagination and virtual scroll**: for sheets too big to send to the browser
 - [ ] **Background computation with progress**: long queries do not block the UI
 - [ ] **Cold row archiving**: keep history without keeping it hot
-- [ ] **`net` table growth**: no index on `sheet_id`, no primary key, and no retention — every webhook delivery and
-      net-http poll is kept forever
+- [ ] **`net` table retention**: the identity PK, the `(sheet_id, created_at desc)` index and a deterministic read order
+      all ship; every webhook delivery and net-http poll is still kept forever
 - [ ] **Per-sheet resource metering**: rows, bytes, compute, and fetches, visible to the user before the limit hits
 
 ### Developer surface
