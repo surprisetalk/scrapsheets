@@ -1,6 +1,10 @@
-import { assert, assertEquals } from "@std/assert";
+import { assertEquals } from "@std/assert";
 import { launch } from "astral";
 import { serveDir } from "@std/http/file-server";
+
+// The CI container has no usable Chrome sandbox (zygote_host_impl_linux.cc: "No
+// usable sandbox!"), and every page here is our own localhost build, so --no-sandbox
+// below costs nothing and is what lets these tests run outside a dev machine.
 
 const dir = new URL(".", import.meta.url).pathname;
 
@@ -179,7 +183,7 @@ Deno.test("a failing HTTP() names the url and the origin's error text", async ()
   );
   const port = server.addr.port;
 
-  const browser = await launch({ args: ["--disable-web-security", "--incognito"] });
+  const browser = await launch({ args: ["--disable-web-security", "--incognito", "--no-sandbox"] });
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${port}/`);
   for (let i = 0; i < 100; i++) {
@@ -248,7 +252,7 @@ Deno.test("bundled examples render and cross-sheet queries join", async () => {
   );
   const port = server.addr.port;
 
-  const browser = await launch({ args: ["--incognito"] });
+  const browser = await launch({ args: ["--incognito", "--no-sandbox"] });
   const page = await browser.newPage();
 
   const waitForText = async (wants: string[], context: string) => {
@@ -412,7 +416,7 @@ Deno.test("page loads, Elm initializes, and automerge boots", async () => {
   const port = server.addr.port;
 
   // Use a fresh browser with cache disabled
-  const browser = await launch({ args: ["--disable-web-security", "--incognito"] });
+  const browser = await launch({ args: ["--disable-web-security", "--incognito", "--no-sandbox"] });
   const page = await browser.newPage();
 
   const errors: string[] = [];

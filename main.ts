@@ -306,7 +306,9 @@ const sheet = async (
     case "net-socket":
       return await cselect({
         cols: null,
-        select: sql`select n.created_at, n.body`,
+        // Appended after body, so existing `select body from @net-hook:x` queries
+        // and existing column positions are untouched.
+        select: sql`select n.created_at, n.body, n.method, n.req_headers, n.query_params`,
         from: sql`from sheet_usr su inner join net n using (sheet_id)`,
         where: [
           sql`(su.sheet_id,su.usr_id) = (${sheet_id},${c.get("usr_id")})`,
@@ -525,6 +527,8 @@ const pgType = (oid: number): Type =>
     ? "usd" // numeric, money
     : [23, 20, 21, 700, 701].includes(oid)
     ? "int" // int2, int4, int8, float4, float8
+    : [114, 3802].includes(oid)
+    ? "json" // json, jsonb
     : "text";
 
 const cselect = async ({

@@ -54,7 +54,8 @@ technologies. It uses a hybrid architecture with:
   `--skip-confirm-prompt` (the prompt needs a TTY). `db:plan` is therefore the only review step — read it before you
   apply, especially for anything pg-schema-diff does _not_ label a hazard: `add column ... generated always as identity`
   rewrites the whole table under an access exclusive lock and carries no warning.
-- Default connection: `postgresql://postgres@127.0.0.1:5434/postgres`
+- Default connection: `postgresql://postgres@127.0.0.1:5434/postgres`, but **`.env` may point `DATABASE_URL` somewhere
+  else entirely — check it before running `db:apply`**, which now applies without a confirmation prompt
 - Tests run against an in-process PGlite over a local pg-gateway on port 5434 (no real Postgres needed)
 - External-DB DSNs are encrypted at the application level (AES-GCM via DSN_ENCRYPTION_KEY) before storage
 
@@ -151,9 +152,12 @@ technologies. It uses a hybrid architecture with:
   - `public boolean`: anonymous read through `syncRole`
 - **sheet_usr**: Many-to-many permissions between sheets and users, with `role` (owner/editor/viewer)
 - **db**: External database connections (DSN storage for codex sheets)
-- **net**: Webhook data storage for net-* type sheets (body content). `net_id` identity PK plus an index on
-  `(sheet_id, created_at desc)`; the read orders by both, without which paging a log repeats and skips rows. No
-  retention policy yet — the table still grows without bound
+- **net**: Webhook data storage for net-* type sheets. The read projects
+  `created_at, body, method, req_headers,
+  query_params` — the last three appended, so existing column positions and
+  `select body from @net-hook:x` still hold. postgresjs returns jsonb as raw JSON text, so those cells are strings; read
+  them with `json_extract()`. `net_id` identity PK plus an index on `(sheet_id, created_at desc)`; the read orders by
+  both, without which paging a log repeats and skips rows. No retention policy yet — the table still grows without bound
 - **payment**: Marketplace transactions (buyer, seller, sell_id, buyer sheet_id, amount, Stripe session)
 
 #### Key Schema Features

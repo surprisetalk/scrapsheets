@@ -961,28 +961,38 @@ Deno.test(async function allTests(_t) {
 
     // Anyone can POST a payload; only the owner reads the log.
     {
-      const res = await app.request(`/net/${hookId}`, {
+      const res = await app.request(`/net/${hookId}?x=1`, {
         method: "POST",
         headers: new Headers({ "Content-Type": "application/json" }),
         body: JSON.stringify({ event: "ping" }),
       });
       assert(res.ok, `webhook ingest failed: ${res.status}`);
+      const cols = "created_at,body,method,req_headers,query_params";
       const [cols_, ...rows] = await get<Table>(jwt, `/net/${hookId}`);
-      assertEquals(Object.values(cols_).map((col) => col.name).join(), "created_at,body");
+      assertEquals(Object.values(cols_).map((col) => col.name).join(), cols);
+      // jsonb reads back as json, not text, so a query author sees the real type.
+      assertEquals(Object.values(cols_).map((col) => col.type).join(), "text,text,text,json,json");
       assertEquals(rows.length, 1);
       assert(String(rows[0].body).includes("ping"), JSON.stringify(rows[0]));
+      // The delivery's own method, headers and query string are the raw material
+      // signature verification needs; they were stored but never readable.
+      assertEquals(rows[0].method, "POST");
+      // postgresjs hands jsonb back as the raw JSON text, in Postgres and PGlite
+      // alike, so a cell holds a string and json_extract() is how a query reads it.
+      assertEquals(JSON.parse(String(rows[0].req_headers))["content-type"], "application/json");
+      assertEquals(JSON.parse(String(rows[0].query_params)), { x: "1" });
       await reject("", `/net/${hookId}`);
 
       // A net log reads and exports like any other sheet, and pages in a stable order.
       const [netCols, ...netRows] = await get<Table>(jwt, `/sheet/${hookId}`);
-      assertEquals(Object.values(netCols).map((col) => col.name).join(), "created_at,body");
+      assertEquals(Object.values(netCols).map((col) => col.name).join(), cols);
       assertEquals(netRows.length, 1);
       const netCsv = await app.request(`/export/${hookId}.csv`, {
         headers: new Headers({ Authorization: `Bearer ${jwt}` }),
       });
       assert(netCsv.ok, `net export failed: ${netCsv.status}`);
       const netCsvText = await netCsv.text();
-      assertEquals(netCsvText.split("\n")[0], "created_at,body");
+      assertEquals(netCsvText.split("\n")[0], cols);
       assert(netCsvText.includes("ping"), `expected the payload in the csv, got: ${netCsvText}`);
 
       // Ten more deliveries must page without repeating or skipping a row.
