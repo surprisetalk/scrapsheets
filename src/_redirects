@@ -10,9 +10,4 @@
 /style.css /style.css 200
 /examples.mjs /examples.mjs 200
 /sql.mjs /sql.mjs 200
-# Nothing is loaded from a CDN any more, but third-party bundles have historically
-# carried root-relative /npm/ and /sm/ URLs that resolve against this origin. These
-# two rules keep the catch-all from answering them with the whole 46KB index.html.
-/npm/* /404.html 404
-/sm/* /404.html 404
 /* / 200

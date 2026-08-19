@@ -80,35 +80,6 @@ Deno.test("every root-absolute asset index.html loads is listed in _redirects", 
   }
 });
 
-// jsDelivr answers /+esm with `link: </npm/...>; rel="modulepreload"`, and WebKit
-// resolves that root-relative URL against this origin. The catch-all used to hand
-// back the whole index.html for each one, on every page load.
-Deno.test("CDN-shaped paths 404 instead of getting the app shell", async () => {
-  const redirects = await Deno.readTextFile(dir + "src/_redirects");
-  const shell = (await Deno.readTextFile(dir + "src/index.html")).length;
-  const notFound = (await Deno.readTextFile(dir + "src/404.html")).length;
-
-  // Compare line positions: "/* /" is also a substring of "/npm/* /404.html".
-  const lines = redirects.split("\n").map((line) => line.trim());
-  const catchAll = lines.findIndex((line) => line.split(/\s+/)[0] === "/*");
-
-  for (const prefix of ["/npm/*", "/sm/*"]) {
-    const at = lines.findIndex((line) => line.split(/\s+/)[0] === prefix);
-    assertEquals(
-      lines[at]?.endsWith("404"),
-      true,
-      `src/_redirects must answer ${prefix} with a 404, or the catch-all serves ${shell} bytes ` +
-        `of index.html for every phantom CDN preload. Got: ${lines[at] ?? "(no rule)"}`,
-    );
-    assertEquals(
-      at >= 0 && at < catchAll,
-      true,
-      `${prefix} must come before the /* catch-all on line ${catchAll}: the first matching rule wins`,
-    );
-  }
-  assertEquals(notFound < shell / 10, true, "404.html should be far smaller than the app shell");
-});
-
 // The page must load nothing from a third party: a CDN outage cannot break the
 // app, and a root-relative URL inside a vendored bundle cannot collide with our
 // /* catch-all. `deno task vendor` rebuilds these self-contained.

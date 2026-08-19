@@ -28,8 +28,12 @@ jobs:
       - name: Type check
         run: deno check main.ts
 
+      # elm-review shells out to `elm`, which the runner lacks; the deno shim
+      # downloads the same 0.19.2-0 binary that `deno task build` uses.
       - name: Elm review
-        run: deno task review
+        run: |
+          deno install -gAf -n elm npm:elm@0.19.2-0
+          PATH="$HOME/.deno/bin:$PATH" deno task review
 
       - name: Run all tests (including backend)
         run: deno test --allow-all
@@ -75,7 +79,8 @@ jobs:
         run: |
           psql -v ON_ERROR_STOP=1 "$BASE/target" -f schema/db.sql
           pg-schema-diff plan --from-dsn "$BASE/target" --to-dir schema --temp-db-dsn "$BASE/scratch" > plan.sql
-          if [ -s plan.sql ]; then
+          # A no-op plan is one blank line, not an empty file.
+          if grep -q "[^[:space:]]" plan.sql; then
             echo "schema/db.sql does not round-trip; pg-schema-diff still wants to change the database:"
             cat plan.sql
             exit 1
