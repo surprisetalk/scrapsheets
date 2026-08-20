@@ -5,10 +5,31 @@ import { citext } from "@electric-sql/pglite/contrib/citext";
 import * as AM from "@automerge/automerge-repo";
 import { WebSocketClientAdapter } from "@automerge/automerge-repo-network-websocket";
 import Stripe from "stripe";
-import { app, arrayify, automerge, createJwt, createToken, parseNetHeaders, pollNetOnce, seed, sql } from "./main.ts";
+import {
+  app,
+  arrayify,
+  automerge,
+  createJwt,
+  createToken,
+  parseNetHeaders,
+  pollAlertOnce,
+  pollNetOnce,
+  seed,
+  sql,
+} from "./main.ts";
 import type { Col, Query, Sheet, Table, Template } from "./main.ts";
 import { DATASETS, EXAMPLES } from "./src/examples.mjs";
-import { applyWindows, checkColumnTypes, describeRef, describeRows, rewriteWindows, scanRefs } from "./src/sql.mjs";
+import {
+  applyWindows,
+  checkCells,
+  checkColumnTypes,
+  checkPivot,
+  describeRef,
+  describeRows,
+  rewriteUnpivot,
+  rewriteWindows,
+  scanRefs,
+} from "./src/sql.mjs";
 import ala from "alasql";
 import dbSql from "./schema/db.sql" with { type: "text" };
 import examplesSql from "./examples.sql" with { type: "text" };
@@ -548,12 +569,24 @@ Deno.test(async function allTests(_t) {
         let rows: unknown[];
         if (described) rows = describeRows(described, cols(described), loaded[described]);
         else {
-          // Same two-step the server runs: windows never reach the engine.
-          const plan = rewriteWindows(scanRefs(code).sql);
+          // The same order the server runs: cells, then unpivot, then windows.
+          const { sql, cells } = scanRefs(code);
+          const colsOf = Object.fromEntries(
+            Object.entries(loaded).map(([ref, rows_]) => [
+              ref,
+              Object.keys(rows_[0] ?? {}).map((name) => ({ name })),
+            ]),
+          );
+          checkCells(cells, loaded, colsOf);
+          checkPivot(sql);
+          const plan = rewriteWindows(rewriteUnpivot(sql, colsOf));
           const res = await ala(plan.sql, [loaded]) as { columns: { columnid: string }[]; data: unknown[] };
-          rows = plan.windows.length ? applyWindows(res, plan).data : res.data;
-          // A window column that came back empty means the pass silently missed it.
+          const run = (q: string, params: unknown[]) => (ala(q, params) as { data: unknown[] }).data;
+          rows = plan.windows.length ? applyWindows(res, plan, run).data : res.data;
+          // A window column that came back empty means the pass silently missed
+          // it. A lifted one is dropped from the result, so it has nothing to say.
           for (const w of plan.windows) {
+            if (w.alias.startsWith("__")) continue;
             assert(
               (rows as Record<string, unknown>[]).some((r) => r[w.alias] !== null && r[w.alias] !== undefined),
               `${id}: the window column "${w.alias}" is empty in every row`,
@@ -569,6 +602,93 @@ Deno.test(async function allTests(_t) {
         examples.filter(([, ex]) => ex.doc.type === "query").length - chained.length,
         `${chained.length} examples build on another query; the browser test covers those`,
       );
+    }
+
+    // An alert sheet: a query, a destination, and a log of what it decided. It
+    // fires when the query returns a row, so the condition is the where clause.
+    {
+      const watched = automerge.create<{ data: Sheet["data"] }>({
+        data: [
+          arrayify([{ name: "region", type: "text", key: 0 }, { name: "burn", type: "num", key: 1 }]),
+          { 0: "north", 1: 0.9 },
+          { 0: "south", 1: 0.8 },
+        ],
+      });
+      await put(jwt, `/library/table:${watched.documentId}`, {});
+      const alert = automerge.create<{ data: [{ code: string; to: string; interval: number }] }>({
+        data: [{
+          code: `select region, burn from @table:${watched.documentId} where burn > 1`,
+          to: "ops@example.com",
+          interval: 60,
+        }],
+      });
+      await put(jwt, `/library/alert:${alert.documentId}`, { name: "burn watch" });
+      const alert_id = `alert:${alert.documentId}`;
+
+      const sent: { to: string; rows: unknown[] }[] = [];
+      const send = (to: string, _id: string, _name: string, rows: unknown[]) => {
+        sent.push({ to, rows });
+        return Promise.resolve("sent");
+      };
+      const history = async () => {
+        const [, ...rows] = await get<Table>(jwt, `/sheet/${alert_id}`, {});
+        return rows.map((row) => JSON.parse(String(row.body)) as Record<string, unknown>);
+      };
+
+      // A day ahead, so the background interval that also runs this never decides
+      // a step of the test: whatever it recorded, these calls are still due.
+      let clock = Date.now() + 86_400_000;
+
+      // Nothing breaches yet, so the first run records "clear" and sends nothing.
+      await pollAlertOnce(send, clock);
+      assertEquals(sent.length, 0, "a clear alert should not email anyone");
+      assertEquals((await history())[0].status, "clear");
+
+      // The same answer again is the same alert, and is not recorded twice.
+      const settled = (await history()).length;
+      clock += 120_000;
+      await pollAlertOnce(send, clock);
+      assertEquals((await history()).length, settled, "an unchanged answer should not be recorded again");
+
+      // A row breaches: it fires once, to the address on the sheet.
+      watched.change((d: { data: Record<number, unknown>[] }) => {
+        d.data[1][1] = 1.4;
+      });
+      clock += 120_000;
+      await pollAlertOnce(send, clock);
+      assertEquals(sent.length, 1, "a breach should email once");
+      assertEquals(sent[0].to, "ops@example.com");
+      assertEquals(sent[0].rows.length, 1);
+      const fired = (await history())[0];
+      assertEquals([fired.status, fired.rows, fired.delivery], ["firing", 1, "sent"]);
+
+      // Still breaching, same rows: no second email.
+      clock += 120_000;
+      await pollAlertOnce(send, clock);
+      assertEquals(sent.length, 1, "the same breach should not email twice");
+
+      // A broken query is recorded against the sheet rather than thrown away.
+      alert.change((d: { data: [{ code: string }] }) => {
+        d.data[0].code = "select * fromm nowhere";
+      });
+      clock += 120_000;
+      await pollAlertOnce(send, clock);
+      const failed = (await history())[0];
+      assertEquals(failed.status, "error");
+      assert(String(failed.error).includes("fromm"), `expected the bad SQL named, got: ${failed.error}`);
+
+      // An alert mails its author on a timer, so a copy of one would mail a
+      // stranger's address: it cannot be listed.
+      await reject(jwt, `/sell/${alert_id}`, { method: "POST", body: JSON.stringify({ price: 0 }) });
+
+      // An alert reads as a sheet, so its history is queryable like any log.
+      const { data: [, row] }: { data: Table } = await post(jwt, `/query`, {
+        lang: "sql",
+        code: `select count(*) as n from @${alert_id}`,
+        args: [],
+      });
+      assertEquals(Number(row.n), (await history()).length);
+      assert(Number(row.n) >= 3, `expected the clear, the firing and the error, got ${row.n}`);
     }
 
     // Buying with invalid sell_id returns 404.
@@ -912,6 +1032,23 @@ Deno.test(async function allTests(_t) {
       );
       assertEquals(col(capped, "running"), "10,5");
 
+      // ignore nulls steps over the rows that have no value, which is what turns
+      // last_value() into a forward fill and lag() into "the last one there was".
+      const G = `(select 1 as n, 10 as px
+                  union all select 2 as n, null as px
+                  union all select 3 as n, null as px
+                  union all select 4 as n, 14 as px)`;
+      const filled = await rows(
+        `select n, px,
+                last_value(px) ignore nulls over (order by n rows between unbounded preceding and current row) as carried,
+                lag(px) ignore nulls over (order by n) as prev,
+                lag(px) respect nulls over (order by n) as prev_raw
+         from ${G} order by n`,
+      );
+      assertEquals(col(filled, "carried"), "10,10,10,14");
+      assertEquals(col(filled, "prev"), ",10,10,10");
+      assertEquals(col(filled, "prev_raw"), ",10,,");
+
       // The result column carries the window's own type, not the source column's.
       const { data: [typed] }: { data: Table } = await post(jwt, `/query`, {
         lang: "sql",
@@ -925,7 +1062,8 @@ Deno.test(async function allTests(_t) {
       for (
         const [code, said] of [
           [`select shop, sum(amt) over (partition by shop) from ${T}`, "as some_name"],
-          [`select shop, sum(amt) over (partition by shop) * 2 as z from ${T}`, "as some_name"],
+          [`select shop, sum(amt) over (partition by shop) * 2 as z from ${T}`, "do not wrap it"],
+          [`select shop, sum(amt) ignore nulls over (partition by shop) as z from ${T}`, "no nulls to ignore"],
           [`select shop, sumx(amt) over (partition by shop) as z from ${T}`, "not a window function"],
           [`select shop from (select shop, sum(amt) over () as w from ${T}) x`, "outermost select list"],
           [`select shop, amt as z, sum(amt) over () as z from ${T}`, "both named"],
@@ -941,6 +1079,88 @@ Deno.test(async function allTests(_t) {
           body: JSON.stringify({ lang: "sql", code, args: [] }),
         });
         assertEquals(res.status, 400);
+        const body = await res.text();
+        assert(body.includes(said), `expected "${said}" in: ${body}`);
+      }
+    }
+
+    // Cell references, unpivot and qualify: the three passes that run beside the
+    // window one, each on a real sheet because each reads the sheet's own shape.
+    {
+      const sheet = (cols: Col[], ...rows: Record<number, unknown>[]) => {
+        const doc = automerge.create<{ data: Sheet["data"] }>({ data: [arrayify(cols), ...rows] });
+        return doc.documentId;
+      };
+      const cfg = sheet(
+        [{ name: "as_of", type: "date", key: 0 }, { name: "factor", type: "num", key: 1 }],
+        { 0: "2026-08-20", 1: 3 },
+      );
+      const wide = sheet(
+        [{ name: "team", type: "text", key: 0 }, { name: "q1", type: "int", key: 1 }, {
+          name: "q2",
+          type: "int",
+          key: 2,
+        }],
+        { 0: "eng", 1: 10, 2: 12 },
+        { 0: "ops", 1: 4, 2: 5 },
+      );
+      for (const id of [cfg, wide]) await put(jwt, `/library/table:${id}`, {});
+
+      const rows = async (code: string) => {
+        const { data: [, ...rs] }: { data: Table } = await post(jwt, `/query`, { lang: "sql", code, args: [] });
+        return rs as Record<string, number | string>[];
+      };
+      const col = (rs: Record<string, number | string>[], name: string) => rs.map((r) => r[name]).join();
+
+      // A cell reference is a scalar: one value out of a one-row sheet.
+      const scaled = await rows(
+        `select team, q1 * @table:${cfg}.factor as scaled, @table:${cfg}.as_of as asked from @table:${wide} order by team`,
+      );
+      assertEquals([col(scaled, "scaled"), col(scaled, "asked")], ["30,12", "2026-08-20,2026-08-20"]);
+
+      // Wide to long. AlaSQL's own unpivot drops every column it is not
+      // unpivoting, so this one never reaches it.
+      const long = await rows(
+        `select team, quarter, headcount from @table:${wide} unpivot (headcount for quarter in (q1, q2)) order by team, quarter`,
+      );
+      assertEquals(col(long, "team"), "eng,eng,ops,ops");
+      assertEquals(col(long, "quarter"), "q1,q2,q1,q2");
+      assertEquals(col(long, "headcount"), "10,12,4,5");
+
+      // ...and back again, which AlaSQL does do correctly.
+      const back = await rows(
+        `select * from (${""}select team, quarter, headcount from @table:${wide} unpivot (headcount for quarter in (q1, q2))) u pivot (sum(headcount) for quarter)`,
+      );
+      assertEquals([col(back, "q1"), col(back, "q2")], ["10,4", "12,5"]);
+
+      // qualify filters on the window it computes, which is what makes an as-of
+      // join one statement: the latest row at or before each date.
+      const asof = await rows(
+        `select w.team, u.quarter, u.headcount from @table:${wide} w join (${""}select team, quarter, headcount from @table:${wide} unpivot (headcount for quarter in (q1, q2))) u on u.team = w.team qualify row_number() over (partition by w.team order by u.headcount desc) = 1 order by w.team`,
+      );
+      assertEquals([col(asof, "team"), col(asof, "headcount")], ["eng,ops", "12,5"]);
+
+      for (
+        const [code, said] of [
+          [`select q1 * @table:${wide}.q1 as x from @table:${wide}`, "does not hold exactly one"],
+          [`select @table:${cfg}.factr as x from @table:${wide}`, `no column named "factr"`],
+          [`select team, q1 from @table:${wide} unpivot (n for q in (q1, q9))`, `no column named "q9"`],
+          [`select * from @table:${wide} pivot (sum(q1) for team in ('eng'))`, "not quoted text"],
+          [`select team from @table:${wide} qualify q1 = 10`, "and this query has none"],
+          [`select team, row_number() over (order by q1) as r from @table:${wide} qualify`, "needs a condition"],
+          [
+            `select team, row_number() over (order by q1) as r from @table:${wide} qualify nope = 1`,
+            `names "nope"`,
+          ],
+          [`select q1 from @table:${wide} where q1 = @table:${cfg}`, "cannot be used as a single value"],
+        ] as const
+      ) {
+        const res = await app.request(`/query`, {
+          method: "POST",
+          headers: new Headers({ Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" }),
+          body: JSON.stringify({ lang: "sql", code, args: [] }),
+        });
+        assertEquals(res.status, 400, `expected a 400 for: ${code}`);
         const body = await res.text();
         assert(body.includes(said), `expected "${said}" in: ${body}`);
       }

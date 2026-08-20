@@ -148,9 +148,15 @@ button:hover {
   border-radius: 2px;
 }
 
-a.chip:hover {
+a.chip:hover,
+button.chip:hover {
   background: #eee;
   text-decoration: none;
+}
+
+button.chip {
+  cursor: pointer;
+  color: var(--ink, inherit);
 }
 
 .x {

@@ -70,7 +70,7 @@ technologies. It uses a hybrid architecture with:
   returns owner/editor/viewer or null, covering membership, purchase-derived access, `sheet.public`, and share-link
   JWTs; a viewer's frames are inspected with `Automerge.decodeSyncMessage` and rejected if they carry changes
 - **Authentication**: JWT-based with email verification via Resend (plain fetch, RESEND_API_KEY)
-- **Document types**: table, query, net-hook, net-http, net-socket, portal, codex-*
+- **Document types**: table, query, net-hook, net-http, net-socket, portal, alert, codex-*
 - **Seeding**: a lazy-once middleware runs `seed()` (examples.sql + src/examples.mjs datasets) on the first request;
   idempotent via `on conflict (doc_id) do update`
 - **net-http polling**: `pollNetOnce` scans net-http sheets every 15s, fetches due URLs through the safeFetch SSRF
@@ -79,6 +79,16 @@ technologies. It uses a hybrid architecture with:
   keys the sheet sent but never their values. `/proxy` returns the same shape
 - **Webhook ingest**: `POST /net/:id` rejects an unknown sheet (404), a non-net sheet (400) and a body over
   `NET_BODY_CAP` (413), each naming what it received. Signature verification does not exist yet
+- **Alerts**: an `alert` sheet is `{ code, to, interval }` and fires when its query returns a row, so the condition is
+  the where clause and there is no second expression language. `pollAlertOnce` scans them every 15s and runs each
+  through `POST /query` **as its owner** (`createJwt(created_by)`), so an alert can never read a sheet its owner cannot.
+  Every run whose answer differs from the last one lands in `net` with `method = 'ALERT'` — status, row count, the first
+  five matches, and what the delivery did — which makes the alert's history a sheet you can query, and makes the de-dupe
+  survive a restart because the previous digest is read back out of that log. `POST /sell` refuses an alert: a copy
+  would mail the seller's address on the buyer's timer
+- **Fork**: the page's `forkDoc` port copies any sheet you can open — a bundled example included — into a new automerge
+  document carrying `forked_from`, registers it, and navigates to it. The toolbar reads `forked_from` back out of the
+  document, so lineage travels with the sheet rather than living in one browser's localStorage
 - **MCP server**: POST /mcp/:id is a hand-rolled JSON-RPC 2.0 endpoint (initialize, tools/list, tools/call) with tools
   read_sheet, write_cells, query_sheet, list_sheets; :id is the default sheet scope
 
@@ -91,9 +101,11 @@ technologies. It uses a hybrid architecture with:
   `haversine_km()` for great-circle distance (AlaSQL ships no trigonometry at all), `min_text()`/`max_text()` because
   AlaSQL's own `min()`/`max()` are compiled inline over numbers and dates and drop a text value, so `min(code)` returns
   nothing rather than the first code — `checkResultColumns()` names that case and points at the replacements.
-  `scanRefs()` is the one `@type:doc_id` scanner, and `checkResultColumns()` turns AlaSQL's silent undefined column into
-  an error. `nearest()` backs every "did you mean": unknown columns and unresolved `@sheet` refs in both engines. The
-  server passes sheet rows through `params[0]` so `alasql.from.SHEET` stays request-scoped
+  `scanRefs()` is the one `@type:doc_id` scanner — `@type:doc_id.column` is a **cell**, one value out of a one-row
+  sheet, rewritten to a scalar subquery so nothing is spliced in as a literal, and `checkCells()` refuses a sheet that
+  does not hold exactly one row. `checkResultColumns()` turns AlaSQL's silent undefined column into an error.
+  `nearest()` backs every "did you mean": unknown columns and unresolved `@sheet` refs in both engines. The server
+  passes sheet rows through `params[0]` so `alasql.from.SHEET` stays request-scoped
 - **Window functions**: AlaSQL parses `over (partition by ...)` and computes it wrong (`sum(x) over (...)` came back 0),
   so a window never reaches it. `rewriteWindows()` in `src/sql.mjs` lifts each one out of the **top-level** select list,
   leaves `null as <alias>` where it stood and appends the plain columns it reads as `__w<n>[apo]<n>`; `applyWindows()`
@@ -103,7 +115,18 @@ technologies. It uses a hybrid architecture with:
   before the engine runs and re-applied after, because a window is defined over every row the query produced. A window
   that is not a select item of its own — wrapped in an expression, or inside a subquery — is refused by name: returning
   zeros for it is the bug this replaced. `WINDOW_TYPES` gives each alias its result type on the server; the page takes
-  it from the query sheet's own `cols`
+  it from the query sheet's own `cols`. `ignore nulls` on `lag`/`lead`/`first_value`/`last_value`/`nth_value` steps over
+  the rows that have no value, which is what makes `last_value(x) ignore nulls` a forward fill; asking any other
+  function to ignore nulls is refused, because it already does. `qualify <condition>` rides the same pass: a window
+  named in the condition is lifted into a `__q<n>` column, computed with the rest, filtered on by the engine itself,
+  then dropped. It is what makes an as-of join one statement —
+  `join ... on p.day <= t.traded_on qualify row_number() over (partition by
+t.trade_id order by p.day desc) = 1` —
+  instead of two sheets, and an unknown column in the condition is named rather than answered with an empty sheet
+- **Pivot and unpivot**: `pivot` is AlaSQL's own and correct, except that a quoted in-list matches nothing and answers
+  with zero rows, which `checkPivot()` refuses. `unpivot` is ours: AlaSQL drops every column it is not unpivoting, so
+  `rewriteUnpivot()` expands it into the `union all` it means, reading the wide column names off the source sheet's own
+  type row. That is why the source has to be a `@sheet` and a subquery is refused
 - **Schema introspection**: `describe @table:abc` is intercepted by `describeRef()` before the engine sees it, in both
   engines, and answers with column/type/rows/nulls/sample. It is the one statement that still works on a sheet whose
   cells fail the type check, because that is the sheet you need to inspect
@@ -154,10 +177,15 @@ technologies. It uses a hybrid architecture with:
   apart. Six end-to-end pipelines from the Demo Gallery ship as sheets tagged `demo` — WIP schedule, AR aging, exit
   waterfall, pairs-trade monitor, restaurant prime cost, municipal burn rate — each a seeded source table plus one or
   two query sheets. Their data is invented; their shapes are not. `store` and `class` are AlaSQL keywords, so no column
-  may be named either: `select store from ...` will not parse
-- **Cross-sheet queries in the browser**: `resolveSheets` rewrites `@type:doc_id` to `SHEET('id')` and pre-loads each
-  doc (library entry or `repo.find`) before AlaSQL runs; `@query:` refs recurse, bounded by `checkRefPath` which reports
-  a cycle as the path that closes it (`a -> b -> a`) and caps depth at `MAX_REF_DEPTH`
+  may be named either: `select store from ...` will not parse. `table:assumptions` is the one-row settings sheet those
+  demos read their parameters from, so changing one cell changes four sheets
+- **Library gallery**: `viewGallery` puts a strip above the library table naming every `demo`-tagged query sheet as a
+  link and every tag as a filter chip. It reads `model.library`, so a new demo needs no code change
+- **Cross-sheet queries in the browser**: `runSql` rewrites `@type:doc_id` to `SHEET('id')` and pre-loads each doc
+  (library entry or `repo.find`) before AlaSQL runs, then applies the cell, unpivot and window passes in the same order
+  the server does; `@query:` refs recurse **through `runSql` itself**, so a window inside a referenced query is computed
+  rather than handed to AlaSQL. Bounded by `checkRefPath`, which reports a cycle as the path that closes it
+  (`a -> b -> a`) and caps depth at `MAX_REF_DEPTH`
 - **UI chrome**: keyboard shortcut sheet (Ctrl/⌘+/ or "?"), library sparkline thumbnails (computed JS-side into
   localStorage entries), five-step first-run tutorial (localStorage `scrapsheets-tutorial`, -1 = dismissed)
 - **Real-time sync**: Ports for Automerge integration
@@ -192,18 +220,18 @@ technologies. It uses a hybrid architecture with:
 
 - **usr**: User accounts with identity, name, email (citext), password, and `stripe_customer_id`
 - **sheet**: Central document table with polymorphic sheet_id format (`type:doc_id`)
-  - Types: template, table, net-hook, net-http, net-socket, query, portal, codex-*
+  - Types: template, table, net-hook, net-http, net-socket, query, portal, alert, codex-*
   - Marketplace fields: sell_id, sell_type, sell_price, buy_id, buy_price
   - Document data: row_0 (jsonb), name, tags (text[])
   - `public boolean`: anonymous read through `syncRole`
 - **sheet_usr**: Many-to-many permissions between sheets and users, with `role` (owner/editor/viewer)
 - **db**: External database connections (DSN storage for codex sheets)
-- **net**: Webhook data storage for net-* type sheets. The read projects
-  `created_at, body, method, req_headers,
-  query_params` — the last three appended, so existing column positions and
-  `select body from @net-hook:x` still hold. postgresjs returns jsonb as raw JSON text, so those cells are strings; read
-  them with `json_extract()`. `net_id` identity PK plus an index on `(sheet_id, created_at desc)`; the read orders by
-  both, without which paging a log repeats and skips rows. No retention policy yet — the table still grows without bound
+- **net**: Webhook data storage for net-\* sheets, and the run log for `alert` sheets, which is why the sheet_id check
+  allows both prefixes. The read projects `created_at, body, method, req_headers, query_params` — the last three
+  appended, so existing column positions and `select body from @net-hook:x` still hold. postgresjs returns jsonb as raw
+  JSON text, so those cells are strings; read them with `json_extract()`. `net_id` identity PK plus an index on
+  `(sheet_id, created_at desc)`; the read orders by both, without which paging a log repeats and skips rows. No
+  retention policy yet — the table still grows without bound
 - **payment**: Marketplace transactions (buyer, seller, sell_id, buyer sheet_id, amount, Stripe session)
 
 #### Key Schema Features

@@ -13,7 +13,7 @@ create table sheet
 ( sheet_id text not null primary key generated always as (type || ':' || doc_id) stored
 , created_at timestamp default now()
 , created_by bigint not null references usr(usr_id)
-, type text not null check (type in ('template','table','net-hook','net-http','net-socket','query','portal') or type like 'codex-%')
+, type text not null check (type in ('template','table','net-hook','net-http','net-socket','query','portal','alert') or type like 'codex-%')
 , doc_id text not null unique
 , name text not null default ''
 , tags text[] not null default '{}'::text[]
@@ -42,7 +42,7 @@ create table sheet_usr
 
 create table net
 ( net_id bigint not null generated always as identity primary key
-, sheet_id text not null references sheet(sheet_id) check (sheet_id ilike 'net-%')
+, sheet_id text not null references sheet(sheet_id) check (sheet_id ilike 'net-%' or sheet_id ilike 'alert:%')
 , created_at timestamp default now()
 , method text not null default 'POST'
 , req_headers jsonb not null default '{}'::jsonb

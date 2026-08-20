@@ -435,11 +435,53 @@ Deno.test("bundled examples render and cross-sheet queries join", async () => {
   await page.goto(`http://127.0.0.1:${port}/query:exit-waterfall`);
   await waitForText(["Anders Seed Fund", "Employee option pool"], "/query:exit-waterfall");
 
+  // Cell parameters: the demo assumptions sheet drives the aging date, and the
+  // page resolves @table:assumptions.as_of the same way the server does.
+  await page.goto(`http://127.0.0.1:${port}/query:ar-aging`);
+  await waitForText(["INV-2041", "90+", "running_exposure"], "/query:ar-aging");
+
+  // qualify makes an as-of join one statement: a Saturday trade prices off the
+  // Friday close, which is what days_stale reports.
+  await page.goto(`http://127.0.0.1:${port}/query:asof-price`);
+  await waitForText(["T-1001", "2026-07-03", "price_at_trade"], "/query:asof-price");
+
+  // unpivot, which AlaSQL parses and then answers with the key columns missing.
+  await page.goto(`http://127.0.0.1:${port}/query:headcount-long`);
+  await waitForText(["Engineering", "q1", "q4"], "/query:headcount-long");
+
+  // ...and pivot, which it does get right, over the unpivoted sheet.
+  await page.goto(`http://127.0.0.1:${port}/query:headcount-wide`);
+  await waitForText(["Engineering", "Operations"], "/query:headcount-wide");
+
+  // Fork: a copy of a bundled demo, owned by the reader, linking back to it.
+  await page.goto(`http://127.0.0.1:${port}/table:headcount-plan`);
+  await waitForText(["Engineering"], "/table:headcount-plan");
+  await page.evaluate(
+    `[...document.querySelectorAll("button.chip")].find((b) => b.innerText === "fork").click()`,
+  );
+  for (let i = 0;; i++) {
+    const url = await page.evaluate(`window.location.pathname`) as string;
+    if (url.startsWith("/table:") && url !== "/table:headcount-plan") break;
+    if (i === 100) throw new Error("fork should navigate to a new table sheet");
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  await waitForText(["forked", "Engineering", "(fork)"], "the forked sheet");
+  const lineage = await page.evaluate(
+    `document.querySelector('a[title^="forked from"]')?.getAttribute("href") ?? ""`,
+  ) as string;
+  assertEquals(lineage, "/table:headcount-plan", "the fork should link back to its source");
+
   // Library chrome: tutorial checklist, net-* creation rows, shortcut sheet.
   await page.goto(`http://127.0.0.1:${port}/`);
   await waitForText(["get started"], "tutorial card");
+  // The gallery strip: demo pipelines by name, and every tag as a filter.
+  await waitForText(["start from a demo", "contractor wip schedule", "reference"], "gallery strip");
+  await page.evaluate(
+    `[...document.querySelectorAll("button.chip")].find((b) => b.innerText === "demo").click()`,
+  );
+  await waitForText(["cap table"], "demo filter");
   await waitForText(["create a table"], "tutorial step 0");
-  await waitForText(["net-hook:..."], "net creation rows");
+  await waitForText(["net-hook:...", "alert:..."], "net and alert creation rows");
   await page.evaluate(
     `document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "/", ctrlKey: true, bubbles: true }))`,
   );

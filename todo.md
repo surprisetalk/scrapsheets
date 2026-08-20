@@ -145,7 +145,10 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 - [ ] **Pairs-trade monitor**: price `portal` for two tickers -> `query` rolling spread z-score -> alert `net-hook` on
       entry/exit bands. `table:pair-prices` -> `query:pair-spread` -> `query:pair-zscore` ships the rolling band and the
-      entry signal off a 10-day window frame; the live price portal and the alert hook are open
+      entry signal off a 10-day window frame, with the band width read from `@table:assumptions.entry_z`; the live price
+      portal and the alert hook are open
+- [x] **Trade priced as of its execution**: `table:trades` + `table:pair-prices` -> `query:asof-price`, an as-of join in
+      one statement. A Saturday fill prices off the Friday close, and `days_stale` says how far back that reached
 - [ ] **Options chain screener**: chain `net-http` -> `query` filtering IV rank, spread width, and days-to-expiry ->
       candidate `table` refreshed intraday
 - [ ] **Crypto treasury view**: exchange balance `net-hook` + on-chain `net-http` -> `query` consolidated position, cost
@@ -480,14 +483,30 @@ The single biggest gap. Most demos die here first.
 - [x] **Window functions**: our own evaluation pass in `src/sql.mjs`, so AlaSQL never sees an `over (...)` clause.
       `rewriteWindows()` lifts each window out of the top-level select list and appends the plain columns it reads;
       `applyWindows()` computes it over the rows the engine returns. Ranking, offset and aggregate functions with
-      `rows`/`range` frames, peer-correct defaults, and the row limit re-applied after the window rather than before. A
-      window buried in an expression or a subquery is refused by name rather than answered with zeros
+      `rows`/`range` frames, peer-correct defaults, `ignore nulls` on the five functions that return a row's own value —
+      which is what makes `last_value(x) ignore nulls` a forward fill — and the row limit re-applied after the window
+      rather than before. A window buried in an expression or a subquery is refused by name rather than answered with
+      zeros
 - [ ] **Timezone-correct timestamps**: store UTC, render local, never guess the zone
-- [ ] **Pivot and unpivot**: wide<->long reshaping as first-class syntax, not hand-written case statements
-- [ ] **Lateral joins and correlated subqueries**: AlaSQL cannot parse `lateral` at all; as-of joins for
-      price-at-time-of-trade depend on this
-- [ ] **As-of / temporal joins**: join a fact to the row that was current at that timestamp
-- [ ] **Query parameters**: bind a query to cells in another sheet so a sheet becomes a parameterized function
+- [x] **Pivot and unpivot**: `pivot (sum(x) for col)` is AlaSQL's own and works; an in-list of quoted strings matches
+      nothing and answers with zero rows, so `checkPivot()` refuses it by name. `unpivot (value for name in (a, b))` is
+      ours: AlaSQL parses it and then drops every column it is not unpivoting, so `rewriteUnpivot()` expands it into the
+      `union all` it means, reading the wide column names off the sheet's own type row. The source has to be a `@sheet`
+      for that reason, and a subquery is refused rather than half-answered
+- [ ] **Lateral joins and correlated subqueries**: AlaSQL cannot parse `lateral` at all. As-of joins no longer depend on
+      it — `qualify` covers that case — but top-N-per-group over an expensive subquery still materializes everything
+      first. A scalar subquery in an expression does work, which is what a cell reference is built on
+- [x] **As-of / temporal joins**: `qualify` does it in one statement — join every candidate row, then keep the newest
+      per fact:
+      `join @table:prices p on p.ticker = t.ticker and p.day <= t.traded_on qualify row_number() over
+    (partition by t.trade_id order by p.day desc) = 1`.
+      `query:asof-price` is the worked demo. The candidate pairs are still materialized before the filter, so a
+      dedicated `asof join` that walks two sorted inputs is open
+- [x] **Query parameters**: `@type:doc_id.column` is a cell — the one value in that column of a one-row sheet. It
+      becomes a scalar subquery, so nothing is spliced into the SQL as a literal and nothing needs escaping, and a sheet
+      that does not hold exactly one row is refused rather than read arbitrarily. `table:assumptions` drives four demos:
+      the aging date, the exit valuation, the entry band and the prime-cost target are one cell each. Binding the other
+      way — a sheet called with arguments, `@query:foo(x)` — is open
 - [x] **Deterministic ordering**: unordered results must not shuffle between runs. `/library` had no `order by` at all
       and `/shop` ordered by a non-unique `name`; both now carry a unique tiebreaker, as the `net` read already did
 - [ ] **Strict null semantics**: distinguish null, empty string, and zero everywhere; no silent coercion
@@ -556,7 +575,11 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 - [ ] **Conditional formatting**: color scales, data bars, icon sets, rule-based cell coloring
 - [ ] **Group by / outline rows**: collapsible groups with subtotals
 - [ ] **Pivot table UI**: drag fields into rows/columns/values without writing SQL
-- [ ] **Data cleaning verbs**: trim, dedupe rows, split column, text-to-columns, change case, remove blanks
+- [ ] **Data cleaning verbs**: trim, dedupe rows, split column, text-to-columns, change case, remove blanks. Filling a
+      gap forward is done:
+      `last_value(x) ignore nulls over (order by t rows between unbounded preceding and current
+      row)`, with
+      `query:meter-daily` as the worked demo. The rest are UI verbs, not SQL
 - [ ] **Fuzzy dedupe UI**: cluster near-duplicate rows and merge with a chosen survivor
 - [ ] **Dropdown options sourced from another sheet**: checkbox and enum cells already ship
 - [ ] **Cell notes**: distinct from threaded comments in Phase 3
@@ -675,16 +698,23 @@ Phase 2 has the runner. These are what the demos need on top of it.
 
 ### Alerts & notifications
 
-Present in almost every demo and absent from the product.
-
-- [ ] **Alert sheet type**: a condition over a query plus a destination
-- [ ] **Threshold, change, and anomaly conditions**: value crosses X, value changed by Y%, value outside its usual band
-- [ ] **New-row and removed-row alerts**: diff against the previous run
-- [ ] **Destinations**: email, SMS, Slack, Discord, Teams, webhook, push
+- [x] **Alert sheet type**: `alert:<doc_id>` holds a query, an email address and an interval. It fires when the query
+      returns a row, so the condition is the query's own where clause and there is no second expression language.
+      `pollAlertOnce` runs it through `POST /query` as the sheet's owner, so an alert can never read what its owner
+      cannot. An alert cannot be listed for sale: a copy would mail the seller's address on the buyer's timer
+- [ ] **Threshold, change, and anomaly conditions**: value crosses X, value changed by Y%, value outside its usual band.
+      Threshold and change are a where clause over a query that already has window functions; an anomaly band needs the
+      forecasting work in **Stats & modeling**
+- [ ] **New-row and removed-row alerts**: diff against the previous run. The previous run's digest is kept, which is
+      what suppresses a repeat, but nothing says _which_ rows arrived or left
+- [ ] **Destinations**: email, SMS, Slack, Discord, Teams, webhook, push. Email ships, through the Resend key the signup
+      flow already uses; a refusal from Resend is recorded on the alert rather than swallowed
 - [ ] **Digest vs immediate**: batch low-priority alerts into a daily summary
-- [ ] **Flap suppression and dedupe**: do not send the same alert every 15 seconds
+- [x] **Flap suppression and dedupe**: only a run whose answer differs from the last recorded one is sent, compared by
+      digest. The digest is read back out of the alert's own log, so a restart does not re-send
 - [ ] **Snooze, acknowledge, and escalate**
-- [ ] **Alert history**: what fired, when, and whether anyone looked
+- [x] **Alert history**: every run that changed the answer lands in `net` as a row on the alert sheet — status, row
+      count, the first five matches and what the delivery did. `select * from @alert:abc` reads it like any other log
 - [ ] **Subscribe to a sheet**: get told when a sheet you follow changes, without owning it
 
 ### Actions & write-back
@@ -788,9 +818,14 @@ Extends the Phase 2 roles work.
 - [ ] **Free samples**: preview the first rows before buying
 - [ ] **Dataset changelogs**: what changed in this dataset since last month
 - [ ] **Provenance display**: source URL, license, fetch date, and transformation chain on every published dataset
-- [ ] **Fork a sheet**: copy someone's sheet, keep the lineage link
-- [ ] **Template gallery**: start from a demo rather than an empty grid. Six demo pipelines ship as seeded sheets tagged
-      `demo`; nothing in the UI groups or presents them as templates yet
+- [x] **Fork a sheet**: the toolbar's `fork` copies whatever sheet you are looking at into one of your own, registers
+      it, and writes `forked_from` into the new document, which the toolbar shows as a link back. It works on a bundled
+      example, which is what makes "start from a demo" mean anything. A fork drops the `demo` and `example` tags so it
+      does not turn up in the gallery pretending to be an original
+- [x] **Template gallery**: the library opens with a strip naming every demo pipeline as a link, and every tag in the
+      library as a filter chip — which is also the first thing that tells a reference table from a spine in a flat list.
+      It is built from the library itself, so a new `demo`-tagged sheet appears without a code change. Forking a demo
+      into a sheet of your own is the separate **Fork a sheet** item
 
 ### Marketplace economics
 

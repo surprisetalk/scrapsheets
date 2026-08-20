@@ -476,6 +476,11 @@ port changeId : Id -> Cmd msg
 port newDoc : E.Value -> Cmd msg
 
 
+{-| Copy the sheet with this id into one of your own, keeping the lineage link.
+-}
+port forkDoc : String -> Cmd msg
+
+
 port deleteDoc : String -> Cmd msg
 
 
@@ -676,6 +681,7 @@ type alias Sheet =
     , netStatus : Maybe String
     , widths : Dict String Int
     , resizing : Maybe { key : String, startX : Int, startWidth : Int }
+    , lineage : Maybe String
     }
 
 
@@ -698,6 +704,7 @@ emptySheet =
     , undoStack = []
     , redoStack = []
     , netStatus = Nothing
+    , lineage = Nothing
     , widths = Dict.empty
     , resizing = Nothing
     }
@@ -766,6 +773,7 @@ type Doc
     | Query Query_
     | NetHook
     | NetHttp { url : String, interval : Int, headers : String }
+    | Alert { code : String, to : String, interval : Int }
     | NetSocket { url : String }
     | Unviewable String
 
@@ -988,6 +996,14 @@ docDecoder =
                                     (D.field "interval" D.int)
                                     (D.oneOf [ D.field "headers" D.string, D.succeed "" ])
 
+                    "alert" ->
+                        D.field "data" <|
+                            D.index 0 <|
+                                D.map3 (\code to interval -> Alert { code = code, to = to, interval = interval })
+                                    (D.oneOf [ D.field "code" D.string, D.succeed "" ])
+                                    (D.oneOf [ D.field "to" D.string, D.succeed "" ])
+                                    (D.oneOf [ D.field "interval" D.int, D.succeed 3600 ])
+
                     "template" ->
                         D.succeed (Unviewable typ)
 
@@ -1164,6 +1180,7 @@ type Msg
     | DocError String
     | DocMsg DocMsg
     | DocNew E.Value
+    | DocFork
     | DocNewQuery
     | DocNewTable
     | DocDelete Id
@@ -1259,6 +1276,8 @@ type Input
     | NetUrl
     | NetInterval
     | NetHeaders
+    | AlertCode
+    | AlertTo
 
 
 
@@ -1463,6 +1482,7 @@ update msg ({ sheet, auth } as model) =
                     , undoStack = []
                     , redoStack = []
                     , netStatus = Nothing
+                    , lineage = data.data.doc |> D.decodeValue (D.field "forked_from" D.string) |> Result.toMaybe
                     , widths = Dict.empty
                     , resizing = Nothing
                     }
@@ -1492,7 +1512,17 @@ update msg ({ sheet, auth } as model) =
                             parsedDoc =
                                 data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString
                         in
-                        { model | sheet = { sheet | doc = parsedDoc, stats = Result.andThen computeStats parsedDoc } }
+                        { model
+                            | sheet =
+                                { sheet
+                                    | doc = parsedDoc
+                                    , stats = Result.andThen computeStats parsedDoc
+                                    , lineage =
+                                        data.data.doc
+                                            |> D.decodeValue (D.field "forked_from" D.string)
+                                            |> Result.toMaybe
+                                }
+                        }
             , Cmd.none
             )
 
@@ -2055,6 +2085,9 @@ update msg ({ sheet, auth } as model) =
         DocNew x ->
             ( model, newDoc x )
 
+        DocFork ->
+            ( model, forkDoc sheet.id )
+
         DocNewTable ->
             advanceTutorial 0 ( model, newDoc <| E.object [ ( "type", E.string "table" ), ( "data", E.list identity [ E.list identity [ E.object [ ( "name", E.string "a" ), ( "type", E.string "text" ), ( "key", E.string "a" ) ] ] ] ) ] )
 
@@ -2145,6 +2178,22 @@ update msg ({ sheet, auth } as model) =
                         ( { model | error = "The poll interval must be a whole number of seconds, got: " ++ x }
                         , Cmd.none
                         )
+
+        InputChange AlertCode x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "code" ], value = E.string x } ]
+                }
+            )
+
+        InputChange AlertTo x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "to" ], value = E.string x } ]
+                }
+            )
 
         InputChange NetHeaders x ->
             ( model
@@ -3741,6 +3790,9 @@ resolveTable model =
         ( Ok (NetSocket _), Err "" ) ->
             Ok emptyNetTable
 
+        ( Ok (Alert _), Err "" ) ->
+            Ok emptyNetTable
+
         ( Err err1, Err err2 ) ->
             -- Both empty means nothing has loaded yet, which the view shows as "loading"
             Err (String.trim (err1 ++ " " ++ err2))
@@ -4454,6 +4506,38 @@ sumColumn rows key =
         rows
 
 
+
+-- The library is one flat table, so the only thing telling a demo pipeline from
+-- a reference table is its tags. This strip names the demos and turns every tag
+-- into a filter, which is what makes an empty grid the second thing you see
+-- rather than the first.
+
+
+viewGallery : Model -> Html Msg
+viewGallery model =
+    let
+        demos =
+            model.library
+                |> Dict.filter (\k v -> String.startsWith "query:" k && List.member "demo" v.tags)
+                |> Dict.toList
+                |> List.sortBy (\( _, v ) -> v.name)
+
+        tags =
+            model.library
+                |> Dict.values
+                |> List.concatMap .tags
+                |> List.filter (\t -> not (List.member t [ "query", "example" ]))
+                |> Set.fromList
+                |> Set.toList
+    in
+    H.div [ S.paddingRem 0.5, S.backgroundColor "#f6f6f6", S.borderBottom "1px solid #aaa", S.displayFlex, S.flexWrapWrap, S.gapRem 0.375, S.alignItemsCenter, S.fontSizeRem 0.8125 ]
+        (H.strong [] [ text "start from a demo" ]
+            :: List.map (\( k, v ) -> H.a [ A.class "chip", A.href ("/" ++ k), A.title k ] [ text v.name ]) demos
+            ++ H.span [ S.color "#666", S.marginLeftRem 0.5 ] [ text "filter" ]
+            :: List.map (\t -> H.button [ A.class "chip", A.onClick (InputChange SheetSearch t) ] [ text t ]) tags
+        )
+
+
 viewTableFooter : Sheet -> Array Col -> Array Row -> Html Msg
 viewTableFooter sheet cols rows =
     H.tfoot [] <|
@@ -4470,6 +4554,7 @@ viewTableFooter sheet cols rows =
                     , ( "net-hook:...", DocNew <| E.object [ ( "type", E.string "net-hook" ), ( "data", E.list identity [] ) ] )
                     , ( "net-http:...", DocNew <| E.object [ ( "type", E.string "net-http" ), ( "data", E.list identity [ E.object [ ( "url", E.string "" ), ( "interval", E.int 3600 ) ] ] ) ] )
                     , ( "net-socket:...", DocNew <| E.object [ ( "type", E.string "net-socket" ), ( "data", E.list identity [ E.object [ ( "url", E.string "" ) ] ] ) ] )
+                    , ( "alert:...", DocNew <| E.object [ ( "type", E.string "alert" ), ( "data", E.list identity [ E.object [ ( "code", E.string "" ), ( "to", E.string "" ), ( "interval", E.int 3600 ) ] ] ) ] )
                     ]
                     ++ [ H.tr [] <|
                             H.td []
@@ -4551,7 +4636,16 @@ viewToolbar model info =
             , iif (sheet.id == "")
                 [ H.span [] [ text "library" ] ]
                 [ H.a [ A.href "#settings", A.title "sheet settings", S.textDecoration "underline dotted" ] [ text (iif (String.trim info.name == "") "untitled" info.name) ] ]
-            , [ H.button [ A.class "chip", A.onClick (ShortcutsToggle True), S.marginLeftAuto ] [ text "keys" ] ]
+            , case sheet.lineage of
+                Just source ->
+                    [ text "/", H.a [ A.href ("/" ++ source), A.title ("forked from " ++ source), S.color "#666" ] [ text "forked" ] ]
+
+                Nothing ->
+                    []
+            , iif (sheet.id == "")
+                []
+                [ H.button [ A.class "chip", A.onClick DocFork, A.title "copy this sheet into one of your own", S.marginLeftAuto ] [ text "fork" ] ]
+            , [ H.button [ A.class "chip", A.onClick (ShortcutsToggle True), iif (sheet.id == "") S.marginLeftAuto (A.classList []) ] [ text "keys" ] ]
             , case sheet.doc of
                 Ok (Tab _) ->
                     [ H.a [ A.class "chip", A.href ("https://api.sheets.scrap.land/export/" ++ sheet.id ++ ".csv"), A.download (sheet.id ++ ".csv") ] [ text "export csv" ] ]
@@ -4655,6 +4749,35 @@ viewNetHttp model cfg =
                     Err _ ->
                         "no payloads yet"
             ]
+        ]
+
+
+viewAlert : Model -> { code : String, to : String, interval : Int } -> Html Msg
+viewAlert model cfg =
+    H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
+        [ H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "fires when this query returns a row"
+            , H.textarea [ A.id "code", A.class "mono", A.rows 8, A.value cfg.code, A.placeholder "select * from @query:budget-burn where burn_ratio > 1.1", A.spellcheck False, A.onInput (InputChange AlertCode) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "email"
+            , H.input [ A.type_ "email", A.value cfg.to, A.placeholder "you@example.com", A.onInput (InputChange AlertTo) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "check every (seconds)"
+            , H.input [ A.type_ "number", A.value (String.fromInt cfg.interval), A.onInput (InputChange NetInterval) ] []
+            ]
+        , H.p [ S.fontSizeRem 0.875, S.color "#666" ]
+            [ text <|
+                case model.sheet.table of
+                    Ok tbl ->
+                        String.fromInt (Array.length tbl.rows) ++ " runs recorded"
+
+                    Err _ ->
+                        "no runs yet"
+            ]
+        , H.p [ S.fontSizeRem 0.875, S.color "#666" ]
+            [ text "Only a run that changes the answer is sent, and every run lands in the rows beside this." ]
         ]
 
 
@@ -4782,7 +4905,8 @@ view ({ sheet } as model) =
                                     sheet.doc |> Result.withDefault Library
                             in
                             H.div []
-                                [ viewFilterBar sheet (Array.length sortedRows) (Array.length rows)
+                                [ iif (doc == Library) (viewGallery model) (text "")
+                                , viewFilterBar sheet (Array.length sortedRows) (Array.length rows)
                                 , H.table [ A.onMouseLeave (CellHover (xy -1 -1)) ]
                                     [ H.tbody [] <|
                                         Array.toList <|
@@ -4803,6 +4927,9 @@ view ({ sheet } as model) =
 
                     Ok (NetHttp cfg) ->
                         [ viewNetHttp model cfg ]
+
+                    Ok (Alert cfg) ->
+                        [ viewAlert model cfg ]
 
                     Ok (NetSocket cfg) ->
                         [ viewNetSocket model cfg ]

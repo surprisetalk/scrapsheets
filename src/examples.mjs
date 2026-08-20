@@ -2995,6 +2995,70 @@ const cityCheckbook = Table(
   ["2026-08-01", "Planning", 53333.33, 49771.76],
 );
 
+
+// The one-row settings sheet the demo queries read their parameters from. A
+// cell reference (@table:assumptions.as_of) is a scalar, so changing a value
+// here changes every sheet downstream of it: the aging date, the exit
+// valuation, the entry band and the prime-cost target are all one cell each.
+const assumptions = Table(
+  ["as_of::date", "exit_value::usd", "entry_z::num", "prime_target::percentage"].map(Col),
+  ["2026-08-20", 60000000, 2, 0.6],
+);
+
+// Executions against the same two tickers @table:pair-prices carries. Several
+// land on a weekend, which is the whole point of an as-of join: the price that
+// was current is not the price on the trade date.
+const trades = Table(
+  ["trade_id::text", "traded_on::date", "ticker::text", "side::enum:buy,sell", "qty::int"].map(Col),
+  ["T-1001", "2026-07-04", "XOM", "buy", 500],
+  ["T-1002", "2026-07-08", "CVX", "buy", 300],
+  ["T-1003", "2026-07-11", "XOM", "sell", 200],
+  ["T-1004", "2026-07-15", "CVX", "sell", 150],
+  ["T-1005", "2026-07-19", "XOM", "buy", 800],
+  ["T-1006", "2026-07-22", "CVX", "buy", 250],
+  ["T-1007", "2026-07-26", "XOM", "sell", 400],
+  ["T-1008", "2026-07-29", "CVX", "sell", 100],
+  ["T-1009", "2026-07-31", "XOM", "buy", 600],
+);
+
+// A hiring plan in the shape a planning spreadsheet actually has it: one column
+// per quarter. Nothing can be grouped or charted until it is long, which is
+// what unpivot is for.
+const headcountPlan = Table(
+  ["department::text", "q1::int", "q2::int", "q3::int", "q4::int"].map(Col),
+  ["Engineering", 24, 26, 29, 31],
+  ["Sales", 12, 14, 15, 17],
+  ["Support", 8, 8, 9, 10],
+  ["Finance", 5, 5, 6, 6],
+  ["Marketing", 6, 7, 7, 8],
+  ["Operations", 9, 9, 10, 11],
+);
+
+
+// A utility meter read every few days, which is how meters are actually read.
+// Nothing can be charged or charted off it until the gaps between reads are
+// filled, and the meter only ever counts up.
+const meterReads = Table(
+  ["building::text", "read_on::date", "meter_kwh::num"].map(Col),
+  ["North", "2026-06-01", 41200],
+  ["North", "2026-06-05", 41930],
+  ["North", "2026-06-09", 42610],
+  ["North", "2026-06-13", 43380],
+  ["North", "2026-06-18", 44210],
+  ["North", "2026-06-23", 45020],
+  ["North", "2026-06-30", 46180],
+  ["South", "2026-06-02", 18800],
+  ["South", "2026-06-08", 19640],
+  ["South", "2026-06-15", 20510],
+  ["South", "2026-06-22", 21390],
+  ["South", "2026-06-29", 22240],
+  ["West", "2026-06-01", 63400],
+  ["West", "2026-06-07", 64720],
+  ["West", "2026-06-14", 66150],
+  ["West", "2026-06-21", 67480],
+  ["West", "2026-06-28", 68930],
+);
+
 const QUERIES = {
   "query:population": {
     name: "population density",
@@ -3280,7 +3344,7 @@ const QUERIES = {
     system: true,
     doc: QuerySql(
       { due: "date", balance: "usd", days_late: "int", running_exposure: "usd" },
-      "select invoice, customer, due, amount - paid as balance, date_diff('day', due, '2026-08-20') as days_late, case when date_diff('day', due, '2026-08-20') <= 0 then 'current' when date_diff('day', due, '2026-08-20') <= 30 then '1-30' when date_diff('day', due, '2026-08-20') <= 60 then '31-60' when date_diff('day', due, '2026-08-20') <= 90 then '61-90' else '90+' end as bucket, sum(amount - paid) over (order by due) as running_exposure from @table:invoices where amount > paid order by due",
+      "select invoice, customer, due, amount - paid as balance, date_diff('day', due, @table:assumptions.as_of) as days_late, case when date_diff('day', due, @table:assumptions.as_of) <= 0 then 'current' when date_diff('day', due, @table:assumptions.as_of) <= 30 then '1-30' when date_diff('day', due, @table:assumptions.as_of) <= 60 then '31-60' when date_diff('day', due, @table:assumptions.as_of) <= 90 then '61-90' else '90+' end as bucket, sum(amount - paid) over (order by due) as running_exposure from @table:invoices where amount > paid order by due",
     ),
   },
   "query:preference-stack": {
@@ -3298,7 +3362,7 @@ const QUERIES = {
     system: true,
     doc: QuerySql(
       { shares: "int", pref_due: "usd", preference_paid: "usd", ownership: "percentage", if_converted: "usd" },
-      "select seniority, series, holder, shares, pref_due, case when 60000000 >= pref_through_tier then pref_due when 60000000 <= pref_through_tier - tier_pref then 0 else (60000000 - (pref_through_tier - tier_pref)) * pref_due / tier_pref end as preference_paid, round(shares / total_shares, 4) as ownership, round(60000000 * shares / total_shares, 0) as if_converted from @query:preference-stack order by seniority, holder",
+      "select seniority, series, holder, shares, pref_due, case when @table:assumptions.exit_value >= pref_through_tier then pref_due when @table:assumptions.exit_value <= pref_through_tier - tier_pref then 0 else (@table:assumptions.exit_value - (pref_through_tier - tier_pref)) * pref_due / tier_pref end as preference_paid, round(shares / total_shares, 4) as ownership, round(@table:assumptions.exit_value * shares / total_shares, 0) as if_converted from @query:preference-stack order by seniority, holder",
     ),
   },
   "query:pair-spread": {
@@ -3316,7 +3380,7 @@ const QUERIES = {
     system: true,
     doc: QuerySql(
       { day: "date", ratio: "num", mean10: "num", sd10: "num", z: "num" },
-      "select day, ratio, round(mean10, 5) as mean10, round(sd10, 5) as sd10, round((ratio - mean10) / sd10, 2) as z, case when (ratio - mean10) / sd10 <= -2 then 'long the ratio' when (ratio - mean10) / sd10 >= 2 then 'short the ratio' else 'flat' end as signal from @query:pair-spread where window_days = 10 order by day",
+      "select day, ratio, round(mean10, 5) as mean10, round(sd10, 5) as sd10, round((ratio - mean10) / sd10, 2) as z, case when (ratio - mean10) / sd10 <= 0 - @table:assumptions.entry_z then 'long the ratio' when (ratio - mean10) / sd10 >= @table:assumptions.entry_z then 'short the ratio' else 'flat' end as signal from @query:pair-spread where window_days = 10 order by day",
     ),
   },
   "query:store-margin": {
@@ -3333,7 +3397,7 @@ const QUERIES = {
         sales_ma4: "usd",
         rank_in_week: "int",
       },
-      "select week, location, net_sales, round(food_cost + labor_cost, 2) as prime_cost, round((food_cost + labor_cost) / net_sales, 4) as prime_pct, round(net_sales - food_cost - labor_cost, 2) as contribution, avg(net_sales) over (partition by location order by week rows between 3 preceding and current row) as sales_ma4, rank() over (partition by week order by net_sales desc) as rank_in_week from @table:pos-weekly order by week, location",
+      "select week, location, net_sales, round(food_cost + labor_cost, 2) as prime_cost, round((food_cost + labor_cost) / net_sales, 4) as prime_pct, round(net_sales - food_cost - labor_cost, 2) as contribution, avg(net_sales) over (partition by location order by week rows between 3 preceding and current row) as sales_ma4, rank() over (partition by week order by net_sales desc) as rank_in_week, case when (food_cost + labor_cost) / net_sales > @table:assumptions.prime_target then 'over' else 'ok' end as prime_flag from @table:pos-weekly order by week, location",
     ),
   },
   "query:budget-ytd": {
@@ -3358,6 +3422,67 @@ const QUERIES = {
         projected_variance: "usd",
       },
       "select department, spent_ytd, adopted_ytd, round(spent_ytd / adopted_ytd, 4) as burn_ratio, round(spent_ytd / months_in * 12, 0) as projected_year, round(spent_ytd / months_in * 12 - adopted_ytd / months_in * 12, 0) as projected_variance from @query:budget-ytd where month = '2026-08-01' order by burn_ratio desc",
+    ),
+  },
+  "query:asof-price": {
+    name: "price at the time of the trade",
+    tags: ["demo", "markets", "query"],
+    system: true,
+    doc: QuerySql(
+      {
+        traded_on: "date",
+        qty: "int",
+        price_at_trade: "num",
+        price_day: "date",
+        days_stale: "int",
+        notional: "usd",
+      },
+      "select t.trade_id, t.traded_on, t.ticker, t.side, t.qty, p.close as price_at_trade, p.day as price_day, date_diff('day', p.day, t.traded_on) as days_stale, round(t.qty * p.close, 2) as notional from @table:trades t join @table:pair-prices p on p.ticker = t.ticker and p.day <= t.traded_on qualify row_number() over (partition by t.trade_id order by p.day desc) = 1 order by t.traded_on",
+    ),
+  },
+  "query:headcount-long": {
+    name: "hiring plan, one row per quarter",
+    tags: ["demo", "query"],
+    system: true,
+    doc: QuerySql(
+      { headcount: "int" },
+      "select department, quarter, headcount from @table:headcount-plan unpivot (headcount for quarter in (q1, q2, q3, q4)) order by department, quarter",
+    ),
+  },
+  "query:headcount-growth": {
+    name: "hiring plan growth",
+    tags: ["demo", "query"],
+    system: true,
+    doc: QuerySql(
+      { headcount: "int", prior_quarter: "int", company: "int", cumulative: "int" },
+      "select department, quarter, headcount, lag(headcount) over (partition by department order by quarter) as prior_quarter, sum(headcount) over (partition by quarter) as company, sum(headcount) over (partition by department order by quarter) as cumulative from @query:headcount-long order by department, quarter",
+    ),
+  },
+  "query:headcount-wide": {
+    name: "hiring plan back across the top",
+    tags: ["demo", "query"],
+    system: true,
+    doc: QuerySql(
+      { q1: "int", q2: "int", q3: "int", q4: "int" },
+      "select * from @query:headcount-long pivot (sum(headcount) for quarter)",
+    ),
+  },
+  "query:meter-daily": {
+    name: "meter reads, gaps filled",
+    tags: ["demo", "query"],
+    system: true,
+    doc: QuerySql(
+      { day: "date", meter_kwh: "num", carried: "num" },
+      "select substr(s.date, 1, 10) as day, b.building, r.meter_kwh, last_value(r.meter_kwh) ignore nulls over (partition by b.building order by s.date rows between unbounded preceding and current row) as carried from series('2026-06-01','2026-06-30') s, (select distinct building from @table:meter-reads) b left join @table:meter-reads r on r.building = b.building and r.read_on = substr(s.date, 1, 10) order by b.building, day",
+    ),
+  },
+  "query:meter-usage": {
+    name: "meter increase per day",
+    tags: ["demo", "query"],
+    system: true,
+    doc: QuerySql(
+      { day: "date", carried: "num", prior_reading: "num", kwh_used: "num" },
+      "select t.day, t.building, t.carried, y.carried as prior_reading, round(t.carried - y.carried, 1) as kwh_used from @query:meter-daily t join @query:meter-daily y on y.building = t.building and y.day = substr(date_add('day', -1, t.day), 1, 10) where t.carried is not null and y.carried is not null order by t.building, t.day",
     ),
   },
   "query:festival-season": {
@@ -3417,6 +3542,10 @@ export const DATASETS = [
   { doc_id: "pair-prices", name: "paired daily closes", tags: ["demo", "markets"], doc: pairPrices },
   { doc_id: "pos-weekly", name: "restaurant weekly sales", tags: ["demo", "hospitality"], doc: posWeekly },
   { doc_id: "city-checkbook", name: "city checkbook", tags: ["demo", "government"], doc: cityCheckbook },
+  { doc_id: "assumptions", name: "demo assumptions", tags: ["demo", "reference"], doc: assumptions },
+  { doc_id: "trades", name: "equity trades", tags: ["demo", "markets"], doc: trades },
+  { doc_id: "headcount-plan", name: "hiring plan by quarter", tags: ["demo"], doc: headcountPlan },
+  { doc_id: "meter-reads", name: "utility meter reads", tags: ["demo"], doc: meterReads },
   { doc_id: "us-states", name: "us states", tags: ["example", "dataset"], doc: usStates },
   { doc_id: "elements", name: "periodic table", tags: ["example", "dataset"], doc: elements },
   { doc_id: "colors", name: "css colors", tags: ["example", "dataset"], doc: colors },

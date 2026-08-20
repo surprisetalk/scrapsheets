@@ -226,20 +226,54 @@ const fit = (xs, ys) => {
 // One scanner for both engines, so `@type:doc_id` means the same thing on the
 // server and in the page. The colon is required, which is what keeps AlaSQL's
 // own `@params` variable from being mistaken for a sheet reference.
+//
+// `@type:doc_id.column` is a cell: the one value in that column, from a sheet
+// holding a single row. It becomes a scalar subquery, which AlaSQL evaluates
+// once, so a query sheet reads its parameters out of cells the same way a
+// spreadsheet reads an assumptions block. Nothing is spliced into the SQL as a
+// literal, so nothing needs escaping.
 export const scanRefs = (code) => {
   let out = "", inStr = false;
-  const ids = [];
+  const ids = [], cells = [];
   for (let i = 0; i < code.length; i++) {
     const ch = code[i];
     if (ch === "'") inStr = !inStr;
-    const ref = !inStr && ch === "@" ? code.slice(i).match(/^@[a-z-]+:[A-Za-z0-9._-]+/)?.[0] : undefined;
+    const ref = !inStr && ch === "@"
+      ? code.slice(i).match(/^@([a-z-]+:[A-Za-z0-9_-]+)(?:\.([A-Za-z_][A-Za-z0-9_]*))?/)
+      : null;
     if (ref) {
-      ids.push(ref.slice(1));
-      out += `SHEET('${ref.slice(1)}')`;
-      i += ref.length - 1;
+      ids.push(ref[1]);
+      if (ref[2]) cells.push({ id: ref[1], column: ref[2] });
+      out += ref[2] ? `(select ${ref[2]} from SHEET('${ref[1]}'))` : `SHEET('${ref[1]}')`;
+      i += ref[0].length - 1;
     } else { out += ch; }
   }
-  return { sql: out, ids };
+  return { sql: out, ids, cells };
+};
+
+// A cell reference is only meaningful over one row, and AlaSQL would answer a
+// two-row sheet with whichever row it reached first. Both engines run this
+// after loading, so the same query fails the same way in each.
+export const checkCells = (cells, rowsOf, colsOf = {}) => {
+  for (const { id, column } of cells) {
+    const rows = rowsOf[id] ?? [];
+    if (rows.length !== 1) {
+      throw new Error(explain(`A cell reference reads one row, and @${id} does not hold exactly one.`, {
+        Expected: "1 row",
+        Received: `${rows.length} rows`,
+        Source: `@${id}.${column} in this query`,
+        Fix: "point it at a sheet holding a single row of settings, or filter that sheet to one row in its own query",
+      }));
+    }
+    const names = colsOf[id]?.map((col) => col.name) ?? Object.keys(rows[0] ?? {});
+    if (names.includes(column)) continue;
+    const hit = nearest(column, names);
+    throw new Error(explain(`The sheet @${id} has no column named "${column}".`, {
+      ...(hit ? { "Did you mean": `@${id}.${hit}` } : { Available: names.join(", ") || "(no columns)" }),
+      Source: `@${id}.${column} in this query`,
+      Fix: hit ? `write @${id}.${hit}` : "check the column names in the sheet's type row",
+    }));
+  }
 };
 
 export const MAX_REF_DEPTH = 8;
@@ -459,7 +493,15 @@ export const WINDOW_TYPES = {
 
 // Ranking and offset functions read the whole partition; a frame never applies.
 const OFFSET = ["lag", "lead"];
+// The functions that return a row's own value, and so can be asked to look past
+// a null to the last row that had one. Everything else skips nulls already.
+const NULLABLE = ["lag", "lead", "first_value", "last_value", "nth_value"];
 const HIDDEN = /^__w\d+[apo]\d+$/;
+// A window lifted out of a qualify clause: computed, filtered on, then dropped.
+const LIFTED = /^__q\d+$/;
+// The words a qualify condition may hold that are not column names.
+const QUALIFY_WORDS =
+  /^(and|or|not|in|is|null|between|like|escape|true|false|case|when|then|else|end|as|cast|convert|int|integer|float|number|string|date|boolean|distinct)$/i;
 
 // Depth of every character, -1 inside a string literal, computed in one pass so
 // a keyword inside a subquery or a quoted value is never read as a top-level one.
@@ -562,15 +604,17 @@ const parseFrame = (text, spec) => {
   return { mode, start, end };
 };
 
-// Parses `fn(args) over (spec)` starting at `from`, or returns null if the item
-// does not start with a call. Everything else about the item is the caller's.
-const parseWindow = (code, depth, from, to, index) => {
+// Parses `fn(args) over (spec)` starting at `from`, or returns null if there is
+// no call there. Naming it is the caller's job: a select item takes its alias
+// from the text after, a window inside qualify gets a generated one.
+const parseCall = (code, depth, from, to, index, alias) => {
   const call = code.slice(from, to).match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
   if (!call) return null;
   const open = from + call[0].length - 1;
   const argEnd = closeParen(code, depth, open);
-  const after = code.slice(argEnd + 1, to).match(/^\s*over\s*\(/i);
+  const after = code.slice(argEnd + 1, to).match(/^\s*(?:(ignore|respect)\s+nulls\s+)?over\s*\(/i);
   if (!after) return null;
+  const ignoreNulls = (after[1] ?? "").toLowerCase() === "ignore";
 
   const fn = call[1].toLowerCase();
   if (!(fn in WINDOW_TYPES)) {
@@ -587,8 +631,9 @@ const parseWindow = (code, depth, from, to, index) => {
   const level = depth[specOpen] + 1;
   const spec = code.slice(specOpen + 1, specEnd);
 
-  const alias = code.slice(specEnd + 1, to).match(/^\s*(?:as\s+)?["'`[]?([A-Za-z_][A-Za-z0-9_]*)["'`\]]?\s*$/i);
-  if (!alias) {
+  const named = alias ??
+    code.slice(specEnd + 1, to).match(/^\s*(?:as\s+)?["'`[]?([A-Za-z_][A-Za-z0-9_]*)["'`\]]?\s*$/i)?.[1];
+  if (!named) {
     throw new Error(explain(`A window function needs a name of its own.`, {
       Expected: `${fn}(...) over (...) as some_name`,
       Received: code.slice(from, to).trim(),
@@ -636,9 +681,21 @@ const parseWindow = (code, depth, from, to, index) => {
   });
   const args = star || !rawArgs.length ? [] : [rawArgs[0]];
 
+  if (ignoreNulls && !NULLABLE.includes(fn)) {
+    throw new Error(explain(`${fn}() has no nulls to ignore.`, {
+      Expected: `ignore nulls only applies to ${NULLABLE.join(", ")}`,
+      Received: `${fn}(...) ignore nulls over (...)`,
+      Cause: `${fn}() skips nulls already, the way every aggregate does`,
+      Source: `the ${named} column in this query`,
+      Fix: `drop "ignore nulls"`,
+    }));
+  }
+
   return {
     fn,
-    alias: alias[1],
+    alias: named,
+    end: specEnd + 1,
+    ignoreNulls,
     star,
     args,
     counted,
@@ -656,8 +713,10 @@ const parseWindow = (code, depth, from, to, index) => {
 
 export const rewriteWindows = (code) => {
   const depth = topLevel(code);
-  // Cheap exit: no over( anywhere outside a string means nothing to lift.
-  if (!/\bover\s*\(/i.test(code.replace(/'[^']*'/g, "''"))) return { sql: code, windows: [], limit: null, offset: 0 };
+  const outsideStrings = code.replace(/'[^']*'/g, "''");
+  // Cheap exit: no over( and no qualify outside a string means nothing to lift.
+  if (!/\bover\s*\(/i.test(outsideStrings) && !/\bqualify\b/i.test(outsideStrings))
+    return { sql: code, windows: [], qualify: null, limit: null, offset: 0 };
 
   const select = findAt(code, depth, /\bselect\b/gi, 0);
   if (!select) {
@@ -668,7 +727,13 @@ export const rewriteWindows = (code) => {
     }));
   }
   const listStart = select.index + select[0].length;
-  const tail = findAt(code, depth, /\b(?:from|where|group|having|order|limit|offset|union|into)\b/gi, 0, listStart);
+  const tail = findAt(
+    code,
+    depth,
+    /\b(?:from|where|group|having|qualify|order|limit|offset|union|into)\b/gi,
+    0,
+    listStart,
+  );
   const listEnd = tail ? tail.index : code.length;
 
   if (/^\s*(?:distinct|top\b)/i.test(code.slice(listStart, listEnd))) {
@@ -680,8 +745,20 @@ export const rewriteWindows = (code) => {
     }));
   }
 
-  // Everything outside the select list: only row_number() works there unlifted.
-  const outside = code.slice(0, listStart) + " ".repeat(listEnd - listStart) + code.slice(listEnd);
+  // qualify is where `row_number() over (...) = 1` belongs, and the condition
+  // cannot name a column the select list does not have, so a window written
+  // there is lifted into a hidden column of its own and the condition is
+  // pointed at that. The clause itself never reaches the engine.
+  const qual = findAt(code, depth, /\bqualify\b/gi, 0, listEnd);
+  const qualStop = qual && findAt(code, depth, /\b(?:order|limit|offset)\b/gi, 0, qual.index + qual[0].length);
+  const qualFrom = qual ? qual.index + qual[0].length : 0;
+  const qualTo = qual ? (qualStop ? qualStop.index : code.length) : 0;
+
+  // Everything outside the select list and the qualify clause: only row_number()
+  // works there unlifted.
+  const blank = (from, to) => " ".repeat(Math.max(0, to - from));
+  const outside = code.slice(0, listStart) + blank(listStart, listEnd) +
+    (qual ? code.slice(listEnd, qual.index) + blank(qual.index, qualTo) + code.slice(qualTo) : code.slice(listEnd));
   const buried = outside.replace(/'[^']*'/g, "''").match(/([A-Za-z_][A-Za-z0-9_]*)\s*\([^()]*\)\s*over\s*\(/i);
   if (buried && buried[1].toLowerCase() !== "row_number") {
     throw new Error(explain(`A window function only works in the outermost select list.`, {
@@ -694,26 +771,73 @@ export const rewriteWindows = (code) => {
 
   const windows = [];
   const edits = [];
+  // Lifts every window written at this depth out of [from, to), leaving the
+  // text with each one replaced by the hidden column that will hold its answer.
+  const lift = (from, to) => {
+    const swaps = [];
+    for (const call of code.slice(from, to).matchAll(/[A-Za-z_][A-Za-z0-9_]*\s*\(/g)) {
+      const at = from + call.index;
+      if (swaps.some(([a, b]) => at >= a && at < b)) continue;
+      if (depth[at] !== depth[from]) continue;
+      const w = parseCall(code, depth, at, to, windows.length, `__q${windows.length}`);
+      if (!w) continue;
+      windows.push(w);
+      swaps.push([at, w.end, w.alias]);
+    }
+    return {
+      swaps,
+      text: swaps
+        .sort((x, y) => y[0] - x[0])
+        .reduce((t, [a, b, name]) => t.slice(0, a - from) + name + t.slice(b - from), code.slice(from, to)),
+    };
+  };
+
   for (const [a, b] of splitAt(code, depth, listStart, listEnd, 0)) {
-    const w = parseWindow(code, depth, a, b, windows.length);
-    if (!w) {
-      // A window buried in an expression or a subquery is not lifted, and only
-      // row_number() survives that in AlaSQL, so say so rather than return zeros.
-      const stray = code.slice(a, b).match(/([A-Za-z_][A-Za-z0-9_]*)\s*\([^()]*\)\s*over\s*\(/i);
-      if (stray && stray[1].toLowerCase() !== "row_number") {
-        throw new Error(explain(`A window function has to be a select item on its own.`, {
-          Expected: `${stray[1]}(...) over (...) as some_name`,
-          Received: code.slice(a, b).trim(),
-          Source: "the select list of this query",
-          Fix: "select the window into its own named column, then wrap it in an outer query sheet",
-        }));
-      }
+    const w = parseCall(code, depth, a, b, windows.length);
+    if (w) {
+      windows.push(w);
+      edits.push([a, b, ` null as ${w.alias} `]);
       continue;
     }
-    windows.push(w);
-    edits.push([a, b, ` null as ${w.alias} `]);
+    // A window wrapped in an expression cannot be lifted: the item's other
+    // operands are consumed by the same expression, and computing it after the
+    // engine has returned would need them as columns nobody asked for. Only
+    // row_number() survives being left to AlaSQL, so name the rest.
+    const stray = code.slice(a, b).replace(/'[^']*'/g, "''").match(
+      /([A-Za-z_][A-Za-z0-9_]*)\s*\([^()]*\)\s*over\s*\(/i,
+    );
+    if (stray && stray[1].toLowerCase() !== "row_number") {
+      throw new Error(explain(`A window function has to be a select item on its own.`, {
+        Expected: `${stray[1]}(...) over (...) as some_name`,
+        Received: code.slice(a, b).trim(),
+        Source: "the select list of this query",
+        Fix: "give the window a column of its own, then do the arithmetic in a query sheet that reads this one",
+      }));
+    }
   }
-  if (!windows.length) return { sql: code, windows: [], limit: null, offset: 0 };
+
+  let qualify = null;
+  if (qual) {
+    qualify = lift(qualFrom, qualTo).text.replace(/;\s*$/, "").trim();
+    if (!qualify) {
+      throw new Error(explain(`qualify needs a condition after it.`, {
+        Expected: "qualify <condition>, e.g. qualify recency = 1",
+        Received: code.slice(qual.index, qualTo).trim(),
+        Source: "the qualify clause of this query",
+        Fix: "name the window column and the value it must have",
+      }));
+    }
+    if (!windows.length) {
+      throw new Error(explain(`qualify filters on a window function, and this query has none.`, {
+        Received: code.slice(qual.index, qualTo).trim().slice(0, 60),
+        Cause: "qualify runs after the windows are computed; with no window it can only repeat what where already did",
+        Source: "the qualify clause of this query",
+        Fix: "write it as a where clause instead",
+      }));
+    }
+    edits.push([qual.index, qualTo, " "]);
+  }
+  if (!windows.length) return { sql: code, windows: [], qualify: null, limit: null, offset: 0 };
 
   // Two columns with one name: AlaSQL keeps whichever it wrote last and the
   // window silently overwrites the other. Name the collision instead.
@@ -734,12 +858,15 @@ export const rewriteWindows = (code) => {
     }
   }
 
-  const hidden = windows.flatMap((w) => [
-    ...w.args.map((expr, j) => `${expr} as ${w.hidden.args[j]}`),
-    ...w.partition.map((expr, j) => `${expr} as ${w.hidden.partition[j]}`),
-    ...w.order.map(({ expr }, j) => `${expr} as ${w.hidden.order[j]}`),
-  ]);
-  edits.push([listEnd, listEnd, hidden.length ? `, ${hidden.join(", ")} ` : " "]);
+  const added = [
+    ...windows.filter((w) => LIFTED.test(w.alias)).map((w) => `null as ${w.alias}`),
+    ...windows.flatMap((w) => [
+      ...w.args.map((expr, j) => `${expr} as ${w.hidden.args[j]}`),
+      ...w.partition.map((expr, j) => `${expr} as ${w.hidden.partition[j]}`),
+      ...w.order.map(({ expr }, j) => `${expr} as ${w.hidden.order[j]}`),
+    ]),
+  ];
+  edits.push([listEnd, listEnd, added.length ? `, ${added.join(", ")} ` : " "]);
 
   // A window is computed over every row the query produced, so the row cap has
   // to come off before the engine applies it and go back on afterwards.
@@ -762,7 +889,7 @@ export const rewriteWindows = (code) => {
 
   let sql = code;
   for (const [a, b, text] of edits.sort((x, y) => y[0] - x[0])) sql = sql.slice(0, a) + text + sql.slice(b);
-  return { sql, windows, limit, offset };
+  return { sql, windows, qualify, limit, offset };
 };
 
 // Nulls sort last ascending and first descending, matching Postgres.
@@ -834,10 +961,21 @@ const winValue = (w, rows, ord, pos) => {
     const cut = big * (small + 1);
     return pos < cut ? Math.floor(pos / (small + 1)) + 1 : big + Math.floor((pos - cut) / small) + 1;
   }
+  const missing = (v) => v === null || v === undefined;
   if (OFFSET.includes(w.fn)) {
-    const step = (w.counted.length ? Number(w.counted[0]) : 1) * (w.fn === "lag" ? -1 : 1);
-    const p = pos + step;
-    return p >= 0 && p < size ? arg(p) : (w.counted.length > 1 ? w.counted[1] : null);
+    const back = w.fn === "lag";
+    let want = w.counted.length ? Number(w.counted[0]) : 1;
+    if (!w.ignoreNulls) {
+      const p = pos + (back ? -want : want);
+      return p >= 0 && p < size ? arg(p) : (w.counted.length > 1 ? w.counted[1] : null);
+    }
+    // ignore nulls: step over the rows that have no value, which is what makes
+    // lag() a forward fill and last_value() an as-of read.
+    for (let p = pos + (back ? -1 : 1); p >= 0 && p < size; p += back ? -1 : 1) {
+      if (missing(arg(p))) continue;
+      if (--want === 0) return arg(p);
+    }
+    return w.counted.length > 1 ? w.counted[1] : null;
   }
 
   const [lo, hi] = frameBounds(w.frame, pos, { first, last }, size);
@@ -848,11 +986,15 @@ const winValue = (w, rows, ord, pos) => {
     for (let p = lo; p <= hi; p++) if (arg(p) !== null && arg(p) !== undefined) n++;
     return n;
   }
-  if (w.fn === "first_value") return arg(lo);
-  if (w.fn === "last_value") return arg(hi);
-  if (w.fn === "nth_value") {
-    const n = w.counted.length ? w.counted[0] : 1;
-    return lo + n - 1 <= hi ? arg(lo + n - 1) : null;
+  if (["first_value", "last_value", "nth_value"].includes(w.fn)) {
+    const n = w.fn === "nth_value" ? (w.counted.length ? w.counted[0] : 1) : 1;
+    const step = w.fn === "last_value" ? -1 : 1;
+    let want = n;
+    for (let p = w.fn === "last_value" ? hi : lo; p >= lo && p <= hi; p += step) {
+      if (w.ignoreNulls && missing(arg(p))) continue;
+      if (--want === 0) return arg(p);
+    }
+    return null;
   }
   if (w.fn === "min" || w.fn === "max") {
     let best;
@@ -878,7 +1020,7 @@ const winValue = (w, rows, ord, pos) => {
   return Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / (xs.length - 1));
 };
 
-export const applyWindows = ({ columns, data }, { windows, limit, offset }) => {
+export const applyWindows = ({ columns, data }, { windows, qualify, limit, offset }, run) => {
   for (const w of windows) {
     const groups = new Map();
     data.forEach((row, i) => {
@@ -899,11 +1041,127 @@ export const applyWindows = ({ columns, data }, { windows, limit, offset }) => {
     }
   }
   for (const row of data) for (const key of Object.keys(row)) if (HIDDEN.test(key)) delete row[key];
-  const cols = columns.filter((col) => !HIDDEN.test(col.columnid));
+
+  // The engine evaluates its own predicate over the finished rows: a hand-rolled
+  // expression evaluator here would be a second SQL dialect to keep in step.
+  let kept = data;
+  if (qualify) {
+    // AlaSQL reads an unknown column as undefined, so `qualify nope = 1` is
+    // false for every row and the answer is an empty sheet rather than an error.
+    const known = new Set([...columns.map((col) => col.columnid), ...windows.map((w) => w.alias)]);
+    const text = qualify.replace(/'[^']*'/g, "''");
+    for (const m of text.matchAll(/[A-Za-z_][A-Za-z0-9_]*/g)) {
+      const word = m[0];
+      const before = text[m.index - 1], after = text.slice(m.index + word.length);
+      if (before === "." || /^\s*\(/.test(after)) continue;
+      if (QUALIFY_WORDS.test(word) || known.has(word)) continue;
+      const hit = nearest(word, [...known]);
+      throw new Error(explain(`The qualify condition names "${word}", which this query does not return.`, {
+        ...(hit ? { "Did you mean": hit } : { Available: [...known].join(", ") || "(no columns)" }),
+        Source: `qualify ${qualify}`,
+        Fix: hit ? `write ${hit} instead` : "the condition may only name columns the select list produces",
+      }));
+    }
+    try {
+      kept = run(`select * from ? where ${qualify}`, [data]);
+    } catch (err) {
+      throw new Error(explain(`I could not apply this qualify condition.`, {
+        Received: qualify,
+        Cause: err instanceof Error ? err.message.split("\n")[0] : String(err),
+        Source: "the qualify clause of this query",
+        Fix: "the condition may only name columns the query returns, including the window ones",
+      }));
+    }
+  }
+  for (const row of kept) for (const key of Object.keys(row)) if (LIFTED.test(key)) delete row[key];
   return {
-    columns: cols,
-    data: limit === null || limit === undefined ? data : data.slice(offset, offset + limit),
+    columns: columns.filter((col) => !HIDDEN.test(col.columnid) && !LIFTED.test(col.columnid)),
+    data: limit === null || limit === undefined ? kept : kept.slice(offset, offset + limit),
   };
+};
+
+// --- pivot and unpivot
+//
+// AlaSQL's own `pivot` works, with one trap: an in-list of quoted strings
+// matches nothing and returns zero rows instead of failing. `unpivot` is worse
+// — it drops every column that is not being unpivoted, and the value column too
+// once you name it in the select list — so it never reaches the engine either.
+// Both run before the window pass, on SQL that scanRefs has already rewritten.
+
+const bare = (text) => text.trim().replace(/^\[(.*)\]$/, "$1").trim();
+
+export const checkPivot = (code) => {
+  const m = code.match(/\bpivot\s*\([\s\S]*?\bin\s*\(([^()]*)\)/i);
+  if (!m || !m[1].includes("'")) return;
+  throw new Error(explain(`A pivot in-list takes column names, not quoted text.`, {
+    Received: m[1].trim(),
+    Cause: "AlaSQL matches a quoted value against no column at all and answers with zero rows rather than failing",
+    Source: "the pivot clause in this query",
+    Fix: "write the names bare or in brackets, e.g. in ([jan], [feb])",
+  }));
+};
+
+export const rewriteUnpivot = (code, columnsOf) => {
+  if (!/\bunpivot\b/i.test(code.replace(/'[^']*'/g, "''"))) return code;
+  const depth = topLevel(code);
+  const re = /SHEET\('([^']+)'\)\s*(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*\s+)?unpivot\s*\(/gi;
+  const edits = [];
+  for (let m; (m = re.exec(code));) {
+    const open = m.index + m[0].length - 1;
+    const close = closeParen(code, depth, open);
+    const spec = code.slice(open + 1, close);
+    const ident = "[A-Za-z_][A-Za-z0-9_]*|\\[[^\\]]*\\]";
+    const parsed = spec.match(new RegExp(`^\\s*(${ident})\\s+for\\s+(${ident})\\s+in\\s*\\(([\\s\\S]+)\\)\\s*$`, "i"));
+    if (!parsed) {
+      throw new Error(explain(`I cannot read this unpivot clause.`, {
+        Expected: "unpivot (<value column> for <name column> in (col, col, ...))",
+        Received: `unpivot (${spec.trim()})`,
+        Source: "the from clause of this query",
+        Fix: "e.g. unpivot (amount for month in (jan, feb, mar))",
+      }));
+    }
+    const [value, name] = [bare(parsed[1]), bare(parsed[2])];
+    const wide = parsed[3].split(",").map(bare);
+    for (const col of wide) {
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(col)) continue;
+      throw new Error(explain(`An unpivot in-list takes column names, not values.`, {
+        Received: col,
+        Source: `unpivot (${spec.trim()})`,
+        Fix: "name the wide columns themselves, e.g. in (jan, feb, mar)",
+      }));
+    }
+    const id = m[1];
+    const known = (columnsOf[id] ?? []).map((col) => col.name);
+    for (const col of wide) {
+      if (known.includes(col)) continue;
+      const hit = nearest(col, known);
+      throw new Error(explain(`The sheet @${id} has no column named "${col}" to unpivot.`, {
+        ...(hit ? { "Did you mean": hit } : { Available: known.join(", ") || "(no columns)" }),
+        Source: `unpivot (${spec.trim()})`,
+        Fix: hit ? `write ${hit} instead` : "check the column names in the sheet's type row",
+      }));
+    }
+    const keys = known.filter((col) => !wide.includes(col));
+    const alias = (m[2] ?? "").trim() || `unpivoted`;
+    const branches = wide.map((col) =>
+      `select ${
+        [...keys.map((k) => `[${k}]`), `'${col}' as [${name}]`, `[${col}] as [${value}]`].join(", ")
+      } from SHEET('${id}')`
+    );
+    edits.push([m.index, close + 1, `(${branches.join(" union all ")}) ${alias}`]);
+  }
+  if (!edits.length) {
+    throw new Error(explain(`unpivot reads a sheet, not a subquery.`, {
+      Expected: "@type:doc_id unpivot (<value> for <name> in (col, ...))",
+      Received: code.trim().slice(0, 80),
+      Cause: "the wide columns are read from the sheet's own type row, which a subquery does not have",
+      Source: "the from clause of this query",
+      Fix: "materialize the subquery as its own query sheet, then unpivot that",
+    }));
+  }
+  let out = code;
+  for (const [a, b, text] of edits.sort((x, y) => y[0] - x[0])) out = out.slice(0, a) + text + out.slice(b);
+  return out;
 };
 
 // --- registration
@@ -1086,6 +1344,18 @@ export const register = (alasql) => {
     return cur ?? null;
   };
   fn.to_json = (v) => JSON.stringify(v ?? null);
+
+  // A sheet reference in an expression position: `where x = @table:cfg` reaches
+  // the engine as a call to a function that does not exist, and "alasql.fn.SHEET
+  // is not a function" says nothing about the query. A sheet is not a value.
+  fn.SHEET = (id) => {
+    throw new Error(explain(`A sheet reference cannot be used as a single value.`, {
+      Received: `@${id}`,
+      Expected: `@${id}.<column>, which reads one value out of a one-row sheet`,
+      Source: "an expression in this query",
+      Fix: `name the column, e.g. @${id}.amount, or read the sheet in the from clause instead`,
+    }));
+  };
 
   // From-functions. AlaSQL's own range() yields empty objects and unnest() throws.
   alasql.from.UNNEST = (arr, _opts, cb, idx, query) => {

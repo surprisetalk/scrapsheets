@@ -33,6 +33,7 @@
       import { Col, EXAMPLES, Table } from "/examples.mjs";
       import {
         applyWindows,
+        checkCells,
         checkColumnTypes,
         checkRefPath,
         checkResultColumns,
@@ -41,7 +42,9 @@
         describeRows,
         formatQueryError,
         nearest,
+        checkPivot,
         register,
+        rewriteUnpivot,
         rewriteWindows,
         scanRefs,
       } from "/sql.mjs";
@@ -538,9 +541,9 @@
           ) {
             alasql.fn[type] = (data) => ({ type, data });
           }
-          // @type:doc_id references resolve in two steps: resolveSheets rewrites
-          // them to SHEET('id') and pre-loads each doc (repo.find is async but
-          // alasql from-functions are synchronous), then SHEET serves the rows.
+          // @type:doc_id references resolve in two steps: runSql rewrites them to
+          // SHEET('id') and pre-loads each doc (repo.find is async but alasql
+          // from-functions are synchronous), then SHEET serves the rows.
           const sheetCache = new Map();
           const sheetCols = new Map();
           // Every column the referenced sheets actually have: what a typo'd
@@ -566,11 +569,23 @@
             if (cb) res = cb(res, idx, query);
             return res;
           };
+          // What each loaded sheet's columns are called: the declared type row for a
+          // table, and whatever the rows carry for a query. checkCells and
+          // rewriteUnpivot both read names rather than types.
+          const columnsOf = () =>
+            Object.fromEntries(
+              [...sheetCache].map(([id, rows]) => [
+                id,
+                sheetCols.get(id) ?? Object.keys(rows?.[0] ?? {}).map((name) => ({ name })),
+              ]),
+            );
           // scanRefs and checkRefPath are shared with the server (src/sql.mjs), so a
           // query resolves the same way in the page and in POST /query. `path` carries
-          // the @query chain that led here, which is what names a cycle.
-          const resolveSheets = async (code, path = []) => {
-            const { sql: out, ids } = scanRefs(code);
+          // the @query chain that led here, which is what names a cycle. A referenced
+          // @query runs through runSql too, so a window inside one is computed rather
+          // than handed to AlaSQL.
+          const runSql = async (code, params, path = []) => {
+            const { sql: out, ids, cells } = scanRefs(code);
             for (const id of new Set(ids)) {
               checkRefPath(path, id);
               const [type, ref_id] = id.split(":");
@@ -594,21 +609,27 @@
                   ].join("\n"),
                 );
               }
-              sheetCache.set(
-                id,
-                type === "query"
-                  ? (await alasql([
-                    [`set @params = ?`, [{ "": null }]],
-                    await resolveSheets(doc.data[0].code, [...path, id]),
-                  ]))[1].data
-                  : toRecords(doc.data),
-              );
-              // Declared types, kept beside the rows so checkColumnTypes can run
-              // after loading rather than during it: describe must still work on a
-              // sheet whose cells are wrong.
-              if (type === "table") sheetCols.set(id, Object.values(doc.data[0]));
+              if (type === "query") {
+                sheetCache.set(id, (await runSql(doc.data[0].code, { "": null }, [...path, id])).data);
+              } else {
+                sheetCache.set(id, toRecords(doc.data));
+                // Declared types, kept beside the rows so checkColumnTypes runs after
+                // loading rather than during it: describe must still work on a sheet
+                // whose cells are wrong.
+                sheetCols.set(id, Object.values(doc.data[0]));
+                checkColumnTypes(id, sheetCols.get(id), sheetCache.get(id));
+              }
             }
-            return out;
+            // Same order as the server: a cell reference needs its sheet loaded,
+            // unpivot needs its column names, and the window pass runs on whatever
+            // those leave behind.
+            checkCells(cells, Object.fromEntries(sheetCache), columnsOf());
+            checkPivot(out);
+            const plan = rewriteWindows(rewriteUnpivot(out, columnsOf()));
+            const [, result = {}] = await alasql([[`set @params = ?`, [params]], plan.sql]);
+            return plan.windows.length
+              ? applyWindows(result, plan, (q, p) => alasql(q, p).data)
+              : result;
           };
           // Pull the origin's own words out of an error body so the message names a cause,
           // not just a status code (arxiv hides it in <entry><summary>, most APIs in JSON).
@@ -756,7 +777,7 @@
                     // sheet it names and reports its shape. Shared with the server.
                     const described = describeRef(code);
                     if (described) {
-                      await resolveSheets(`select 1 from @${described}`);
+                      await runSql(`select 1 from @${described}`, params);
                       const known = sheetCache.get(described) ?? [];
                       app.ports.docQueried.send({
                         id,
@@ -772,20 +793,7 @@
                       });
                       break;
                     }
-                    const resolved = await resolveSheets(code);
-                    // Same check as the server, so a sheet that fails in one fails in both.
-                    for (const [id_, cols_] of sheetCols) checkColumnTypes(id_, cols_, sheetCache.get(id_) ?? []);
-                    // A window never reaches the engine: AlaSQL parses `over (...)`
-                    // and computes it wrong. Lifted out here and filled back in
-                    // afterwards, the same way the server does it.
-                    const plan = rewriteWindows(resolved);
-                    const [, result = {}] = await alasql([
-                      [`set @params = ?`, [params]],
-                      plan.sql,
-                    ]);
-                    const { columns: cols, data: rows } = plan.windows.length
-                      ? applyWindows(result, plan)
-                      : result;
+                    const { columns: cols, data: rows } = await runSql(code, params);
                     checkResultColumns(cols, rows, sheetColumns(), code);
                     // TODO: If doc contains cols data, use that names and types.
                     app.ports.docQueried.send({
@@ -900,7 +908,7 @@
               };
               connect();
             }
-            if (type.startsWith("net-")) {
+            if (type.startsWith("net-") || type === "alert") {
               const fetchNet = catchy(async () => {
                 const token = getAuthToken();
                 if (!token) {
@@ -1041,6 +1049,51 @@
               window.history.pushState({}, '', `/${id}`);
               await selectDoc(id, sheet);
             }, 'newDoc'),
+          );
+
+          // Fork: a copy of the sheet you are looking at, owned by you, with a link
+          // back to what it came from. It works on a bundled example too, which is
+          // what makes "start from a demo" mean anything. `demo` and `example` mark
+          // the originals, so a fork does not inherit them and does not turn up in
+          // the gallery strip pretending to be one.
+          app.ports.forkDoc.subscribe(
+            catchy(async (sourceId) => {
+              const [type, source_doc_id] = sourceId.split(":");
+              const entry = Library.get()[sourceId];
+              const source = entry?.doc ??
+                (await repo.find(source_doc_id).then(async (h) => (await h.whenReady?.(), h.doc())));
+              if (!source?.data) {
+                app.ports.docErrored.send(
+                  [
+                    `I could not fork "@${sourceId}".`,
+                    ``,
+                    `  Received:     a sheet with no data`,
+                    `  Source:       the sheet this page is showing`,
+                    `  Fix:          open the sheet once so it loads, then fork it`,
+                  ].join("\n"),
+                );
+                return;
+              }
+              const name = `${entry?.name || source.name || sourceId} (fork)`;
+              const copy = repo.create({
+                ...JSON.parse(JSON.stringify(source)),
+                name,
+                forked_from: sourceId,
+              });
+              if (copy.whenReady) await copy.whenReady();
+              const id = `${type}:${copy.documentId}`;
+              const tags = (entry?.tags ?? []).filter((t) => !["demo", "example"].includes(t));
+              Library.set(id, { name, tags });
+              const registered = await registerDocWithRetry(id, name);
+              if (!registered) {
+                app.ports.docErrored.send(
+                  `This fork was made locally but the server rejected its registration, so it will not sync. Reload and try again.`,
+                );
+              }
+              window.history.pushState({}, "", `/${id}`);
+              sheet = copy;
+              await selectDoc(id, copy);
+            }, "forkDoc"),
           );
 
           app.ports.importCsv.subscribe(

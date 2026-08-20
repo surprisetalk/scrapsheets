@@ -19,7 +19,9 @@ import examplesSql from "./examples.sql" with { type: "text" };
 import { DATASETS } from "./src/examples.mjs";
 import {
   applyWindows,
+  checkCells,
   checkColumnTypes,
+  checkPivot,
   checkQueryRows,
   checkRefPath,
   checkResultColumns,
@@ -31,6 +33,7 @@ import {
   MAX_QUERY_MS,
   nearest,
   register,
+  rewriteUnpivot,
   rewriteWindows,
   scanRefs,
   WINDOW_TYPES,
@@ -225,6 +228,10 @@ export type Template =
   | Tag<`codex-${string}`, []>;
 export type Query = { lang: "sql" | "prql"; code: string; args: Args };
 export type NetHttp = { url: string; interval: number; headers?: string };
+// An alert is a query plus somewhere to send it. The condition is the query's
+// own where clause: it fires when the query returns a row, which is the only
+// definition that needs no second language.
+export type Alert = { code: string; to: string; interval: number };
 export type NetSocket = { url: string };
 export type Sheet =
   | Tag<"template", [Template]>
@@ -335,6 +342,7 @@ const sheet = async (
     case "net-hook":
     case "net-http":
     case "net-socket":
+    case "alert":
       return await cselect({
         cols: null,
         // Appended after body, so existing `select body from @net-hook:x` queries
@@ -367,7 +375,7 @@ const sheet = async (
       });
     default:
       throw new HTTPException(400, {
-        message: `Expected sheet type table, net-hook, net-http, net-socket, or query, received ${
+        message: `Expected sheet type table, net-hook, net-http, net-socket, alert, or query, received ${
           JSON.stringify(type)
         } from sheet id ${sheet_id}. Fix the type prefix on the id.`,
       });
@@ -383,7 +391,9 @@ const executeSql = async (
   // names and reports its shape. describeRef is shared with the page.
   const described = describeRef(sqlCode);
   // scanRefs is shared with the page, so @type:doc_id resolves identically here.
-  const { sql: code_, ids: sheet_ids } = described ? { sql: "", ids: [described] } : scanRefs(sqlCode);
+  const { sql: scanned, ids: sheet_ids, cells } = described
+    ? { sql: "", ids: [described], cells: [] }
+    : scanRefs(sqlCode);
 
   // Load referenced sheets, remembering source column types by name.
   const docs: Record<string, Record<string, unknown>[]> = {};
@@ -457,12 +467,25 @@ const executeSql = async (
     };
   }
 
+  // Everything the engine cannot be trusted with, in the order it has to happen:
+  // a cell reference needs the sheet loaded to be checked, unpivot needs its
+  // column names, and a window has to be lifted out of whatever those produce.
+  let code_ = scanned;
+  try {
+    checkCells(cells, docs, colsOf);
+    checkPivot(code_);
+    code_ = rewriteUnpivot(code_, colsOf);
+  } catch (err) {
+    throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
+  }
+
   // A window never reaches the engine: AlaSQL parses `over (...)` and computes
   // it wrong. rewriteWindows lifts each one out and applyWindows fills the answer
   // back in, the same way in both engines.
   let plan: {
     sql: string;
     windows: { fn: string; alias: string; args: string[] }[];
+    qualify: string | null;
     limit: number | null;
     offset: number;
   };
@@ -510,7 +533,13 @@ const executeSql = async (
   }
   let { columns: cols, data: rows } = result;
   try {
-    if (plan.windows.length) ({ columns: cols, data: rows } = applyWindows(result, plan));
+    if (plan.windows.length) {
+      ({ columns: cols, data: rows } = applyWindows(
+        result,
+        plan,
+        (q: string, params: unknown[]) => (ala(q, params) as { data: Record<string, unknown>[] }).data,
+      ));
+    }
     checkResultColumns(cols, rows, Object.keys(nameToType), sqlCode);
   } catch (err) {
     throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
@@ -1678,6 +1707,101 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
 
 setInterval(() => pollNetOnce().catch((err) => console.error("net-http poll:", err)), 15_000);
 
+// --- alerts
+//
+// An alert sheet is a query plus a destination. It fires when the query returns
+// a row, which means the condition is the query's own where clause and there is
+// no second expression language to learn. Every evaluation that changes the
+// answer lands in `net`, so the alert's own history is a sheet you can query.
+
+const alertDue = new Map<string, number>();
+
+// Only what the alert decided, never the rows themselves: the digest is what
+// tells one firing from the next without keeping the data twice.
+const digest = async (value: unknown) =>
+  Array.from(
+    new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value)))),
+  ).slice(0, 8).map((b) => b.toString(16).padStart(2, "0")).join("");
+
+export const sendAlertEmail = async (to: string, sheet_id: string, name: string, rows: Row[]): Promise<string> => {
+  const key = Deno.env.get(`RESEND_API_KEY`);
+  if (!key) return "no RESEND_API_KEY, so nothing was sent";
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      to,
+      from: "hello@sheets.scrap.land",
+      subject: `${name || sheet_id}: ${rows.length} row${rows.length === 1 ? "" : "s"}`,
+      text: [
+        `${name || sheet_id} matched ${rows.length} row${rows.length === 1 ? "" : "s"}.`,
+        ``,
+        ...rows.slice(0, 20).map((row) => JSON.stringify(row)),
+        ...(rows.length > 20 ? [`... and ${rows.length - 20} more`] : []),
+        ``,
+        `https://sheets.scrap.land/${sheet_id}`,
+      ].join("\n"),
+    }),
+  });
+  if (res.ok) return "sent";
+  const detail = await res.text();
+  console.error(`alert ${sheet_id}: resend refused the message:`, res.status, detail);
+  return `resend refused it with ${res.status}: ${detail.slice(0, 200)}`;
+};
+
+export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Promise<void> => {
+  const sheets = await sql`select sheet_id, doc_id, name, created_by from sheet where type = 'alert'`;
+  for (const { sheet_id, doc_id, name, created_by } of sheets) {
+    if ((alertDue.get(sheet_id) ?? 0) > now) continue;
+    alertDue.set(sheet_id, now + 3600_000);
+    let record: Record<string, unknown>;
+    try {
+      const config = (await automerge.find<{ data: [Alert] }>(doc_id)).doc()?.data?.[0];
+      if (!config) throw new Error("The document has no config in data[0].");
+      alertDue.set(sheet_id, now + Math.max(60, Number(config.interval) || 3600) * 1000);
+      if (!config.code?.trim()) continue;
+      // Run it as the owner would, through the same authenticated path, so an
+      // alert can never read a sheet its owner cannot.
+      const res = await app.request(`/query`, {
+        method: "POST",
+        headers: new Headers({
+          Authorization: `Bearer ${await createJwt(created_by)}`,
+          "Content-Type": "application/json",
+        }),
+        body: JSON.stringify({ lang: "sql", code: config.code, args: [] }),
+      });
+      const text = await res.text();
+      if (!res.ok) throw new Error(`the query failed with ${res.status}: ${text.slice(0, 400)}`);
+      const [, ...rows] = (JSON.parse(text) as { data: Row[] }).data;
+      const fingerprint = await digest(rows);
+      const [last]: { body: string }[] = await sql`
+        select body from net where sheet_id = ${sheet_id} order by net_id desc limit 1
+      `;
+      // Same answer as last time means the same alert, and sending it again every
+      // interval is how people learn to filter alerts into a folder they never open.
+      if (last && (JSON.parse(last.body) as { fingerprint?: string }).fingerprint === fingerprint) continue;
+      record = {
+        status: rows.length ? "firing" : "clear",
+        rows: rows.length,
+        fingerprint,
+        to: config.to ?? "",
+        matched: rows.slice(0, 5),
+        delivery: rows.length
+          ? (config.to ? await send(config.to, sheet_id, name, rows) : "no destination, so nothing was sent")
+          : "cleared, so nothing was sent",
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`alert ${sheet_id}:`, message);
+      record = { status: "error", rows: 0, fingerprint: await digest(message), error: message };
+    }
+    await sql`insert into net (sheet_id, method, body) values (${sheet_id}, 'ALERT', ${JSON.stringify(record)})`
+      .catch((dbErr: unknown) => console.error(`alert ${sheet_id}: could not record the run:`, dbErr));
+  }
+};
+
+setInterval(() => pollAlertOnce().catch((err) => console.error("alert poll:", err)), 15_000);
+
 // CORS proxy for external data sources (unauthenticated, rate-limited)
 app.get("/proxy", async (c) => {
   const url = c.req.query("url");
@@ -1822,6 +1946,17 @@ app.post("/sell/:id", async (c) => {
       message: `Expected a "price" field in the body, received ${
         JSON.stringify(body)
       }. Post {"price": 0} to list it for free.`,
+    });
+  }
+  // An alert holds someone's email address and sends mail on a timer. Selling
+  // copies would hand a stranger a thing that emails the seller.
+  if (c.req.param("id").startsWith("alert:")) {
+    throw new HTTPException(400, {
+      message: explain(`An alert cannot be listed for sale.`, {
+        Received: c.req.param("id"),
+        Cause: "an alert carries a destination address and sends mail on its own, so a copy would mail its author",
+        Fix: "sell the query the alert watches instead, and let the buyer point their own alert at it",
+      }),
     });
   }
   const updated = await sql`
