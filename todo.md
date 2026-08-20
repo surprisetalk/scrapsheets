@@ -2,13 +2,13 @@
 
 > Programmable data OS: every table is a database, every query is a table, every sheet is an API.
 
+- [ ] let's remove screenshots from test suite if possible
+
 ---
 
 ## Phase 1 — Foundation
 
 Make Scrapsheets reliable enough to be someone's primary data tool.
-
-- [ ] **Seller payouts**: Stripe Connect for marketplace payouts (platform collects on Checkout today)
 
 ---
 
@@ -73,6 +73,8 @@ Transform Scrapsheets into a platform. Each feature creates a new axis of compos
 
 ## Go-to-Market
 
+- [ ] **Seller payouts**: Stripe Connect for marketplace payouts (platform collects on Checkout today)
+
 - [ ] **Public demo post**: skip the pitch deck; post a compelling demo and say you're looking for angels
 - [ ] **Dev launch**: file real GitHub issues, publish the demo + a blog post, rally contributors
 - [ ] **User testing round**: sit with Clark, Kirk, Jake; convert findings into issues
@@ -90,20 +92,27 @@ Transform Scrapsheets into a platform. Each feature creates a new axis of compos
 
 ## Demo Gallery
 
-Hypothetical end-to-end use-cases, written as sheet pipelines (`net-http` / `net-hook` / `portal` / `codex` -> `query`
--> `table`). Nothing here is built. The point is coverage: later passes mine this list for the missing features and the
-datasets worth seeding in the shop.
+End-to-end use-cases, written as sheet pipelines (`net-http` / `net-hook` / `portal` / `codex` -> `query` -> `table`).
+Six of them now ship as seeded sheets in `src/examples.mjs`, tagged `demo`: the query half is real and runs in both
+engines, and each entry names the ingest half that is still missing. The rest are unbuilt, and the point of the list is
+coverage: later passes mine it for the missing features and the datasets worth seeding in the shop.
 
 ### Flagship (best whole-stack stories)
 
 - [ ] **Restaurant group weekly P&L**: POS `net-hook` + USDA commodity `net-http` + labor `codex` -> `query` plate cost,
-      labor %, and store-level margin -> one embedded dashboard the owner reads on Sunday night
+      labor %, and store-level margin -> one embedded dashboard the owner reads on Sunday night. `table:pos-weekly` ->
+      `query:store-margin` ships the prime-cost read, with a 4-week moving average and a rank per week; the POS hook,
+      the commodity feed and the embed are open
 - [ ] **Fund 13F drift**: EDGAR `net-http` quarterly filings -> `query` diffing consecutive quarters -> `table` of
       position adds/trims valued live by a price `portal`; publish the diff table to the shop
 - [ ] **Contractor WIP schedule**: cost-code `table` + timecard `net-hook` -> `query` percent-complete revenue,
-      over/under billing -> the exact schedule the bonding agent and the CPA both ask for
+      over/under billing -> the exact schedule the bonding agent and the CPA both ask for. `table:job-costs` ->
+      `query:wip-schedule` ships the schedule itself, including the estimate movement that turns a job upside down; the
+      timecard hook is open
 - [ ] **Municipal budget watchdog**: city checkbook `net-http` -> `query` department burn rate vs adopted budget ->
-      public embed a local reporter can cite, republished monthly
+      public embed a local reporter can cite, republished monthly. `table:city-checkbook` -> `query:budget-ytd` ->
+      `query:budget-burn` ships the burn rate and the projected year-end variance; the checkbook pull and the embed are
+      open
 - [ ] **Solo consultant's whole business**: proposal `net-hook` form -> pipeline `query` -> invoice `table` -> Stripe
       `net-hook` -> cash-collected `query`; the whole back office in six sheets
 
@@ -119,21 +128,24 @@ datasets worth seeding in the shop.
       alert when any ratio lands inside a warning band before the quarter closes
 - [ ] **FX exposure and hedge sizing**: rate `portal` + open-invoice `table` by currency -> `query` net exposure per
       currency with suggested forward notional
-- [ ] **Cap table and exit waterfall**: rounds/options `table` -> `query` distributing proceeds across preferences and
-      participation at a range of exit valuations
+- [x] **Cap table and exit waterfall**: `table:cap-table` -> `query:preference-stack` -> `query:exit-waterfall`, which
+      walks the preference stack in seniority order and sets each holder's preference against what the same stake is
+      worth converted. One exit valuation, not a range: that needs query parameters
 - [ ] **Overhead allocation**: headcount, square footage, and machine-hour `table`s -> `query` allocating shared cost
       pools to cost centers with a switchable allocation basis
 - [ ] **Revenue recognition (ASC 606)**: contract `table` with performance obligations -> `query` producing the monthly
       recognition schedule and deferred revenue rollforward
 - [ ] **AR aging and collections queue**: invoice `codex` -> `query` aging buckets + payment-behavior score -> dunning
-      `net-hook` that fires the right email at the right bucket
+      `net-hook` that fires the right email at the right bucket. `table:invoices` -> `query:ar-aging` ships the buckets
+      and the running exposure; the codex, the behaviour score and the dunning hook are open
 - [ ] **Purchase-price allocation and earnout tracking**: deal `table` -> `query` earnout attainment against actuals
       each period
 
 ### Trading & Markets
 
 - [ ] **Pairs-trade monitor**: price `portal` for two tickers -> `query` rolling spread z-score -> alert `net-hook` on
-      entry/exit bands
+      entry/exit bands. `table:pair-prices` -> `query:pair-spread` -> `query:pair-zscore` ships the rolling band and the
+      entry signal off a 10-day window frame; the live price portal and the alert hook are open
 - [ ] **Options chain screener**: chain `net-http` -> `query` filtering IV rank, spread width, and days-to-expiry ->
       candidate `table` refreshed intraday
 - [ ] **Crypto treasury view**: exchange balance `net-hook` + on-chain `net-http` -> `query` consolidated position, cost
@@ -465,9 +477,11 @@ The single biggest gap. Most demos die here first.
 - [ ] **min()/max() over text**: AlaSQL compiles both inline, restricted to numbers and dates, and drops a text value,
       so `min(code)` returns nothing. `min_text()`/`max_text()` are the workaround and `checkResultColumns()` names the
       case; a real fix is upstream
-- [ ] **Window functions**: AlaSQL parses `over (partition by ...)` but computes it wrong
-      (`sum(x) over (partition by k)` returns 0); only `row_number()` works. Needs a fix upstream or our own evaluation
-      pass
+- [x] **Window functions**: our own evaluation pass in `src/sql.mjs`, so AlaSQL never sees an `over (...)` clause.
+      `rewriteWindows()` lifts each window out of the top-level select list and appends the plain columns it reads;
+      `applyWindows()` computes it over the rows the engine returns. Ranking, offset and aggregate functions with
+      `rows`/`range` frames, peer-correct defaults, and the row limit re-applied after the window rather than before. A
+      window buried in an expression or a subquery is refused by name rather than answered with zeros
 - [ ] **Timezone-correct timestamps**: store UTC, render local, never guess the zone
 - [ ] **Pivot and unpivot**: wide<->long reshaping as first-class syntax, not hand-written case statements
 - [ ] **Lateral joins and correlated subqueries**: AlaSQL cannot parse `lateral` at all; as-of joins for
@@ -775,7 +789,8 @@ Extends the Phase 2 roles work.
 - [ ] **Dataset changelogs**: what changed in this dataset since last month
 - [ ] **Provenance display**: source URL, license, fetch date, and transformation chain on every published dataset
 - [ ] **Fork a sheet**: copy someone's sheet, keep the lineage link
-- [ ] **Template gallery**: start from a demo rather than an empty grid
+- [ ] **Template gallery**: start from a demo rather than an empty grid. Six demo pipelines ship as seeded sheets tagged
+      `demo`; nothing in the UI groups or presents them as templates yet
 
 ### Marketplace economics
 
@@ -853,7 +868,8 @@ should land as a sheet with a stated source, license, update cadence, and proven
 - [ ] **Products**: GTIN/UPC catalog and category taxonomy. `table:gs1-prefixes` ships the prefix-to-issuer ranges,
       which is what reads a barcode's origin; the catalog and taxonomy are open
 - [ ] **Events**: the flagship local-events dataset already promised in Go-to-Market
-- [ ] **Securities**: ticker <-> CIK <-> LEI <-> ISIN <-> domain crosswalk
+- [ ] **Securities**: ticker <-> CIK <-> LEI <-> ISIN <-> domain crosswalk. `table:exchanges` ships the ISO 10383 MIC
+      spine every trade record names the venue by; the identifier crosswalk itself is open
 - [ ] **Songs and recordings**: MusicBrainz, ISRC/ISWC, Discogs
 - [ ] **Colors**: already promised; the fun one that gets shared
 
@@ -887,10 +903,14 @@ should land as a sheet with a stated source, license, update cadence, and proven
 
 - [ ] **BLS**: CPI, PPI by commodity, employment, OES wages by area and occupation
 - [ ] **BEA**: GDP, personal income by county, industry accounts
-- [ ] **FRED / Treasury**: rates, yield curve, spreads, money supply
+- [ ] **FRED / Treasury**: rates, yield curve, spreads, money supply. `table:fed-districts` ships the 12 districts with
+      their serial letter, which is what a call report and a Beige Book entry are keyed to
 - [ ] **Census**: ACS demographics, County Business Patterns, Building Permits Survey, TIGER geometries
-- [ ] **Federal Register and regulations**: rule changes with effective dates
-- [ ] **USAspending and SAM.gov**: contracts, grants, and registered entities
+- [ ] **Federal Register and regulations**: rule changes with effective dates. `table:cfr-titles` ships all 50 titles,
+      the first grouping any notice feed needs; the notices themselves are open
+- [ ] **USAspending and SAM.gov**: contracts, grants, and registered entities. `table:agencies` ships 71 federal
+      agencies with the department each bureau sits under, which is the handle three of these feeds disagree on the
+      spelling of
 - [ ] **Grants.gov**: open funding opportunities with eligibility
 - [ ] **FEC**: committees, contributions, expenditures
 - [ ] **Congress**: bills, roll-call votes, sponsors, committees
@@ -901,7 +921,8 @@ should land as a sheet with a stated source, license, update cadence, and proven
 
 ### Finance & markets
 
-- [ ] **SEC EDGAR**: 10-K/10-Q, 8-K, 13F, N-PORT, Form 4, S-1, with XBRL financials extracted
+- [ ] **SEC EDGAR**: 10-K/10-Q, 8-K, 13F, N-PORT, Form 4, S-1, with XBRL financials extracted. `table:sec-forms` ships
+      the form-type spine with who files each and when it is due, which is all a filing index gives you to group by
 - [ ] **Equity prices**: end-of-day history plus a live quote portal, with splits and dividends applied
 - [ ] **Options chains**: strikes, expiries, implied volatility
 - [ ] **Futures and commodities**: CME settlements, LME, energy and ag spot prices
@@ -963,7 +984,8 @@ should land as a sheet with a stated source, license, update cadence, and proven
 - [ ] **HTS tariff schedule**: with duty rates and change history. `table:hs-chapters` ships all 97 HS 2022 chapters
       grouped into their 21 sections, which is the join key; the duty rates and the history are open
 - [ ] **Trade flows**: Census trade data and UN Comtrade
-- [ ] **Vessel positions and port calls**: AIS-derived
+- [ ] **Vessel positions and port calls**: AIS-derived. `table:vessel-types` ships the AIS ship-and-cargo codes, the
+      only description a position report carries; the positions are open
 - [ ] **Port throughput and congestion**. `table:containers` ships the ISO 6346 types with the TEU each counts as, which
       is what makes a throughput figure comparable; the throughput itself is open
 - [x] **Incoterms**: `table:incoterms` ships all 11 Incoterms 2020 with who pays carriage, who must insure, who clears
@@ -1004,11 +1026,14 @@ should land as a sheet with a stated source, license, update cadence, and proven
 
 ### Legal & compliance
 
-- [ ] **Court dockets and opinions**: federal and available state
-- [ ] **Patents and trademarks**: USPTO grants, applications, assignments, CPC codes
+- [ ] **Court dockets and opinions**: federal and available state. `table:circuits` ships the 13 courts of appeals with
+      the states each covers and its authorized judgeships; the dockets are open
+- [ ] **Patents and trademarks**: USPTO grants, applications, assignments, CPC codes. `table:nice-classes` ships the 45
+      Nice classes, the only subject key a trademark register carries; CPC and the filings are open
 - [ ] **UCC filings and liens**
 - [ ] **Regulatory enforcement actions**: SEC, FTC, CFPB, state AGs
-- [ ] **Statutes and administrative codes**: with citation structure
+- [ ] **Statutes and administrative codes**: with citation structure. `table:cfr-titles` is the top of the CFR citation
+      tree; parts, sections and the US Code are open
 
 ### Media, culture & sport
 
@@ -1021,10 +1046,15 @@ should land as a sheet with a stated source, license, update cadence, and proven
 
 ### Technology
 
-- [ ] **Vulnerabilities**: NVD, OSV, CISA KEV, with package and version ranges
+- [ ] **Vulnerabilities**: NVD, OSV, CISA KEV, with package and version ranges. The CVSS v3.1 severity bands ride
+      `table:hazard-scales` as the `cvss-v3` scale, since a score is banded the same way a wind speed is; the feeds are
+      open
 - [ ] **Package registries**: npm, PyPI, crates, Maven metadata and download counts
-- [ ] **Cloud pricing**: AWS, GCP, Azure SKU prices and regions
-- [ ] **Domain, DNS, and certificate transparency data**
+- [ ] **Cloud pricing**: AWS, GCP, Azure SKU prices and regions. `table:cloud-regions` ships 73 regions across the three
+      clouds with the coordinates of the city each is named for, so a latency or residency question answers without a
+      price list; the SKU prices are open
+- [ ] **Domain, DNS, and certificate transparency data**. `table:dns-records` ships the IANA record types by number,
+      which is the form a wire capture carries; the zone, WHOIS and CT feeds are open
 - [ ] **Public status pages and incident history**. `table:http-status` ships the IANA status registry with a `retry`
       column, which is what turns a log of statuses into an answer about whether an integration is broken or busy
 

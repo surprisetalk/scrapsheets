@@ -94,6 +94,16 @@ technologies. It uses a hybrid architecture with:
   `scanRefs()` is the one `@type:doc_id` scanner, and `checkResultColumns()` turns AlaSQL's silent undefined column into
   an error. `nearest()` backs every "did you mean": unknown columns and unresolved `@sheet` refs in both engines. The
   server passes sheet rows through `params[0]` so `alasql.from.SHEET` stays request-scoped
+- **Window functions**: AlaSQL parses `over (partition by ...)` and computes it wrong (`sum(x) over (...)` came back 0),
+  so a window never reaches it. `rewriteWindows()` in `src/sql.mjs` lifts each one out of the **top-level** select list,
+  leaves `null as <alias>` where it stood and appends the plain columns it reads as `__w<n>[apo]<n>`; `applyWindows()`
+  computes it over the rows the engine returned and drops those columns again. Both engines call the pair, so a window
+  means the same thing in the page and in `POST /query`. Ranking, offset and aggregate functions with `rows`/`range`
+  frames; the default frame is peer-correct `range unbounded preceding to current row`. A trailing `limit` is stripped
+  before the engine runs and re-applied after, because a window is defined over every row the query produced. A window
+  that is not a select item of its own — wrapped in an expression, or inside a subquery — is refused by name: returning
+  zeros for it is the bug this replaced. `WINDOW_TYPES` gives each alias its result type on the server; the page takes
+  it from the query sheet's own `cols`
 - **Schema introspection**: `describe @table:abc` is intercepted by `describeRef()` before the engine sees it, in both
   engines, and answers with column/type/rows/nulls/sample. It is the one statement that still works on a sheet whose
   cells fail the type check, because that is the sheet you need to inspect
@@ -140,7 +150,11 @@ technologies. It uses a hybrid architecture with:
   `deno eval "const m = await import('./src/examples.mjs'); console.log(m.DATASETS.length,
   Object.keys(m.EXAMPLES).length, JSON.stringify(m.EXAMPLES).length)"`
   prints the counts and the byte size, which has to stay well under the ~5 MB localStorage budget. Reference tables
-  carry the `reference` tag and joinable spines `dataset`, the only handle the flat library gives for telling them apart
+  carry the `reference` tag and joinable spines `dataset`, the only handle the flat library gives for telling them
+  apart. Six end-to-end pipelines from the Demo Gallery ship as sheets tagged `demo` — WIP schedule, AR aging, exit
+  waterfall, pairs-trade monitor, restaurant prime cost, municipal burn rate — each a seeded source table plus one or
+  two query sheets. Their data is invented; their shapes are not. `store` and `class` are AlaSQL keywords, so no column
+  may be named either: `select store from ...` will not parse
 - **Cross-sheet queries in the browser**: `resolveSheets` rewrites `@type:doc_id` to `SHEET('id')` and pre-loads each
   doc (library entry or `repo.find`) before AlaSQL runs; `@query:` refs recurse, bounded by `checkRefPath` which reports
   a cycle as the path that closes it (`a -> b -> a`) and caps depth at `MAX_REF_DEPTH`

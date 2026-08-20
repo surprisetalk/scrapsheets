@@ -8,7 +8,7 @@ import Stripe from "stripe";
 import { app, arrayify, automerge, createJwt, createToken, parseNetHeaders, pollNetOnce, seed, sql } from "./main.ts";
 import type { Col, Query, Sheet, Table, Template } from "./main.ts";
 import { DATASETS, EXAMPLES } from "./src/examples.mjs";
-import { checkColumnTypes, describeRef, describeRows, scanRefs } from "./src/sql.mjs";
+import { applyWindows, checkColumnTypes, describeRef, describeRows, rewriteWindows, scanRefs } from "./src/sql.mjs";
 import ala from "alasql";
 import dbSql from "./schema/db.sql" with { type: "text" };
 import examplesSql from "./examples.sql" with { type: "text" };
@@ -545,13 +545,30 @@ Deno.test(async function allTests(_t) {
         // A @query ref needs the whole recursion; the browser test covers those.
         if (code.includes("@query:")) continue;
         const described = describeRef(code);
-        const rows = described
-          ? describeRows(described, cols(described), loaded[described])
-          : (await ala(scanRefs(code).sql, [loaded]) as { data: unknown[] }).data;
+        let rows: unknown[];
+        if (described) rows = describeRows(described, cols(described), loaded[described]);
+        else {
+          // Same two-step the server runs: windows never reach the engine.
+          const plan = rewriteWindows(scanRefs(code).sql);
+          const res = await ala(plan.sql, [loaded]) as { columns: { columnid: string }[]; data: unknown[] };
+          rows = plan.windows.length ? applyWindows(res, plan).data : res.data;
+          // A window column that came back empty means the pass silently missed it.
+          for (const w of plan.windows) {
+            assert(
+              (rows as Record<string, unknown>[]).some((r) => r[w.alias] !== null && r[w.alias] !== undefined),
+              `${id}: the window column "${w.alias}" is empty in every row`,
+            );
+          }
+        }
         assert(rows.length > 0, `${id} returned no rows`);
         ran++;
       }
-      assertEquals(ran, examples.filter(([, ex]) => ex.doc.type === "query").length - 1, "one example is @query-only");
+      const chained = examples.filter(([, ex]) => ex.doc.type === "query" && ex.doc.data[0].code.includes("@query:"));
+      assertEquals(
+        ran,
+        examples.filter(([, ex]) => ex.doc.type === "query").length - chained.length,
+        `${chained.length} examples build on another query; the browser test covers those`,
+      );
     }
 
     // Buying with invalid sell_id returns 404.
@@ -838,6 +855,95 @@ Deno.test(async function allTests(_t) {
       // A date spine turns gaps into zero rows instead of missing rows.
       const spine = await run(`select count(*) n from series('2026-01-01','2026-01-10')`);
       assertEquals(spine.n, 10);
+    }
+
+    // Window functions. AlaSQL parses `over (partition by ...)` and then computes
+    // it wrong -- sum(x) over (...) came back 0 -- so src/sql.mjs lifts every
+    // window out of the query and computes it over the rows the engine returns.
+    // The page runs the same pass from the same module.
+    {
+      const rows = async (code: string) => {
+        const { data: [, ...rs] }: { data: Table } = await post(jwt, `/query`, { lang: "sql", code, args: [] });
+        return rs as Record<string, number | string>[];
+      };
+      const T = `(select 'a' as shop, '2026-01-01' as day, 10 as amt
+                  union all select 'b' as shop, '2026-01-01' as day, 5 as amt
+                  union all select 'a' as shop, '2026-01-02' as day, 20 as amt
+                  union all select 'b' as shop, '2026-01-02' as day, 5 as amt
+                  union all select 'a' as shop, '2026-01-03' as day, 30 as amt
+                  union all select 'b' as shop, '2026-01-03' as day, 50 as amt)`;
+      const col = (rs: Record<string, number | string>[], name: string) => rs.map((r) => r[name]).join();
+
+      const running = await rows(
+        `select shop, day, sum(amt) over (partition by shop order by day) as running from ${T} order by shop, day`,
+      );
+      assertEquals(col(running, "running"), "10,30,60,5,10,60");
+
+      // Ties share a rank but not a row number, and dense_rank does not skip.
+      const ranked = await rows(
+        `select amt, row_number() over (order by amt) as rn, rank() over (order by amt) as rk,
+                dense_rank() over (order by amt) as dr
+         from ${T} where shop = 'b' order by rn`,
+      );
+      assertEquals([col(ranked, "rn"), col(ranked, "rk"), col(ranked, "dr")], ["1,2,3", "1,1,3", "1,1,2"]);
+
+      const offsets = await rows(
+        `select day, lag(amt, 1, 0) over (partition by shop order by day) as prev,
+                lead(amt) over (partition by shop order by day) as next,
+                avg(amt) over (partition by shop order by day rows between 1 preceding and current row) as ma2
+         from ${T} where shop = 'a' order by day`,
+      );
+      assertEquals([col(offsets, "prev"), col(offsets, "next"), col(offsets, "ma2")], [
+        "0,10,20",
+        "20,30,",
+        "10,15,25",
+      ]);
+
+      // A window over an aggregate: the grand total beside each group's own.
+      const grouped = await rows(
+        `select shop, sum(amt) as amt, sum(sum(amt)) over () as grand from ${T} group by shop order by shop`,
+      );
+      assertEquals([col(grouped, "amt"), col(grouped, "grand")], ["60,60", "120,120"]);
+
+      // The row cap comes off before the engine runs and goes back on after, so
+      // the running total is the one over every row, not over the two returned.
+      const capped = await rows(
+        `select shop, sum(amt) over (partition by shop order by day) as running from ${T} order by day, shop limit 2`,
+      );
+      assertEquals(col(capped, "running"), "10,5");
+
+      // The result column carries the window's own type, not the source column's.
+      const { data: [typed] }: { data: Table } = await post(jwt, `/query`, {
+        lang: "sql",
+        code: `select shop, row_number() over (order by amt) as rn from ${T}`,
+        args: [],
+      });
+      assertEquals(Object.values(typed).map((c) => `${c.name}:${c.type}`).join(), "shop:text,rn:int");
+
+      // A window that is not a select item of its own cannot be lifted, and
+      // returning zeros for it is worse than saying so.
+      for (
+        const [code, said] of [
+          [`select shop, sum(amt) over (partition by shop) from ${T}`, "as some_name"],
+          [`select shop, sum(amt) over (partition by shop) * 2 as z from ${T}`, "as some_name"],
+          [`select shop, sumx(amt) over (partition by shop) as z from ${T}`, "not a window function"],
+          [`select shop from (select shop, sum(amt) over () as w from ${T}) x`, "outermost select list"],
+          [`select shop, amt as z, sum(amt) over () as z from ${T}`, "both named"],
+          [
+            `select shop, sum(amt) over (partition by shop range between 1 preceding and current row) as z from ${T}`,
+            "range frame cannot count",
+          ],
+        ] as const
+      ) {
+        const res = await app.request(`/query`, {
+          method: "POST",
+          headers: new Headers({ Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" }),
+          body: JSON.stringify({ lang: "sql", code, args: [] }),
+        });
+        assertEquals(res.status, 400);
+        const body = await res.text();
+        assert(body.includes(said), `expected "${said}" in: ${body}`);
+      }
     }
 
     // A malformed query is a 400 naming the line, not a generic 500.

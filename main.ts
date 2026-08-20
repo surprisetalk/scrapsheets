@@ -18,6 +18,7 @@ import * as path from "@std/path";
 import examplesSql from "./examples.sql" with { type: "text" };
 import { DATASETS } from "./src/examples.mjs";
 import {
+  applyWindows,
   checkColumnTypes,
   checkQueryRows,
   checkRefPath,
@@ -30,7 +31,9 @@ import {
   MAX_QUERY_MS,
   nearest,
   register,
+  rewriteWindows,
   scanRefs,
+  WINDOW_TYPES,
 } from "./src/sql.mjs";
 import Stripe from "stripe";
 
@@ -454,6 +457,25 @@ const executeSql = async (
     };
   }
 
+  // A window never reaches the engine: AlaSQL parses `over (...)` and computes
+  // it wrong. rewriteWindows lifts each one out and applyWindows fills the answer
+  // back in, the same way in both engines.
+  let plan: {
+    sql: string;
+    windows: { fn: string; alias: string; args: string[] }[];
+    limit: number | null;
+    offset: number;
+  };
+  try {
+    plan = rewriteWindows(code_);
+  } catch (err) {
+    throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
+  }
+  for (const w of plan.windows) {
+    const declared = (WINDOW_TYPES as Record<string, Type | null>)[w.fn];
+    nameToType[w.alias] = declared ?? nameToType[w.args[0]] ?? "num";
+  }
+
   let result: { columns: { columnid: string }[]; data: Record<string, unknown>[] };
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -461,7 +483,7 @@ const executeSql = async (
     // how long the caller waits, not how long the CPU burns. checkQueryRows above
     // is the guard that actually keeps a runaway from starting.
     result = await Promise.race<typeof result>([
-      ala(code_, [docs]),
+      ala(plan.sql, [docs]),
       new Promise<never>((_, reject) => {
         timer = setTimeout(
           () =>
@@ -486,8 +508,9 @@ const executeSql = async (
   } finally {
     clearTimeout(timer);
   }
-  const { columns: cols, data: rows } = result;
+  let { columns: cols, data: rows } = result;
   try {
+    if (plan.windows.length) ({ columns: cols, data: rows } = applyWindows(result, plan));
     checkResultColumns(cols, rows, Object.keys(nameToType), sqlCode);
   } catch (err) {
     throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });

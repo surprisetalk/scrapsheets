@@ -32,6 +32,7 @@
       import { BrowserWebSocketClientAdapter } from "/automerge-repo-ws.mjs";
       import { Col, EXAMPLES, Table } from "/examples.mjs";
       import {
+        applyWindows,
         checkColumnTypes,
         checkRefPath,
         checkResultColumns,
@@ -41,6 +42,7 @@
         formatQueryError,
         nearest,
         register,
+        rewriteWindows,
         scanRefs,
       } from "/sql.mjs";
       import alasql from "/alasql.mjs";
@@ -773,10 +775,17 @@
                     const resolved = await resolveSheets(code);
                     // Same check as the server, so a sheet that fails in one fails in both.
                     for (const [id_, cols_] of sheetCols) checkColumnTypes(id_, cols_, sheetCache.get(id_) ?? []);
-                    const [, { columns: cols, data: rows } = {}] = await alasql([
+                    // A window never reaches the engine: AlaSQL parses `over (...)`
+                    // and computes it wrong. Lifted out here and filled back in
+                    // afterwards, the same way the server does it.
+                    const plan = rewriteWindows(resolved);
+                    const [, result = {}] = await alasql([
                       [`set @params = ?`, [params]],
-                      resolved,
+                      plan.sql,
                     ]);
+                    const { columns: cols, data: rows } = plan.windows.length
+                      ? applyWindows(result, plan)
+                      : result;
                     checkResultColumns(cols, rows, sheetColumns(), code);
                     // TODO: If doc contains cols data, use that names and types.
                     app.ports.docQueried.send({

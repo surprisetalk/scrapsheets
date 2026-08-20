@@ -420,6 +420,21 @@ Deno.test("bundled examples render and cross-sheet queries join", async () => {
   ) as string;
   assertEquals(droppedMin, "[{}]", "alasql still drops a text min() silently");
 
+  // Window functions run in the page engine through the same pass the server
+  // uses: AlaSQL never sees the over(...) clause in either place. A moving
+  // average, a rank inside the week, and a running total all appear here.
+  await page.goto(`http://127.0.0.1:${port}/query:store-margin`);
+  await waitForText(["Riverside", "Uptown", "Airport", "sales_ma4", "rank_in_week"], "/query:store-margin");
+
+  // A window over a @query chain: pair-zscore reads pair-spread, which is where
+  // the rolling band is computed. The entry signal is the point of the demo.
+  await page.goto(`http://127.0.0.1:${port}/query:pair-zscore`);
+  await waitForText(["long the ratio", "2026-07-16"], "/query:pair-zscore");
+
+  // A demo pipeline whose second sheet reads the first sheet's window columns.
+  await page.goto(`http://127.0.0.1:${port}/query:exit-waterfall`);
+  await waitForText(["Anders Seed Fund", "Employee option pool"], "/query:exit-waterfall");
+
   // Library chrome: tutorial checklist, net-* creation rows, shortcut sheet.
   await page.goto(`http://127.0.0.1:${port}/`);
   await waitForText(["get started"], "tutorial card");

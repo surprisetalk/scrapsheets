@@ -427,6 +427,485 @@ export const checkResultColumns = (cols, rows, known = [], code = "") => {
   }
 };
 
+// --- window functions
+//
+// AlaSQL parses `over (partition by ...)` and then computes it wrong: `sum(x)
+// over (partition by k)` comes back 0, and only row_number() is right. So a
+// window never reaches the engine. rewriteWindows() lifts each one out of the
+// top-level select list, leaves `null as <alias>` where it stood, and appends
+// the plain columns the window reads; applyWindows() computes it over the rows
+// the engine returns and drops those columns again.
+
+// The type each window produces. null means "whatever its argument already was".
+export const WINDOW_TYPES = {
+  row_number: "int",
+  rank: "int",
+  dense_rank: "int",
+  ntile: "int",
+  count: "int",
+  percent_rank: "num",
+  cume_dist: "num",
+  sum: "num",
+  avg: "num",
+  stddev: "num",
+  lag: null,
+  lead: null,
+  first_value: null,
+  last_value: null,
+  nth_value: null,
+  min: null,
+  max: null,
+};
+
+// Ranking and offset functions read the whole partition; a frame never applies.
+const OFFSET = ["lag", "lead"];
+const HIDDEN = /^__w\d+[apo]\d+$/;
+
+// Depth of every character, -1 inside a string literal, computed in one pass so
+// a keyword inside a subquery or a quoted value is never read as a top-level one.
+const topLevel = (s) => {
+  const depth = new Array(s.length).fill(-1);
+  let d = 0, inStr = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (ch === "'") inStr = false;
+      continue;
+    }
+    if (ch === "'") {
+      inStr = true;
+      continue;
+    }
+    if (ch === "(" || ch === "[") {
+      depth[i] = d++;
+      continue;
+    }
+    if (ch === ")" || ch === "]") {
+      depth[i] = --d;
+      continue;
+    }
+    depth[i] = d;
+  }
+  return depth;
+};
+
+const findAt = (s, depth, re, level, from = 0, to = s.length) => {
+  re.lastIndex = from;
+  for (let m; (m = re.exec(s));) {
+    if (m.index >= to) return null;
+    if (depth[m.index] === level) return m;
+  }
+  return null;
+};
+
+const closeParen = (s, depth, open) => {
+  for (let i = open + 1; i < s.length; i++) if (s[i] === ")" && depth[i] === depth[open]) return i;
+  throw new Error(explain(`A window function is missing a closing bracket.`, {
+    Received: s.slice(open, open + 40),
+    Source: "the over(...) clause in this query",
+    Fix: "close every bracket in the over(...) clause",
+  }));
+};
+
+const splitAt = (s, depth, from, to, level) => {
+  const spans = [];
+  let start = from;
+  for (let i = from; i < to; i++) {
+    if (s[i] === "," && depth[i] === level) {
+      spans.push([start, i]);
+      start = i + 1;
+    }
+  }
+  spans.push([start, to]);
+  return spans.filter(([a, b]) => s.slice(a, b).trim() !== "");
+};
+
+const BOUND = /^(?:(unbounded)\s+(preceding|following)|(current)\s+row|(\d+)\s+(preceding|following))$/i;
+
+const bound = (text, spec) => {
+  const m = text.trim().match(BOUND);
+  if (!m) {
+    throw new Error(explain(`A window frame bound is not one I understand.`, {
+      Expected: "unbounded preceding, N preceding, current row, N following, or unbounded following",
+      Received: JSON.stringify(text.trim()),
+      Source: `over (${spec.trim()})`,
+      Fix: "write the bound in one of those five forms",
+    }));
+  }
+  if (m[1]) return { at: m[2].toLowerCase() === "preceding" ? -Infinity : Infinity };
+  if (m[3]) return { at: 0 };
+  return { at: (m[5].toLowerCase() === "preceding" ? -1 : 1) * Number(m[4]) };
+};
+
+const parseFrame = (text, spec) => {
+  const m = text.trim().match(/^(rows|range)\s+(?:between\s+([\s\S]+?)\s+and\s+([\s\S]+)|([\s\S]+))$/i);
+  if (!m) {
+    throw new Error(explain(`A window frame clause is not one I understand.`, {
+      Expected: "rows|range between <bound> and <bound>",
+      Received: JSON.stringify(text.trim()),
+      Source: `over (${spec.trim()})`,
+      Fix: "e.g. rows between 6 preceding and current row",
+    }));
+  }
+  const mode = m[1].toLowerCase();
+  const start = bound(m[2] ?? m[4], spec);
+  const end = m[3] === undefined ? { at: 0 } : bound(m[3], spec);
+  // A range frame counts peers, not rows, so an offset in rows has no meaning here.
+  if (mode === "range" && [start.at, end.at].some((n) => Number.isFinite(n) && n !== 0)) {
+    throw new Error(explain(`A range frame cannot count a number of rows.`, {
+      Received: JSON.stringify(text.trim()),
+      Cause: "range measures peers of the order-by value; only unbounded and current row are defined for it",
+      Source: `over (${spec.trim()})`,
+      Fix: `write "rows between ..." instead, which counts rows`,
+    }));
+  }
+  return { mode, start, end };
+};
+
+// Parses `fn(args) over (spec)` starting at `from`, or returns null if the item
+// does not start with a call. Everything else about the item is the caller's.
+const parseWindow = (code, depth, from, to, index) => {
+  const call = code.slice(from, to).match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+  if (!call) return null;
+  const open = from + call[0].length - 1;
+  const argEnd = closeParen(code, depth, open);
+  const after = code.slice(argEnd + 1, to).match(/^\s*over\s*\(/i);
+  if (!after) return null;
+
+  const fn = call[1].toLowerCase();
+  if (!(fn in WINDOW_TYPES)) {
+    const hit = nearest(fn, Object.keys(WINDOW_TYPES));
+    throw new Error(explain(`"${fn}()" is not a window function.`, {
+      ...(hit ? { "Did you mean": `${hit}()` } : { Available: Object.keys(WINDOW_TYPES).join(", ") }),
+      Source: `${fn}(...) over (...) in this query`,
+      Fix: hit ? `write ${hit}(...) over (...)` : "use one of the listed functions, or drop the over(...) clause",
+    }));
+  }
+
+  const specOpen = argEnd + 1 + after[0].length - 1;
+  const specEnd = closeParen(code, depth, specOpen);
+  const level = depth[specOpen] + 1;
+  const spec = code.slice(specOpen + 1, specEnd);
+
+  const alias = code.slice(specEnd + 1, to).match(/^\s*(?:as\s+)?["'`[]?([A-Za-z_][A-Za-z0-9_]*)["'`\]]?\s*$/i);
+  if (!alias) {
+    throw new Error(explain(`A window function needs a name of its own.`, {
+      Expected: `${fn}(...) over (...) as some_name`,
+      Received: code.slice(from, to).trim(),
+      Source: "the select list of this query",
+      Fix: `add "as <name>" after the over(...) clause, and do not wrap it in another expression`,
+    }));
+  }
+
+  const p = findAt(code, depth, /\bpartition\s+by\b/gi, level, specOpen + 1, specEnd);
+  const o = findAt(code, depth, /\border\s+by\b/gi, level, specOpen + 1, specEnd);
+  const f = findAt(code, depth, /\b(?:rows|range)\b/gi, level, (o ?? p)?.index ?? specOpen + 1, specEnd);
+  const stop = (...xs) => Math.min(...xs.filter((n) => n !== undefined && n !== null));
+
+  const partition = p
+    ? splitAt(code, depth, p.index + p[0].length, stop(o?.index, f?.index, specEnd), level)
+      .map(([a, b]) => code.slice(a, b).trim())
+    : [];
+  const order = o
+    ? splitAt(code, depth, o.index + o[0].length, stop(f?.index, specEnd), level).map(([a, b]) => {
+      const text = code.slice(a, b).trim();
+      const dir = text.match(/\s+(asc|desc)$/i);
+      return { expr: dir ? text.slice(0, dir.index).trim() : text, desc: !!dir && dir[1].toLowerCase() === "desc" };
+    })
+    : [];
+  const frame = f
+    ? parseFrame(code.slice(f.index, specEnd), spec)
+    // The standard default: with an order by, everything up to the current row
+    // and its peers; without one, the whole partition.
+    : { mode: "range", start: { at: -Infinity }, end: { at: order.length ? 0 : Infinity } };
+
+  const rawArgs = splitAt(code, depth, open + 1, argEnd, depth[open] + 1).map(([a, b]) => code.slice(a, b).trim());
+  const star = rawArgs.length === 1 && rawArgs[0] === "*";
+  // lag/lead/ntile/nth_value take a literal count after the value expression;
+  // only the value expression becomes a column.
+  const counted = rawArgs.slice(1).map((t) => {
+    if (/^-?\d+$/.test(t)) return Number(t);
+    if (/^null$/i.test(t)) return null;
+    if (/^'([^']*)'$/.test(t)) return t.slice(1, -1);
+    throw new Error(explain(`${fn}() takes a literal after its value, not an expression.`, {
+      Expected: "a whole number, a quoted text value, or null",
+      Received: JSON.stringify(t),
+      Source: `${fn}(${rawArgs.join(", ")}) over (...)`,
+      Fix: `write the offset as a number, e.g. ${fn}(x, 1)`,
+    }));
+  });
+  const args = star || !rawArgs.length ? [] : [rawArgs[0]];
+
+  return {
+    fn,
+    alias: alias[1],
+    star,
+    args,
+    counted,
+    partition,
+    order,
+    frame,
+    span: [from, to],
+    hidden: {
+      args: args.map((_, j) => `__w${index}a${j}`),
+      partition: partition.map((_, j) => `__w${index}p${j}`),
+      order: order.map((_, j) => `__w${index}o${j}`),
+    },
+  };
+};
+
+export const rewriteWindows = (code) => {
+  const depth = topLevel(code);
+  // Cheap exit: no over( anywhere outside a string means nothing to lift.
+  if (!/\bover\s*\(/i.test(code.replace(/'[^']*'/g, "''"))) return { sql: code, windows: [], limit: null, offset: 0 };
+
+  const select = findAt(code, depth, /\bselect\b/gi, 0);
+  if (!select) {
+    throw new Error(explain(`A window function needs a select statement around it.`, {
+      Received: code.trim().slice(0, 60),
+      Source: "this query",
+      Fix: "put the over(...) clause in the select list of a select statement",
+    }));
+  }
+  const listStart = select.index + select[0].length;
+  const tail = findAt(code, depth, /\b(?:from|where|group|having|order|limit|offset|union|into)\b/gi, 0, listStart);
+  const listEnd = tail ? tail.index : code.length;
+
+  if (/^\s*(?:distinct|top\b)/i.test(code.slice(listStart, listEnd))) {
+    throw new Error(explain(`A window function cannot share a select list with distinct or top.`, {
+      Received: code.slice(listStart, listEnd).trim().slice(0, 60),
+      Cause: "both change which rows exist, and a window is defined over the rows that do",
+      Source: "the select list of this query",
+      Fix: "compute the window in its own query sheet, then select distinct from that",
+    }));
+  }
+
+  // Everything outside the select list: only row_number() works there unlifted.
+  const outside = code.slice(0, listStart) + " ".repeat(listEnd - listStart) + code.slice(listEnd);
+  const buried = outside.replace(/'[^']*'/g, "''").match(/([A-Za-z_][A-Za-z0-9_]*)\s*\([^()]*\)\s*over\s*\(/i);
+  if (buried && buried[1].toLowerCase() !== "row_number") {
+    throw new Error(explain(`A window function only works in the outermost select list.`, {
+      Received: buried[0].trim(),
+      Cause: "windows are computed after the engine returns its rows, so a nested one would see the wrong rows",
+      Source: "a subquery or clause of this query",
+      Fix: "move that select into its own query sheet and reference it with @query:",
+    }));
+  }
+
+  const windows = [];
+  const edits = [];
+  for (const [a, b] of splitAt(code, depth, listStart, listEnd, 0)) {
+    const w = parseWindow(code, depth, a, b, windows.length);
+    if (!w) {
+      // A window buried in an expression or a subquery is not lifted, and only
+      // row_number() survives that in AlaSQL, so say so rather than return zeros.
+      const stray = code.slice(a, b).match(/([A-Za-z_][A-Za-z0-9_]*)\s*\([^()]*\)\s*over\s*\(/i);
+      if (stray && stray[1].toLowerCase() !== "row_number") {
+        throw new Error(explain(`A window function has to be a select item on its own.`, {
+          Expected: `${stray[1]}(...) over (...) as some_name`,
+          Received: code.slice(a, b).trim(),
+          Source: "the select list of this query",
+          Fix: "select the window into its own named column, then wrap it in an outer query sheet",
+        }));
+      }
+      continue;
+    }
+    windows.push(w);
+    edits.push([a, b, ` null as ${w.alias} `]);
+  }
+  if (!windows.length) return { sql: code, windows: [], limit: null, offset: 0 };
+
+  // Two columns with one name: AlaSQL keeps whichever it wrote last and the
+  // window silently overwrites the other. Name the collision instead.
+  const taken = new Map();
+  for (const [a, b] of splitAt(code, depth, listStart, listEnd, 0)) {
+    const item = code.slice(a, b).trim();
+    const named = item.match(/\bas\s+["'`[]?([A-Za-z_][A-Za-z0-9_]*)/i) ??
+      item.match(/^(?:[A-Za-z_][A-Za-z0-9_]*\.)?([A-Za-z_][A-Za-z0-9_]*)$/);
+    if (named) taken.set(named[1].toLowerCase(), (taken.get(named[1].toLowerCase()) ?? 0) + 1);
+  }
+  for (const w of windows) {
+    if (taken.get(w.alias.toLowerCase()) > 1) {
+      throw new Error(explain(`Two columns in this query are both named "${w.alias}".`, {
+        Cause: "the window is written into that column after the engine runs, so it would overwrite the other one",
+        Source: "the select list of this query",
+        Fix: `rename one of them, e.g. ${w.alias}_window`,
+      }));
+    }
+  }
+
+  const hidden = windows.flatMap((w) => [
+    ...w.args.map((expr, j) => `${expr} as ${w.hidden.args[j]}`),
+    ...w.partition.map((expr, j) => `${expr} as ${w.hidden.partition[j]}`),
+    ...w.order.map(({ expr }, j) => `${expr} as ${w.hidden.order[j]}`),
+  ]);
+  edits.push([listEnd, listEnd, hidden.length ? `, ${hidden.join(", ")} ` : " "]);
+
+  // A window is computed over every row the query produced, so the row cap has
+  // to come off before the engine applies it and go back on afterwards.
+  let limit = null, offset = 0;
+  const lim = findAt(code, depth, /\blimit\b/gi, 0, listEnd);
+  if (lim) {
+    const rest = code.slice(lim.index).match(/^limit\s+(\d+)(?:\s+offset\s+(\d+))?\s*;?\s*$/i);
+    if (!rest) {
+      throw new Error(explain(`I cannot read the row limit on a query that uses a window function.`, {
+        Expected: "limit <n>, or limit <n> offset <m>, at the very end",
+        Received: code.slice(lim.index).trim(),
+        Source: "the end of this query",
+        Fix: "write the limit as a plain number at the end of the query",
+      }));
+    }
+    limit = Number(rest[1]);
+    offset = rest[2] ? Number(rest[2]) : 0;
+    edits.push([lim.index, code.length, " "]);
+  }
+
+  let sql = code;
+  for (const [a, b, text] of edits.sort((x, y) => y[0] - x[0])) sql = sql.slice(0, a) + text + sql.slice(b);
+  return { sql, windows, limit, offset };
+};
+
+// Nulls sort last ascending and first descending, matching Postgres.
+const winCompare = (a, b) => {
+  const [na, nb] = [a === null || a === undefined, b === null || b === undefined];
+  if (na || nb) return na && nb ? 0 : na ? 1 : -1;
+  if (typeof a === "number" && typeof b === "number") return a - b;
+  const [x, y] = [String(a), String(b)];
+  return x < y ? -1 : x > y ? 1 : 0;
+};
+
+const winNum = (fn, v) => {
+  if (v === null || v === undefined || v === "") return null;
+  const n = typeof v === "string" ? Number(v) : v instanceof Date ? v.getTime() : v;
+  if (typeof n !== "number" || !Number.isFinite(n)) {
+    throw new Error(explain(`${fn}() over a window received a value it cannot add up.`, {
+      Expected: "a number or a blank",
+      Received: `${typeof v} ${JSON.stringify(v)}`,
+      Source: `the ${fn}(...) over (...) column in this query`,
+      Fix: "filter the non-numeric rows out, or use min()/max() which compare instead of add",
+    }));
+  }
+  return n;
+};
+
+const frameBounds = (frame, pos, peer, size) => {
+  const edge = ({ at }, fallback) => at === -Infinity ? 0 : at === Infinity ? size - 1 : at === 0 ? fallback : pos + at;
+  // A range frame moves to the edge of the peer group; a rows frame counts rows.
+  const lo = frame.mode === "range" && frame.start.at === 0 ? peer.first : edge(frame.start, pos);
+  const hi = frame.mode === "range" && frame.end.at === 0 ? peer.last : edge(frame.end, pos);
+  return [Math.max(0, lo), Math.min(size - 1, hi)];
+};
+
+const winValue = (w, rows, ord, pos) => {
+  const size = ord.length;
+  const at = (p) => rows[ord[p]];
+  const arg = (p) => (w.hidden.args.length ? at(p)[w.hidden.args[0]] : null);
+  const sameOrder = (a, b) => w.hidden.order.every((k) => winCompare(at(a)[k], at(b)[k]) === 0);
+
+  // Peer group: the run of rows with the same order-by value. With no order by
+  // every row in the partition is a peer, which is what makes rank() all 1s.
+  let first = pos, last = pos;
+  if (!w.order.length) [first, last] = [0, size - 1];
+  else {
+    while (first > 0 && sameOrder(first - 1, pos)) first--;
+    while (last < size - 1 && sameOrder(last + 1, pos)) last++;
+  }
+
+  if (w.fn === "row_number") return pos + 1;
+  if (w.fn === "rank") return first + 1;
+  if (w.fn === "dense_rank") {
+    let n = 1;
+    for (let i = 1; i <= first; i++) if (!sameOrder(i, i - 1)) n++;
+    return n;
+  }
+  if (w.fn === "percent_rank") return size === 1 ? 0 : first / (size - 1);
+  if (w.fn === "cume_dist") return (last + 1) / size;
+  if (w.fn === "ntile") {
+    const n = w.counted.length ? w.counted[0] : Number(w.args[0]);
+    if (!Number.isInteger(n) || n < 1) {
+      throw new Error(explain(`ntile() needs a whole number of buckets.`, {
+        Expected: "a positive whole number, e.g. ntile(4)",
+        Received: JSON.stringify(w.counted[0] ?? w.args[0] ?? null),
+        Source: `the ${w.alias} column in this query`,
+        Fix: "write ntile(4) over (...) for quartiles",
+      }));
+    }
+    const big = size % n, small = Math.floor(size / n);
+    const cut = big * (small + 1);
+    return pos < cut ? Math.floor(pos / (small + 1)) + 1 : big + Math.floor((pos - cut) / small) + 1;
+  }
+  if (OFFSET.includes(w.fn)) {
+    const step = (w.counted.length ? Number(w.counted[0]) : 1) * (w.fn === "lag" ? -1 : 1);
+    const p = pos + step;
+    return p >= 0 && p < size ? arg(p) : (w.counted.length > 1 ? w.counted[1] : null);
+  }
+
+  const [lo, hi] = frameBounds(w.frame, pos, { first, last }, size);
+  if (hi < lo) return w.fn === "count" ? 0 : null;
+  if (w.fn === "count") {
+    if (w.star) return hi - lo + 1;
+    let n = 0;
+    for (let p = lo; p <= hi; p++) if (arg(p) !== null && arg(p) !== undefined) n++;
+    return n;
+  }
+  if (w.fn === "first_value") return arg(lo);
+  if (w.fn === "last_value") return arg(hi);
+  if (w.fn === "nth_value") {
+    const n = w.counted.length ? w.counted[0] : 1;
+    return lo + n - 1 <= hi ? arg(lo + n - 1) : null;
+  }
+  if (w.fn === "min" || w.fn === "max") {
+    let best;
+    for (let p = lo; p <= hi; p++) {
+      const v = arg(p);
+      if (v === null || v === undefined) continue;
+      const keep = w.fn === "min" ? winCompare(v, best) < 0 : winCompare(v, best) > 0;
+      if (best === undefined || keep) best = v;
+    }
+    return best ?? null;
+  }
+  const xs = [];
+  for (let p = lo; p <= hi; p++) {
+    const n = winNum(w.fn, arg(p));
+    if (n !== null) xs.push(n);
+  }
+  if (!xs.length) return null;
+  const total = xs.reduce((a, b) => a + b, 0);
+  if (w.fn === "sum") return total;
+  if (w.fn === "avg") return total / xs.length;
+  if (xs.length < 2) return null;
+  const m = total / xs.length;
+  return Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / (xs.length - 1));
+};
+
+export const applyWindows = ({ columns, data }, { windows, limit, offset }) => {
+  for (const w of windows) {
+    const groups = new Map();
+    data.forEach((row, i) => {
+      const key = JSON.stringify(w.hidden.partition.map((k) => row[k] ?? null));
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(i);
+    });
+    for (const idxs of groups.values()) {
+      // Stable: the engine's own row order breaks a tie, so repeated runs agree.
+      const ord = [...idxs].sort((a, b) => {
+        for (let j = 0; j < w.order.length; j++) {
+          const c = winCompare(data[a][w.hidden.order[j]], data[b][w.hidden.order[j]]) * (w.order[j].desc ? -1 : 1);
+          if (c) return c;
+        }
+        return a - b;
+      });
+      for (let pos = 0; pos < ord.length; pos++) data[ord[pos]][w.alias] = winValue(w, data, ord, pos);
+    }
+  }
+  for (const row of data) for (const key of Object.keys(row)) if (HIDDEN.test(key)) delete row[key];
+  const cols = columns.filter((col) => !HIDDEN.test(col.columnid));
+  return {
+    columns: cols,
+    data: limit === null || limit === undefined ? data : data.slice(offset, offset + limit),
+  };
+};
+
 // --- registration
 
 export const register = (alasql) => {
