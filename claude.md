@@ -70,7 +70,7 @@ technologies. It uses a hybrid architecture with:
   returns owner/editor/viewer or null, covering membership, purchase-derived access, `sheet.public`, and share-link
   JWTs; a viewer's frames are inspected with `Automerge.decodeSyncMessage` and rejected if they carry changes
 - **Authentication**: JWT-based with email verification via Resend (plain fetch, RESEND_API_KEY)
-- **Document types**: table, query, net-hook, net-http, net-socket, portal, alert, codex-*
+- **Document types**: table, query, net-hook, net-http, net-socket, portal, alert, chart, codex-*
 - **Seeding**: a lazy-once middleware runs `seed()` (examples.sql + src/examples.mjs datasets) on the first request;
   idempotent via `on conflict (doc_id) do update`
 - **net-http polling**: `pollNetOnce` scans net-http sheets every 15s, fetches due URLs through the safeFetch SSRF
@@ -82,10 +82,22 @@ technologies. It uses a hybrid architecture with:
 - **Alerts**: an `alert` sheet is `{ code, to, interval }` and fires when its query returns a row, so the condition is
   the where clause and there is no second expression language. `pollAlertOnce` scans them every 15s and runs each
   through `POST /query` **as its owner** (`createJwt(created_by)`), so an alert can never read a sheet its owner cannot.
-  Every run whose answer differs from the last one lands in `net` with `method = 'ALERT'` — status, row count, the first
-  five matches, and what the delivery did — which makes the alert's history a sheet you can query, and makes the de-dupe
-  survive a restart because the previous digest is read back out of that log. `POST /sell` refuses an alert: a copy
-  would mail the seller's address on the buyer's timer
+  Every run whose answer differs from the last one lands in `net` with `method = 'ALERT'` — status, row count,
+  `added`/`removed` against the run before, the rows it matched up to `ALERT_ROWS`, and what the delivery did — which
+  makes the alert's history a sheet you can query, and makes both the de-dupe and the diff survive a restart, because
+  the previous run is read back out of that log. Past `ALERT_ROWS` the run records why it could not diff rather than a
+  number it cannot stand behind. `POST /sell` refuses an alert: a copy would mail the seller's address on the buyer's
+  timer
+- **Charts**: a `chart` sheet is `{ source, kind, x, y }`. `chartSql()` in `src/sql.mjs` turns that into one query both
+  engines build identically, so the SVG the page draws and the rows `GET /sheet/chart:abc` and `/export/chart:abc.csv`
+  return are the same answer. Only a column name reaches the SQL — anything else is refused by name rather than
+  concatenated in — and the page draws it with `elm/svg`, baseline pinned to zero unless the data goes below it,
+  dropping a row whose y is not a number rather than reading it as zero. The `svg`/`png` buttons serialize the SVG
+  already on screen instead of drawing it again, so a saved chart cannot drift from the shown one
+- **Embeds and dashboards**: `?embed=1` on any sheet's own URL renders that sheet with no chrome — same page, same
+  access rules, so an embed grants nothing a link would not. A `dashboard` sheet is `{ tiles: ["@chart:a", ...] }` and
+  lays those out as a grid of embeds, so nothing in it knows how to draw a chart or a table: the sheet it names already
+  does. One page per tile is the cost, and a dashboard cannot be a tile on a dashboard because that nests forever
 - **Fork**: the page's `forkDoc` port copies any sheet you can open — a bundled example included — into a new automerge
   document carrying `forked_from`, registers it, and navigates to it. The toolbar reads `forked_from` back out of the
   document, so lineage travels with the sheet rather than living in one browser's localStorage
@@ -220,7 +232,7 @@ t.trade_id order by p.day desc) = 1` —
 
 - **usr**: User accounts with identity, name, email (citext), password, and `stripe_customer_id`
 - **sheet**: Central document table with polymorphic sheet_id format (`type:doc_id`)
-  - Types: template, table, net-hook, net-http, net-socket, query, portal, alert, codex-*
+  - Types: template, table, net-hook, net-http, net-socket, query, portal, alert, chart, codex-*
   - Marketplace fields: sell_id, sell_type, sell_price, buy_id, buy_price
   - Document data: row_0 (jsonb), name, tags (text[])
   - `public boolean`: anonymous read through `syncRole`
@@ -229,9 +241,11 @@ t.trade_id order by p.day desc) = 1` —
 - **net**: Webhook data storage for net-\* sheets, and the run log for `alert` sheets, which is why the sheet_id check
   allows both prefixes. The read projects `created_at, body, method, req_headers, query_params` — the last three
   appended, so existing column positions and `select body from @net-hook:x` still hold. postgresjs returns jsonb as raw
-  JSON text, so those cells are strings; read them with `json_extract()`. `net_id` identity PK plus an index on
-  `(sheet_id, created_at desc)`; the read orders by both, without which paging a log repeats and skips rows. No
-  retention policy yet — the table still grows without bound
+  JSON text, so those cells are strings; read them with `json_extract()`. `meta` is what the run itself cost:
+  `{status, ms, bytes}` for a net-http poll, `{ms}` for an alert run, `{bytes}` for a webhook delivery. `net_id`
+  identity PK plus an index on `(sheet_id, created_at desc)`; the read orders by both, without which paging a log
+  repeats and skips rows. `trimNet()` keeps the newest `NET_KEEP` rows per sheet and runs behind every write, so the log
+  is bounded — a sheet that must keep everything writes to a table, which is never trimmed
 - **payment**: Marketplace transactions (buyer, seller, sell_id, buyer sheet_id, amount, Stripe session)
 
 #### Key Schema Features

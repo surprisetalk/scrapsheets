@@ -55,6 +55,8 @@ import Http
 import Json.Decode as D
 import Json.Encode as E
 import Set exposing (Set)
+import Svg
+import Svg.Attributes as SvgA
 import Task
 import Url exposing (Url)
 import Url.Parser as UrlP exposing ((</>), (<?>))
@@ -481,6 +483,11 @@ port newDoc : E.Value -> Cmd msg
 port forkDoc : String -> Cmd msg
 
 
+{-| Save the chart on screen as "svg" or "png".
+-}
+port downloadChart : String -> Cmd msg
+
+
 port deleteDoc : String -> Cmd msg
 
 
@@ -609,6 +616,7 @@ type alias Model =
     , share : Share
     , showShortcuts : Bool
     , tutorial : Maybe Int
+    , embed : Bool
     }
 
 
@@ -773,7 +781,9 @@ type Doc
     | Query Query_
     | NetHook
     | NetHttp { url : String, interval : Int, headers : String }
-    | Alert { code : String, to : String, interval : Int }
+    | Alert { code : String, to : String, interval : Int, digest : Bool }
+    | Chart { source : String, kind : String, x : String, y : String }
+    | Dashboard (List String)
     | NetSocket { url : String }
     | Unviewable String
 
@@ -999,10 +1009,26 @@ docDecoder =
                     "alert" ->
                         D.field "data" <|
                             D.index 0 <|
-                                D.map3 (\code to interval -> Alert { code = code, to = to, interval = interval })
+                                D.map4 (\code to interval digest -> Alert { code = code, to = to, interval = interval, digest = digest })
                                     (D.oneOf [ D.field "code" D.string, D.succeed "" ])
                                     (D.oneOf [ D.field "to" D.string, D.succeed "" ])
                                     (D.oneOf [ D.field "interval" D.int, D.succeed 3600 ])
+                                    (D.oneOf [ D.field "digest" D.bool, D.succeed False ])
+
+                    "chart" ->
+                        D.field "data" <|
+                            D.index 0 <|
+                                D.map4 (\source kind x y -> Chart { source = source, kind = kind, x = x, y = y })
+                                    (D.oneOf [ D.field "source" D.string, D.succeed "" ])
+                                    (D.oneOf [ D.field "kind" D.string, D.succeed "line" ])
+                                    (D.oneOf [ D.field "x" D.string, D.succeed "" ])
+                                    (D.oneOf [ D.field "y" D.string, D.succeed "" ])
+
+                    "dashboard" ->
+                        D.field "data" <|
+                            D.index 0 <|
+                                D.map Dashboard
+                                    (D.oneOf [ D.field "tiles" (D.list D.string), D.succeed [] ])
 
                     "template" ->
                         D.succeed (Unviewable typ)
@@ -1135,6 +1161,7 @@ init flags url nav =
                     }
                 , deleteConfirm = Nothing
                 , showSettings = False
+                , embed = False
                 , share = emptyShare
                 , showShortcuts = False
                 , tutorial = iif (tutorialStep < 0) Nothing (Just (clamp 0 4 tutorialStep))
@@ -1161,7 +1188,13 @@ route url model =
                     )
                 |> Maybe.withDefault model
     in
-    { baseModel | showSettings = showSettings }
+    -- ?embed= drops every piece of chrome, which is the whole embed: one sheet,
+    -- with no app around it. Read off the raw query the way the fragment is,
+    -- rather than threaded through the path parser that also carries ?q=.
+    { baseModel
+        | showSettings = showSettings
+        , embed = url.query |> Maybe.map (String.contains "embed") |> Maybe.withDefault False
+    }
 
 
 
@@ -1181,6 +1214,7 @@ type Msg
     | DocMsg DocMsg
     | DocNew E.Value
     | DocFork
+    | ChartDownload String
     | DocNewQuery
     | DocNewTable
     | DocDelete Id
@@ -1278,6 +1312,12 @@ type Input
     | NetHeaders
     | AlertCode
     | AlertTo
+    | AlertDigest
+    | ChartSource
+    | ChartKind
+    | ChartX
+    | ChartY
+    | DashboardTiles
 
 
 
@@ -2088,6 +2128,9 @@ update msg ({ sheet, auth } as model) =
         DocFork ->
             ( model, forkDoc sheet.id )
 
+        ChartDownload format ->
+            ( model, downloadChart format )
+
         DocNewTable ->
             advanceTutorial 0 ( model, newDoc <| E.object [ ( "type", E.string "table" ), ( "data", E.list identity [ E.list identity [ E.object [ ( "name", E.string "a" ), ( "type", E.string "text" ), ( "key", E.string "a" ) ] ] ] ) ] )
 
@@ -2192,6 +2235,39 @@ update msg ({ sheet, auth } as model) =
             , changeDoc
                 { id = sheet.id
                 , data = [ { action = "set", path = [ E.int 0, E.string "to" ], value = E.string x } ]
+                }
+            )
+
+        InputChange AlertDigest x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "digest" ], value = E.bool (x /= "") } ]
+                }
+            )
+
+        InputChange ChartSource x ->
+            ( model, chartSet sheet.id "source" x )
+
+        InputChange ChartKind x ->
+            ( model, chartSet sheet.id "kind" x )
+
+        InputChange ChartX x ->
+            ( model, chartSet sheet.id "x" x )
+
+        InputChange ChartY x ->
+            ( model, chartSet sheet.id "y" x )
+
+        InputChange DashboardTiles x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data =
+                    [ { action = "set"
+                      , path = [ E.int 0, E.string "tiles" ]
+                      , value = E.list E.string (x |> String.lines |> List.map String.trim |> List.filter (not << String.isEmpty))
+                      }
+                    ]
                 }
             )
 
@@ -3793,6 +3869,15 @@ resolveTable model =
         ( Ok (Alert _), Err "" ) ->
             Ok emptyNetTable
 
+        ( Ok (Chart _), Err "" ) ->
+            Ok { cols = Array.fromList [ Col "x" "x" Text, Col "y" "y" Number ], rows = Array.empty }
+
+        ( Ok (Dashboard tiles), _ ) ->
+            Ok
+                { cols = Array.fromList [ Col "tile" "tile" SheetId ]
+                , rows = tiles |> List.map (\t -> Dict.singleton "tile" (E.string (String.dropLeft 1 t))) |> Array.fromList
+                }
+
         ( Err err1, Err err2 ) ->
             -- Both empty means nothing has loaded yet, which the view shows as "loading"
             Err (String.trim (err1 ++ " " ++ err2))
@@ -4554,7 +4639,9 @@ viewTableFooter sheet cols rows =
                     , ( "net-hook:...", DocNew <| E.object [ ( "type", E.string "net-hook" ), ( "data", E.list identity [] ) ] )
                     , ( "net-http:...", DocNew <| E.object [ ( "type", E.string "net-http" ), ( "data", E.list identity [ E.object [ ( "url", E.string "" ), ( "interval", E.int 3600 ) ] ] ) ] )
                     , ( "net-socket:...", DocNew <| E.object [ ( "type", E.string "net-socket" ), ( "data", E.list identity [ E.object [ ( "url", E.string "" ) ] ] ) ] )
-                    , ( "alert:...", DocNew <| E.object [ ( "type", E.string "alert" ), ( "data", E.list identity [ E.object [ ( "code", E.string "" ), ( "to", E.string "" ), ( "interval", E.int 3600 ) ] ] ) ] )
+                    , ( "alert:...", DocNew <| E.object [ ( "type", E.string "alert" ), ( "data", E.list identity [ E.object [ ( "code", E.string "" ), ( "to", E.string "" ), ( "interval", E.int 3600 ), ( "digest", E.bool False ) ] ] ) ] )
+                    , ( "chart:...", DocNew <| E.object [ ( "type", E.string "chart" ), ( "data", E.list identity [ E.object [ ( "source", E.string "" ), ( "kind", E.string "line" ), ( "x", E.string "" ), ( "y", E.string "" ) ] ] ) ] )
+                    , ( "dashboard:...", DocNew <| E.object [ ( "type", E.string "dashboard" ), ( "data", E.list identity [ E.object [ ( "tiles", E.list E.string [] ) ] ] ) ] )
                     ]
                     ++ [ H.tr [] <|
                             H.td []
@@ -4649,6 +4736,11 @@ viewToolbar model info =
             , case sheet.doc of
                 Ok (Tab _) ->
                     [ H.a [ A.class "chip", A.href ("https://api.sheets.scrap.land/export/" ++ sheet.id ++ ".csv"), A.download (sheet.id ++ ".csv") ] [ text "export csv" ] ]
+
+                Ok (Chart _) ->
+                    List.map
+                        (\format -> H.button [ A.class "chip", A.onClick (ChartDownload format), A.title ("save the chart as " ++ format) ] [ text format ])
+                        [ "svg", "png" ]
 
                 _ ->
                     []
@@ -4752,7 +4844,7 @@ viewNetHttp model cfg =
         ]
 
 
-viewAlert : Model -> { code : String, to : String, interval : Int } -> Html Msg
+viewAlert : Model -> { code : String, to : String, interval : Int, digest : Bool } -> Html Msg
 viewAlert model cfg =
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
@@ -4767,6 +4859,10 @@ viewAlert model cfg =
             [ text "check every (seconds)"
             , H.input [ A.type_ "number", A.value (String.fromInt cfg.interval), A.onInput (InputChange NetInterval) ] []
             ]
+        , H.label [ S.displayFlex, S.gapRem 0.5, S.alignItemsCenter, S.fontSizeRem 0.875 ]
+            [ H.input [ A.type_ "checkbox", A.checked cfg.digest, A.onCheck (\on -> InputChange AlertDigest (iif on "1" "")) ] []
+            , text "fold into the daily digest, sent to the account email"
+            ]
         , H.p [ S.fontSizeRem 0.875, S.color "#666" ]
             [ text <|
                 case model.sheet.table of
@@ -4779,6 +4875,187 @@ viewAlert model cfg =
         , H.p [ S.fontSizeRem 0.875, S.color "#666" ]
             [ text "Only a run that changes the answer is sent, and every run lands in the rows beside this." ]
         ]
+
+
+{-| A tile is the sheet itself, embedded. Nothing here knows how to draw a
+chart or a table, because the sheet it names already does -- which is the whole
+reason a chart is a sheet.
+-}
+viewDashboard : List String -> Html Msg
+viewDashboard tiles =
+    if List.isEmpty tiles then
+        H.p [ S.paddingRem 2, S.color "#666" ] [ text "List the sheets to show, one reference per line." ]
+
+    else
+        H.div [ S.displayGrid, S.gridTemplateColumns "repeat(auto-fit, minmax(22rem, 1fr))", S.gapRem 0.5, S.paddingRem 0.5 ]
+            (tiles
+                |> List.map
+                    (\tile ->
+                        let
+                            id =
+                                String.dropLeft 1 tile
+                        in
+                        H.div [ A.class "panel", S.backgroundColor "#fff", S.overflowHidden ]
+                            [ H.a [ A.href ("/" ++ id), S.displayBlock, S.paddingRem 0.375, S.fontSizeRem 0.8125, S.borderBottom "1px solid #aaa" ] [ text tile ]
+
+                            -- A dashboard of dashboards nests one embed inside
+                            -- another until the browser gives up, and a dashboard
+                            -- holding itself never stops. A tile is a sheet with
+                            -- rows; this one is not.
+                            , if String.startsWith "dashboard:" id then
+                                H.p [ S.paddingRem 1, S.fontSizeRem 0.875, S.color "#666" ] [ text "A dashboard cannot be a tile on a dashboard." ]
+
+                              else
+                                H.iframe [ A.src ("/" ++ id ++ "?embed=1"), A.title tile, S.width "100%", S.height "20rem", S.border "none" ] []
+                            ]
+                    )
+            )
+
+
+viewDashboardSettings : List String -> Html Msg
+viewDashboardSettings tiles =
+    H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
+        [ H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "tiles, one sheet reference per line"
+            , H.textarea [ A.class "mono", A.rows 10, A.value (String.join "\n" tiles), A.placeholder "@chart:burn-by-department\n@query:budget-burn", A.spellcheck False, A.onInput (InputChange DashboardTiles) ] []
+            ]
+        , H.p [ S.fontSizeRem 0.875, S.color "#666" ]
+            [ text "Each tile is that sheet, embedded, so it shows whatever the sheet shows." ]
+        ]
+
+
+chartSet : Id -> String -> String -> Cmd Msg
+chartSet id field value =
+    changeDoc { id = id, data = [ { action = "set", path = [ E.int 0, E.string field ], value = E.string value } ] }
+
+
+viewChartSettings : Model -> { source : String, kind : String, x : String, y : String } -> Html Msg
+viewChartSettings model cfg =
+    H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
+        [ H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "reads"
+            , H.input [ A.class "mono", A.value cfg.source, A.placeholder "@query:budget-burn", A.onInput (InputChange ChartSource) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "kind"
+            , H.select [ A.value cfg.kind, A.onInput (InputChange ChartKind) ] <|
+                List.map (\k -> H.option [ A.value k, A.selected (k == cfg.kind) ] [ text k ]) [ "line", "bar" ]
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "across"
+            , H.input [ A.class "mono", A.value cfg.x, A.placeholder "month", A.onInput (InputChange ChartX) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "up"
+            , H.input [ A.class "mono", A.value cfg.y, A.placeholder "spent", A.onInput (InputChange ChartY) ] []
+            ]
+        , H.p [ S.fontSizeRem 0.875, S.color "#666" ]
+            [ text <|
+                case model.sheet.table of
+                    Ok tbl ->
+                        String.fromInt (Array.length tbl.rows) ++ " points"
+
+                    Err _ ->
+                        "no points yet"
+            ]
+        ]
+
+
+{-| The plotted points, in the order the query returned them. A row whose y does
+not read as a number is dropped: a chart cannot draw "n/a", and pretending it is
+zero would be a lie about the shape.
+-}
+chartPoints : Table -> List ( String, Float )
+chartPoints tbl =
+    tbl.rows
+        |> Array.toList
+        |> List.filterMap
+            (\row ->
+                Maybe.map2 Tuple.pair
+                    (Dict.get "x" row |> Maybe.map (D.decodeValue D.string >> Result.withDefault ""))
+                    (Dict.get "y" row |> Maybe.andThen (D.decodeValue number >> Result.toMaybe))
+            )
+
+
+viewChart : { source : String, kind : String, x : String, y : String } -> Table -> Html Msg
+viewChart cfg tbl =
+    let
+        points =
+            chartPoints tbl
+
+        ys =
+            List.map Tuple.second points
+
+        -- The baseline is zero unless the data goes below it, because a bar
+        -- chart that does not start at zero misstates every comparison on it.
+        top =
+            Maybe.withDefault 1 (List.maximum ys) |> max 0
+
+        bottom =
+            Maybe.withDefault 0 (List.minimum ys) |> min 0
+
+        span =
+            iif (top - bottom == 0) 1 (top - bottom)
+
+        n =
+            List.length points
+
+        plotY v =
+            260 - ((v - bottom) / span) * 240
+
+        plotX i =
+            iif (n < 2) 400 (60 + (toFloat i / toFloat (n - 1)) * 720)
+
+        num v =
+            String.fromFloat (round2 v)
+    in
+    if List.isEmpty points then
+        H.p [ S.paddingRem 2, S.color "#666" ]
+            [ text (iif (String.isEmpty cfg.source) "Set what this chart reads, and the two columns to draw." "No points to draw: check that the y column holds numbers.") ]
+
+    else
+        H.div [ S.paddingRem 1, S.backgroundColor "#fff" ]
+            [ Svg.svg [ SvgA.viewBox "0 0 800 300", SvgA.width "100%", SvgA.height "300" ] <|
+                List.concat
+                    [ [ Svg.line [ SvgA.x1 "60", SvgA.y1 (String.fromFloat (plotY bottom)), SvgA.x2 "790", SvgA.y2 (String.fromFloat (plotY bottom)), SvgA.stroke "#aaa" ] []
+                      , Svg.text_ [ SvgA.x "4", SvgA.y "24", SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (num top) ]
+                      , Svg.text_ [ SvgA.x "4", SvgA.y (String.fromFloat (plotY bottom)), SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (num bottom) ]
+                      ]
+                    , case cfg.kind of
+                        "bar" ->
+                            List.indexedMap
+                                (\i ( _, v ) ->
+                                    let
+                                        w =
+                                            iif (n == 0) 10 (720 / toFloat n * 0.7)
+                                    in
+                                    Svg.rect
+                                        [ SvgA.x (String.fromFloat (60 + (toFloat i / toFloat (max 1 n)) * 720))
+                                        , SvgA.y (String.fromFloat (min (plotY v) (plotY 0)))
+                                        , SvgA.width (String.fromFloat w)
+                                        , SvgA.height (String.fromFloat (abs (plotY v - plotY 0)))
+                                        , SvgA.fill "#468"
+                                        ]
+                                        []
+                                )
+                                points
+
+                        _ ->
+                            [ Svg.polyline
+                                [ SvgA.fill "none"
+                                , SvgA.stroke "#468"
+                                , SvgA.strokeWidth "2"
+                                , SvgA.points (points |> List.indexedMap (\i ( _, v ) -> String.fromFloat (plotX i) ++ "," ++ String.fromFloat (plotY v)) |> String.join " ")
+                                ]
+                                []
+                            ]
+                    , -- Only the ends are labelled: every tick would collide, and the
+                      -- rows underneath are one click away in the source sheet.
+                      [ Svg.text_ [ SvgA.x "60", SvgA.y "290", SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (points |> List.head |> Maybe.map Tuple.first |> Maybe.withDefault "") ]
+                      , Svg.text_ [ SvgA.x "790", SvgA.y "290", SvgA.fontSize "12", SvgA.fill "#666", SvgA.textAnchor "end" ] [ Svg.text (points |> List.reverse |> List.head |> Maybe.map Tuple.first |> Maybe.withDefault "") ]
+                      ]
+                    ]
+            ]
 
 
 viewNetSocket : Model -> { url : String } -> Html Msg
@@ -4874,50 +5151,48 @@ view ({ sheet } as model) =
 
         table =
             resolveTable model
-    in
-    { title = "scrapsheets"
-    , body =
-        [ viewAuthForm model.auth
-        , viewFindReplace sheet.findReplace
-        , viewDeleteConfirm model.deleteConfirm
-        , viewSettings model.showSettings info model.share
-        , viewShortcuts model.showShortcuts
-        , viewTutorial model.tutorial
-        , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
-            [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
-                [ viewToolbar model info
-                , H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder "search", S.width "100%", S.border "none", S.borderRadius "0", S.borderBottom "1px solid #aaa", S.padding "0.25rem 0.5rem", S.fontSizeRem 0.875, S.marginBottomPx -1, S.zIndex "2" ] []
-                , H.div [ S.overflowAuto, S.height "100%", S.backgroundColor "#eee" ]
-                    [ viewError model.error
-                    , case table of
-                        Err "" ->
-                            H.div [ S.textAlignCenter, S.paddingRem 2, S.color "#666" ] [ text "loading" ]
 
-                        Err err ->
-                            H.p [] [ text err ]
+        content =
+            H.div [ S.overflowAuto, S.height "100%", S.backgroundColor "#eee" ]
+                [ viewError model.error
+                , case table of
+                    Err "" ->
+                        H.div [ S.textAlignCenter, S.paddingRem 2, S.color "#666" ] [ text "loading" ]
 
-                        Ok { cols, rows } ->
-                            let
-                                sortedRows =
-                                    filterAndSort model.search sheet rows
+                    Err err ->
+                        H.p [] [ text err ]
 
-                                doc =
-                                    sheet.doc |> Result.withDefault Library
-                            in
-                            H.div []
-                                [ iif (doc == Library) (viewGallery model) (text "")
-                                , viewFilterBar sheet (Array.length sortedRows) (Array.length rows)
-                                , H.table [ A.onMouseLeave (CellHover (xy -1 -1)) ]
-                                    [ H.tbody [] <|
-                                        Array.toList <|
-                                            Array.indexedMap (\n_ row -> viewTableRow sheet doc stats cols (n_ - 2) row) <|
-                                                Array.append (Array.repeat 3 Dict.empty) sortedRows
-                                    , viewTableFooter sheet cols sortedRows
+                    Ok { cols, rows } ->
+                        let
+                            sortedRows =
+                                filterAndSort model.search sheet rows
+
+                            doc =
+                                sheet.doc |> Result.withDefault Library
+                        in
+                        case doc of
+                            Chart cfg ->
+                                viewChart cfg { cols = cols, rows = rows }
+
+                            Dashboard tiles ->
+                                viewDashboard tiles
+
+                            _ ->
+                                H.div []
+                                    [ iif (doc == Library) (viewGallery model) (text "")
+                                    , viewFilterBar sheet (Array.length sortedRows) (Array.length rows)
+                                    , H.table [ A.onMouseLeave (CellHover (xy -1 -1)) ]
+                                        [ H.tbody [] <|
+                                            Array.toList <|
+                                                Array.indexedMap (\n_ row -> viewTableRow sheet doc stats cols (n_ - 2) row) <|
+                                                    Array.append (Array.repeat 3 Dict.empty) sortedRows
+                                        , viewTableFooter sheet cols sortedRows
+                                        ]
                                     ]
-                                ]
-                    ]
                 ]
-            , H.aside [ A.id "aside", S.displayFlex, S.flexDirectionColumn, S.height "100%", S.backgroundColor "#fff" ] <|
+
+        aside =
+            H.aside [ A.id "aside", S.displayFlex, S.flexDirectionColumn, S.height "100%", S.backgroundColor "#fff" ] <|
                 case sheet.doc of
                     Ok (Query query) ->
                         [ viewQueryEditor model query ]
@@ -4931,11 +5206,40 @@ view ({ sheet } as model) =
                     Ok (Alert cfg) ->
                         [ viewAlert model cfg ]
 
+                    Ok (Chart cfg) ->
+                        [ viewChartSettings model cfg ]
+
+                    Ok (Dashboard tiles) ->
+                        [ viewDashboardSettings tiles ]
+
                     Ok (NetSocket cfg) ->
                         [ viewNetSocket model cfg ]
 
                     _ ->
                         []
+    in
+    { title = "scrapsheets"
+    , body =
+        -- An embed is the sheet and nothing else: no toolbar, no search, no
+        -- aside, no modals. What a viewer may see is whatever the sheet's own
+        -- sharing already says, so an embed grants nothing a link would not.
+        if model.embed then
+            [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.height "100%", S.width "100%", S.overflowXAuto ] [ content ] ]
+
+        else
+            [ viewAuthForm model.auth
+            , viewFindReplace sheet.findReplace
+            , viewDeleteConfirm model.deleteConfirm
+            , viewSettings model.showSettings info model.share
+            , viewShortcuts model.showShortcuts
+            , viewTutorial model.tutorial
+            , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
+                [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
+                    [ viewToolbar model info
+                    , H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder "search", S.width "100%", S.border "none", S.borderRadius "0", S.borderBottom "1px solid #aaa", S.padding "0.25rem 0.5rem", S.fontSizeRem 0.875, S.marginBottomPx -1, S.zIndex "2" ] []
+                    , content
+                    ]
+                , aside
+                ]
             ]
-        ]
     }

@@ -42,6 +42,7 @@
         describeRows,
         formatQueryError,
         nearest,
+        chartSql,
         checkPivot,
         register,
         rewriteUnpivot,
@@ -859,13 +860,19 @@
             });
             storedThumb(id, doc);
             if (!type || !doc_id) return;
+            // A chart is a query whose SQL its settings describe, built by the
+            // same chartSql the server uses, so the picture matches the export.
+            const chartQuery = (cfg) =>
+              cfg?.source ? { lang: "sql", code: chartSql(cfg), cols: { y: "num" } } : null;
             if (type === "query") queryDoc(id, doc.data[0]);
+            if (type === "chart" && chartQuery(doc.data?.[0])) queryDoc(id, chartQuery(doc.data[0]));
             sheetHandle?.on?.("change", (data) => {
               app.ports.docChanged.send({
                 id: type + ":" + data.handle.documentId,
                 data,
               });
               if (type === "query") queryDoc(id, data.doc.data[0]);
+              if (type === "chart" && chartQuery(data.doc.data?.[0])) queryDoc(id, chartQuery(data.doc.data[0]));
               storedThumbDebounced(id, data.doc);
             });
             if (type === "portal") {
@@ -1094,6 +1101,54 @@
               sheet = copy;
               await selectDoc(id, copy);
             }, "forkDoc"),
+          );
+
+          // The chart on screen is the chart you save: the SVG is serialized out of
+          // the page rather than drawn a second time, and the PNG is that SVG
+          // painted onto a canvas. Nothing is rendered twice, so nothing can drift.
+          app.ports.downloadChart.subscribe(
+            catchy(async (format) => {
+              const svg = document.querySelector("main svg");
+              if (!svg) {
+                app.ports.docErrored.send("There is no chart on screen to save yet.");
+                return;
+              }
+              const box = svg.viewBox.baseVal;
+              const [w, h] = [box.width || 800, box.height || 300];
+              const clone = svg.cloneNode(true);
+              clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+              clone.setAttribute("width", w);
+              clone.setAttribute("height", h);
+              // A transparent PNG on a dark slide is an invisible chart.
+              const bg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+              bg.setAttribute("width", "100%");
+              bg.setAttribute("height", "100%");
+              bg.setAttribute("fill", "#fff");
+              clone.insertBefore(bg, clone.firstChild);
+              const markup = new XMLSerializer().serializeToString(clone);
+              const name = (window.location.pathname.slice(1) || "chart") + "." + format;
+              const save = (href) => {
+                const a = document.createElement("a");
+                a.href = href;
+                a.download = name;
+                a.click();
+              };
+              if (format === "svg") {
+                const url = URL.createObjectURL(new Blob([markup], { type: "image/svg+xml" }));
+                save(url);
+                setTimeout(() => URL.revokeObjectURL(url), 10000);
+                return;
+              }
+              const img = new Image();
+              img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(markup);
+              await img.decode();
+              const canvas = document.createElement("canvas");
+              // Twice the viewBox, so the chart is not a blur in a slide deck.
+              canvas.width = w * 2;
+              canvas.height = h * 2;
+              canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+              save(canvas.toDataURL("image/png"));
+            }, "downloadChart"),
           );
 
           app.ports.importCsv.subscribe(

@@ -19,6 +19,7 @@ import examplesSql from "./examples.sql" with { type: "text" };
 import { DATASETS } from "./src/examples.mjs";
 import {
   applyWindows,
+  chartSql,
   checkCells,
   checkColumnTypes,
   checkPivot,
@@ -231,7 +232,12 @@ export type NetHttp = { url: string; interval: number; headers?: string };
 // An alert is a query plus somewhere to send it. The condition is the query's
 // own where clause: it fires when the query returns a row, which is the only
 // definition that needs no second language.
-export type Alert = { code: string; to: string; interval: number };
+export type Alert = { code: string; to: string; interval: number; digest?: boolean };
+// A chart is a sheet: where the numbers come from, and which two columns to draw.
+export type Chart = { source: string; kind: string; x: string; y: string };
+// A dashboard owns no data: it names the sheets to show, and each tile is that
+// sheet. Its own rows are therefore the list of what it names.
+export type Dashboard = { tiles: string[] };
 export type NetSocket = { url: string };
 export type Sheet =
   | Tag<"template", [Template]>
@@ -346,8 +352,9 @@ const sheet = async (
       return await cselect({
         cols: null,
         // Appended after body, so existing `select body from @net-hook:x` queries
-        // and existing column positions are untouched.
-        select: sql`select n.created_at, n.body, n.method, n.req_headers, n.query_params`,
+        // and existing column positions are untouched. `meta` is how a run reads
+        // as a run: status, milliseconds, bytes.
+        select: sql`select n.created_at, n.body, n.method, n.req_headers, n.query_params, n.meta`,
         from: sql`from sheet_usr su inner join net n using (sheet_id)`,
         where: [
           sql`(su.sheet_id,su.usr_id) = (${sheet_id},${c.get("usr_id")})`,
@@ -357,6 +364,26 @@ const sheet = async (
         limit,
         offset,
       });
+    case "dashboard": {
+      const { tiles } = hand.doc().data[0] as unknown as Dashboard;
+      const rows = (Array.isArray(tiles) ? tiles : []).map((tile) => ({ tile: String(tile).replace(/^@/, "") }));
+      return {
+        data: [arrayify([{ name: "tile", type: "text" as Type, key: "tile" }]), ...rows],
+        count: rows.length,
+        offset: 0,
+      };
+    }
+    // A chart's rows are the query its settings describe, so it reads, pages and
+    // exports like any other sheet -- the picture is the page's job, not the API's.
+    case "chart": {
+      let code: string;
+      try {
+        code = chartSql(hand.doc().data[0] as unknown as Chart);
+      } catch (err) {
+        throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
+      }
+      return await executeSql(c, code, path_);
+    }
     case "query":
       return await querify(c, hand.doc().data[0] as Query, {
         limit,
@@ -375,9 +402,10 @@ const sheet = async (
       });
     default:
       throw new HTTPException(400, {
-        message: `Expected sheet type table, net-hook, net-http, net-socket, alert, or query, received ${
-          JSON.stringify(type)
-        } from sheet id ${sheet_id}. Fix the type prefix on the id.`,
+        message:
+          `Expected sheet type table, net-hook, net-http, net-socket, alert, chart, dashboard, or query, received ${
+            JSON.stringify(type)
+          } from sheet id ${sheet_id}. Fix the type prefix on the id.`,
       });
   }
 };
@@ -1521,6 +1549,27 @@ app.get("/shop", async (c) => {
 // yet, so an unbounded body is an unbounded table.
 const NET_BODY_CAP = 1_048_576;
 
+// Rows kept per sheet. Everything that writes to `net` trims behind itself, so
+// a webhook that fires every second cannot fill the disk. It is a cap on the
+// log, not on the data: a sheet that must keep everything should write to a
+// table, which is never trimmed.
+export const NET_KEEP = 1_000;
+
+// Deletes the rows past the cap for one sheet. The identity column is
+// monotonic, so "the newest NET_KEEP" is exactly "net_id at or above the
+// smallest of the newest NET_KEEP", and a sheet under the cap matches nothing.
+export const trimNet = async (sheet_id: string): Promise<void> => {
+  await sql`
+    delete from net
+    where sheet_id = ${sheet_id}
+      and net_id < (
+        select min(net_id) from (
+          select net_id from net where sheet_id = ${sheet_id} order by net_id desc limit ${NET_KEEP}
+        ) keep
+      )
+  `.catch((err: unknown) => console.error(`net retention ${sheet_id}:`, err));
+};
+
 app.post("/net/:id", async (c) => {
   const sheet_id = c.req.param("id");
   const heard = [...c.req.raw.headers.keys()].sort().join(", ") || "(none)";
@@ -1567,8 +1616,10 @@ app.post("/net/:id", async (c) => {
       method: c.req.method,
       req_headers: JSON.stringify(Object.fromEntries(c.req.raw.headers)),
       query_params: JSON.stringify(c.req.query()),
+      meta: JSON.stringify({ bytes: size }),
     })
   }`;
+  await trimNet(sheet_id);
   return c.json(null, 200);
 });
 
@@ -1688,18 +1739,26 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       if (!config.url) continue;
       url = config.url;
       headers = parseNetHeaders(config.headers);
+      const started = Date.now();
       const res = await fetcher(url, headers);
       const text = await readCapped(res, 65536);
       // Errors become log rows too: the user who typed the URL must see them, and
       // must be able to run the same request by hand.
       const body = res.ok ? text : JSON.stringify(fetchFailure(url, headers, res, text));
-      await sql`insert into net (sheet_id, method, body) values (${sheet_id}, 'GET', ${body})`;
+      // The run beside the payload: whether a feed is slow, or 200-ing an error
+      // page, is a question about the poll and not about the body it returned.
+      const meta = JSON.stringify({ status: res.status, ms: Date.now() - started, bytes: text.length });
+      await sql`
+        insert into net (sheet_id, method, body, meta) values (${sheet_id}, 'GET', ${body}, ${meta})
+      `;
+      await trimNet(sheet_id);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`net-http poll ${sheet_id}:`, message);
       const failure = fetchFailure(url, headers, null, message);
       await sql`
-        insert into net (sheet_id, method, body) values (${sheet_id}, 'GET', ${JSON.stringify(failure)})
+        insert into net (sheet_id, method, body, meta)
+        values (${sheet_id}, 'GET', ${JSON.stringify(failure)}, ${JSON.stringify({ status: 0, ms: 0, bytes: 0 })})
       `.catch((dbErr: unknown) => console.error(`net-http poll ${sheet_id}: could not record the error:`, dbErr));
     }
   }
@@ -1716,6 +1775,17 @@ setInterval(() => pollNetOnce().catch((err) => console.error("net-http poll:", e
 
 const alertDue = new Map<string, number>();
 
+// How many matched rows an alert keeps, and so the most it can diff against the
+// run before. Past this the rows are still counted and still sent, but the run
+// says it could not tell you which of them are new.
+const ALERT_ROWS = 200;
+
+// What a run says when the alert asked to be folded into the daily summary
+// instead of mailed on its own. The summary is a convenience over runs that are
+// already recorded, so a digest that fails to send loses nothing but the email.
+const HELD = "held for the daily digest";
+const DIGEST_EVERY_MS = 24 * 60 * 60 * 1000;
+
 // Only what the alert decided, never the rows themselves: the digest is what
 // tells one firing from the next without keeping the data twice.
 const digest = async (value: unknown) =>
@@ -1723,19 +1793,34 @@ const digest = async (value: unknown) =>
     new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value)))),
   ).slice(0, 8).map((b) => b.toString(16).padStart(2, "0")).join("");
 
-export const sendAlertEmail = async (to: string, sheet_id: string, name: string, rows: Row[]): Promise<string> => {
+export const sendAlertEmail = async (
+  to: string,
+  sheet_id: string,
+  name: string,
+  rows: Row[],
+  diff: { added: Row[]; removed: number } | null,
+): Promise<string> => {
   const key = Deno.env.get(`RESEND_API_KEY`);
   if (!key) return "no RESEND_API_KEY, so nothing was sent";
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  // What changed is the news; the whole matching set is the context underneath.
+  const headline = diff
+    ? `${plural(diff.added.length, "new row")}, ${plural(diff.removed, "gone")}, ${plural(rows.length, "row")} in all`
+    : plural(rows.length, "row");
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       to,
       from: "hello@sheets.scrap.land",
-      subject: `${name || sheet_id}: ${rows.length} row${rows.length === 1 ? "" : "s"}`,
+      subject: `${name || sheet_id}: ${headline}`,
       text: [
-        `${name || sheet_id} matched ${rows.length} row${rows.length === 1 ? "" : "s"}.`,
+        `${name || sheet_id}: ${headline}.`,
+        ...(diff?.added.length
+          ? [``, `New since the last run:`, ...diff.added.slice(0, 20).map((row) => JSON.stringify(row))]
+          : []),
         ``,
+        `Matching now:`,
         ...rows.slice(0, 20).map((row) => JSON.stringify(row)),
         ...(rows.length > 20 ? [`... and ${rows.length - 20} more`] : []),
         ``,
@@ -1755,6 +1840,7 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
     if ((alertDue.get(sheet_id) ?? 0) > now) continue;
     alertDue.set(sheet_id, now + 3600_000);
     let record: Record<string, unknown>;
+    const started = Date.now();
     try {
       const config = (await automerge.find<{ data: [Alert] }>(doc_id)).doc()?.data?.[0];
       if (!config) throw new Error("The document has no config in data[0].");
@@ -1777,30 +1863,121 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
       const [last]: { body: string }[] = await sql`
         select body from net where sheet_id = ${sheet_id} order by net_id desc limit 1
       `;
+      const before = last
+        ? JSON.parse(last.body) as { fingerprint?: string; matched?: Row[]; truncated?: boolean }
+        : null;
       // Same answer as last time means the same alert, and sending it again every
       // interval is how people learn to filter alerts into a folder they never open.
-      if (last && (JSON.parse(last.body) as { fingerprint?: string }).fingerprint === fingerprint) continue;
+      if (before?.fingerprint === fingerprint) continue;
+      // The diff is over the rows the last run kept, so it is only honest when
+      // neither run had more rows than it keeps. Say so rather than guess.
+      const truncated = rows.length > ALERT_ROWS;
+      const comparable = !truncated && before !== null && !before.truncated;
+      const gone = new Set((before?.matched ?? []).map((row) => JSON.stringify(row)));
+      const here = new Set(rows.map((row) => JSON.stringify(row)));
+      const diff = comparable
+        ? {
+          added: rows.filter((row) => !gone.has(JSON.stringify(row))),
+          removed: [...gone].filter((row) => !here.has(row)).length,
+        }
+        : null;
       record = {
         status: rows.length ? "firing" : "clear",
         rows: rows.length,
         fingerprint,
         to: config.to ?? "",
-        matched: rows.slice(0, 5),
-        delivery: rows.length
-          ? (config.to ? await send(config.to, sheet_id, name, rows) : "no destination, so nothing was sent")
-          : "cleared, so nothing was sent",
+        truncated,
+        matched: rows.slice(0, ALERT_ROWS),
+        added: diff ? diff.added.length : null,
+        removed: diff ? diff.removed : null,
+        ...(diff ? {} : {
+          diff_skipped: truncated
+            ? `this run matched more than ${ALERT_ROWS} rows`
+            : before === null
+            ? "this is the first run, so there is nothing to compare it with"
+            : `the run before matched more than ${ALERT_ROWS} rows`,
+        }),
+        delivery: !rows.length
+          ? "cleared, so nothing was sent"
+          : config.digest
+          ? HELD
+          : config.to
+          ? await send(config.to, sheet_id, name, rows, diff)
+          : "no destination, so nothing was sent",
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`alert ${sheet_id}:`, message);
       record = { status: "error", rows: 0, fingerprint: await digest(message), error: message };
     }
-    await sql`insert into net (sheet_id, method, body) values (${sheet_id}, 'ALERT', ${JSON.stringify(record)})`
-      .catch((dbErr: unknown) => console.error(`alert ${sheet_id}: could not record the run:`, dbErr));
+    await sql`
+      insert into net (sheet_id, method, body, meta)
+      values (${sheet_id}, 'ALERT', ${JSON.stringify(record)}, ${JSON.stringify({ ms: Date.now() - started })})
+    `.catch((dbErr: unknown) => console.error(`alert ${sheet_id}: could not record the run:`, dbErr));
+    await trimNet(sheet_id);
   }
 };
 
 setInterval(() => pollAlertOnce().catch((err) => console.error("alert poll:", err)), 15_000);
+
+export const sendDigestEmail = async (
+  to: string,
+  runs: { sheet_id: string; name: string; body: string }[],
+): Promise<string> => {
+  const key = Deno.env.get(`RESEND_API_KEY`);
+  if (!key) return "no RESEND_API_KEY, so nothing was sent";
+  const line = ({ sheet_id, name, body }: { sheet_id: string; name: string; body: string }) => {
+    const run = JSON.parse(body) as { status: string; rows: number; added: number | null; removed: number | null };
+    const moved = run.added === null ? "" : ` (+${run.added} -${run.removed})`;
+    return `${run.status.padEnd(7)} ${String(run.rows).padStart(5)} rows${moved}  ${name || sheet_id}`;
+  };
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      to,
+      from: "hello@sheets.scrap.land",
+      subject: `Your alert digest: ${runs.length} change${runs.length === 1 ? "" : "s"}`,
+      text: [...runs.map(line), ``, `https://sheets.scrap.land/`].join("\n"),
+    }),
+  });
+  if (res.ok) return "sent";
+  const detail = await res.text();
+  console.error(`alert digest for ${to}: resend refused the message:`, res.status, detail);
+  return `resend refused it with ${res.status}: ${detail.slice(0, 200)}`;
+};
+
+// One email per account per day, holding every held run since the last one. The
+// watermark moves whether or not the send worked: the runs are all still on
+// their own sheets, and retrying a summary forever is worse than missing one.
+export const sendDigestOnce = async (send = sendDigestEmail, now = Date.now()): Promise<void> => {
+  const users = await sql`
+    select u.usr_id, u.email, u.digest_at from usr u
+    where exists (select 1 from sheet s where s.created_by = u.usr_id and s.type = 'alert')
+  `;
+  for (const { usr_id, email, digest_at } of users) {
+    const since = digest_at ? new Date(digest_at) : new Date(0);
+    if (digest_at && now - since.getTime() < DIGEST_EVERY_MS) continue;
+    const runs = await sql`
+      select s.sheet_id, s.name, n.body
+      from net n inner join sheet s using (sheet_id)
+      where s.created_by = ${usr_id} and n.method = 'ALERT' and n.created_at > ${since}
+      order by n.created_at
+    `;
+    const held = runs.filter((run: { body: string }) => {
+      try {
+        return (JSON.parse(run.body) as { delivery?: string }).delivery === HELD;
+      } catch {
+        return false;
+      }
+    });
+    if (!held.length) continue;
+    await send(email, held as { sheet_id: string; name: string; body: string }[]);
+    await sql`update usr set digest_at = ${new Date(now)} where usr_id = ${usr_id}`;
+  }
+};
+
+setInterval(() => sendDigestOnce().catch((err) => console.error("alert digest:", err)), 900_000);
 
 // CORS proxy for external data sources (unauthenticated, rate-limited)
 app.get("/proxy", async (c) => {

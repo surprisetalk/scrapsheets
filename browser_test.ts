@@ -453,6 +453,54 @@ Deno.test("bundled examples render and cross-sheet queries join", async () => {
   await page.goto(`http://127.0.0.1:${port}/query:headcount-wide`);
   await waitForText(["Engineering", "Operations"], "/query:headcount-wide");
 
+  // A chart is a sheet: its settings describe a query, the same chartSql the
+  // server exports through, and the page draws the answer.
+  await page.goto(`http://127.0.0.1:${port}/chart:pair-z`);
+  for (let i = 0;; i++) {
+    const pts = await page.evaluate(
+      `document.querySelector("svg polyline")?.getAttribute("points")?.split(" ").length ?? 0`,
+    ) as number;
+    if (pts >= 14) break;
+    if (i === 100) throw new Error(`the line chart should plot the z series, got ${pts} points`);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  await waitForText(["2026-07-14", "2026-07-31"], "chart axis ends");
+
+  await page.goto(`http://127.0.0.1:${port}/chart:burn-by-department`);
+  for (let i = 0;; i++) {
+    const bars = await page.evaluate(`document.querySelectorAll("svg rect").length`) as number;
+    if (bars === 6) break;
+    if (i === 100) throw new Error(`the bar chart should draw one bar per department, got ${bars}`);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  // The chart on screen is the chart you save, serialized out of the page rather
+  // than drawn a second time. Only the offer is checked here; the download itself
+  // is the browser's job.
+  const savers = await page.evaluate(
+    `[...document.querySelectorAll("button.chip")].map((b) => b.innerText).filter((t) => t === "svg" || t === "png").join()`,
+  ) as string;
+  assertEquals(savers, "svg,png", "a chart should offer both ways to save it");
+
+  // ?embed= is the sheet with no app around it: no toolbar, no search, no aside.
+  await page.goto(`http://127.0.0.1:${port}/query:budget-burn?embed=1`);
+  await waitForText(["Public Works"], "/query:budget-burn?embed=1");
+  const chrome = await page.evaluate(
+    `[document.querySelector("#title") ? "title" : "", document.querySelector("#aside") ? "aside" : "", document.querySelector("input[placeholder=search]") ? "search" : ""].filter(Boolean).join()`,
+  ) as string;
+  assertEquals(chrome, "", "an embed should carry no chrome");
+
+  // A dashboard is a grid of those embeds, so a tile is the sheet it names.
+  await page.goto(`http://127.0.0.1:${port}/dashboard:budget-watch`);
+  for (let i = 0;; i++) {
+    const srcs = await page.evaluate(
+      `[...document.querySelectorAll("iframe")].map((f) => new URL(f.src).pathname + new URL(f.src).search).join(" ")`,
+    ) as string;
+    if (srcs === "/chart:burn-by-department?embed=1 /query:budget-burn?embed=1") break;
+    if (i === 100) throw new Error(`dashboard tiles should embed their sheets, got: ${srcs}`);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
   // Fork: a copy of a bundled demo, owned by the reader, linking back to it.
   await page.goto(`http://127.0.0.1:${port}/table:headcount-plan`);
   await waitForText(["Engineering"], "/table:headcount-plan");
@@ -481,7 +529,7 @@ Deno.test("bundled examples render and cross-sheet queries join", async () => {
   );
   await waitForText(["cap table"], "demo filter");
   await waitForText(["create a table"], "tutorial step 0");
-  await waitForText(["net-hook:...", "alert:..."], "net and alert creation rows");
+  await waitForText(["net-hook:...", "alert:...", "chart:..."], "net, alert and chart creation rows");
   await page.evaluate(
     `document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "/", ctrlKey: true, bubbles: true }))`,
   );

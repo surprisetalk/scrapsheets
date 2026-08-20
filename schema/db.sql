@@ -7,13 +7,14 @@ create table usr
 , email citext unique not null
 , password text
 , stripe_customer_id text unique
+, digest_at timestamp
 );
 
 create table sheet
 ( sheet_id text not null primary key generated always as (type || ':' || doc_id) stored
 , created_at timestamp default now()
 , created_by bigint not null references usr(usr_id)
-, type text not null check (type in ('template','table','net-hook','net-http','net-socket','query','portal','alert') or type like 'codex-%')
+, type text not null check (type in ('template','table','net-hook','net-http','net-socket','query','portal','alert','chart','dashboard') or type like 'codex-%')
 , doc_id text not null unique
 , name text not null default ''
 , tags text[] not null default '{}'::text[]
@@ -47,6 +48,7 @@ create table net
 , method text not null default 'POST'
 , req_headers jsonb not null default '{}'::jsonb
 , query_params jsonb not null default '{}'::jsonb
+, meta jsonb not null default '{}'::jsonb
 , body text not null
 );
 

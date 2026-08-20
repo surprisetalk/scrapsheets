@@ -3485,6 +3485,30 @@ const QUERIES = {
       "select t.day, t.building, t.carried, y.carried as prior_reading, round(t.carried - y.carried, 1) as kwh_used from @query:meter-daily t join @query:meter-daily y on y.building = t.building and y.day = substr(date_add('day', -1, t.day), 1, 10) where t.carried is not null and y.carried is not null order by t.building, t.day",
     ),
   },
+  "chart:burn-by-department": {
+    name: "budget burn by department",
+    tags: ["demo", "chart"],
+    system: true,
+    doc: { type: "chart", data: [{ source: "@query:budget-burn", kind: "bar", x: "department", y: "burn_ratio" }] },
+  },
+  "chart:pair-z": {
+    name: "pair z-score over july",
+    tags: ["demo", "chart"],
+    system: true,
+    doc: { type: "chart", data: [{ source: "@query:pair-zscore", kind: "line", x: "day", y: "z" }] },
+  },
+  "dashboard:budget-watch": {
+    name: "budget watch",
+    tags: ["demo", "government", "dashboard"],
+    system: true,
+    doc: { type: "dashboard", data: [{ tiles: ["@chart:burn-by-department", "@query:budget-burn"] }] },
+  },
+  "dashboard:pair-desk": {
+    name: "pairs desk",
+    tags: ["demo", "markets", "dashboard"],
+    system: true,
+    doc: { type: "dashboard", data: [{ tiles: ["@chart:pair-z", "@query:pair-zscore", "@query:asof-price"] }] },
+  },
   "query:festival-season": {
     name: "festival season",
     tags: ["example", "query"],

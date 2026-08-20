@@ -11,11 +11,14 @@ import {
   automerge,
   createJwt,
   createToken,
+  NET_KEEP,
   parseNetHeaders,
   pollAlertOnce,
   pollNetOnce,
   seed,
+  sendDigestOnce,
   sql,
+  trimNet,
 } from "./main.ts";
 import type { Col, Query, Sheet, Table, Template } from "./main.ts";
 import { DATASETS, EXAMPLES } from "./src/examples.mjs";
@@ -625,9 +628,15 @@ Deno.test(async function allTests(_t) {
       await put(jwt, `/library/alert:${alert.documentId}`, { name: "burn watch" });
       const alert_id = `alert:${alert.documentId}`;
 
-      const sent: { to: string; rows: unknown[] }[] = [];
-      const send = (to: string, _id: string, _name: string, rows: unknown[]) => {
-        sent.push({ to, rows });
+      const sent: { to: string; rows: unknown[]; added: number; removed: number }[] = [];
+      const send = (
+        to: string,
+        _id: string,
+        _name: string,
+        rows: unknown[],
+        diff: { added: unknown[]; removed: number } | null,
+      ) => {
+        sent.push({ to, rows, added: diff?.added.length ?? -1, removed: diff?.removed ?? -1 });
         return Promise.resolve("sent");
       };
       const history = async () => {
@@ -661,11 +670,26 @@ Deno.test(async function allTests(_t) {
       assertEquals(sent[0].rows.length, 1);
       const fired = (await history())[0];
       assertEquals([fired.status, fired.rows, fired.delivery], ["firing", 1, "sent"]);
+      // One row arrived, none left: the run says so and the email leads with it.
+      assertEquals([fired.added, fired.removed], [1, 0]);
+      assertEquals([sent[0].added, sent[0].removed], [1, 0]);
 
       // Still breaching, same rows: no second email.
       clock += 120_000;
       await pollAlertOnce(send, clock);
       assertEquals(sent.length, 1, "the same breach should not email twice");
+
+      // A second region breaches and the first recovers: one row in, one out.
+      watched.change((d: { data: Record<number, unknown>[] }) => {
+        d.data[1][1] = 0.7;
+        d.data[2][1] = 1.9;
+      });
+      clock += 120_000;
+      await pollAlertOnce(send, clock);
+      assertEquals(sent.length, 2, "a different breach should email again");
+      assertEquals([sent[1].added, sent[1].removed], [1, 1]);
+      const swapped = (await history())[0];
+      assertEquals([swapped.rows, swapped.added, swapped.removed], [1, 1, 1]);
 
       // A broken query is recorded against the sheet rather than thrown away.
       alert.change((d: { data: [{ code: string }] }) => {
@@ -681,6 +705,37 @@ Deno.test(async function allTests(_t) {
       // stranger's address: it cannot be listed.
       await reject(jwt, `/sell/${alert_id}`, { method: "POST", body: JSON.stringify({ price: 0 }) });
 
+      // A digest alert records its run but holds the email, and one summary a day
+      // goes to the account address with every held run since the last one.
+      {
+        alert.change((d: { data: [{ code: string; digest?: boolean }] }) => {
+          d.data[0].code = `select region, burn from @table:${watched.documentId} where burn > 0`;
+          d.data[0].digest = true;
+        });
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        assertEquals(sent.length, 2, "a digest alert should not email on its own");
+        assertEquals((await history())[0].delivery, "held for the daily digest");
+
+        const digests: { to: string; runs: number }[] = [];
+        const digest = (to: string, runs: unknown[]) => {
+          digests.push({ to, runs: runs.length });
+          return Promise.resolve("sent");
+        };
+        await sendDigestOnce(digest, clock);
+        assertEquals(digests.length, 1, "the held run should arrive in a digest");
+        assertEquals(digests[0].to, "bob@example.com");
+        assertEquals(digests[0].runs, 1);
+
+        // One a day: the same account does not get a second digest an hour later.
+        await sendDigestOnce(digest, clock + 3_600_000);
+        assertEquals(digests.length, 1, "a digest should go out at most once a day");
+
+        // A day later, with nothing new held, there is nothing to send.
+        await sendDigestOnce(digest, clock + 25 * 3_600_000);
+        assertEquals(digests.length, 1, "an empty day should not send an empty digest");
+      }
+
       // An alert reads as a sheet, so its history is queryable like any log.
       const { data: [, row] }: { data: Table } = await post(jwt, `/query`, {
         lang: "sql",
@@ -689,6 +744,67 @@ Deno.test(async function allTests(_t) {
       });
       assertEquals(Number(row.n), (await history()).length);
       assert(Number(row.n) >= 3, `expected the clear, the firing and the error, got ${row.n}`);
+    }
+
+    // A chart is a sheet: its settings describe a query, so it reads, pages and
+    // exports through exactly the paths every other sheet does.
+    {
+      const source = automerge.create<{ data: Sheet["data"] }>({
+        data: [
+          arrayify([{ name: "month", type: "date", key: 0 }, { name: "spent", type: "usd", key: 1 }]),
+          { 0: "2026-01-01", 1: 120 },
+          { 0: "2026-02-01", 1: 150 },
+          { 0: "2026-03-01", 1: 90 },
+        ],
+      });
+      await put(jwt, `/library/table:${source.documentId}`, {});
+      const chart = automerge.create<{ data: [{ source: string; kind: string; x: string; y: string }] }>({
+        data: [{ source: `@table:${source.documentId}`, kind: "line", x: "month", y: "spent" }],
+      });
+      await put(jwt, `/library/chart:${chart.documentId}`, { name: "spend" });
+      const chart_id = `chart:${chart.documentId}`;
+
+      const [cols_, ...points] = await get<Table>(jwt, `/sheet/${chart_id}`);
+      assertEquals(Object.values(cols_).map((col) => col.name).join(), "x,y");
+      assertEquals(points.map((row) => row.y).join(), "120,150,90");
+      // Ordered by the x column, so the same chart drawn twice is the same line.
+      assertEquals(points.map((row) => row.x).join(), "2026-01-01,2026-02-01,2026-03-01");
+
+      const csv = await app.request(`/export/${chart_id}.csv`, {
+        headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+      });
+      assert(csv.ok, `chart export failed: ${csv.status}`);
+      assert((await csv.text()).includes("2026-02-01"), "a chart should export the rows it draws");
+
+      // A column name is the only thing that goes into the SQL, so anything else
+      // is refused by name rather than concatenated in.
+      for (
+        const [cfg, said] of [
+          [{ source: "budget", kind: "line", x: "month", y: "spent" }, "one table or query sheet"],
+          [{ source: "@chart:abc", kind: "line", x: "month", y: "spent" }, "one table or query sheet"],
+          [{ source: `@table:${source.documentId}`, kind: "line", x: "month", y: "spent; drop table" }, "column name"],
+        ] as const
+      ) {
+        const bad = automerge.create<{ data: [typeof cfg] }>({ data: [cfg] });
+        await put(jwt, `/library/chart:${bad.documentId}`, {});
+        const res = await app.request(`/sheet/chart:${bad.documentId}`, {
+          headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+        });
+        assertEquals(res.status, 400);
+        assert((await res.text()).includes(said), `expected "${said}" for ${JSON.stringify(cfg)}`);
+      }
+    }
+
+    // A dashboard owns no data: it names the sheets to show, so its own rows are
+    // the list of what it names, and each tile is that sheet embedded.
+    {
+      const board = automerge.create<{ data: [{ tiles: string[] }] }>({
+        data: [{ tiles: ["@chart:one", "@query:two"] }],
+      });
+      await put(jwt, `/library/dashboard:${board.documentId}`, { name: "watch" });
+      const [cols_, ...tiles] = await get<Table>(jwt, `/sheet/dashboard:${board.documentId}`);
+      assertEquals(Object.values(cols_).map((col) => col.name).join(), "tile");
+      assertEquals(tiles.map((row) => row.tile).join(), "chart:one,query:two");
     }
 
     // Buying with invalid sell_id returns 404.
@@ -1578,11 +1694,14 @@ Deno.test(async function allTests(_t) {
         body: JSON.stringify({ event: "ping" }),
       });
       assert(res.ok, `webhook ingest failed: ${res.status}`);
-      const cols = "created_at,body,method,req_headers,query_params";
+      const cols = "created_at,body,method,req_headers,query_params,meta";
       const [cols_, ...rows] = await get<Table>(jwt, `/net/${hookId}`);
       assertEquals(Object.values(cols_).map((col) => col.name).join(), cols);
       // jsonb reads back as json, not text, so a query author sees the real type.
-      assertEquals(Object.values(cols_).map((col) => col.type).join(), "text,text,text,json,json");
+      assertEquals(Object.values(cols_).map((col) => col.type).join(), "text,text,text,json,json,json");
+      // Every delivery carries what the run itself cost, beside what it delivered.
+      assertEquals(JSON.parse(String(rows[0].meta)).bytes, '{"event":"ping"}'.length);
+
       assertEquals(rows.length, 1);
       assert(String(rows[0].body).includes("ping"), JSON.stringify(rows[0]));
       // The delivery's own method, headers and query string are the raw material
@@ -1593,6 +1712,29 @@ Deno.test(async function allTests(_t) {
       assertEquals(JSON.parse(String(rows[0].req_headers))["content-type"], "application/json");
       assertEquals(JSON.parse(String(rows[0].query_params)), { x: "1" });
       await reject("", `/net/${hookId}`);
+
+      // Retention: the log is capped per sheet, so a webhook firing every second
+      // cannot fill the disk. A sheet that must keep everything writes to a table,
+      // which is never trimmed. Its own sheet, so nothing else counts these rows.
+      {
+        const busy = automerge.create<Sheet>({ type: "net-hook", data: [] });
+        const busyId = `net-hook:${busy.documentId}`;
+        await put(jwt, `/library/${busyId}`, {});
+        await sql`
+          insert into net (sheet_id, method, body)
+          select ${busyId}, 'POST', 'filler ' || g from generate_series(1, ${NET_KEEP + 5}) g
+        `;
+        await trimNet(busyId);
+        const [{ n }] = await sql`select count(*)::int as n from net where sheet_id = ${busyId}`;
+        assertEquals(n, NET_KEEP);
+        // The newest survive: the last row written is still the first row read.
+        const [, newest] = await get<Table>(jwt, `/net/${busyId}`);
+        assertEquals(String(newest.body), `filler ${NET_KEEP + 5}`);
+        // A sheet under the cap loses nothing.
+        await trimNet(hookId);
+        const [{ n: kept }] = await sql`select count(*)::int as n from net where sheet_id = ${hookId}`;
+        assertEquals(kept, 1);
+      }
 
       // A net log reads and exports like any other sheet, and pages in a stable order.
       const [netCols, ...netRows] = await get<Table>(jwt, `/sheet/${hookId}`);

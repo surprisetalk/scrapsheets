@@ -1164,6 +1164,41 @@ export const rewriteUnpivot = (code, columnsOf) => {
   return out;
 };
 
+// --- charts
+//
+// A chart is a sheet: a source ref, a kind, and the two columns to plot. Both
+// engines build the same query out of that, so the picture the page draws and
+// the rows the server exports are the same answer.
+
+export const CHART_KINDS = ["line", "bar"];
+
+const chartIdent = (what, value) => {
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(value ?? "")) return value;
+  throw new Error(explain(`A chart's ${what} has to be a column name.`, {
+    Expected: "a plain column name, e.g. month",
+    Received: JSON.stringify(value ?? null),
+    Source: "this chart sheet's settings",
+    Fix: "pick a column from the sheet the chart reads",
+  }));
+};
+
+export const chartSql = ({ source, x, y }) => {
+  // Only what a query can reference: the page refuses any other prefix while
+  // loading, and a chart that runs on the server but not in the page is worse
+  // than one that is refused in both.
+  if (!/^@(?:table|query):[A-Za-z0-9_-]+$/.test(source ?? "")) {
+    throw new Error(explain(`A chart reads one table or query sheet.`, {
+      Expected: "@table:doc_id or @query:doc_id",
+      Received: JSON.stringify(source ?? null),
+      Source: "this chart sheet's settings",
+      Fix: "set the source to a table or query sheet, e.g. @query:budget-burn",
+    }));
+  }
+  // Ordered by the x column, so the line is drawn in the order it is read and
+  // two runs of the same chart agree.
+  return `select ${chartIdent("x column", x)} as x, ${chartIdent("y column", y)} as y from ${source} order by 1`;
+};
+
 // --- registration
 
 export const register = (alasql) => {

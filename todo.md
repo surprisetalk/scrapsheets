@@ -52,9 +52,12 @@ Transform Scrapsheets into a platform. Each feature creates a new axis of compos
 - [ ] **User-defined portal sources**: provide a WebSocket URL or HTTP polling config to create custom portals
 - [ ] **Portal marketplace**: sell live data feeds as portal sheets
 - [ ] **Portal composition**: query across multiple live portals in real-time
-- [ ] **Embed endpoint**: /embed/:id renders minimal-chrome read-only sheet view
+- [x] **Embed endpoint**: `?embed=1` on any sheet's own URL drops every piece of chrome — toolbar, search, aside, modals
+      — and renders the sheet alone. One flag rather than a second route, so an embed is the same page with the same
+      access rules: it grants a viewer nothing a link would not
 - [ ] **Embed code generator**: copy-pasteable iframe snippet in sheet settings
-- [ ] **Interactive embeds**: viewers can sort/filter embedded sheets
+- [ ] **Interactive embeds**: viewers can sort/filter embedded sheets. An embed drops the filter bar with the rest of
+      the chrome, so today it is a picture of the sheet, not a copy of it
 - [ ] **Live dashboard mode**: combine portal data + embeds for real-time dashboards
 - [ ] **Cursor presence**: show other users' cursor positions with colored indicators
 - [ ] **Active user list**: display connected collaborators in sheet header
@@ -588,17 +591,28 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
 ### Charts & dashboards
 
-- [ ] **Chart sheet type**: a chart is a sheet, so it can be shared, embedded, and sold like anything else
-- [ ] **Core chart set**: line, bar, stacked bar, area, scatter, histogram, box plot
+- [x] **Chart sheet type**: `chart:<doc_id>` holds a source ref, a kind and the two columns to plot. `chartSql()` in
+      `src/sql.mjs` turns that into one query both engines build identically, so `GET /sheet/chart:abc` and
+      `/export/chart:abc.csv` return exactly the rows the page draws. Only a column name reaches the SQL: anything else
+      is refused by name rather than concatenated in
+- [ ] **Core chart set**: line, bar, stacked bar, area, scatter, histogram, box plot. Line and bar ship, drawn as SVG
+      from `elm/svg`, with the baseline pinned to zero unless the data goes below it — a bar chart that starts anywhere
+      else misstates every comparison on it. A row whose y is not a number is dropped rather than read as zero
 - [ ] **Time-series handling**: date axis, gap handling, downsampling for long series
 - [ ] **Maps**: point maps and choropleths driven by a geo column
 - [ ] **Heatmap and matrix charts**: cohort grids and loss triangles read naturally as heatmaps
 - [ ] **KPI tiles**: single number with a delta and a sparkline
-- [ ] **Dashboard sheet type**: a grid of chart, table, and KPI tiles, each backed by a query
+- [x] **Dashboard sheet type**: `dashboard:<doc_id>` names the sheets to show, one reference per line, and lays them out
+      as a responsive grid in which each tile is that sheet embedded. Nothing in the dashboard knows how to draw a chart
+      or a table, because the sheet it names already does — which is the whole reason a chart is a sheet. The cost is
+      one page per tile; a dashboard cannot hold a dashboard, because that nests until the browser gives up. KPI tiles
+      need the tile type that does not exist yet
 - [ ] **Chart annotations**: mark an event on the axis (a release, a price change, a storm)
 - [ ] **Dual axis and secondary series**
-- [ ] **Export chart as PNG/SVG**: for the deck the user has to make anyway
-- [ ] **Chart embeds**: same embed path as tables (extends Phase 3 embeds)
+- [x] **Export chart as PNG/SVG**: the `svg` and `png` buttons on a chart serialize the SVG already on screen — nothing
+      is drawn a second time, so the saved chart cannot drift from the shown one. The PNG is that SVG painted onto a
+      canvas at twice the viewBox, on white, because a transparent chart on a dark slide is an invisible one
+- [x] **Chart embeds**: the same `?embed=1` every other sheet uses, which is what makes a dashboard tile a chart
 
 ### Ingest — net-http
 
@@ -687,7 +701,9 @@ Phase 2 has the runner. These are what the demos need on top of it.
 - [ ] **Timezone- and DST-aware schedules**: "9am local on business days" must mean it
 - [ ] **Business-day and fiscal-calendar triggers**: third business day after month end
 - [ ] **Run now, pause, and disable**: with a visible next-run time
-- [ ] **Run history**: start, duration, rows in/out, status, error, per sheet
+- [ ] **Run history**: start, duration, rows in/out, status, error, per sheet. Every row in `net` now carries a `meta`
+      column beside its body — `{status, ms, bytes}` for a net-http poll, `{ms}` for an alert run — so "is this feed
+      slow, is it 200-ing an error page" is a query. A scheduled runner has no history because it has no runner
 - [ ] **Idempotency keys**: a re-run must not double-append
 - [ ] **Backfill**: run a schedule over a historical date range
 - [ ] **Concurrency control**: skip or queue if the previous run is still going
@@ -705,11 +721,15 @@ Phase 2 has the runner. These are what the demos need on top of it.
 - [ ] **Threshold, change, and anomaly conditions**: value crosses X, value changed by Y%, value outside its usual band.
       Threshold and change are a where clause over a query that already has window functions; an anomaly band needs the
       forecasting work in **Stats & modeling**
-- [ ] **New-row and removed-row alerts**: diff against the previous run. The previous run's digest is kept, which is
-      what suppresses a repeat, but nothing says _which_ rows arrived or left
+- [x] **New-row and removed-row alerts**: each run keeps the rows it matched, up to `ALERT_ROWS`, so the next one
+      records `added` and `removed` against them and the email leads with what is new rather than repeating the whole
+      set. Past that cap the run says why it could not diff instead of reporting a number it cannot stand behind
 - [ ] **Destinations**: email, SMS, Slack, Discord, Teams, webhook, push. Email ships, through the Resend key the signup
       flow already uses; a refusal from Resend is recorded on the alert rather than swallowed
-- [ ] **Digest vs immediate**: batch low-priority alerts into a daily summary
+- [x] **Digest vs immediate**: an alert marked `digest` records its run and holds the email; `sendDigestOnce` mails one
+      summary per account per day carrying every held run since the last one, to the account address rather than the
+      alert's own. The watermark moves whether or not the send worked — every run is still on its own sheet, and
+      retrying a summary forever is worse than missing one
 - [x] **Flap suppression and dedupe**: only a run whose answer differs from the last recorded one is sent, compared by
       digest. The digest is read back out of the alert's own log, so a restart does not re-send
 - [ ] **Snooze, acknowledge, and escalate**
@@ -849,8 +869,9 @@ Extends the Phase 1 Stripe work.
 - [ ] **Server-side pagination and virtual scroll**: for sheets too big to send to the browser
 - [ ] **Background computation with progress**: long queries do not block the UI
 - [ ] **Cold row archiving**: keep history without keeping it hot
-- [ ] **`net` table retention**: the identity PK, the `(sheet_id, created_at desc)` index and a deterministic read order
-      all ship; every webhook delivery and net-http poll is still kept forever
+- [x] **`net` table retention**: `trimNet()` keeps the newest `NET_KEEP` rows per sheet and runs behind every write —
+      webhook delivery, net-http poll and alert run alike — so a hook firing every second cannot fill the disk. It is a
+      cap on the log, not on the data: a sheet that must keep everything writes to a table, which is never trimmed
 - [ ] **Per-sheet resource metering**: rows, bytes, compute, and fetches, visible to the user before the limit hits
 
 ### Developer surface
