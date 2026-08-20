@@ -471,7 +471,8 @@ The single biggest gap. Most demos die here first.
       price-at-time-of-trade depend on this
 - [ ] **As-of / temporal joins**: join a fact to the row that was current at that timestamp
 - [ ] **Query parameters**: bind a query to cells in another sheet so a sheet becomes a parameterized function
-- [ ] **Deterministic ordering**: unordered results must not shuffle between runs
+- [x] **Deterministic ordering**: unordered results must not shuffle between runs. `/library` had no `order by` at all
+      and `/shop` ordered by a non-unique `name`; both now carry a unique tiebreaker, as the `net` read already did
 - [ ] **Strict null semantics**: distinguish null, empty string, and zero everywhere; no silent coercion
 - [ ] **Typed query output**: query results carry column types forward, not strings
 - [ ] **Materialized query results**: cache with an explicit refresh, so a 40-sheet dependency chain is not re-run per
@@ -479,9 +480,12 @@ The single biggest gap. Most demos die here first.
 - [ ] **Incremental query execution**: recompute only what changed since the last run
 - [ ] **Chunked / larger-than-memory execution**: a million-row join should not need a million rows in the tab
 - [ ] **Predicate pushdown to codex**: filter on the external database, not after transferring the whole table
-- [ ] **Query timeouts and cost guards**: kill runaway queries with a clear message rather than freezing the tab
+- [x] **Query timeouts and cost guards**: `checkQueryRows()` caps the rows one query may load across every `@sheet`,
+      which is the guard that actually stops a runaway; `MAX_QUERY_MS` bounds how long the caller waits. A real timeout
+      needs the engine in a worker — a single-threaded engine cannot be preempted, so the work still finishes
 - [ ] **Explain / profile**: show which step is slow and how many rows each stage produced
-- [ ] **Schema introspection**: `describe @table:abc` and a browsable column list per referenced sheet
+- [x] **Schema introspection**: `describe @table:abc` in both engines, answering column/type/rows/nulls/sample. A
+      browsable column list in the editor is still missing
 - [ ] **@sheet autocomplete**: suggest sheets and columns as the user types, from the real schema
 - [ ] **Saved query snippets / UDFs**: reusable named expressions across sheets (leads into Scrapscript)
 
@@ -489,11 +493,17 @@ The single biggest gap. Most demos die here first.
 
 Per house style, an ambiguous error is the worst bug in the system.
 
-- [ ] **Type mismatch explanation**: show both types, the offending values, and the row they came from
-- [ ] **Fetch failures with a repro**: status, response snippet, resolved URL, and a copy-pasteable curl line
-- [ ] **Webhook rejection detail**: which signature header failed, expected vs received, clock skew if relevant
-- [ ] **Permission denials that teach**: what access is missing, on which sheet, and who can grant it
-- [ ] **Import failures with the bad row**: row number, raw text, and the column that could not parse
+- [x] **Type mismatch explanation**: `checkColumnTypes()` rejects a non-numeric value in a numeric column as the sheet
+      loads, naming the declared type, the value and the row
+- [x] **Fetch failures with a repro**: `fetchFailure()` gives status, resolved URL, content type, body snippet and a
+      curl line, in the `net` log and from `/proxy`. Header values are never echoed: they may carry a token
+- [ ] **Webhook rejection detail**: which signature header failed, expected vs received, clock skew if relevant. Blocked
+      on signature verification, which does not exist. The rejections that do exist — unknown sheet, non-net sheet,
+      oversize body — each name what they received
+- [x] **Permission denials that teach**: the denial names the sheet, whether it exists, how access is granted, and the
+      exact `/share` or `/public` call. Deliberately not the owners' emails: any user can name any sheet_id
+- [x] **Import failures with the bad row**: a CSV row that does not match its header is rejected with the line, both
+      field counts, the raw text and the column it stops at. Inference now needs every value to parse, not four in five
 - [ ] **Error sheet**: every failure lands in a queryable log rather than a toast that disappears
 
 ### Types & validation
@@ -508,7 +518,8 @@ Per house style, an ambiguous error is the worst bug in the system.
 - [ ] **Geo types**: point, polygon, and address
 - [ ] **Unit-of-measure type**: quantity + unit with conversion, so lbs and kg cannot silently add
 - [ ] **Column constraints**: not-null, unique, range, regex, allowed-values, referential integrity
-- [ ] **Validation on write**: reject bad rows loudly at the ingest boundary, quarantine rather than coerce
+- [ ] **Validation on write**: reject bad rows loudly at the ingest boundary, quarantine rather than coerce. CSV import
+      rejects; `POST /net/:id` and cell edits still do not, and nothing is quarantined
 - [ ] **Type inference on import with manual override**: guess, show the guess, let the user correct it
 - [ ] **Schema drift detection**: alert when an upstream feed adds, drops, or retypes a column
 - [ ] **Computed columns**: a column defined by an expression over its own row
@@ -724,13 +735,14 @@ The Excel add-in market lives here (see the add-in research item).
 
 ### Reports & export
 
-- [ ] **Export formats**: XLSX with formatting, NDJSON, Parquet, Markdown table. CSV ships for every sheet type, and
-      JSON through `GET /sheet/:id`
+- [ ] **Export formats**: XLSX with formatting and Parquet. `GET /export/:id.<format>` ships csv, json, ndjson and md
+      for every sheet type, and `GET /sheet/:id` is still the API-shaped JSON read
 - [ ] **PDF report generation**: a print layout with headers, page breaks, and a title page
 - [ ] **Scheduled report delivery**: emailed on a schedule with the file attached
 - [ ] **Report templates**: prose plus live sheet embeds, so the narrative regenerates with the numbers
-- [ ] **Download endpoint**: a stable URL that always returns the current CSV
-- [ ] **iCal feed**: date columns as a subscribable calendar (deadline demos)
+- [x] **Download endpoint**: `GET /export/:id.csv` and its four siblings, each with a `Content-Disposition` filename
+- [x] **iCal feed**: `GET /export/:id.ics` builds a VEVENT per row from the first `date`/`timestamp` column, all-day for
+      a date-only value. Not yet subscribable: the URL needs a token, since a calendar client sends no `Authorization`
 
 ### Permissions & governance
 
@@ -840,14 +852,20 @@ should land as a sheet with a stated source, license, update cadence, and proven
 
 ### Reference & crosswalks
 
-- [ ] **Calendars**: business days, public holidays by country and state, fiscal calendars, ISO weeks
+- [ ] **Calendars**: business days, public holidays by country and state, fiscal calendars, ISO weeks. `table:holidays`
+      ships US federal holidays for 2026-2027 with statutory and observed dates; every other country and state is open,
+      and `business_days()`/`iso_week()`/`fiscal_*()` already cover the derived parts
 - [ ] **Time zones and DST rules**
-- [ ] **Currencies and FX rates**: daily and historical, plus a live rate portal
-- [ ] **Units of measure**: conversion factors across mass, volume, length, energy, area
+- [ ] **Currencies and FX rates**: daily and historical, plus a live rate portal. `table:currencies` ships the ISO 4217
+      codes with symbol and minor units; the rates themselves are the open half
+- [x] **Units of measure**: `table:units` ships mass, length, area, volume, energy, time, pressure and speed as a factor
+      to the SI unit for each quantity
 - [ ] **Geographic crosswalks**: ZIP <-> county <-> CBSA <-> tract <-> congressional district
-- [ ] **Industry classification**: NAICS, SIC, GICS, with mappings between them
+- [ ] **Industry classification**: NAICS, SIC, GICS, with mappings between them. `table:naics` ships the 20 NAICS 2022
+      sectors; the 6-digit codes, SIC, GICS and the crosswalks are open
 - [ ] **Occupations**: SOC and O*NET codes and descriptions
-- [ ] **Country, language, and locale codes**: ISO 3166, 639, plus phone and postal formats
+- [ ] **Country, language, and locale codes**: ISO 3166, 639, plus phone and postal formats. `table:countries` ships ISO
+      3166 alpha-2 and `table:languages` ships ISO 639-1 with its 639-3 counterpart; phone and postal formats are open
 - [ ] **Name and address normalization tables**: street suffixes, company suffixes, nickname lists
 
 ### Economy & government

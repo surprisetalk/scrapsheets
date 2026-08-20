@@ -31,7 +31,18 @@
       import { IndexedDBStorageAdapter } from "/automerge-repo-idb.mjs";
       import { BrowserWebSocketClientAdapter } from "/automerge-repo-ws.mjs";
       import { Col, EXAMPLES, Table } from "/examples.mjs";
-      import { checkRefPath, checkResultColumns, formatQueryError, nearest, register, scanRefs } from "/sql.mjs";
+      import {
+        checkColumnTypes,
+        checkRefPath,
+        checkResultColumns,
+        DESCRIBE_COLUMNS,
+        describeRef,
+        describeRows,
+        formatQueryError,
+        nearest,
+        register,
+        scanRefs,
+      } from "/sql.mjs";
       import alasql from "/alasql.mjs";
       // Was a CDN <script> that defined a global. Keep the global so query code
       // and the browser tests can reach it the same way.
@@ -529,6 +540,7 @@
           // them to SHEET('id') and pre-loads each doc (repo.find is async but
           // alasql from-functions are synchronous), then SHEET serves the rows.
           const sheetCache = new Map();
+          const sheetCols = new Map();
           // Every column the referenced sheets actually have: what a typo'd
           // column name gets matched against.
           const sheetColumns = () => [
@@ -589,6 +601,10 @@
                   ]))[1].data
                   : toRecords(doc.data),
               );
+              // Declared types, kept beside the rows so checkColumnTypes can run
+              // after loading rather than during it: describe must still work on a
+              // sheet whose cells are wrong.
+              if (type === "table") sheetCols.set(id, Object.values(doc.data[0]));
             }
             return out;
           };
@@ -732,9 +748,34 @@
                         },
                         { "": [].join(" ") },
                       ) ?? { "": null };
+                    // `describe @table:abc` never reaches the engine: it loads the one
+                    // sheet it names and reports its shape. Shared with the server.
+                    // `describe @table:abc` never reaches the engine: it loads the one
+                    // sheet it names and reports its shape. Shared with the server.
+                    const described = describeRef(code);
+                    if (described) {
+                      await resolveSheets(`select 1 from @${described}`);
+                      const known = sheetCache.get(described) ?? [];
+                      app.ports.docQueried.send({
+                        id,
+                        data: [
+                          DESCRIBE_COLUMNS.map((name) => ({ key: name, name, type: null })),
+                          ...describeRows(
+                            described,
+                            sheetCols.get(described) ??
+                              Object.keys(known[0] ?? {}).map((name) => ({ name, type: "text" })),
+                            known,
+                          ),
+                        ],
+                      });
+                      break;
+                    }
+                    const resolved = await resolveSheets(code);
+                    // Same check as the server, so a sheet that fails in one fails in both.
+                    for (const [id_, cols_] of sheetCols) checkColumnTypes(id_, cols_, sheetCache.get(id_) ?? []);
                     const [, { columns: cols, data: rows } = {}] = await alasql([
                       [`set @params = ?`, [params]],
-                      await resolveSheets(code),
+                      resolved,
                     ]);
                     checkResultColumns(cols, rows, sheetColumns(), code);
                     // TODO: If doc contains cols data, use that names and types.

@@ -6,8 +6,10 @@ import * as AM from "@automerge/automerge-repo";
 import { WebSocketClientAdapter } from "@automerge/automerge-repo-network-websocket";
 import Stripe from "stripe";
 import { app, arrayify, automerge, createJwt, createToken, parseNetHeaders, pollNetOnce, seed, sql } from "./main.ts";
-import type { Query, Sheet, Table, Template } from "./main.ts";
-import { DATASETS } from "./src/examples.mjs";
+import type { Col, Query, Sheet, Table, Template } from "./main.ts";
+import { DATASETS, EXAMPLES } from "./src/examples.mjs";
+import { checkColumnTypes, describeRef, describeRows, scanRefs } from "./src/sql.mjs";
+import ala from "alasql";
 import dbSql from "./schema/db.sql" with { type: "text" };
 import examplesSql from "./examples.sql" with { type: "text" };
 
@@ -187,6 +189,15 @@ Deno.test(async function allTests(_t) {
         "created_at,type,doc_id,name,tags,sell_price",
       );
       assertEquals(rows.length, templates.length * 2);
+
+      // The library had no order at all, so paging it repeated and skipped rows.
+      const paged: string[] = [];
+      for (let at = 0; at < rows.length; at += 3) {
+        const [, ...page] = await get<Table>(jwt, `/library`, { limit: 3, offset: at });
+        paged.push(...page.map((row) => `${row.type}:${row.doc_id}`));
+      }
+      assertEquals(paged, rows.map((row) => `${row.type}:${row.doc_id}`));
+      assertEquals(new Set(paged).size, rows.length, "paging must not repeat a sheet");
     }
 
     // Alice updates templates and posts them to shop.
@@ -510,6 +521,37 @@ Deno.test(async function allTests(_t) {
         args: [],
       });
       assertEquals(row.n, countries.doc.data.length - 1);
+    }
+
+    // Every bundled dataset must satisfy its own declared types, and every
+    // bundled query must run against them. These ship as the shop's inventory,
+    // so a broken one is a broken storefront.
+    {
+      const cols = (id: string) =>
+        Object.values(DATASETS.find((d: { doc_id: string }) => `table:${d.doc_id}` === id)!.doc.data[0]) as Col[];
+      const loaded: Record<string, Record<string, unknown>[]> = {};
+      for (const { doc_id, doc } of DATASETS as unknown as { doc_id: string; doc: { data: Table } }[]) {
+        const [cols_, ...rows] = doc.data;
+        loaded[`table:${doc_id}`] = rows.map((row) =>
+          Object.fromEntries(Object.values(cols_).map((col) => [col.name, row[col.key]]))
+        );
+        checkColumnTypes(`table:${doc_id}`, Object.values(cols_), loaded[`table:${doc_id}`]);
+      }
+      const examples = Object.entries(EXAMPLES) as unknown as [string, { doc: { type: string; data: [Query] } }][];
+      let ran = 0;
+      for (const [id, ex] of examples) {
+        if (ex.doc.type !== "query") continue;
+        const { code } = ex.doc.data[0];
+        // A @query ref needs the whole recursion; the browser test covers those.
+        if (code.includes("@query:")) continue;
+        const described = describeRef(code);
+        const rows = described
+          ? describeRows(described, cols(described), loaded[described])
+          : (await ala(scanRefs(code).sql, [loaded]) as { data: unknown[] }).data;
+        assert(rows.length > 0, `${id} returned no rows`);
+        ran++;
+      }
+      assertEquals(ran, examples.filter(([, ex]) => ex.doc.type === "query").length - 1, "one example is @query-only");
     }
 
     // Buying with invalid sell_id returns 404.
@@ -950,6 +992,216 @@ Deno.test(async function allTests(_t) {
       `an empty sheet should be a 4xx, got ${bareCsv.status}: ${await bareCsv.text()}`,
     );
     assertEquals((await qCsv.text()).split("\n"), ["name", "Alice", "Bob"]);
+
+    // Every export format rides the same sheet() path, so each inherits access,
+    // pagination and the query recursion rather than repeating them.
+    const exp = async (id: string, format: string, who = jwt) =>
+      await app.request(`/export/${id}.${format}`, { headers: new Headers({ Authorization: `Bearer ${who}` }) });
+    {
+      const json = await exp(sheet_id, "json");
+      assertEquals(json.headers.get("content-type"), "application/json; charset=utf-8");
+      assertEquals(await json.json(), [{ name: "Alice", age: 30 }, { name: "Bob", age: 25 }]);
+
+      const ndjson = await exp(sheet_id, "ndjson");
+      assertEquals(ndjson.headers.get("content-type"), "application/x-ndjson; charset=utf-8");
+      assertEquals((await ndjson.text()).split("\n").map((line) => JSON.parse(line).name), ["Alice", "Bob"]);
+
+      const md = await exp(sheet_id, "md");
+      assertEquals((await md.text()).split("\n"), [
+        "| name | age |",
+        "| --- | --- |",
+        "| Alice | 30 |",
+        "| Bob | 25 |",
+      ]);
+
+      // The download name carries the format, and a non-member still cannot read.
+      assertEquals(
+        (await exp(sheet_id, "ndjson")).headers.get("content-disposition"),
+        `attachment; filename="${sheet_id.replace(/[^a-zA-Z0-9-_]/g, "_")}.ndjson"`,
+      );
+      assertEquals((await exp(`table:${bare.documentId}`, "json", outsider)).status, 403);
+    }
+
+    // .ics needs a date column, and says so plainly when there is none.
+    {
+      const noDate = await exp(sheet_id, "ics");
+      assertEquals(noDate.status, 400);
+      const said = await noDate.text();
+      assert(said.includes("date column"), said);
+      assert(said.includes("age"), `the message should list the columns it did find, got: ${said}`);
+
+      const cal = automerge.create<{ data: Sheet["data"] }>({
+        data: [
+          arrayify([
+            { name: "day", type: "date", key: 0 },
+            { name: "what", type: "text", key: 1 },
+            { name: "seats", type: "num", key: 2 },
+          ]),
+          { 0: "2026-06-01", 1: "Kickoff; with a comma", 2: 40 },
+          { 0: "2026-07-04T18:30:00Z", 1: "Fireworks", 2: 900 },
+        ],
+      });
+      await put(jwt, `/library/table:${cal.documentId}`, {});
+      const ics = await exp(`table:${cal.documentId}`, "ics");
+      assertEquals(ics.headers.get("content-type"), "text/calendar; charset=utf-8");
+      const lines = (await ics.text()).split("\r\n");
+      assertEquals(lines[0], "BEGIN:VCALENDAR");
+      assertEquals(lines.at(-1), "END:VCALENDAR");
+      assertEquals(lines.filter((l) => l === "BEGIN:VEVENT").length, 2);
+      // A date-only value stays all-day; a timestamp keeps its time.
+      assert(lines.includes("DTSTART;VALUE=DATE:20260601"), lines.join("\n"));
+      assert(lines.includes("DTSTART:20260704T183000Z"), lines.join("\n"));
+      // RFC 5545 reserves the comma and semicolon inside a value.
+      assert(lines.includes("SUMMARY:Kickoff\\; with a comma"), lines.join("\n"));
+
+      // Folding counts octets but must cut on codepoints: a long emoji summary
+      // split mid-sequence comes back as replacement characters.
+      const wide = automerge.create<{ data: Sheet["data"] }>({
+        data: [
+          arrayify([{ name: "day", type: "date", key: 0 }, { name: "what", type: "text", key: 1 }]),
+          { 0: "2026-06-01", 1: "🦄".repeat(40) },
+        ],
+      });
+      await put(jwt, `/library/table:${wide.documentId}`, {});
+      const folded = (await (await exp(`table:${wide.documentId}`, "ics")).text()).split("\r\n");
+      assert(!folded.some((l) => l.includes("\ufffd")), "folding must not split a codepoint");
+      for (const l of folded)
+        assert(new TextEncoder().encode(l).byteLength <= 75, `line over 75 octets: ${JSON.stringify(l)}`);
+      assertEquals(
+        folded.filter((l) => l.startsWith("SUMMARY:") || l.startsWith(" ")).join("").replace(/^SUMMARY:| /g, ""),
+        "🦄".repeat(40),
+        "unfolding must give the summary back",
+      );
+    }
+
+    // Two columns of the same name would silently overwrite each other in a
+    // name-keyed format, so those formats refuse it.
+    {
+      const dup = automerge.create<{ data: Sheet["data"] }>({
+        data: [arrayify([{ name: "a", type: "text", key: 0 }, { name: "a", type: "text", key: 1 }]), {
+          0: "x",
+          1: "y",
+        }],
+      });
+      await put(jwt, `/library/table:${dup.documentId}`, {});
+      assert((await exp(`table:${dup.documentId}`, "csv")).ok, "csv carries positions, so duplicates are fine");
+      const json = await exp(`table:${dup.documentId}`, "json");
+      assertEquals(json.status, 400);
+      assert((await json.text()).includes("same name"), "the duplicate must be named");
+    }
+  }
+
+  // A CSV that does not match its own header is a rejection, not a coercion.
+  {
+    const { jwt } = await usr("ruth@example.com");
+    const importCsv = (text: string) =>
+      app.request("/import/csv", {
+        method: "POST",
+        headers: new Headers({ Authorization: `Bearer ${jwt}`, "Content-Type": "text/csv" }),
+        body: text,
+      });
+
+    const short = await importCsv("name,age,city\nAlice,30,Reno\nBob,25\n");
+    assertEquals(short.status, 400);
+    const said = await short.text();
+    for (const part of ["Line 3", "3 fields", "2 fields", "Bob,25", "city"])
+      assert(said.includes(part), `${part} missing from: ${said}`);
+
+    // A quoted newline is one row, so the line number must survive it.
+    const quoted = await importCsv('a,b\n"one\ntwo",2\nragged\n');
+    assertEquals(quoted.status, 400);
+    assert((await quoted.text()).includes("Line 4"), "a quoted newline still advances the line count");
+
+    // 4 of 5 numbers used to make the column numeric and turn the fifth into NaN.
+    const mixed = await importCsv("qty\n1\n2\n3\n4\nn/a\n");
+    const body = await mixed.json();
+    assert(mixed.ok, `a mostly-numeric column should import as text: ${JSON.stringify(body)}`);
+    const { sheet_id } = body;
+    const [cols_, ...rows] = await get<Table>(jwt, `/sheet/${sheet_id}`);
+    assertEquals(Object.values(cols_)[0].type, "text");
+    assertEquals(rows.map((r) => r["0"]), ["1", "2", "3", "4", "n/a"]);
+  }
+
+  // A webhook sender only ever sees the response body, so the body diagnoses.
+  {
+    const { jwt } = await usr("sam@example.com");
+    const deliver = (id: string, body: string) =>
+      app.request(`/net/${id}`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json" }),
+        body,
+      });
+
+    const missing = await deliver("net-hook:nosuchdoc", "{}");
+    assertEquals(missing.status, 404);
+    assert((await missing.text()).includes("PUT /library/net-hook:"), "it must say how to create the sheet");
+
+    const table = automerge.create<Sheet>({ type: "table", data: [arrayify([{ name: "a", type: "text", key: 0 }])] });
+    await put(jwt, `/library/table:${table.documentId}`, {});
+    const wrongType = await deliver(`table:${table.documentId}`, "{}");
+    assertEquals(wrongType.status, 400);
+    assert((await wrongType.text()).includes("a table sheet"), "it must name the type it received");
+
+    const hook = automerge.create<Sheet>({ type: "net-hook", data: [] });
+    await put(jwt, `/library/net-hook:${hook.documentId}`, {});
+    const big = await deliver(`net-hook:${hook.documentId}`, "x".repeat(1_048_577));
+    assertEquals(big.status, 413);
+    assert((await big.text()).includes("1048577 bytes"), "it must name the size it received");
+    assert((await deliver(`net-hook:${hook.documentId}`, "{}")).ok, "a valid delivery still lands");
+  }
+
+  // describe @sheet, cost guards, and the source-type check.
+  {
+    const { jwt } = await usr("quinn@example.com");
+    const hand = automerge.create<{ data: Sheet["data"] }>({
+      data: [
+        arrayify([
+          { name: "city", type: "text", key: 0 },
+          { name: "pop", type: "num", key: 1 },
+        ]),
+        { 0: "Reno", 1: 264000 },
+        { 0: "Elko", 1: "" },
+      ],
+    });
+    const id = `table:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+
+    // describe answers "what columns does this sheet have" without a guess.
+    const runs = (code: string) => post(jwt, `/query`, { lang: "sql", code, args: [] });
+    {
+      const [cols_, ...rows] = (await runs(`describe @${id}`)).data as Table;
+      assertEquals(Object.values(cols_).map((col) => col.name).join(), "column,type,rows,nulls,sample");
+      assertEquals(rows, [
+        { column: "city", type: "text", rows: 2, nulls: 0, sample: "Reno" },
+        { column: "pop", type: "num", rows: 2, nulls: 1, sample: "264000" },
+      ]);
+      // Trailing semicolon and case are the two things a SQL author types by habit.
+      assertEquals(((await runs(`DESCRIBE @${id};`)).data as Table).length, 3);
+    }
+
+    // A numeric column holding text is a mismatch the sum would have hidden.
+    {
+      const bad = automerge.create<{ data: Sheet["data"] }>({
+        data: [
+          arrayify([{ name: "price", type: "usd", key: 0 }]),
+          { 0: 10 },
+          { 0: "n/a" },
+        ],
+      });
+      const badId = `table:${bad.documentId}`;
+      await put(jwt, `/library/${badId}`, {});
+      const res = await app.request(`/query`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        body: JSON.stringify({ lang: "sql", code: `select sum(price) as total from @${badId}`, args: [] }),
+      });
+      assertEquals(res.status, 400);
+      const said = await res.text();
+      for (const part of ["usd", '"n/a"', "row 2", "price"]) assert(said.includes(part), `${part} missing: ${said}`);
+      // describe still works on it: a broken sheet is the one you need to inspect.
+      const [, ...rows] = (await runs(`describe @${badId}`)).data as Table;
+      assertEquals(rows.length, 1);
+    }
   }
 
   // net-hook ingestion + net-http polling.
@@ -1152,6 +1404,8 @@ Deno.test(async function allTests(_t) {
       const denied = await call(intruder, "read_sheet", {});
       assertEquals(denied.isError, true);
       assert(denied.content[0].text.includes("access"), denied.content[0].text);
+      // A denial has to say how access is granted, not just that it is missing.
+      assert(denied.content[0].text.includes(`/library/${sheet_id}/share`), denied.content[0].text);
     }
 
     // Protocol errors.
@@ -1169,17 +1423,20 @@ Deno.test(async function allTests(_t) {
 
   // Proxy guards. Each rejection must name its own cause, never a bare status.
   {
+    // `code` is the proxy's own status; the body's `status` is the origin's.
     const proxy = async (url?: string) => {
       const res = await app.request(
         "/proxy" + (url === undefined ? "" : `?url=${encodeURIComponent(url)}`),
       );
-      return { status: res.status, ...(await res.json()) };
+      return { code: res.status, ...(await res.json()) };
     };
-    assertEquals(await proxy(), { status: 400, error: "Missing url parameter" });
-    assertEquals(await proxy("ftp://example.com/x"), {
-      status: 400,
-      error: "Only HTTP(S) URLs allowed.",
-    });
+    assertEquals(await proxy(), { code: 400, error: "Missing url parameter" });
+    {
+      const { code, error, repro } = await proxy("ftp://example.com/x");
+      assertEquals([code, error], [400, "Only HTTP(S) URLs allowed."]);
+      // A failure has to be reproducible by hand, not just described.
+      assertEquals(repro, "curl -i 'ftp://example.com/x'");
+    }
     for (
       const url of [
         "http://localhost/x",
@@ -1188,10 +1445,11 @@ Deno.test(async function allTests(_t) {
         "http://169.254.169.254/latest/meta-data",
       ]
     ) {
-      assertEquals(await proxy(url), { status: 400, error: "Internal URLs not allowed." }, url);
+      const { code, error, repro } = await proxy(url);
+      assertEquals([code, error, repro], [400, "Internal URLs not allowed.", `curl -i '${url}'`], url);
     }
-    const { status, error } = await proxy("notaurl");
-    assertEquals(status, 502);
+    const { code, error } = await proxy("notaurl");
+    assertEquals(code, 502);
     assert(
       error.includes("Invalid URL") && error.includes("notaurl"),
       `A malformed url should say which url is malformed, got: ${error}`,

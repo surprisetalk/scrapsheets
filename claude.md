@@ -74,7 +74,11 @@ technologies. It uses a hybrid architecture with:
 - **Seeding**: a lazy-once middleware runs `seed()` (examples.sql + src/examples.mjs datasets) on the first request;
   idempotent via `on conflict (doc_id) do update`
 - **net-http polling**: `pollNetOnce` scans net-http sheets every 15s, fetches due URLs through the safeFetch SSRF
-  guard, and appends bodies to the `net` table
+  guard, and appends bodies to the `net` table. A failed fetch lands as a row too, shaped by `fetchFailure()`: status,
+  the URL actually fetched after redirects, content type, a body snippet, and a `repro` curl line that names the header
+  keys the sheet sent but never their values. `/proxy` returns the same shape
+- **Webhook ingest**: `POST /net/:id` rejects an unknown sheet (404), a non-net sheet (400) and a body over
+  `NET_BODY_CAP` (413), each naming what it received. Signature verification does not exist yet
 - **MCP server**: POST /mcp/:id is a hand-rolled JSON-RPC 2.0 endpoint (initialize, tools/list, tools/call) with tools
   read_sheet, write_cells, query_sheet, list_sheets; :id is the default sheet scope
 
@@ -87,6 +91,18 @@ technologies. It uses a hybrid architecture with:
   `scanRefs()` is the one `@type:doc_id` scanner, and `checkResultColumns()` turns AlaSQL's silent undefined column into
   an error. `nearest()` backs every "did you mean": unknown columns and unresolved `@sheet` refs in both engines. The
   server passes sheet rows through `params[0]` so `alasql.from.SHEET` stays request-scoped
+- **Schema introspection**: `describe @table:abc` is intercepted by `describeRef()` before the engine sees it, in both
+  engines, and answers with column/type/rows/nulls/sample. It is the one statement that still works on a sheet whose
+  cells fail the type check, because that is the sheet you need to inspect
+- **Cost guards**: `checkQueryRows()` caps the rows a single query may load across every `@sheet` (`MAX_QUERY_ROWS`);
+  that is the guard that actually stops a runaway, since a single-threaded engine cannot be preempted. `MAX_QUERY_MS`
+  only bounds how long the caller waits — the work itself still finishes
+- **Type mismatch**: `checkColumnTypes()` runs on each **table** sheet as it loads, in both engines, and rejects a
+  non-numeric value in a `num`/`int`/`float`/`usd`/`percentage` column, naming the row, the declared type and the value.
+  Without it a `sum()` over a column holding "n/a" was quietly wrong. Query sheets are exempt: their column types are
+  the source column's, so `cast(price as string) as price` would trip a check meant for a bad cell
+- **Error shape**: `explain(headline, fields)` in `src/sql.mjs` is the one formatter for the aligned
+  expected/received/source/fix block
 - **Sharing**: `GET/POST/DELETE /library/:id/share` (owner-only, by email + role), `POST /library/:id/public`, and
   `POST /library/:id/link` which mints a viewer-scoped JWT. The link rides the sync socket's existing `?auth=`
   parameter, so there is one read path rather than two
@@ -94,9 +110,17 @@ technologies. It uses a hybrid architecture with:
   Checkout Session (`STRIPE_SECRET_KEY`) and returns `{ checkout_url }`. `POST /stripe` verifies `stripe-signature`
   (`STRIPE_WEBHOOK_SECRET`) and fulfills `checkout.session.completed` with `payment_status=paid`. Checkout is card-only.
   Money lands on the platform account; Connect payouts are not wired.
-- **Reads and export**: `GET /sheet/:id` is the stable JSON read for every sheet type, and `GET /export/:id.csv` the CSV
-  one. Both go through `sheet()`, so they inherit `assertSheetAccess` (membership, purchase, and `public`), pagination,
-  and query-sheet recursion. Export asks for 100000 rows so a net or query sheet is not truncated at the default 50
+- **Reads and export**: `GET /sheet/:id` is the stable JSON read for every sheet type. `GET /export/:id.<format>` is the
+  download path, one route over the `EXPORTS` table: `csv`, `json`, `ndjson`, `md`, `ics`. All go through `sheet()`, so
+  they inherit `assertSheetAccess` (membership, purchase, and `public`), pagination, and query-sheet recursion. Export
+  asks for 100000 rows so a net or query sheet is not truncated at the default 50. The name-keyed formats (`json`,
+  `ndjson`) refuse a sheet with two columns of the same name rather than overwrite one; `ics` needs a
+  `date`/`timestamp`/`create` column and says so when there is none
+- **CSV import**: `POST /import/csv` rejects a row whose field count does not match the header, naming the line, both
+  counts, the raw text and the column it stops at. Type inference requires every non-blank value to parse: at the old
+  80% threshold the other fifth became `NaN` silently
+- **Deterministic reads**: `/library` had no `order by` at all and `/shop` ordered by a non-unique `name`, so paging
+  either repeated and skipped rows. Both now carry a unique tiebreaker, as the `net` read already did
 - **Marketplace**: Buy/sell sheets with pricing system
 - **Real-time data**: WebSocket portals for live data (time, stock prices)
 - **Database codex**: Connect external PostgreSQL databases
@@ -107,8 +131,11 @@ technologies. It uses a hybrid architecture with:
 - **Document types**: Library, Shop, Tab (table), Query, NetHook, NetHttp, NetSocket. Remaining server types (portal,
   template, codex-_) decode to `Unviewable typ`, which the view reports as an error naming the type and a query that can
   read the sheet. Give a type a real view by replacing its `Unviewable` branch in `docDecoder`.
-- **Default library**: client-side (localStorage) system entries merge bundled examples from `src/examples.mjs` (6
-  datasets + example queries), 7 live portals, and the tutorial sheet; system ids skip `repo.find` in `changeId`
+- **Default library**: client-side (localStorage) system entries merge bundled examples from `src/examples.mjs`
+  (datasets, reference/crosswalk tables and example queries —
+  `deno eval "console.log((await
+  import('./src/examples.mjs')).DATASETS.length)"` counts them), 7 live portals, and
+  the tutorial sheet; system ids skip `repo.find` in `changeId`
 - **Cross-sheet queries in the browser**: `resolveSheets` rewrites `@type:doc_id` to `SHEET('id')` and pre-loads each
   doc (library entry or `repo.find`) before AlaSQL runs; `@query:` refs recurse, bounded by `checkRefPath` which reports
   a cycle as the path that closes it (`a -> b -> a`) and caps depth at `MAX_REF_DEPTH`

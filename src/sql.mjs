@@ -12,6 +12,17 @@ const fail = (what, expected, received, fix) =>
     `  Fix:      ${fix}`,
   ].join("\n"));
 
+// The house error shape: a headline, then aligned expected/received/source/fix
+// fields. One formatter so every message in both engines reads the same way.
+export const explain = (headline, fields) =>
+  [
+    headline,
+    ``,
+    ...Object.entries(fields)
+      .filter(([, v]) => v !== undefined && v !== null)
+      .map(([k, v]) => `  ${(k + ":").padEnd(13)}${v}`),
+  ].join("\n");
+
 const show = (v) => v === null ? "null" : v === undefined ? "nothing" : `${typeof v} ${JSON.stringify(v)}`;
 
 const str = (fn, arg, v) => {
@@ -252,6 +263,85 @@ export const checkRefPath = (path, id) => {
   }
 };
 
+// --- schema introspection
+//
+// `describe @table:abc` is not SQL AlaSQL can parse, so both engines intercept it
+// before the engine sees the text. One statement, one ref, nothing else: the
+// point is to answer "what columns does this sheet have" without writing a query
+// that guesses.
+
+export const describeRef = (code) =>
+  code.trim().replace(/;+$/, "").match(/^describe\s+@([a-z-]+:[A-Za-z0-9._-]+)\s*$/i)?.[1];
+
+export const DESCRIBE_COLUMNS = ["column", "type", "rows", "nulls", "sample"];
+
+export const describeRows = (id, cols, rows) => {
+  if (!cols.length) {
+    throw new Error(explain(`The sheet "@${id}" has no columns to describe.`, {
+      Received: `${rows.length} rows and an empty column row`,
+      Source: "data[0] of the referenced sheet",
+      Fix: "add a column to the sheet, then describe it again",
+    }));
+  }
+  return cols.map((col) => {
+    const vals = rows.map((row) => row[col.name]);
+    const filled = vals.filter((v) => v !== null && v !== undefined && v !== "");
+    return {
+      column: col.name,
+      type: typeof col.type === "string" ? col.type : JSON.stringify(col.type),
+      rows: rows.length,
+      nulls: rows.length - filled.length,
+      sample: filled.length ? String(filled[0]).slice(0, 60) : null,
+    };
+  });
+};
+
+// --- type mismatch
+//
+// A numeric column holding "n/a" reaches the engine as a string, and every sum
+// over it is wrong without saying so. The check belongs on the source sheet, not
+// the result: the sheet is the only place the declared type and the row number
+// both exist.
+
+const NUMERIC = ["num", "int", "float", "usd", "percentage"];
+
+export const checkColumnTypes = (id, cols, rows) => {
+  for (const col of cols) {
+    if (!NUMERIC.includes(col.type)) continue;
+    for (let i = 0; i < rows.length; i++) {
+      const v = rows[i][col.name];
+      if (v === null || v === undefined || v === "" || typeof v === "number") continue;
+      if (typeof v === "string" && !Number.isNaN(Number(v.trim()))) continue;
+      throw new Error(explain(`Column "${col.name}" of @${id} holds a value its type does not allow.`, {
+        Expected: `${col.type}, so a number or a blank`,
+        Received: `${typeof v} ${JSON.stringify(v)}`,
+        Source: `row ${i + 1} of @${id}, column "${col.name}"`,
+        Fix: `clear that cell, or change the column's type to text`,
+      }));
+    }
+  }
+};
+
+// --- cost guards
+//
+// A single-threaded engine cannot be preempted mid-query, so the only guard that
+// actually prevents a runaway is the one applied before the engine starts: cap
+// the rows loaded, not the time spent. MAX_QUERY_MS bounds how long a caller
+// waits for an answer; the work itself still finishes in the background.
+
+export const MAX_QUERY_ROWS = 200_000;
+export const MAX_QUERY_MS = 15_000;
+
+export const checkQueryRows = (total, id) => {
+  if (total <= MAX_QUERY_ROWS) return total;
+  throw new Error(explain(`This query loads more rows than one run is allowed.`, {
+    Received: `${total} rows, the last of them from @${id}`,
+    Limit: `${MAX_QUERY_ROWS} rows across every @sheet in one query`,
+    Source: "the @sheet refs in this query",
+    Fix: "filter the large sheet in its own query sheet, then reference that instead",
+  }));
+};
+
 // --- error formatting
 
 export const nearest = (name, known) => {
@@ -310,19 +400,11 @@ export const checkResultColumns = (cols, rows, known = [], code = "") => {
     // Strictly undefined, never null: `select null as x` is a real answer.
     if (!rows.every((row) => row[columnid] === undefined)) continue;
     const hit = nearest(columnid, known);
-    throw new Error(
-      [
-        `No column named "${columnid}".`,
-        ``,
-        hit
-          ? `  Did you mean: ${hit}`
-          : `  Available:    ${known.join(", ") || "(the referenced sheets have no columns)"}`,
-        `  Source:       ${known.length ? "the sheets this query references" : "no @sheet is referenced"}`,
-        `  Fix:          ${
-          hit ? `rename "${columnid}" to "${hit}"` : "check the column names in the sheet's type row"
-        }`,
-      ].join("\n"),
-    );
+    throw new Error(explain(`No column named "${columnid}".`, {
+      ...(hit ? { "Did you mean": hit } : { Available: known.join(", ") || "(the referenced sheets have no columns)" }),
+      Source: known.length ? "the sheets this query references" : "no @sheet is referenced",
+      Fix: hit ? `rename "${columnid}" to "${hit}"` : "check the column names in the sheet's type row",
+    }));
   }
 };
 

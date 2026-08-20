@@ -17,7 +17,21 @@ import * as prql from "prql-js";
 import * as path from "@std/path";
 import examplesSql from "./examples.sql" with { type: "text" };
 import { DATASETS } from "./src/examples.mjs";
-import { checkRefPath, checkResultColumns, formatQueryError, nearest, register, scanRefs } from "./src/sql.mjs";
+import {
+  checkColumnTypes,
+  checkQueryRows,
+  checkRefPath,
+  checkResultColumns,
+  DESCRIBE_COLUMNS,
+  describeRef,
+  describeRows,
+  explain,
+  formatQueryError,
+  MAX_QUERY_MS,
+  nearest,
+  register,
+  scanRefs,
+} from "./src/sql.mjs";
 import Stripe from "stripe";
 
 // --- secrets & crypto
@@ -188,6 +202,8 @@ export type Type =
   | "bool"
   | "float"
   | "percentage"
+  | "date"
+  | "timestamp"
   | "json"
   | ["array", Type]
   | ["tuple", Type[]]
@@ -249,10 +265,18 @@ const assertSheetAccess = async (c: Context, sheet_id: string): Promise<void> =>
     select true from sheet where sheet_id = ${sheet_id} and public
   `;
   if (!access) {
+    // Deliberately no owner emails: any signed-in user can name any sheet_id, so
+    // the message says how access is granted without saying who holds it.
+    const [exists] = await sql`select type from sheet where sheet_id = ${sheet_id}`;
     throw new HTTPException(403, {
-      message: `Expected read access to ${sheet_id} for usr ${
-        c.get("usr_id")
-      }, received none. Source: sheet_usr membership, a purchase of the listing, or sheet.public. Ask an owner to share it with you, or have them make it public.`,
+      message: explain(`You do not have read access to ${sheet_id}.`, {
+        Received: exists ? `no membership, no purchase, and the sheet is not public` : `no sheet with that id exists`,
+        Expected: "a share on the sheet, a purchase of its listing, or sheet.public",
+        Source: "sheet_usr, the payment-derived buy_id/sell_id link, and sheet.public",
+        Fix: exists
+          ? `ask an owner to run POST /library/${sheet_id}/share with your email, or POST /library/${sheet_id}/public`
+          : "check the id: it is type:doc_id, e.g. table:abc123",
+      }),
     });
   }
 };
@@ -268,10 +292,14 @@ const assertSheetOwner = async (c: Context, sheet_id: string): Promise<void> => 
       and (su.role = 'owner' or s.created_by = ${c.get("usr_id")})
   `;
   if (!owner) {
+    const [mine] = await sql`select role from sheet_usr where sheet_id = ${sheet_id} and usr_id = ${c.get("usr_id")}`;
     throw new HTTPException(403, {
-      message: `Expected usr ${
-        c.get("usr_id")
-      } to own ${sheet_id}, received a non-owner. Source: sheet_usr.role and sheet.created_by. Only an owner can change sharing; ask one to make the change or grant you the owner role.`,
+      message: explain(`Only an owner can change ${sheet_id}.`, {
+        Received: mine ? `your role on this sheet is ${mine.role}` : "you have no role on this sheet",
+        Expected: "role owner, or having created the sheet",
+        Source: "sheet_usr.role and sheet.created_by",
+        Fix: `ask an owner to run POST /library/${sheet_id}/share with your email and role owner`,
+      }),
     });
   }
 };
@@ -348,14 +376,20 @@ const executeSql = async (
   sqlCode: string,
   path_: string[] = [],
 ): Promise<Page> => {
+  // `describe @table:abc` never reaches the engine: it loads the one sheet it
+  // names and reports its shape. describeRef is shared with the page.
+  const described = describeRef(sqlCode);
   // scanRefs is shared with the page, so @type:doc_id resolves identically here.
-  const { sql: code_, ids: sheet_ids } = scanRefs(sqlCode);
+  const { sql: code_, ids: sheet_ids } = described ? { sql: "", ids: [described] } : scanRefs(sqlCode);
 
   // Load referenced sheets, remembering source column types by name.
   const docs: Record<string, Record<string, unknown>[]> = {};
+  const colsOf: Record<string, Col[]> = {};
   const nameToType: Record<string, Type> = {};
+  let loaded = 0;
   for (const sheet_id of sheet_ids) {
     if (docs[sheet_id]) continue;
+    const [type_] = sheet_id.split(":");
     try {
       checkRefPath(path_, sheet_id);
     } catch (err) {
@@ -378,21 +412,79 @@ const executeSql = async (
         ].join("\n"),
       });
     })).data;
-    for (const col of Object.values(cols)) nameToType[col.name] = col.type;
+    colsOf[sheet_id] = Object.values(cols);
+    for (const col of colsOf[sheet_id]) nameToType[col.name] = col.type;
     docs[sheet_id] = rows.map((row) =>
       Object.fromEntries(
-        Object.values(cols).map((col) => [col.name, row[col.key]]),
+        colsOf[sheet_id].map((col) => [col.name, row[col.key]]),
       )
     );
+    try {
+      loaded = checkQueryRows(loaded + rows.length, sheet_id);
+      // Only table sheets, matching the page: a query column keeps the source
+      // column's declared type, so `cast(price as string) as price` would trip a
+      // check that is meant to catch a bad cell. Skipped for describe too, since
+      // a sheet that fails this is exactly the one you need to inspect.
+      if (!described && type_ === "table") checkColumnTypes(sheet_id, colsOf[sheet_id], docs[sheet_id]);
+    } catch (err) {
+      throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  if (described) {
+    let rows: Record<string, unknown>[];
+    try {
+      rows = describeRows(described, colsOf[described], docs[described]);
+    } catch (err) {
+      throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
+    }
+    return {
+      data: [
+        arrayify(
+          DESCRIBE_COLUMNS.map((name) => ({
+            name,
+            type: (["rows", "nulls"].includes(name) ? "int" : "text") as Type,
+            key: name,
+          })),
+        ),
+        ...rows,
+      ],
+      count: rows.length,
+      offset: 0,
+    };
   }
 
   let result: { columns: { columnid: string }[]; data: Record<string, unknown>[] };
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    result = await ala(code_, [docs]);
+    // The engine is single-threaded JS and cannot be interrupted, so this bounds
+    // how long the caller waits, not how long the CPU burns. checkQueryRows above
+    // is the guard that actually keeps a runaway from starting.
+    result = await Promise.race<typeof result>([
+      ala(code_, [docs]),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new HTTPException(504, {
+                message: explain(`This query ran longer than one request is allowed.`, {
+                  Received: `still running after ${MAX_QUERY_MS / 1000}s over ${loaded} loaded rows`,
+                  Limit: `${MAX_QUERY_MS / 1000}s per query`,
+                  Source: "the SQL in this query sheet",
+                  Fix: "narrow the joins, or filter each @sheet in its own query sheet first",
+                }),
+              }),
+            ),
+          MAX_QUERY_MS,
+        );
+      }),
+    ]);
   } catch (err) {
     // An AlaSQL parse error used to surface as a generic 500. Say where it is.
     if (err instanceof HTTPException) throw err;
     throw new HTTPException(400, { message: formatQueryError(err, sqlCode) });
+  } finally {
+    clearTimeout(timer);
   }
   const { columns: cols, data: rows } = result;
   try {
@@ -1365,18 +1457,61 @@ app.get("/shop", async (c) => {
         qs.sell_price &&
         sql`sell_price between ${qs.sell_price.split("-")[0]}::numeric and ${qs.sell_price.split("-")[1]}::numeric`,
       ],
-      order: sql`order by name`,
+      // name is not unique, so it cannot decide the order on its own.
+      order: sql`order by name, sell_id`,
       limit,
       offset,
     }),
   );
 });
 
+// One delivery may not be larger than this. The net table has no retention policy
+// yet, so an unbounded body is an unbounded table.
+const NET_BODY_CAP = 1_048_576;
+
 app.post("/net/:id", async (c) => {
+  const sheet_id = c.req.param("id");
+  const heard = [...c.req.raw.headers.keys()].sort().join(", ") || "(none)";
+  // Every rejection below names the delivery, not just the status: a webhook
+  // sender sees only the response body, so the body has to carry the diagnosis.
+  const [target] = await sql`select type from sheet where sheet_id = ${sheet_id}`;
+  if (!target) {
+    throw new HTTPException(404, {
+      message: explain(`No sheet with id ${sheet_id} accepts deliveries.`, {
+        Received: `POST /net/${sheet_id} carrying headers ${heard}`,
+        Expected: "the sheet_id of an existing net-hook, net-http, or net-socket sheet",
+        Source: "the sheet table",
+        Fix: `create the sheet first with PUT /library/net-hook:<doc_id>, then post to /net/net-hook:<doc_id>`,
+      }),
+    });
+  }
+  if (!String(target.type).startsWith("net-")) {
+    throw new HTTPException(400, {
+      message: explain(`Sheet ${sheet_id} does not accept deliveries.`, {
+        Received: `a ${target.type} sheet`,
+        Expected: "a net-hook, net-http, or net-socket sheet",
+        Source: "sheet.type",
+        Fix: "post to a net-hook sheet, or change this sheet's type prefix",
+      }),
+    });
+  }
+  const declared = Number(c.req.header("content-length") ?? NaN);
+  const body = declared > NET_BODY_CAP ? "" : await c.req.text();
+  const size = declared > NET_BODY_CAP ? declared : new TextEncoder().encode(body).byteLength;
+  if (size > NET_BODY_CAP) {
+    throw new HTTPException(413, {
+      message: explain(`This delivery to ${sheet_id} is too large to store.`, {
+        Received: `${size} bytes`,
+        Limit: `${NET_BODY_CAP} bytes per delivery`,
+        Source: "the request body",
+        Fix: "send the payload in pages, or post a URL the sheet can fetch instead",
+      }),
+    });
+  }
   await sql`insert into net ${
     sql({
-      sheet_id: c.req.param("id"),
-      body: await c.req.text(),
+      sheet_id,
+      body,
       method: c.req.method,
       req_headers: JSON.stringify(Object.fromEntries(c.req.raw.headers)),
       query_params: JSON.stringify(c.req.query()),
@@ -1442,6 +1577,26 @@ export const parseNetHeaders = (raw = ""): Record<string, string> =>
     }),
   );
 
+// A failure the user can reproduce. The curl line names the header keys the sheet
+// sent but never their values: a net-http header may carry a token.
+const curlFor = (url: string, headers: Record<string, string>): string =>
+  ["curl -i", ...Object.keys(headers).map((k) => `-H '${k}: <value>'`), `'${url.replace(/'/g, "'\\''")}'`].join(" ");
+
+const fetchFailure = (
+  url: string,
+  headers: Record<string, string>,
+  res: Response | null,
+  detail: string,
+): Record<string, unknown> => ({
+  error: res ? `HTTP ${res.status}${res.statusText ? " " + res.statusText : ""}` : detail,
+  status: res?.status ?? null,
+  // The URL actually fetched, which is not the configured one once a redirect ran.
+  url: res?.url || url,
+  content_type: res?.headers.get("content-type") ?? null,
+  body: res ? detail.slice(0, 1000) : null,
+  repro: curlFor(res?.url || url, headers),
+});
+
 const netDue = new Map<string, number>();
 
 // Read at most `cap` bytes, then abandon the rest of the body.
@@ -1472,21 +1627,27 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
   for (const { sheet_id, doc_id } of sheets) {
     if ((netDue.get(sheet_id) ?? 0) > now) continue;
     netDue.set(sheet_id, now + 3600_000);
+    // Declared out here so the catch can name the URL and headers it failed on.
+    let url = `sheet ${sheet_id}`, headers: Record<string, string> = {};
     try {
       const config = (await automerge.find<{ data: [NetHttp] }>(doc_id)).doc()?.data?.[0];
       if (!config) throw new Error("The document has no config in data[0].");
       netDue.set(sheet_id, now + Math.max(60, Number(config.interval) || 3600) * 1000);
       if (!config.url) continue;
-      const res = await fetcher(config.url, parseNetHeaders(config.headers));
+      url = config.url;
+      headers = parseNetHeaders(config.headers);
+      const res = await fetcher(url, headers);
       const text = await readCapped(res, 65536);
-      // Errors become log rows too: the user who typed the URL must see them.
-      const body = res.ok ? text : JSON.stringify({ error: `HTTP ${res.status}`, body: text.slice(0, 1000) });
+      // Errors become log rows too: the user who typed the URL must see them, and
+      // must be able to run the same request by hand.
+      const body = res.ok ? text : JSON.stringify(fetchFailure(url, headers, res, text));
       await sql`insert into net (sheet_id, method, body) values (${sheet_id}, 'GET', ${body})`;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`net-http poll ${sheet_id}:`, message);
+      const failure = fetchFailure(url, headers, null, message);
       await sql`
-        insert into net (sheet_id, method, body) values (${sheet_id}, 'GET', ${JSON.stringify({ error: message })})
+        insert into net (sheet_id, method, body) values (${sheet_id}, 'GET', ${JSON.stringify(failure)})
       `.catch((dbErr: unknown) => console.error(`net-http poll ${sheet_id}: could not record the error:`, dbErr));
     }
   }
@@ -1508,13 +1669,15 @@ app.get("/proxy", async (c) => {
     const res = await safeFetch(url);
     const contentType = res.headers.get("content-type") || "application/octet-stream";
     const body = await res.text();
+    if (!res.ok) return c.json(fetchFailure(url, {}, res, body), 502);
     return c.text(body, res.status as 200, {
       "Content-Type": contentType,
       "X-Proxy-Status": String(res.status),
     });
   } catch (err) {
-    if (err instanceof HTTPException) return c.json({ error: err.message }, err.status);
-    return c.json({ error: `Fetch failed: ${err instanceof Error ? err.message : "Unknown error"}` }, 502);
+    const message = err instanceof Error ? err.message : "Unknown error";
+    if (err instanceof HTTPException) return c.json(fetchFailure(url, {}, null, err.message), err.status);
+    return c.json(fetchFailure(url, {}, null, `Fetch failed: ${message}`), 502);
   }
 });
 
@@ -1667,7 +1830,9 @@ app.get("/library", async (c) => {
         qs.doc_id && sql`doc_id = ${qs.doc_id}`,
         qs.type && sql`type = ${qs.type}`,
       ],
-      order: undefined,
+      // Without an order the heap decides, so paging the library repeats and
+      // skips rows; sheet_id breaks ties between sheets created in the same tick.
+      order: sql`order by s.created_at desc, s.sheet_id`,
       limit,
       offset,
     }),
@@ -1887,12 +2052,23 @@ app.post("/import/csv", async (c) => {
     });
   }
 
-  // Parse CSV
-  const parseCSV = (text: string): string[][] => {
-    const rows: string[][] = [];
+  // Parse CSV. Each row keeps the line it started on and its raw text, because a
+  // rejection has to point at the line in the file the user is looking at.
+  const parseCSV = (text: string): { fields: string[]; line: number; raw: string }[] => {
+    const rows: { fields: string[]; line: number; raw: string }[] = [];
     let currentRow: string[] = [];
     let currentField = "";
     let inQuotes = false;
+    let start = 0;
+    let line = 1; // where the scanner is
+    let rowLine = 1; // where the row being built started
+
+    const push = (end: number) => {
+      currentRow.push(currentField);
+      rows.push({ fields: currentRow, line: rowLine, raw: text.slice(start, end) });
+      currentRow = [];
+      currentField = "";
+    };
 
     for (let i = 0; i < text.length; i++) {
       const char = text[i];
@@ -1904,8 +2080,10 @@ app.post("/import/csv", async (c) => {
           i++; // Skip next quote
         } else if (char === '"')
           inQuotes = false;
-        else
+        else {
+          if (char === "\n") line++;
           currentField += char;
+        }
       } else {
         if (char === '"')
           inQuotes = true;
@@ -1913,11 +2091,10 @@ app.post("/import/csv", async (c) => {
           currentRow.push(currentField);
           currentField = "";
         } else if (char === "\n" || (char === "\r" && nextChar === "\n")) {
-          currentRow.push(currentField);
-          rows.push(currentRow);
-          currentRow = [];
-          currentField = "";
+          push(i);
           if (char === "\r") i++; // Skip \n in \r\n
+          start = i + 1;
+          rowLine = ++line;
         } else if (char !== "\r") {
           currentField += char;
         }
@@ -1925,10 +2102,7 @@ app.post("/import/csv", async (c) => {
     }
 
     // Don't forget the last field/row
-    if (currentField || currentRow.length > 0) {
-      currentRow.push(currentField);
-      rows.push(currentRow);
-    }
+    if (currentField || currentRow.length > 0) push(text.length);
 
     return rows;
   };
@@ -1943,28 +2117,38 @@ app.post("/import/csv", async (c) => {
 
   const [headerRow, ...dataRows] = parsed;
 
-  // Infer types from data
+  // A short or long row is the single most common broken CSV, and coercing it
+  // loses data silently. Name the line, the counts, and the column it stops at.
+  const ragged = dataRows.find((row) => row.fields.length !== headerRow.fields.length);
+  if (ragged) {
+    const at = Math.min(ragged.fields.length, headerRow.fields.length);
+    throw new HTTPException(400, {
+      message: explain(`Line ${ragged.line} of the CSV does not match its header.`, {
+        Expected: `${headerRow.fields.length} fields: ${headerRow.fields.join(", ")}`,
+        Received: `${ragged.fields.length} fields: ${ragged.raw.slice(0, 200)}`,
+        Column: ragged.fields.length < headerRow.fields.length
+          ? `nothing for "${headerRow.fields[at]}"`
+          : `an extra field after "${headerRow.fields[at - 1]}"`,
+        Source: `line ${ragged.line} of the uploaded file`,
+        Fix: "quote the field that contains a comma, or fill in the missing column",
+      }),
+    });
+  }
+
+  // Every non-blank value must parse, not four in five. At 80% the other fifth
+  // became NaN or false silently, which is data loss dressed up as inference.
   const inferType = (values: string[]): string => {
-    let numericCount = 0;
-    let boolCount = 0;
-    let total = 0;
-
-    for (const val of values) {
-      if (!val.trim()) continue;
-      total++;
-      if (!isNaN(Number(val))) numericCount++;
-      if (["true", "false", "t", "f", "1", "0", "yes", "no"].includes(val.toLowerCase())) boolCount++;
-    }
-
-    if (total === 0) return "text";
-    if (numericCount / total > 0.8) return "num";
-    if (boolCount / total > 0.8) return "bool";
+    const filled = values.filter((val) => val.trim());
+    if (!filled.length) return "text";
+    if (filled.every((val) => !isNaN(Number(val)))) return "num";
+    if (filled.every((val) => ["true", "false", "t", "f", "1", "0", "yes", "no"].includes(val.toLowerCase())))
+      return "bool";
     return "text";
   };
 
   // Build column definitions
-  const cols: Col[] = headerRow.map((name, i) => {
-    const colValues = dataRows.map((row) => row[i] || "");
+  const cols: Col[] = headerRow.fields.map((name, i) => {
+    const colValues = dataRows.map((row) => row.fields[i] || "");
     return {
       name: name.trim() || `Column ${i + 1}`,
       type: inferType(colValues) as Type,
@@ -1973,10 +2157,10 @@ app.post("/import/csv", async (c) => {
   });
 
   // Build rows with proper type conversion
-  const rows: Row[] = dataRows.map((row) => {
+  const rows: Row[] = dataRows.map(({ fields }) => {
     const obj: Row = {};
     cols.forEach((col, i) => {
-      const val = row[i] ?? "";
+      const val = fields[i] ?? "";
       if (col.type === "num" && val.trim())
         obj[col.key] = Number(val);
       else if (col.type === "bool")
@@ -2024,8 +2208,139 @@ app.post("/import/csv", async (c) => {
   return c.json({ sheet_id: created.sheet_id, rows: rows.length, cols: cols.length }, 201);
 });
 
-app.get("/export/:id{.+\\.csv}", async (c) => {
-  const sheet_id = c.req.param("id").replace(/\.csv$/, "");
+// One export route, five renderings. Every format goes through sheet(), so it
+// inherits assertSheetAccess and the query/net recursion rather than repeating it.
+
+const csvCell = (val: unknown): string => {
+  const str = val === null || val === undefined ? "" : String(val);
+  return /[",\n\r]/.test(str) ? '"' + str.replace(/"/g, '""') + '"' : str;
+};
+
+// RFC 5545: escape the reserved characters, then fold so no line exceeds 75
+// octets. Folding counts bytes but must cut on codepoints: splitting a UTF-8
+// sequence in half turns an emoji into two replacement characters.
+const icsLine = (name: string, val: string): string => {
+  const line = `${name}:${val.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/([;,])/g, "\\$1")}`;
+  const parts: string[] = [];
+  let part = "", used = 0;
+  for (const ch of line) {
+    const size = new TextEncoder().encode(ch).byteLength;
+    // A continuation line spends one of its 75 octets on the leading space.
+    if (used + size > (parts.length ? 74 : 75)) {
+      parts.push(part);
+      part = "";
+      used = 0;
+    }
+    part += ch;
+    used += size;
+  }
+  parts.push(part);
+  return parts.join("\r\n ");
+};
+
+// A date-only value stays a date: an all-day event must not shift by a timezone.
+const icsStamp = (val: string): string => {
+  const d = new Date(/^\d{4}-\d{2}-\d{2}$/.test(val) ? `${val}T00:00:00Z` : val);
+  if (Number.isNaN(d.getTime())) return "";
+  const iso = d.toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "");
+  return /^\d{4}-\d{2}-\d{2}$/.test(val) ? `;VALUE=DATE:${iso.slice(0, 8)}` : `:${iso}`;
+};
+
+const DATE_TYPES = ["date", "timestamp", "create"];
+
+// Records keyed by column name, for the formats that carry names into every row.
+const named = (sheet_id: string, cols: Col[], rows: Row[]): Record<string, unknown>[] => {
+  const seen = cols.map((col) => col.name).filter((name, i, all) => all.indexOf(name) !== i);
+  if (seen.length) {
+    throw new HTTPException(400, {
+      message: explain(`Sheet ${sheet_id} has two columns with the same name.`, {
+        Received: `${seen.join(", ")} appears more than once`,
+        Source: "the column row of the sheet, or the select list of its query",
+        Fix: "alias one of them, e.g. select a, b as b2, then export again",
+      }),
+    });
+  }
+  return rows.map((row) => Object.fromEntries(cols.map((col) => [col.name, row[col.key] ?? null])));
+};
+
+const EXPORTS: Record<string, { mime: string; render: (id: string, cols: Col[], rows: Row[]) => string }> = {
+  csv: {
+    mime: "text/csv; charset=utf-8",
+    render: (_id, cols, rows) =>
+      [
+        cols.map((col) => csvCell(col.name)).join(","),
+        ...rows.map((row) => cols.map((col) => csvCell(row[col.key])).join(",")),
+      ].join("\n"),
+  },
+  json: {
+    mime: "application/json; charset=utf-8",
+    render: (id, cols, rows) => JSON.stringify(named(id, cols, rows), null, 2),
+  },
+  ndjson: {
+    mime: "application/x-ndjson; charset=utf-8",
+    render: (id, cols, rows) => named(id, cols, rows).map((row) => JSON.stringify(row)).join("\n"),
+  },
+  md: {
+    mime: "text/markdown; charset=utf-8",
+    render: (_id, cols, rows) => {
+      const cell = (val: unknown) =>
+        (val === null || val === undefined ? "" : String(val)).replace(/\|/g, "\\|").replace(/\n/g, "<br>");
+      return [
+        `| ${cols.map((col) => cell(col.name)).join(" | ")} |`,
+        `| ${cols.map(() => "---").join(" | ")} |`,
+        ...rows.map((row) => `| ${cols.map((col) => cell(row[col.key])).join(" | ")} |`),
+      ].join("\n");
+    },
+  },
+  ics: {
+    mime: "text/calendar; charset=utf-8",
+    render: (id, cols, rows) => {
+      const when = cols.find((col) => DATE_TYPES.includes(String(col.type)));
+      if (!when) {
+        throw new HTTPException(400, {
+          message: explain(`Sheet ${id} has no date column to build a calendar from.`, {
+            Received: cols.map((col) => `${col.name} (${JSON.stringify(col.type)})`).join(", ") || "(no columns)",
+            Expected: `one column typed ${DATE_TYPES.join(", ")}`,
+            Source: "the column row of the sheet",
+            Fix: "set a column's type to date, then export .ics again",
+          }),
+        });
+      }
+      const title = cols.find((col) => col.key !== when.key && String(col.type) === "text") ?? when;
+      const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "");
+      const events = rows.flatMap((row, i) => {
+        const at = icsStamp(String(row[when.key] ?? ""));
+        if (!at) return [];
+        return [
+          "BEGIN:VEVENT",
+          icsLine("UID", `${id}-${i}@sheets.scrap.land`),
+          `DTSTAMP:${stamp}`,
+          `DTSTART${at}`,
+          icsLine("SUMMARY", String(row[title.key] ?? `${id} row ${i + 1}`)),
+          icsLine(
+            "DESCRIPTION",
+            cols.filter((col) => col.key !== when.key && col.key !== title.key)
+              .map((col) => `${col.name}: ${row[col.key] ?? ""}`).join("\n"),
+          ),
+          "END:VEVENT",
+        ];
+      });
+      return [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Scrapsheets//EN",
+        "CALSCALE:GREGORIAN",
+        ...events,
+        "END:VCALENDAR",
+      ].join("\r\n");
+    },
+  },
+};
+
+app.get(`/export/:id{.+\\.(${Object.keys(EXPORTS).join("|")})}`, async (c) => {
+  const raw = c.req.param("id");
+  const format = raw.slice(raw.lastIndexOf(".") + 1);
+  const sheet_id = raw.slice(0, raw.lastIndexOf("."));
   // sheet() paginates net and query sheets at 50 rows; an export wants the whole sheet.
   const { data } = await sheet(c, sheet_id, { limit: "100000", ...c.req.query() });
   const [colsRow, ...rows] = data;
@@ -2035,25 +2350,11 @@ app.get("/export/:id{.+\\.csv}", async (c) => {
         `Expected sheet ${sheet_id} to have a column row, received a document with no rows at all. Source: data[0] of the automerge document. Add a column before exporting.`,
     });
   }
-  const cols = Object.values(colsRow) as Col[];
-
-  const escapeCSV = (val: unknown): string => {
-    if (val === null || val === undefined) return "";
-    const str = String(val);
-    if (str.includes(",") || str.includes('"') || str.includes("\n"))
-      return '"' + str.replace(/"/g, '""') + '"';
-    return str;
-  };
-
-  const csv = [
-    cols.map((col) => escapeCSV(col.name)).join(","),
-    ...rows.map((row) => cols.map((col) => escapeCSV((row as Row)[col.key])).join(",")),
-  ].join("\n");
-
-  return new Response(csv, {
+  const { mime, render } = EXPORTS[format];
+  return new Response(render(sheet_id, Object.values(colsRow) as Col[], rows), {
     headers: {
-      "Content-Type": "text/csv; charset=utf-8",
-      "Content-Disposition": `attachment; filename="${sheet_id.replace(/[^a-zA-Z0-9-_]/g, "_")}.csv"`,
+      "Content-Type": mime,
+      "Content-Disposition": `attachment; filename="${sheet_id.replace(/[^a-zA-Z0-9-_]/g, "_")}.${format}"`,
     },
   });
 });

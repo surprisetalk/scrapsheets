@@ -382,6 +382,18 @@ Deno.test("bundled examples render and cross-sheet queries join", async () => {
   await page.goto(`http://127.0.0.1:${port}/query:festival-season`);
   await waitForText(["2026-06", "2026-07", "2026-08"], "/query:festival-season");
 
+  // describe never reaches the engine: it reports the shape of the sheet it names.
+  await page.goto(`http://127.0.0.1:${port}/query:describe-currencies`);
+  await waitForText(["minor"], "/query:describe-currencies");
+  const described = await page.evaluate(`document.body.innerText`) as string;
+  for (const want of ["column", "nulls", "sample", "code", "symbol", "USD"]) {
+    assertEquals(described.includes(want), true, `describe should report ${want}, got:\n${described.slice(0, 1500)}`);
+  }
+
+  // A reference dataset joins to a bundled one through the page engine.
+  await page.goto(`http://127.0.0.1:${port}/query:moved-holidays`);
+  await waitForText(["Independence Day"], "/query:moved-holidays");
+
   // Library chrome: tutorial checklist, net-* creation rows, shortcut sheet.
   await page.goto(`http://127.0.0.1:${port}/`);
   await waitForText(["get started"], "tutorial card");
