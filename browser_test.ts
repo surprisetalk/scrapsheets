@@ -386,13 +386,39 @@ Deno.test("bundled examples render and cross-sheet queries join", async () => {
   await page.goto(`http://127.0.0.1:${port}/query:describe-currencies`);
   await waitForText(["minor"], "/query:describe-currencies");
   const described = await page.evaluate(`document.body.innerText`) as string;
-  for (const want of ["column", "nulls", "sample", "code", "symbol", "USD"]) {
+  for (const want of ["column", "nulls", "sample", "code", "symbol", "USD"])
     assertEquals(described.includes(want), true, `describe should report ${want}, got:\n${described.slice(0, 1500)}`);
-  }
 
   // A reference dataset joins to a bundled one through the page engine.
   await page.goto(`http://127.0.0.1:${port}/query:moved-holidays`);
   await waitForText(["Independence Day"], "/query:moved-holidays");
+
+  // A reference table joins to the country spine, and haversine_km runs in the
+  // page engine as well as the server one.
+  await page.goto(`http://127.0.0.1:${port}/query:port-airport-pairs`);
+  await waitForText(["HND"], "/query:port-airport-pairs");
+  const km = await page.evaluate(
+    `alasql("select round(haversine_km(51.47, -0.45, 40.64, -73.78)) as km").data[0].km`,
+  ) as number;
+  // LHR to JFK, from the two-decimal coordinates this dataset ships. The exact
+  // airport reference points give 5555 km; the rounding costs about 14.
+  assertEquals(km, 5541, "haversine_km should agree with the server engine");
+
+  // min_text()/max_text() run in the page engine too, over a reference table that
+  // has only text to compare.
+  await page.goto(`http://127.0.0.1:${port}/query:ambiguous-nicknames`);
+  await waitForText(["Alexandra"], "/query:ambiguous-nicknames");
+  const both = await page.evaluate(`document.body.innerText`) as string;
+  for (const want of ["Alex", "Chris", "Harry", "Pat"])
+    assertEquals(both.includes(want), true, `expected ${want} among the ambiguous nicknames`);
+
+  // Canary on the upstream bug min_text()/max_text() exist to work around: raw
+  // alasql drops a text min() rather than erroring, so checkResultColumns has to
+  // catch it. If this ever throws instead, the workaround can go.
+  const droppedMin = await page.evaluate(
+    `JSON.stringify(alasql("select min(c) as m from ?", [[{c:"b"},{c:"a"}]]).data)`,
+  ) as string;
+  assertEquals(droppedMin, "[{}]", "alasql still drops a text min() silently");
 
   // Library chrome: tutorial checklist, net-* creation rows, shortcut sheet.
   await page.goto(`http://127.0.0.1:${port}/`);

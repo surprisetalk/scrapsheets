@@ -88,6 +88,9 @@ technologies. It uses a hybrid architecture with:
 - **Query engine**: SQL execution via AlaSQL for cross-sheet queries using `@sheet_id` syntax. `src/sql.mjs` is shared
   by both engines (server `npm:alasql`, page `/alasql.mjs`): `register()` adds the UDFs AlaSQL lacks — aggregates,
   regression, fuzzy matching, UTC date arithmetic including `fiscal_year`/`fiscal_quarter`/`fiscal_period` —
+  `haversine_km()` for great-circle distance (AlaSQL ships no trigonometry at all), `min_text()`/`max_text()` because
+  AlaSQL's own `min()`/`max()` are compiled inline over numbers and dates and drop a text value, so `min(code)` returns
+  nothing rather than the first code — `checkResultColumns()` names that case and points at the replacements.
   `scanRefs()` is the one `@type:doc_id` scanner, and `checkResultColumns()` turns AlaSQL's silent undefined column into
   an error. `nearest()` backs every "did you mean": unknown columns and unresolved `@sheet` refs in both engines. The
   server passes sheet rows through `params[0]` so `alasql.from.SHEET` stays request-scoped
@@ -132,10 +135,12 @@ technologies. It uses a hybrid architecture with:
   template, codex-_) decode to `Unviewable typ`, which the view reports as an error naming the type and a query that can
   read the sheet. Give a type a real view by replacing its `Unviewable` branch in `docDecoder`.
 - **Default library**: client-side (localStorage) system entries merge bundled examples from `src/examples.mjs`
-  (datasets, reference/crosswalk tables and example queries —
-  `deno eval "console.log((await
-  import('./src/examples.mjs')).DATASETS.length)"` counts them), 7 live portals, and
-  the tutorial sheet; system ids skip `repo.find` in `changeId`
+  (datasets, reference/crosswalk tables and example queries), 7 live portals, and the tutorial sheet; system ids skip
+  `repo.find` in `changeId`.
+  `deno eval "const m = await import('./src/examples.mjs'); console.log(m.DATASETS.length,
+  Object.keys(m.EXAMPLES).length, JSON.stringify(m.EXAMPLES).length)"`
+  prints the counts and the byte size, which has to stay well under the ~5 MB localStorage budget. Reference tables
+  carry the `reference` tag and joinable spines `dataset`, the only handle the flat library gives for telling them apart
 - **Cross-sheet queries in the browser**: `resolveSheets` rewrites `@type:doc_id` to `SHEET('id')` and pre-loads each
   doc (library entry or `repo.find`) before AlaSQL runs; `@query:` refs recurse, bounded by `checkRefPath` which reports
   a cycle as the path that closes it (`a -> b -> a`) and caps depth at `MAX_REF_DEPTH`

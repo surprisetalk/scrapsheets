@@ -1179,6 +1179,39 @@ Deno.test(async function allTests(_t) {
       assertEquals(((await runs(`DESCRIBE @${id};`)).data as Table).length, 3);
     }
 
+    // min()/max() over text used to drop the column out of the result: a silent
+    // wrong answer, which is the worst kind. Now it says so, and says what to use.
+    {
+      const codes = automerge.create<{ data: Sheet["data"] }>({
+        data: [
+          arrayify([{ name: "code", type: "text", key: 0 }, { name: "n", type: "num", key: 1 }]),
+          { 0: "10", 1: 5 },
+          { 0: "01", 1: 9 },
+        ],
+      });
+      const codesId = `table:${codes.documentId}`;
+      await put(jwt, `/library/${codesId}`, {});
+      const fails = async (code: string) => {
+        const res = await app.request(`/query`, {
+          method: "POST",
+          headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+          body: JSON.stringify({ lang: "sql", code, args: [] }),
+        });
+        assertEquals(res.status, 400, code);
+        return await res.text();
+      };
+      // Aliased and bare, since the alias exemption used to hide this one.
+      for (const code of [`select min(code) as lowest from @${codesId}`, `select max(code) from @${codesId}`]) {
+        const said = await fails(code);
+        assert(said.includes("min_text"), `${code} -> ${said}`);
+      }
+      // The replacements compare as text, and min() over numbers still works.
+      const [, row] = (await runs(
+        `select min_text(code) as lo, max_text(code) as hi, min(n) as least from @${codesId}`,
+      )).data as Table;
+      assertEquals([row.lo, row.hi, row.least], ["01", "10", 5]);
+    }
+
     // A numeric column holding text is a mismatch the sum would have hidden.
     {
       const bad = automerge.create<{ data: Sheet["data"] }>({

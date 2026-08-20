@@ -389,16 +389,35 @@ export const formatQueryError = (error, code) => {
 // Aliased columns are exempt. `select null as note` also yields undefined, and
 // wrongly rejecting a working query is worse than missing a typo the author
 // went out of their way to name.
+const KEYWORD = /^(from|where|group|order|having|limit|offset|join|on|and|or|union|into)$/i;
+
 export const checkResultColumns = (cols, rows, known = [], code = "") => {
   if (!rows.length) return;
   const aliased = new Set(
     [...code.matchAll(/\bas\s+["'`[]?([A-Za-z_][A-Za-z0-9_]*)/gi)].map((m) => m[1]),
   );
+  // Every min()/max() in the query, by the name its column will carry: the alias
+  // if it has one, otherwise AlaSQL's own MIN(expr) spelling.
+  const extremes = new Set(
+    [...code.matchAll(/\b(min|max)\s*\(\s*([^()]*?)\s*\)(?:\s+(?:as\s+)?["'`[]?([A-Za-z_][A-Za-z0-9_]*))?/gi)]
+      .flatMap(([, fn, arg, as]) => [
+        `${fn.toUpperCase()}(${arg})`,
+        ...(as && !KEYWORD.test(as) ? [as] : []),
+      ]),
+  );
   for (const { columnid } of cols) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(columnid) || known.includes(columnid)) continue;
-    if (aliased.has(columnid)) continue;
+    if (known.includes(columnid)) continue;
     // Strictly undefined, never null: `select null as x` is a real answer.
     if (!rows.every((row) => row[columnid] === undefined)) continue;
+    if (extremes.has(columnid)) {
+      throw new Error(explain(`min() and max() cannot compare the text in "${columnid}".`, {
+        Received: `"${columnid}" is empty in all ${rows.length} rows`,
+        Cause: "AlaSQL computes min() and max() over numbers and dates only, and drops a text value",
+        Fix: `use min_text() or max_text(), which compare as text`,
+      }));
+    }
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(columnid)) continue;
+    if (aliased.has(columnid)) continue;
     const hit = nearest(columnid, known);
     throw new Error(explain(`No column named "${columnid}".`, {
       ...(hit ? { "Did you mean": hit } : { Available: known.join(", ") || "(the referenced sheets have no columns)" }),
@@ -424,6 +443,23 @@ export const register = (alasql) => {
     if (stage === 2) return (v === null || v === undefined ? acc : (acc.push(v), acc));
     return finish(acc);
   };
+
+  // AlaSQL compiles min()/max() inline, restricted to numbers, bigints and
+  // dates, and turns a text value into undefined: `min(code)` does not return
+  // the first code, it drops the column out of the result entirely. The compiler
+  // never consults alasql.aggr for those two names, so they cannot be replaced —
+  // these compare as text, and checkResultColumns points a dropped min() here.
+  const extreme = (keep) => (v, acc, stage) => {
+    if (stage === 1) return v === null || v === undefined ? undefined : String(v);
+    if (stage === 2) {
+      if (v === null || v === undefined) return acc;
+      const val = String(v);
+      return acc === undefined || keep(val, acc) ? val : acc;
+    }
+    return acc === undefined ? null : acc;
+  };
+  aggr.min_text = aggr.MIN_TEXT = extreme((val, acc) => val < acc);
+  aggr.max_text = aggr.MAX_TEXT = extreme((val, acc) => val > acc);
 
   aggr.array_agg = aggr.ARRAY_AGG = collect((acc) => acc);
   aggr.mode = aggr.MODE = collect((acc) => {
@@ -515,6 +551,37 @@ export const register = (alasql) => {
   };
   fn.fiscal_quarter = (ts, start) => Math.floor(fiscal("fiscal_quarter", ts, start).into / 3) + 1;
   fn.fiscal_period = (ts, start) => fiscal("fiscal_period", ts, start).into + 1;
+
+  // Great-circle distance in kilometres. AlaSQL ships no trigonometry at all, and
+  // "how far apart are these two rows" is the only thing anyone wants it for, so
+  // this is one function rather than six primitives to compose wrongly.
+  fn.haversine_km = (lat1, lon1, lat2, lon2) => {
+    const rad = [lat1, lon1, lat2, lon2].map((v, i) => {
+      const n = typeof v === "string" ? Number(v) : v;
+      if (typeof n !== "number" || !Number.isFinite(n)) {
+        throw fail(
+          `haversine_km() argument ${i + 1}`,
+          "a finite latitude or longitude in degrees",
+          show(v),
+          "drop the rows with no coordinates in a where clause",
+        );
+      }
+      const limit = i % 2 === 0 ? 90 : 180;
+      if (Math.abs(n) > limit) {
+        throw fail(
+          `haversine_km() argument ${i + 1}`,
+          `${i % 2 === 0 ? "a latitude" : "a longitude"} between -${limit} and ${limit}`,
+          show(v),
+          i % 2 === 0 ? "the arguments are (lat, lon, lat, lon); check the order" : "check the column's units",
+        );
+      }
+      return (n * Math.PI) / 180;
+    });
+    const [a1, o1, a2, o2] = rad;
+    const h = Math.sin((a2 - a1) / 2) ** 2 + Math.cos(a1) * Math.cos(a2) * Math.sin((o2 - o1) / 2) ** 2;
+    // 6371.0088 km is the IUGG mean Earth radius.
+    return 2 * 6371.0088 * Math.asin(Math.min(1, Math.sqrt(h)));
+  };
 
   fn.business_days = (a, b) => {
     let [from, to] = [truncate("day", date("business_days", a)), truncate("day", date("business_days", b))];

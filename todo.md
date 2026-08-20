@@ -462,6 +462,9 @@ sorts it into phases. Where a line deepens something already in Phase 2/3, it sa
 The single biggest gap. Most demos die here first.
 
 - [ ] **Exact decimal arithmetic**: money must not be a float; typed `Decimal` with scale, no silent precision loss
+- [ ] **min()/max() over text**: AlaSQL compiles both inline, restricted to numbers and dates, and drops a text value,
+      so `min(code)` returns nothing. `min_text()`/`max_text()` are the workaround and `checkResultColumns()` names the
+      case; a real fix is upstream
 - [ ] **Window functions**: AlaSQL parses `over (partition by ...)` but computes it wrong
       (`sum(x) over (partition by k)` returns 0); only `row_number()` works. Needs a fix upstream or our own evaluation
       pass
@@ -716,7 +719,8 @@ The Excel add-in market lives here (see the add-in research item).
 - [ ] **Geocoding and reverse geocoding**: address <-> point, with a match-confidence score
 - [ ] **Address normalization and dedupe**: the hard part of every property and customer dataset
 - [ ] **Spatial joins**: point-in-polygon, nearest, within-distance, inside a query
-- [ ] **Distance, area, and drive-time**: with correct projections
+- [ ] **Distance, area, and drive-time**: with correct projections. `haversine_km()` ships in both engines; area and
+      drive-time do not, and nothing reprojects
 - [ ] **Boundary datasets as sheets**: counties, tracts, ZCTAs, districts, custom territories
 - [ ] **H3 / geohash indexing**: for fast aggregation at scale
 - [ ] **Map rendering**: points, choropleths, and heatmaps in a chart sheet
@@ -842,9 +846,12 @@ should land as a sheet with a stated source, license, update cadence, and proven
 
 - [ ] **Organizations**: legal entity, brand, domain, ticker, LEI, EIN, NAICS, address; the join key for half the demos
 - [ ] **People**: public figures, officers, physicians, licensees, with disambiguated ids
-- [ ] **Places**: countries, states, counties, cities, ZIP/ZCTA, CBSA, census tracts, with geometries
+- [ ] **Places**: countries, states, counties, cities, ZIP/ZCTA, CBSA, census tracts, with geometries. `table:countries`
+      and `table:us-states` ship, plus `table:airports` and `table:seaports` as point spines with coordinates. Counties,
+      ZCTAs, CBSAs, tracts and every geometry are open
 - [ ] **Parcels and buildings**: parcel boundaries, ownership, zoning, footprints
-- [ ] **Products**: GTIN/UPC catalog and category taxonomy
+- [ ] **Products**: GTIN/UPC catalog and category taxonomy. `table:gs1-prefixes` ships the prefix-to-issuer ranges,
+      which is what reads a barcode's origin; the catalog and taxonomy are open
 - [ ] **Events**: the flagship local-events dataset already promised in Go-to-Market
 - [ ] **Securities**: ticker <-> CIK <-> LEI <-> ISIN <-> domain crosswalk
 - [ ] **Songs and recordings**: MusicBrainz, ISRC/ISWC, Discogs
@@ -853,20 +860,28 @@ should land as a sheet with a stated source, license, update cadence, and proven
 ### Reference & crosswalks
 
 - [ ] **Calendars**: business days, public holidays by country and state, fiscal calendars, ISO weeks. `table:holidays`
-      ships US federal holidays for 2026-2027 with statutory and observed dates; every other country and state is open,
-      and `business_days()`/`iso_week()`/`fiscal_*()` already cover the derived parts
-- [ ] **Time zones and DST rules**
+      ships US federal holidays for 2026-2027 with statutory and observed dates, and `table:fiscal-calendars` the fiscal
+      year start months that `fiscal_year()` takes as an argument; `business_days()` and `iso_week()` cover the derived
+      parts. Every country and state outside the US is open
+- [ ] **Time zones and DST rules**. `table:timezones` ships 96 IANA zones with standard and daylight offsets and an ISO
+      3166 country code; the transition dates themselves are open
 - [ ] **Currencies and FX rates**: daily and historical, plus a live rate portal. `table:currencies` ships the ISO 4217
       codes with symbol and minor units; the rates themselves are the open half
 - [x] **Units of measure**: `table:units` ships mass, length, area, volume, energy, time, pressure and speed as a factor
-      to the SI unit for each quantity
+      to the SI unit for each quantity, and `table:si-prefixes` the 24 prefixes through quetta and quecto
 - [ ] **Geographic crosswalks**: ZIP <-> county <-> CBSA <-> tract <-> congressional district
-- [ ] **Industry classification**: NAICS, SIC, GICS, with mappings between them. `table:naics` ships the 20 NAICS 2022
-      sectors; the 6-digit codes, SIC, GICS and the crosswalks are open
-- [ ] **Occupations**: SOC and O*NET codes and descriptions
-- [ ] **Country, language, and locale codes**: ISO 3166, 639, plus phone and postal formats. `table:countries` ships ISO
-      3166 alpha-2 and `table:languages` ships ISO 639-1 with its 639-3 counterpart; phone and postal formats are open
-- [ ] **Name and address normalization tables**: street suffixes, company suffixes, nickname lists
+- [ ] **Industry classification**: NAICS, SIC, GICS, with mappings between them. `table:naics` (20 NAICS 2022 sectors),
+      `table:sic` (11 divisions, which is what EDGAR stamps on a filer) and `table:gics` (11 sectors, 25 industry
+      groups) all ship. The 6-digit codes and the crosswalks between the three are open, and GICS-to-NAICS never maps
+      cleanly: one classifies revenue, the other establishments
+- [ ] **Occupations**: SOC and O*NET codes and descriptions. `table:soc` ships the 23 SOC 2018 major groups; the
+      detailed codes and all of O*NET are open
+- [x] **Country, language, and locale codes**: `table:countries` (ISO 3166 alpha-2), `table:languages` (ISO 639-1 with
+      639-3), `table:calling-codes` (E.164 dial, trunk and exit prefixes) and `table:postal-formats` (name, example and
+      a regex per country, including the countries that have no postal code at all)
+- [x] **Name and address normalization tables**: `table:street-suffixes` (USPS Publication 28, standard form plus the
+      variants that must fold into it), `table:company-suffixes` (legal entity suffixes keyed to the country whose
+      company law defines them) and `table:nicknames` (given name to short form, both directions)
 
 ### Economy & government
 
@@ -902,7 +917,8 @@ should land as a sheet with a stated source, license, update cadence, and proven
 - [ ] **Hospital price transparency files**: the normalized cross-hospital rate table nobody has cleaned well
 - [ ] **FDA**: drug shortages, recalls, adverse events, NDC directory, device clearances
 - [ ] **ClinicalTrials.gov**: trials, sites, sponsors, enrollment
-- [ ] **Code sets**: ICD-10, HCPCS, LOINC, RxNorm, SNOMED — note the ones that need a license (CPT)
+- [ ] **Code sets**: ICD-10, HCPCS, LOINC, RxNorm, SNOMED — note the ones that need a license (CPT). `table:icd10` ships
+      the 22 ICD-10-CM chapter ranges, which is what groups a claims table; the codes themselves are open
 - [ ] **CDC**: notifiable disease surveillance, wastewater, mortality, vaccination
 - [ ] **Genomics references**: ClinVar, dbSNP, gene and transcript annotations
 
@@ -910,7 +926,9 @@ should land as a sheet with a stated source, license, update cadence, and proven
 
 - [ ] **NWS/NOAA forecasts and observations**: plus a live conditions portal
 - [ ] **Historical weather and climate normals**: with growing degree days derived
-- [ ] **Storm tracks and severe weather**: hurricanes, hail, wind, tornado reports
+- [ ] **Storm tracks and severe weather**: hurricanes, hail, wind, tornado reports. `table:hazard-scales` ships
+      Saffir-Simpson, Enhanced Fujita, Beaufort, moment magnitude, US AQI and UV index as one bandable table; the
+      observations themselves are open
 - [ ] **FEMA**: flood maps, disaster declarations, NFIP claims
 - [ ] **Wildfire perimeters and risk**: NIFC and related
 - [ ] **Air quality**: regulatory monitors plus low-cost sensor networks
@@ -920,10 +938,13 @@ should land as a sheet with a stated source, license, update cadence, and proven
 ### Energy & environment
 
 - [ ] **EIA**: generation, fuel prices, consumption, capacity
-- [ ] **ISO/RTO price feeds**: CAISO, ERCOT, PJM, MISO, ISO-NE, NYISO day-ahead and real-time LMP
+- [ ] **ISO/RTO price feeds**: CAISO, ERCOT, PJM, MISO, ISO-NE, NYISO day-ahead and real-time LMP.
+      `table:grid-operators` ships the 9 North American operators as the spine; every price feed is open
 - [ ] **Solar resource**: irradiance and modeled production
 - [ ] **State oil and gas production**: well-level, by state agency
-- [ ] **Emissions factors**: eGRID, EPA, DEFRA, for carbon accounting
+- [ ] **Emissions factors**: eGRID, EPA, DEFRA, for carbon accounting. `table:emission-factors` ships the EPA combustion
+      factors per mmBtu and per physical unit plus the eGRID US average; DEFRA and the per-subregion grid factors are
+      open
 - [ ] **EPA enforcement and emissions**: ECHO, GHG reporting, TRI
 
 ### Property & construction
@@ -939,13 +960,19 @@ should land as a sheet with a stated source, license, update cadence, and proven
 
 ### Trade & logistics
 
-- [ ] **HTS tariff schedule**: with duty rates and change history
+- [ ] **HTS tariff schedule**: with duty rates and change history. `table:hs-chapters` ships all 97 HS 2022 chapters
+      grouped into their 21 sections, which is the join key; the duty rates and the history are open
 - [ ] **Trade flows**: Census trade data and UN Comtrade
 - [ ] **Vessel positions and port calls**: AIS-derived
-- [ ] **Port throughput and congestion**
+- [ ] **Port throughput and congestion**. `table:containers` ships the ISO 6346 types with the TEU each counts as, which
+      is what makes a throughput figure comparable; the throughput itself is open
+- [x] **Incoterms**: `table:incoterms` ships all 11 Incoterms 2020 with who pays carriage, who must insure, who clears
+      the import and where risk passes
 - [ ] **Fuel surcharge basis**: DOE diesel price series
 - [ ] **Carrier registry and safety**: FMCSA SAFER, inspections, crashes
-- [ ] **Air cargo and flight data**: schedules, ADS-B positions, on-time performance
+- [ ] **Air cargo and flight data**: schedules, ADS-B positions, on-time performance. `table:airports` and
+      `table:airlines` ship the IATA/ICAO spines — a schedule carries the IATA code and an ADS-B feed the ICAO one, so
+      both are needed to join them. Every movement feed is open
 - [ ] **Freight rate indices**: container and truckload spot
 
 ### Retail, food & hospitality
@@ -998,7 +1025,8 @@ should land as a sheet with a stated source, license, update cadence, and proven
 - [ ] **Package registries**: npm, PyPI, crates, Maven metadata and download counts
 - [ ] **Cloud pricing**: AWS, GCP, Azure SKU prices and regions
 - [ ] **Domain, DNS, and certificate transparency data**
-- [ ] **Public status pages and incident history**
+- [ ] **Public status pages and incident history**. `table:http-status` ships the IANA status registry with a `retry`
+      column, which is what turns a log of statuses into an answer about whether an integration is broken or busy
 
 ### Dataset infrastructure
 
