@@ -2,7 +2,11 @@
 
 > Programmable data OS: every table is a database, every query is a table, every sheet is an API.
 
-- [ ] let's remove screenshots from test suite if possible
+- [ ] let's remove screenshots from test suite if possible. Nothing takes a screenshot; what is slow is the three
+      headless-Chrome tests in `browser_test.ts` and the `elm make` behind them. The chained half of the gallery no
+      longer needs them: `main_test.ts` resolves `@query:` refs itself, so every bundled example — chained included —
+      runs headlessly in seconds, with `checkResultColumns()` catching the typo that used to read as a sheet of blanks.
+      What is left in the browser is whether the page renders, which is the part a browser is for
 
 ---
 
@@ -96,8 +100,10 @@ Transform Scrapsheets into a platform. Each feature creates a new axis of compos
 ## Demo Gallery
 
 End-to-end use-cases, written as sheet pipelines (`net-http` / `net-hook` / `portal` / `codex` -> `query` -> `table`).
-Six of them now ship as seeded sheets in `src/examples.mjs`, tagged `demo`: the query half is real and runs in both
-engines, and each entry names the ingest half that is still missing. The rest are unbuilt, and the point of the list is
+The checked ones ship as seeded sheets in `src/examples.mjs`, tagged `demo`: the query half is real and runs in both
+engines, and each entry names the ingest half that is still missing — which is always the same half, because a seeded
+table is a feed nobody has connected yet. `main_test.ts` runs every one of them, chained `@query:` refs included, so a
+broken demo is a failing test rather than a broken storefront. The rest are unbuilt, and the point of the list is
 coverage: later passes mine it for the missing features and the datasets worth seeding in the shop.
 
 ### Flagship (best whole-stack stories)
@@ -123,8 +129,10 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 - [ ] **Three-statement rolling forecast**: ERP GL `codex` -> `query` actuals by account -> driver-assumption `table` ->
       `query` producing P&L, balance sheet, and cash flow that refresh at each monthly close
-- [ ] **Bank reconciliation**: Mercury/Plaid `net-hook` transactions -> `query` matching against the AP/AR ledger
-      `table` -> exceptions-only `table` for the controller
+- [x] **Bank reconciliation**: `table:bank-txns` + `table:ledger` -> `query:recon-matches` and `query:recon-exceptions`.
+      The amount matches exactly and the name never does, so the name is scored with `token_set_ratio()` over a memo
+      stripped of its `ACH DEBIT` prefix — the same words in any order score the same, which is what a bank does to a
+      payee. The exceptions sheet is the only half a controller reads. The Plaid hook is open
 - [ ] **Sales commission calculator**: closed-won `net-hook` from CRM -> `query` joining quota, accelerator tiers, and
       clawback rules -> per-rep payout `table`; sell the whole thing as a shop template
 - [ ] **Debt covenant monitor**: GL `codex` -> `query` computing DSCR, leverage, and fixed-charge coverage -> webhook
@@ -163,12 +171,17 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Healthcare
 
-- [ ] **Claim denial triage**: 835 remittance `net-hook` -> `query` grouping CARC/RARC denial reasons by payer and
-      procedure -> appeal-queue `table` ranked by recoverable dollars
+- [x] **Claim denial triage**: `table:remittances` + `table:carc` -> `query:denial-triage` ranks the appeal queue by
+      recoverable dollars, and `query:denial-rate` reads the same file by place of service through `table:pos-codes`.
+      The CARC table carries an `appealable` column, which is the whole triage: a deductible is the patient's to pay and
+      an absent authorization is the practice's to fix. `chart:denial-rate` and `dashboard:revenue-cycle` draw it. The
+      835 hook is open
 - [ ] **Hospital price transparency comparison**: machine-readable price file `net-http` across N hospitals -> `query`
       normalizing negotiated rates per CPT -> a shop dataset nobody else has cleaned
-- [ ] **Clinic no-show and overbooking**: EHR `codex` -> `query` no-show rate by slot, provider, and lead time ->
-      overbooking policy `table` the front desk actually follows
+- [x] **Clinic no-show and overbooking**: `table:appointments` -> `query:no-show-lead` bins lead time with
+      `width_bucket()` and `chart:no-show-lead` draws the histogram, `query:no-show-provider` cuts the same rows by
+      provider and slot, and `dashboard:clinic-front-desk` puts both on one page. A slot booked seven weeks out is a
+      different product from one booked tomorrow. The EHR codex is open
 - [ ] **Medicare PS&R reconciliation**: scheduled PS&R report pull -> `query` against the internal patient log ->
       variance `table` for the cost report
 - [ ] **Drug shortage exposure**: FDA shortage feed `net-http` + formulary/inventory `table` -> `query` at-risk items
@@ -183,8 +196,10 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Insurance
 
-- [ ] **IBNR loss triangle**: claim `table` -> `query` building the development triangle and loss development factors ->
-      reserve estimate `table` by accident year
+- [x] **IBNR loss triangle**: `table:claim-devel` -> `query:loss-triangle` pivots cumulative paid into the triangle and
+      `query:loss-factors` derives the development factors from every year that has both periods. The short rows on
+      recent accident years are the point: those months have not happened, and the missing corner is what a reserve is.
+      Selecting a tail factor and carrying a young year to ultimate is open
 - [ ] **Catastrophe exposure**: storm track `portal` + geocoded policy `table` -> `query` total insured value inside the
       cone, refreshed as the track updates
 - [ ] **Producer commission reconciliation**: carrier statement `net-hook` -> `query` against the book of business ->
@@ -208,10 +223,13 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Real Estate
 
-- [ ] **Rent roll vs market comps**: rent roll `table` + listing feed `net-http` -> `query` units priced below market
-      with the dollar upside at renewal
-- [ ] **Parcel and zoning screen**: parcel `codex` -> `query` joining zoning envelope rules -> buildable-site `table`
-      ranked by residual land value
+- [x] **Rent roll vs market comps**: `table:rent-roll` + `table:listings` -> `query:below-market`, where what makes a
+      listing comparable is `haversine_km(...) <= 2` and the same bed count — a number in the query rather than a
+      neighbourhood somebody drew on a map. The listing feed is still a seeded table, not a `net-http` pull
+- [x] **Parcel and zoning screen**: `table:parcels` + `table:zoning-districts` -> `query:buildable-sites`, whose join
+      predicate is the geometry itself: `point_in_polygon(p.lat, p.lon, z.boundary)`, because nothing on a parcel row
+      says which district's rules apply to it. `query:district-area` measures the same polygons with
+      `polygon_area_km2()`. The parcel codex is open
 - [ ] **Property tax appeal**: assessor `net-http` -> `query` assessment-to-sale ratio against comparables -> appeal
       packet `table`
 - [ ] **Construction draw request**: budget `table` + invoice `net-hook` -> `query` percent-complete draw schedule the
@@ -239,8 +257,11 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 - [ ] **OEE by line**: PLC/MES count `net-hook` -> `query` availability x performance x quality -> shift `table` with
       the top loss reason
-- [ ] **SPC control charts**: measurement `net-hook` -> `query` computing control limits and western-electric rule
-      violations -> out-of-control alert
+- [x] **SPC control charts**: `table:measurements` -> `query:spc-limits` -> `query:spc-chart` -> `query:spc-violations`,
+      which reports both alarms at once: a point beyond three sigma, and eight in a row on one side via a `qualify` over
+      a trailing window. The second one is why the first is not enough — a drifting line widens its own limits until the
+      loud test never fires. The limits sheet carries a median and a MAD beside the mean and sigma, because an excursion
+      inflates the very spread it is measured against. The measurement hook is open
 - [ ] **Multi-level BOM cost roll-up**: component `table` -> recursive `query` exploding the BOM with current purchase
       prices
 - [ ] **Supplier quality scorecard**: receipt/inspection `codex` -> `query` PPM defective, on-time, and cost of poor
@@ -260,8 +281,10 @@ coverage: later passes mine it for the missing features and the datasets worth s
       quarantine `table`
 - [ ] **Tariff and trade rule change impact**: Federal Register `net-http` -> `query` affected HTS codes joined to the
       active SKU list
-- [ ] **Freight invoice audit**: carrier invoice `net-hook` -> `query` against contracted rate `table` -> overcharge
-      claim `table`
+- [x] **Freight invoice audit**: `table:freight-invoices` + `table:carrier-rates` -> `query:freight-overcharge`, which
+      recomputes each invoice from the contract — the minimum charge is a floor, not a rate, so it is a `case` and not a
+      `max()` — and keeps what is left over as the claim. `chart:freight-overcharge` ranks them. The carrier hook is
+      open
 
 ### Retail & E-commerce
 
@@ -269,7 +292,10 @@ coverage: later passes mine it for the missing features and the datasets worth s
       `table` pushed back out by webhook
 - [ ] **Marketplace settlement reconciliation**: Shopify/Amazon payout `net-hook` -> `query` fee-by-fee vs expected ->
       dispute `table`
-- [ ] **Cohort LTV and payback**: order `codex` -> `query` cohort retention curve and contribution-margin payback month
+- [x] **Cohort LTV and payback**: `table:orders` -> `query:cohort-retention` -> `query:cohort-grid`. The cohort is
+      derived rather than stored — a customer belongs to the month of their first order — which needs `min_text()`,
+      since AlaSQL's own `min()` drops a date held as text and the column comes back empty. The grid is a pivot.
+      Contribution margin and the payback month itself are open, and so is the order codex
 - [ ] **Multi-channel inventory allocation**: channel demand `table` -> `query` allocating constrained stock by margin
       and velocity
 - [ ] **Return abuse detection**: return `net-hook` -> `query` outlier return rate per customer and per SKU
@@ -295,8 +321,10 @@ coverage: later passes mine it for the missing features and the datasets worth s
       site -> underperformer `table` ranked by lost revenue
 - [ ] **Demand response event**: grid signal `portal` -> webhook shedding loads -> `query` measuring realized
       curtailment against the baseline for settlement
-- [ ] **Well decline curves**: state oil-and-gas production `net-http` -> `query` fitting hyperbolic decline -> EUR
-      `table` per well
+- [x] **Well decline curves**: `table:well-production` -> `query:decline-fit`, which fits the exponential case with
+      `fit_exponential()` and reads the rate back at 24 and 36 months. Exponential is the curve a log transform
+      straightens; a true hyperbolic fit needs nonlinear least squares, and EUR needs an economic limit, so both are
+      open — as is the state production pull
 - [ ] **Utility bill audit**: bill `net-hook` -> `query` recomputing the tariff -> billing-error `table` and a
       rate-switch recommendation
 - [ ] **Scope 1/2/3 carbon inventory**: activity `table` + emission factor `net-http` -> `query` inventory with factor
@@ -319,7 +347,9 @@ coverage: later passes mine it for the missing features and the datasets worth s
 - [ ] **Budget vs actual burn rate**: checkbook `net-http` -> `query` department burn against adopted budget with a
       year-end projection
 - [ ] **Permit backlog**: permit portal `net-http` -> `query` median days to issue by type and reviewer
-- [ ] **311 hotspot analysis**: service request `net-http` -> `query` complaint density by block and category over time
+- [x] **311 hotspot analysis**: `table:service-requests` -> `query:311-hotspots`, which groups by `geohash(lat, lon, 6)`
+      — a fixed box on the earth, so two runs agree and two categories in the same cell are genuinely the same place. It
+      is a hotspot map without a spatial index or a map. The 311 feed is open
 - [ ] **Campaign finance network**: FEC `net-http` -> `query` donor overlap between committees -> shareable graph table
 - [ ] **Lobbying vs voting record**: disclosure `net-http` + roll call `net-http` -> `query` correlating spend to votes
 - [ ] **Public records request tracker**: intake `net-hook` form -> `query` statutory deadline -> webhook reminder
@@ -402,7 +432,10 @@ coverage: later passes mine it for the missing features and the datasets worth s
 - [ ] **SERP rank tracking**: SERP `net-http` -> `query` rank deltas, cannibalization, and lost-featured-snippet alerts
 - [ ] **Multi-touch attribution**: event `net-hook` -> `query` over ordered touchpoint sequences with a switchable model
 - [ ] **Influencer and affiliate ROI**: promo code `net-hook` -> `query` incremental revenue per creator
-- [ ] **Experiment readout**: assignment and outcome `table`s -> `query` computing lift with confidence intervals
+- [x] **Experiment readout**: `table:experiment` -> `query:experiment-lift`, which reports conversion and revenue per
+      user side by side with a Welch p-value on each, because the two do not have to agree and reporting only the one
+      that moved is how an experiment lies. Each arm is read out by its own subquery: `array()` keeps the nulls that a
+      `case when` would leave behind. A switchable stopping rule is open
 - [ ] **Content calendar to performance**: plan `table` joined to analytics `query` so the calendar grades itself
 
 ### Sales & CRM Ops
@@ -429,8 +462,10 @@ coverage: later passes mine it for the missing features and the datasets worth s
 ### Software & DevOps
 
 - [ ] **Incident metrics**: alert `net-hook` -> `query` MTTA/MTTR by service and severity -> reliability review `table`
-- [ ] **Cloud cost anomaly**: billing export `net-http` -> `query` day-over-day delta by service and tag -> owner-routed
-      alert
+- [x] **Cloud cost anomaly**: `table:cloud-spend` -> `query:cost-anomaly`, scoring each day against its own service's
+      median and MAD rather than its mean and sigma — a month containing a sevenfold spike drags both of those toward
+      the spike until the day stops looking unusual. `query:cost-by-region` joins the same rows to
+      `table:cloud-regions`. The billing export and the owner routing are open
 - [ ] **CVE exposure**: OSV feed `net-http` + SBOM `table` -> `query` affected services ranked by exploitability and
       blast radius
 - [ ] **DORA metrics**: deploy and incident `net-hook` -> `query` deploy frequency, lead time, change failure rate
@@ -532,6 +567,9 @@ The single biggest gap. Most demos die here first.
 
 Per house style, an ambiguous error is the worst bug in the system.
 
+- [x] **Values a message could not name**: `JSON.stringify()` renders `Infinity` and `NaN` as `null`, so every UDF
+      refusing a non-finite number said "received number null" — which names neither the value nor the problem. `show()`
+      prints them by name now, and it is the one formatter every UDF message goes through
 - [x] **Type mismatch explanation**: `checkColumnTypes()` rejects a non-numeric value in a numeric column as the sheet
       loads, naming the declared type, the value and the row
 - [x] **Fetch failures with a repro**: `fetchFailure()` gives status, resolved URL, content type, body snippet and a
@@ -543,6 +581,12 @@ Per house style, an ambiguous error is the worst bug in the system.
       exact `/share` or `/public` call. Deliberately not the owners' emails: any user can name any sheet_id
 - [x] **Import failures with the bad row**: a CSV row that does not match its header is rejected with the line, both
       field counts, the raw text and the column it stops at. Inference now needs every value to parse, not four in five
+- [x] **The engine's own dropped message**: AlaSQL discards an exception thrown from a function while a subquery in the
+      from clause is being computed, and reports "Cannot read properties of null (reading 'data')" from somewhere else
+      entirely — the careful message saying what was actually wrong is gone before it reaches us. `formatQueryError()`
+      replaces that with one that names what happened and says how to read the real one. It also names the other case a
+      function receives nothing: AlaSQL evaluates a `group by` expression against an empty row, so
+      `group by date_trunc(...)` reads as a column-name typo unless the message says otherwise
 - [ ] **Error sheet**: every failure lands in a queryable log rather than a toast that disappears
 
 ### Types & validation
@@ -578,8 +622,9 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 - [ ] **Conditional formatting**: color scales, data bars, icon sets, rule-based cell coloring
 - [ ] **Group by / outline rows**: collapsible groups with subtotals
 - [ ] **Pivot table UI**: drag fields into rows/columns/values without writing SQL
-- [ ] **Data cleaning verbs**: trim, dedupe rows, split column, text-to-columns, change case, remove blanks. Filling a
-      gap forward is done:
+- [ ] **Data cleaning verbs**: trim, dedupe rows, split column, text-to-columns, change case, remove blanks. Binning a
+      numeric column is done: `width_bucket(v, lo, hi, n)`, with 0 below the range and n+1 above it so the tails stay
+      visible instead of being folded into the end buckets. Filling a gap forward is done:
       `last_value(x) ignore nulls over (order by t rows between unbounded preceding and current
       row)`, with
       `query:meter-daily` as the worked demo. The rest are UI verbs, not SQL
@@ -595,9 +640,12 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
       `src/sql.mjs` turns that into one query both engines build identically, so `GET /sheet/chart:abc` and
       `/export/chart:abc.csv` return exactly the rows the page draws. Only a column name reaches the SQL: anything else
       is refused by name rather than concatenated in
-- [ ] **Core chart set**: line, bar, stacked bar, area, scatter, histogram, box plot. Line and bar ship, drawn as SVG
-      from `elm/svg`, with the baseline pinned to zero unless the data goes below it — a bar chart that starts anywhere
-      else misstates every comparison on it. A row whose y is not a number is dropped rather than read as zero
+- [ ] **Core chart set**: line, bar, stacked bar, area, scatter, box plot. Line and bar ship, drawn as SVG from
+      `elm/svg`, with the baseline pinned to zero unless the data goes below it — a bar chart that starts anywhere else
+      misstates every comparison on it. A row whose y is not a number is dropped rather than read as zero. **Histogram
+      needs no chart kind**: `width_bucket(v, lo, hi, n)` bins in SQL and a `bar` chart draws the bins, which is
+      `query:no-show-lead` and `chart:no-show-lead`. A `histogram` kind would only mean teaching `viewChart` a fourth
+      word for the bars it already draws
 - [ ] **Time-series handling**: date axis, gap handling, downsampling for long series
 - [ ] **Maps**: point maps and choropleths driven by a geo column
 - [ ] **Heatmap and matrix charts**: cohort grids and loss triangles read naturally as heatmaps
@@ -679,7 +727,10 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 Ordered roughly by how many demos each unblocks.
 
 - [ ] **Accounting**: QuickBooks, Xero, NetSuite, Sage, SAP, Dynamics
-- [ ] **Payments and banking**: Stripe, Square, Plaid, Mercury, Ramp, Brex, PayPal, Adyen
+- [ ] **Payments and banking**: Stripe, Square, Plaid, Mercury, Ramp, Brex, PayPal, Adyen. The reference half ships:
+      `table:iban-formats` (length per country, the cheapest check on an account number and the one that fails before
+      anything reaches a bank), `table:card-networks` (issuer prefixes, lengths, Luhn) and `table:mcc-ranges` (ISO 18245
+      merchant categories by range, the only grouping the standard itself defines)
 - [ ] **Commerce**: Shopify, Amazon SP-API, WooCommerce, BigCommerce, Etsy, eBay
 - [ ] **CRM**: Salesforce, HubSpot, Pipedrive, Close, Attio
 - [ ] **Support**: Zendesk, Intercom, Front, Help Scout
@@ -766,27 +817,51 @@ The missing other half: sheets that do something, not just show something.
 
 The Excel add-in market lives here (see the add-in research item).
 
-- [ ] **Regression**: linear, multiple, logistic, with residuals and diagnostics
-- [ ] **Forecasting**: seasonal decomposition and a defensible baseline forecast per series
-- [ ] **Anomaly detection**: seasonal-aware outlier flags for the alerting demos
+- [ ] **Regression**: `regr_slope()`, `regr_intercept()`, `r2()`, `corr()`, `regr_predict()` and `regr_stderr()` ship —
+      the fitted value and the spread of the points around the line, in the units of y, because a slope with no standard
+      error beside it is a number nobody can argue with. Multiple and logistic regression, and per-row residuals, are
+      open
+- [ ] **Forecasting**: `regr_predict()` is the straight-line baseline and `fit_exponential()` the log-linear one.
+      Seasonal decomposition is open, and it needs a series-to-series function, which neither the aggregate protocol nor
+      the window pass can express today
+- [x] **Anomaly detection**: `mad()` and `robust_z()` score a value against a median and a median absolute deviation
+      rather than a mean and a standard deviation, so the outlier being measured cannot widen the ruler it is measured
+      against — which is what a z-score gets wrong on exactly the day that matters. `query:cost-anomaly` and
+      `query:spc-violations` are the worked demos. Seasonal awareness is open and waits on the forecasting line
 - [ ] **Monte Carlo simulation**: distributions on input cells, sampled outputs, percentile results (the @RISK slot)
 - [ ] **Sensitivity and tornado analysis**: which input moves the output most
 - [ ] **Scenario manager**: named sets of assumptions, compared side by side
 - [ ] **Goal seek and solver**: constrained optimization over a sheet
-- [ ] **Significance tests and confidence intervals**: for the experiment-readout demos
+- [x] **Significance tests and confidence intervals**: `t_test()` is Welch's two-sample test — neither equal sizes nor a
+      shared variance assumed, because the version that assumes them is the one that reports a difference that is not
+      there — and `ci_low()`/`ci_high()` give the mean's t-based interval, so eight rows widen it instead of reporting
+      the precision of eight hundred. Both go through one Student-t CDF, tested against published values. Proportion
+      tests and multiple-comparison correction are open
 - [ ] **Clustering and segmentation**
-- [ ] **Cohort and retention helpers**: the curve without hand-writing the SQL every time
-- [ ] **Curve fitting**: hyperbolic decline, learning curves, loss development factors
+- [ ] **Cohort and retention helpers**: `query:cohort-retention` and `query:cohort-grid` are the worked SQL, which is
+      the thing to generalise from — deriving the cohort from the first order, then a pivot. A helper that writes it is
+      open
+- [ ] **Curve fitting**: `fit_exponential()` and `fit_power()` fit by the transform that straightens the curve — a log
+      on y, a log on both — and refuse a value at or below zero by name rather than dropping it and bending the fit.
+      That covers exponential decline and learning curves. Hyperbolic decline needs nonlinear least squares and is open;
+      loss development factors turned out to be a self-join, not a fit (`query:loss-factors`)
 
 ### Geospatial
 
 - [ ] **Geocoding and reverse geocoding**: address <-> point, with a match-confidence score
 - [ ] **Address normalization and dedupe**: the hard part of every property and customer dataset
-- [ ] **Spatial joins**: point-in-polygon, nearest, within-distance, inside a query
-- [ ] **Distance, area, and drive-time**: with correct projections. `haversine_km()` ships in both engines; area and
-      drive-time do not, and nothing reprojects
+- [ ] **Spatial joins**: `point_in_polygon()` ships and works as a join predicate — `query:buildable-sites` joins a
+      parcel to its zoning district on the geometry, since nothing on the parcel row says which district it is in.
+      Within-distance is `haversine_km(...) <= n` in a where clause (`query:below-market`). Nearest still materializes
+      every pair first, which is the same missing piece as the as-of join
+- [ ] **Distance, area, and drive-time**: `haversine_km()`, `bearing_deg()` and `polygon_area_km2()` ship in both
+      engines, the last spherical rather than planar, because a county-sized polygon read as flat is wrong by more than
+      the decision it is feeding. A ring that crosses the antimeridian is refused rather than answered inside out.
+      Drive-time does not exist and nothing reprojects
 - [ ] **Boundary datasets as sheets**: counties, tracts, ZCTAs, districts, custom territories
-- [ ] **H3 / geohash indexing**: for fast aggregation at scale
+- [x] **Geohash indexing**: `geohash(lat, lon, precision)` in both engines, so `group by geohash(lat, lon, 5)` is a
+      hotspot map without a spatial index — the cells are fixed, which is what makes two runs agree.
+      `query:311-hotspots` is the worked demo. H3 is a different tiling and is open
 - [ ] **Map rendering**: points, choropleths, and heatmaps in a chart sheet
 
 ### AI & MCP
@@ -941,11 +1016,17 @@ should land as a sheet with a stated source, license, update cadence, and proven
       codes with symbol and minor units; the rates themselves are the open half
 - [x] **Units of measure**: `table:units` ships mass, length, area, volume, energy, time, pressure and speed as a factor
       to the SI unit for each quantity, and `table:si-prefixes` the 24 prefixes through quetta and quecto
-- [ ] **Geographic crosswalks**: ZIP <-> county <-> CBSA <-> tract <-> congressional district
-- [ ] **Industry classification**: NAICS, SIC, GICS, with mappings between them. `table:naics` (20 NAICS 2022 sectors),
-      `table:sic` (11 divisions, which is what EDGAR stamps on a filer) and `table:gics` (11 sectors, 25 industry
-      groups) all ship. The 6-digit codes and the crosswalks between the three are open, and GICS-to-NAICS never maps
-      cleanly: one classifies revenue, the other establishments
+- [ ] **Geographic crosswalks**: ZIP <-> county <-> CBSA <-> tract <-> congressional district. `table:zip-ranges` ships
+      the three-digit ZIP prefix ranges per state — a ZIP is not a shape and does not nest inside a county, but the
+      first three digits land in exactly one state, which is the join an address list actually needs. `table:us-states`
+      now carries `fips` and its Census `division` beside the region, and `table:fema-regions` and `table:epa-regions`
+      ship the two federal groupings that are numbered alike and staffed from different cities. Counties, CBSAs, tracts
+      and districts are open
+- [ ] **Industry classification**: NAICS, SIC, GICS, with mappings between them. `table:naics-subsectors` ships the
+      NAICS 2022 three-digit subsectors keyed to the sector table, which is the level most business data is reported at.
+      `table:naics` (20 NAICS 2022 sectors), `table:sic` (11 divisions, which is what EDGAR stamps on a filer) and
+      `table:gics` (11 sectors, 25 industry groups) all ship. The 6-digit codes and the crosswalks between the three are
+      open, and GICS-to-NAICS never maps cleanly: one classifies revenue, the other establishments
 - [ ] **Occupations**: SOC and O*NET codes and descriptions. `table:soc` ships the 23 SOC 2018 major groups; the
       detailed codes and all of O*NET are open
 - [x] **Country, language, and locale codes**: `table:countries` (ISO 3166 alpha-2), `table:languages` (ISO 639-1 with
@@ -995,7 +1076,11 @@ should land as a sheet with a stated source, license, update cadence, and proven
 - [ ] **FDA**: drug shortages, recalls, adverse events, NDC directory, device clearances
 - [ ] **ClinicalTrials.gov**: trials, sites, sponsors, enrollment
 - [ ] **Code sets**: ICD-10, HCPCS, LOINC, RxNorm, SNOMED — note the ones that need a license (CPT). `table:icd10` ships
-      the 22 ICD-10-CM chapter ranges, which is what groups a claims table; the codes themselves are open
+      the 22 ICD-10-CM chapter ranges and `table:hcpcs-ranges` the Level II letter ranges, which is the whole Level II
+      taxonomy: the letter says which benefit category a line falls in before anyone reads the code. `table:pos-codes`
+      ships the CMS place-of-service codes, the two digits that decide which of two prices a procedure is paid at, and
+      `table:carc` the common claim adjustment reason codes with an `appealable` column. The detailed code sets, LOINC,
+      RxNorm and SNOMED are open
 - [ ] **CDC**: notifiable disease surveillance, wastewater, mortality, vaccination
 - [ ] **Genomics references**: ClinVar, dbSNP, gene and transcript annotations
 
@@ -1039,7 +1124,9 @@ should land as a sheet with a stated source, license, update cadence, and proven
 
 - [ ] **HTS tariff schedule**: with duty rates and change history. `table:hs-chapters` ships all 97 HS 2022 chapters
       grouped into their 21 sections, which is the join key; the duty rates and the history are open
-- [ ] **Trade flows**: Census trade data and UN Comtrade
+- [ ] **Trade flows**: Census trade data and UN Comtrade. `table:edi-transactions` ships the X12 transaction set codes —
+      810, 214, 850, 856 and the rest — which is the number that says what an EDI file is and the only thing a logistics
+      or claims feed tells you about its own shape
 - [ ] **Vessel positions and port calls**: AIS-derived. `table:vessel-types` ships the AIS ship-and-cargo codes, the
       only description a position report carries; the positions are open
 - [ ] **Port throughput and congestion**. `table:containers` ships the ISO 6346 types with the TEU each counts as, which
@@ -1064,7 +1151,9 @@ should land as a sheet with a stated source, license, update cadence, and proven
 
 ### Agriculture
 
-- [ ] **USDA NASS**: yields, acreage, prices received, by county
+- [ ] **USDA NASS**: yields, acreage, prices received, by county. `table:hardiness-zones` ships the USDA plant hardiness
+      half-zones with their temperature bands — a zone is a temperature, not a place, which is why it joins to a
+      planting table rather than to a map
 - [ ] **Soil survey**: SSURGO properties by map unit
 - [ ] **Satellite vegetation indices**: NDVI time series per field
 - [ ] **Crop insurance program data**: RMA actuarial and loss history

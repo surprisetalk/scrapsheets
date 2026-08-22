@@ -109,15 +109,23 @@ technologies. It uses a hybrid architecture with:
 - **Sheet system**: Polymorphic documents identified by `type:doc_id` format
 - **Query engine**: SQL execution via AlaSQL for cross-sheet queries using `@sheet_id` syntax. `src/sql.mjs` is shared
   by both engines (server `npm:alasql`, page `/alasql.mjs`): `register()` adds the UDFs AlaSQL lacks — aggregates,
-  regression, fuzzy matching, UTC date arithmetic including `fiscal_year`/`fiscal_quarter`/`fiscal_period` —
-  `haversine_km()` for great-circle distance (AlaSQL ships no trigonometry at all), `min_text()`/`max_text()` because
-  AlaSQL's own `min()`/`max()` are compiled inline over numbers and dates and drop a text value, so `min(code)` returns
-  nothing rather than the first code — `checkResultColumns()` names that case and points at the replacements.
-  `scanRefs()` is the one `@type:doc_id` scanner — `@type:doc_id.column` is a **cell**, one value out of a one-row
-  sheet, rewritten to a scalar subquery so nothing is spliced in as a literal, and `checkCells()` refuses a sheet that
-  does not hold exactly one row. `checkResultColumns()` turns AlaSQL's silent undefined column into an error.
-  `nearest()` backs every "did you mean": unknown columns and unresolved `@sheet` refs in both engines. The server
-  passes sheet rows through `params[0]` so `alasql.from.SHEET` stays request-scoped
+  regression, fuzzy matching, UTC date arithmetic including `fiscal_year`/`fiscal_quarter`/`fiscal_period` — inference
+  (`t_test()` is Welch's, `ci_low()`/`ci_high()` the mean's t-based interval, both over one Student-t CDF), robust
+  statistics (`mad()`, `robust_z()`, so the outlier cannot widen the ruler it is measured against), curve fitting by log
+  transform (`fit_exponential()`, `fit_power()`), `width_bucket()` (which is why a histogram needs no chart kind),
+  geometry (`point_in_polygon()` — usable as a join predicate — `polygon_area_km2()` spherical, `bearing_deg()`,
+  `geohash()`), `haversine_km()` for great-circle distance (AlaSQL ships no trigonometry at all),
+  `min_text()`/`max_text()` because AlaSQL's own `min()`/`max()` are compiled inline over numbers and dates and drop a
+  text value, so `min(code)` returns nothing rather than the first code — `checkResultColumns()` names that case and
+  points at the replacements. `scanRefs()` is the one `@type:doc_id` scanner — `@type:doc_id.column` is a **cell**, one
+  value out of a one-row sheet, rewritten to a scalar subquery so nothing is spliced in as a literal, and `checkCells()`
+  refuses a sheet that does not hold exactly one row. `checkResultColumns()` turns AlaSQL's silent undefined column into
+  an error. `nearest()` backs every "did you mean": unknown columns and unresolved `@sheet` refs in both engines. The
+  server passes sheet rows through `params[0]` so `alasql.from.SHEET` stays request-scoped. Two AlaSQL behaviours shape
+  how every query sheet is written: a `group by` expression is evaluated against an **empty row**, so a UDF named there
+  receives nothing and the call has to move into a subquery; and an exception thrown from a function while a subquery in
+  the from clause is computed is **discarded**, surfacing as "Cannot read properties of null (reading 'data')" —
+  `formatQueryError()` replaces that one, because the message it destroyed is unrecoverable
 - **Window functions**: AlaSQL parses `over (partition by ...)` and computes it wrong (`sum(x) over (...)` came back 0),
   so a window never reaches it. `rewriteWindows()` in `src/sql.mjs` lifts each one out of the **top-level** select list,
   leaves `null as <alias>` where it stood and appends the plain columns it reads as `__w<n>[apo]<n>`; `applyWindows()`
@@ -186,11 +194,15 @@ t.trade_id order by p.day desc) = 1` —
   Object.keys(m.EXAMPLES).length, JSON.stringify(m.EXAMPLES).length)"`
   prints the counts and the byte size, which has to stay well under the ~5 MB localStorage budget. Reference tables
   carry the `reference` tag and joinable spines `dataset`, the only handle the flat library gives for telling them
-  apart. Six end-to-end pipelines from the Demo Gallery ship as sheets tagged `demo` — WIP schedule, AR aging, exit
-  waterfall, pairs-trade monitor, restaurant prime cost, municipal burn rate — each a seeded source table plus one or
-  two query sheets. Their data is invented; their shapes are not. `store` and `class` are AlaSQL keywords, so no column
-  may be named either: `select store from ...` will not parse. `table:assumptions` is the one-row settings sheet those
-  demos read their parameters from, so changing one cell changes four sheets
+  apart. The end-to-end pipelines from the Demo Gallery ship as sheets tagged `demo` plus a domain tag — WIP schedule,
+  AR aging, exit waterfall, pairs-trade monitor, restaurant prime cost, municipal burn rate, claim denial triage, clinic
+  no-show, SPC control charts, experiment readout, zoning screen, rent comps, 311 hotspots, cloud cost anomaly, cohort
+  retention, well decline, bank reconciliation, loss triangle, freight audit — each a seeded source table plus one or
+  two query sheets, and `todo.md`'s Demo Gallery is the index of which is which. Their data is invented; their shapes
+  are not. `store` and `class` are AlaSQL keywords, so no column may be named either: `select store from ...` will not
+  parse. `table:assumptions` is the one-row settings sheet those demos read their parameters from, so changing one cell
+  changes four sheets. `main_test.ts` runs **every** bundled query, resolving `@query:` refs itself, and calls
+  `checkResultColumns()` on each result — a typo in a bundled example used to read as a sheet of blanks
 - **Library gallery**: `viewGallery` puts a strip above the library table naming every `demo`-tagged query sheet as a
   link and every tag as a filter chip. It reads `model.library`, so a new demo needs no code change
 - **Cross-sheet queries in the browser**: `runSql` rewrites `@type:doc_id` to `SHEET('id')` and pre-loads each doc

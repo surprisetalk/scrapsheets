@@ -23,11 +23,33 @@ export const explain = (headline, fields) =>
       .map(([k, v]) => `  ${(k + ":").padEnd(13)}${v}`),
   ].join("\n");
 
-const show = (v) => v === null ? "null" : v === undefined ? "nothing" : `${typeof v} ${JSON.stringify(v)}`;
+// JSON.stringify() renders Infinity and NaN as "null", so a message about a
+// number that is not finite used to read "received number null" -- which names
+// neither the value nor the problem.
+const show = (v) =>
+  v === null
+    ? "null"
+    : v === undefined
+    ? "nothing"
+    : typeof v === "number" && !Number.isFinite(v)
+    ? `number ${v}`
+    : `${typeof v} ${JSON.stringify(v)}`;
+
+// A function that receives nothing at all has two causes and they look identical
+// from inside it: the row has no such column, or the call sits in a `group by`,
+// which AlaSQL evaluates against an empty row rather than against each group.
+// Naming only the first would send someone hunting a typo that is not there.
+const MISSING = "check the column name, or move the call into a subquery and group by the column it produces";
 
 const str = (fn, arg, v) => {
-  if (typeof v !== "string")
-    throw fail(`${fn}() argument ${arg}`, "a text value", show(v), `cast it with cast(x as string)`);
+  if (typeof v !== "string") {
+    throw fail(
+      `${fn}() argument ${arg}`,
+      "a text value",
+      show(v),
+      v === undefined ? MISSING : `cast it with cast(x as string)`,
+    );
+  }
   return v;
 };
 
@@ -37,15 +59,34 @@ const nums = (fn, arg, v) => {
       `${fn}() argument ${arg}`,
       "an array of numbers",
       show(v),
-      `build one with array(x), e.g. ${fn}(array(x), array(y))`,
+      v === undefined ? MISSING : `build one with array(x), e.g. ${fn}(array(x), array(y))`,
     );
   }
   return v.map((n) => {
     const f = typeof n === "string" ? Number(n) : n;
-    if (typeof f !== "number" || !Number.isFinite(f))
-      throw fail(`${fn}() argument ${arg}`, "only finite numbers", show(n), "filter the nulls out with a where clause");
+    if (typeof f !== "number" || !Number.isFinite(f)) {
+      throw fail(
+        `${fn}() argument ${arg}`,
+        "only finite numbers",
+        show(n),
+        n === undefined ? MISSING : "filter the nulls out with a where clause",
+      );
+    }
     return f;
   });
+};
+
+const num = (fn, arg, v) => {
+  const n = typeof v === "string" ? Number(v) : v;
+  if (typeof n !== "number" || !Number.isFinite(n)) {
+    throw fail(
+      `${fn}() argument ${arg}`,
+      "a finite number",
+      show(v),
+      v === undefined ? MISSING : "filter the blanks out with a where clause",
+    );
+  }
+  return n;
 };
 
 const pair = (fn, xs_, ys_) => {
@@ -77,7 +118,7 @@ const date = (fn, v) => {
       `${fn}() date`,
       "an ISO timestamp, e.g. '2026-08-16' or '2026-08-16T12:00:00Z'",
       show(v),
-      "check the column's type row",
+      v === undefined ? MISSING : "check the column's type row",
     );
   }
   return d;
@@ -219,6 +260,95 @@ const fit = (xs, ys) => {
     syy += (ys[i] - my) ** 2;
   }
   return { mx, my, sxy, sxx, syy };
+};
+
+// Sample variance, the n-1 kind: a sheet holds a sample, not a population.
+const variance = (xs) => {
+  const m = mean(xs);
+  return xs.reduce((a, b) => a + (b - m) ** 2, 0) / (xs.length - 1);
+};
+
+// Student's t, for t_test() and the mean's confidence interval. There is no
+// closed form for either, so both go through the regularized incomplete beta,
+// and the interval inverts it by bisection rather than carrying a table that
+// only covers the degrees of freedom it happens to list.
+
+// Lanczos approximation, g=7.
+const logGamma = (x) => {
+  const g = [
+    676.5203681218851,
+    -1259.1392167224028,
+    771.32342877765313,
+    -176.61502916214059,
+    12.507343278686905,
+    -0.13857109526572012,
+    9.9843695780195716e-6,
+    1.5056327351493116e-7,
+  ];
+  if (x < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * x)) - logGamma(1 - x);
+  let a = 0.99999999999980993;
+  for (let i = 0; i < g.length; i++) a += g[i] / (x - 1 + i + 1);
+  const t = x - 1 + 7.5;
+  return 0.5 * Math.log(2 * Math.PI) + (x - 0.5) * Math.log(t) - t + Math.log(a);
+};
+
+// Continued fraction for the incomplete beta (Lentz's method).
+const betacf = (a, b, x) => {
+  const tiny = 1e-300, qab = a + b, qap = a + 1, qam = a - 1;
+  let c = 1, d = 1 - (qab * x) / qap;
+  if (Math.abs(d) < tiny) d = tiny;
+  d = 1 / d;
+  let h = d;
+  for (let m = 1; m <= 300; m++) {
+    const m2 = 2 * m;
+    let aa = (m * (b - m) * x) / ((qam + m2) * (a + m2));
+    d = 1 + aa * d, c = 1 + aa / c;
+    if (Math.abs(d) < tiny) d = tiny;
+    if (Math.abs(c) < tiny) c = tiny;
+    d = 1 / d, h *= d * c;
+    aa = (-(a + m) * (qab + m) * x) / ((a + m2) * (qap + m2));
+    d = 1 + aa * d, c = 1 + aa / c;
+    if (Math.abs(d) < tiny) d = tiny;
+    if (Math.abs(c) < tiny) c = tiny;
+    d = 1 / d;
+    const del = d * c;
+    h *= del;
+    if (Math.abs(del - 1) < 1e-15) return h;
+  }
+  throw fail(
+    "the t distribution",
+    "a continued fraction that settles within 300 steps",
+    `a=${a}, b=${b}, x=${x}`,
+    "this is a bug in sql.mjs, not in the query: report these three numbers",
+  );
+};
+
+const betaInc = (a, b, x) => {
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  const front = Math.exp(logGamma(a + b) - logGamma(a) - logGamma(b) + a * Math.log(x) + b * Math.log(1 - x));
+  return x < (a + 1) / (a + b + 2) ? (front * betacf(a, b, x)) / a : 1 - (front * betacf(b, a, 1 - x)) / b;
+};
+
+// The two-sided tail: the share of a t distribution further from zero than t.
+const tTail = (t, df) => betaInc(df / 2, 0.5, df / (df + t * t));
+
+// The multiplier for a two-sided interval, by bisection on tTail, which falls
+// as t rises. 1000 covers every level a sheet can ask for at df >= 1.
+const tCrit = (level, df) => {
+  let lo = 0, hi = 1000;
+  for (let i = 0; i < 200; i++) {
+    const mid = (lo + hi) / 2;
+    if (hi - lo < 1e-9) return mid;
+    if (tTail(mid, df) > 1 - level) lo = mid;
+    else hi = mid;
+  }
+  throw fail(
+    "a confidence interval",
+    "a t value that settles within 200 steps",
+    `level=${level}, df=${df}`,
+    "this is a bug in sql.mjs, not in the query: report both numbers",
+  );
 };
 
 // --- @sheet references
@@ -390,6 +520,17 @@ export const nearest = (name, known) => {
 // Turns an engine error into a message that points at the offending token.
 export const formatQueryError = (error, code) => {
   const msg = error?.message || String(error);
+  // AlaSQL discards an exception thrown from a function while an aggregate sits
+  // in the same select list, and reports this instead. The message that said
+  // what was wrong is gone by the time it reaches us, so the best that can be
+  // done is to name what happened and say how to read the real one.
+  if (/Cannot read propert(y|ies) of null \(reading 'data'\)/.test(msg)) {
+    return explain(`A function in this query failed, and the engine dropped its message.`, {
+      Received: msg,
+      Cause: "a function threw while a subquery in the from clause was being computed",
+      Fix: "read the subquery's rows into a sheet, or run the function on its own, to see what it says",
+    });
+  }
   const lines = code.split("\n");
   let out = msg;
 
@@ -1275,6 +1416,133 @@ export const register = (alasql) => {
     return c === null ? null : c * c;
   };
 
+  fn.regr_predict = (xs, ys, at) => {
+    const [x, y] = pair("regr_predict", xs, ys), { mx, my, sxy, sxx } = fit(x, y);
+    const a = num("regr_predict", 3, at);
+    return sxx === 0 ? null : my + (sxy / sxx) * (a - mx);
+  };
+  // The spread of the points around the line, in the units of y. A slope with no
+  // standard error beside it is a number nobody can argue with, which is worse
+  // than one nobody can use.
+  fn.regr_stderr = (xs, ys) => {
+    const [x, y] = pair("regr_stderr", xs, ys), { mx, my, sxy, sxx } = fit(x, y);
+    if (sxx === 0 || x.length < 3) return null;
+    const b = sxy / sxx, a = my - b * mx;
+    let ss = 0;
+    for (let i = 0; i < x.length; i++) ss += (y[i] - (a + b * x[i])) ** 2;
+    return Math.sqrt(ss / (x.length - 2));
+  };
+
+  // Curve fitting by the transform that straightens the curve: a log on y for
+  // exponential decay (a well, a half-life), a log on both for a power law (a
+  // learning curve). A value at or below zero has no logarithm, so it is refused
+  // by name rather than dropped, which would bend the fit silently.
+  const curve = (name, xs, ys, at, logX) => {
+    const [x0, y0] = pair(name, xs, ys);
+    const positive = (arg, v) => {
+      if (v <= 0) {
+        throw fail(
+          `${name}() argument ${arg}`,
+          "only values above zero",
+          show(v),
+          "a log curve has no value at zero: filter those rows out first",
+        );
+      }
+      return Math.log(v);
+    };
+    const x = logX ? x0.map((v) => positive(1, v)) : x0;
+    const y = y0.map((v) => positive(2, v));
+    const { mx, my, sxy, sxx } = fit(x, y);
+    if (sxx === 0) return null;
+    const a = num(name, 3, at);
+    return Math.exp(my + (sxy / sxx) * ((logX ? positive(3, a) : a) - mx));
+  };
+  fn.fit_exponential = (xs, ys, at) => curve("fit_exponential", xs, ys, at, false);
+  fn.fit_power = (xs, ys, at) => curve("fit_power", xs, ys, at, true);
+
+  // Median absolute deviation, and the outlier score built on it. 1.4826 scales
+  // a MAD to the standard deviation of a normal sample, so robust_z reads on the
+  // same scale as a z-score — except that the outlier being measured cannot move
+  // the ruler, which is exactly what a z-score gets wrong on the day that matters.
+  const middle = (xs) => {
+    const m = quantile(xs, 0.5);
+    return [m, quantile(xs.map((v) => Math.abs(v - m)), 0.5)];
+  };
+  fn.mad = (xs) => {
+    const v = nums("mad", 1, xs);
+    return v.length ? middle(v)[1] : null;
+  };
+  fn.robust_z = (v, xs) => {
+    const n = num("robust_z", 1, v), x = nums("robust_z", 2, xs);
+    if (!x.length) return null;
+    const [m, d] = middle(x);
+    // Half the sample identical: there is no spread to score against, and 0/0
+    // would read as "perfectly normal" for a value that is nothing of the kind.
+    return d === 0 ? null : (n - m) / (1.4826 * d);
+  };
+
+  // Welch's two-sample t-test, which assumes neither equal sizes nor a shared
+  // variance, because the version that does is the one that quietly reports a
+  // difference that is not there. Returns the two-sided p-value.
+  fn.t_test = (as, bs) => {
+    const a = nums("t_test", 1, as), b = nums("t_test", 2, bs);
+    for (const [i, s] of [[1, a], [2, b]]) {
+      if (s.length < 2)
+        throw fail(`t_test() argument ${i}`, "at least 2 values", `${s.length}`, "widen the query so more rows match");
+    }
+    const [va, vb] = [variance(a) / a.length, variance(b) / b.length];
+    if (va + vb === 0) return null;
+    const t = (mean(a) - mean(b)) / Math.sqrt(va + vb);
+    const df = (va + vb) ** 2 / (va ** 2 / (a.length - 1) + vb ** 2 / (b.length - 1));
+    return tTail(Math.abs(t), df);
+  };
+
+  // The mean's confidence interval, t-based, so eight rows widen it the way they
+  // should instead of reporting the precision of eight hundred.
+  const interval = (name, xs, level, sign) => {
+    const v = nums(name, 1, xs);
+    if (typeof level !== "number" || level <= 0 || level >= 1) {
+      throw fail(
+        `${name}() argument 2`,
+        "a confidence level between 0 and 1",
+        show(level),
+        "use 0.95 for a 95% interval",
+      );
+    }
+    if (v.length < 2)
+      throw fail(`${name}()`, "at least 2 values", `${v.length}`, "widen the query so more rows match");
+    return mean(v) + sign * tCrit(level, v.length - 1) * Math.sqrt(variance(v) / v.length);
+  };
+  fn.ci_low = (xs, level) => interval("ci_low", xs, level, -1);
+  fn.ci_high = (xs, level) => interval("ci_high", xs, level, 1);
+
+  // The standard-SQL histogram bin. Below the range is bucket 0 and above it is
+  // n+1, so the tails stay visible instead of being folded into the end bars,
+  // which is the one thing a histogram must never do.
+  fn.width_bucket = (v, lo, hi, count) => {
+    const x = num("width_bucket", 1, v), a = num("width_bucket", 2, lo), b = num("width_bucket", 3, hi);
+    const n = num("width_bucket", 4, count);
+    if (!Number.isInteger(n) || n < 1) {
+      throw fail(
+        "width_bucket() argument 4",
+        "a whole bucket count of 1 or more",
+        show(count),
+        "e.g. width_bucket(lead_days, 0, 30, 6)",
+      );
+    }
+    if (a >= b) {
+      throw fail(
+        "width_bucket()",
+        "a low end below the high end",
+        `${a} and ${b}`,
+        "swap arguments 2 and 3, or widen the range",
+      );
+    }
+    if (x < a) return 0;
+    if (x >= b) return n + 1;
+    return Math.floor(((x - a) / (b - a)) * n) + 1;
+  };
+
   // Regex. regexp_like already works in AlaSQL, so it is left alone.
   const re = (name, pattern, flags) => {
     try {
@@ -1353,6 +1621,149 @@ export const register = (alasql) => {
     const h = Math.sin((a2 - a1) / 2) ** 2 + Math.cos(a1) * Math.cos(a2) * Math.sin((o2 - o1) / 2) ** 2;
     // 6371.0088 km is the IUGG mean Earth radius.
     return 2 * 6371.0088 * Math.asin(Math.min(1, Math.sqrt(h)));
+  };
+
+  const degrees = (name, arg, v, kind) => {
+    const n = num(name, arg, v), limit = kind === "latitude" ? 90 : 180;
+    if (Math.abs(n) > limit) {
+      throw fail(
+        `${name}() argument ${arg}`,
+        `a ${kind} in degrees, between -${limit} and ${limit}`,
+        show(v),
+        kind === "latitude" ? "latitude comes first; check the order" : "check the column's units",
+      );
+    }
+    return n;
+  };
+
+  // A polygon is a JSON array of [lat, lon] pairs — the shape a cell can hold and
+  // a query can build. The ring closes itself, so the last point need not repeat
+  // the first.
+  const ring = (name, arg, value) => {
+    let raw = value;
+    if (typeof raw === "string") {
+      try {
+        raw = JSON.parse(raw);
+      } catch {
+        throw fail(
+          `${name}() argument ${arg}`,
+          "a JSON array of [lat, lon] pairs",
+          show(value),
+          `e.g. '[[40.7,-74.0],[40.8,-74.0],[40.8,-73.9]]'`,
+        );
+      }
+    }
+    if (!Array.isArray(raw) || raw.length < 3) {
+      throw fail(
+        `${name}() argument ${arg}`,
+        "at least 3 [lat, lon] pairs",
+        show(value),
+        "a polygon needs three corners to enclose anything",
+      );
+    }
+    // Math.max(...lons) below throws a RangeError past about a hundred thousand
+    // arguments, which says nothing about the polygon. Refuse it by size first.
+    if (raw.length > 10000) {
+      throw fail(
+        `${name}() argument ${arg}`,
+        "at most 10000 points in a polygon",
+        `${raw.length} points`,
+        "simplify the ring before storing it, or split it into parts",
+      );
+    }
+    const pts = raw.map((p, i) => {
+      if (!Array.isArray(p) || p.length < 2) {
+        throw fail(
+          `${name}() argument ${arg}, point ${i + 1}`,
+          "a [lat, lon] pair",
+          show(p),
+          "each point is a two-element array, latitude first",
+        );
+      }
+      return [
+        degrees(name, `${arg}, point ${i + 1}`, p[0], "latitude"),
+        degrees(name, `${arg}, point ${i + 1}`, p[1], "longitude"),
+      ];
+    });
+    const lons = pts.map(([, lon]) => lon);
+    // A ring wider than half the world is one that wraps the antimeridian, and
+    // every formula below would read it inside out. Refuse it rather than answer.
+    if (Math.max(...lons) - Math.min(...lons) > 180) {
+      throw fail(
+        `${name}() argument ${arg}`,
+        "a polygon that does not cross the antimeridian",
+        `longitudes from ${Math.min(...lons)} to ${Math.max(...lons)}`,
+        "split the polygon at 180 degrees and add the two halves",
+      );
+    }
+    return pts;
+  };
+
+  // Ray casting. Exact for the polygons a sheet holds — a parcel, a zoning
+  // district, a delivery zone — and a point exactly on the edge falls on one
+  // side of it, consistently, rather than on both.
+  fn.point_in_polygon = (lat, lon, polygon) => {
+    const y = degrees("point_in_polygon", 1, lat, "latitude"), x = degrees("point_in_polygon", 2, lon, "longitude");
+    const pts = ring("point_in_polygon", 3, polygon);
+    let inside = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const [yi, xi] = pts[i], [yj, xj] = pts[j];
+      if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  };
+
+  // Spherical, not planar: a county-sized polygon read as flat is wrong by more
+  // than the decision it is feeding.
+  fn.polygon_area_km2 = (polygon) => {
+    const pts = ring("polygon_area_km2", 1, polygon), rad = Math.PI / 180;
+    let total = 0;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const [lat1, lon1] = pts[j], [lat2, lon2] = pts[i];
+      total += (lon2 - lon1) * rad * (2 + Math.sin(lat1 * rad) + Math.sin(lat2 * rad));
+    }
+    return Math.abs((total * 6371.0088 * 6371.0088) / 2);
+  };
+
+  // Initial bearing, degrees clockwise from north. It is the direction you leave
+  // in, not the one you arrive on: a great circle turns as it goes.
+  fn.bearing_deg = (lat1, lon1, lat2, lon2) => {
+    const rad = Math.PI / 180;
+    const a1 = degrees("bearing_deg", 1, lat1, "latitude") * rad;
+    const o1 = degrees("bearing_deg", 2, lon1, "longitude") * rad;
+    const a2 = degrees("bearing_deg", 3, lat2, "latitude") * rad;
+    const o2 = degrees("bearing_deg", 4, lon2, "longitude") * rad;
+    const y = Math.sin(o2 - o1) * Math.cos(a2);
+    const x = Math.cos(a1) * Math.sin(a2) - Math.sin(a1) * Math.cos(a2) * Math.cos(o2 - o1);
+    return (((Math.atan2(y, x) / rad) % 360) + 360) % 360;
+  };
+
+  // Geohash: the cheap spatial bucket. Two points sharing a prefix are near each
+  // other, so `group by geohash(lat, lon, 5)` is a hotspot map without a spatial
+  // index. The cells are fixed, which is what makes two runs agree.
+  const GEOHASH32 = "0123456789bcdefghjkmnpqrstuvwxyz";
+  fn.geohash = (lat, lon, precision) => {
+    const y = degrees("geohash", 1, lat, "latitude"), x = degrees("geohash", 2, lon, "longitude");
+    const p = num("geohash", 3, precision);
+    if (!Number.isInteger(p) || p < 1 || p > 12) {
+      throw fail(
+        "geohash() argument 3",
+        "a whole precision between 1 and 12",
+        show(precision),
+        "5 is about 5km across, 7 about 150m",
+      );
+    }
+    const lats = [-90, 90], lons = [-180, 180];
+    let hash = "", bits = 0, ch = 0, even = true;
+    while (hash.length < p) {
+      const [range, v] = even ? [lons, x] : [lats, y];
+      const mid = (range[0] + range[1]) / 2;
+      if (v >= mid) ch = ch * 2 + 1, range[0] = mid;
+      else ch = ch * 2, range[1] = mid;
+      even = !even;
+      if (++bits === 5) hash += GEOHASH32[ch], bits = 0, ch = 0;
+    }
+    return hash;
   };
 
   fn.business_days = (a, b) => {

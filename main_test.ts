@@ -27,6 +27,7 @@ import {
   checkCells,
   checkColumnTypes,
   checkPivot,
+  checkResultColumns,
   describeRef,
   describeRows,
   rewriteUnpivot,
@@ -562,12 +563,20 @@ Deno.test(async function allTests(_t) {
         checkColumnTypes(`table:${doc_id}`, Object.values(cols_), loaded[`table:${doc_id}`]);
       }
       const examples = Object.entries(EXAMPLES) as unknown as [string, { doc: { type: string; data: [Query] } }][];
-      let ran = 0;
-      for (const [id, ex] of examples) {
-        if (ex.doc.type !== "query") continue;
-        const { code } = ex.doc.data[0];
-        // A @query ref needs the whole recursion; the browser test covers those.
-        if (code.includes("@query:")) continue;
+      // A query that reads another query is resolved by running that one first
+      // and keeping its rows, which is what both engines do. Without this the
+      // chained half of the gallery only ran in the browser test, which names
+      // the few it checks rather than running them all.
+      const byId = Object.fromEntries(examples);
+      const ran = new Set<string>();
+      const resolve = async (id: string, depth = 0): Promise<unknown[]> => {
+        if (loaded[id]) return loaded[id];
+        assert(depth <= 8, `${id}: @query refs nest deeper than 8`);
+        const ex = byId[id];
+        assert(ex, `${id} is referenced but not bundled`);
+        assertEquals(ex!.doc.type, "query", `${id} is referenced as a query`);
+        const { code } = ex!.doc.data[0];
+        for (const ref of code.match(/@query:[A-Za-z0-9_-]+/g) ?? []) await resolve(ref.slice(1), depth + 1);
         const described = describeRef(code);
         let rows: unknown[];
         if (described) rows = describeRows(described, cols(described), loaded[described]);
@@ -585,7 +594,18 @@ Deno.test(async function allTests(_t) {
           const plan = rewriteWindows(rewriteUnpivot(sql, colsOf));
           const res = await ala(plan.sql, [loaded]) as { columns: { columnid: string }[]; data: unknown[] };
           const run = (q: string, params: unknown[]) => (ala(q, params) as { data: unknown[] }).data;
-          rows = plan.windows.length ? applyWindows(res, plan, run).data : res.data;
+          let out = res;
+          if (plan.windows.length) out = applyWindows(res, plan, run);
+          rows = out.data;
+          // AlaSQL answers a column name it does not have with undefined in
+          // every row, so a typo in a bundled example reads as a sheet full of
+          // blanks rather than as an error. This is the pass that says so.
+          checkResultColumns(
+            out.columns,
+            rows,
+            Object.values(loaded).flatMap((rows_) => Object.keys(rows_[0] ?? {})),
+            code,
+          );
           // A window column that came back empty means the pass silently missed
           // it. A lifted one is dropped from the result, so it has nothing to say.
           for (const w of plan.windows) {
@@ -597,14 +617,35 @@ Deno.test(async function allTests(_t) {
           }
         }
         assert(rows.length > 0, `${id} returned no rows`);
-        ran++;
+        ran.add(id);
+        loaded[id] = rows as Record<string, unknown>[];
+        return rows;
+      };
+      for (const [id, ex] of examples) {
+        if (ex.doc.type !== "query") continue;
+        await resolve(id);
       }
-      const chained = examples.filter(([, ex]) => ex.doc.type === "query" && ex.doc.data[0].code.includes("@query:"));
-      assertEquals(
-        ran,
-        examples.filter(([, ex]) => ex.doc.type === "query").length - chained.length,
-        `${chained.length} examples build on another query; the browser test covers those`,
-      );
+      assertEquals(ran.size, examples.filter(([, ex]) => ex.doc.type === "query").length);
+
+      // Every chart reads a sheet that exists and plots columns it has, and
+      // every dashboard tile names a sheet somebody bundled. A chart that only
+      // fails when it is opened is a broken storefront too.
+      for (const [id, ex] of examples as unknown as [string, { doc: { type: string; data: [never] } }][]) {
+        const doc = ex.doc.data[0] as unknown as { source: string; x: string; y: string; tiles: string[] };
+        if (ex.doc.type === "chart") {
+          const chart = await resolve(doc.source.slice(1));
+          for (const axis of [doc.x, doc.y]) {
+            assert(
+              Object.hasOwn(chart[0] as object, axis),
+              `${id} plots "${axis}", which ${doc.source} does not have`,
+            );
+          }
+        }
+        if (ex.doc.type === "dashboard") {
+          for (const tile of doc.tiles)
+            assert(byId[tile.slice(1)], `${id} names the missing tile ${tile}`);
+        }
+      }
     }
 
     // An alert sheet: a query, a destination, and a log of what it decided. It
@@ -1091,6 +1132,117 @@ Deno.test(async function allTests(_t) {
       // A date spine turns gaps into zero rows instead of missing rows.
       const spine = await run(`select count(*) n from series('2026-01-01','2026-01-10')`);
       assertEquals(spine.n, 10);
+
+      // Every value below is a published one, so these check the arithmetic
+      // rather than checking it against itself.
+      const fails = async (code: string) => {
+        const res = await app.request(`/query`, {
+          method: "POST",
+          headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+          body: JSON.stringify({ lang: "sql", code, args: [] }),
+        });
+        assertEquals(res.status, 400, code);
+        return await res.text();
+      };
+      const five = `(select 1 as x, 3 as y union all select 2, 5 union all select 3, 7
+                     union all select 4, 9 union all select 5, 11)`;
+
+      // Regression: the line through y = 2x + 1 predicts 21 at x = 10 and has no
+      // spread around it, because every point is on it.
+      const line = await run(
+        `select regr_predict(array(x),array(y),10) at10, regr_stderr(array(x),array(y)) se from ${five}`,
+      );
+      assertEquals([round(line.at10), round(line.se)], [21, 0]);
+
+      // Curve fitting: 100 * exp(-0.1x) read back at x = 6, and y = 2x^3 at x = 4.
+      const curves = await run(
+        `select fit_exponential(array(x),array(y),6) e from
+           (select 0 as x, 100 as y union all select 1, 90.4837418 union all select 2, 81.8730753
+            union all select 3, 74.0818221 union all select 4, 67.0320046)`,
+      );
+      assertEquals(round(curves.e, 3), 54.881);
+      const power = await run(
+        `select fit_power(array(x),array(y),4) p from
+           (select 1 as x, 2 as y union all select 2, 16 union all select 3, 54)`,
+      );
+      assertEquals(round(power.p, 6), 128);
+
+      // A robust score: one value at 100 among small ones cannot widen the ruler
+      // it is measured against, which is what a plain z-score lets it do.
+      const outlier = await run(
+        `select mad(array(x)) m, robust_z(100, array(x)) z from
+           (select 1 as x union all select 2 union all select 3 union all select 4 union all select 100)`,
+      );
+      assertEquals([outlier.m, round(outlier.z, 2)], [1, 65.43]);
+
+      // Welch's t-test and the mean's interval, against the textbook numbers.
+      const ab = `(select 'a' as g, 1 as v union all select 'a', 2 union all select 'a', 3 union all select 'a', 4
+                   union all select 'a', 5 union all select 'b', 6 union all select 'b', 7 union all select 'b', 8
+                   union all select 'b', 9 union all select 'b', 10)`;
+      const test = await run(
+        `select t_test(a.vs, b.vs) p from (select array(v) vs from ${ab} where g = 'a') a,
+                (select array(v) vs from ${ab} where g = 'b') b`,
+      );
+      assertEquals(round(test.p, 6), 0.001053);
+      const band = await run(`select ci_low(array(x), 0.95) lo, ci_high(array(x), 0.95) hi from ${five}`);
+      assertEquals([round(band.lo, 4), round(band.hi, 4)], [1.0368, 4.9632]);
+
+      // Histogram bins. Below the range is bucket 0 and above it is n+1, so the
+      // tails stay visible instead of being folded into the end bars.
+      const bins = await run(
+        `select width_bucket(5,0,30,6) mid, width_bucket(-1,0,30,6) below, width_bucket(30,0,30,6) above`,
+      );
+      assertEquals([bins.mid, bins.below, bins.above], [2, 0, 7]);
+
+      // Geospatial. The geohash is the canonical vector, and the area is a one
+      // degree square on the equator, which is 12363.7 km2 on a sphere.
+      const geo = await run(
+        `select geohash(57.64911, 10.40744, 11) h, bearing_deg(0,0,0,1) east,
+                point_in_polygon(0.5, 0.5, '[[0,0],[0,1],[1,1],[1,0]]') inside,
+                point_in_polygon(2, 0.5, '[[0,0],[0,1],[1,1],[1,0]]') outside,
+                polygon_area_km2('[[0,0],[0,1],[1,1],[1,0]]') km2`,
+      );
+      assertEquals([geo.h, geo.east, geo.inside, geo.outside], ["u4pruydqqvj", 90, true, false]);
+      assertEquals(round(geo.km2, 1), 12363.7);
+
+      // Each refusal has to name the argument and the value, not return NaN.
+      for (
+        const [code, said] of [
+          [`select width_bucket(5, 0, 30, 0) b`, "1 or more"],
+          [`select geohash(1, 2, 99) h`, "between 1 and 12"],
+          [`select geohash(100, 2, 5) h`, "between -90 and 90"],
+          [`select point_in_polygon(1, 2, 'not json') p`, "JSON array of [lat, lon] pairs"],
+          [`select polygon_area_km2('[[0,-179],[0,179],[1,179]]') a`, "antimeridian"],
+        ]
+      ) {
+        assert((await fails(code)).includes(said), `${code} should say ${said}`);
+      }
+      // AlaSQL cannot run any aggregate over a one-row derived table, so the
+      // too-small-sample guard is checked against the function rather than
+      // through a query that the engine refuses before it is reached.
+      assertThrows(() => ala.fn.t_test([1], [2, 3]), Error, "at least 2 values");
+      assertThrows(() => ala.fn.ci_low([1, 2, 3], 95), Error, "between 0 and 1");
+      assertThrows(() => ala.fn.fit_exponential([1, 2], [1, 0], 4), Error, "above zero");
+      // JSON.stringify() turns Infinity and NaN into "null", so these used to
+      // read "received number null", which names neither the value nor the bug.
+      assertThrows(() => ala.fn.width_bucket(Infinity, 0, 30, 6), Error, "received number Infinity");
+      assertThrows(() => ala.fn.robust_z(NaN, [1, 2, 3]), Error, "received number NaN");
+
+      // Reading a sheet, a function's own message comes through. Reading a
+      // subquery in the from clause, AlaSQL drops it and reports "Cannot read
+      // properties of null" from somewhere else entirely -- the worst error in
+      // the system, so it is replaced by one that says what happened.
+      const dropped = await fails(`select ci_low(array(x), 95) lo from ${five}`);
+      assert(dropped.includes("dropped its message"), dropped);
+      assert(dropped.includes("read the subquery's rows into a sheet"), dropped);
+
+      // AlaSQL evaluates a group by expression against an empty row, so every UDF
+      // named there receives nothing. The message has to say so: hunting a typo
+      // in a column name that is spelled correctly is the worse bug.
+      const grouped = await fails(
+        `select date_trunc('month', missing) m, count(*) n from series('2026-01-01','2026-01-03') group by 1`,
+      );
+      assert(grouped.includes("subquery"), grouped);
     }
 
     // Window functions. AlaSQL parses `over (partition by ...)` and then computes
