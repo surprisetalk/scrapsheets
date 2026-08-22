@@ -21,19 +21,7 @@ import {
   trimNet,
 } from "./main.ts";
 import type { Col, Query, Sheet, Table, Template } from "./main.ts";
-import { DATASETS, EXAMPLES } from "./src/examples.mjs";
-import {
-  applyWindows,
-  checkCells,
-  checkColumnTypes,
-  checkPivot,
-  checkResultColumns,
-  describeRef,
-  describeRows,
-  rewriteUnpivot,
-  rewriteWindows,
-  scanRefs,
-} from "./src/sql.mjs";
+import { DATASETS } from "./src/examples.mjs";
 import ala from "alasql";
 import dbSql from "./schema/db.sql" with { type: "text" };
 import examplesSql from "./examples.sql" with { type: "text" };
@@ -548,105 +536,9 @@ Deno.test(async function allTests(_t) {
       assertEquals(row.n, countries.doc.data.length - 1);
     }
 
-    // Every bundled dataset must satisfy its own declared types, and every
-    // bundled query must run against them. These ship as the shop's inventory,
-    // so a broken one is a broken storefront.
-    {
-      const cols = (id: string) =>
-        Object.values(DATASETS.find((d: { doc_id: string }) => `table:${d.doc_id}` === id)!.doc.data[0]) as Col[];
-      const loaded: Record<string, Record<string, unknown>[]> = {};
-      for (const { doc_id, doc } of DATASETS as unknown as { doc_id: string; doc: { data: Table } }[]) {
-        const [cols_, ...rows] = doc.data;
-        loaded[`table:${doc_id}`] = rows.map((row) =>
-          Object.fromEntries(Object.values(cols_).map((col) => [col.name, row[col.key]]))
-        );
-        checkColumnTypes(`table:${doc_id}`, Object.values(cols_), loaded[`table:${doc_id}`]);
-      }
-      const examples = Object.entries(EXAMPLES) as unknown as [string, { doc: { type: string; data: [Query] } }][];
-      // A query that reads another query is resolved by running that one first
-      // and keeping its rows, which is what both engines do. Without this the
-      // chained half of the gallery only ran in the browser test, which names
-      // the few it checks rather than running them all.
-      const byId = Object.fromEntries(examples);
-      const ran = new Set<string>();
-      const resolve = async (id: string, depth = 0): Promise<unknown[]> => {
-        if (loaded[id]) return loaded[id];
-        assert(depth <= 8, `${id}: @query refs nest deeper than 8`);
-        const ex = byId[id];
-        assert(ex, `${id} is referenced but not bundled`);
-        assertEquals(ex!.doc.type, "query", `${id} is referenced as a query`);
-        const { code } = ex!.doc.data[0];
-        for (const ref of code.match(/@query:[A-Za-z0-9_-]+/g) ?? []) await resolve(ref.slice(1), depth + 1);
-        const described = describeRef(code);
-        let rows: unknown[];
-        if (described) rows = describeRows(described, cols(described), loaded[described]);
-        else {
-          // The same order the server runs: cells, then unpivot, then windows.
-          const { sql, cells } = scanRefs(code);
-          const colsOf = Object.fromEntries(
-            Object.entries(loaded).map(([ref, rows_]) => [
-              ref,
-              Object.keys(rows_[0] ?? {}).map((name) => ({ name })),
-            ]),
-          );
-          checkCells(cells, loaded, colsOf);
-          checkPivot(sql);
-          const plan = rewriteWindows(rewriteUnpivot(sql, colsOf));
-          const res = await ala(plan.sql, [loaded]) as { columns: { columnid: string }[]; data: unknown[] };
-          const run = (q: string, params: unknown[]) => (ala(q, params) as { data: unknown[] }).data;
-          let out = res;
-          if (plan.windows.length) out = applyWindows(res, plan, run);
-          rows = out.data;
-          // AlaSQL answers a column name it does not have with undefined in
-          // every row, so a typo in a bundled example reads as a sheet full of
-          // blanks rather than as an error. This is the pass that says so.
-          checkResultColumns(
-            out.columns,
-            rows,
-            Object.values(loaded).flatMap((rows_) => Object.keys(rows_[0] ?? {})),
-            code,
-          );
-          // A window column that came back empty means the pass silently missed
-          // it. A lifted one is dropped from the result, so it has nothing to say.
-          for (const w of plan.windows) {
-            if (w.alias.startsWith("__")) continue;
-            assert(
-              (rows as Record<string, unknown>[]).some((r) => r[w.alias] !== null && r[w.alias] !== undefined),
-              `${id}: the window column "${w.alias}" is empty in every row`,
-            );
-          }
-        }
-        assert(rows.length > 0, `${id} returned no rows`);
-        ran.add(id);
-        loaded[id] = rows as Record<string, unknown>[];
-        return rows;
-      };
-      for (const [id, ex] of examples) {
-        if (ex.doc.type !== "query") continue;
-        await resolve(id);
-      }
-      assertEquals(ran.size, examples.filter(([, ex]) => ex.doc.type === "query").length);
-
-      // Every chart reads a sheet that exists and plots columns it has, and
-      // every dashboard tile names a sheet somebody bundled. A chart that only
-      // fails when it is opened is a broken storefront too.
-      for (const [id, ex] of examples as unknown as [string, { doc: { type: string; data: [never] } }][]) {
-        const doc = ex.doc.data[0] as unknown as { source: string; x: string; y: string; tiles: string[] };
-        if (ex.doc.type === "chart") {
-          const chart = await resolve(doc.source.slice(1));
-          for (const axis of [doc.x, doc.y]) {
-            assert(
-              Object.hasOwn(chart[0] as object, axis),
-              `${id} plots "${axis}", which ${doc.source} does not have`,
-            );
-          }
-        }
-        if (ex.doc.type === "dashboard") {
-          for (const tile of doc.tiles)
-            assert(byId[tile.slice(1)], `${id} names the missing tile ${tile}`);
-        }
-      }
-    }
+    // examples_test.ts replays every bundled sheet through both engines and
+    // compares them row for row. What is checked here is only that this server
+    // serves them: the seeded datasets are the shop's inventory.
 
     // An alert sheet: a query, a destination, and a log of what it decided. It
     // fires when the query returns a row, so the condition is the where clause.

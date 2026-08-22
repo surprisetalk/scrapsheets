@@ -495,6 +495,40 @@ suite =
                     D.decodeString docDecoder """{"type":"wat"}"""
                         |> Result.toMaybe
                         |> Expect.equal Nothing
+            , test "chart decodes its source, kind and both axes" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:budget-burn","kind":"bar","x":"department","y":"burn_ratio"}]}"""
+                        |> Expect.equal (Ok (Chart { source = "@query:budget-burn", kind = "bar", x = "department", y = "burn_ratio" }))
+            , test "a chart with no kind is a line, and its axes default to empty" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:x"}]}"""
+                        |> Expect.equal (Ok (Chart { source = "@query:x", kind = "line", x = "", y = "" }))
+            , test "dashboard decodes its tiles in order" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"dashboard","data":[{"tiles":["@chart:a","@query:b"]}]}"""
+                        |> Expect.equal (Ok (Dashboard [ "@chart:a", "@query:b" ]))
+            , test "a dashboard with no tiles is empty rather than a failure" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"dashboard","data":[{}]}"""
+                        |> Expect.equal (Ok (Dashboard []))
+            ]
+        , describe "chartPoints"
+            [ test "reads the x label and the y number, in the order given" <|
+                \_ ->
+                    chartPoints (chartTable [ ( "Jan", E.float 3 ), ( "Feb", E.float 1 ) ])
+                        |> Expect.equal [ ( "Jan", 3 ), ( "Feb", 1 ) ]
+            , test "a y that is not a number is dropped, not read as zero" <|
+                \_ ->
+                    chartPoints (chartTable [ ( "Jan", E.float 3 ), ( "Feb", E.string "n/a" ), ( "Mar", E.float 2 ) ])
+                        |> Expect.equal [ ( "Jan", 3 ), ( "Mar", 2 ) ]
+            , test "a y held as a numeric string still counts" <|
+                \_ ->
+                    chartPoints (chartTable [ ( "Jan", E.string "4.5" ) ])
+                        |> Expect.equal [ ( "Jan", 4.5 ) ]
+            , test "no plottable rows is an empty chart, not a crash" <|
+                \_ ->
+                    chartPoints (chartTable [ ( "Jan", E.null ) ])
+                        |> Expect.equal []
             ]
         , describe "Column stats"
             [ describe "civilDays"
@@ -620,3 +654,18 @@ dateRows =
 boolRows : List E.Value -> Array.Array (Dict.Dict String D.Value)
 boolRows =
     List.map (Dict.singleton "b") >> Array.fromList
+
+
+{-| A chart sheet always resolves to two columns named x and y, whatever the
+query underneath it called them, so a test only has to supply the pairs.
+-}
+chartTable : List ( String, E.Value ) -> Table
+chartTable points =
+    -- chartPoints reads the rows by key and never looks at the columns, so
+    -- naming them here would only be a second place to keep them in step.
+    { cols = Array.empty
+    , rows =
+        points
+            |> List.map (\( x, y ) -> Dict.fromList [ ( "x", E.string x ), ( "y", y ) ])
+            |> Array.fromList
+    }

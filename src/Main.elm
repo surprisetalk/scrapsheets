@@ -6,8 +6,10 @@ port module Main exposing
     , Rect
     , Sheet
     , SortOrder(..)
+    , Table
     , Stat(..)
     , TableBounds
+    , chartPoints
     , civilDays
     , clampIndex
     , computeBoolishStats

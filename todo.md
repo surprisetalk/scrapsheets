@@ -2,11 +2,20 @@
 
 > Programmable data OS: every table is a database, every query is a table, every sheet is an API.
 
-- [ ] let's remove screenshots from test suite if possible. Nothing takes a screenshot; what is slow is the three
-      headless-Chrome tests in `browser_test.ts` and the `elm make` behind them. The chained half of the gallery no
-      longer needs them: `main_test.ts` resolves `@query:` refs itself, so every bundled example — chained included —
-      runs headlessly in seconds, with `checkResultColumns()` catching the typo that used to read as a sheet of blanks.
-      What is left in the browser is whether the page renders, which is the part a browser is for
+- [ ] **Smoke-test the boot without a browser.** The headless-Chrome tests are gone: what they proved about the query
+      engine now lives in `examples_test.ts`, which runs both engines — `npm:alasql` and the vendored `src/alasql.mjs`
+      the page loads — over every bundled sheet and compares them row for row, and what they proved about pure view
+      logic lives in `tests/MainTest.elm`. The suite went from 24s to 11s. What went with them has no home: Elm
+      initializing, the automerge WASM resolving, `window.__scrapsheets.repo` being constructed, and every DOM behaviour
+      (sort by clicking, column hide, fill-down, fork, tutorial, shortcut sheet, dashboard tiles as iframes, `?embed=1`
+      dropping the chrome). The cheapest half of that hole is now covered: `browser_test.ts` asserts the built bundles
+      still export what the page boots from, so a bundle that compiled to nothing, or a vendored automerge rebuilt
+      without `initializeWasm`, fails the suite. **A bundle that loads but throws on boot would still ship.**
+  1. Decide whether the boot deserves one Chrome test of its own — Elm initializing and `window.__scrapsheets.repo`
+     being constructed, nothing else — or whether `deno task dev` plus a manual pass before release is the honest answer
+     for a project this size.
+  2. If it does, keep it to one test and one page load. The three that were removed cost 13 of the suite's 24 seconds
+     because each drove a whole session through the DOM.
 
 ---
 
@@ -211,14 +220,20 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 - [ ] **Docket watch**: court RSS/PACER `net-http` -> `query` matching client and adverse-party names -> alert `table`
       with new filings each morning
-- [ ] **Contract obligation calendar**: clause `table` (term, notice window, auto-renew) -> `query` producing the next
-      12 months of deadlines -> webhook into the firm calendar
+- [x] **Contract obligation calendar**: `table:contracts` -> `query:notice-calendar`. The deadline is not the term end —
+      it is the notice window before it, and a renewal nobody wanted is what a passed notice date buys. The date the
+      reader stands on is `@table:assumptions.as_of`, so one cell moves the whole calendar. The webhook into the firm
+      calendar is open, though `GET /export/:id.ics` already builds a feed from the date column
 - [ ] **Realization and write-off analysis**: practice-management `codex` -> `query` realization by matter, partner, and
       client -> the table that drives rate discussions
 - [ ] **Entity and lien monitoring**: Secretary of State `net-http` -> `query` detecting officer changes, new liens, and
       status lapses across a client portfolio
 - [ ] **Patent landscape**: USPTO/EPO `net-http` -> `query` CPC class counts by assignee over time -> a whitespace map
-- [ ] **Conflict check**: client and adverse-party `table`s -> `query` with fuzzy name matching across every matter
+- [x] **Conflict check**: `table:matters` + `table:matter-parties` -> `query:conflict-check` scores every adverse name
+      against every client on another matter, and `query:conflict-nicknames` catches the ones a fuzzy match alone
+      misses: "Bill Achebe" against "William Achebe" scores 0.35, under any threshold anyone would set, and unfolding
+      the short form through `table:nicknames` makes it 1.0. A missed conflict is not a bad search result, it is a
+      disqualification
 - [ ] **Discovery volume and cost tracking**: vendor invoice `net-hook` -> `query` cost per GB per custodian
 
 ### Real Estate
@@ -332,8 +347,10 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Agriculture
 
-- [ ] **Yield per input dollar**: planting/application `table` + weather and GDD `net-http` -> `query` margin by field,
-      hybrid, and rate
+- [x] **Yield per input dollar**: `table:fields` + `table:hardiness-zones` -> `query:field-margin`, with
+      `chart:field-margin`. The zone joins in as a published temperature band rather than as a label, because comparing
+      a field in 6a to one in 5a on yield alone credits the hybrid for the winter. The weather feed and growing degree
+      days are open
 - [ ] **Irrigation scheduling**: soil moisture `net-hook` + evapotranspiration `portal` -> `query` next irrigation by
       zone
 - [ ] **Grain marketing and hedge ratio**: CME futures `portal` + bushels-on-hand `table` -> `query` basis, hedged
@@ -358,8 +375,9 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Education
 
-- [ ] **Room and instructor conflict finder**: schedule `table` -> `query` detecting overlaps and capacity violations
-      before registration opens
+- [x] **Room and instructor conflict finder**: `table:sections` -> `query:schedule-conflicts` and `query:over-capacity`.
+      The overlap is a self-join on `a starts before b ends and b starts before a ends`, over the same room or the same
+      instructor, and it costs nothing to run in August — which is the only month it can still be fixed in
 - [ ] **Grant effort reporting**: payroll `codex` -> `query` effort % vs award commitment per investigator
 - [ ] **Early-warning student risk**: LMS `net-hook` -> `query` attendance, submission, and grade slope -> advisor
       worklist
@@ -372,7 +390,10 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 - [ ] **Grant opportunity pipeline**: Grants.gov `net-http` -> `query` scoring fit by eligibility and keyword ->
       go/no-go `table`
-- [ ] **LYBUNT / SYBUNT donor lists**: gift `codex` -> `query` lapsed donors by segment and last gift size
+- [x] **LYBUNT / SYBUNT donor lists**: `table:gifts` -> `query:lybunt` and `query:donor-retention`. The list is defined
+      by an absence — gave last year, has not given this one — so it comes out of a having clause over the last gift
+      date rather than out of any row, and needs `max_text()`, since AlaSQL's own `max()` drops a date held as text and
+      would answer with nothing at all. The gift codex is open
 - [ ] **Form 990 peer benchmarking**: IRS 990 XML `net-http` -> `query` program-expense ratio and comp benchmarks
       against peers
 - [ ] **Program outcome reporting**: intake `net-hook` form -> `query` producing the exact table each funder demands
@@ -391,8 +412,10 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Music & Entertainment
 
-- [ ] **Royalty statement normalization**: DSP statement `net-hook` in a dozen shapes -> `query` unifying to per-track
-      per-territory earnings -> collaborator split `table` and payout list
+- [x] **Royalty statement normalization**: `table:royalties` -> `query:royalties-long` -> `query:writer-payouts`. A DSP
+      statement arrives with a column per service, which is the wrong shape for every question anyone asks of it;
+      `unpivot` turns it into one row per service, and only then can a split be applied. Reading a dozen different
+      statement shapes is the open half — this demo starts from one that is already parsed
 - [ ] **Tour routing and gross potential**: venue `table` + ticket sales `portal` -> `query` routing distance, capacity,
       and settlement projection per night
 - [ ] **Catalog and setlist analytics**: Setlist.fm `net-http` -> `query` song performance frequency vs streaming lift
@@ -404,7 +427,9 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 - [ ] **Player efficiency model**: box score `net-http` -> `query` per-possession metrics and rolling form -> rankings
       `table`
-- [ ] **Model vs market edge**: odds `portal` -> `query` comparing model probability to implied odds -> +EV `table`
+- [x] **Model vs market edge**: `table:game-odds` -> `query:market-edge`. A decimal price implies a probability, and the
+      edge is what the model believes times what the price pays, minus the stake. Most of the apparent edges are the
+      vig; the ones that survive it are the list. The live odds portal is open
 - [ ] **Athlete load management**: wearable `net-hook` -> `query` acute:chronic workload ratio -> flag `table` for the
       trainer
 - [ ] **Youth league scheduling**: team, field, and official `table`s -> `query` producing a conflict-free schedule with
@@ -418,7 +443,9 @@ coverage: later passes mine it for the missing features and the datasets worth s
       already read
 - [ ] **Instrument run QC**: instrument `net-hook` -> `query` control-sample pass/fail with drift detection -> rerun
       queue
-- [ ] **Lab inventory and reagent expiry**: `table` + `query` producing the reorder list and expiring-soon alert
+- [x] **Lab inventory and reagent expiry**: `table:reagents` -> `query:reagent-reorder`, which answers two questions of
+      one shelf — what expires soon, and what has fallen under its reorder point — and names which of the two each row
+      is. The reagents that are both are the order to place today. An `alert` sheet over it would send the mail
 - [ ] **Variant annotation**: variant `table` -> `query` joined against a ClinVar `codex` -> annotated report
 - [ ] **Field survey collection**: mobile `net-hook` form -> `query` validating observations -> a citable dataset
       published to the shop
@@ -451,8 +478,11 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### HR & Recruiting
 
-- [ ] **Comp bands and pay equity**: employee `codex` + market survey `table` -> `query` compa-ratio and a residual
-      analysis by group
+- [x] **Comp bands and pay equity**: `table:employees` + `table:comp-bands` -> `query:compa-ratio` and
+      `query:pay-equity`. The mean salaries of the two cohorts are within a rounding error of each other and the
+      compa-ratios are not, because one sits in higher-paying roles — which is exactly why the band is the thing to
+      compare against, and why a headline average is the number that hides a gap rather than the one that finds it.
+      `t_test()` says how much of what is left a coin could have produced. The employee codex is open
 - [ ] **Applicant funnel**: ATS `net-hook` -> `query` pass-through rate by stage and source, time-to-fill by role
 - [ ] **Headcount plan vs actual**: plan `table` -> `query` feeding the finance forecast directly, no re-keying
 - [ ] **Immigration and certification dates**: `table` -> `query` upcoming expirations -> webhook to HR and the employee
@@ -476,8 +506,9 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Transportation & Aviation
 
-- [ ] **Fleet cost per mile**: telematics `net-hook` + fuel and maintenance `table` -> `query` cost per mile by vehicle
-      and route
+- [x] **Fleet cost per mile**: `table:fleet-legs` -> `query:cost-per-mile`. The miles are not on the row: each leg names
+      two airports, and the distance is a great circle over the coordinates in `table:airports`, which is what makes the
+      spine worth shipping. The telematics hook is open
 - [ ] **Hours-of-service compliance**: ELD `net-hook` -> `query` violations and near-violations before dispatch
 - [ ] **Flight ops on-time analysis**: ADS-B `portal` + schedule `table` -> `query` tail utilization, turn time, and
       delay cause
@@ -495,8 +526,10 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Household & Personal
 
-- [ ] **Envelope budgeting**: bank `net-hook` -> `query` categorized spend vs envelope -> a `table` a household actually
-      maintains together in real time
+- [x] **Envelope budgeting**: `table:household-spend` + `table:mcc-ranges` + `table:envelopes` ->
+      `query:envelope-budget`, with `chart:envelope-spend` and `dashboard:household-month`. The category is not on the
+      transaction: the bank sends a four-digit MCC, and which envelope that is comes from the range it falls in, so the
+      join is a between rather than an equals. The bank hook is open
 - [ ] **Job search tracker**: application `table` + posting `net-http` -> `query` stale applications and follow-up dates
 - [ ] **Renovation bid comparison**: bid `table` -> `query` normalized line-by-line comparison with scope gaps flagged
 - [ ] **Collection catalog**: records, books, or plants `table` + price `net-http` -> `query` current value and gaps

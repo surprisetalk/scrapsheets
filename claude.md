@@ -31,7 +31,18 @@ technologies. It uses a hybrid architecture with:
 
 - **Build frontend**: `deno task build` (copies src/* to dist and runs elm make)
 - **Development server**: `deno task dev`
-- **Run all tests**: `deno task test` (or `deno test --allow-all`; browser tests build dist themselves)
+- **Run all tests**: `deno task test` (or `deno test --allow-all`). No test drives a browser. The suite is four files,
+  and which one a failure belongs in is usually obvious:
+  - `main_test.ts` — the server: auth, sync and roles, shop and Stripe, `POST /query`, the `src/sql.mjs` UDFs, net-http
+    polling, alerts and digests, MCP, export. One `Deno.test` full of prose-headed blocks against in-process PGlite.
+  - `examples_test.ts` — every bundled sheet, run through **both** engines (`npm:alasql` and the vendored
+    `src/alasql.mjs` the page loads) and compared row for row. A UDF registered in one and not the other, or a vendored
+    bundle built from a different alasql, fails here rather than in somebody's browser.
+  - `browser_test.ts` — despite the name, no browser: dist builds, index.html wires the WASM and the import map, every
+    root-absolute asset is in `_redirects`, nothing reaches a CDN, and the built bundles still export what the page
+    boots from.
+  - `tests/MainTest.elm` via `elm_test.ts` — pure Elm: selection and navigation, sort and filter, clipboard parsing,
+    column stats, `docDecoder`, `chartPoints`.
 - **Re-vendor browser bundles**: `deno task vendor` (after bumping the versions at the top of `vendor.ts`; alasql tracks
   `deno.json`)
 - **Elm review**: `deno task review`. Runs clean with zero suppressions; keep it that way.
@@ -194,15 +205,17 @@ t.trade_id order by p.day desc) = 1` —
   Object.keys(m.EXAMPLES).length, JSON.stringify(m.EXAMPLES).length)"`
   prints the counts and the byte size, which has to stay well under the ~5 MB localStorage budget. Reference tables
   carry the `reference` tag and joinable spines `dataset`, the only handle the flat library gives for telling them
-  apart. The end-to-end pipelines from the Demo Gallery ship as sheets tagged `demo` plus a domain tag — WIP schedule,
-  AR aging, exit waterfall, pairs-trade monitor, restaurant prime cost, municipal burn rate, claim denial triage, clinic
-  no-show, SPC control charts, experiment readout, zoning screen, rent comps, 311 hotspots, cloud cost anomaly, cohort
-  retention, well decline, bank reconciliation, loss triangle, freight audit — each a seeded source table plus one or
-  two query sheets, and `todo.md`'s Demo Gallery is the index of which is which. Their data is invented; their shapes
-  are not. `store` and `class` are AlaSQL keywords, so no column may be named either: `select store from ...` will not
-  parse. `table:assumptions` is the one-row settings sheet those demos read their parameters from, so changing one cell
-  changes four sheets. `main_test.ts` runs **every** bundled query, resolving `@query:` refs itself, and calls
-  `checkResultColumns()` on each result — a typo in a bundled example used to read as a sheet of blanks
+  apart. Thirty-odd end-to-end pipelines from the Demo Gallery ship as sheets tagged `demo` plus a domain tag, spanning
+  twenty-two domains — finance, healthcare, legal, real estate, manufacturing, government, retail, insurance, logistics,
+  hr, education, nonprofit, household, music, sports, transport, science, agriculture and the rest — each a seeded
+  source table plus one or two query sheets. **`todo.md`'s Demo Gallery is the index: the checked entries name their
+  sheets, and that is the list to read rather than this one.** Their data is invented; their shapes are not. `store` and
+  `class` are AlaSQL keywords, so no column may be named either: `select store from ...` will not parse.
+  `table:assumptions` is the one-row settings sheet those demos read their parameters from, so changing one cell changes
+  four sheets. `examples_test.ts` runs **every** bundled query in both engines, resolving `@query:` refs itself, and
+  calls `checkResultColumns()` on each result — a typo in a bundled example used to read as a sheet of blanks. Two
+  AlaSQL limits shape how the demo SQL is written: a UDF cannot be named in a `group by` (bin or bucket in a subquery,
+  then group by the column), and `min()`/`max()` drop a date held as text (`min_text()`/`max_text()`)
 - **Library gallery**: `viewGallery` puts a strip above the library table naming every `demo`-tagged query sheet as a
   link and every tag as a filter chip. It reads `model.library`, so a new demo needs no code change
 - **Cross-sheet queries in the browser**: `runSql` rewrites `@type:doc_id` to `SHEET('id')` and pre-loads each doc
