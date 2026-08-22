@@ -31,7 +31,6 @@
       import { IndexedDBStorageAdapter } from "/automerge-repo-idb.mjs";
       import { BrowserWebSocketClientAdapter } from "/automerge-repo-ws.mjs";
       import {
-        atomToJson,
         docThumb,
         httpErrorDetail,
         httpFailure,
@@ -64,8 +63,11 @@
         };
       }
 
+      // Declared out here so the catch below can still reach it. Inside the try
+      // it is out of scope exactly when the handler runs.
+      let app;
       try {
-        const app = Elm.Main.init({
+        app = Elm.Main.init({
           node: document.getElementById("elm"),
           flags: {
             tutorial: ((v) => (Number.isFinite(v) ? v : 0))(
@@ -430,7 +432,7 @@
                       })),
                       ...data.map((row) => {
                         const rowObj = {};
-                        headers.forEach((header, index) => {
+                        headers.forEach((_, index) => {
                           rowObj[index] = row[index] || "";
                         });
                         return rowObj;
@@ -534,7 +536,7 @@
           };
           alasql.from.HTTP = (url, qs = {}) => alasql.fn.http(url, qs).res;
           const queryDoc = debounce(
-            async (id, { code, lang, args, cols: cols_ = {} }) => {
+            async (id, { code, lang, cols: cols_ = {} }) => {
               try {
                 switch (lang) {
                   case "sql":
@@ -730,7 +732,7 @@
           }, 'selectDoc');
 
           const changeId = catchy(async (id) => {
-            const [type, doc_id = ""] = id.split(":");
+            const [, doc_id = ""] = id.split(":");
             if (doc_id === sheet?.documentId) return;
             ws?.close?.();
             clearInterval(netInterval);
@@ -1052,9 +1054,11 @@
         }
       } catch (error) {
         console.error('[scrapsheets] Fatal initialization error:', error);
-        app.ports.docErrored.send(
-          `Initialization failed: ${error?.message ?? "Something went wrong."}`,
-        );
+        const detail = `Initialization failed: ${error?.message ?? "Something went wrong."}`;
+        // If Elm.Main.init is what threw there is no app and no UI, so the port
+        // would leave a blank page with the message only in the console.
+        if (app) app.ports.docErrored.send(detail);
+        else document.getElementById("elm").textContent = detail;
       }
     </script>
   </body>

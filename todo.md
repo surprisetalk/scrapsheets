@@ -2,19 +2,6 @@
 
 > Programmable data OS: every table is a database, every query is a table, every sheet is an API.
 
-- [ ] **Cover what is left of src/index.html.** The testable half is out, and both engines now resolve a query through
-      the same code: `toRecords()`, `loadRefs()` and `planQuery()` in `src/sql.mjs` are called by `executeSql` on the
-      server and by `sheets()` in `src/page.mjs`, so the ref walk, the cycle bound, the type check and the four
-      pre-engine passes are one fact rather than two. Where a sheet comes from is the only difference left and it is an
-      argument. `index.html` is down from 1298 lines to 1061. Each extraction has caught something the copies had
-      drifted on: arxiv's `<opensearch:totalResults>` never matched its selector; `Library.set` was shadowing the
-      imported `library`; and `describe` on a sheet whose cells fail the type check worked on the server and was refused
-      in the page, which is the opposite of what that statement is for.
-  1. What is left in `index.html` is glue — the automerge repo, the websocket, the ports, drag-and-drop, the clipboard,
-     query-editor cursor tracking. None of it has a return value to assert.
-  2. Still unchecked: a plain undefined identifier in `index.html` that no module exports. Both import directions are
-     covered; this one needs scope analysis rather than another assertion.
-
 ---
 
 ## Phase 1 — Foundation

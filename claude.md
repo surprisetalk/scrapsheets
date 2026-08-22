@@ -50,7 +50,15 @@ technologies. It uses a hybrid architecture with:
     it has no `replaceData` on a text node, which is how Elm's virtual-dom patches text in place.
   - `browser_test.ts` — despite the name, no browser: dist builds, index.html wires the WASM and the import map, every
     root-absolute asset is in `_redirects`, every name index.html imports is actually exported, nothing reaches a CDN,
-    and the built bundles still export what the page boots from.
+    and the built bundles still export what the page boots from. Nothing boots `index.html`, so its
+    `<script type="module">` body is sliced out and piped over stdin to `deno lint` with `no-undef` and
+    `no-unused-vars`. That is real scope analysis — module bindings, block scope, hoisting — rather than the regex it
+    replaced, which matched call shapes only and so could not see a value use like `PARSERS[ct]`. A free identifier or a
+    dead import fails here instead of shipping as a blank page; it is what caught `app` being referenced from the
+    fatal-initialization `catch` that its `try` had scoped it out of. `BROWSER_GLOBALS` in that file is the whole
+    allowlist — the seven names the page reaches for that Deno's own global scope lacks, `Elm` among them, from the
+    classic `<script src="/index.js">`. Everything else it touches, `fetch` and `localStorage` and `WebSocket`, Deno
+    already defines, so a new browser API has to be added there on purpose.
   - `tests/MainTest.elm` via `elm_test.ts` — pure Elm: selection and navigation, sort and filter, clipboard parsing,
     column stats, `docDecoder`, `chartPoints`.
 - **Re-vendor browser bundles**: `deno task vendor` (after bumping the versions at the top of `vendor.ts`; alasql tracks

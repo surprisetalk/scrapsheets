@@ -90,15 +90,12 @@ Deno.test("index.html has correct WASM initialization", async () => {
   assertEquals(html.includes("new Repo"), true, "Should create a Repo instance");
 });
 
-// Test 1b: vendored bundles must defer to the import map for automerge
-// src/_redirects is an allowlist ending in `/* / 200`, so an asset that is not
-// listed is served the SPA shell instead of itself. For a module that surfaces
-// only in the browser, as "'text/html' is not a valid JavaScript MIME type".
-Deno.test("index.html imports exactly the names it uses", async () => {
+Deno.test("index.html imports names its modules actually export", async () => {
   // src/index.html is the one file with no runtime coverage: nothing boots it,
-  // so a name that moved out of it -- or was never exported in the first place --
-  // fails as a blank page rather than as a test. This is the cheap half of that:
-  // read its import statements and check them against the modules they name.
+  // so a name that was never exported in the first place fails as a blank page
+  // rather than as a test. The other direction -- a name used here and never
+  // imported -- is the scope analysis in the next test, which catches it as a
+  // free identifier whether it is called or merely read.
   const html = await Deno.readTextFile(dir + "src/index.html");
   const imports = [...html.matchAll(/import\s*\{([^}]+)\}\s*from\s*"(\/[^"]+\.mjs)"/g)];
   assert(imports.length >= 2, `expected index.html to import from local modules, found ${imports.length}`);
@@ -112,26 +109,94 @@ Deno.test("index.html imports exactly the names it uses", async () => {
       );
     }
   }
+});
 
-  // And the other direction, which is the one an extraction gets wrong: a name
-  // that moved into a module, is still called here, and was never added to the
-  // import list. JavaScript will not say so until the page is open.
-  const imported = new Set(imports.flatMap(([, names]) => names.split(",").map((n) => n.trim())));
-  const script = html.slice(html.indexOf("<script"), html.lastIndexOf("</script>"));
-  for (const spec of new Set(imports.map(([, , s]) => s))) {
-    const mod = await import("./src" + spec);
-    for (const name of Object.keys(mod)) {
-      if (imported.has(name)) continue;
-      // A local of the same name is this file's own, not the module's.
-      if (new RegExp(`(const|let|var|function)\\s+${name}\\b`).test(script)) continue;
-      assert(
-        !new RegExp(`\\b${name}\\s*\\(`).test(script),
-        `index.html calls ${name}(), which "${spec}" exports but index.html never imports`,
-      );
-    }
+// The names the page reaches for that Deno's own global scope does not have.
+// Everything else it touches -- fetch, localStorage, WebSocket, console,
+// setTimeout, URLSearchParams -- Deno already defines, so no-undef never raises
+// it. `Elm` comes from the classic <script src="/index.js"> in <head>.
+const BROWSER_GLOBALS = [
+  "document",
+  "Elm",
+  "Image",
+  "MutationObserver",
+  "requestAnimationFrame",
+  "XMLHttpRequest",
+  "XMLSerializer",
+];
+
+Deno.test("index.html has no undefined identifier and no dead import", async () => {
+  // The regex half of this used to match call shapes only, so a value use like
+  // PARSERS[ct] was invisible and a `const x` anywhere whitelisted `x`
+  // everywhere. deno lint does the real scope analysis -- it resolves module
+  // bindings, block scope and hoisting -- and reads from stdin, so index.html
+  // needs neither a build step nor to stop being one file to get it.
+  const html = await Deno.readTextFile(dir + "src/index.html");
+  const open = html.indexOf('<script type="module">');
+  assert(open >= 0, 'expected one <script type="module"> in src/index.html, found none');
+  const from = html.indexOf(">", open) + 1;
+  const script = html.slice(from, html.indexOf("</script>", open));
+  // Line numbers come back relative to the slice; this puts them back on the file.
+  const offset = html.slice(0, from).split("\n").length - 1;
+
+  const lint = new Deno.Command(Deno.execPath(), {
+    // --no-config or the project deno.json applies, which excludes this very
+    // file and would restore the default rule tags. An empty --rules-tags
+    // clears those, leaving only the two rules named here.
+    args: [
+      "lint",
+      "--json",
+      "-",
+      "--ext=js",
+      "--no-config",
+      "--rules-tags=",
+      "--rules-include=no-undef,no-unused-vars",
+    ],
+    cwd: dir,
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+  const w = lint.stdin.getWriter();
+  await w.write(new TextEncoder().encode(script));
+  await w.close();
+  const { stdout, stderr } = await lint.output();
+  const out = new TextDecoder().decode(stdout);
+  let report;
+  try {
+    report = JSON.parse(out);
+  } catch {
+    throw new Error(
+      `deno lint did not return JSON for index.html's module script.\n` +
+        `stdout: ${out.slice(0, 400)}\nstderr: ${new TextDecoder().decode(stderr).slice(0, 400)}`,
+    );
+  }
+  assertEquals(report.errors, [], "deno lint could not parse index.html's module script");
+
+  // One entry per name, not per call site: `document` alone is 14 diagnostics.
+  const found = new Map<string, number>();
+  for (const d of report.diagnostics) {
+    // no-unused-vars backticks the name, no-undef does not.
+    const name = d.message.replace(/ is never used$| is not defined$/, "").replace(/`/g, "");
+    if (BROWSER_GLOBALS.includes(name) && d.code === "no-undef") continue;
+    if (!found.has(name)) found.set(name, d.range.start.line + offset);
+  }
+  if (found.size > 0) {
+    const lines = [...found].map(([name, line]) => `    ${name} (src/index.html:${line})`).join("\n");
+    throw new Error(
+      `index.html's module script has bindings that do not resolve.\n` +
+        `    expected  every identifier bound by an import, a declaration, or a known browser global\n` +
+        `    received  ${found.size} that are not:\n${lines}\n` +
+        `    source    deno lint no-undef,no-unused-vars over the <script type="module"> body\n` +
+        `    fix       import the name, delete it if it is dead, or -- if it is a browser API the page\n` +
+        `              is meant to reach for -- add it to BROWSER_GLOBALS in browser_test.ts`,
+    );
   }
 });
 
+// src/_redirects is an allowlist ending in `/* / 200`, so an asset that is not
+// listed is served the SPA shell instead of itself. For a module that surfaces
+// only in the browser, as "'text/html' is not a valid JavaScript MIME type".
 Deno.test("every root-absolute asset index.html loads is listed in _redirects", async () => {
   const html = await Deno.readTextFile(dir + "src/index.html");
   const redirects = await Deno.readTextFile(dir + "src/_redirects");
