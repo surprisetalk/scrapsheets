@@ -31,13 +31,18 @@ technologies. It uses a hybrid architecture with:
 
 - **Build frontend**: `deno task build` (copies src/* to dist and runs elm make)
 - **Development server**: `deno task dev`
-- **Run all tests**: `deno task test` (or `deno test --allow-all`). No test drives a browser. The suite is four files,
+- **Run all tests**: `deno task test` (or `deno test --allow-all`). No test drives a browser. The suite is five files,
   and which one a failure belongs in is usually obvious:
   - `main_test.ts` — the server: auth, sync and roles, shop and Stripe, `POST /query`, the `src/sql.mjs` UDFs, net-http
     polling, alerts and digests, MCP, export. One `Deno.test` full of prose-headed blocks against in-process PGlite.
   - `examples_test.ts` — every bundled sheet, run through **both** engines (`npm:alasql` and the vendored
     `src/alasql.mjs` the page loads) and compared row for row. A UDF registered in one and not the other, or a vendored
     bundle built from a different alasql, fails here rather than in somebody's browser.
+  - `page_test.ts` — the page itself, booted under jsdom: the compiled Elm in `dist/index.js` initializes, renders, and
+    answers clicks, with the library fed in through the ports exactly as `src/index.html` feeds it. Covers the gallery
+    strip, sorting by clicking a header, hiding a column, chart SVG, dashboard tiles, `?embed=1`, the tutorial and the
+    shortcut sheet. It always runs `deno task build` first, so it can never pass against a stale bundle. deno-dom is not
+    enough for this — it has no `replaceData` on a text node, which is how Elm's virtual-dom patches text in place.
   - `browser_test.ts` — despite the name, no browser: dist builds, index.html wires the WASM and the import map, every
     root-absolute asset is in `_redirects`, nothing reaches a CDN, and the built bundles still export what the page
     boots from.

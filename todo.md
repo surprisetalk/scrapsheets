@@ -2,20 +2,19 @@
 
 > Programmable data OS: every table is a database, every query is a table, every sheet is an API.
 
-- [ ] **Smoke-test the boot without a browser.** The headless-Chrome tests are gone: what they proved about the query
-      engine now lives in `examples_test.ts`, which runs both engines — `npm:alasql` and the vendored `src/alasql.mjs`
-      the page loads — over every bundled sheet and compares them row for row, and what they proved about pure view
-      logic lives in `tests/MainTest.elm`. The suite went from 24s to 11s. What went with them has no home: Elm
-      initializing, the automerge WASM resolving, `window.__scrapsheets.repo` being constructed, and every DOM behaviour
-      (sort by clicking, column hide, fill-down, fork, tutorial, shortcut sheet, dashboard tiles as iframes, `?embed=1`
-      dropping the chrome). The cheapest half of that hole is now covered: `browser_test.ts` asserts the built bundles
-      still export what the page boots from, so a bundle that compiled to nothing, or a vendored automerge rebuilt
-      without `initializeWasm`, fails the suite. **A bundle that loads but throws on boot would still ship.**
-  1. Decide whether the boot deserves one Chrome test of its own — Elm initializing and `window.__scrapsheets.repo`
-     being constructed, nothing else — or whether `deno task dev` plus a manual pass before release is the honest answer
-     for a project this size.
-  2. If it does, keep it to one test and one page load. The three that were removed cost 13 of the suite's 24 seconds
-     because each drove a whole session through the DOM.
+- [ ] **Cover what jsdom cannot reach.** The headless-Chrome tests are gone and the suite runs in about 11s. What they
+      proved is now proved in three places: `examples_test.ts` runs both engines — `npm:alasql` and the vendored
+      `src/alasql.mjs` the page loads — over every bundled sheet and compares them row for row; `page_test.ts` boots the
+      compiled Elm under jsdom and drives the real DOM (sorting by clicking, hiding a column, chart SVG, dashboard
+      tiles, `?embed=1`, the tutorial, the shortcut sheet); `tests/MainTest.elm` covers the pure view logic. What is
+      still uncovered is everything in `src/index.html` below the ports — the automerge repo constructing, the WASM
+      initializing, the websocket sync, `runSql` and the query editor, the fork flow, localStorage persistence — since
+      `page_test.ts` supplies those ports by hand rather than running that file.
+  1. The cheapest next step is not a browser: extract the parts of `src/index.html` that are pure functions of their
+     input — the library merge, the `httpFailure` message builder, the thumbnail — into a module both the page and a
+     test can import. Most of that file is glue, but not all of it.
+  2. Only then decide whether the automerge boot deserves one Chrome test of its own. It is the last thing with no other
+     way to observe it: a vendored bundle that loads but throws on `initializeWasm` would still ship.
 
 ---
 
