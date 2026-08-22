@@ -10,6 +10,17 @@
 // proves the copy works.
 
 import { Col, EXAMPLES, Table } from "./examples.mjs";
+import {
+  applyWindows,
+  DESCRIBE_COLUMNS,
+  describeRef,
+  describeRows,
+  loadRefs,
+  nearest,
+  planQuery,
+  scanRefs,
+  toRecords,
+} from "./sql.mjs";
 
 // --- the library
 //
@@ -184,3 +195,107 @@ export const atomToJson = (xml) => {
 };
 
 export const PARSERS = { "application/atom+xml": atomToJson };
+
+// --- the page's half of the query engine
+//
+// `@type:doc_id` resolves in two steps: runSql rewrites each ref to SHEET('id')
+// and pre-loads the document behind it, then the SHEET from-function serves the
+// rows. The pre-load has to happen first because finding a document is async and
+// an AlaSQL from-function is not.
+//
+// Two things come from outside: `shelf()`, the library map the page has already
+// built, and `find(doc_id)`, which pulls a document out of the automerge repo.
+// Everything else — the recursion through referenced queries, the cycle bound,
+// the column bookkeeping, the pass order — is the same in a test as in the page.
+
+export const sheets = (alasql, shelf, find) => {
+  const rows = new Map();
+  const types = new Map();
+
+  alasql.from.SHEET = (id, _opts, cb, idx, query) => {
+    let res = rows.get(id) ?? (shelf()[id]?.doc?.data && toRecords(shelf()[id].doc.data));
+    if (!res) {
+      const hit = nearest(id, [...rows.keys(), ...Object.keys(shelf())]);
+      throw new Error([
+        `I could not load the sheet "${id}".`,
+        ``,
+        hit ? `  Did you mean: @${hit}` : `  Loaded:       ${[...rows.keys()].join(", ") || "(nothing yet)"}`,
+        `  Source:       the @sheet refs in this query`,
+        `  Fix:          ${hit ? `write @${hit} instead` : `reference it as @${id} so it loads before the query runs`}`,
+      ].join("\n"));
+    }
+    if (cb) res = cb(res, idx, query);
+    return res;
+  };
+
+  // What each loaded sheet's columns are called: the declared type row for a
+  // table, and whatever the rows carry for a query. checkCells and rewriteUnpivot
+  // both read names rather than types.
+  const columnsOf = () =>
+    Object.fromEntries(
+      [...rows].map(([id, rs]) => [id, types.get(id) ?? Object.keys(rs?.[0] ?? {}).map((name) => ({ name }))]),
+    );
+
+  const runSql = async (code, params, path = []) => {
+    // `describe @table:abc` never reaches the engine: it loads the one sheet it
+    // names and reports its shape. Same statement, same answer, on the server.
+    const describing = describeRef(code);
+    const { sql: out, ids, cells } = describing ? { sql: "", ids: [describing], cells: [] } : scanRefs(code);
+
+    const { colsOf } = await loadRefs(ids, {
+      path,
+      describing: !!describing,
+      fetch: async (id) => {
+        const [type, ref_id] = id.split(":");
+        if (!["table", "query"].includes(type))
+          throw new Error(`@${id}: only table and query sheets can be referenced in queries.`);
+        const doc = shelf()[id]?.doc ?? await find(ref_id);
+        if (!doc?.data) {
+          const known = Object.keys(shelf()).filter((k) => /^(table|query):/.test(k));
+          const hit = nearest(id, known);
+          throw new Error([
+            `@${id}: this sheet has no data.`,
+            ``,
+            hit ? `  Did you mean: @${hit}` : `  Available:    ${known.slice(0, 12).join(", ") || "(none yet)"}`,
+            `  Source:       the @sheet refs in this query`,
+            `  Fix:          ${hit ? `write @${hit} instead` : "open the sheet once so it loads, or check the id"}`,
+          ].join("\n"));
+        }
+        // A referenced query runs through runSql too, so a window inside one is
+        // computed rather than handed to AlaSQL. The server recurses in `sheet()`
+        // instead, which is the one place the two engines are shaped differently.
+        if (type !== "query") return doc.data;
+        const inner = await runSql(doc.data[0].code, { "": null }, [...path, id]);
+        return [
+          Object.fromEntries(inner.columns.map((c, i) => [i, { key: c.columnid, name: c.columnid }])),
+          ...inner.data,
+        ];
+      },
+      // Kept as they load, so SHEET can serve them and a nested query sees what
+      // its parent already fetched.
+      onLoad: (id, loaded) => rows.set(id, loaded),
+    });
+    // The declared type row, kept beside the rows: it is what names the columns
+    // for unpivot and what describe reports.
+    for (const id of Object.keys(colsOf)) if (id.startsWith("table:")) types.set(id, colsOf[id]);
+
+    if (describing) {
+      return {
+        columns: DESCRIBE_COLUMNS.map((name) => ({ columnid: name })),
+        data: describeRows(describing, colsOf[describing], rows.get(describing)),
+      };
+    }
+    const plan = planQuery(out, cells, Object.fromEntries(rows), columnsOf());
+    const [, result = {}] = await alasql([[`set @params = ?`, [params]], plan.sql]);
+    return plan.windows.length ? applyWindows(result, plan, (q, p) => alasql(q, p).data) : result;
+  };
+
+  return {
+    runSql,
+    /** Every column the referenced sheets actually have: what a typo'd column
+     * name gets matched against. */
+    columns: () => [...new Set([...rows.values()].flatMap((rs) => Object.keys(rs?.[0] ?? {})))],
+    rows: (id) => rows.get(id),
+    types: (id) => types.get(id),
+  };
+};

@@ -40,24 +40,14 @@
         httpUnreachable,
         library,
         PARSERS,
+        sheets,
       } from "/page.mjs";
       import {
-        applyWindows,
-        checkCells,
-        checkColumnTypes,
-        checkRefPath,
-        checkResultColumns,
-        DESCRIBE_COLUMNS,
-        describeRef,
-        describeRows,
-        formatQueryError,
-        nearest,
         chartSql,
-        checkPivot,
+        checkResultColumns,
+        describeRef,
+        formatQueryError,
         register,
-        rewriteUnpivot,
-        rewriteWindows,
-        scanRefs,
       } from "/sql.mjs";
       import alasql from "/alasql.mjs";
       // Was a CDN <script> that defined a global. Keep the global so query code
@@ -493,96 +483,13 @@
           ) {
             alasql.fn[type] = (data) => ({ type, data });
           }
-          // @type:doc_id references resolve in two steps: runSql rewrites them to
-          // SHEET('id') and pre-loads each doc (repo.find is async but alasql
-          // from-functions are synchronous), then SHEET serves the rows.
-          const sheetCache = new Map();
-          const sheetCols = new Map();
-          // Every column the referenced sheets actually have: what a typo'd
-          // column name gets matched against.
-          const sheetColumns = () => [
-            ...new Set([...sheetCache.values()].flatMap((rows) => Object.keys(rows?.[0] ?? {}))),
-          ];
-          const toRecords = ([cols, ...rows]) =>
-            rows.map((row) => Object.fromEntries(Object.values(cols).map((c) => [c.name, row[c.key]])));
-          alasql.from.SHEET = (id, opts, cb, idx, query) => {
-            let res = sheetCache.get(id) ??
-              (Library.get()[id]?.doc?.data && toRecords(Library.get()[id].doc.data));
-            if (!res) {
-              const hit = nearest(id, [...sheetCache.keys(), ...Object.keys(Library.get())]);
-              throw new Error([
-                `I could not load the sheet "${id}".`,
-                ``,
-                hit ? `  Did you mean: @${hit}` : `  Loaded:       ${[...sheetCache.keys()].join(", ") || "(nothing yet)"}`,
-                `  Source:       the @sheet refs in this query`,
-                `  Fix:          ${hit ? `write @${hit} instead` : `reference it as @${id} so it loads before the query runs`}`,
-              ].join("\n"));
-            }
-            if (cb) res = cb(res, idx, query);
-            return res;
-          };
-          // What each loaded sheet's columns are called: the declared type row for a
-          // table, and whatever the rows carry for a query. checkCells and
-          // rewriteUnpivot both read names rather than types.
-          const columnsOf = () =>
-            Object.fromEntries(
-              [...sheetCache].map(([id, rows]) => [
-                id,
-                sheetCols.get(id) ?? Object.keys(rows?.[0] ?? {}).map((name) => ({ name })),
-              ]),
-            );
-          // scanRefs and checkRefPath are shared with the server (src/sql.mjs), so a
-          // query resolves the same way in the page and in POST /query. `path` carries
-          // the @query chain that led here, which is what names a cycle. A referenced
-          // @query runs through runSql too, so a window inside one is computed rather
-          // than handed to AlaSQL.
-          const runSql = async (code, params, path = []) => {
-            const { sql: out, ids, cells } = scanRefs(code);
-            for (const id of new Set(ids)) {
-              checkRefPath(path, id);
-              const [type, ref_id] = id.split(":");
-              if (!["table", "query"].includes(type)) {
-                throw new Error(`@${id}: only table and query sheets can be referenced in queries.`);
-              }
-              const doc = Library.get()[id]?.doc ??
-                (await repo.find(ref_id).then(async (h) => (await h.whenReady?.(), h.doc())));
-              if (!doc?.data) {
-                const known = Object.keys(Library.get()).filter((k) => /^(table|query):/.test(k));
-                const hit = nearest(id, known);
-                throw new Error(
-                  [
-                    `@${id}: this sheet has no data.`,
-                    ``,
-                    hit
-                      ? `  Did you mean: @${hit}`
-                      : `  Available:    ${known.slice(0, 12).join(", ") || "(none yet)"}`,
-                    `  Source:       the @sheet refs in this query`,
-                    `  Fix:          ${hit ? `write @${hit} instead` : "open the sheet once so it loads, or check the id"}`,
-                  ].join("\n"),
-                );
-              }
-              if (type === "query") {
-                sheetCache.set(id, (await runSql(doc.data[0].code, { "": null }, [...path, id])).data);
-              } else {
-                sheetCache.set(id, toRecords(doc.data));
-                // Declared types, kept beside the rows so checkColumnTypes runs after
-                // loading rather than during it: describe must still work on a sheet
-                // whose cells are wrong.
-                sheetCols.set(id, Object.values(doc.data[0]));
-                checkColumnTypes(id, sheetCols.get(id), sheetCache.get(id));
-              }
-            }
-            // Same order as the server: a cell reference needs its sheet loaded,
-            // unpivot needs its column names, and the window pass runs on whatever
-            // those leave behind.
-            checkCells(cells, Object.fromEntries(sheetCache), columnsOf());
-            checkPivot(out);
-            const plan = rewriteWindows(rewriteUnpivot(out, columnsOf()));
-            const [, result = {}] = await alasql([[`set @params = ?`, [params]], plan.sql]);
-            return plan.windows.length
-              ? applyWindows(result, plan, (q, p) => alasql(q, p).data)
-              : result;
-          };
+          // The resolver lives in /page.mjs so a test can drive it: everything it
+          // needs from this file is the library map and a way to find a document.
+          const { runSql, columns: sheetColumns } = sheets(
+            alasql,
+            Library.get,
+            (doc_id) => repo.find(doc_id).then(async (h) => (await h.whenReady?.(), h.doc())),
+          );
           // Pull the origin's own words out of an error body so the message names a cause,
           // not just a status code (arxiv hides it in <entry><summary>, most APIs in JSON).
           alasql.fn.http = (url, qs = {}) => {
@@ -646,26 +553,12 @@
                     // sheet it names and reports its shape. Shared with the server.
                     // `describe @table:abc` never reaches the engine: it loads the one
                     // sheet it names and reports its shape. Shared with the server.
-                    const described = describeRef(code);
-                    if (described) {
-                      await runSql(`select 1 from @${described}`, params);
-                      const known = sheetCache.get(described) ?? [];
-                      app.ports.docQueried.send({
-                        id,
-                        data: [
-                          DESCRIBE_COLUMNS.map((name) => ({ key: name, name, type: null })),
-                          ...describeRows(
-                            described,
-                            sheetCols.get(described) ??
-                              Object.keys(known[0] ?? {}).map((name) => ({ name, type: "text" })),
-                            known,
-                          ),
-                        ],
-                      });
-                      break;
-                    }
+                    // describe is answered by runSql itself, the same way the
+                    // server answers it, and is the one statement whose columns
+                    // are not the query's own -- so it skips the column check.
+                    const describing = describeRef(code);
                     const { columns: cols, data: rows } = await runSql(code, params);
-                    checkResultColumns(cols, rows, sheetColumns(), code);
+                    if (!describing) checkResultColumns(cols, rows, sheetColumns(), code);
                     // TODO: If doc contains cols data, use that names and types.
                     app.ports.docQueried.send({
                       id,

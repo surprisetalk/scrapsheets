@@ -1340,6 +1340,51 @@ export const chartSql = ({ source, x, y }) => {
   return `select ${chartIdent("x column", x)} as x, ${chartIdent("y column", y)} as y from ${source} order by 1`;
 };
 
+// --- resolving a query's sheet references
+//
+// Both engines do the same three things before AlaSQL sees anything: load every
+// sheet the query names, check what only a loaded sheet can be checked against,
+// and lift the windows out. Where the sheets come from is the only real
+// difference — a database and an access check on the server, a library entry or
+// an automerge document in the page — so that is the part each one passes in.
+
+/** A sheet's rows keyed by column name, which is the shape a query reads. */
+export const toRecords = ([cols, ...rows]) =>
+  rows.map((row) => Object.fromEntries(Object.values(cols).map((c) => [c.name, row[c.key]])));
+
+/** Load every sheet a query names, in the order it names them.
+ *
+ * `fetch(id)` returns one as `[cols, ...rows]`. `onLoad(id, rows)` runs after
+ * each, which is where the server spends its row budget; the page has no budget.
+ * `describing` skips the column-type check, because a sheet whose cells are wrong
+ * is exactly the sheet `describe` exists to inspect.
+ */
+export const loadRefs = async (ids, { path, describing, fetch, onLoad }) => {
+  const docs = {}, colsOf = {};
+  for (const id of ids) {
+    if (docs[id]) continue;
+    checkRefPath(path, id);
+    const sheet = await fetch(id);
+    colsOf[id] = Object.values(sheet[0]);
+    docs[id] = toRecords(sheet);
+    await onLoad(id, docs[id]);
+    // Only table sheets: a query column keeps its source column's declared type,
+    // so `cast(price as string) as price` would trip a check meant for a bad cell.
+    if (!describing && id.startsWith("table:")) checkColumnTypes(id, colsOf[id], docs[id]);
+  }
+  return { docs, colsOf };
+};
+
+/** Everything the engine cannot be trusted with, in the order it has to happen:
+ * a cell reference needs its sheet loaded to be checked, unpivot needs its column
+ * names, and a window has to be lifted out of whatever those two produce.
+ */
+export const planQuery = (sql, cells, docs, colsOf) => {
+  checkCells(cells, docs, colsOf);
+  checkPivot(sql);
+  return rewriteWindows(rewriteUnpivot(sql, colsOf));
+};
+
 // --- registration
 
 export const register = (alasql) => {

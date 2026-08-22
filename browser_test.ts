@@ -94,7 +94,7 @@ Deno.test("index.html has correct WASM initialization", async () => {
 // src/_redirects is an allowlist ending in `/* / 200`, so an asset that is not
 // listed is served the SPA shell instead of itself. For a module that surfaces
 // only in the browser, as "'text/html' is not a valid JavaScript MIME type".
-Deno.test("every name index.html imports is actually exported", async () => {
+Deno.test("index.html imports exactly the names it uses", async () => {
   // src/index.html is the one file with no runtime coverage: nothing boots it,
   // so a name that moved out of it -- or was never exported in the first place --
   // fails as a blank page rather than as a test. This is the cheap half of that:
@@ -109,6 +109,24 @@ Deno.test("every name index.html imports is actually exported", async () => {
       assert(
         name in mod,
         `index.html imports { ${name} } from "${spec}", which does not export it`,
+      );
+    }
+  }
+
+  // And the other direction, which is the one an extraction gets wrong: a name
+  // that moved into a module, is still called here, and was never added to the
+  // import list. JavaScript will not say so until the page is open.
+  const imported = new Set(imports.flatMap(([, names]) => names.split(",").map((n) => n.trim())));
+  const script = html.slice(html.indexOf("<script"), html.lastIndexOf("</script>"));
+  for (const spec of new Set(imports.map(([, , s]) => s))) {
+    const mod = await import("./src" + spec);
+    for (const name of Object.keys(mod)) {
+      if (imported.has(name)) continue;
+      // A local of the same name is this file's own, not the module's.
+      if (new RegExp(`(const|let|var|function)\\s+${name}\\b`).test(script)) continue;
+      assert(
+        !new RegExp(`\\b${name}\\s*\\(`).test(script),
+        `index.html calls ${name}(), which "${spec}" exports but index.html never imports`,
       );
     }
   }

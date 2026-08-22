@@ -20,22 +20,18 @@ import { DATASETS } from "./src/examples.mjs";
 import {
   applyWindows,
   chartSql,
-  checkCells,
-  checkColumnTypes,
-  checkPivot,
   checkQueryRows,
-  checkRefPath,
   checkResultColumns,
   DESCRIBE_COLUMNS,
   describeRef,
   describeRows,
   explain,
   formatQueryError,
+  loadRefs,
   MAX_QUERY_MS,
   nearest,
+  planQuery,
   register,
-  rewriteUnpivot,
-  rewriteWindows,
   scanRefs,
   WINDOW_TYPES,
 } from "./src/sql.mjs";
@@ -423,62 +419,63 @@ const executeSql = async (
     ? { sql: "", ids: [described], cells: [] }
     : scanRefs(sqlCode);
 
-  // Load referenced sheets, remembering source column types by name.
-  const docs: Record<string, Record<string, unknown>[]> = {};
-  const colsOf: Record<string, Col[]> = {};
+  // A check that fires on the query itself is the author's problem: 400. One
+  // that came out of loading a sheet already carries its own status -- 403 for a
+  // sheet that is not theirs, 404 for one that is not there -- and re-wrapping
+  // it would turn "you cannot see this" into "your SQL is wrong".
+  const asBadRequest = (err: unknown): never => {
+    if (err instanceof HTTPException) throw err;
+    throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
+  };
+
+  // Source column types by name, which is what the result columns are typed from.
   const nameToType: Record<string, Type> = {};
   let loaded = 0;
-  for (const sheet_id of sheet_ids) {
-    if (docs[sheet_id]) continue;
-    const [type_] = sheet_id.split(":");
-    try {
-      checkRefPath(path_, sheet_id);
-    } catch (err) {
-      throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
-    }
-    const [cols, ...rows] = (await sheet(c, sheet_id, {}, [...path_, sheet_id]).catch(async (err) => {
-      // A mistyped @ref reads as "no access". Name the sheet the author meant.
-      const mine: { sheet_id: string }[] = await sql`
-        select sheet_id from sheet_usr where usr_id = ${c.get("usr_id")}
-      `;
-      const hit = nearest(sheet_id, mine.map((r) => r.sheet_id));
-      if (!hit) throw err;
-      throw new HTTPException(400, {
-        message: [
-          `I could not load the sheet "@${sheet_id}".`,
-          ``,
-          `  Did you mean: @${hit}`,
-          `  Source:       the @sheet refs in this query`,
-          `  Fix:          write @${hit} instead`,
-        ].join("\n"),
-      });
-    })).data;
-    colsOf[sheet_id] = Object.values(cols);
-    for (const col of colsOf[sheet_id]) nameToType[col.name] = col.type;
-    docs[sheet_id] = rows.map((row) =>
-      Object.fromEntries(
-        colsOf[sheet_id].map((col) => [col.name, row[col.key]]),
-      )
-    );
-    try {
+  const { docs, colsOf } = await loadRefs(sheet_ids, {
+    path: path_,
+    describing: !!described,
+    // Where a sheet comes from is the only real difference between the engines:
+    // here it is sheet(), which enforces access and recurses into a query sheet
+    // on its own; in the page it is a library entry or an automerge document.
+    fetch: (sheet_id: string) =>
+      sheet(c, sheet_id, {}, [...path_, sheet_id]).then((r) => r.data).catch(async (err) => {
+        // A mistyped @ref reads as "no access". Name the sheet the author meant.
+        const mine: { sheet_id: string }[] = await sql`
+          select sheet_id from sheet_usr where usr_id = ${c.get("usr_id")}
+        `;
+        const hit = nearest(sheet_id, mine.map((r) => r.sheet_id));
+        if (!hit) throw err;
+        throw new HTTPException(400, {
+          message: [
+            `I could not load the sheet "@${sheet_id}".`,
+            ``,
+            `  Did you mean: @${hit}`,
+            `  Source:       the @sheet refs in this query`,
+            `  Fix:          write @${hit} instead`,
+          ].join("\n"),
+        });
+      }),
+    // The row budget, spent as each sheet lands rather than after all of them:
+    // this is the guard that stops a runaway before it starts, so it has to
+    // refuse while there is still something left to refuse.
+    onLoad: (sheet_id: string, rows: Record<string, unknown>[]) => {
       loaded = checkQueryRows(loaded + rows.length, sheet_id);
-      // Only table sheets, matching the page: a query column keeps the source
-      // column's declared type, so `cast(price as string) as price` would trip a
-      // check that is meant to catch a bad cell. Skipped for describe too, since
-      // a sheet that fails this is exactly the one you need to inspect.
-      if (!described && type_ === "table") checkColumnTypes(sheet_id, colsOf[sheet_id], docs[sheet_id]);
-    } catch (err) {
-      throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
-    }
-  }
+    },
+  }).catch(asBadRequest) as {
+    docs: Record<string, Record<string, unknown>[]>;
+    colsOf: Record<string, Col[]>;
+  };
+
+  for (const cols of Object.values(colsOf)) for (const col of cols) nameToType[col.name] = col.type;
 
   if (described) {
-    let rows: Record<string, unknown>[];
-    try {
-      rows = describeRows(described, colsOf[described], docs[described]);
-    } catch (err) {
-      throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
-    }
+    const rows = ((): Record<string, unknown>[] => {
+      try {
+        return describeRows(described, colsOf[described], docs[described]);
+      } catch (err) {
+        return asBadRequest(err);
+      }
+    })();
     return {
       data: [
         arrayify(
@@ -495,21 +492,9 @@ const executeSql = async (
     };
   }
 
-  // Everything the engine cannot be trusted with, in the order it has to happen:
-  // a cell reference needs the sheet loaded to be checked, unpivot needs its
-  // column names, and a window has to be lifted out of whatever those produce.
-  let code_ = scanned;
-  try {
-    checkCells(cells, docs, colsOf);
-    checkPivot(code_);
-    code_ = rewriteUnpivot(code_, colsOf);
-  } catch (err) {
-    throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
-  }
-
-  // A window never reaches the engine: AlaSQL parses `over (...)` and computes
-  // it wrong. rewriteWindows lifts each one out and applyWindows fills the answer
-  // back in, the same way in both engines.
+  // Everything the engine cannot be trusted with, in the order it has to happen.
+  // planQuery is shared with the page, which is what keeps that order one fact
+  // rather than two.
   let plan: {
     sql: string;
     windows: { fn: string; alias: string; args: string[] }[];
@@ -518,9 +503,9 @@ const executeSql = async (
     offset: number;
   };
   try {
-    plan = rewriteWindows(code_);
+    plan = planQuery(scanned, cells, docs, colsOf);
   } catch (err) {
-    throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
+    return asBadRequest(err);
   }
   for (const w of plan.windows) {
     const declared = (WINDOW_TYPES as Record<string, Type | null>)[w.fn];
@@ -532,7 +517,8 @@ const executeSql = async (
   try {
     // The engine is single-threaded JS and cannot be interrupted, so this bounds
     // how long the caller waits, not how long the CPU burns. checkQueryRows above
-    // is the guard that actually keeps a runaway from starting.
+    // is the guard that actually keeps a runaway from starting. The page has no
+    // equivalent: there is no other request waiting on it.
     result = await Promise.race<typeof result>([
       ala(plan.sql, [docs]),
       new Promise<never>((_, reject) => {
@@ -570,7 +556,7 @@ const executeSql = async (
     }
     checkResultColumns(cols, rows, Object.keys(nameToType), sqlCode);
   } catch (err) {
-    throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
+    return asBadRequest(err);
   }
 
   return {

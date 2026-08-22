@@ -2,19 +2,18 @@
 
 > Programmable data OS: every table is a database, every query is a table, every sheet is an API.
 
-- [ ] **Cover what is left of src/index.html.** The pure half is out: `src/page.mjs` holds the library merge, the sheet
-      thumbnail, and the four things the page does with an HTTP response — the proxy routing decision, the
-      origin's-own-words error detail, the failure messages, and the Atom parser. `page_test.ts` boots the compiled Elm
-      under jsdom and drives the real DOM, and `browser_test.ts` checks that every name `index.html` imports is actually
-      exported, which is the cheapest guard on a file nothing runs. The extraction paid for itself once already:
-      `querySelector("totalResults")` never matched arxiv's `<opensearch:totalResults>`, so that field was silently 0 on
-      every feed. What is still uncovered is the glue: the automerge repo constructing, the WASM initializing, the
-      websocket sync, `runSql` and the query editor, the fork flow, the drag-and-drop import, localStorage persistence.
-  1. `runSql` is the biggest of those and the most testable — it is the page's half of the query engine, and
-     `examples_test.ts` already proves the engine underneath it. Extracting the sheet-loading recursion (the part
-     bounded by `checkRefPath`) would let a test drive it without a browser.
-  2. Only then decide whether the automerge boot deserves one Chrome test of its own. It is the last thing with no other
-     way to observe it: a vendored bundle that loads but throws on `initializeWasm` would still ship.
+- [ ] **Cover what is left of src/index.html.** The testable half is out, and both engines now resolve a query through
+      the same code: `toRecords()`, `loadRefs()` and `planQuery()` in `src/sql.mjs` are called by `executeSql` on the
+      server and by `sheets()` in `src/page.mjs`, so the ref walk, the cycle bound, the type check and the four
+      pre-engine passes are one fact rather than two. Where a sheet comes from is the only difference left and it is an
+      argument. `index.html` is down from 1298 lines to 1061. Each extraction has caught something the copies had
+      drifted on: arxiv's `<opensearch:totalResults>` never matched its selector; `Library.set` was shadowing the
+      imported `library`; and `describe` on a sheet whose cells fail the type check worked on the server and was refused
+      in the page, which is the opposite of what that statement is for.
+  1. What is left in `index.html` is glue — the automerge repo, the websocket, the ports, drag-and-drop, the clipboard,
+     query-editor cursor tracking. None of it has a return value to assert.
+  2. Still unchecked: a plain undefined identifier in `index.html` that no module exports. Both import directions are
+     covered; this one needs scope analysis rather than another assertion.
 
 ---
 

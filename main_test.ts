@@ -1721,6 +1721,24 @@ Deno.test(async function allTests(_t) {
       const [, ...rows] = (await runs(`describe @${badId}`)).data as Table;
       assertEquals(rows.length, 1);
     }
+
+    // A sheet somebody else owns is refused with the status the refusal earned.
+    // The query path wraps its own checks as 400, and re-wrapping this one would
+    // turn "you cannot see this sheet" into "your SQL is wrong".
+    {
+      const mine = automerge.create<{ data: Sheet["data"] }>({
+        data: [arrayify([{ name: "secret", type: "text", key: 0 }]), { 0: "shh" }],
+      });
+      const mineId = `table:${mine.documentId}`;
+      await put(jwt, `/library/${mineId}`, {});
+      const { jwt: stranger } = await usr("mallory-outsider@example.com");
+      const res = await app.request(`/query`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${stranger}` }),
+        body: JSON.stringify({ lang: "sql", code: `select * from @${mineId}`, args: [] }),
+      });
+      assertEquals(res.status, 403, `a stranger's query should be refused as access, got: ${await res.text()}`);
+    }
   }
 
   // net-hook ingestion + net-http polling.

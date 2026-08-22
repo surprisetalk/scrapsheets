@@ -25,7 +25,10 @@ import {
   httpUnreachable,
   library,
   PORTALS,
+  sheets,
 } from "./src/page.mjs";
+import alasql from "./src/alasql.mjs";
+import { register } from "./src/sql.mjs";
 
 const dir = new URL(".", import.meta.url).pathname;
 
@@ -427,4 +430,149 @@ Deno.test("an atom feed flattens into rows a query can select from", () => {
   assertEquals(feed.entries[0].authors, ["R. Okonkwo", "M. Petrova"]);
   assertEquals(feed.entries[0].categories, ["cs.LG"]);
   assertEquals(feed.entries[1].authors, [], "an entry with no authors is empty, not missing");
+});
+
+// --- the page's half of the query engine
+//
+// sheets() over the vendored engine the page loads, with the two things it takes
+// from the browser stubbed: the library map, and finding a document that is not
+// in it. Nothing here is bundled outside the library, so `find` answers nothing
+// and the "this sheet has no data" path is the one that runs.
+register(alasql);
+alasql.options.modifier = "RECORDSET";
+const resolver = () => sheets(alasql, () => shelf, () => Promise.resolve(undefined));
+const rowsOf = async (code: string) => {
+  const { data } = await resolver().runSql(code, { "": null });
+  return data as Record<string, unknown>[];
+};
+const refused = async (code: string) => {
+  try {
+    await resolver().runSql(code, { "": null });
+  } catch (err) {
+    return (err as Error).message;
+  }
+  throw new Error(`expected this to be refused: ${code}`);
+};
+
+Deno.test("a @sheet ref loads the sheet behind it and serves its rows", async () => {
+  const rows = await rowsOf("select name, code from @table:countries where code = 'JP'");
+  assertEquals(rows, [{ name: "Japan", code: "JP" }]);
+});
+
+Deno.test("a @query ref runs that query first, windows and all", async () => {
+  // query:budget-burn reads query:budget-ytd, which is where the running totals
+  // are computed. Handing the inner query to AlaSQL instead of recursing would
+  // answer with zeros, which is the bug the recursion exists to avoid.
+  const rows = await rowsOf("select department, burn_ratio from @query:budget-burn order by burn_ratio desc");
+  assertEquals(rows.length, 6);
+  assertEquals(rows[0].department, "Public Works");
+  assert((rows[0].burn_ratio as number) > 1.2, `expected an overspend, got ${rows[0].burn_ratio}`);
+});
+
+Deno.test("a cell reference reads one value out of a one-row sheet", async () => {
+  const rows = await rowsOf("select @table:assumptions.entry_z as band");
+  assertEquals(rows, [{ band: 2 }]);
+});
+
+Deno.test("the resolver reports every way a ref can fail, by name", async () => {
+  // A typo gets the nearest sheet rather than a list to read.
+  const typo = await refused("select * from @table:countrys");
+  assert(typo.includes("Did you mean: @table:countries"), typo);
+
+  // Only a table or a query can be read as rows. A portal is a live socket and a
+  // chart is a picture of a query, so neither is a relation.
+  assert((await refused("select * from @portal:time")).includes("only table and query sheets"));
+  assert((await refused("select * from @chart:pair-z")).includes("only table and query sheets"));
+
+  // A sheet nobody has is named, not silently empty.
+  const missing = await refused("select * from @table:nothing-like-this-at-all");
+  assert(missing.includes("this sheet has no data"), missing);
+
+  // A cell reference needs exactly one row, or it would pick one arbitrarily.
+  const many = await refused("select @table:countries.name as n");
+  assert(many.includes("one row"), many);
+});
+
+Deno.test("a reference cycle is refused as the path that closes it", async () => {
+  const chart = { doc: { type: "query", data: [{ code: "select * from @query:loop" }] } };
+  const loop = sheets(
+    alasql,
+    () => ({ ...shelf, "query:loop": chart } as Record<string, unknown>),
+    () => Promise.resolve(undefined),
+  );
+  try {
+    await loop.runSql("select * from @query:loop", { "": null });
+    throw new Error("a self-referencing query should not run");
+  } catch (err) {
+    const said = (err as Error).message;
+    assert(said.includes("@query:loop -> @query:loop"), said);
+  }
+});
+
+Deno.test("describe reports a sheet whose cells are wrong, and select still will not", async () => {
+  // The one statement that has to work on a broken sheet, because that is the
+  // sheet you need to inspect. main_test.ts asserts the same thing of the server;
+  // before both engines shared loadRefs, the page refused it and the server did
+  // not, and nothing said so.
+  const bad = {
+    doc: {
+      type: "table",
+      data: [{ 0: { key: "0", name: "amount", type: "usd" } }, { 0: 10 }, { 0: "n/a" }],
+    },
+  };
+  const engine = () =>
+    sheets(alasql, () => ({ ...shelf, "table:bad": bad } as Record<string, unknown>), () => Promise.resolve(undefined));
+
+  const { data } = await engine().runSql("describe @table:bad", { "": null });
+  assertEquals(data, [{ column: "amount", type: "usd", rows: 2, nulls: 0, sample: "10" }]);
+
+  try {
+    await engine().runSql("select sum(amount) from @table:bad", { "": null });
+    throw new Error("a sum over a column holding text should not be answered");
+  } catch (err) {
+    assert((err as Error).message.includes(`"n/a"`), (err as Error).message);
+  }
+});
+
+Deno.test("describe answers for a query sheet too, through the chain under it", async () => {
+  const { data } = await resolver().runSql("describe @query:budget-burn", { "": null });
+  assertEquals(
+    (data as Record<string, unknown>[]).map((r) => r.column),
+    ["department", "spent_ytd", "adopted_ytd", "burn_ratio", "projected_year", "projected_variance"],
+  );
+});
+
+Deno.test("a table whose cells contradict their column type is refused as it loads", async () => {
+  const bad = {
+    doc: {
+      type: "table",
+      data: [
+        { 0: { key: "0", name: "amount", type: "usd" } },
+        { 0: 10 },
+        { 0: "n/a" },
+      ],
+    },
+  };
+  const engine = sheets(
+    alasql,
+    () => ({ ...shelf, "table:bad": bad } as Record<string, unknown>),
+    () => Promise.resolve(undefined),
+  );
+  try {
+    await engine.runSql("select sum(amount) from @table:bad", { "": null });
+    throw new Error("a sum over a column holding text should not be answered");
+  } catch (err) {
+    const said = (err as Error).message;
+    assert(said.includes(`"n/a"`) && said.includes("row 2"), said);
+  }
+});
+
+Deno.test("the resolver remembers the columns a typo should be matched against", async () => {
+  const engine = resolver();
+  await engine.runSql("select 1 from @table:countries", { "": null });
+  const columns = engine.columns();
+  for (const name of ["name", "code", "region", "population"])
+    assert(columns.includes(name), `expected ${name} among ${columns.join(", ")}`);
+  assertEquals(engine.rows("table:countries")?.length, 198);
+  assertEquals(engine.types("table:countries")?.length, 8);
 });

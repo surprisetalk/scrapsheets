@@ -46,12 +46,18 @@ const engines: [string, Engine][] = [["server", server as Engine], ["page", page
 for (const [, engine] of engines) {
   engine.options.modifier = "RECORDSET";
   register(engine);
+}
+
+// Installed per replay rather than once at import: page_test.ts builds its own
+// SHEET over the same vendored engine, and whichever module happened to load
+// last would otherwise win.
+const serveSheets = (engine: Engine) => {
   engine.from.SHEET = (id: string, _opts: unknown, cb: unknown, idx: unknown, query: unknown) => {
     const rows = ((query as { params?: Record<string, Row[]>[] })?.params?.[0] ?? {})[id];
     if (!rows) throw new Error(`I could not load the sheet "@${id}".`);
     return cb ? (cb as (r: Row[], i: unknown, q: unknown) => Row[])(rows, idx, query) : rows;
   };
-}
+};
 
 const cols = (id: string) =>
   Object.values(
@@ -61,6 +67,7 @@ const cols = (id: string) =>
 // The same order both engines run: refs, cells, pivot, unpivot, windows, then
 // the result-column check. Anything that diverges here is a bug in one of them.
 const replay = (engine: Engine) => {
+  serveSheets(engine);
   const loaded: Record<string, Row[]> = {};
   for (const { doc_id, doc } of DATASETS as { doc_id: string; doc: { data: Row[] } }[]) {
     const [cols_, ...rows] = doc.data;

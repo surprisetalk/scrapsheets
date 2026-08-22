@@ -19,8 +19,9 @@ technologies. It uses a hybrid architecture with:
 - `src/Main.elm` - Frontend application
 - `src/examples.mjs` - Bundled example datasets and queries (imported by both the page and the server seeder)
 - `src/page.mjs` - The parts of `src/index.html` that are functions of their input rather than of the browser: the
-  library merge, the sheet thumbnail, and the four things the page does with an HTTP response. Extracted so they can be
-  tested, since nothing boots `index.html` itself
+  library merge, the sheet thumbnail, the four things the page does with an HTTP response, and `sheets()` — the page's
+  half of the query engine, which resolves `@type:doc_id` refs and recurses through referenced queries. Extracted so
+  they can be tested, since nothing boots `index.html` itself
 - `schema/db.sql` - Declarative database schema (schema only, no data: `pg-schema-diff` diffs a live DB against it)
 - `examples.sql` - Shop catalogue of query templates (applied by `seed()` on first request)
 - `deno.json` - Dependencies and import map
@@ -141,11 +142,17 @@ technologies. It uses a hybrid architecture with:
   value out of a one-row sheet, rewritten to a scalar subquery so nothing is spliced in as a literal, and `checkCells()`
   refuses a sheet that does not hold exactly one row. `checkResultColumns()` turns AlaSQL's silent undefined column into
   an error. `nearest()` backs every "did you mean": unknown columns and unresolved `@sheet` refs in both engines. The
-  server passes sheet rows through `params[0]` so `alasql.from.SHEET` stays request-scoped. Two AlaSQL behaviours shape
-  how every query sheet is written: a `group by` expression is evaluated against an **empty row**, so a UDF named there
-  receives nothing and the call has to move into a subquery; and an exception thrown from a function while a subquery in
-  the from clause is computed is **discarded**, surfacing as "Cannot read properties of null (reading 'data')" —
-  `formatQueryError()` replaces that one, because the message it destroyed is unrecoverable
+  server passes sheet rows through `params[0]` so `alasql.from.SHEET` stays request-scoped. **Both engines resolve a
+  query through the same three functions in `src/sql.mjs`**: `toRecords()` keys a sheet's rows by column name,
+  `loadRefs()` walks the refs — cycle bound, fetch, type check, and the row budget the server spends through its
+  `onLoad` — and `planQuery()` runs the four pre-engine passes in the one order that works. Where a sheet comes from is
+  the only real difference, and it is an argument: `sheet()` with its access check on the server, a library entry or an
+  automerge document in the page. `describing` is why `describe` still answers on a sheet whose cells fail the type
+  check, in both places. Two AlaSQL behaviours shape how every query sheet is written: a `group by` expression is
+  evaluated against an **empty row**, so a UDF named there receives nothing and the call has to move into a subquery;
+  and an exception thrown from a function while a subquery in the from clause is computed is **discarded**, surfacing as
+  "Cannot read properties of null (reading 'data')" — `formatQueryError()` replaces that one, because the message it
+  destroyed is unrecoverable
 - **Window functions**: AlaSQL parses `over (partition by ...)` and computes it wrong (`sum(x) over (...)` came back 0),
   so a window never reaches it. `rewriteWindows()` in `src/sql.mjs` lifts each one out of the **top-level** select list,
   leaves `null as <alias>` where it stood and appends the plain columns it reads as `__w<n>[apo]<n>`; `applyWindows()`
@@ -168,8 +175,9 @@ t.trade_id order by p.day desc) = 1` —
   `rewriteUnpivot()` expands it into the `union all` it means, reading the wide column names off the source sheet's own
   type row. That is why the source has to be a `@sheet` and a subquery is refused
 - **Schema introspection**: `describe @table:abc` is intercepted by `describeRef()` before the engine sees it, in both
-  engines, and answers with column/type/rows/nulls/sample. It is the one statement that still works on a sheet whose
-  cells fail the type check, because that is the sheet you need to inspect
+  engines — inside `executeSql` on the server and inside `runSql` in the page — and answers with
+  column/type/rows/nulls/sample. It is the one statement that still works on a sheet whose cells fail the type check,
+  because that is the sheet you need to inspect
 - **Cost guards**: `checkQueryRows()` caps the rows a single query may load across every `@sheet` (`MAX_QUERY_ROWS`);
   that is the guard that actually stops a runaway, since a single-threaded engine cannot be preempted. `MAX_QUERY_MS`
   only bounds how long the caller waits — the work itself still finishes
@@ -227,11 +235,14 @@ t.trade_id order by p.day desc) = 1` —
   then group by the column), and `min()`/`max()` drop a date held as text (`min_text()`/`max_text()`)
 - **Library gallery**: `viewGallery` puts a strip above the library table naming every `demo`-tagged query sheet as a
   link and every tag as a filter chip. It reads `model.library`, so a new demo needs no code change
-- **Cross-sheet queries in the browser**: `runSql` rewrites `@type:doc_id` to `SHEET('id')` and pre-loads each doc
-  (library entry or `repo.find`) before AlaSQL runs, then applies the cell, unpivot and window passes in the same order
-  the server does; `@query:` refs recurse **through `runSql` itself**, so a window inside a referenced query is computed
-  rather than handed to AlaSQL. Bounded by `checkRefPath`, which reports a cycle as the path that closes it
-  (`a -> b -> a`) and caps depth at `MAX_REF_DEPTH`
+- **Cross-sheet queries in the browser**: `sheets(alasql, shelf, find)` in `src/page.mjs` returns the `runSql` that
+  rewrites `@type:doc_id` to `SHEET('id')` and pre-loads each doc before AlaSQL runs — the pre-load has to happen first
+  because finding a document is async and an AlaSQL from-function is not. It then applies the cell, unpivot and window
+  passes in the same order the server does; `@query:` refs recurse **through `runSql` itself**, so a window inside a
+  referenced query is computed rather than handed to AlaSQL. Bounded by `checkRefPath`, which reports a cycle as the
+  path that closes it (`a -> b -> a`) and caps depth at `MAX_REF_DEPTH`. Only two things come from the browser and both
+  are arguments: `shelf()` is the library map (`Library.get`) and `find(doc_id)` is `repo.find`, which is what lets
+  `page_test.ts` drive the whole thing with neither
 - **UI chrome**: keyboard shortcut sheet (Ctrl/⌘+/ or "?"), library sparkline thumbnails (computed JS-side into
   localStorage entries), five-step first-run tutorial (localStorage `scrapsheets-tutorial`, -1 = dismissed)
 - **Real-time sync**: Ports for Automerge integration
