@@ -63,6 +63,9 @@ technologies. It uses a hybrid architecture with:
     column stats, `docDecoder`, `chartPoints`.
 - **Re-vendor browser bundles**: `deno task vendor` (after bumping the versions at the top of `vendor.ts`; alasql tracks
   `deno.json`)
+- **Status check**: `deno task status` prints every graded condition from the deployed `GET /status` and exits nonzero
+  when any of them is below 1.0. `.github/workflows/status.yml` runs it on a 15-minute cron; the failure email is the
+  alarm.
 - **Elm review**: `deno task review`. Runs clean with zero suppressions; keep it that way.
 - **Watch and build**: `watch src { try { cp -vu src/* dist ; elm make src/Main.elm --debug --output=dist/index.js } }`
 
@@ -107,7 +110,26 @@ technologies. It uses a hybrid architecture with:
   the URL actually fetched after redirects, content type, a body snippet, and a `repro` curl line that names the header
   keys the sheet sent but never their values. `/proxy` returns the same shape
 - **Webhook ingest**: `POST /net/:id` rejects an unknown sheet (404), a non-net sheet (400) and a body over
-  `NET_BODY_CAP` (413), each naming what it received. Signature verification does not exist yet
+  `NET_BODY_CAP` (413), each naming what it received. **Every delivery must be signed**, with no per-sheet opt-out:
+  without it, anyone who learns a net sheet's id can write rows to it. The header is
+  `scrapsheets-signature: t=<unix seconds>,v1=<hex>`, HMAC-SHA256 over `` `${t}.` `` **and the body's own bytes**,
+  within `HOOK_SKEW` seconds of the server's clock. Bytes rather than a decoded string, because `c.req.text()` replaces
+  invalid UTF-8 and a sender that signed exactly what it sent would then be refused; and the `t` that is verified is the
+  captured text, not a `Number()` round-trip of it. The sheet's secret is **derived rather than stored** —
+  `hookSecret()` is `HMAC-SHA256(TOKEN_SECRET, "hook:" + sheet_id)`, the prefix domain-separating it from
+  `createToken()`, which derives email-verification tokens from the same root — so nothing new is persisted and the
+  secret never enters the automerge document, where a viewer or a share-link holder could read it. Rotating one sheet's
+  secret therefore means rotating `TOKEN_SECRET`, **which also invalidates every outstanding email-verification link**;
+  per-sheet rotation is open. The four rejections (unsigned, malformed, stale, mismatched) are all 401 and each names
+  its own check, but none prints the secret or the expected digest, which would make the message a signing oracle.
+  `hookSign()` is exported because the tests sign the way a sender does rather than reimplementing it. The 404 and the
+  400 answer _before_ the signature is checked, which is an existence oracle to anyone already holding a doc_id —
+  accepted, because a doc_id is 22 unguessable characters and the messages are worth more than the disclosure.
+  Owner-only `GET /library/:id/hook` returns `{ url, secret, repro }` under `Cache-Control: no-store`, the last a
+  runnable `openssl`/`curl` line; the page reaches it through the existing `shareAction`/`shareLoaded` port pair with
+  the action `hook`, behind a button, so a secret nobody asked for is never on screen, and `UrlChange` clears it so it
+  cannot follow you to another sheet. A decode failure on that answer is reported rather than swallowed — the
+  alternative is a button that does nothing and says nothing
 - **Alerts**: an `alert` sheet is `{ code, to, interval }` and fires when its query returns a row, so the condition is
   the where clause and there is no second expression language. `pollAlertOnce` scans them every 15s and runs each
   through `POST /query` **as its owner** (`createJwt(created_by)`), so an alert can never read a sheet its owner cannot.
@@ -117,6 +139,48 @@ technologies. It uses a hybrid architecture with:
   the previous run is read back out of that log. Past `ALERT_ROWS` the run records why it could not diff rather than a
   number it cannot stand behind. `POST /sell` refuses an alert: a copy would mail the seller's address on the buyer's
   timer
+- **Status**: `GET /status` is public — an uptime check carries no bearer token — and answers grades and no rows: no
+  ids, no names, no addresses, though a grade is a ratio against a limit named in `main.ts`, so a reader can invert one
+  back to the count behind it. `status()` returns one entry per likely failure mode, keyed by **the sentence the grade
+  is about**, mapping a seconds-ago offset (`STATUS_AGO` = now, an hour ago, a day ago) to the grade as of then. **1.0
+  is the minimum passing grade and 0.0 is total failure**, so a number above 1.0 is headroom rather than a score to
+  maximize. `grade()` **floors** rather than rounds — 0.999 rounding up to a pass is the Goodhart failure in miniature —
+  and throws on a non-finite value, naming the condition, because a check that answers "fine" because its SQL alias was
+  renamed is worse than no check. The numbers a sentence quotes (`LATENCY_MS`, `REFUSALS_MAX`, `POLL_STALE_S`,
+  `DB_BYTES_CAP`, `HEAP_BYTES_CAP`) are read into the sentence, so a changed limit cannot leave the prose claiming the
+  old one. The historical conditions are one query evaluated at three instants — the offsets are a join, not three round
+  trips — and the current-state ones carry `"0"` alone. **Every cast out of jsonb is guarded**
+  (`substring(x from '^[0-9]+$')::int`, and `is json` in the where clause, which an aggregate's `filter` is evaluated
+  after): one row this code did not write used to take the endpoint to 500, and an uptime checker cannot tell that from
+  a dead server. Two conditions are shaped by what an anonymous caller can do — rejections are counted as **deliveries
+  refused on `/net/`** rather than requests rejected, because a scanner walking unknown paths would otherwise hold the
+  alarm red with nothing broken; and "Every failure is reaching the error log" grades a counter of consecutive log-write
+  failures, because the two conditions above it are counted out of that very sheet, so a log that cannot be written
+  would otherwise read as a service with no failures. The route answers 503 when a `"0"` grade that **pages** is below
+  1.0; `REPORTED_ONLY` names the conditions that are graded and returned but do not page — today just "Somebody created
+  a sheet in the past 24 hours.", because a product with no users is not a service that is down, and a 15-minute email
+  about it would take the eleven technical conditions with it. A sentence in `REPORTED_ONLY` that `status()` does not
+  actually return is a 500 by name, since a typo there silently starts paging again. `deno task status` prints the same
+  thing, times out at 10s, refuses an answer carrying fewer than 12 conditions, lists every grade below 1.0, and **exits
+  on the route's own status code** rather than deciding again — a second copy of the paging rule would drift from the
+  first; `.github/workflows/status.yml` runs it every 15 minutes beside a plain `curl` of the homepage, which the API's
+  own check cannot see, because the page is built by Cloudflare and the API runs on Deno Deploy. A failed scheduled run
+  emails the repo owner, and that email is the alarm. There is deliberately no in-process watchdog, because a watchdog
+  dies with what it watches
+- **Error sheet**: `net-hook:errors` is seeded by `seed()`, owned by the same sentinel `usr` with the empty email, and
+  `app.onError` writes one row to it per failure — `method`, the `explain(...)` block the caller was sent, and
+  `meta = {status, path}`. It is a `net-hook` sheet because that already means "a sheet whose rows live in `net`", so it
+  reads, pages, exports and trims (`trimNet`, `NET_KEEP`) with no new code, and `select * from @net-hook:errors` works.
+  **Names are stored, never values**, for headers _and_ the query string: the sync socket takes `?auth=<jwt>` and a
+  share link rides the same parameter, so a failing request would otherwise write a live token into a sheet that can be
+  shared and exported. The write is **not awaited** — when the database is what failed, an error response must not wait
+  for the logger to discover that too — and its rejection is caught, because a logging failure must never replace the
+  failure being logged; that happens, since the rate limiter throws before the seed middleware has run. A **429 is not
+  logged at all**: shedding load is the cheap path by definition, and paying two round trips per shed request inverts
+  the point. `logWriteFailures` counts consecutive write failures and resets on the next success, which is the one fact
+  about this log that cannot be read out of the log. The sentinel cannot be logged into, so reading it means one
+  `insert into sheet_usr` at the psql prompt (`readme.md` has the statement). It is the operator's log; a per-user error
+  sheet is a separate item
 - **Charts**: a `chart` sheet is `{ source, kind, x, y }`. `chartSql()` in `src/sql.mjs` turns that into one query both
   engines build identically, so the SVG the page draws and the rows `GET /sheet/chart:abc` and `/export/chart:abc.csv`
   return are the same answer. Only a column name reaches the SQL — anything else is refused by name rather than
@@ -197,7 +261,8 @@ t.trade_id order by p.day desc) = 1` —
   expected/received/source/fix block
 - **Sharing**: `GET/POST/DELETE /library/:id/share` (owner-only, by email + role), `POST /library/:id/public`, and
   `POST /library/:id/link` which mints a viewer-scoped JWT. The link rides the sync socket's existing `?auth=`
-  parameter, so there is one read path rather than two
+  parameter, so there is one read path rather than two. `GET /library/:id/hook` (owner-only, net sheets only) is the
+  webhook signing secret and a runnable curl line
 - **Marketplace checkout**: `POST /buy/:id` fulfills `$0` listings immediately. A positive `sell_price` creates a Stripe
   Checkout Session (`STRIPE_SECRET_KEY`) and returns `{ checkout_url }`. `POST /stripe` verifies `stripe-signature`
   (`STRIPE_WEBHOOK_SECRET`) and fulfills `checkout.session.completed` with `payment_status=paid`. Checkout is card-only.
@@ -233,9 +298,9 @@ t.trade_id order by p.day desc) = 1` —
   apart. Thirty-odd end-to-end pipelines from the Demo Gallery ship as sheets tagged `demo` plus a domain tag, spanning
   twenty-two domains — finance, healthcare, legal, real estate, manufacturing, government, retail, insurance, logistics,
   hr, education, nonprofit, household, music, sports, transport, science, agriculture and the rest — each a seeded
-  source table plus one or two query sheets. **`todo.md`'s Demo Gallery is the index: the checked entries name their
-  sheets, and that is the list to read rather than this one.** Their data is invented; their shapes are not. `store` and
-  `class` are AlaSQL keywords, so no column may be named either: `select store from ...` will not parse.
+  source table plus one or two query sheets. **`src/examples.mjs` is the index: the sheets tagged `demo` are the list,
+  and `todo.md`'s Demo Gallery names only the ones still unbuilt.** Their data is invented; their shapes are not.
+  `store` and `class` are AlaSQL keywords, so no column may be named either: `select store from ...` will not parse.
   `table:assumptions` is the one-row settings sheet those demos read their parameters from, so changing one cell changes
   four sheets. `examples_test.ts` runs **every** bundled query in both engines, resolving `@query:` refs itself, and
   calls `checkResultColumns()` on each result — a typo in a bundled example used to read as a sheet of blanks. Two

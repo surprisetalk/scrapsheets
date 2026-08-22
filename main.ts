@@ -110,6 +110,68 @@ const verifyPassword = async (password: string, stored: string | null): Promise<
   );
   return b64(bits) === want;
 };
+
+const hex = (buf: Uint8Array): string => Array.from(buf).map((b) => b.toString(16).padStart(2, "0")).join("");
+
+// --- webhook signing
+//
+// A net sheet's signing secret is derived from TOKEN_SECRET and the sheet_id
+// rather than stored. Nothing new is persisted, and the secret never enters the
+// automerge document -- which a viewer, or anyone holding a share link, can
+// read. The cost is that rotating one sheet's secret means rotating
+// TOKEN_SECRET, which also invalidates every outstanding email-verification
+// token, since createToken() hashes the same secret. Per-sheet rotation is its
+// own item.
+const hmacKey = (secret: string) =>
+  crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [
+    "sign",
+    "verify",
+  ]);
+
+const hookMac = async (secret: string, message: Uint8Array<ArrayBuffer>): Promise<Uint8Array> =>
+  new Uint8Array(await crypto.subtle.sign("HMAC", await hmacKey(secret), message));
+
+// The "hook:" prefix domain-separates this from createToken(), which derives
+// email-verification tokens from the same root secret. One secret, two uses,
+// and neither may be able to produce the other's output.
+export const hookSecret = async (sheet_id: string): Promise<string> =>
+  hex(await hookMac(TOKEN_SECRET, new TextEncoder().encode(`hook:${sheet_id}`)));
+
+// What is actually signed: the timestamp exactly as it appears in the header, a
+// dot, then the body's own bytes. Bytes rather than a decoded string, because
+// decoding a non-UTF-8 payload replaces characters and would make a correctly
+// signed delivery unverifiable.
+const hookMessage = (t: string, body: Uint8Array): Uint8Array<ArrayBuffer> => {
+  const prefix = new TextEncoder().encode(`${t}.`);
+  const message = new Uint8Array(prefix.length + body.length);
+  message.set(prefix);
+  message.set(body, prefix.length);
+  return message;
+};
+
+/** The `scrapsheets-signature` header value for one delivery. Exported because
+ * the tests sign the same way a sender does, rather than re-deriving it. */
+export const hookSign = async (
+  sheet_id: string,
+  body: string,
+  t: number = Math.floor(Date.now() / 1000),
+): Promise<string> => {
+  const mac = await hookMac(await hookSecret(sheet_id), hookMessage(String(t), new TextEncoder().encode(body)));
+  return `t=${t},v1=${hex(mac)}`;
+};
+
+// crypto.subtle.verify does the comparison, so no digest equality is written by
+// hand. The signature reaches here already matched against [0-9a-f]{64}; a pair
+// that is not hex would silently become a zero byte, so it throws instead.
+const hookVerify = async (secret: string, message: Uint8Array<ArrayBuffer>, signature: string): Promise<boolean> => {
+  const bytes = Uint8Array.from((signature.match(/../g) ?? []).map((pair) => {
+    const byte = parseInt(pair, 16);
+    if (!Number.isInteger(byte)) throw new Error(`Expected two hex digits in a v1 signature, received ${pair}.`);
+    return byte;
+  }));
+  return await crypto.subtle.verify("HMAC", await hmacKey(secret), bytes, message);
+};
+
 if (!Deno.env.get("JWT_SECRET"))
   console.warn("WARNING: JWT_SECRET not set, using random value. Tokens will break on restart.");
 if (!Deno.env.get("TOKEN_SECRET"))
@@ -622,11 +684,7 @@ export const createToken = async (
     "SHA-256",
     new TextEncoder().encode(`${epoch}:${email}:${TOKEN_SECRET}`),
   );
-  return `${epoch}:${
-    Array.from(new Uint8Array(hash))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("")
-  }`;
+  return `${epoch}:${hex(new Uint8Array(hash))}`;
 };
 
 const sendVerificationEmail = async (email: string) => {
@@ -753,18 +811,20 @@ app.use("*", async (c, next) => {
 
 // --- seeding
 
+// Every sheet seed() puts in the shop. Named rather than inlined because the
+// status check grades how many of them are still there.
+const SEEDED = [
+  ...DATASETS,
+  { doc_id: "webhook-inbox", name: "webhook inbox", tags: ["example", "net"], doc: { type: "net-hook", data: [] } },
+];
+
 // Idempotent: examples.sql and every dataset upsert on doc_id.
 export const seed = async () => {
   // schema/db.sql is schema only, so pg-schema-diff can diff it. This sentinel
   // user owns every seeded sheet and must exist before examples.sql runs.
   await sql`insert into usr (name, email) values ('Scrapsheets', '') on conflict (email) do nothing`;
   await sql.unsafe(examplesSql);
-  for (
-    const { doc_id, name, tags, doc } of [
-      ...DATASETS,
-      { doc_id: "webhook-inbox", name: "webhook inbox", tags: ["example", "net"], doc: { type: "net-hook", data: [] } },
-    ]
-  ) {
+  for (const { doc_id, name, tags, doc } of SEEDED) {
     await sql`
       insert into sheet (sell_price, created_by, type, name, tags, doc_id, row_0)
       values (0, (select usr_id from usr where email = ''), 'template', ${name}, ${tags},
@@ -772,6 +832,16 @@ export const seed = async () => {
       on conflict (doc_id) do update set name = excluded.name, tags = excluded.tags, row_0 = excluded.row_0
     `;
   }
+  // The operator's failure log. It is a net-hook sheet because that is already
+  // "a sheet whose rows live in the net table" -- so it reads, pages, exports
+  // and trims with no new code, and `select * from @net-hook:errors` works the
+  // day it lands. The sentinel owns it and has no password, so reading it in
+  // the app means sharing it to a real account once.
+  await sql`
+    insert into sheet (created_by, type, doc_id, name, tags)
+    values ((select usr_id from usr where email = ''), 'net-hook', ${ERROR_DOC}, 'errors', '{"system"}')
+    on conflict (doc_id) do nothing
+  `;
 };
 
 let seeded: Promise<unknown> | undefined;
@@ -1299,11 +1369,233 @@ app.notFound((c) => {
   });
 });
 
+// Every failure lands here as a row, so "what is breaking, how often, on which
+// path" is a query instead of a scroll through a console that has already
+// scrolled. Header values are never stored, only their names: a caller's
+// Authorization must not sit in a log forever. trimNet bounds it at NET_KEEP.
+const ERROR_DOC = "errors";
+const ERROR_SHEET = `net-hook:${ERROR_DOC}`;
+
+// How many log writes have failed in a row. It resets on the next success, so
+// it reads as "the log is broken right now" rather than "it was once". Without
+// it, a log that cannot be written grades as a service with no failures: the
+// two conditions below it are counted out of this very sheet.
+let logWriteFailures = 0;
+
+const logFailure = async (c: Context, status: number, message: string): Promise<void> => {
+  await sql`insert into net ${
+    sql({
+      sheet_id: ERROR_SHEET,
+      body: message,
+      method: c.req.method,
+      // Names, never values, on both. A query string carries secrets here by
+      // design -- the sync socket takes ?auth=<jwt> and a share link rides the
+      // same parameter -- so a failing request would otherwise write a live
+      // token into a sheet that can be shared and exported.
+      req_headers: JSON.stringify({ names: [...c.req.raw.headers.keys()].sort().join(", ") || "(none)" }),
+      query_params: JSON.stringify({ names: Object.keys(c.req.query()).sort().join(", ") || "(none)" }),
+      meta: JSON.stringify({ status, path: new URL(c.req.url).pathname }),
+    })
+  }`;
+  await trimNet(ERROR_SHEET);
+};
+
 app.onError((err, c) => {
-  // if (err?.code === "23505") return c.json({ error: "Already exists" }, 409);
-  if (err instanceof HTTPException) return err.getResponse();
-  if (err) console.error(err);
-  return c.json({ error: "Sorry, something went wrong." }, 500);
+  const known = err instanceof HTTPException;
+  const res = known ? err.getResponse() : c.json({ error: "Sorry, something went wrong." }, 500);
+  if (!known) console.error(err);
+  // 429 is the one status that is not logged. Shedding load is the cheap path
+  // by definition, and paying two round trips to record each shed request
+  // inverts the point of shedding it.
+  //
+  // Not awaited: when the database is what failed, the error response must not
+  // wait for the logger to discover that too. And a failure to write the log
+  // must never replace the failure being logged -- which happens, because the
+  // rate limiter throws before seed() has run, so the sheet row may not exist.
+  if (res.status !== 429) {
+    logFailure(c, res.status, known ? err.message : String(err?.stack ?? err))
+      .then(() => logWriteFailures = 0)
+      .catch((logErr) => {
+        logWriteFailures++;
+        console.error(`error log ${ERROR_SHEET}:`, logErr);
+      });
+  }
+  return res;
+});
+
+// --- status
+//
+// One graded condition per likely failure mode. 1.0 is the minimum passing
+// grade and 0.0 is total failure, so a number above 1.0 is headroom rather than
+// a score to maximize -- which is the whole point: a check written to be
+// maximized measures the wrong thing the moment somebody notices it.
+//
+// Each key is the sentence the grade is about. Each value maps a seconds-ago
+// offset to the grade as of then, so the reader sees a trend and not a
+// snapshot. A condition that can only be measured now carries "0" alone.
+const STATUS_AGO = [0, 3600, 86400];
+
+// The numbers each condition's sentence quotes. They are read into the sentence
+// rather than typed into it twice, so a changed limit cannot leave a sentence
+// claiming the old one. DB_BYTES_CAP is Neon's free-tier ceiling and
+// HEAP_BYTES_CAP the heap a Deno Deploy isolate gets: both live outside this
+// code, which is why they are written down rather than derived.
+const LATENCY_MS = 100;
+const REFUSALS_MAX = 20;
+const POLL_STALE_S = 7200;
+const DB_BYTES_CAP = 4_000_000_000;
+const HEAP_BYTES_CAP = 512_000_000;
+
+// Floor, not round: a condition half a percent short of its own bar would
+// otherwise report exactly 1.0 and pass. A grade that will not compute is a
+// broken check, and a broken check that answers "fine" is worse than no check.
+const grade = (condition: string, n: number): number => {
+  const value = Math.floor(Number(n) * 100) / 100;
+  if (!Number.isFinite(value)) {
+    throw new Error(explain(`The status condition "${condition}" did not grade to a number.`, {
+      Received: JSON.stringify(n) ?? String(n),
+      Expected: "a finite grade, where 1.0 is the minimum pass",
+      Source: "status()",
+      Fix: "check the SQL alias this condition reads; a renamed column grades as undefined",
+    }));
+  }
+  return value;
+};
+
+export const status = async (): Promise<Record<string, Record<string, number>>> => {
+  // A round trip, not a workload: timing the aggregates below would grade the
+  // heaviest statement in the file as "a query".
+  const started = Date.now();
+  await sql`select 1`;
+  const dbMs = Date.now() - started;
+
+  // One round trip per shape: the historical conditions are the same SQL
+  // evaluated at three instants, so the offsets are a join rather than three
+  // queries.
+  //
+  // Every cast out of jsonb is guarded, because a single row this code did not
+  // write would otherwise take the whole endpoint to 500 -- and an uptime
+  // checker cannot tell that from a dead server. `substring(x from '^[0-9]+$')`
+  // answers null rather than raising, and `is json` sits in the where clause,
+  // which an aggregate's filter is evaluated after.
+  const overTime = await sql`
+    with at as (select seconds, now() - make_interval(secs => seconds) as t
+                from unnest(${STATUS_AGO}::int[]) as seconds)
+    select
+      at.seconds,
+      1.0 / (1 + (
+        select count(*) from net n
+        where n.sheet_id = ${ERROR_SHEET}
+          and n.created_at > at.t - interval '1 hour' and n.created_at <= at.t
+          and substring(n.meta->>'status' from '^[0-9]+$')::int >= 500
+      )) as no_5xx,
+      ${REFUSALS_MAX}::numeric / greatest(1, (
+        select count(*) from net n
+        where n.sheet_id = ${ERROR_SHEET}
+          and n.created_at > at.t - interval '1 hour' and n.created_at <= at.t
+          and substring(n.meta->>'status' from '^[0-9]+$')::int = 401
+          and n.meta->>'path' like '/net/%'
+      )) as refusals,
+      (select case when count(*) = 0 then 1
+                   else count(*) filter (
+                     where substring(n.meta->>'status' from '^[0-9]+$')::int between 200 and 299
+                   )::numeric / count(*) end
+       from net n inner join sheet s using (sheet_id)
+       where s.type = 'net-http' and n.method = 'GET'
+         and n.created_at > at.t - interval '1 hour' and n.created_at <= at.t) as polls_ok,
+      (select case when count(*) = 0 then 1
+                   else count(*) filter (
+                     where n.body::jsonb->>'status' <> 'error'
+                       and n.body::jsonb->>'delivery' in ('sent', ${HELD})
+                   )::numeric / count(*) end
+       from net n
+       where n.method = 'ALERT' and n.body is json
+         and n.created_at > at.t - interval '1 day' and n.created_at <= at.t) as alerts_delivered,
+      (select count(*) from sheet s
+       where s.created_at > at.t - interval '1 day' and s.created_at <= at.t
+         and s.created_by <> (select usr_id from usr where email = '')) as sheets_created
+    from at
+  `;
+
+  // Current state, with no history to read it against: how stale the feeds are,
+  // how full the disk is, whether the seed is intact.
+  const [live] = await sql`
+    select
+      (select coalesce(min(${POLL_STALE_S}::numeric / greatest(1, extract(epoch from (now() - last)))), 1)
+       from (select max(n.created_at) as last
+             from sheet s inner join net n using (sheet_id)
+             where s.type = 'net-http' and n.method = 'GET' group by s.sheet_id) feeds) as polls_fresh,
+      ${NET_KEEP}::numeric / greatest(1, coalesce(
+        (select max(c) from (select count(*) as c from net group by sheet_id) logs), 0)) as log_capped,
+      ${DB_BYTES_CAP}::numeric / greatest(1, pg_database_size(current_database())) as db_size,
+      (select count(*) from sheet where doc_id like 'dataset-%')::numeric / ${SEEDED.length} as datasets_present
+  `;
+
+  const byAgo = (
+    condition: string,
+    pick: (row: Record<string, number>) => number,
+  ): [string, Record<string, number>] => [
+    condition,
+    Object.fromEntries(
+      overTime.map((row: Record<string, number>) => [String(row.seconds), grade(condition, pick(row))]),
+    ),
+  ];
+  const now = (condition: string, n: number): [string, Record<string, number>] => [condition, {
+    "0": grade(condition, n),
+  }];
+
+  return Object.fromEntries([
+    now(`The database answers a query in under ${LATENCY_MS}ms.`, LATENCY_MS / Math.max(1, dbMs)),
+    byAgo("No request failed with a 5xx in the past hour.", (r) => r.no_5xx),
+    // Deliveries refused, not requests rejected: a scanner walking unknown
+    // paths would otherwise hold this red with nothing broken, and an alarm
+    // anyone can trigger is an alarm that gets muted. A 401 on /net/ is a real
+    // sender that cannot sign -- usually a rotation nobody finished.
+    byAgo(`No more than ${REFUSALS_MAX} deliveries were refused in the past hour.`, (r) => r.refusals),
+    now("Every failure is reaching the error log.", 1 / (1 + logWriteFailures)),
+    byAgo("Every net-http poll in the past hour returned 2xx.", (r) => r.polls_ok),
+    now(
+      `Every net-http sheet that has ever polled did so in the past ${POLL_STALE_S / 3600} hours.`,
+      live.polls_fresh,
+    ),
+    byAgo("Every alert run in the past day was delivered.", (r) => r.alerts_delivered),
+    now("No sheet's net log has grown past its retention cap.", live.log_capped),
+    now(`The database is under ${DB_BYTES_CAP / 1e9} GB.`, live.db_size),
+    now(`The server heap is under ${HEAP_BYTES_CAP / 1e6} MB.`, HEAP_BYTES_CAP / Deno.memoryUsage().heapUsed),
+    byAgo("Somebody created a sheet in the past 24 hours.", (r) => r.sheets_created),
+    now("Every seeded dataset is still in the shop.", live.datasets_present),
+  ]);
+};
+
+// Reported, but not paged on. A product nobody is using is failing, and that
+// grade belongs in the answer -- but a service with no users is not a service
+// that is down, and an alarm that fires every fifteen minutes about it is an
+// alarm that gets muted, taking the eleven technical conditions with it.
+const REPORTED_ONLY = ["Somebody created a sheet in the past 24 hours."];
+
+// Public, because an uptime check carries no bearer token. It answers grades and
+// no rows -- no ids, no names, no addresses -- though a grade is a ratio against
+// a limit named in this file, so a reader can invert one back to the count it
+// came from. 503 rather than 200 when a condition that pages is failing now, so
+// a checker that reads only the status line still learns the answer, and
+// `deno task status` reads exactly that rather than deciding again.
+app.get("/status", async (c) => {
+  const grades = await status();
+  const missing = REPORTED_ONLY.filter((condition) => !(condition in grades));
+  if (missing.length) {
+    throw new HTTPException(500, {
+      message: explain(`A condition excused from paging is not one this check grades.`, {
+        Received: missing.join("; "),
+        Expected: "a sentence that status() actually returns",
+        Source: "REPORTED_ONLY",
+        Fix: "match the sentence exactly, or it silently starts paging again",
+      }),
+    });
+  }
+  const failing = Object.entries(grades)
+    .filter(([condition]) => !REPORTED_ONLY.includes(condition))
+    .filter(([, series]) => !(series["0"] >= 1));
+  return c.json(grades, failing.length ? 503 : 200);
 });
 
 app.post("/signup", async (c) => {
@@ -1535,6 +1827,11 @@ app.get("/shop", async (c) => {
 // yet, so an unbounded body is an unbounded table.
 const NET_BODY_CAP = 1_048_576;
 
+// How far a delivery's signed timestamp may sit from ours. It is replay
+// protection only in the crude sense -- a delivery id dedupe is a separate item
+// -- but it bounds how long a captured request stays usable.
+const HOOK_SKEW = 300;
+
 // Rows kept per sheet. Everything that writes to `net` trims behind itself, so
 // a webhook that fires every second cannot fill the disk. It is a cap on the
 // log, not on the data: a sheet that must keep everything should write to a
@@ -1583,8 +1880,14 @@ app.post("/net/:id", async (c) => {
     });
   }
   const declared = Number(c.req.header("content-length") ?? NaN);
-  const body = declared > NET_BODY_CAP ? "" : await c.req.text();
-  const size = declared > NET_BODY_CAP ? declared : new TextEncoder().encode(body).byteLength;
+  // Bytes, not text: the signature covers what was sent, and decoding a
+  // non-UTF-8 payload first would replace characters and make a correctly
+  // signed delivery unverifiable. The column is text, so it is decoded after.
+  const raw = declared > NET_BODY_CAP
+    ? new Uint8Array(new ArrayBuffer(0))
+    : new Uint8Array<ArrayBuffer>(await c.req.arrayBuffer());
+  const size = declared > NET_BODY_CAP ? declared : raw.byteLength;
+  const body = new TextDecoder().decode(raw);
   if (size > NET_BODY_CAP) {
     throw new HTTPException(413, {
       message: explain(`This delivery to ${sheet_id} is too large to store.`, {
@@ -1592,6 +1895,58 @@ app.post("/net/:id", async (c) => {
         Limit: `${NET_BODY_CAP} bytes per delivery`,
         Source: "the request body",
         Fix: "send the payload in pages, or post a URL the sheet can fetch instead",
+      }),
+    });
+  }
+  // Every delivery is signed. There is no per-sheet opt-out: without this,
+  // anyone who learns a net sheet's id can append rows to it. The four
+  // rejections below each name their own check, because "401" tells a sender
+  // nothing about which half of the handshake it got wrong -- and none of them
+  // prints the secret or the expected digest, which would make the message a
+  // signing oracle.
+  const signature = c.req.header("scrapsheets-signature");
+  if (!signature) {
+    throw new HTTPException(401, {
+      message: explain(`This delivery to ${sheet_id} is not signed.`, {
+        Received: `headers ${heard}`,
+        Expected: "a scrapsheets-signature header, formatted t=<unix seconds>,v1=<64 hex characters>",
+        Source: "the request headers",
+        Fix: `read this sheet's signing secret with GET /library/${sheet_id}/hook, then sign ` +
+          `"<t>.<body>" with HMAC-SHA256`,
+      }),
+    });
+  }
+  const parts = signature.match(/^t=(\d{1,10}),v1=([0-9a-fA-F]{64})$/);
+  if (!parts) {
+    throw new HTTPException(401, {
+      message: explain(`The signature on this delivery to ${sheet_id} is malformed.`, {
+        Received: JSON.stringify(signature),
+        Expected: "t=<unix seconds>,v1=<64 hex characters>, in that order, with no spaces",
+        Source: "the scrapsheets-signature header",
+        Fix: 'build it as `t=$(date +%s),v1=$(printf "%s.%s" "$t" "$body" | openssl dgst -sha256 -hmac "$secret" -r ' +
+          "| cut -d' ' -f1)`",
+      }),
+    });
+  }
+  const sent = Number(parts[1]);
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowSec - sent) > HOOK_SKEW) {
+    throw new HTTPException(401, {
+      message: explain(`The signature on this delivery to ${sheet_id} is outside the replay window.`, {
+        Received: `t=${sent}, which is ${Math.abs(nowSec - sent)} seconds ${sent < nowSec ? "old" : "in the future"}`,
+        Expected: `a t within ${HOOK_SKEW} seconds of ${nowSec}, this server's clock`,
+        Source: "the t field of the scrapsheets-signature header",
+        Fix: "sign with the current time rather than a stored header, and check the sender's clock",
+      }),
+    });
+  }
+  if (!(await hookVerify(await hookSecret(sheet_id), hookMessage(parts[1], raw), parts[2]))) {
+    throw new HTTPException(401, {
+      message: explain(`The signature on this delivery to ${sheet_id} does not match its body.`, {
+        Received: `v1 starting ${parts[2].slice(0, 8)}, over ${size} bytes`,
+        Expected: `HMAC-SHA256 of "${sent}.<body>" under this sheet's signing secret`,
+        Source: "the v1 field of the scrapsheets-signature header",
+        Fix: "sign the exact bytes you send, unmodified, and check the secret is this sheet's",
       }),
     });
   }
@@ -2337,6 +2692,43 @@ app.post("/library/:id/link", async (c) => {
     JWT_ALG,
   );
   return c.json({ data: { token } });
+});
+
+// The signing secret for one net sheet, plus a shell line that sends a signed
+// delivery. Owner-only: the secret is what stands between the sheet and anyone
+// who learns its id, so it may not travel with the document the way a share
+// link does.
+app.get("/library/:id/hook", async (c) => {
+  const sheet_id = c.req.param("id");
+  await assertSheetOwner(c, sheet_id);
+  const [target] = await sql`select type from sheet where sheet_id = ${sheet_id}`;
+  if (!target || !String(target.type).startsWith("net-")) {
+    throw new HTTPException(400, {
+      message: explain(`Sheet ${sheet_id} has no delivery endpoint.`, {
+        Received: target ? `a ${target.type} sheet` : "no sheet row",
+        Expected: "a net-hook, net-http, or net-socket sheet",
+        Source: "sheet.type",
+        Fix: "ask for the hook of a net-hook sheet",
+      }),
+    });
+  }
+  const secret = await hookSecret(sheet_id);
+  const url = `${new URL(c.req.url).origin}/net/${sheet_id}`;
+  // A long-lived secret may not sit in a shared cache.
+  c.header("Cache-Control", "no-store");
+  return c.json({
+    data: {
+      url,
+      secret,
+      repro: [
+        `body='{"hello":"world"}'`,
+        `t=$(date +%s)`,
+        `sig=$(printf '%s.%s' "$t" "$body" | openssl dgst -sha256 -hmac '${secret}' -r | cut -d' ' -f1)`,
+        `curl -X POST '${url}' -H 'Content-Type: application/json' \\`,
+        `  -H "scrapsheets-signature: t=$t,v1=$sig" -d "$body"`,
+      ].join("\n"),
+    },
+  });
 });
 
 // CSV Import - parse CSV and create a new table sheet

@@ -11,6 +11,8 @@ import {
   automerge,
   createJwt,
   createToken,
+  hookSecret,
+  hookSign,
   NET_KEEP,
   parseNetHeaders,
   pollAlertOnce,
@@ -18,6 +20,7 @@ import {
   seed,
   sendDigestOnce,
   sql,
+  status,
   trimNet,
 } from "./main.ts";
 import type { Col, Query, Sheet, Table, Template } from "./main.ts";
@@ -72,6 +75,19 @@ const post = (jwt: string, route: string, body: unknown) =>
   request(jwt, route, { method: "POST", body: JSON.stringify(body) });
 const put = (jwt: string, route: string, body: unknown) =>
   request(jwt, route, { method: "PUT", body: JSON.stringify(body) });
+
+// Every delivery is signed, so the tests sign it the way a sender does: through
+// the server's own hookSign, rather than a second implementation that could
+// agree with a bug in the first.
+const deliver = async (sheet_id: string, body: string, query = "") =>
+  await app.request(`/net/${sheet_id}${query}`, {
+    method: "POST",
+    headers: new Headers({
+      "Content-Type": "application/json",
+      "scrapsheets-signature": await hookSign(sheet_id, body),
+    }),
+    body,
+  });
 
 const usr = async (email: string) => {
   const [{ usr_id }] = await sql`
@@ -1611,12 +1627,6 @@ Deno.test(async function allTests(_t) {
   // A webhook sender only ever sees the response body, so the body diagnoses.
   {
     const { jwt } = await usr("sam@example.com");
-    const deliver = (id: string, body: string) =>
-      app.request(`/net/${id}`, {
-        method: "POST",
-        headers: new Headers({ "Content-Type": "application/json" }),
-        body,
-      });
 
     const missing = await deliver("net-hook:nosuchdoc", "{}");
     assertEquals(missing.status, 404);
@@ -1750,11 +1760,7 @@ Deno.test(async function allTests(_t) {
 
     // Anyone can POST a payload; only the owner reads the log.
     {
-      const res = await app.request(`/net/${hookId}?x=1`, {
-        method: "POST",
-        headers: new Headers({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ event: "ping" }),
-      });
+      const res = await deliver(hookId, JSON.stringify({ event: "ping" }), "?x=1");
       assert(res.ok, `webhook ingest failed: ${res.status}`);
       const cols = "created_at,body,method,req_headers,query_params,meta";
       const [cols_, ...rows] = await get<Table>(jwt, `/net/${hookId}`);
@@ -1811,13 +1817,7 @@ Deno.test(async function allTests(_t) {
       assert(netCsvText.includes("ping"), `expected the payload in the csv, got: ${netCsvText}`);
 
       // Ten more deliveries must page without repeating or skipping a row.
-      for (let i = 0; i < 10; i++) {
-        await app.request(`/net/${hookId}`, {
-          method: "POST",
-          headers: new Headers({ "Content-Type": "application/json" }),
-          body: JSON.stringify({ seq: i }),
-        });
-      }
+      for (let i = 0; i < 10; i++) await deliver(hookId, JSON.stringify({ seq: i }));
       const pageOf = async (offset: number) =>
         (await get<Table>(jwt, `/net/${hookId}`, { limit: 4, offset })).slice(1).map((r) => String(r.body));
       const paged = [...await pageOf(0), ...await pageOf(4), ...await pageOf(8)];
@@ -2173,6 +2173,164 @@ Deno.test(async function allTests(_t) {
       assert(text.includes("Stripe"), `error must name Stripe, got: ${text}`);
       assertEquals((await sql`select * from sheet where buy_id = ${listing.sell_id}`).length, 0);
     }
+  }
+
+  // Signing. Without it, anyone who learns a net sheet's id can write rows to it,
+  // so every rejection has to say which half of the handshake was wrong -- and
+  // none of them may print the secret, which would make the message an oracle.
+  {
+    const { jwt } = await usr("wes@example.com");
+    const hand = automerge.create<Sheet>({ type: "net-hook", data: [] });
+    const id = `net-hook:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+    const secret = await hookSecret(id);
+    const body = JSON.stringify({ event: "signed" });
+    const send = (signature: string | null) =>
+      app.request(`/net/${id}`, {
+        method: "POST",
+        headers: new Headers({
+          "Content-Type": "application/json",
+          ...(signature === null ? {} : { "scrapsheets-signature": signature }),
+        }),
+        body,
+      });
+
+    assert((await send(await hookSign(id, body))).ok, "a correctly signed delivery must land");
+
+    const refused = async (signature: string | null, says: string) => {
+      const res = await send(signature);
+      assertEquals(res.status, 401, `expected 401 for ${says}`);
+      const text = await res.text();
+      assert(text.includes(says), `the rejection must name its own check, got: ${text}`);
+      assert(!text.includes(secret), "a rejection that prints the secret is a signing oracle");
+      return text;
+    };
+    await refused(null, "is not signed");
+    await refused("v1=nope", "is malformed");
+    // Signed correctly, but for a moment outside the replay window.
+    const stale = Math.floor(Date.now() / 1000) - 3600;
+    const staleText = await refused(await hookSign(id, body, stale), "outside the replay window");
+    assert(staleText.includes("3600 seconds old"), `it must name the skew, got: ${staleText}`);
+    // The right shape over the wrong bytes: the one failure a sender misreads as
+    // a wrong secret.
+    await refused(await hookSign(id, body + " "), "does not match its body");
+    // The right shape under another sheet's secret.
+    const other = automerge.create<Sheet>({ type: "net-hook", data: [] });
+    await refused(await hookSign(`net-hook:${other.documentId}`, body), "does not match its body");
+
+    // The owner reads the secret; nobody else does, and a non-net sheet has none.
+    const hook = await get<{ url: string; secret: string; repro: string }>(jwt, `/library/${id}/hook`);
+    assertEquals(hook.secret, secret);
+    assert(hook.url.endsWith(`/net/${id}`), `the hook url must be the delivery url, got: ${hook.url}`);
+    assert(hook.repro.includes(secret) && hook.repro.includes("openssl"), "the repro must be runnable");
+    const { jwt: strangerJwt } = await usr("wanda@example.com");
+    await reject(strangerJwt, `/library/${id}/hook`);
+    const table = automerge.create<Sheet>({ type: "table", data: [arrayify([{ name: "a", type: "text", key: 0 }])] });
+    await put(jwt, `/library/table:${table.documentId}`, {});
+    await reject(jwt, `/library/table:${table.documentId}/hook`);
+  }
+
+  // Every failure lands on one sheet, so "what is breaking, and where" is a
+  // query. It must carry the path and the status, and it must never carry a
+  // header value: an Authorization in a log outlives the request that sent it.
+  {
+    const { usr_id, jwt } = await usr("erin@example.com");
+    await sql`
+      insert into sheet_usr (sheet_id, usr_id, role) values ('net-hook:errors', ${usr_id}, 'viewer')
+      on conflict (sheet_id, usr_id) do nothing
+    `;
+    const marker = `/no-such-route-${crypto.randomUUID()}?auth=Bearer%20super-secret-token`;
+    // An unknown path with a bad bearer token: the jwt middleware answers before
+    // the not-found handler does, which is exactly the sort of thing the log is
+    // for -- the path alone does not explain the status.
+    await app.request(marker, { headers: new Headers({ Authorization: "Bearer super-secret-token" }) });
+
+    const [, newest] = await get<Table>(jwt, `/sheet/net-hook:errors`);
+    const meta = JSON.parse(String(newest.meta));
+    assertEquals(meta.path, marker.split("?")[0]);
+    assertEquals(meta.status, 401);
+    const row = JSON.stringify(newest);
+    assert(row.includes("authorization"), "the header names are what makes a failed request reproducible");
+    assert(row.includes("auth"), "a query parameter's name is worth keeping");
+    // The sync socket takes ?auth=<jwt> and a share link rides the same
+    // parameter, so a query value in this log is a live token sitting in a
+    // sheet that can be shared and exported. One rule for both, not two.
+    assert(!row.includes("super-secret-token"), "neither a header nor a query value may reach the log");
+  }
+
+  // The status check. Every condition is graded so that 1.0 is the minimum pass,
+  // which is what lets an uptime check read the whole thing without knowing what
+  // any of it means.
+  {
+    const grades = await status();
+    const conditions = Object.keys(grades);
+    assertEquals(conditions.length, 12);
+    for (const [condition, series] of Object.entries(grades)) {
+      assert(condition.endsWith("."), `a condition is a sentence: ${condition}`);
+      assert("0" in series, `${condition} must be graded now`);
+      for (const value of Object.values(series))
+        assert(Number.isFinite(value), `${condition} graded ${value}, which says nothing`);
+    }
+    // A historical condition carries the trend; a live one carries only now.
+    assertEquals(Object.keys(grades["No request failed with a 5xx in the past hour."]), ["0", "3600", "86400"]);
+    assertEquals(Object.keys(grades["The database is under 4 GB."]), ["0"]);
+
+    // A row this code did not write must degrade one grade, never take the
+    // endpoint down: an uptime checker cannot tell a 500 here from a dead
+    // server. Both of these used to raise out of a cast.
+    await sql`
+      insert into net (sheet_id, method, body, meta)
+      values ('net-hook:errors', 'GET', 'x', '{"status":"oops"}'::jsonb),
+             ('net-hook:errors', 'ALERT', 'not json at all', '{}'::jsonb)
+    `;
+    const survived = await app.request("/status");
+    assertEquals(
+      Object.keys(await survived.json()).length,
+      12,
+      "a malformed row must degrade a grade, not replace the whole answer with an error",
+    );
+
+    // A condition that is reported but does not page: a service with no users is
+    // not a service that is down. It still has to be graded and still has to be
+    // in the answer.
+    await sql`delete from net`;
+    assert(
+      (await status())["Somebody created a sheet in the past 24 hours."]["0"] >= 0,
+      "the usage condition is still graded",
+    );
+    await sql`update sheet set created_at = now() - interval '3 days'
+              where created_by <> (select usr_id from usr where email = '')`;
+    const idle = await app.request("/status");
+    assertEquals(idle.status, 200, "a product nobody used today is not an outage");
+    assertEquals((await idle.json())["Somebody created a sheet in the past 24 hours."]["0"], 0);
+
+    // 200 is reachable. The suite has spent the run filling the error log and
+    // failing net-http polls on purpose, so a clean log is what proves the
+    // healthy path exists at all -- without this the 503 below passes for
+    // whatever happens to be true, which is no test.
+    await sql`delete from net`;
+    const clean = await app.request("/status");
+    assertEquals(
+      clean.status,
+      200,
+      `every condition must pass on a healthy database: ${JSON.stringify(await clean.json())}`,
+    );
+
+    // A 500 in the log is what pulls that condition under 1.0, and one failing
+    // condition is what turns the route 503 -- so a checker that reads only the
+    // status line still learns the answer.
+    await sql`
+      insert into net (sheet_id, method, body, meta)
+      values ('net-hook:errors', 'GET', 'boom', '{"status":500,"path":"/boom"}'::jsonb)
+    `;
+    assert((await status())["No request failed with a 5xx in the past hour."]["0"] < 1);
+    const res = await app.request("/status");
+    assertEquals(res.status, 503);
+    // Public, because an uptime check carries no bearer token, and grades only.
+    const body = await res.json();
+    for (const series of Object.values(body as Record<string, Record<string, number>>))
+      for (const value of Object.values(series)) assertEquals(typeof value, "number");
+    await sql`delete from net where sheet_id = 'net-hook:errors' and body = 'boom'`;
   }
 
   await sql.end();

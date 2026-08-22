@@ -1,0 +1,38 @@
+name: Status
+
+# The server cannot report its own death, so the check runs off it. A failed
+# scheduled run emails the repo owner, and that email is the whole alarm --
+# there is no in-process watchdog, because a watchdog dies with what it watches.
+#
+# GitHub stops scheduled workflows after 60 days without a commit, so a repo
+# that goes quiet loses its alarm. Re-enable it from the Actions tab.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    # The job's own bound. The task times its request out at 10s, but a runner
+    # that hangs for the 360-minute default drops the next scheduled run too.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      # The API grades itself. The page is served by a different provider --
+      # Cloudflare Workers Builds, not Deno Deploy -- so a frontend that stops
+      # building raises nothing on the API's own check. It gets its own step.
+      - name: The homepage answers
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 https://sheets.scrap.land/)
+          if [ "$code" != "200" ]; then
+            echo "Expected 200 from https://sheets.scrap.land/, received $code."
+            echo "Source: the Cloudflare Workers build. The API can be healthy while the page is not."
+            exit 1
+          fi
+      # Nonzero when any condition is below 1.0, or when nothing answered at all.
+      - name: Every status condition passes
+        run: deno task status

@@ -2,6 +2,34 @@
 deno task build
 deno task dev
 deno task test
+deno task status
+```
+
+`deno task status` grades every likely failure mode of the deployed service and exits nonzero when one that pages is
+failing. **1.0 is the minimum passing grade**, 0.0 is total failure, and anything above 1.0 is headroom. Usage is graded
+and printed but does not page: a product nobody used today is not an outage. `.github/workflows/status.yml` runs it
+every 15 minutes; a failed scheduled run emails the repo owner, and that email is the alarm. `GET /status` is the same
+answer as JSON, and needs no login.
+
+Every failure lands as a row on `net-hook:errors`, so `select * from @net-hook:errors` is the error log. It is owned by
+the seeded sentinel account, which has no password and cannot be logged into, so `/share` cannot reach it. Grant
+yourself the row once, at the psql prompt:
+
+```sql
+insert into sheet_usr (sheet_id, usr_id, role)
+select 'net-hook:errors', usr_id, 'viewer' from usr where email = 'you@example.com'
+on conflict (sheet_id, usr_id) do nothing;
+```
+
+A webhook delivery must be signed. Read a net sheet's secret from its panel in the app, or with
+`GET /library/<sheet_id>/hook`, which also answers with a runnable line:
+
+```sh
+body='{"hello":"world"}'
+t=$(date +%s)
+sig=$(printf '%s.%s' "$t" "$body" | openssl dgst -sha256 -hmac "$secret" -r | cut -d' ' -f1)
+curl -X POST "https://api.sheets.scrap.land/net/$sheet_id" -H 'Content-Type: application/json' \
+  -H "scrapsheets-signature: t=$t,v1=$sig" -d "$body"
 ```
 
 ```nu

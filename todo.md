@@ -4,12 +4,6 @@
 
 ---
 
-## Phase 1 — Foundation
-
-Make Scrapsheets reliable enough to be someone's primary data tool.
-
----
-
 ## Phase 2 — Growth
 
 Build the features that create network effects. This is where the spreadsheet OS vision comes alive.
@@ -50,9 +44,6 @@ Transform Scrapsheets into a platform. Each feature creates a new axis of compos
 - [ ] **User-defined portal sources**: provide a WebSocket URL or HTTP polling config to create custom portals
 - [ ] **Portal marketplace**: sell live data feeds as portal sheets
 - [ ] **Portal composition**: query across multiple live portals in real-time
-- [x] **Embed endpoint**: `?embed=1` on any sheet's own URL drops every piece of chrome — toolbar, search, aside, modals
-      — and renders the sheet alone. One flag rather than a second route, so an embed is the same page with the same
-      access rules: it grants a viewer nothing a link would not
 - [ ] **Embed code generator**: copy-pasteable iframe snippet in sheet settings
 - [ ] **Interactive embeds**: viewers can sort/filter embedded sheets. An embed drops the filter bar with the rest of
       the chrome, so today it is a picture of the sheet, not a copy of it
@@ -94,11 +85,11 @@ Transform Scrapsheets into a platform. Each feature creates a new axis of compos
 ## Demo Gallery
 
 End-to-end use-cases, written as sheet pipelines (`net-http` / `net-hook` / `portal` / `codex` -> `query` -> `table`).
-The checked ones ship as seeded sheets in `src/examples.mjs`, tagged `demo`: the query half is real and runs in both
-engines, and each entry names the ingest half that is still missing — which is always the same half, because a seeded
-table is a feed nobody has connected yet. `main_test.ts` runs every one of them, chained `@query:` refs included, so a
-broken demo is a failing test rather than a broken storefront. The rest are unbuilt, and the point of the list is
-coverage: later passes mine it for the missing features and the datasets worth seeding in the shop.
+Nothing here is finished. What already ships is in `src/examples.mjs` under the `demo` tag, run by `examples_test.ts` in
+both engines — that file is the index, not this list. Some entries below name the query half that ships and the ingest
+half that does not. The point of this list is coverage: later passes mine it for the missing features and the datasets
+worth seeding in the shop. Every one of them dies at the same place, the ingest half, because a seeded table is a feed
+nobody has connected yet.
 
 ### Flagship (best whole-stack stories)
 
@@ -123,19 +114,12 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 - [ ] **Three-statement rolling forecast**: ERP GL `codex` -> `query` actuals by account -> driver-assumption `table` ->
       `query` producing P&L, balance sheet, and cash flow that refresh at each monthly close
-- [x] **Bank reconciliation**: `table:bank-txns` + `table:ledger` -> `query:recon-matches` and `query:recon-exceptions`.
-      The amount matches exactly and the name never does, so the name is scored with `token_set_ratio()` over a memo
-      stripped of its `ACH DEBIT` prefix — the same words in any order score the same, which is what a bank does to a
-      payee. The exceptions sheet is the only half a controller reads. The Plaid hook is open
 - [ ] **Sales commission calculator**: closed-won `net-hook` from CRM -> `query` joining quota, accelerator tiers, and
       clawback rules -> per-rep payout `table`; sell the whole thing as a shop template
 - [ ] **Debt covenant monitor**: GL `codex` -> `query` computing DSCR, leverage, and fixed-charge coverage -> webhook
       alert when any ratio lands inside a warning band before the quarter closes
 - [ ] **FX exposure and hedge sizing**: rate `portal` + open-invoice `table` by currency -> `query` net exposure per
       currency with suggested forward notional
-- [x] **Cap table and exit waterfall**: `table:cap-table` -> `query:preference-stack` -> `query:exit-waterfall`, which
-      walks the preference stack in seniority order and sets each holder's preference against what the same stake is
-      worth converted. One exit valuation, not a range: that needs query parameters
 - [ ] **Overhead allocation**: headcount, square footage, and machine-hour `table`s -> `query` allocating shared cost
       pools to cost centers with a switchable allocation basis
 - [ ] **Revenue recognition (ASC 606)**: contract `table` with performance obligations -> `query` producing the monthly
@@ -152,8 +136,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
       entry/exit bands. `table:pair-prices` -> `query:pair-spread` -> `query:pair-zscore` ships the rolling band and the
       entry signal off a 10-day window frame, with the band width read from `@table:assumptions.entry_z`; the live price
       portal and the alert hook are open
-- [x] **Trade priced as of its execution**: `table:trades` + `table:pair-prices` -> `query:asof-price`, an as-of join in
-      one statement. A Saturday fill prices off the Friday close, and `days_stale` says how far back that reached
 - [ ] **Options chain screener**: chain `net-http` -> `query` filtering IV rank, spread width, and days-to-expiry ->
       candidate `table` refreshed intraday
 - [ ] **Crypto treasury view**: exchange balance `net-hook` + on-chain `net-http` -> `query` consolidated position, cost
@@ -165,17 +147,8 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Healthcare
 
-- [x] **Claim denial triage**: `table:remittances` + `table:carc` -> `query:denial-triage` ranks the appeal queue by
-      recoverable dollars, and `query:denial-rate` reads the same file by place of service through `table:pos-codes`.
-      The CARC table carries an `appealable` column, which is the whole triage: a deductible is the patient's to pay and
-      an absent authorization is the practice's to fix. `chart:denial-rate` and `dashboard:revenue-cycle` draw it. The
-      835 hook is open
 - [ ] **Hospital price transparency comparison**: machine-readable price file `net-http` across N hospitals -> `query`
       normalizing negotiated rates per CPT -> a shop dataset nobody else has cleaned
-- [x] **Clinic no-show and overbooking**: `table:appointments` -> `query:no-show-lead` bins lead time with
-      `width_bucket()` and `chart:no-show-lead` draws the histogram, `query:no-show-provider` cuts the same rows by
-      provider and slot, and `dashboard:clinic-front-desk` puts both on one page. A slot booked seven weeks out is a
-      different product from one booked tomorrow. The EHR codex is open
 - [ ] **Medicare PS&R reconciliation**: scheduled PS&R report pull -> `query` against the internal patient log ->
       variance `table` for the cost report
 - [ ] **Drug shortage exposure**: FDA shortage feed `net-http` + formulary/inventory `table` -> `query` at-risk items
@@ -190,10 +163,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Insurance
 
-- [x] **IBNR loss triangle**: `table:claim-devel` -> `query:loss-triangle` pivots cumulative paid into the triangle and
-      `query:loss-factors` derives the development factors from every year that has both periods. The short rows on
-      recent accident years are the point: those months have not happened, and the missing corner is what a reserve is.
-      Selecting a tail factor and carrying a young year to ultimate is open
 - [ ] **Catastrophe exposure**: storm track `portal` + geocoded policy `table` -> `query` total insured value inside the
       cone, refreshed as the track updates
 - [ ] **Producer commission reconciliation**: carrier statement `net-hook` -> `query` against the book of business ->
@@ -205,31 +174,15 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 - [ ] **Docket watch**: court RSS/PACER `net-http` -> `query` matching client and adverse-party names -> alert `table`
       with new filings each morning
-- [x] **Contract obligation calendar**: `table:contracts` -> `query:notice-calendar`. The deadline is not the term end —
-      it is the notice window before it, and a renewal nobody wanted is what a passed notice date buys. The date the
-      reader stands on is `@table:assumptions.as_of`, so one cell moves the whole calendar. The webhook into the firm
-      calendar is open, though `GET /export/:id.ics` already builds a feed from the date column
 - [ ] **Realization and write-off analysis**: practice-management `codex` -> `query` realization by matter, partner, and
       client -> the table that drives rate discussions
 - [ ] **Entity and lien monitoring**: Secretary of State `net-http` -> `query` detecting officer changes, new liens, and
       status lapses across a client portfolio
 - [ ] **Patent landscape**: USPTO/EPO `net-http` -> `query` CPC class counts by assignee over time -> a whitespace map
-- [x] **Conflict check**: `table:matters` + `table:matter-parties` -> `query:conflict-check` scores every adverse name
-      against every client on another matter, and `query:conflict-nicknames` catches the ones a fuzzy match alone
-      misses: "Bill Achebe" against "William Achebe" scores 0.35, under any threshold anyone would set, and unfolding
-      the short form through `table:nicknames` makes it 1.0. A missed conflict is not a bad search result, it is a
-      disqualification
 - [ ] **Discovery volume and cost tracking**: vendor invoice `net-hook` -> `query` cost per GB per custodian
 
 ### Real Estate
 
-- [x] **Rent roll vs market comps**: `table:rent-roll` + `table:listings` -> `query:below-market`, where what makes a
-      listing comparable is `haversine_km(...) <= 2` and the same bed count — a number in the query rather than a
-      neighbourhood somebody drew on a map. The listing feed is still a seeded table, not a `net-http` pull
-- [x] **Parcel and zoning screen**: `table:parcels` + `table:zoning-districts` -> `query:buildable-sites`, whose join
-      predicate is the geometry itself: `point_in_polygon(p.lat, p.lon, z.boundary)`, because nothing on a parcel row
-      says which district's rules apply to it. `query:district-area` measures the same polygons with
-      `polygon_area_km2()`. The parcel codex is open
 - [ ] **Property tax appeal**: assessor `net-http` -> `query` assessment-to-sale ratio against comparables -> appeal
       packet `table`
 - [ ] **Construction draw request**: budget `table` + invoice `net-hook` -> `query` percent-complete draw schedule the
@@ -257,11 +210,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 - [ ] **OEE by line**: PLC/MES count `net-hook` -> `query` availability x performance x quality -> shift `table` with
       the top loss reason
-- [x] **SPC control charts**: `table:measurements` -> `query:spc-limits` -> `query:spc-chart` -> `query:spc-violations`,
-      which reports both alarms at once: a point beyond three sigma, and eight in a row on one side via a `qualify` over
-      a trailing window. The second one is why the first is not enough — a drifting line widens its own limits until the
-      loud test never fires. The limits sheet carries a median and a MAD beside the mean and sigma, because an excursion
-      inflates the very spread it is measured against. The measurement hook is open
 - [ ] **Multi-level BOM cost roll-up**: component `table` -> recursive `query` exploding the BOM with current purchase
       prices
 - [ ] **Supplier quality scorecard**: receipt/inspection `codex` -> `query` PPM defective, on-time, and cost of poor
@@ -281,10 +229,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
       quarantine `table`
 - [ ] **Tariff and trade rule change impact**: Federal Register `net-http` -> `query` affected HTS codes joined to the
       active SKU list
-- [x] **Freight invoice audit**: `table:freight-invoices` + `table:carrier-rates` -> `query:freight-overcharge`, which
-      recomputes each invoice from the contract — the minimum charge is a floor, not a rate, so it is a `case` and not a
-      `max()` — and keeps what is left over as the claim. `chart:freight-overcharge` ranks them. The carrier hook is
-      open
 
 ### Retail & E-commerce
 
@@ -292,10 +236,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
       `table` pushed back out by webhook
 - [ ] **Marketplace settlement reconciliation**: Shopify/Amazon payout `net-hook` -> `query` fee-by-fee vs expected ->
       dispute `table`
-- [x] **Cohort LTV and payback**: `table:orders` -> `query:cohort-retention` -> `query:cohort-grid`. The cohort is
-      derived rather than stored — a customer belongs to the month of their first order — which needs `min_text()`,
-      since AlaSQL's own `min()` drops a date held as text and the column comes back empty. The grid is a pivot.
-      Contribution margin and the payback month itself are open, and so is the order codex
 - [ ] **Multi-channel inventory allocation**: channel demand `table` -> `query` allocating constrained stock by margin
       and velocity
 - [ ] **Return abuse detection**: return `net-hook` -> `query` outlier return rate per customer and per SKU
@@ -321,10 +261,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
       site -> underperformer `table` ranked by lost revenue
 - [ ] **Demand response event**: grid signal `portal` -> webhook shedding loads -> `query` measuring realized
       curtailment against the baseline for settlement
-- [x] **Well decline curves**: `table:well-production` -> `query:decline-fit`, which fits the exponential case with
-      `fit_exponential()` and reads the rate back at 24 and 36 months. Exponential is the curve a log transform
-      straightens; a true hyperbolic fit needs nonlinear least squares, and EUR needs an economic limit, so both are
-      open — as is the state production pull
 - [ ] **Utility bill audit**: bill `net-hook` -> `query` recomputing the tariff -> billing-error `table` and a
       rate-switch recommendation
 - [ ] **Scope 1/2/3 carbon inventory**: activity `table` + emission factor `net-http` -> `query` inventory with factor
@@ -332,10 +268,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Agriculture
 
-- [x] **Yield per input dollar**: `table:fields` + `table:hardiness-zones` -> `query:field-margin`, with
-      `chart:field-margin`. The zone joins in as a published temperature band rather than as a label, because comparing
-      a field in 6a to one in 5a on yield alone credits the hybrid for the winter. The weather feed and growing degree
-      days are open
 - [ ] **Irrigation scheduling**: soil moisture `net-hook` + evapotranspiration `portal` -> `query` next irrigation by
       zone
 - [ ] **Grain marketing and hedge ratio**: CME futures `portal` + bushels-on-hand `table` -> `query` basis, hedged
@@ -349,9 +281,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
 - [ ] **Budget vs actual burn rate**: checkbook `net-http` -> `query` department burn against adopted budget with a
       year-end projection
 - [ ] **Permit backlog**: permit portal `net-http` -> `query` median days to issue by type and reviewer
-- [x] **311 hotspot analysis**: `table:service-requests` -> `query:311-hotspots`, which groups by `geohash(lat, lon, 6)`
-      — a fixed box on the earth, so two runs agree and two categories in the same cell are genuinely the same place. It
-      is a hotspot map without a spatial index or a map. The 311 feed is open
 - [ ] **Campaign finance network**: FEC `net-http` -> `query` donor overlap between committees -> shareable graph table
 - [ ] **Lobbying vs voting record**: disclosure `net-http` + roll call `net-http` -> `query` correlating spend to votes
 - [ ] **Public records request tracker**: intake `net-hook` form -> `query` statutory deadline -> webhook reminder
@@ -360,9 +289,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Education
 
-- [x] **Room and instructor conflict finder**: `table:sections` -> `query:schedule-conflicts` and `query:over-capacity`.
-      The overlap is a self-join on `a starts before b ends and b starts before a ends`, over the same room or the same
-      instructor, and it costs nothing to run in August — which is the only month it can still be fixed in
 - [ ] **Grant effort reporting**: payroll `codex` -> `query` effort % vs award commitment per investigator
 - [ ] **Early-warning student risk**: LMS `net-hook` -> `query` attendance, submission, and grade slope -> advisor
       worklist
@@ -375,10 +301,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 - [ ] **Grant opportunity pipeline**: Grants.gov `net-http` -> `query` scoring fit by eligibility and keyword ->
       go/no-go `table`
-- [x] **LYBUNT / SYBUNT donor lists**: `table:gifts` -> `query:lybunt` and `query:donor-retention`. The list is defined
-      by an absence — gave last year, has not given this one — so it comes out of a having clause over the last gift
-      date rather than out of any row, and needs `max_text()`, since AlaSQL's own `max()` drops a date held as text and
-      would answer with nothing at all. The gift codex is open
 - [ ] **Form 990 peer benchmarking**: IRS 990 XML `net-http` -> `query` program-expense ratio and comp benchmarks
       against peers
 - [ ] **Program outcome reporting**: intake `net-hook` form -> `query` producing the exact table each funder demands
@@ -397,10 +319,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Music & Entertainment
 
-- [x] **Royalty statement normalization**: `table:royalties` -> `query:royalties-long` -> `query:writer-payouts`. A DSP
-      statement arrives with a column per service, which is the wrong shape for every question anyone asks of it;
-      `unpivot` turns it into one row per service, and only then can a split be applied. Reading a dozen different
-      statement shapes is the open half — this demo starts from one that is already parsed
 - [ ] **Tour routing and gross potential**: venue `table` + ticket sales `portal` -> `query` routing distance, capacity,
       and settlement projection per night
 - [ ] **Catalog and setlist analytics**: Setlist.fm `net-http` -> `query` song performance frequency vs streaming lift
@@ -412,9 +330,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 - [ ] **Player efficiency model**: box score `net-http` -> `query` per-possession metrics and rolling form -> rankings
       `table`
-- [x] **Model vs market edge**: `table:game-odds` -> `query:market-edge`. A decimal price implies a probability, and the
-      edge is what the model believes times what the price pays, minus the stake. Most of the apparent edges are the
-      vig; the ones that survive it are the list. The live odds portal is open
 - [ ] **Athlete load management**: wearable `net-hook` -> `query` acute:chronic workload ratio -> flag `table` for the
       trainer
 - [ ] **Youth league scheduling**: team, field, and official `table`s -> `query` producing a conflict-free schedule with
@@ -428,9 +343,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
       already read
 - [ ] **Instrument run QC**: instrument `net-hook` -> `query` control-sample pass/fail with drift detection -> rerun
       queue
-- [x] **Lab inventory and reagent expiry**: `table:reagents` -> `query:reagent-reorder`, which answers two questions of
-      one shelf — what expires soon, and what has fallen under its reorder point — and names which of the two each row
-      is. The reagents that are both are the order to place today. An `alert` sheet over it would send the mail
 - [ ] **Variant annotation**: variant `table` -> `query` joined against a ClinVar `codex` -> annotated report
 - [ ] **Field survey collection**: mobile `net-hook` form -> `query` validating observations -> a citable dataset
       published to the shop
@@ -444,10 +356,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
 - [ ] **SERP rank tracking**: SERP `net-http` -> `query` rank deltas, cannibalization, and lost-featured-snippet alerts
 - [ ] **Multi-touch attribution**: event `net-hook` -> `query` over ordered touchpoint sequences with a switchable model
 - [ ] **Influencer and affiliate ROI**: promo code `net-hook` -> `query` incremental revenue per creator
-- [x] **Experiment readout**: `table:experiment` -> `query:experiment-lift`, which reports conversion and revenue per
-      user side by side with a Welch p-value on each, because the two do not have to agree and reporting only the one
-      that moved is how an experiment lies. Each arm is read out by its own subquery: `array()` keeps the nulls that a
-      `case when` would leave behind. A switchable stopping rule is open
 - [ ] **Content calendar to performance**: plan `table` joined to analytics `query` so the calendar grades itself
 
 ### Sales & CRM Ops
@@ -463,11 +371,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### HR & Recruiting
 
-- [x] **Comp bands and pay equity**: `table:employees` + `table:comp-bands` -> `query:compa-ratio` and
-      `query:pay-equity`. The mean salaries of the two cohorts are within a rounding error of each other and the
-      compa-ratios are not, because one sits in higher-paying roles — which is exactly why the band is the thing to
-      compare against, and why a headline average is the number that hides a gap rather than the one that finds it.
-      `t_test()` says how much of what is left a coin could have produced. The employee codex is open
 - [ ] **Applicant funnel**: ATS `net-hook` -> `query` pass-through rate by stage and source, time-to-fill by role
 - [ ] **Headcount plan vs actual**: plan `table` -> `query` feeding the finance forecast directly, no re-keying
 - [ ] **Immigration and certification dates**: `table` -> `query` upcoming expirations -> webhook to HR and the employee
@@ -477,10 +380,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
 ### Software & DevOps
 
 - [ ] **Incident metrics**: alert `net-hook` -> `query` MTTA/MTTR by service and severity -> reliability review `table`
-- [x] **Cloud cost anomaly**: `table:cloud-spend` -> `query:cost-anomaly`, scoring each day against its own service's
-      median and MAD rather than its mean and sigma — a month containing a sevenfold spike drags both of those toward
-      the spike until the day stops looking unusual. `query:cost-by-region` joins the same rows to
-      `table:cloud-regions`. The billing export and the owner routing are open
 - [ ] **CVE exposure**: OSV feed `net-http` + SBOM `table` -> `query` affected services ranked by exploitability and
       blast radius
 - [ ] **DORA metrics**: deploy and incident `net-hook` -> `query` deploy frequency, lead time, change failure rate
@@ -491,9 +390,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Transportation & Aviation
 
-- [x] **Fleet cost per mile**: `table:fleet-legs` -> `query:cost-per-mile`. The miles are not on the row: each leg names
-      two airports, and the distance is a great circle over the coordinates in `table:airports`, which is what makes the
-      spine worth shipping. The telematics hook is open
 - [ ] **Hours-of-service compliance**: ELD `net-hook` -> `query` violations and near-violations before dispatch
 - [ ] **Flight ops on-time analysis**: ADS-B `portal` + schedule `table` -> `query` tail utilization, turn time, and
       delay cause
@@ -511,10 +407,6 @@ coverage: later passes mine it for the missing features and the datasets worth s
 
 ### Household & Personal
 
-- [x] **Envelope budgeting**: `table:household-spend` + `table:mcc-ranges` + `table:envelopes` ->
-      `query:envelope-budget`, with `chart:envelope-spend` and `dashboard:household-month`. The category is not on the
-      transaction: the bank sends a four-digit MCC, and which envelope that is comes from the range it falls in, so the
-      join is a between rather than an equals. The bank hook is open
 - [ ] **Job search tracker**: application `table` + posting `net-http` -> `query` stale applications and follow-up dates
 - [ ] **Renovation bid comparison**: bid `table` -> `query` normalized line-by-line comparison with scope gaps flagged
 - [ ] **Collection catalog**: records, books, or plants `table` + price `net-http` -> `query` current value and gaps
@@ -536,35 +428,14 @@ The single biggest gap. Most demos die here first.
 - [ ] **min()/max() over text**: AlaSQL compiles both inline, restricted to numbers and dates, and drops a text value,
       so `min(code)` returns nothing. `min_text()`/`max_text()` are the workaround and `checkResultColumns()` names the
       case; a real fix is upstream
-- [x] **Window functions**: our own evaluation pass in `src/sql.mjs`, so AlaSQL never sees an `over (...)` clause.
-      `rewriteWindows()` lifts each window out of the top-level select list and appends the plain columns it reads;
-      `applyWindows()` computes it over the rows the engine returns. Ranking, offset and aggregate functions with
-      `rows`/`range` frames, peer-correct defaults, `ignore nulls` on the five functions that return a row's own value —
-      which is what makes `last_value(x) ignore nulls` a forward fill — and the row limit re-applied after the window
-      rather than before. A window buried in an expression or a subquery is refused by name rather than answered with
-      zeros
 - [ ] **Timezone-correct timestamps**: store UTC, render local, never guess the zone
-- [x] **Pivot and unpivot**: `pivot (sum(x) for col)` is AlaSQL's own and works; an in-list of quoted strings matches
-      nothing and answers with zero rows, so `checkPivot()` refuses it by name. `unpivot (value for name in (a, b))` is
-      ours: AlaSQL parses it and then drops every column it is not unpivoting, so `rewriteUnpivot()` expands it into the
-      `union all` it means, reading the wide column names off the sheet's own type row. The source has to be a `@sheet`
-      for that reason, and a subquery is refused rather than half-answered
 - [ ] **Lateral joins and correlated subqueries**: AlaSQL cannot parse `lateral` at all. As-of joins no longer depend on
       it — `qualify` covers that case — but top-N-per-group over an expensive subquery still materializes everything
-      first. A scalar subquery in an expression does work, which is what a cell reference is built on
-- [x] **As-of / temporal joins**: `qualify` does it in one statement — join every candidate row, then keep the newest
-      per fact:
-      `join @table:prices p on p.ticker = t.ticker and p.day <= t.traded_on qualify row_number() over
-    (partition by t.trade_id order by p.day desc) = 1`.
-      `query:asof-price` is the worked demo. The candidate pairs are still materialized before the filter, so a
-      dedicated `asof join` that walks two sorted inputs is open
-- [x] **Query parameters**: `@type:doc_id.column` is a cell — the one value in that column of a one-row sheet. It
-      becomes a scalar subquery, so nothing is spliced into the SQL as a literal and nothing needs escaping, and a sheet
-      that does not hold exactly one row is refused rather than read arbitrarily. `table:assumptions` drives four demos:
-      the aging date, the exit valuation, the entry band and the prime-cost target are one cell each. Binding the other
-      way — a sheet called with arguments, `@query:foo(x)` — is open
-- [x] **Deterministic ordering**: unordered results must not shuffle between runs. `/library` had no `order by` at all
-      and `/shop` ordered by a non-unique `name`; both now carry a unique tiebreaker, as the `net` read already did
+      first. A scalar subquery in an expression does work, which is what a cell reference is built on (partition by
+      t.trade_id order by p.day desc) =
+      1`.`query:asof-price`is the worked demo. The candidate pairs are still materialized before the filter, so a
+      dedicated`asof
+      join` that walks two sorted inputs is open
 - [ ] **Strict null semantics**: distinguish null, empty string, and zero everywhere; no silent coercion
 - [ ] **Typed query output**: query results carry column types forward, not strings
 - [ ] **Materialized query results**: cache with an explicit refresh, so a 40-sheet dependency chain is not re-run per
@@ -572,12 +443,7 @@ The single biggest gap. Most demos die here first.
 - [ ] **Incremental query execution**: recompute only what changed since the last run
 - [ ] **Chunked / larger-than-memory execution**: a million-row join should not need a million rows in the tab
 - [ ] **Predicate pushdown to codex**: filter on the external database, not after transferring the whole table
-- [x] **Query timeouts and cost guards**: `checkQueryRows()` caps the rows one query may load across every `@sheet`,
-      which is the guard that actually stops a runaway; `MAX_QUERY_MS` bounds how long the caller waits. A real timeout
-      needs the engine in a worker — a single-threaded engine cannot be preempted, so the work still finishes
 - [ ] **Explain / profile**: show which step is slow and how many rows each stage produced
-- [x] **Schema introspection**: `describe @table:abc` in both engines, answering column/type/rows/nulls/sample. A
-      browsable column list in the editor is still missing
 - [ ] **@sheet autocomplete**: suggest sheets and columns as the user types, from the real schema
 - [ ] **Saved query snippets / UDFs**: reusable named expressions across sheets (leads into Scrapscript)
 
@@ -585,27 +451,14 @@ The single biggest gap. Most demos die here first.
 
 Per house style, an ambiguous error is the worst bug in the system.
 
-- [x] **Values a message could not name**: `JSON.stringify()` renders `Infinity` and `NaN` as `null`, so every UDF
-      refusing a non-finite number said "received number null" — which names neither the value nor the problem. `show()`
-      prints them by name now, and it is the one formatter every UDF message goes through
-- [x] **Type mismatch explanation**: `checkColumnTypes()` rejects a non-numeric value in a numeric column as the sheet
-      loads, naming the declared type, the value and the row
-- [x] **Fetch failures with a repro**: `fetchFailure()` gives status, resolved URL, content type, body snippet and a
-      curl line, in the `net` log and from `/proxy`. Header values are never echoed: they may carry a token
-- [ ] **Webhook rejection detail**: which signature header failed, expected vs received, clock skew if relevant. Blocked
-      on signature verification, which does not exist. The rejections that do exist — unknown sheet, non-net sheet,
-      oversize body — each name what they received
-- [x] **Permission denials that teach**: the denial names the sheet, whether it exists, how access is granted, and the
-      exact `/share` or `/public` call. Deliberately not the owners' emails: any user can name any sheet_id
-- [x] **Import failures with the bad row**: a CSV row that does not match its header is rejected with the line, both
-      field counts, the raw text and the column it stops at. Inference now needs every value to parse, not four in five
-- [x] **The engine's own dropped message**: AlaSQL discards an exception thrown from a function while a subquery in the
-      from clause is being computed, and reports "Cannot read properties of null (reading 'data')" from somewhere else
-      entirely — the careful message saying what was actually wrong is gone before it reaches us. `formatQueryError()`
-      replaces that with one that names what happened and says how to read the real one. It also names the other case a
-      function receives nothing: AlaSQL evaluates a `group by` expression against an empty row, so
-      `group by date_trunc(...)` reads as a column-name typo unless the message says otherwise
-- [ ] **Error sheet**: every failure lands in a queryable log rather than a toast that disappears
+- [ ] **A failed decode says which field failed**: `ShareLoad` reports a bad `hook` answer, but `members` still falls
+      back to the last list it decoded, so a stale member list can be shown as current — a permissions UI lying about
+      permissions.
+  1. Decode `members` strictly and route the `D.Error` through `error`, the way the `hook` branch does.
+- [ ] **A failure the user can see**: every failure lands in `net-hook:errors`, which is the operator's sheet — nobody
+      else can read it, and a toast is still all a user gets. A per-user error log is the open half.
+  1. Decide where a user's failures live: their own sheet is a sheet per account, which is a lifecycle nobody wants.
+  2. More likely: `net-hook:errors` gains the `usr_id` that caused it, and the read filters on it.
 
 ### Types & validation
 
@@ -654,10 +507,6 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
 ### Charts & dashboards
 
-- [x] **Chart sheet type**: `chart:<doc_id>` holds a source ref, a kind and the two columns to plot. `chartSql()` in
-      `src/sql.mjs` turns that into one query both engines build identically, so `GET /sheet/chart:abc` and
-      `/export/chart:abc.csv` return exactly the rows the page draws. Only a column name reaches the SQL: anything else
-      is refused by name rather than concatenated in
 - [ ] **Core chart set**: line, bar, stacked bar, area, scatter, box plot. Line and bar ship, drawn as SVG from
       `elm/svg`, with the baseline pinned to zero unless the data goes below it — a bar chart that starts anywhere else
       misstates every comparison on it. A row whose y is not a number is dropped rather than read as zero. **Histogram
@@ -668,17 +517,8 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 - [ ] **Maps**: point maps and choropleths driven by a geo column
 - [ ] **Heatmap and matrix charts**: cohort grids and loss triangles read naturally as heatmaps
 - [ ] **KPI tiles**: single number with a delta and a sparkline
-- [x] **Dashboard sheet type**: `dashboard:<doc_id>` names the sheets to show, one reference per line, and lays them out
-      as a responsive grid in which each tile is that sheet embedded. Nothing in the dashboard knows how to draw a chart
-      or a table, because the sheet it names already does — which is the whole reason a chart is a sheet. The cost is
-      one page per tile; a dashboard cannot hold a dashboard, because that nests until the browser gives up. KPI tiles
-      need the tile type that does not exist yet
 - [ ] **Chart annotations**: mark an event on the axis (a release, a price change, a storm)
 - [ ] **Dual axis and secondary series**
-- [x] **Export chart as PNG/SVG**: the `svg` and `png` buttons on a chart serialize the SVG already on screen — nothing
-      is drawn a second time, so the saved chart cannot drift from the shown one. The PNG is that SVG painted onto a
-      canvas at twice the viewBox, on white, because a transparent chart on a dark slide is an invisible one
-- [x] **Chart embeds**: the same `?embed=1` every other sheet uses, which is what makes a dashboard tile a chart
 
 ### Ingest — net-http
 
@@ -702,9 +542,17 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
 ### Ingest — net-hook & forms
 
-- [ ] **Signature verification**: HMAC verification per provider (Stripe, Shopify, GitHub, Slack, generic)
-- [ ] **Secret rotation**: two live secrets during a rollover
-- [ ] **Replay protection**: timestamp window plus delivery-id dedupe
+- [ ] **You send a Stripe or GitHub webhook straight at a sheet**: ours is one scheme, and every provider signs its own
+      way, so today a hook has to be relayed by something that re-signs it.
+  1. Read the provider off the sheet's config, not off the request: a spoofed header must not pick the verifier.
+  2. Verify Stripe's `stripe-signature`, GitHub's `x-hub-signature-256` and Shopify's base64 HMAC against a stored
+     secret. That is the point a secret store stops being optional — a shared secret cannot be derived.
+- [ ] **You rotate a hook's secret without a missed delivery**: `hookSecret()` derives from `TOKEN_SECRET`, so today
+      rotating one sheet rotates every sheet.
+  1. Accept two secrets during a rollover, and record which one a delivery verified against.
+- [ ] **A captured delivery cannot be replayed**: the `HOOK_SKEW` window bounds it to five minutes, which is not the
+      same as never.
+  1. Store the delivery id (or the signature) per sheet and refuse a repeat, bounded the way `trimNet` bounds a log.
 - [ ] **Payload mapping**: JSON path -> column mapping, so a webhook lands as typed rows not a blob
 - [ ] **Filters**: drop events that do not match a predicate before they hit the table
 - [ ] **Dead-letter table**: malformed payloads are kept and inspectable, never dropped
@@ -783,27 +631,18 @@ Phase 2 has the runner. These are what the demos need on top of it.
 
 ### Alerts & notifications
 
-- [x] **Alert sheet type**: `alert:<doc_id>` holds a query, an email address and an interval. It fires when the query
-      returns a row, so the condition is the query's own where clause and there is no second expression language.
-      `pollAlertOnce` runs it through `POST /query` as the sheet's owner, so an alert can never read what its owner
-      cannot. An alert cannot be listed for sale: a copy would mail the seller's address on the buyer's timer
 - [ ] **Threshold, change, and anomaly conditions**: value crosses X, value changed by Y%, value outside its usual band.
       Threshold and change are a where clause over a query that already has window functions; an anomaly band needs the
       forecasting work in **Stats & modeling**
-- [x] **New-row and removed-row alerts**: each run keeps the rows it matched, up to `ALERT_ROWS`, so the next one
-      records `added` and `removed` against them and the email leads with what is new rather than repeating the whole
-      set. Past that cap the run says why it could not diff instead of reporting a number it cannot stand behind
 - [ ] **Destinations**: email, SMS, Slack, Discord, Teams, webhook, push. Email ships, through the Resend key the signup
       flow already uses; a refusal from Resend is recorded on the alert rather than swallowed
-- [x] **Digest vs immediate**: an alert marked `digest` records its run and holds the email; `sendDigestOnce` mails one
-      summary per account per day carrying every held run since the last one, to the account address rather than the
-      alert's own. The watermark moves whether or not the send worked — every run is still on its own sheet, and
-      retrying a summary forever is worse than missing one
-- [x] **Flap suppression and dedupe**: only a run whose answer differs from the last recorded one is sent, compared by
-      digest. The digest is read back out of the alert's own log, so a restart does not re-send
+- [ ] **You can tell a quiet alert from a dead one**: `pollAlertOnce` records a run only when the answer changed, so a
+      stable alert writes nothing for days and a `setInterval` that died writes nothing either. `GET /status` therefore
+      cannot grade alert liveness at all, the way it grades net-http freshness.
+  1. Record every run, not only the ones that changed, with `status = 'unchanged'`; the de-dupe already reads the last
+     row, so it keeps working.
+  2. Then add the status condition: every alert sheet ran within twice its interval.
 - [ ] **Snooze, acknowledge, and escalate**
-- [x] **Alert history**: every run that changed the answer lands in `net` as a row on the alert sheet — status, row
-      count, the first five matches and what the delivery did. `select * from @alert:abc` reads it like any other log
 - [ ] **Subscribe to a sheet**: get told when a sheet you follow changes, without owning it
 
 ### Actions & write-back
@@ -842,19 +681,10 @@ The Excel add-in market lives here (see the add-in research item).
 - [ ] **Forecasting**: `regr_predict()` is the straight-line baseline and `fit_exponential()` the log-linear one.
       Seasonal decomposition is open, and it needs a series-to-series function, which neither the aggregate protocol nor
       the window pass can express today
-- [x] **Anomaly detection**: `mad()` and `robust_z()` score a value against a median and a median absolute deviation
-      rather than a mean and a standard deviation, so the outlier being measured cannot widen the ruler it is measured
-      against — which is what a z-score gets wrong on exactly the day that matters. `query:cost-anomaly` and
-      `query:spc-violations` are the worked demos. Seasonal awareness is open and waits on the forecasting line
 - [ ] **Monte Carlo simulation**: distributions on input cells, sampled outputs, percentile results (the @RISK slot)
 - [ ] **Sensitivity and tornado analysis**: which input moves the output most
 - [ ] **Scenario manager**: named sets of assumptions, compared side by side
 - [ ] **Goal seek and solver**: constrained optimization over a sheet
-- [x] **Significance tests and confidence intervals**: `t_test()` is Welch's two-sample test — neither equal sizes nor a
-      shared variance assumed, because the version that assumes them is the one that reports a difference that is not
-      there — and `ci_low()`/`ci_high()` give the mean's t-based interval, so eight rows widen it instead of reporting
-      the precision of eight hundred. Both go through one Student-t CDF, tested against published values. Proportion
-      tests and multiple-comparison correction are open
 - [ ] **Clustering and segmentation**
 - [ ] **Cohort and retention helpers**: `query:cohort-retention` and `query:cohort-grid` are the worked SQL, which is
       the thing to generalise from — deriving the cohort from the first order, then a pivot. A helper that writes it is
@@ -877,9 +707,6 @@ The Excel add-in market lives here (see the add-in research item).
       the decision it is feeding. A ring that crosses the antimeridian is refused rather than answered inside out.
       Drive-time does not exist and nothing reprojects
 - [ ] **Boundary datasets as sheets**: counties, tracts, ZCTAs, districts, custom territories
-- [x] **Geohash indexing**: `geohash(lat, lon, precision)` in both engines, so `group by geohash(lat, lon, 5)` is a
-      hotspot map without a spatial index — the cells are fixed, which is what makes two runs agree.
-      `query:311-hotspots` is the worked demo. H3 is a different tiling and is open
 - [ ] **Map rendering**: points, choropleths, and heatmaps in a chart sheet
 
 ### AI & MCP
@@ -901,9 +728,6 @@ The Excel add-in market lives here (see the add-in research item).
 - [ ] **PDF report generation**: a print layout with headers, page breaks, and a title page
 - [ ] **Scheduled report delivery**: emailed on a schedule with the file attached
 - [ ] **Report templates**: prose plus live sheet embeds, so the narrative regenerates with the numbers
-- [x] **Download endpoint**: `GET /export/:id.csv` and its four siblings, each with a `Content-Disposition` filename
-- [x] **iCal feed**: `GET /export/:id.ics` builds a VEVENT per row from the first `date`/`timestamp` column, all-day for
-      a date-only value. Not yet subscribable: the URL needs a token, since a calendar client sends no `Authorization`
 
 ### Permissions & governance
 
@@ -916,6 +740,16 @@ Extends the Phase 2 roles work.
 - [ ] **Ownership transfer and offboarding**: what happens to sheets when someone leaves
 - [ ] **Audit log**: reads and writes, exportable, queryable as a sheet
 - [ ] **PII tagging and masking**: mark a column sensitive; masked by default in shares and embeds
+- [ ] **The server refuses to boot without its secrets**: `JWT_SECRET`, `TOKEN_SECRET` and `DSN_ENCRYPTION_KEY` each
+      fall back to `Math.random()` and only warn. `TOKEN_SECRET` is now the root of every webhook signing key, so an
+      unset one re-rolls every sender's secret on each restart, and the delivery is then refused with a message that
+      points at the sender's secret rather than at the server.
+  1. Throw at startup instead of warning; a secret-less boot is not a recoverable state.
+  2. The tests import `main.ts` at module load, so they must set the three variables before the import, or the harness
+     must set them in `deno.json`.
+- [ ] **You read the error log without a psql prompt**: `net-hook:errors` is owned by the seeded sentinel, which has no
+      password and cannot be logged into, so `POST /library/net-hook:errors/share` returns 403 for every real account.
+  1. Have `seed()` grant the owner row to a configured operator address, or add an owner-transfer path.
 - [ ] **Secrets scanning on publish**: refuse to publish a sheet containing an API key
 - [ ] **PII scanning on publish**: warn before a dataset with personal data goes public
 - [ ] **Retention policies and legal hold**
@@ -931,18 +765,10 @@ Extends the Phase 2 roles work.
 - [ ] **Free samples**: preview the first rows before buying
 - [ ] **Dataset changelogs**: what changed in this dataset since last month
 - [ ] **Provenance display**: source URL, license, fetch date, and transformation chain on every published dataset
-- [x] **Fork a sheet**: the toolbar's `fork` copies whatever sheet you are looking at into one of your own, registers
-      it, and writes `forked_from` into the new document, which the toolbar shows as a link back. It works on a bundled
-      example, which is what makes "start from a demo" mean anything. A fork drops the `demo` and `example` tags so it
-      does not turn up in the gallery pretending to be an original
-- [x] **Template gallery**: the library opens with a strip naming every demo pipeline as a link, and every tag in the
-      library as a filter chip — which is also the first thing that tells a reference table from a spine in a flat list.
-      It is built from the library itself, so a new `demo`-tagged sheet appears without a code change. Forking a demo
-      into a sheet of your own is the separate **Fork a sheet** item
 
 ### Marketplace economics
 
-Extends the Phase 1 Stripe work.
+Extends the Stripe Checkout work, which ships platform-side.
 
 - [ ] **Subscriptions**: recurring price for a dataset that keeps updating (the real model for feeds)
 - [ ] **Usage-based pricing and metering**: per query, per row, per API call
@@ -962,9 +788,6 @@ Extends the Phase 1 Stripe work.
 - [ ] **Server-side pagination and virtual scroll**: for sheets too big to send to the browser
 - [ ] **Background computation with progress**: long queries do not block the UI
 - [ ] **Cold row archiving**: keep history without keeping it hot
-- [x] **`net` table retention**: `trimNet()` keeps the newest `NET_KEEP` rows per sheet and runs behind every write —
-      webhook delivery, net-http poll and alert run alike — so a hook firing every second cannot fill the disk. It is a
-      cap on the log, not on the data: a sheet that must keep everything writes to a table, which is never trimmed
 - [ ] **Per-sheet resource metering**: rows, bytes, compute, and fetches, visible to the user before the limit hits
 
 ### Developer surface
@@ -994,6 +817,12 @@ Extends the Phase 3 API work.
 ### Trust, safety & abuse
 
 - [ ] **Per-user quotas**: fetches, rows, storage, and outbound actions
+- [ ] **An anonymous flood cannot outweigh the traffic it replaces**: every 4xx writes a row to `net-hook:errors` and
+      runs `trimNet` behind it, so a rejected request costs two round trips — more than serving it would. The rate
+      limiter keys on `x-forwarded-for`, which the caller sets, so the bucket is free to rotate. A 429 is already exempt
+      from the log; the rest are not.
+  1. Suppress repeats: one row per (status, path) per minute rather than one per request.
+  2. Key the limiter on the connecting address, and trust `x-forwarded-for` only from the proxy in front of us.
 - [ ] **Scraping etiquette controls**: per-host limits and a documented user agent
 - [ ] **Shop moderation**: report a listing, review queue, takedown path
 - [ ] **Source terms compliance**: record whether a dataset may be redistributed before it can be sold
@@ -1032,8 +861,6 @@ should land as a sheet with a stated source, license, update cadence, and proven
       3166 country code; the transition dates themselves are open
 - [ ] **Currencies and FX rates**: daily and historical, plus a live rate portal. `table:currencies` ships the ISO 4217
       codes with symbol and minor units; the rates themselves are the open half
-- [x] **Units of measure**: `table:units` ships mass, length, area, volume, energy, time, pressure and speed as a factor
-      to the SI unit for each quantity, and `table:si-prefixes` the 24 prefixes through quetta and quecto
 - [ ] **Geographic crosswalks**: ZIP <-> county <-> CBSA <-> tract <-> congressional district. `table:zip-ranges` ships
       the three-digit ZIP prefix ranges per state — a ZIP is not a shape and does not nest inside a county, but the
       first three digits land in exactly one state, which is the join an address list actually needs. `table:us-states`
@@ -1047,12 +874,6 @@ should land as a sheet with a stated source, license, update cadence, and proven
       open, and GICS-to-NAICS never maps cleanly: one classifies revenue, the other establishments
 - [ ] **Occupations**: SOC and O*NET codes and descriptions. `table:soc` ships the 23 SOC 2018 major groups; the
       detailed codes and all of O*NET are open
-- [x] **Country, language, and locale codes**: `table:countries` (ISO 3166 alpha-2), `table:languages` (ISO 639-1 with
-      639-3), `table:calling-codes` (E.164 dial, trunk and exit prefixes) and `table:postal-formats` (name, example and
-      a regex per country, including the countries that have no postal code at all)
-- [x] **Name and address normalization tables**: `table:street-suffixes` (USPS Publication 28, standard form plus the
-      variants that must fold into it), `table:company-suffixes` (legal entity suffixes keyed to the country whose
-      company law defines them) and `table:nicknames` (given name to short form, both directions)
 
 ### Economy & government
 
@@ -1149,8 +970,6 @@ should land as a sheet with a stated source, license, update cadence, and proven
       only description a position report carries; the positions are open
 - [ ] **Port throughput and congestion**. `table:containers` ships the ISO 6346 types with the TEU each counts as, which
       is what makes a throughput figure comparable; the throughput itself is open
-- [x] **Incoterms**: `table:incoterms` ships all 11 Incoterms 2020 with who pays carriage, who must insure, who clears
-      the import and where risk passes
 - [ ] **Fuel surcharge basis**: DOE diesel price series
 - [ ] **Carrier registry and safety**: FMCSA SAFER, inspections, crashes
 - [ ] **Air cargo and flight data**: schedules, ADS-B positions, on-time performance. `table:airports` and
@@ -1228,8 +1047,11 @@ Not datasets, but the machinery every dataset above needs to be sellable.
 - [ ] **Dataset manifest**: source URL, license, attribution requirement, cadence, owner, and refresh status per sheet
 - [ ] **Redistribution flag**: whether a source may legally be resold, checked before a listing goes live
 - [ ] **Versioned publishing**: buyers pin a version; a changelog explains each release
-- [ ] **Refresh monitoring**: a dashboard of every seeded dataset and whether its last pull succeeded
-- [ ] **Source rot alerts**: government URLs move constantly; failures must page the maintainer, not rot quietly
+- [ ] **You see which dataset stopped refreshing**: `GET /status` grades the feeds in aggregate — "every net-http poll
+      returned 2xx", "every net-http sheet was polled in the past two hours" — but names none of them, so the alarm says
+      something is rotten without saying what.
+  1. A `dashboard` sheet over a query of `net` grouped by sheet, which needs no new server code.
+  2. Failing that, one condition per feed is the wrong shape: the status check is a fixed list, not a per-row report.
 - [ ] **Normalization conventions**: shared column names, date formats, and code sets across all shop datasets
 - [ ] **Sample and preview generation**: a free first-N-rows sheet for every paid dataset
 - [ ] **Seeding pipeline**: the datasets themselves defined as Scrapsheets pipelines, dogfooding the product
@@ -1280,8 +1102,8 @@ Trains of thought worth chasing; each should end in either a checklist item or a
 Scrapscript (2) is the moat no one can replicate -> pipelines (2) make sheets self-updating -> sheet-as-API (3) makes
 every sheet a microservice.
 
-**What ships at 70%**: Phase 0, MCP, and Stripe Checkout (platform-side) are done. Connect payouts are the remaining
-Phase 1 item. Everything else compounds on top.
+**What ships at 70%**: the foundation, MCP, and Stripe Checkout (platform-side) are done. Connect payouts are the one
+piece of the marketplace still missing. Everything else compounds on top.
 
 **The unique position**: Scrapsheets is not Google Sheets. It is not Airtable. It is a programmable data OS where every
 table is a queryable database, every query result is a shareable table, every portal is a live data stream, every sheet

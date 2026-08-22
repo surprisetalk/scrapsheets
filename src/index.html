@@ -291,6 +291,12 @@
             else if (action === "link") {
               const { data } = await send("/link", "POST", {});
               link = `${location.origin}/${id}?share=${data.token}`;
+            } else if (action === "hook") {
+              // A net sheet's signing secret. It returns here rather than falling
+              // through to the member list: this panel is the aside, not the
+              // settings modal, and it asked one question.
+              const { data } = await send("/hook", "GET");
+              return app.ports.shareLoaded.send({ hook: data });
             }
 
             const { data } = await send("/share", "GET");

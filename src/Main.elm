@@ -6,8 +6,8 @@ port module Main exposing
     , Rect
     , Sheet
     , SortOrder(..)
-    , Table
     , Stat(..)
+    , Table
     , TableBounds
     , chartPoints
     , civilDays
@@ -651,12 +651,15 @@ type Peers
 
 
 {-| Who a sheet is shared with, as last loaded from the server. `link` holds a
-freshly minted view-only URL, shown only after the owner asks for one.
+freshly minted view-only URL, and `hook` a net sheet's signing secret. Both are
+shown only after the owner asks for them: a secret nobody asked for is a secret
+on somebody's screen share.
 -}
 type alias Share =
     { members : List Member
     , public : Bool
     , link : Maybe String
+    , hook : Maybe Hook
     , email : String
     , role : String
     }
@@ -666,9 +669,13 @@ type alias Member =
     { email : String, role : String }
 
 
+type alias Hook =
+    { url : String, secret : String, repro : String }
+
+
 emptyShare : Share
 emptyShare =
-    { members = [], public = False, link = Nothing, email = "", role = "viewer" }
+    { members = [], public = False, link = Nothing, hook = Nothing, email = "", role = "viewer" }
 
 
 type alias Sheet =
@@ -1230,6 +1237,7 @@ type Msg
     | ShareRemove String
     | SharePublic Bool
     | ShareLink
+    | ShareHook
     | ShortcutsToggle Bool
     | SettingsNameChange String
     | SettingsTagsChange String
@@ -1466,7 +1474,7 @@ update msg ({ sheet, auth } as model) =
                 next =
                     route url model
             in
-            ( { next | share = iif next.showSettings next.share emptyShare }
+            ( { next | share = iif next.showSettings (\sh -> { sh | hook = Nothing }) (always emptyShare) next.share }
             , Cmd.batch
                 [ changeId next.id
                 , -- Load the member list the moment the settings modal opens.
@@ -2066,6 +2074,20 @@ update msg ({ sheet, auth } as model) =
             let
                 share =
                     model.share
+
+                hook =
+                    value
+                        |> D.decodeValue
+                            (D.field "hook"
+                                (D.map3 Hook (D.field "url" D.string) (D.field "secret" D.string) (D.field "repro" D.string))
+                            )
+
+                -- Whether a hook was sent at all, which is what separates "this
+                -- payload is about something else" from "the answer arrived and
+                -- could not be read". Without the split, a changed field name
+                -- makes the button do nothing and say nothing.
+                hookSent =
+                    value |> D.decodeValue (D.field "hook" D.value) |> Result.toMaybe
             in
             ( { model
                 | share =
@@ -2076,7 +2098,15 @@ update msg ({ sheet, auth } as model) =
                                 |> Result.withDefault share.members
                         , public = value |> D.decodeValue (D.field "public" D.bool) |> Result.withDefault share.public
                         , link = value |> D.decodeValue (D.field "link" D.string) |> Result.toMaybe |> orElse share.link
+                        , hook = hook |> Result.toMaybe |> orElse share.hook
                     }
+                , error =
+                    case ( hookSent, hook ) of
+                        ( Just _, Err err ) ->
+                            "The signing secret arrived in a shape I could not read: " ++ D.errorToString err
+
+                        _ ->
+                            model.error
               }
             , Cmd.none
             )
@@ -2104,6 +2134,9 @@ update msg ({ sheet, auth } as model) =
 
         ShareLink ->
             ( model, shareAction { id = model.sheet.id, action = "link", email = "", role = "", public = False } )
+
+        ShareHook ->
+            ( model, shareAction { id = model.sheet.id, action = "hook", email = "", role = "", public = False } )
 
         SettingsClose ->
             ( { model | showSettings = False }, Nav.replaceUrl model.nav ("/" ++ model.sheet.id) )
@@ -4814,7 +4847,23 @@ viewNetHook model =
         , H.div [ A.class "mono", S.fontSizeRem 0.8125, S.backgroundColor "#f0f0f0", S.padding "0.5rem", S.borderRadius "4px", S.overflowXAuto ]
             [ text url ]
         , H.button [ A.onClick (CopyText url) ] [ text "copy" ]
-        , H.p [ S.fontSizeRem 0.875, S.color "#666" ] [ text "POST any payload to this URL; rows appear in the table." ]
+        , H.p [ S.fontSizeRem 0.875, S.color "#666" ]
+            [ text "POST to this URL and rows appear in the table. Every delivery must be signed: without a scrapsheets-signature header it is refused, because otherwise anyone who learns this sheet's id can write to it." ]
+        , case model.share.hook of
+            Nothing ->
+                H.button [ A.onClick ShareHook ] [ text "show signing secret" ]
+
+            Just hook ->
+                H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5 ]
+                    [ H.label [ S.fontSizeRem 0.875 ] [ text "signing secret" ]
+                    , H.div [ A.class "mono", S.fontSizeRem 0.8125, S.backgroundColor "#f0f0f0", S.padding "0.5rem", S.borderRadius "4px", S.overflowXAuto ]
+                        [ text hook.secret ]
+                    , H.button [ A.onClick (CopyText hook.secret) ] [ text "copy secret" ]
+                    , H.label [ S.fontSizeRem 0.875 ] [ text "send one" ]
+                    , H.pre [ A.class "mono", S.fontSizeRem 0.75, S.backgroundColor "#f0f0f0", S.padding "0.5rem", S.borderRadius "4px", S.overflowXAuto ]
+                        [ text hook.repro ]
+                    , H.button [ A.onClick (CopyText hook.repro) ] [ text "copy curl" ]
+                    ]
         ]
 
 
