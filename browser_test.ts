@@ -8,7 +8,7 @@
 // view logic lives in tests/MainTest.elm. What nothing covers any more is the
 // boot itself -- Elm initializing, the automerge WASM resolving, a cell being
 // typed into -- and that is a real hole, not an oversight.
-import { assertEquals } from "@std/assert";
+import { assert, assertEquals } from "@std/assert";
 import { serveDir } from "@std/http/file-server";
 
 const dir = new URL(".", import.meta.url).pathname;
@@ -94,6 +94,26 @@ Deno.test("index.html has correct WASM initialization", async () => {
 // src/_redirects is an allowlist ending in `/* / 200`, so an asset that is not
 // listed is served the SPA shell instead of itself. For a module that surfaces
 // only in the browser, as "'text/html' is not a valid JavaScript MIME type".
+Deno.test("every name index.html imports is actually exported", async () => {
+  // src/index.html is the one file with no runtime coverage: nothing boots it,
+  // so a name that moved out of it -- or was never exported in the first place --
+  // fails as a blank page rather than as a test. This is the cheap half of that:
+  // read its import statements and check them against the modules they name.
+  const html = await Deno.readTextFile(dir + "src/index.html");
+  const imports = [...html.matchAll(/import\s*\{([^}]+)\}\s*from\s*"(\/[^"]+\.mjs)"/g)];
+  assert(imports.length >= 2, `expected index.html to import from local modules, found ${imports.length}`);
+
+  for (const [, names, spec] of imports) {
+    const mod = await import("./src" + spec);
+    for (const name of names.split(",").map((n) => n.trim()).filter(Boolean)) {
+      assert(
+        name in mod,
+        `index.html imports { ${name} } from "${spec}", which does not export it`,
+      );
+    }
+  }
+});
+
 Deno.test("every root-absolute asset index.html loads is listed in _redirects", async () => {
   const html = await Deno.readTextFile(dir + "src/index.html");
   const redirects = await Deno.readTextFile(dir + "src/_redirects");

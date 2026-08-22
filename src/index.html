@@ -30,7 +30,17 @@
       import { Repo } from "@automerge/automerge-repo";
       import { IndexedDBStorageAdapter } from "/automerge-repo-idb.mjs";
       import { BrowserWebSocketClientAdapter } from "/automerge-repo-ws.mjs";
-      import { Col, EXAMPLES, Table } from "/examples.mjs";
+      import {
+        atomToJson,
+        docThumb,
+        httpErrorDetail,
+        httpFailure,
+        httpTarget,
+        httpUnparsed,
+        httpUnreachable,
+        library,
+        PARSERS,
+      } from "/page.mjs";
       import {
         applyWindows,
         checkCells,
@@ -104,96 +114,37 @@
           };
         }
 
-        const docThumb = (doc) => {
-          if (doc?.type !== "table" || !Array.isArray(doc.data))
-            return { kind: doc?.type ?? "unknown", cols: 0, rows: 0, spark: [] };
-          const cols = Object.values(doc.data[0] ?? {});
-          let spark = [];
-          for (const col of cols) {
-            const nums = doc.data
-              .slice(1, 21)
-              .map((row) => parseFloat(row[col.key]))
-              .filter(Number.isFinite);
-            if (nums.length < 3) continue;
-            const take = nums.slice(0, 16);
-            const min = Math.min(...take);
-            const max = Math.max(...take);
-            spark = take.map((n) =>
-              Math.round((max === min ? 0.5 : (n - min) / (max - min)) * 1000) / 1000,
-            );
-            break;
-          }
-          return { kind: "table", cols: cols.length, rows: doc.data.length - 1, spark };
-        };
-
         const Library = {
           // Memoized: docThumb over the bundled datasets is too costly per call.
           cache: null,
-          get: () => {
-            if (Library.cache) return Library.cache;
-            const merged = {
-              ...JSON.parse(
-                localStorage.getItem("scrapsheets-library") ?? "{}",
-              ),
-              "": {
-                name: "library",
-                system: true,
-                doc: { type: "library" },
-              },
-              shop: {
-                name: "shop",
-                system: true,
-                doc: { type: "shop" },
-              },
-              ...Object.fromEntries(
-                ["time","stonks","dice","orbit","cafe","forest","words"]
-                  .map(p => [`portal:${p}`, { name: `${p} demo`, system: true, doc: { type: "portal", data: null } }])
-              ),
-              ...EXAMPLES,
-              "table:tutorial": {
-                name: "tutorial",
-                system: true,
-                doc: Table(
-                  ["step::text", "how::text"].map(Col),
-                  ["create a table", "click table:... below"],
-                  ["edit a cell", "click a cell and type"],
-                  ["create a query", "click query:... below"],
-                  ["reference a sheet with @", "type @ in the editor and pick a table"],
-                  ["see live results", "try: select * from @table:countries limit 5"],
-                ),
-              },
-            };
-            return Library.cache = Object.fromEntries(
-              Object.entries(merged).map(([id, entry]) => [
-                id,
-                entry.doc && !entry.thumb
-                  ? { ...entry, thumb: docThumb(entry.doc) }
-                  : entry,
-              ]),
-            );
-          },
+          get: () =>
+            Library.cache ??= library(
+              JSON.parse(localStorage.getItem("scrapsheets-library") ?? "{}"),
+            ),
+          // `stored`, not `library`: the imported library() builds the merged
+          // shelf, and shadowing it here would be a trap for whoever edits next.
           set: (id, info) => {
             for (const i in info) if (info[i] === null) delete info[i];
-            const library = JSON.parse(
+            const stored = JSON.parse(
               localStorage.getItem("scrapsheets-library") ?? "{}",
             );
             localStorage.setItem(
               "scrapsheets-library",
               JSON.stringify({
-                ...library,
-                [id]: { ...library[id], ...info },
+                ...stored,
+                [id]: { ...stored[id], ...info },
               }),
             );
             Library.cache = null;
             app.ports.librarySynced.send(Library.get());
           },
           delete: (id) => {
-            const library = JSON.parse(
+            const stored = JSON.parse(
               localStorage.getItem("scrapsheets-library") ?? "{}",
             );
             localStorage.setItem(
               "scrapsheets-library",
-              JSON.stringify({ ...library, [id]: undefined }),
+              JSON.stringify({ ...stored, [id]: undefined }),
             );
             Library.cache = null;
             app.ports.librarySynced.send(Library.get());
@@ -634,75 +585,11 @@
           };
           // Pull the origin's own words out of an error body so the message names a cause,
           // not just a status code (arxiv hides it in <entry><summary>, most APIs in JSON).
-          const httpErrorDetail = (text, contentType) => {
-            if (/xml/.test(contentType)) {
-              const detail = new DOMParser()
-                .parseFromString(text, "text/xml")
-                .querySelector("entry > summary, error, message")
-                ?.textContent?.trim();
-              if (detail) return detail;
-            }
-            if (/json/.test(contentType)) {
-              try {
-                const body = JSON.parse(text);
-                const detail = body?.error?.info ?? body?.error?.message ?? body?.error ??
-                  body?.message;
-                if (detail) return typeof detail === "string" ? detail : JSON.stringify(detail);
-              } catch { /* not actually json; fall through to the raw body */ }
-            }
-            return text.trim().slice(0, 300) || "(empty body)";
-          };
           alasql.fn.http = (url, qs = {}) => {
-            const atomToJson = (xmlString) => {
-              const parser = new DOMParser();
-              const doc = parser.parseFromString(xmlString, "text/xml");
-              const feed = {
-                title: doc.querySelector("feed > title")?.textContent,
-                updated: doc.querySelector("feed > updated")
-                  ?.textContent,
-                totalResults: parseInt(
-                  doc.querySelector("totalResults")?.textContent || "0",
-                ),
-                entries: [],
-              };
-              doc.querySelectorAll("entry").forEach((entry) => {
-                feed.entries.push({
-                  id: entry.querySelector("id")?.textContent,
-                  title: entry.querySelector("title")?.textContent
-                    ?.trim(),
-                  summary: entry.querySelector("summary")?.textContent
-                    ?.trim(),
-                  published: entry.querySelector("published")
-                    ?.textContent,
-                  updated: entry.querySelector("updated")?.textContent,
-                  authors: Array.from(
-                    entry.querySelectorAll("author name"),
-                  ).map((a) => a.textContent),
-                  links: Array.from(entry.querySelectorAll("link")).map(
-                    (l) => ({
-                      href: l.getAttribute("href"),
-                      rel: l.getAttribute("rel"),
-                      type: l.getAttribute("type"),
-                    }),
-                  ),
-                  categories: Array.from(
-                    entry.querySelectorAll("category"),
-                  ).map((c) => c.getAttribute("term")),
-                });
-              });
-              return feed;
-            };
-            const parsers = {
-              "application/atom+xml": atomToJson,
-            };
             if (!url) return;
-            // Route external URLs through proxy to avoid CORS issues
-            const apiBase = "https://api.sheets.scrap.land";
-            const isExternal = !url.startsWith(window.location.origin) && !url.startsWith(apiBase);
-            const fullUrl = url + "?" + new URLSearchParams(qs);
-            const targetUrl = isExternal
-              ? `${apiBase}/proxy?url=${encodeURIComponent(fullUrl)}`
-              : fullUrl;
+            // Anything that is not ours goes through the server's proxy: the
+            // browser will not allow the request, and the SSRF guard lives there.
+            const { url: targetUrl, full: fullUrl, viaProxy } = httpTarget(url, qs, window.location.origin);
             const request = new XMLHttpRequest();
             request.open(
               "GET",
@@ -713,46 +600,29 @@
             const contentType = request
               .getResponseHeader("Content-Type")
               ?.replace(/;.*$/, "") || "application/json";
-            if (!request.status)
-              throw new Error([
-                `I could not reach this server:`,
-                ``,
-                `  ${fullUrl}`,
-                ``,
-                `The request failed before a response arrived. The host may be down, or it`,
-                `may refuse cross-origin requests.`,
-              ].join("\n"));
+            if (!request.status) throw new Error(httpUnreachable(fullUrl));
             // The proxy forwards the origin status verbatim, so X-Proxy-Status tells
             // us whether the origin or the proxy itself rejected the request.
             if (request.status >= 400)
-              throw new Error([
-                isExternal && !request.getResponseHeader("X-Proxy-Status")
-                  ? `The scrapsheets proxy rejected this request with ${request.status}:`
-                  : `This server responded with ${request.status}:`,
-                ``,
-                `  ${fullUrl}`,
-                ``,
-                `It said:`,
-                ``,
-                `  ${httpErrorDetail(request.responseText, contentType)}`,
-              ].join("\n"));
+              throw new Error(httpFailure({
+                status: request.status,
+                url: fullUrl,
+                body: request.responseText,
+                contentType,
+                rejectedByProxy: viaProxy && !request.getResponseHeader("X-Proxy-Status"),
+              }));
             try {
               return {
                 status: request.status,
-                res: (parsers[contentType] ?? JSON.parse)(request.responseText) || null,
+                res: (PARSERS[contentType] ?? JSON.parse)(request.responseText) || null,
               };
             } catch (err) {
-              throw new Error([
-                `This server sent ${contentType}, which I could not parse:`,
-                ``,
-                `  ${fullUrl}`,
-                ``,
-                `  ${err.message}`,
-                ``,
-                `The response starts with:`,
-                ``,
-                `  ${request.responseText.trim().slice(0, 200) || "(empty body)"}`,
-              ].join("\n"));
+              throw new Error(httpUnparsed({
+                url: fullUrl,
+                contentType,
+                body: request.responseText,
+                message: err.message,
+              }));
             }
           };
           alasql.from.HTTP = (url, qs = {}) => alasql.fn.http(url, qs).res;

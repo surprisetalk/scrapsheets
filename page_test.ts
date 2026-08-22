@@ -15,6 +15,17 @@
 import { assert, assertEquals } from "@std/assert";
 import { JSDOM } from "jsdom";
 import { EXAMPLES } from "./src/examples.mjs";
+import {
+  atomToJson,
+  docThumb,
+  httpErrorDetail,
+  httpFailure,
+  httpTarget,
+  httpUnparsed,
+  httpUnreachable,
+  library,
+  PORTALS,
+} from "./src/page.mjs";
 
 const dir = new URL(".", import.meta.url).pathname;
 
@@ -31,14 +42,10 @@ const ensureDist = () =>
     assertEquals(code, 0, `deno task build failed: ${new TextDecoder().decode(stderr)}`);
   })();
 
-// The library the page assembles in src/index.html:130-175: two synthetic
-// entries, then the bundled examples. The thumbnails and the localStorage half
-// are that file's business, not Elm's.
-const library: Record<string, { name: string; system: boolean; doc: unknown }> = {
-  library: { name: "library", system: true, doc: { type: "library" } },
-  shop: { name: "shop", system: true, doc: { type: "shop" } },
-  ...(EXAMPLES as Record<string, { name: string; system: boolean; doc: unknown }>),
-};
+// The library the page itself builds, not a copy of it written for the test:
+// that is the reason src/page.mjs exists. Nothing is stored, so this is the
+// library a first visit sees.
+const shelf = library();
 
 type Ports = Record<string, { send: (v: unknown) => void; subscribe: (f: (v: never) => void) => void }>;
 // Deno has no DOM lib, and jsdom ships no types, so the few members these tests
@@ -94,11 +101,14 @@ const boot = async (url: string, { tutorial = -1 } = {}) => {
     flags: { tutorial },
   });
 
-  app.ports.librarySynced.send(library);
+  app.ports.librarySynced.send(shelf);
   // src/index.html:850 does this: an id that resolves to nothing falls back to
   // the library rather than leaving the page on "loading" forever.
   app.ports.changeId.subscribe((id: string) =>
-    app.ports.docSelected.send({ id, data: { doc: library[id]?.doc ?? { type: "library" } } })
+    app.ports.docSelected.send({
+      id,
+      data: { doc: (shelf as Record<string, { doc?: unknown }>)[id]?.doc ?? { type: "library" } },
+    })
   );
 
   const doc = dom.window.document;
@@ -275,4 +285,146 @@ Deno.test("?embed=1 renders the sheet with no chrome around it", async () => {
   assert(all("tbody tr").length > 190, "an embed still renders the sheet");
   for (const sel of ["#title", "#aside", "input[placeholder=search]"])
     assertEquals(doc.querySelector(sel), null, `an embed should carry no ${sel}`);
+});
+
+// --- src/page.mjs, on its own
+//
+// Two of these parse XML, so they need a DOMParser. Installing jsdom's once here
+// is what the page gets from the browser for free.
+(globalThis as Record<string, unknown>).DOMParser =
+  (new JSDOM("", { url: "http://localhost/" }).window as unknown as Record<string, unknown>).DOMParser;
+
+Deno.test("the library merges what is stored under what is bundled", () => {
+  const stored = {
+    "table:mine": { name: "mine", doc: { type: "table", data: [{}] } },
+    // A stale copy of a bundled example must not shadow the real one.
+    "table:countries": { name: "an old countries", doc: { type: "table", data: [{}] } },
+  };
+  const shelf = library(stored) as Record<string, { name: string; system?: boolean; thumb?: unknown }>;
+
+  assertEquals(shelf["table:mine"].name, "mine", "a stored sheet survives the merge");
+  assertEquals(shelf["table:countries"].name, "countries", "the bundled countries wins over a stored copy");
+  assertEquals(shelf[""].name, "library", "the empty id is the library itself");
+  for (const p of PORTALS) assert(shelf[`portal:${p}`], `portal:${p} should be listed`);
+  assert(shelf["table:tutorial"], "the tutorial is part of the library");
+  // Every entry with a doc gets a thumbnail, which is what the library rows draw.
+  for (const [id, entry] of Object.entries(shelf)) assert(entry.thumb, `${id} should carry a thumb`);
+});
+
+Deno.test("a thumbnail is the first numeric column, scaled, or nothing to draw", () => {
+  const table = (...rows: unknown[]) => ({
+    type: "table",
+    data: [{ 0: { key: "0", name: "label", type: "text" }, 1: { key: "1", name: "n", type: "num" } }, ...rows],
+  });
+  // The text column is skipped; the numeric one is scaled across 0..1.
+  assertEquals(
+    docThumb(table({ 0: "a", 1: 10 }, { 0: "b", 1: 20 }, { 0: "c", 1: 30 })),
+    { kind: "table", cols: 2, rows: 3, spark: [0, 0.5, 1] },
+  );
+  // Fewer than three numbers is not a line.
+  assertEquals(docThumb(table({ 0: "a", 1: 10 }, { 0: "b", 1: 20 })).spark, []);
+  // A flat column has no range to scale against, so every point sits in the middle
+  // rather than dividing by zero.
+  assertEquals(docThumb(table({ 0: "a", 1: 7 }, { 0: "b", 1: 7 }, { 0: "c", 1: 7 })).spark, [0.5, 0.5, 0.5]);
+  // A sheet that is not a table has a shape but no line.
+  assertEquals(docThumb({ type: "query", data: [] }), { kind: "query", cols: 0, rows: 0, spark: [] });
+  assertEquals(docThumb(undefined), { kind: "unknown", cols: 0, rows: 0, spark: [] });
+});
+
+Deno.test("only a third-party url goes through the proxy", () => {
+  const ours = httpTarget("http://localhost/net/abc", { q: "x" }, "http://localhost");
+  assertEquals([ours.viaProxy, ours.url], [false, "http://localhost/net/abc?q=x"]);
+
+  const api = httpTarget("https://api.sheets.scrap.land/sheet/table:abc", {}, "http://localhost");
+  assertEquals(api.viaProxy, false, "our own api is not third-party");
+
+  const theirs = httpTarget("https://export.arxiv.org/api/query", { search_query: "all:" }, "http://localhost");
+  assertEquals(theirs.viaProxy, true);
+  assert(theirs.url.startsWith("https://api.sheets.scrap.land/proxy?url="), theirs.url);
+  // The whole target, query string included, is encoded into one parameter --
+  // splitting it would let the second parameter escape into the proxy's own.
+  assertEquals(
+    decodeURIComponent(theirs.url.split("url=")[1]),
+    "https://export.arxiv.org/api/query?search_query=all%3A",
+  );
+});
+
+Deno.test("an origin's own words are dug out of whatever shape it sent them in", () => {
+  // The arxiv regression this exists for: the summary is the only place the
+  // reason appears, and reporting "HTTP 400" instead says nothing.
+  assertEquals(
+    httpErrorDetail(
+      `<?xml version='1.0' encoding='UTF-8'?><feed xmlns="http://www.w3.org/2005/Atom"><entry>` +
+        `<title>Error</title><summary>Either a search_query or id_list must be specified.</summary></entry></feed>`,
+      "application/atom+xml",
+    ),
+    "Either a search_query or id_list must be specified.",
+  );
+  assertEquals(httpErrorDetail(`{"error":{"info":"rate limited"}}`, "application/json"), "rate limited");
+  assertEquals(httpErrorDetail(`{"error":"nope"}`, "application/json"), "nope");
+  assertEquals(httpErrorDetail(`{"message":"bad key"}`, "application/json"), "bad key");
+  // Something that claims to be json and is not falls through to the raw body
+  // rather than throwing on top of the error it was reporting.
+  assertEquals(httpErrorDetail("<html>500</html>", "application/json"), "<html>500</html>");
+  assertEquals(httpErrorDetail("   ", "text/plain"), "(empty body)");
+});
+
+Deno.test("an http failure says who refused, and shows the url", () => {
+  const origin = httpFailure({
+    status: 404,
+    url: "https://example.test/x?a=1",
+    body: `{"message":"no such thing"}`,
+    contentType: "application/json",
+  });
+  assert(origin.includes("This server responded with 404"), origin);
+  assert(origin.includes("https://example.test/x?a=1"), origin);
+  assert(origin.includes("no such thing"), origin);
+
+  // The same status from our own proxy is a different problem with a different
+  // fix, so it must not read as the origin's answer.
+  const proxy = httpFailure({
+    status: 400,
+    url: "http://127.0.0.1/x?",
+    body: `{"error":"Internal URLs not allowed."}`,
+    contentType: "application/json",
+    rejectedByProxy: true,
+  });
+  assert(proxy.includes("The scrapsheets proxy rejected this request with 400"), proxy);
+  assert(proxy.includes("Internal URLs not allowed."), proxy);
+
+  assert(httpUnreachable("https://example.test/x").includes("cross-origin"), "unreachable names the likely cause");
+  const unparsed = httpUnparsed({
+    url: "https://example.test/x",
+    contentType: "application/json",
+    body: "<html>hello",
+    message: "Unexpected token <",
+  });
+  assert(unparsed.includes("application/json, which I could not parse"), unparsed);
+  assert(unparsed.includes("<html>hello"), "the body is shown, because the content type already lied");
+  assertEquals(httpUnparsed({ url: "u", contentType: "c", body: "  ", message: "m" }).includes("(empty body)"), true);
+});
+
+Deno.test("an atom feed flattens into rows a query can select from", () => {
+  const feed = atomToJson(
+    `<?xml version='1.0' encoding='UTF-8'?><feed xmlns="http://www.w3.org/2005/Atom">` +
+      `<title>arXiv Query</title><updated>2026-08-22T00:00:00Z</updated>` +
+      `<opensearch:totalResults xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">2</opensearch:totalResults>` +
+      `<entry><id>http://arxiv.org/abs/2601.00001</id><title> Attention Reconsidered </title>` +
+      `<summary> A summary. </summary><published>2026-01-02T00:00:00Z</published>` +
+      `<author><name>R. Okonkwo</name></author><author><name>M. Petrova</name></author>` +
+      `<link href="http://arxiv.org/abs/2601.00001" rel="alternate" type="text/html"/>` +
+      `<category term="cs.LG"/></entry>` +
+      `<entry><id>http://arxiv.org/abs/2601.00002</id><title>Second</title></entry></feed>`,
+  ) as { title: string; totalResults: number; entries: Record<string, unknown>[] };
+
+  assertEquals(feed.title, "arXiv Query");
+  assertEquals(feed.totalResults, 2);
+  assertEquals(feed.entries.length, 2);
+  // Titles and summaries arrive wrapped in whitespace; a query grouping by title
+  // would otherwise see two of everything.
+  assertEquals(feed.entries[0].title, "Attention Reconsidered");
+  assertEquals(feed.entries[0].summary, "A summary.");
+  assertEquals(feed.entries[0].authors, ["R. Okonkwo", "M. Petrova"]);
+  assertEquals(feed.entries[0].categories, ["cs.LG"]);
+  assertEquals(feed.entries[1].authors, [], "an entry with no authors is empty, not missing");
 });

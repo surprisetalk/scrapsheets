@@ -18,6 +18,9 @@ technologies. It uses a hybrid architecture with:
 - `main.ts` - Main server application and API routes
 - `src/Main.elm` - Frontend application
 - `src/examples.mjs` - Bundled example datasets and queries (imported by both the page and the server seeder)
+- `src/page.mjs` - The parts of `src/index.html` that are functions of their input rather than of the browser: the
+  library merge, the sheet thumbnail, and the four things the page does with an HTTP response. Extracted so they can be
+  tested, since nothing boots `index.html` itself
 - `schema/db.sql` - Declarative database schema (schema only, no data: `pg-schema-diff` diffs a live DB against it)
 - `examples.sql` - Shop catalogue of query templates (applied by `seed()` on first request)
 - `deno.json` - Dependencies and import map
@@ -39,13 +42,14 @@ technologies. It uses a hybrid architecture with:
     `src/alasql.mjs` the page loads) and compared row for row. A UDF registered in one and not the other, or a vendored
     bundle built from a different alasql, fails here rather than in somebody's browser.
   - `page_test.ts` — the page itself, booted under jsdom: the compiled Elm in `dist/index.js` initializes, renders, and
-    answers clicks, with the library fed in through the ports exactly as `src/index.html` feeds it. Covers the gallery
-    strip, sorting by clicking a header, hiding a column, chart SVG, dashboard tiles, `?embed=1`, the tutorial and the
-    shortcut sheet. It always runs `deno task build` first, so it can never pass against a stale bundle. deno-dom is not
-    enough for this — it has no `replaceData` on a text node, which is how Elm's virtual-dom patches text in place.
+    answers clicks, with the library fed in through `library()` from `src/page.mjs` — the same function `index.html`
+    calls, not a copy written for the test. Also covers that module on its own. Covers the gallery strip, sorting by
+    clicking a header, hiding a column, chart SVG, dashboard tiles, `?embed=1`, the tutorial and the shortcut sheet. It
+    always runs `deno task build` first, so it can never pass against a stale bundle. deno-dom is not enough for this —
+    it has no `replaceData` on a text node, which is how Elm's virtual-dom patches text in place.
   - `browser_test.ts` — despite the name, no browser: dist builds, index.html wires the WASM and the import map, every
-    root-absolute asset is in `_redirects`, nothing reaches a CDN, and the built bundles still export what the page
-    boots from.
+    root-absolute asset is in `_redirects`, every name index.html imports is actually exported, nothing reaches a CDN,
+    and the built bundles still export what the page boots from.
   - `tests/MainTest.elm` via `elm_test.ts` — pure Elm: selection and navigation, sort and filter, clipboard parsing,
     column stats, `docDecoder`, `chartPoints`.
 - **Re-vendor browser bundles**: `deno task vendor` (after bumping the versions at the top of `vendor.ts`; alasql tracks
