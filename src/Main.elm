@@ -2075,6 +2075,28 @@ update msg ({ sheet, auth } as model) =
                 share =
                     model.share
 
+                -- Whether a field was sent at all, which is what separates "this
+                -- payload is about something else" from "the answer arrived and
+                -- could not be read". Without the split, a field that arrives in
+                -- the wrong shape leaves the panel showing the last answer it
+                -- understood -- a permissions UI presenting a stale member list
+                -- as the current one. It cannot catch a field that was *renamed*
+                -- away: the payload carries no action, so an absent field and a
+                -- renamed one look the same from here.
+                sent field =
+                    value |> D.decodeValue (D.field field D.value) |> Result.toMaybe
+
+                members =
+                    value
+                        |> D.decodeValue
+                            (D.field "members" (D.list (D.map2 Member (D.field "email" D.string) (D.field "role" D.string))))
+
+                public =
+                    value |> D.decodeValue (D.field "public" D.bool)
+
+                link =
+                    value |> D.decodeValue (D.field "link" D.string)
+
                 hook =
                     value
                         |> D.decodeValue
@@ -2082,31 +2104,40 @@ update msg ({ sheet, auth } as model) =
                                 (D.map3 Hook (D.field "url" D.string) (D.field "secret" D.string) (D.field "repro" D.string))
                             )
 
-                -- Whether a hook was sent at all, which is what separates "this
-                -- payload is about something else" from "the answer arrived and
-                -- could not be read". Without the split, a changed field name
-                -- makes the button do nothing and say nothing.
-                hookSent =
-                    value |> D.decodeValue (D.field "hook" D.value) |> Result.toMaybe
+                unreadable =
+                    [ ( "member list", sent "members", Result.map (always ()) members )
+                    , ( "public flag", sent "public", Result.map (always ()) public )
+                    , ( "share link", sent "link", Result.map (always ()) link )
+                    , ( "signing secret", sent "hook", Result.map (always ()) hook )
+                    ]
+                        |> List.filterMap
+                            (\( what, was, decoded ) ->
+                                case ( was, decoded ) of
+                                    ( Just _, Err err ) ->
+                                        Just ("The " ++ what ++ " arrived in a shape I could not read: " ++ D.errorToString err)
+
+                                    _ ->
+                                        Nothing
+                            )
             in
             ( { model
                 | share =
                     { share
-                        | members =
-                            value
-                                |> D.decodeValue (D.field "members" (D.list (D.map2 Member (D.field "email" D.string) (D.field "role" D.string))))
-                                |> Result.withDefault share.members
-                        , public = value |> D.decodeValue (D.field "public" D.bool) |> Result.withDefault share.public
-                        , link = value |> D.decodeValue (D.field "link" D.string) |> Result.toMaybe |> orElse share.link
+                        | members = members |> Result.withDefault share.members
+                        , public = public |> Result.withDefault share.public
+                        , link = link |> Result.toMaybe |> orElse share.link
                         , hook = hook |> Result.toMaybe |> orElse share.hook
                     }
-                , error =
-                    case ( hookSent, hook ) of
-                        ( Just _, Err err ) ->
-                            "The signing secret arrived in a shape I could not read: " ++ D.errorToString err
 
-                        _ ->
-                            model.error
+                -- Every unreadable field, not the first: a banner about the
+                -- member list while the public flag quietly shows the previous
+                -- sheet's value is worse than one that names both.
+                , error =
+                    if List.isEmpty unreadable then
+                        model.error
+
+                    else
+                        String.join " " unreadable
               }
             , Cmd.none
             )

@@ -451,14 +451,28 @@ The single biggest gap. Most demos die here first.
 
 Per house style, an ambiguous error is the worst bug in the system.
 
-- [ ] **A failed decode says which field failed**: `ShareLoad` reports a bad `hook` answer, but `members` still falls
-      back to the last list it decoded, so a stale member list can be shown as current — a permissions UI lying about
-      permissions.
-  1. Decode `members` strictly and route the `D.Error` through `error`, the way the `hook` branch does.
-- [ ] **A failure the user can see**: every failure lands in `net-hook:errors`, which is the operator's sheet — nobody
-      else can read it, and a toast is still all a user gets. A per-user error log is the open half.
-  1. Decide where a user's failures live: their own sheet is a sheet per account, which is a lifecycle nobody wants.
-  2. More likely: `net-hook:errors` gains the `usr_id` that caused it, and the read filters on it.
+- [ ] **A burst that stops is counted, not rounded to one**: `logFailure` writes one row per (status, path) per minute
+      and folds the rest onto `meta.folded`, which the two conditions counted out of that sheet add back. The last
+      window of a burst never flushes: its count sits in `logSeen` until that key writes again, which never happens if
+      the burst ended. 6,000 refused deliveries in a minute that then stops read as one.
+  1. Flush the pending folds from the sweep `setInterval` that already runs beside `rateLimitBuckets`, as a row carrying
+     the count and no headers — there is no request left to read them off.
+  2. The same row is what tells the difference between "one failure" and "one failure we kept a message for".
+- [ ] **A share answer says which sheet it is about**: the `shareLoaded` payload carries no id and no action, so a
+      `list` for sheet A that resolves after the user opened sheet B writes A's member list and public flag into B's
+      panel, silently. `UrlChange` keeps them when settings stay open, so navigating between two sheets with the panel
+      up shows the first sheet's permissions as the second's. `ShareLoad` reports a field it cannot read, but it cannot
+      see a field that was renamed away either — an absent field and a renamed one look the same from there.
+  1. `index.html` sends `{ id, action, ... }`; `ShareLoad` drops a payload whose id is not `model.sheet.id`.
+  2. With the action named, each branch can require the fields that action promises, which is what makes a renamed field
+     an error rather than an absence.
+- [ ] **You read back the failures your own account caused**: every failure lands in `net-hook:errors`, which is the
+      operator's sheet — a toast is still all anyone else gets, and it is gone on the next render.
+  1. `logFailure` writes `usr_id` into `meta`, from `c.get("usr_id")`. It is absent on an unauthenticated failure, which
+     is the honest answer: nobody owns it.
+  2. One sheet, not one per account: `GET /sheet/net-hook:errors` gains a read that filters `meta->>'usr_id'` to the
+     caller and needs no `sheet_usr` row, beside the operator read that filters on nothing.
+  3. The row still carries header and query **names only**, so this read leaks nothing the operator's does not.
 
 ### Types & validation
 
@@ -523,7 +537,7 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 ### Ingest — net-http
 
 - [ ] **Secrets for authenticated requests**: per-sheet headers already ship, but the values sit in the document in
-      plain text; they belong in a secret store
+      plain text, where sync hands them to a viewer. Needs **A sheet holds a secret nothing else can read**, below
 - [ ] **OAuth token handling**: authorization code flow plus automatic refresh
 - [ ] **Non-GET requests**: POST/PUT with a templated body
 - [ ] **Response parsers**: JSON path, CSV/TSV, NDJSON, XML, RSS/Atom, HTML with CSS selectors, XLSX, Parquet
@@ -542,17 +556,36 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
 ### Ingest — net-hook & forms
 
+- [ ] **A sheet holds a secret nothing else can read**: three items below and **Secrets for authenticated requests**
+      under `Ingest — net-http` all stop here. `hookSecret()` derives its key from `TOKEN_SECRET` because there is
+      nowhere to put one, and a net-http sheet's auth header sits in the automerge document in plain text, where a
+      viewer or a share-link holder reads it.
+  1. `create table secret (sheet_id, name, value_encrypted, created_at, primary key (sheet_id, name))`, encrypted with
+     the `encryptDsn`/`decryptDsn` pair `main.ts` already uses for codex DSNs, under `DSN_ENCRYPTION_KEY`.
+  2. Owner-only write, no read-back: `POST /library/:id/secret` takes `{name, value}` and `GET` answers the names alone.
+     A value that can be read back is a value a share link can be pointed at.
+  3. Never into the automerge document, and never into a cell: the document is what sync hands to a viewer.
 - [ ] **You send a Stripe or GitHub webhook straight at a sheet**: ours is one scheme, and every provider signs its own
-      way, so today a hook has to be relayed by something that re-signs it.
+      way, so today a hook has to be relayed by something that re-signs it. Needs the secret store above — a shared
+      secret cannot be derived.
   1. Read the provider off the sheet's config, not off the request: a spoofed header must not pick the verifier.
-  2. Verify Stripe's `stripe-signature`, GitHub's `x-hub-signature-256` and Shopify's base64 HMAC against a stored
-     secret. That is the point a secret store stops being optional — a shared secret cannot be derived.
+  2. Verify Stripe's `stripe-signature`, GitHub's `x-hub-signature-256` and Shopify's base64 HMAC against the stored
+     secret, each in its own function, each refusing by name the way the four checks in `POST /net/:id` already do.
+  3. The replay refusal already in that route keys on `scrapsheets-signature`; give it the provider's own header
+     instead, or a provider delivery becomes replayable again.
 - [ ] **You rotate a hook's secret without a missed delivery**: `hookSecret()` derives from `TOKEN_SECRET`, so today
-      rotating one sheet rotates every sheet.
-  1. Accept two secrets during a rollover, and record which one a delivery verified against.
-- [ ] **A captured delivery cannot be replayed**: the `HOOK_SKEW` window bounds it to five minutes, which is not the
-      same as never.
-  1. Store the delivery id (or the signature) per sheet and refuse a repeat, bounded the way `trimNet` bounds a log.
+      rotating one sheet rotates every sheet — and every outstanding email-verification link with it. Needs the secret
+      store above.
+  1. Two secrets per sheet during a rollover, `current` and `previous`, tried in that order.
+  2. Record which one a delivery verified against, in `meta`, so "is anyone still sending the old one" is a query rather
+     than a guess, and the rollover has a visible end.
+- [ ] **A sender says which delivery this is**: the signature covers `t` and the body and nothing else, and the unique
+      index that refuses a replay is over exactly that — so two genuinely different deliveries carrying the same body in
+      the same second are one delivery here, however their headers or query strings differ. A fan-out that discriminates
+      by query string, or a sensor repeating a reading, loses the second one to a 409 that says it replayed.
+  1. Sign the path and the query string alongside the body, so what identifies a delivery is what the sender varies.
+  2. That changes the scheme every existing sender implements, so it needs the two-secret rollover above to land without
+     a missed delivery.
 - [ ] **Payload mapping**: JSON path -> column mapping, so a webhook lands as typed rows not a blob
 - [ ] **Filters**: drop events that do not match a predicate before they hit the table
 - [ ] **Dead-letter table**: malformed payloads are kept and inspectable, never dropped
@@ -636,12 +669,6 @@ Phase 2 has the runner. These are what the demos need on top of it.
       forecasting work in **Stats & modeling**
 - [ ] **Destinations**: email, SMS, Slack, Discord, Teams, webhook, push. Email ships, through the Resend key the signup
       flow already uses; a refusal from Resend is recorded on the alert rather than swallowed
-- [ ] **You can tell a quiet alert from a dead one**: `pollAlertOnce` records a run only when the answer changed, so a
-      stable alert writes nothing for days and a `setInterval` that died writes nothing either. `GET /status` therefore
-      cannot grade alert liveness at all, the way it grades net-http freshness.
-  1. Record every run, not only the ones that changed, with `status = 'unchanged'`; the de-dupe already reads the last
-     row, so it keeps working.
-  2. Then add the status condition: every alert sheet ran within twice its interval.
 - [ ] **Snooze, acknowledge, and escalate**
 - [ ] **Subscribe to a sheet**: get told when a sheet you follow changes, without owning it
 
@@ -740,16 +767,6 @@ Extends the Phase 2 roles work.
 - [ ] **Ownership transfer and offboarding**: what happens to sheets when someone leaves
 - [ ] **Audit log**: reads and writes, exportable, queryable as a sheet
 - [ ] **PII tagging and masking**: mark a column sensitive; masked by default in shares and embeds
-- [ ] **The server refuses to boot without its secrets**: `JWT_SECRET`, `TOKEN_SECRET` and `DSN_ENCRYPTION_KEY` each
-      fall back to `Math.random()` and only warn. `TOKEN_SECRET` is now the root of every webhook signing key, so an
-      unset one re-rolls every sender's secret on each restart, and the delivery is then refused with a message that
-      points at the sender's secret rather than at the server.
-  1. Throw at startup instead of warning; a secret-less boot is not a recoverable state.
-  2. The tests import `main.ts` at module load, so they must set the three variables before the import, or the harness
-     must set them in `deno.json`.
-- [ ] **You read the error log without a psql prompt**: `net-hook:errors` is owned by the seeded sentinel, which has no
-      password and cannot be logged into, so `POST /library/net-hook:errors/share` returns 403 for every real account.
-  1. Have `seed()` grant the owner row to a configured operator address, or add an owner-transfer path.
 - [ ] **Secrets scanning on publish**: refuse to publish a sheet containing an API key
 - [ ] **PII scanning on publish**: warn before a dataset with personal data goes public
 - [ ] **Retention policies and legal hold**
@@ -817,12 +834,6 @@ Extends the Phase 3 API work.
 ### Trust, safety & abuse
 
 - [ ] **Per-user quotas**: fetches, rows, storage, and outbound actions
-- [ ] **An anonymous flood cannot outweigh the traffic it replaces**: every 4xx writes a row to `net-hook:errors` and
-      runs `trimNet` behind it, so a rejected request costs two round trips — more than serving it would. The rate
-      limiter keys on `x-forwarded-for`, which the caller sets, so the bucket is free to rotate. A 429 is already exempt
-      from the log; the rest are not.
-  1. Suppress repeats: one row per (status, path) per minute rather than one per request.
-  2. Key the limiter on the connecting address, and trust `x-forwarded-for` only from the proxy in front of us.
 - [ ] **Scraping etiquette controls**: per-host limits and a documented user agent
 - [ ] **Shop moderation**: report a listing, review queue, takedown path
 - [ ] **Source terms compliance**: record whether a dataset may be redistributed before it can be sold
@@ -1049,9 +1060,14 @@ Not datasets, but the machinery every dataset above needs to be sellable.
 - [ ] **Versioned publishing**: buyers pin a version; a changelog explains each release
 - [ ] **You see which dataset stopped refreshing**: `GET /status` grades the feeds in aggregate — "every net-http poll
       returned 2xx", "every net-http sheet was polled in the past two hours" — but names none of them, so the alarm says
-      something is rotten without saying what.
-  1. A `dashboard` sheet over a query of `net` grouped by sheet, which needs no new server code.
-  2. Failing that, one condition per feed is the wrong shape: the status check is a fixed list, not a per-row report.
+      something is rotten without saying what. A dashboard over `net` cannot answer it: `net` is not a sheet, and every
+      `@net-http:x` ref reads one feed's rows, so there is nothing to group by.
+  1. `GET /library/freshness` answers one row per net-http and alert sheet the caller can read: sheet_id, name, last
+     run, the `meta` of that run, and consecutive failures. One query, grouped in SQL, on the index `net` already has.
+  2. It is a sheet-shaped read, so it pages and exports through the same route the others do, and a `query` sheet can
+     select from it.
+  3. The status check stays a fixed list of sentences. One condition per feed is the wrong shape — a check whose
+     conditions come and go with the data cannot be read by an uptime checker.
 - [ ] **Normalization conventions**: shared column names, date formats, and code sets across all shop datasets
 - [ ] **Sample and preview generation**: a free first-N-rows sheet for every paid dataset
 - [ ] **Seeding pipeline**: the datasets themselves defined as Scrapsheets pipelines, dogfooding the product

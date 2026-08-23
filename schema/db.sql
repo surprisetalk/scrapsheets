@@ -54,6 +54,15 @@ create table net
 
 create index net_sheet_id_created_at_idx on net (sheet_id, created_at desc);
 
+-- One delivery per signature per sheet. POST /net/:id used to decide this by
+-- selecting first and inserting after, so ten parallel copies of one captured
+-- delivery all saw no prior row and all landed -- the control bypassed by the
+-- least sophisticated version of the attack it exists for. A unique index is
+-- the only thing that decides it under concurrency. The expression is null on
+-- every row that is not a signed delivery (a poll, an alert run, an error), and
+-- nulls do not collide, so nothing else in this table is constrained.
+create unique index net_hook_signature_idx on net (sheet_id, (req_headers->>'scrapsheets-signature'));
+
 create table payment
 ( payment_id bigint not null generated always as identity primary key
 , created_at timestamp default now()

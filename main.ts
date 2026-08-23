@@ -39,10 +39,28 @@ import Stripe from "stripe";
 
 // --- secrets & crypto
 
-const JWT_SECRET = Deno.env.get("JWT_SECRET") ?? Math.random().toString();
+// A secret-less boot is not a recoverable state, so it is not a warning. These
+// three used to fall back to Math.random(), which meant a restart silently
+// re-rolled them: every session dropped, every encrypted DSN unreadable, and --
+// since TOKEN_SECRET is the root hookSecret() derives every sender's signing key
+// from -- every webhook delivery refused with a message blaming the sender.
+export const requireSecret = (name: string): string => {
+  const value = Deno.env.get(name);
+  if (!value) {
+    throw new Error(explain(`The server cannot start without ${name}.`, {
+      Received: "an unset environment variable",
+      Expected: `${name} set to a long random string, the same one across every restart`,
+      Source: "the process environment",
+      Fix: "add it to .env locally, or to the deployment's environment, then start again",
+    }));
+  }
+  return value;
+};
+
+const JWT_SECRET = requireSecret("JWT_SECRET");
 const JWT_ALG = "HS256";
-const TOKEN_SECRET = Deno.env.get("TOKEN_SECRET") ?? Math.random().toString();
-const DSN_KEY = Deno.env.get("DSN_ENCRYPTION_KEY") ?? Math.random().toString();
+const TOKEN_SECRET = requireSecret("TOKEN_SECRET");
+const DSN_KEY = requireSecret("DSN_ENCRYPTION_KEY");
 
 const b64 = (buf: Uint8Array): string => {
   let s = "";
@@ -172,13 +190,6 @@ const hookVerify = async (secret: string, message: Uint8Array<ArrayBuffer>, sign
   return await crypto.subtle.verify("HMAC", await hmacKey(secret), bytes, message);
 };
 
-if (!Deno.env.get("JWT_SECRET"))
-  console.warn("WARNING: JWT_SECRET not set, using random value. Tokens will break on restart.");
-if (!Deno.env.get("TOKEN_SECRET"))
-  console.warn("WARNING: TOKEN_SECRET not set, using random value. Tokens will break on restart.");
-if (!Deno.env.get("DSN_ENCRYPTION_KEY"))
-  console.warn("WARNING: DSN_ENCRYPTION_KEY not set, using random value. Encrypted DSNs will break on restart.");
-
 // Simple in-memory rate limiter (token bucket algorithm)
 const rateLimitBuckets = new Map<string, { tokens: number; lastRefill: number }>();
 const RATE_LIMIT_MAX_TOKENS = 1000; // Max burst per IP (debounced queries fire per keystroke)
@@ -192,6 +203,8 @@ const rateLimit = (identifier: string): boolean => {
   if (!bucket) {
     bucket = { tokens: RATE_LIMIT_MAX_TOKENS, lastRefill: now };
     rateLimitBuckets.set(identifier, bucket);
+    if (rateLimitBuckets.size > RATE_LIMIT_KEYS_MAX)
+      rateLimitBuckets.delete(rateLimitBuckets.keys().next().value!);
   }
 
   // Refill tokens based on time elapsed
@@ -205,6 +218,11 @@ const rateLimit = (identifier: string): boolean => {
   bucket.tokens -= 1;
   return true;
 };
+
+// Bounded, and not only swept: sweeping is by idle time, so a caller who can
+// vary its own key mints entries faster than a 60-second broom removes them.
+// Insertion order is iteration order, so the oldest key is the first one out.
+const RATE_LIMIT_KEYS_MAX = 10_000;
 
 // Cleanup stale rate limit entries periodically
 setInterval(() => {
@@ -412,7 +430,13 @@ const sheet = async (
         // Appended after body, so existing `select body from @net-hook:x` queries
         // and existing column positions are untouched. `meta` is how a run reads
         // as a run: status, milliseconds, bytes.
-        select: sql`select n.created_at, n.body, n.method, n.req_headers, n.query_params, n.meta`,
+        //
+        // Cast to text on the way out. These three are jsonb in the table, so the
+        // status check can read `meta->>'status'` in SQL, but a cell holds text --
+        // and `json_extract(req_headers, '$.names')` is how a sheet reads one,
+        // which needs the string postgresjs would otherwise have parsed away.
+        select: sql`select n.created_at, n.body, n.method,
+                           n.req_headers::text, n.query_params::text, n.meta::text`,
         from: sql`from sheet_usr su inner join net n using (sheet_id)`,
         where: [
           sql`(su.sheet_id,su.usr_id) = (${sheet_id},${c.get("usr_id")})`,
@@ -796,14 +820,20 @@ export const app = new Hono<{
 
 app.use("*", logger());
 
-// Rate limiting middleware
-app.use("*", async (c, next) => {
-  // Use IP address as identifier, fall back to a default for local dev
-  const ip = c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
-    c.req.header("x-real-ip") ||
-    "127.0.0.1";
+/** The address a rate-limit bucket is keyed on. The **rightmost**
+ * x-forwarded-for entry, not the leftmost: the rightmost is the one the proxy in
+ * front of us appended, and the leftmost is whatever the caller typed -- so
+ * keying on it let a flood rotate its own bucket for free, one header value per
+ * request. No header at all means nothing proxied us, so the socket's own peer
+ * is the caller. x-real-ip is gone for the same reason: nothing in front of us
+ * sets it, so a caller who sets it chooses its own bucket. */
+export const callerIp = (c: Context): string =>
+  c.req.header("x-forwarded-for")?.split(",").at(-1)?.trim() ||
+  (c.env as { remoteAddr?: { hostname?: string } } | undefined)?.remoteAddr?.hostname ||
+  "127.0.0.1";
 
-  if (!rateLimit(ip))
+app.use("*", async (c, next) => {
+  if (!rateLimit(callerIp(c)))
     throw new HTTPException(429, { message: "Too many requests. Please slow down." });
 
   await next();
@@ -842,6 +872,19 @@ export const seed = async () => {
     values ((select usr_id from usr where email = ''), 'net-hook', ${ERROR_DOC}, 'errors', '{"system"}')
     on conflict (doc_id) do nothing
   `;
+  // The sentinel cannot be logged into, so the log needs a reader who can. The
+  // account row is created here rather than waited for: an operator who has not
+  // signed up yet would otherwise get nothing, and signing up later adopts this
+  // row, because POST /signup/:token upserts on the email.
+  const operator = Deno.env.get("OPERATOR_EMAIL")?.trim();
+  if (operator) {
+    await sql`insert into usr (email) values (${operator}) on conflict (email) do nothing`;
+    await sql`
+      insert into sheet_usr (sheet_id, usr_id, role)
+      select ${ERROR_SHEET}, usr_id, 'viewer' from usr where email = ${operator}
+      on conflict (sheet_id, usr_id) do nothing
+    `;
+  }
 };
 
 let seeded: Promise<unknown> | undefined;
@@ -1382,7 +1425,52 @@ const ERROR_SHEET = `net-hook:${ERROR_DOC}`;
 // two conditions below it are counted out of this very sheet.
 let logWriteFailures = 0;
 
-const logFailure = async (c: Context, status: number, message: string): Promise<void> => {
+// One row per (status, path) per minute. Every 4xx used to cost an insert and a
+// trimNet behind it, so refusing a request was more expensive than serving it --
+// which is the wrong way round for the path that exists to shed load. The count
+// a suppressed minute hid rides the next row that key writes, as `meta.folded`,
+// and the two conditions counted out of this sheet add it back.
+//
+// Two things folding costs, both of them real:
+//
+// The row keeps one message per key per minute. A different failure that shares
+// a status and a path inside that minute is counted but its own message is not
+// kept -- and on /query, where a debounced editor fires one request per
+// keystroke, that is most of them. The alternative is a key that includes the
+// message, which folds nothing at all on exactly the flood it exists for.
+//
+// A burst that stops is undercounted by whatever it did in its final window:
+// that count sits in memory until the key writes again, which never happens if
+// the burst ended. A sender that cannot sign keeps retrying, which is the case
+// the refusals condition is written for, so it flushes every minute.
+const LOG_EVERY_MS = 60_000;
+// Bounded, because a scanner walking unknown paths mints a key per request.
+// Insertion order is iteration order, so the oldest key is the first one out.
+const LOG_KEYS_MAX = 1_000;
+const logSeen = new Map<string, { at: number; folded: number }>();
+
+/** Writes one failure to the error sheet. Answers whether a row actually
+ * landed: a suppressed call resolves like a written one, and `logWriteFailures`
+ * may only be cleared by a write that happened. Cleared by a suppression, a
+ * database that is refusing every insert reads as a service with no failures --
+ * which is the one thing this log cannot report about itself. */
+const logFailure = async (c: Context, status: number, message: string): Promise<boolean> => {
+  const path = new URL(c.req.url).pathname;
+  const key = `${status} ${path}`;
+  const seen = logSeen.get(key) ?? { at: 0, folded: 0 };
+  const at = Date.now();
+  if (seen.at && at - seen.at < LOG_EVERY_MS) {
+    seen.folded++;
+    return false;
+  }
+  // Deleted first so the key moves to the back: Map.set on a key it already
+  // holds keeps its original position, which would evict a busy key ahead of an
+  // idle one.
+  const folded = seen.folded;
+  seen.at = at;
+  logSeen.delete(key);
+  logSeen.set(key, seen);
+  if (logSeen.size > LOG_KEYS_MAX) logSeen.delete(logSeen.keys().next().value!);
   await sql`insert into net ${
     sql({
       sheet_id: ERROR_SHEET,
@@ -1392,12 +1480,19 @@ const logFailure = async (c: Context, status: number, message: string): Promise<
       // design -- the sync socket takes ?auth=<jwt> and a share link rides the
       // same parameter -- so a failing request would otherwise write a live
       // token into a sheet that can be shared and exported.
-      req_headers: JSON.stringify({ names: [...c.req.raw.headers.keys()].sort().join(", ") || "(none)" }),
-      query_params: JSON.stringify({ names: Object.keys(c.req.query()).sort().join(", ") || "(none)" }),
-      meta: JSON.stringify({ status, path: new URL(c.req.url).pathname }),
+      req_headers: sql.json({ names: [...c.req.raw.headers.keys()].sort().join(", ") || "(none)" }),
+      query_params: sql.json({ names: Object.keys(c.req.query()).sort().join(", ") || "(none)" }),
+      meta: sql.json({ status, path, ...(folded ? { folded } : {}) }),
     })
   }`;
+  // Subtract what this row carried rather than zeroing: onError does not await
+  // this call, so every failure arriving during the insert's round trip has
+  // already folded onto the same entry, and zeroing would drop occurrences that
+  // were never written. A throw above skips this line entirely, so the count
+  // stays on the entry for the next row that key writes.
+  seen.folded -= folded;
   await trimNet(ERROR_SHEET);
+  return true;
 };
 
 app.onError((err, c) => {
@@ -1414,7 +1509,9 @@ app.onError((err, c) => {
   // rate limiter throws before seed() has run, so the sheet row may not exist.
   if (res.status !== 429) {
     logFailure(c, res.status, known ? err.message : String(err?.stack ?? err))
-      .then(() => logWriteFailures = 0)
+      .then((wrote) => {
+        if (wrote) logWriteFailures = 0;
+      })
       .catch((logErr) => {
         logWriteFailures++;
         console.error(`error log ${ERROR_SHEET}:`, logErr);
@@ -1483,14 +1580,18 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
                 from unnest(${STATUS_AGO}::int[]) as seconds)
     select
       at.seconds,
+      -- Each row stands for itself plus whatever logFailure folded into it, or
+      -- suppression would turn "how many requests failed" into "how many
+      -- minutes did failures span", and any burst inside REFUSALS_MAX minutes
+      -- would pass at any volume.
       1.0 / (1 + (
-        select count(*) from net n
+        select coalesce(sum(1 + coalesce(substring(n.meta->>'folded' from '^[0-9]+$')::int, 0)), 0) from net n
         where n.sheet_id = ${ERROR_SHEET}
           and n.created_at > at.t - interval '1 hour' and n.created_at <= at.t
           and substring(n.meta->>'status' from '^[0-9]+$')::int >= 500
       )) as no_5xx,
       ${REFUSALS_MAX}::numeric / greatest(1, (
-        select count(*) from net n
+        select coalesce(sum(1 + coalesce(substring(n.meta->>'folded' from '^[0-9]+$')::int, 0)), 0) from net n
         where n.sheet_id = ${ERROR_SHEET}
           and n.created_at > at.t - interval '1 hour' and n.created_at <= at.t
           and substring(n.meta->>'status' from '^[0-9]+$')::int = 401
@@ -1506,7 +1607,8 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
       (select case when count(*) = 0 then 1
                    else count(*) filter (
                      where n.body::jsonb->>'status' <> 'error'
-                       and n.body::jsonb->>'delivery' in ('sent', ${HELD})
+                       and (n.body::jsonb->>'delivery' in ('sent', ${HELD})
+                            or n.body::jsonb->>'status' in ('clear', 'unchanged', 'idle'))
                    )::numeric / count(*) end
        from net n
        where n.method = 'ALERT' and n.body is json
@@ -1525,6 +1627,23 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
        from (select max(n.created_at) as last
              from sheet s inner join net n using (sheet_id)
              where s.type = 'net-http' and n.method = 'GET' group by s.sheet_id) feeds) as polls_fresh,
+      -- Each alert against its own interval, taken off its newest run rather
+      -- than an automerge document. Twice, not once: one missed tick is a slow
+      -- poll, two in a row is a poller that stopped.
+      --
+      -- A left join, so an alert that has never run at all is graded from the
+      -- moment it was created. An inner join would have excluded exactly the
+      -- failure this condition is for -- a poller that never fired once, on a
+      -- cold isolate -- and an empty set grades as a pass. The 3600 an
+      -- interval-less run falls back to is pollAlertOnce's own default, so a
+      -- sheet that never said otherwise is graded against what it would use.
+      (select coalesce(min((2 * interval_s)::numeric / greatest(1, extract(epoch from (now() - last)))), 1)
+       from (select coalesce(max(n.created_at), s.created_at) as last,
+                    coalesce(
+                      (array_agg(substring(n.meta->>'interval' from '^[0-9]+$')::int
+                                 order by n.created_at desc))[1], 3600) as interval_s
+             from sheet s left join net n on n.sheet_id = s.sheet_id and n.method = 'ALERT'
+             where s.type = 'alert' group by s.sheet_id, s.created_at) runs) as alerts_fresh,
       ${NET_KEEP}::numeric / greatest(1, coalesce(
         (select max(c) from (select count(*) as c from net group by sheet_id) logs), 0)) as log_capped,
       ${DB_BYTES_CAP}::numeric / greatest(1, pg_database_size(current_database())) as db_size,
@@ -1558,7 +1677,8 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
       `Every net-http sheet that has ever polled did so in the past ${POLL_STALE_S / 3600} hours.`,
       live.polls_fresh,
     ),
-    byAgo("Every alert run in the past day was delivered.", (r) => r.alerts_delivered),
+    byAgo("Every alert run in the past day either delivered or had nothing to deliver.", (r) => r.alerts_delivered),
+    now("Every alert sheet ran within twice its own interval.", live.alerts_fresh),
     now("No sheet's net log has grown past its retention cap.", live.log_capped),
     now(`The database is under ${DB_BYTES_CAP / 1e9} GB.`, live.db_size),
     now(`The server heap is under ${HEAP_BYTES_CAP / 1e6} MB.`, HEAP_BYTES_CAP / Deno.memoryUsage().heapUsed),
@@ -1909,19 +2029,24 @@ app.post("/net/:id", async (c) => {
     throw new HTTPException(401, {
       message: explain(`This delivery to ${sheet_id} is not signed.`, {
         Received: `headers ${heard}`,
-        Expected: "a scrapsheets-signature header, formatted t=<unix seconds>,v1=<64 hex characters>",
+        Expected: "a scrapsheets-signature header, formatted t=<unix seconds>,v1=<64 lowercase hex characters>",
         Source: "the request headers",
         Fix: `read this sheet's signing secret with GET /library/${sheet_id}/hook, then sign ` +
           `"<t>.<body>" with HMAC-SHA256`,
       }),
     });
   }
-  const parts = signature.match(/^t=(\d{1,10}),v1=([0-9a-fA-F]{64})$/);
+  // Lowercase only. parseInt is case-insensitive, so an upper-cased v1 verifies
+  // against the same secret while reading as a different string -- and the
+  // uniqueness that refuses a replay is over the header as sent, so every one of
+  // the 2^64 case variants of one captured signature was a free replay. A hex
+  // digest has one canonical spelling; this is where it is required.
+  const parts = signature.match(/^t=(\d{1,10}),v1=([0-9a-f]{64})$/);
   if (!parts) {
     throw new HTTPException(401, {
       message: explain(`The signature on this delivery to ${sheet_id} is malformed.`, {
         Received: JSON.stringify(signature),
-        Expected: "t=<unix seconds>,v1=<64 hex characters>, in that order, with no spaces",
+        Expected: "t=<unix seconds>,v1=<64 lowercase hex characters>, in that order, with no spaces",
         Source: "the scrapsheets-signature header",
         Fix: 'build it as `t=$(date +%s),v1=$(printf "%s.%s" "$t" "$body" | openssl dgst -sha256 -hmac "$secret" -r ' +
           "| cut -d' ' -f1)`",
@@ -1950,16 +2075,41 @@ app.post("/net/:id", async (c) => {
       }),
     });
   }
-  await sql`insert into net ${
+  // The skew window bounds a replay to HOOK_SKEW seconds, which is not the same
+  // as never: a delivery captured off the wire can be sent again, unchanged,
+  // until its t goes stale. The unique index on (sheet_id, signature) is what
+  // refuses the repeat, and the insert is what asks -- selecting first and
+  // inserting after would let ten parallel copies of one captured delivery all
+  // see no prior row and all land.
+  //
+  // The one hole is the log's own retention: trimNet keeps NET_KEEP rows per
+  // sheet, so a sheet taking more than that can evict the record and free the
+  // signature -- at which point the skew check has long since refused it anyway.
+  const [stored] = await sql`insert into net ${
     sql({
       sheet_id,
       body,
       method: c.req.method,
-      req_headers: JSON.stringify(Object.fromEntries(c.req.raw.headers)),
-      query_params: JSON.stringify(c.req.query()),
-      meta: JSON.stringify({ bytes: size }),
+      req_headers: sql.json(Object.fromEntries(c.req.raw.headers)),
+      query_params: sql.json(c.req.query()),
+      meta: sql.json({ bytes: size }),
     })
-  }`;
+  } on conflict (sheet_id, (req_headers->>'scrapsheets-signature')) do nothing returning net_id`;
+  if (!stored) {
+    throw new HTTPException(409, {
+      message: explain(`This delivery to ${sheet_id} has already been stored.`, {
+        Received: "a signature this sheet has already accepted",
+        // The signature covers t and the body, and nothing else -- so two
+        // deliveries carrying the same body in the same second are one
+        // delivery here, however their headers or query strings differ. A
+        // sender that must send the same body twice has to say so in the body.
+        Expected: "one delivery per signature, where a signature is this second plus these bytes",
+        Source: "the scrapsheets-signature header, against this sheet's log",
+        Fix: "put a delivery id in the body, or wait for the next second; a query string is not signed, " +
+          "so varying it does not make a second delivery",
+      }),
+    });
+  }
   await trimNet(sheet_id);
   return c.json(null, 200);
 });
@@ -2088,7 +2238,7 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       const body = res.ok ? text : JSON.stringify(fetchFailure(url, headers, res, text));
       // The run beside the payload: whether a feed is slow, or 200-ing an error
       // page, is a question about the poll and not about the body it returned.
-      const meta = JSON.stringify({ status: res.status, ms: Date.now() - started, bytes: text.length });
+      const meta = sql.json({ status: res.status, ms: Date.now() - started, bytes: text.length });
       await sql`
         insert into net (sheet_id, method, body, meta) values (${sheet_id}, 'GET', ${body}, ${meta})
       `;
@@ -2099,7 +2249,7 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       const failure = fetchFailure(url, headers, null, message);
       await sql`
         insert into net (sheet_id, method, body, meta)
-        values (${sheet_id}, 'GET', ${JSON.stringify(failure)}, ${JSON.stringify({ status: 0, ms: 0, bytes: 0 })})
+        values (${sheet_id}, 'GET', ${JSON.stringify(failure)}, ${sql.json({ status: 0, ms: 0, bytes: 0 })})
       `.catch((dbErr: unknown) => console.error(`net-http poll ${sheet_id}: could not record the error:`, dbErr));
     }
   }
@@ -2111,8 +2261,9 @@ setInterval(() => pollNetOnce().catch((err) => console.error("net-http poll:", e
 //
 // An alert sheet is a query plus a destination. It fires when the query returns
 // a row, which means the condition is the query's own where clause and there is
-// no second expression language to learn. Every evaluation that changes the
-// answer lands in `net`, so the alert's own history is a sheet you can query.
+// no second expression language to learn. Every evaluation lands in `net`, so
+// the alert's own history is a sheet you can query -- and a quiet alert is
+// distinguishable from a dead one, which it is not when only changes are kept.
 
 const alertDue = new Map<string, number>();
 
@@ -2181,35 +2332,80 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
     if ((alertDue.get(sheet_id) ?? 0) > now) continue;
     alertDue.set(sheet_id, now + 3600_000);
     let record: Record<string, unknown>;
+    // Recorded beside the run so the status check can grade liveness in SQL,
+    // instead of opening an automerge document per alert. A run whose document
+    // would not open keeps the hour the due map just assumed.
+    let interval = 3600;
+    // The row a repeated unchanged tick updates instead of duplicating: set only
+    // when the previous run was itself unchanged, so the run that last said
+    // something different is never overwritten.
+    let quiet: string | null = null;
     const started = Date.now();
     try {
       const config = (await automerge.find<{ data: [Alert] }>(doc_id)).doc()?.data?.[0];
       if (!config) throw new Error("The document has no config in data[0].");
-      alertDue.set(sheet_id, now + Math.max(60, Number(config.interval) || 3600) * 1000);
-      if (!config.code?.trim()) continue;
-      // Run it as the owner would, through the same authenticated path, so an
-      // alert can never read a sheet its owner cannot.
-      const res = await app.request(`/query`, {
-        method: "POST",
-        headers: new Headers({
-          Authorization: `Bearer ${await createJwt(created_by)}`,
-          "Content-Type": "application/json",
-        }),
-        body: JSON.stringify({ lang: "sql", code: config.code, args: [] }),
-      });
-      const text = await res.text();
-      if (!res.ok) throw new Error(`the query failed with ${res.status}: ${text.slice(0, 400)}`);
-      const [, ...rows] = (JSON.parse(text) as { data: Row[] }).data;
+      // The status check reads this number back out of the run and reports it as
+      // the alert's own interval, so a value nobody can parse has to be a crash
+      // rather than a silent hour. Rounded, because the guard the check reads it
+      // through is anchored on digits: a fractional interval would drop out and
+      // be graded against the default instead.
+      if (config.interval !== undefined && config.interval !== null && !(Number(config.interval) > 0)) {
+        throw new Error(explain(`The interval on ${sheet_id} is not a number of seconds.`, {
+          Received: JSON.stringify(config.interval),
+          Expected: "a positive number of seconds, or no interval at all for the default 3600",
+          Source: "data[0].interval on the alert document",
+          Fix: "put seconds in the interval cell, or clear it",
+        }));
+      }
+      interval = Math.max(60, Math.round(Number(config.interval) || 3600));
+      alertDue.set(sheet_id, now + interval * 1000);
+      const code = config.code?.trim() ?? "";
+      let rows: Row[] = [];
+      if (code) {
+        // Run it as the owner would, through the same authenticated path, so an
+        // alert can never read a sheet its owner cannot.
+        const res = await app.request(`/query`, {
+          method: "POST",
+          headers: new Headers({
+            Authorization: `Bearer ${await createJwt(created_by)}`,
+            "Content-Type": "application/json",
+          }),
+          body: JSON.stringify({ lang: "sql", code, args: [] }),
+        });
+        const text = await res.text();
+        if (!res.ok) throw new Error(`the query failed with ${res.status}: ${text.slice(0, 400)}`);
+        rows = (JSON.parse(text) as { data: Row[] }).data.slice(1);
+      }
       const fingerprint = await digest(rows);
-      const [last]: { body: string }[] = await sql`
-        select body from net where sheet_id = ${sheet_id} order by net_id desc limit 1
+      const [last]: { net_id: string; body: string }[] = await sql`
+        select net_id, body from net where sheet_id = ${sheet_id} order by net_id desc limit 1
       `;
       const before = last
-        ? JSON.parse(last.body) as { fingerprint?: string; matched?: Row[]; truncated?: boolean }
+        ? JSON.parse(last.body) as {
+          fingerprint?: string;
+          matched?: Row[];
+          truncated?: boolean;
+          status?: string;
+          delivery?: string;
+          to?: string;
+        }
         : null;
-      // Same answer as last time means the same alert, and sending it again every
-      // interval is how people learn to filter alerts into a folder they never open.
-      if (before?.fingerprint === fingerprint) continue;
+      // Same answer as last time means the same alert, and sending it again
+      // every interval is how people learn to filter alerts into a folder they
+      // never open. The run is still recorded: a healthy quiet alert and a
+      // poller that died both write nothing otherwise, and nothing outside this
+      // log can tell them apart. The row carries the same fingerprint, matched
+      // and truncated the next run reads back, so the de-dupe and the diff both
+      // keep working off "the last row" as they did.
+      // ...unless the last run never got through. A send that failed and is
+      // then de-duped away is an alert one Resend outage silences for good, so
+      // the same rows are sent again rather than counted as already delivered.
+      // A run with no destination is not stuck: retrying sends nothing, and
+      // recording that every interval would page on a sheet nobody finished.
+      quiet = before?.status === "unchanged" && last ? last.net_id : null;
+      const stuck = before?.status === "firing" && !!before?.to &&
+        before?.delivery !== "sent" && before?.delivery !== HELD;
+      const unchanged = before?.fingerprint === fingerprint && !stuck;
       // The diff is over the rows the last run kept, so it is only honest when
       // neither run had more rows than it keeps. Say so rather than guess.
       const truncated = rows.length > ALERT_ROWS;
@@ -2223,7 +2419,7 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
         }
         : null;
       record = {
-        status: rows.length ? "firing" : "clear",
+        status: !code ? "idle" : unchanged ? "unchanged" : rows.length ? "firing" : "clear",
         rows: rows.length,
         fingerprint,
         to: config.to ?? "",
@@ -2238,7 +2434,11 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
             ? "this is the first run, so there is nothing to compare it with"
             : `the run before matched more than ${ALERT_ROWS} rows`,
         }),
-        delivery: !rows.length
+        delivery: !code
+          ? "no query to run, so nothing was sent"
+          : unchanged
+          ? "the same answer as the run before, so nothing was sent"
+          : !rows.length
           ? "cleared, so nothing was sent"
           : config.digest
           ? HELD
@@ -2251,11 +2451,22 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
       console.error(`alert ${sheet_id}:`, message);
       record = { status: "error", rows: 0, fingerprint: await digest(message), error: message };
     }
-    await sql`
-      insert into net (sheet_id, method, body, meta)
-      values (${sheet_id}, 'ALERT', ${JSON.stringify(record)}, ${JSON.stringify({ ms: Date.now() - started })})
-    `.catch((dbErr: unknown) => console.error(`alert ${sheet_id}: could not record the run:`, dbErr));
-    await trimNet(sheet_id);
+    // A tick that says what the tick before it said moves that row's timestamp
+    // rather than adding another. Liveness reads max(created_at) and the
+    // de-dupe reads the last row, so both still work -- and a minute-interval
+    // alert stops writing 1440 rows a day, which would push the run the daily
+    // digest still has to find out past NET_KEEP in under 17 hours.
+    const repeat = record.status === "unchanged" && quiet;
+    await (repeat
+      ? sql`
+        update net set created_at = now(), meta = ${sql.json({ ms: Date.now() - started, interval })}
+        where net_id = ${quiet}
+      `
+      : sql`
+        insert into net (sheet_id, method, body, meta)
+        values (${sheet_id}, 'ALERT', ${JSON.stringify(record)}, ${sql.json({ ms: Date.now() - started, interval })})
+      `).catch((dbErr: unknown) => console.error(`alert ${sheet_id}: could not record the run:`, dbErr));
+    if (!repeat) await trimNet(sheet_id);
   }
 };
 
@@ -2325,9 +2536,7 @@ app.get("/proxy", async (c) => {
   const url = c.req.query("url");
   if (!url) return c.json({ error: "Missing url parameter" }, 400);
 
-  // Rate limit by IP
-  const ip = c.req.header("x-forwarded-for")?.split(",")[0] || "unknown";
-  if (!rateLimit(`proxy:${ip}`))
+  if (!rateLimit(`proxy:${callerIp(c)}`))
     return c.json({ error: "Rate limit exceeded" }, 429);
 
   try {

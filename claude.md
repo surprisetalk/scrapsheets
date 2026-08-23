@@ -35,8 +35,10 @@ technologies. It uses a hybrid architecture with:
 
 - **Build frontend**: `deno task build` (copies src/* to dist and runs elm make)
 - **Development server**: `deno task dev`
-- **Run all tests**: `deno task test` (or `deno test --allow-all`). No test drives a browser. The suite is five files,
-  and which one a failure belongs in is usually obvious:
+- **Run all tests**: `deno task test`. Not `deno test --allow-all`: the task is the one place `JWT_SECRET`,
+  `TOKEN_SECRET` and `DSN_ENCRYPTION_KEY` are set, and `main.ts` refuses to load without all three, so a bare
+  `deno test` cannot start. No test drives a browser. The suite is five files, and which one a failure belongs in is
+  usually obvious:
   - `main_test.ts` — the server: auth, sync and roles, shop and Stripe, `POST /query`, the `src/sql.mjs` UDFs, net-http
     polling, alerts and digests, MCP, export. One `Deno.test` full of prose-headed blocks against in-process PGlite.
   - `examples_test.ts` — every bundled sheet, run through **both** engines (`npm:alasql` and the vendored
@@ -102,9 +104,17 @@ technologies. It uses a hybrid architecture with:
   returns owner/editor/viewer or null, covering membership, purchase-derived access, `sheet.public`, and share-link
   JWTs; a viewer's frames are inspected with `Automerge.decodeSyncMessage` and rejected if they carry changes
 - **Authentication**: JWT-based with email verification via Resend (plain fetch, RESEND_API_KEY)
+- **Secrets**: `requireSecret()` **throws at module load** for `JWT_SECRET`, `TOKEN_SECRET` and `DSN_ENCRYPTION_KEY`.
+  They used to fall back to `Math.random()` and warn, which meant a restart silently re-rolled them: every session
+  dropped, every encrypted DSN unreadable, and — since `TOKEN_SECRET` is the root `hookSecret()` derives every sender's
+  signing key from — every webhook delivery refused with a message blaming the sender. A secret-less boot is not a
+  recoverable state. `deno task test` sets all three; nothing else does
 - **Document types**: table, query, net-hook, net-http, net-socket, portal, alert, chart, codex-*
 - **Seeding**: a lazy-once middleware runs `seed()` (examples.sql + src/examples.mjs datasets) on the first request;
-  idempotent via `on conflict (doc_id) do update`
+  idempotent via `on conflict (doc_id) do update`. It also grants `OPERATOR_EMAIL` a viewer row on `net-hook:errors`,
+  creating the `usr` row if it does not exist yet — the sentinel that owns that sheet has no password and cannot be
+  logged into, so `/share` cannot reach it. A password-less row is not an account; `POST /signup/:token` upserts on the
+  email, so signing up later adopts it along with the grant
 - **net-http polling**: `pollNetOnce` scans net-http sheets every 15s, fetches due URLs through the safeFetch SSRF
   guard, and appends bodies to the `net` table. A failed fetch lands as a row too, shaped by `fetchFailure()`: status,
   the URL actually fetched after redirects, content type, a body snippet, and a `repro` curl line that names the header
@@ -121,24 +131,44 @@ technologies. It uses a hybrid architecture with:
   secret never enters the automerge document, where a viewer or a share-link holder could read it. Rotating one sheet's
   secret therefore means rotating `TOKEN_SECRET`, **which also invalidates every outstanding email-verification link**;
   per-sheet rotation is open. The four rejections (unsigned, malformed, stale, mismatched) are all 401 and each names
-  its own check, but none prints the secret or the expected digest, which would make the message a signing oracle.
-  `hookSign()` is exported because the tests sign the way a sender does rather than reimplementing it. The 404 and the
-  400 answer _before_ the signature is checked, which is an existence oracle to anyone already holding a doc_id —
-  accepted, because a doc_id is 22 unguessable characters and the messages are worth more than the disclosure.
-  Owner-only `GET /library/:id/hook` returns `{ url, secret, repro }` under `Cache-Control: no-store`, the last a
-  runnable `openssl`/`curl` line; the page reaches it through the existing `shareAction`/`shareLoaded` port pair with
-  the action `hook`, behind a button, so a secret nobody asked for is never on screen, and `UrlChange` clears it so it
-  cannot follow you to another sheet. A decode failure on that answer is reported rather than swallowed — the
-  alternative is a button that does nothing and says nothing
+  its own check, but none prints the secret or the expected digest, which would make the message a signing oracle. The
+  `v1` digest must be **lowercase** hex: `parseInt` is case-insensitive, so an upper-cased signature verifies against
+  the same secret while reading as a different string, and the uniqueness that refuses a replay is over the header as
+  sent — every one of the 2^64 case variants of one captured signature was otherwise a free replay. A signature this
+  sheet has already stored is refused with **409**, not 401 — a replay is not a signing failure, and the status check
+  reads a 401 on `/net/` as a sender that cannot sign. The refusal is the unique index `net_hook_signature_idx` on
+  `(sheet_id, (req_headers->>'scrapsheets-signature'))`, and the **insert** is what asks it: selecting first and
+  inserting after let ten parallel copies of one captured delivery all see no prior row and all land, which is the least
+  sophisticated version of the attack the check exists for. The consequence is that a delivery's identity is
+  `(this sheet, this second, these bytes)` — a query string is not signed — so two deliveries carrying the same body in
+  the same second are one delivery here, and the 409 says exactly that. The one hole is `trimNet`, which can evict the
+  record on a busy sheet and free the signature, by which point the skew check has long refused it. `hookSign()` is
+  exported because the tests sign the way a sender does rather than reimplementing it. The 404 and the 400 answer
+  _before_ the signature is checked, which is an existence oracle to anyone already holding a doc_id — accepted, because
+  a doc_id is 22 unguessable characters and the messages are worth more than the disclosure. Owner-only
+  `GET /library/:id/hook` returns `{ url, secret, repro }` under `Cache-Control: no-store`, the last a runnable
+  `openssl`/`curl` line; the page reaches it through the existing `shareAction`/`shareLoaded` port pair with the action
+  `hook`, behind a button, so a secret nobody asked for is never on screen, and `UrlChange` clears it so it cannot
+  follow you to another sheet. A decode failure on that answer is reported rather than swallowed — the alternative is a
+  button that does nothing and says nothing
 - **Alerts**: an `alert` sheet is `{ code, to, interval }` and fires when its query returns a row, so the condition is
   the where clause and there is no second expression language. `pollAlertOnce` scans them every 15s and runs each
   through `POST /query` **as its owner** (`createJwt(created_by)`), so an alert can never read a sheet its owner cannot.
-  Every run whose answer differs from the last one lands in `net` with `method = 'ALERT'` — status, row count,
-  `added`/`removed` against the run before, the rows it matched up to `ALERT_ROWS`, and what the delivery did — which
-  makes the alert's history a sheet you can query, and makes both the de-dupe and the diff survive a restart, because
-  the previous run is read back out of that log. Past `ALERT_ROWS` the run records why it could not diff rather than a
-  number it cannot stand behind. `POST /sell` refuses an alert: a copy would mail the seller's address on the buyer's
-  timer
+  A run whose delivery failed is **not** de-duped away — the same rows are sent again next interval, or one Resend
+  outage silences an alert for good — though a run with no destination at all is, since retrying sends nothing.
+  **Every** run lands in `net` with `method = 'ALERT'`, not only the ones whose answer changed: a healthy quiet alert
+  and a dead `setInterval` write the same empty log otherwise, and nothing outside this log can tell them apart. An
+  unchanged run carries `status = 'unchanged'` and the same `fingerprint`, `matched` and `truncated` the next run reads
+  back, so the de-dupe and the diff both still work off "the last row"; an alert with no query records `idle`. A
+  _repeated_ quiet tick moves that row's `created_at` rather than adding another — liveness reads `max(created_at)` and
+  the de-dupe reads the last row, so both still work, and a minute-interval alert stops writing 1440 rows a day and
+  pushing the run the daily digest still has to find out past `NET_KEEP` in under 17 hours. An `interval` that is
+  present but not a positive number is a **crash**, not a guessed hour: the status check reads that number back and
+  reports it as the alert's own interval. The row carries status, row count, `added`/`removed` against the run before,
+  the rows it matched up to `ALERT_ROWS`, and what the delivery did — which makes the alert's history a sheet you can
+  query, and makes both the de-dupe and the diff survive a restart, because the previous run is read back out of that
+  log. Past `ALERT_ROWS` the run records why it could not diff rather than a number it cannot stand behind. `POST /sell`
+  refuses an alert: a copy would mail the seller's address on the buyer's timer
 - **Status**: `GET /status` is public — an uptime check carries no bearer token — and answers grades and no rows: no
   ids, no names, no addresses, though a grade is a ratio against a limit named in `main.ts`, so a reader can invert one
   back to the count behind it. `status()` returns one entry per likely failure mode, keyed by **the sentence the grade
@@ -156,17 +186,23 @@ technologies. It uses a hybrid architecture with:
   refused on `/net/`** rather than requests rejected, because a scanner walking unknown paths would otherwise hold the
   alarm red with nothing broken; and "Every failure is reaching the error log" grades a counter of consecutive log-write
   failures, because the two conditions above it are counted out of that very sheet, so a log that cannot be written
-  would otherwise read as a service with no failures. The route answers 503 when a `"0"` grade that **pages** is below
-  1.0; `REPORTED_ONLY` names the conditions that are graded and returned but do not page — today just "Somebody created
-  a sheet in the past 24 hours.", because a product with no users is not a service that is down, and a 15-minute email
-  about it would take the eleven technical conditions with it. A sentence in `REPORTED_ONLY` that `status()` does not
-  actually return is a 500 by name, since a typo there silently starts paging again. `deno task status` prints the same
-  thing, times out at 10s, refuses an answer carrying fewer than 12 conditions, lists every grade below 1.0, and **exits
-  on the route's own status code** rather than deciding again — a second copy of the paging rule would drift from the
-  first; `.github/workflows/status.yml` runs it every 15 minutes beside a plain `curl` of the homepage, which the API's
-  own check cannot see, because the page is built by Cloudflare and the API runs on Deno Deploy. A failed scheduled run
-  emails the repo owner, and that email is the alarm. There is deliberately no in-process watchdog, because a watchdog
-  dies with what it watches
+  would otherwise read as a service with no failures. Alert liveness is graded the way net-http freshness is — every
+  alert sheet ran within twice the `interval` its own newest run recorded — which only became possible once every run
+  was logged. It is a **left** join onto `net`: an inner join drops an alert that has never run at all, and an empty set
+  grades as a pass, so the condition would have reported healthy on exactly the failure it is for — a poller that never
+  fired once. A never-run sheet is graded from its own `created_at`. And "either delivered or had nothing to deliver" is
+  one condition, not two: a `clear`, `unchanged` or `idle` run sent nothing on purpose, and grading that as an
+  undelivered alert held the route at 503 for a day every time an alert went quiet. The route answers 503 when a `"0"`
+  grade that **pages** is below 1.0; `REPORTED_ONLY` names the conditions that are graded and returned but do not page —
+  today just "Somebody created a sheet in the past 24 hours.", because a product with no users is not a service that is
+  down, and a 15-minute email about it would take the twelve technical conditions with it. A sentence in `REPORTED_ONLY`
+  that `status()` does not actually return is a 500 by name, since a typo there silently starts paging again.
+  `deno task status` prints the same thing, times out at 10s, refuses an answer carrying fewer than 13 conditions, lists
+  every grade below 1.0, and **exits on the route's own status code** rather than deciding again — a second copy of the
+  paging rule would drift from the first; `.github/workflows/status.yml` runs it every 15 minutes beside a plain `curl`
+  of the homepage, which the API's own check cannot see, because the page is built by Cloudflare and the API runs on
+  Deno Deploy. A failed scheduled run emails the repo owner, and that email is the alarm. There is deliberately no
+  in-process watchdog, because a watchdog dies with what it watches
 - **Error sheet**: `net-hook:errors` is seeded by `seed()`, owned by the same sentinel `usr` with the empty email, and
   `app.onError` writes one row to it per failure — `method`, the `explain(...)` block the caller was sent, and
   `meta = {status, path}`. It is a `net-hook` sheet because that already means "a sheet whose rows live in `net`", so it
@@ -175,12 +211,22 @@ technologies. It uses a hybrid architecture with:
   share link rides the same parameter, so a failing request would otherwise write a live token into a sheet that can be
   shared and exported. The write is **not awaited** — when the database is what failed, an error response must not wait
   for the logger to discover that too — and its rejection is caught, because a logging failure must never replace the
-  failure being logged; that happens, since the rate limiter throws before the seed middleware has run. A **429 is not
-  logged at all**: shedding load is the cheap path by definition, and paying two round trips per shed request inverts
-  the point. `logWriteFailures` counts consecutive write failures and resets on the next success, which is the one fact
-  about this log that cannot be read out of the log. The sentinel cannot be logged into, so reading it means one
-  `insert into sheet_usr` at the psql prompt (`readme.md` has the statement). It is the operator's log; a per-user error
-  sheet is a separate item
+  failure being logged; that happens, since the rate limiter throws before the seed middleware has run. `logFailure`
+  answers **whether a row actually landed**, and only a write that happened may clear `logWriteFailures` — a suppressed
+  call resolves like a written one, so clearing on any resolution made a database refusing every insert read as a
+  service with no failures. It writes **one row per (status, path) per minute**, and the count a suppressed window hid
+  rides the next row that key writes as `meta.folded`, which the two conditions counted out of this sheet add back; that
+  count is _subtracted_ rather than zeroed after the insert, because `onError` does not await the call and every failure
+  arriving during that round trip has already folded onto the same entry. Two costs, both real: the row keeps **one
+  message per key per minute**, so a different failure sharing a status and a path inside that window is counted but its
+  own message is not kept; and a burst that _stops_ is undercounted by whatever it did in its final window, since that
+  count never flushes. `logSeen` is bounded at `LOG_KEYS_MAX` and evicts oldest-first, because a scanner mints a key per
+  path — `rateLimitBuckets` is bounded the same way, since sweeping by idle time alone loses to a caller minting keys
+  faster than the broom runs. A **429 is not logged at all**: shedding load is the cheap path by definition, and paying
+  two round trips per shed request inverts the point. `logWriteFailures` counts consecutive write failures and resets on
+  the next success, which is the one fact about this log that cannot be read out of the log. `seed()` grants
+  `OPERATOR_EMAIL` the viewer row, so reading it needs no psql prompt. It is the operator's log; a per-user error sheet
+  is a separate item
 - **Charts**: a `chart` sheet is `{ source, kind, x, y }`. `chartSql()` in `src/sql.mjs` turns that into one query both
   engines build identically, so the SVG the page draws and the rows `GET /sheet/chart:abc` and `/export/chart:abc.csv`
   return are the same answer. Only a column name reaches the SQL — anything else is refused by name rather than
@@ -259,6 +305,16 @@ t.trade_id order by p.day desc) = 1` —
   the source column's, so `cast(price as string) as price` would trip a check meant for a bad cell
 - **Error shape**: `explain(headline, fields)` in `src/sql.mjs` is the one formatter for the aligned
   expected/received/source/fix block
+- **Rate limiting**: `callerIp(c)` is the bucket key, and it reads the **rightmost** `x-forwarded-for` entry — the one
+  the proxy in front of us appended. The leftmost is whatever the caller typed, so keying on it let a flood rotate its
+  own bucket for free, one header value per request. With no header at all nothing proxied us, so `c.env.remoteAddr` is
+  the caller. `x-real-ip` is not consulted: nothing in front of us sets it
+- **jsonb writes**: every jsonb column is written with `sql.json(...)`, never `JSON.stringify(...)`. postgresjs
+  registers `JSON.stringify` as the serializer for the jsonb OID, so a pre-stringified value is encoded **twice** and
+  lands as a jsonb _string_ holding JSON rather than an object — which made `meta->>'status'` null on every row
+  `logFailure` wrote, and so made the 5xx and refusals conditions in `GET /status` grade a dead check as fine. The `net`
+  read casts the three jsonb columns `::text` on the way out, so a cell holds the JSON `json_extract()` reads rather
+  than an object postgresjs parsed
 - **Sharing**: `GET/POST/DELETE /library/:id/share` (owner-only, by email + role), `POST /library/:id/public`, and
   `POST /library/:id/link` which mints a viewer-scoped JWT. The link rides the sync socket's existing `?auth=`
   parameter, so there is one read path rather than two. `GET /library/:id/hook` (owner-only, net sheets only) is the
@@ -358,12 +414,16 @@ t.trade_id order by p.day desc) = 1` —
 - **db**: External database connections (DSN storage for codex sheets)
 - **net**: Webhook data storage for net-\* sheets, and the run log for `alert` sheets, which is why the sheet_id check
   allows both prefixes. The read projects `created_at, body, method, req_headers, query_params` — the last three
-  appended, so existing column positions and `select body from @net-hook:x` still hold. postgresjs returns jsonb as raw
-  JSON text, so those cells are strings; read them with `json_extract()`. `meta` is what the run itself cost:
-  `{status, ms, bytes}` for a net-http poll, `{ms}` for an alert run, `{bytes}` for a webhook delivery. `net_id`
-  identity PK plus an index on `(sheet_id, created_at desc)`; the read orders by both, without which paging a log
-  repeats and skips rows. `trimNet()` keeps the newest `NET_KEEP` rows per sheet and runs behind every write, so the log
-  is bounded — a sheet that must keep everything writes to a table, which is never trimmed
+  appended, so existing column positions and `select body from @net-hook:x` still hold. The three jsonb columns are cast
+  `::text` in that projection, so those cells hold the raw JSON and `json_extract()` reads them; without the cast
+  postgresjs parses jsonb into an object, which no cell can hold. `meta` is what the run itself cost:
+  `{status, ms, bytes}` for a net-http poll, `{ms, interval}` for an alert run, `{bytes}` for a webhook delivery, and
+  `{status, path, folded?}` on `net-hook:errors`. `net_id` identity PK, an index on `(sheet_id, created_at desc)`, and a
+  unique index `net_hook_signature_idx` on `(sheet_id, (req_headers->>'scrapsheets-signature'))` — the expression is
+  null on every row that is not a signed delivery, and nulls do not collide, so nothing else in the table is
+  constrained; the read orders by both, without which paging a log repeats and skips rows. `trimNet()` keeps the newest
+  `NET_KEEP` rows per sheet and runs behind every write, so the log is bounded — a sheet that must keep everything
+  writes to a table, which is never trimmed
 - **payment**: Marketplace transactions (buyer, seller, sell_id, buyer sheet_id, amount, Stripe session)
 
 #### Key Schema Features

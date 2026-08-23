@@ -9,6 +9,7 @@ import {
   app,
   arrayify,
   automerge,
+  callerIp,
   createJwt,
   createToken,
   hookSecret,
@@ -17,6 +18,7 @@ import {
   parseNetHeaders,
   pollAlertOnce,
   pollNetOnce,
+  requireSecret,
   seed,
   sendDigestOnce,
   sql,
@@ -118,7 +120,24 @@ Deno.test(async function allTests(_t) {
 
   await pglite.waitReady;
   await pglite.exec(dbSql);
+  // seed() grants the error log to this address. It is set before seed() runs
+  // because that is the only moment the grant is written.
+  Deno.env.set("OPERATOR_EMAIL", "erin@example.com");
   await seed();
+
+  // A secret-less boot is a crash, not a warning: the three roots used to fall
+  // back to Math.random(), so a restart re-rolled every session, every encrypted
+  // DSN, and every sender's webhook signing key. That this suite loaded main.ts
+  // at all is the other half of the proof -- `deno task test` is the one place
+  // the three are set.
+  {
+    assertThrows(
+      () => requireSecret("SCRAPSHEETS_SECRET_THAT_IS_NEVER_SET"),
+      Error,
+      "SCRAPSHEETS_SECRET_THAT_IS_NEVER_SET",
+    );
+    assertEquals(requireSecret("JWT_SECRET"), Deno.env.get("JWT_SECRET"));
+  }
 
   // Signup completion + login round-trip (app-level password hashing, no pgcrypto).
   {
@@ -602,11 +621,23 @@ Deno.test(async function allTests(_t) {
       assertEquals(sent.length, 0, "a clear alert should not email anyone");
       assertEquals((await history())[0].status, "clear");
 
-      // The same answer again is the same alert, and is not recorded twice.
+      // The same answer again is the same alert, so nothing is sent -- but the
+      // run is still recorded. A quiet alert and a dead poller write the same
+      // empty log otherwise, and nothing outside this log can tell them apart.
       const settled = (await history()).length;
       clock += 120_000;
       await pollAlertOnce(send, clock);
-      assertEquals((await history()).length, settled, "an unchanged answer should not be recorded again");
+      const quiet = await history();
+      assertEquals(quiet.length, settled + 1, "every run is recorded, changed or not");
+      // The sheet's own interval rides the run, which is what lets the status
+      // check grade liveness in SQL rather than by opening every document.
+      const [{ recorded }] = await sql`
+        select meta->>'interval' as recorded from net where sheet_id = ${alert_id} order by net_id desc limit 1
+      `;
+      assertEquals(recorded, "60");
+      assertEquals(quiet[0].status, "unchanged");
+      assertEquals(quiet[0].fingerprint, quiet[1].fingerprint, "the de-dupe still reads the last row");
+      assertEquals(sent.length, 0, "an unchanged answer should not email anyone");
 
       // A row breaches: it fires once, to the address on the sheet.
       watched.change((d: { data: Record<number, unknown>[] }) => {
@@ -623,10 +654,20 @@ Deno.test(async function allTests(_t) {
       assertEquals([fired.added, fired.removed], [1, 0]);
       assertEquals([sent[0].added, sent[0].removed], [1, 0]);
 
-      // Still breaching, same rows: no second email.
+      // Still breaching, same rows: no second email, and the unchanged run
+      // carries the matched rows forward so the next diff is still honest.
       clock += 120_000;
       await pollAlertOnce(send, clock);
       assertEquals(sent.length, 1, "the same breach should not email twice");
+      assertEquals((await history())[0].status, "unchanged");
+
+      // A second quiet tick moves that row's timestamp rather than adding
+      // another. Otherwise a minute-interval alert writes 1440 rows a day and
+      // pushes the held run the daily digest still has to find past NET_KEEP.
+      const held = (await history()).length;
+      clock += 120_000;
+      await pollAlertOnce(send, clock);
+      assertEquals((await history()).length, held, "a repeated quiet tick is one row, not a row per tick");
 
       // A second region breaches and the first recovers: one row in, one out.
       watched.change((d: { data: Record<number, unknown>[] }) => {
@@ -639,6 +680,29 @@ Deno.test(async function allTests(_t) {
       assertEquals([sent[1].added, sent[1].removed], [1, 1]);
       const swapped = (await history())[0];
       assertEquals([swapped.rows, swapped.added, swapped.removed], [1, 1, 1]);
+
+      // A send that failed must not be de-duped away: the same rows next interval
+      // would then never be sent, so one Resend outage silences the alert for
+      // good. The refusal is recorded, and the run after it tries again.
+      {
+        const refusals: number[] = [];
+        const refuse = () => {
+          refusals.push(1);
+          return Promise.resolve("resend refused it with 500: down");
+        };
+        watched.change((d: { data: Record<number, unknown>[] }) => {
+          d.data[1][1] = 2.5;
+        });
+        clock += 120_000;
+        await pollAlertOnce(refuse, clock);
+        assertEquals(refusals.length, 1);
+        assert(String((await history())[0].delivery).includes("resend refused"));
+
+        clock += 120_000;
+        await pollAlertOnce(refuse, clock);
+        assertEquals(refusals.length, 2, "the same rows must be sent again after a failed delivery");
+        assertEquals((await history())[0].status, "firing", "a retry is a firing run, not an unchanged one");
+      }
 
       // A broken query is recorded against the sheet rather than thrown away.
       alert.change((d: { data: [{ code: string }] }) => {
@@ -1765,8 +1829,17 @@ Deno.test(async function allTests(_t) {
       const cols = "created_at,body,method,req_headers,query_params,meta";
       const [cols_, ...rows] = await get<Table>(jwt, `/net/${hookId}`);
       assertEquals(Object.values(cols_).map((col) => col.name).join(), cols);
-      // jsonb reads back as json, not text, so a query author sees the real type.
-      assertEquals(Object.values(cols_).map((col) => col.type).join(), "text,text,text,json,json,json");
+      // The three jsonb columns are cast to text on the way out, so a cell holds
+      // the JSON rather than a parsed object json_extract() cannot read. The
+      // column says text because that is what the cell is.
+      assertEquals(Object.values(cols_).map((col) => col.type).join(), "text,text,text,text,text,text");
+      // Stored as a real jsonb object, not a jsonb string holding JSON. Written
+      // the other way, `meta->>'status'` was null on every row -- which is how
+      // the 5xx and the refusals conditions came to grade a dead check as fine.
+      const [{ shape }] = await sql`
+        select jsonb_typeof(meta) as shape from net where sheet_id = ${hookId} limit 1
+      `;
+      assertEquals(shape, "object");
       // Every delivery carries what the run itself cost, beside what it delivered.
       assertEquals(JSON.parse(String(rows[0].meta)).bytes, '{"event":"ping"}'.length);
 
@@ -1775,8 +1848,8 @@ Deno.test(async function allTests(_t) {
       // The delivery's own method, headers and query string are the raw material
       // signature verification needs; they were stored but never readable.
       assertEquals(rows[0].method, "POST");
-      // postgresjs hands jsonb back as the raw JSON text, in Postgres and PGlite
-      // alike, so a cell holds a string and json_extract() is how a query reads it.
+      // The cell holds the raw JSON text, so json_extract() is how a query reads
+      // it -- the same in Postgres and in PGlite.
       assertEquals(JSON.parse(String(rows[0].req_headers))["content-type"], "application/json");
       assertEquals(JSON.parse(String(rows[0].query_params)), { x: "1" });
       await reject("", `/net/${hookId}`);
@@ -2195,7 +2268,44 @@ Deno.test(async function allTests(_t) {
         body,
       });
 
-    assert((await send(await hookSign(id, body))).ok, "a correctly signed delivery must land");
+    const first = await hookSign(id, body);
+    assert((await send(first)).ok, "a correctly signed delivery must land");
+
+    // A captured delivery, sent again unchanged. The skew window bounds a replay
+    // to five minutes, which is not the same as never -- so the same signature
+    // is refused rather than stored twice. 409 and not 401: the four checks
+    // above are about signing, and the status check reads a 401 on /net/ as a
+    // sender that cannot sign.
+    {
+      const again = await send(first);
+      assertEquals(again.status, 409);
+      const text = await again.text();
+      assert(text.includes("already been stored"), `the rejection must name the replay, got: ${text}`);
+      assert(!text.includes(secret), "a rejection that prints the secret is a signing oracle");
+      const [{ n }] = await sql`select count(*) as n from net where sheet_id = ${id}`;
+      assertEquals(Number(n), 1, "a replayed delivery must not be stored twice");
+    }
+
+    // Ten copies at once. Selecting first and inserting after let every one of
+    // them see no prior row and land, so the control was bypassed by the least
+    // sophisticated version of the attack it exists for. The unique index is
+    // what decides it; the insert is what asks.
+    {
+      const burst = JSON.stringify({ event: "burst" });
+      const signature = await hookSign(id, burst);
+      const answers = await Promise.all(
+        Array.from({ length: 10 }, () =>
+          app.request(`/net/${id}`, {
+            method: "POST",
+            headers: new Headers({ "Content-Type": "application/json", "scrapsheets-signature": signature }),
+            body: burst,
+          })),
+      );
+      assertEquals(answers.filter((res) => res.ok).length, 1, "exactly one copy of a burst may land");
+      assertEquals(answers.filter((res) => res.status === 409).length, 9);
+      const [{ n }] = await sql`select count(*) as n from net where sheet_id = ${id} and body = ${burst}`;
+      assertEquals(Number(n), 1, "a concurrent replay must not be stored twice");
+    }
 
     const refused = async (signature: string | null, says: string) => {
       const res = await send(signature);
@@ -2207,6 +2317,13 @@ Deno.test(async function allTests(_t) {
     };
     await refused(null, "is not signed");
     await refused("v1=nope", "is malformed");
+    // An upper-cased v1 verifies against the same secret -- parseInt does not
+    // care about case -- while reading as a different string, so every case
+    // variant of one captured signature used to be a free replay. A hex digest
+    // has one spelling here.
+    const upper = (await hookSign(id, body)).replace(/v1=(.*)$/, (_, hex) => `v1=${hex.toUpperCase()}`);
+    assert(/^t=\d+,v1=[0-9A-F]{64}$/.test(upper), `only the digest may be upper-cased, got: ${upper}`);
+    await refused(upper, "is malformed");
     // Signed correctly, but for a moment outside the replay window.
     const stale = Math.floor(Date.now() / 1000) - 3600;
     const staleText = await refused(await hookSign(id, body, stale), "outside the replay window");
@@ -2234,11 +2351,14 @@ Deno.test(async function allTests(_t) {
   // query. It must carry the path and the status, and it must never carry a
   // header value: an Authorization in a log outlives the request that sent it.
   {
-    const { usr_id, jwt } = await usr("erin@example.com");
-    await sql`
-      insert into sheet_usr (sheet_id, usr_id, role) values ('net-hook:errors', ${usr_id}, 'viewer')
-      on conflict (sheet_id, usr_id) do nothing
+    // No psql prompt: seed() granted OPERATOR_EMAIL the viewer row, and erin
+    // signed up afterwards onto the account row seed() had already made.
+    const { jwt } = await usr("erin@example.com");
+    const [grant] = await sql`
+      select role from sheet_usr su inner join usr u using (usr_id)
+      where su.sheet_id = 'net-hook:errors' and u.email = 'erin@example.com'
     `;
+    assertEquals(grant?.role, "viewer");
     const marker = `/no-such-route-${crypto.randomUUID()}?auth=Bearer%20super-secret-token`;
     // An unknown path with a bad bearer token: the jwt middleware answers before
     // the not-found handler does, which is exactly the sort of thing the log is
@@ -2256,6 +2376,71 @@ Deno.test(async function allTests(_t) {
     // parameter, so a query value in this log is a live token sitting in a
     // sheet that can be shared and exported. One rule for both, not two.
     assert(!row.includes("super-secret-token"), "neither a header nor a query value may reach the log");
+
+    // One row per (status, path) per minute. Every 4xx used to cost an insert
+    // and a trimNet behind it, so refusing a request was dearer than serving
+    // it -- the wrong way round for the path whose whole job is shedding load.
+    const settle = () => new Promise((res) => setTimeout(res, 100));
+    const counted = async (path: string) => {
+      const [{ n }] = await sql`
+        select count(*) as n from net where sheet_id = 'net-hook:errors' and meta->>'path' = ${path}
+      `;
+      return Number(n);
+    };
+    const flood = `/no-such-route-${crypto.randomUUID()}`;
+    for (let i = 0; i < 3; i++) await app.request(flood);
+    await settle();
+    assertEquals(await counted(flood), 1, "three identical rejections are one row, not three");
+
+    const elsewhere = `/no-such-route-${crypto.randomUUID()}`;
+    await app.request(elsewhere);
+    await settle();
+    assertEquals(await counted(elsewhere), 1, "suppression is per status and path, never global");
+
+    // A suppressed write must not clear `logWriteFailures`. Cleared by a
+    // suppression, a database refusing every insert reads as a service with no
+    // failures -- and the two conditions counted out of this sheet read an
+    // empty sheet as a clean hour, so /status answers 200 while nothing works.
+    // The sheet row is what `net` references, so removing it breaks the write.
+    const reaching = "Every failure is reaching the error log.";
+    await sql`delete from net where sheet_id = 'net-hook:errors'`;
+    await sql`delete from sheet_usr where sheet_id = 'net-hook:errors'`;
+    await sql`delete from sheet where sheet_id = 'net-hook:errors'`;
+    const broken = `/no-such-route-${crypto.randomUUID()}`;
+    await app.request(broken);
+    await settle();
+    assert((await status())[reaching]["0"] < 1, "a log that cannot be written must say so");
+
+    // The same failure again, now that the first one's rejection has landed.
+    // It is suppressed, so no write is attempted -- and a suppression that
+    // reported itself as a write would clear the counter here.
+    await app.request(broken);
+    await settle();
+    assert((await status())[reaching]["0"] < 1, "a suppressed write must not clear the counter");
+
+    await seed();
+    const healed = `/no-such-route-${crypto.randomUUID()}`;
+    await app.request(healed);
+    await settle();
+    assertEquals((await status())[reaching]["0"], 1, "one real write clears it again");
+  }
+
+  // The bucket a flood is counted against must be one the flood cannot choose.
+  {
+    const ip = (xff: string | undefined, remote?: string) =>
+      callerIp(
+        {
+          req: { header: (name: string) => (name === "x-forwarded-for" ? xff : undefined) },
+          env: remote ? { remoteAddr: { hostname: remote } } : undefined,
+        } as unknown as Parameters<typeof callerIp>[0],
+      );
+    // The rightmost entry is the one our proxy appended; the leftmost is
+    // whatever the caller typed, so keying on it rotated the bucket for free.
+    assertEquals(ip("9.9.9.9, 1.2.3.4"), "1.2.3.4");
+    assertEquals(ip("1.2.3.4"), "1.2.3.4");
+    // Nothing proxied us, so the socket's own peer is the caller.
+    assertEquals(ip(undefined, "5.6.7.8"), "5.6.7.8");
+    assertEquals(ip(undefined), "127.0.0.1");
   }
 
   // The status check. Every condition is graded so that 1.0 is the minimum pass,
@@ -2264,7 +2449,7 @@ Deno.test(async function allTests(_t) {
   {
     const grades = await status();
     const conditions = Object.keys(grades);
-    assertEquals(conditions.length, 12);
+    assertEquals(conditions.length, 13);
     for (const [condition, series] of Object.entries(grades)) {
       assert(condition.endsWith("."), `a condition is a sentence: ${condition}`);
       assert("0" in series, `${condition} must be graded now`);
@@ -2286,14 +2471,61 @@ Deno.test(async function allTests(_t) {
     const survived = await app.request("/status");
     assertEquals(
       Object.keys(await survived.json()).length,
-      12,
+      13,
       "a malformed row must degrade a grade, not replace the whole answer with an error",
     );
+
+    // A clear run delivered nothing, which is the healthy outcome and not a
+    // failure. Graded the other way, an alert going quiet held /status at 503
+    // for a day -- and an unchanged run, recorded every interval now, would
+    // have held it there for good.
+    const [quietAlert] = await sql`select sheet_id from sheet where type = 'alert' limit 1`;
+    assert(quietAlert, "the alert block above should have left a sheet to grade");
+    await sql`delete from net`;
+    await sql`
+      insert into net (sheet_id, method, body, meta) values
+        (${quietAlert.sheet_id}, 'ALERT',
+         '{"status":"clear","rows":0,"delivery":"cleared, so nothing was sent"}', '{"interval":60}'::jsonb),
+        (${quietAlert.sheet_id}, 'ALERT',
+         '{"status":"unchanged","rows":1,"delivery":"the same answer as the run before, so nothing was sent"}',
+         '{"interval":60}'::jsonb)
+    `;
+    assertEquals(
+      (await status())["Every alert run in the past day either delivered or had nothing to deliver."]["0"],
+      1,
+      "an alert with nothing to say is not an undelivered alert",
+    );
+    assertEquals((await app.request("/status")).status, 200, "a quiet alert is not an outage");
+
+    // A poller that stopped. Every run is recorded now, so the newest one being
+    // older than twice its own interval is what separates a dead setInterval
+    // from an alert that simply had nothing to say.
+    await sql`update net set created_at = now() - interval '10 minutes' where sheet_id = ${quietAlert.sheet_id}`;
+    assert(
+      (await status())["Every alert sheet ran within twice its own interval."]["0"] < 1,
+      "an alert that stopped running must grade as stopped",
+    );
+    // An alert that has never run at all -- a poller that never fired once, on
+    // a cold isolate. An inner join would drop it, and an empty set grades as a
+    // pass, so the condition would report healthy on exactly the failure it is
+    // for. Graded from the sheet's own creation instead.
+    await sql`delete from net`;
+    await sql`update sheet set created_at = now() - interval '3 hours' where type = 'alert'`;
+    assert(
+      (await status())["Every alert sheet ran within twice its own interval."]["0"] < 1,
+      "an alert that has never run must grade as never run",
+    );
+
+    // Done with the alert sheets. Every condition below is about an idle
+    // product, and an alert sheet with no runs at all is a dead poller, not an
+    // idle one -- which is what the liveness condition above just proved.
+    await sql`delete from net`;
+    await sql`delete from sheet_usr where sheet_id like 'alert:%'`;
+    await sql`delete from sheet where type = 'alert'`;
 
     // A condition that is reported but does not page: a service with no users is
     // not a service that is down. It still has to be graded and still has to be
     // in the answer.
-    await sql`delete from net`;
     assert(
       (await status())["Somebody created a sheet in the past 24 hours."]["0"] >= 0,
       "the usage condition is still graded",
@@ -2315,6 +2547,26 @@ Deno.test(async function allTests(_t) {
       200,
       `every condition must pass on a healthy database: ${JSON.stringify(await clean.json())}`,
     );
+
+    // The refusals condition reads `meta->>'status'`, which answers null on a
+    // jsonb string -- so a log written as one made the check count nothing and
+    // grade every hour as clean. Count a row this app actually wrote, with the
+    // condition's own predicate, rather than one the test hand-wrote.
+    await sql`
+      insert into sheet (created_by, type, doc_id, name)
+      values ((select usr_id from usr where email = ''), 'net-hook', 'refusal-probe', 'refusal probe')
+      on conflict (doc_id) do nothing
+    `;
+    await app.request("/net/net-hook:refusal-probe", { method: "POST", body: "{}" });
+    await new Promise((res) => setTimeout(res, 100));
+    const [{ refused: refusedRows }] = await sql`
+      select count(*) as refused from net
+      where sheet_id = 'net-hook:errors'
+        and substring(meta->>'status' from '^[0-9]+$')::int = 401
+        and meta->>'path' like '/net/%'
+    `;
+    assertEquals(Number(refusedRows), 1, "the refusals condition must count rows this app wrote");
+    await sql`delete from net`;
 
     // A 500 in the log is what pulls that condition under 1.0, and one failing
     // condition is what turns the route 503 -- so a checker that reads only the

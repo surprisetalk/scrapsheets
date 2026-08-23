@@ -208,6 +208,35 @@ Deno.test("clicking a header sorts, and shift-clicking adds a second key", async
   );
 });
 
+Deno.test("a share answer that cannot be read says which field failed", async () => {
+  const { app, settle, text } = await boot("http://localhost/table:countries");
+
+  // A member with no role. The panel used to keep the last list it understood
+  // and say nothing, which is a permissions UI showing stale permissions as
+  // current -- the one lie this screen must not tell.
+  app.ports.shareLoaded.send({ members: [{ email: "a@b.c" }], public: true });
+  await settle();
+  assert(text().includes("member list"), `expected the field named, got: ${text().slice(0, 400)}`);
+  assert(text().includes("role"), `expected the missing field named, got: ${text().slice(0, 400)}`);
+
+  // Every unreadable field, not the first: a banner about the member list while
+  // the public flag quietly shows the previous sheet's value is worse than one
+  // that names both.
+  const both = await boot("http://localhost/table:countries");
+  both.app.ports.shareLoaded.send({ members: [{ email: "a@b.c" }], public: "yes" });
+  await both.settle();
+  assert(both.text().includes("member list"), `expected the member list named, got: ${both.text().slice(0, 400)}`);
+  assert(both.text().includes("public flag"), `expected the public flag named too, got: ${both.text().slice(0, 400)}`);
+
+  // A payload about something else is not a failure: a hook answer carries no
+  // member list, and reporting its absence would make every secret an error.
+  // A fresh boot, because the banner stays up until it is dismissed.
+  const quiet = await boot("http://localhost/table:countries");
+  quiet.app.ports.shareLoaded.send({ hook: { url: "u", secret: "s", repro: "r" } });
+  await quiet.settle();
+  assert(!quiet.text().includes("could not read"), "an absent field is not an unreadable one");
+});
+
 Deno.test("hiding a column stops it rendering, and show-all brings it back", async () => {
   const { all, click, text } = await boot("http://localhost/table:countries");
   // A hidden column keeps its x coordinate and only stops rendering, so the cell

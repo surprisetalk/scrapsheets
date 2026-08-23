@@ -35,8 +35,10 @@ jobs:
           deno install -gAf -n elm npm:elm@0.19.2-0
           PATH="$HOME/.deno/bin:$PATH" deno task review
 
+      # deno task test, not `deno test` -- the task is the one place the three
+      # boot secrets are set, and main.ts refuses to load without them.
       - name: Run all tests (including backend)
-        run: deno test --allow-all
+        run: deno task test
         env:
           CI: true
 
