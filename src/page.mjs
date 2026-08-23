@@ -19,6 +19,7 @@ import {
   nearest,
   planQuery,
   scanRefs,
+  selectTypes,
   toRecords,
 } from "./sql.mjs";
 
@@ -266,8 +267,16 @@ export const sheets = (alasql, shelf, find) => {
         // instead, which is the one place the two engines are shaped differently.
         if (type !== "query") return doc.data;
         const inner = await runSql(doc.data[0].code, { "": null }, [...path, id]);
+        // A query sheet's columns carry the types its select list produced,
+        // which runSql has already stamped on them. Without them
+        // `describe @query:x` reported every type as undefined in the page and
+        // the real one on the server, off the same query.
         return [
-          Object.fromEntries(inner.columns.map((c, i) => [i, { key: c.columnid, name: c.columnid }])),
+          Object.fromEntries(inner.columns.map((c, i) => [i, {
+            key: c.columnid,
+            name: c.columnid,
+            type: c.type ?? "text",
+          }])),
           ...inner.data,
         ];
       },
@@ -287,7 +296,19 @@ export const sheets = (alasql, shelf, find) => {
     }
     const plan = planQuery(out, cells, Object.fromEntries(rows), columnsOf());
     const [, result = {}] = await alasql([[`set @params = ?`, [params]], plan.sql]);
-    return plan.windows.length ? applyWindows(result, plan, (q, p) => alasql(q, p).data) : result;
+    const answer = plan.windows.length ? applyWindows(result, plan, (q, p) => alasql(q, p).data) : result;
+    // Every column carries the type its select item produced, which is the map
+    // the server stamps its own answer with -- off the author's own text, not
+    // the scanned rewrite, so both engines infer from the same characters. A
+    // column selectTypes declines carries no type, and the caller decides what
+    // that means: "text" for a referenced sheet above, the query document's own
+    // declared cols in src/index.html.
+    const known = Object.fromEntries([...types.values()].flatMap((cs) => cs.map((c) => [c.name, c.type])));
+    const typed = selectTypes(code, known);
+    return {
+      ...answer,
+      columns: answer.columns.map((c) => ({ ...c, type: typed[c.columnid] ?? known[c.columnid] })),
+    };
   };
 
   return {

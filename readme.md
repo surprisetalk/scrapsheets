@@ -48,9 +48,28 @@ answers with the names and timestamps and never a value. Name it `hook:stripe`, 
 and that provider's own signature is what is checked, against its own header — which verifier runs is read off the
 stored secret, never off the headers the sender sent.
 
+A sheet is also an API. `POST /sheet/<sheet_id>` appends rows keyed by column name, checked against the column types
+before anything is written — a batch is all-or-nothing, because a half-written append under a 201 is a lie. A script
+carries a key for one sheet rather than your login: `POST /library/<sheet_id>/secret` with `{"name":"api"}` and no value
+mints one, answers it once, and it opens that sheet and nothing else. `GET /openapi/<sheet_id>` describes the read and
+the write, generated from the sheet's own columns, so it cannot drift from them.
+
+```sh
+curl -X POST "https://api.sheets.scrap.land/sheet/$sheet_id" -H "scrapsheets-key: $key" \
+  -H 'Content-Type: application/json' -d '{"rows":[{"city":"Oslo","population":709037}]}'
+```
+
 `GET /library/freshness` names the feeds that stopped. One row per net-http and alert sheet you can read: when it last
 ran, when it last succeeded, and how many runs since. It is a sheet, so `select * from @library:freshness` and
 `/export/library:freshness.csv` both work.
+
+The library table shows the same answer per row — last run, and failures since — and the demo strip marks a sheet whose
+feed is failing, so a dead feed is visible where you open it rather than only in the 15-minute alarm email. Ctrl/⌘+K
+opens a palette over every sheet and every shortcut; Ctrl/⌘+/ still lists the keys.
+
+`POST /library/<sheet_id>/link` mints a view-only link. It takes `{"days": 7}` for an expiry and `{"password": "..."}`
+for a lock — the password is never stored, only an HMAC of it under `TOKEN_SECRET`, so holding the link buys nobody an
+offline guess. A locked link is opened with `&pass=` beside the token.
 
 ```nu
 # watch mode

@@ -266,6 +266,36 @@
             }
           };
 
+          // `library:freshness` is a sheet the server computes rather than
+          // stores, and this is the same answer GET /sheet/library:freshness
+          // gives -- no new endpoint. It is read here rather than in Elm for the
+          // reason sharing is: the JWT lives in this file. No token means no
+          // request and no answer at all, so the library's column is absent
+          // rather than a row of blanks that would read as "nothing is wrong".
+          const loadFreshness = catchy(async () => {
+            const token = getAuthToken();
+            if (!token) return;
+            // Above the default page of 50. A truncated answer would report a
+            // rotten feed as a sheet with no freshness at all.
+            const res = await fetch(
+              "https://api.sheets.scrap.land/library/freshness?limit=1000",
+              { headers: { Authorization: `Bearer ${token}` } },
+            );
+            if (!res.ok)
+              throw new Error(
+                `Could not read feed health (${res.status}): ${
+                  httpErrorDetail(await res.text(), res.headers.get("Content-Type") ?? "")
+                }`,
+              );
+            const { data } = await res.json();
+            // data[0] is the column list, as every paged read sends it.
+            app.ports.freshnessLoaded.send(data.slice(1));
+          }, 'freshness');
+          loadFreshness();
+          // A tab left open on the library has to see a feed die without a
+          // reload, which is the whole point of not waiting for the status email.
+          setInterval(loadFreshness, 60000);
+
           // Sharing lives here rather than in Elm because the JWT does. Every
           // action re-reads the member list, so the modal never shows stale state.
           //
@@ -564,24 +594,23 @@
                         },
                         { "": [].join(" ") },
                       ) ?? { "": null };
-                    // `describe @table:abc` never reaches the engine: it loads the one
-                    // sheet it names and reports its shape. Shared with the server.
-                    // `describe @table:abc` never reaches the engine: it loads the one
-                    // sheet it names and reports its shape. Shared with the server.
                     // describe is answered by runSql itself, the same way the
                     // server answers it, and is the one statement whose columns
                     // are not the query's own -- so it skips the column check.
                     const describing = describeRef(code);
                     const { columns: cols, data: rows } = await runSql(code, params);
                     if (!describing) checkResultColumns(cols, rows, sheetColumns(), code);
-                    // TODO: If doc contains cols data, use that names and types.
                     app.ports.docQueried.send({
                       id,
                       data: [
                         cols.map((col) => ({
                           key: col.columnid,
                           name: col.columnid,
-                          type: cols_?.[col.columnid] ?? null,
+                          // The type runSql read off the select item, which is
+                          // what POST /query answers with. The sheet's own
+                          // declared cols are the last word only where the
+                          // select item states no type of its own.
+                          type: col.type ?? cols_?.[col.columnid] ?? null,
                         })),
                         ...rows,
                       ],

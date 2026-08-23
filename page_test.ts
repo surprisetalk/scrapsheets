@@ -57,6 +57,8 @@ type El = {
   dispatchEvent: (event: unknown) => boolean;
   textContent: string | null;
   getAttribute: (name: string) => string | null;
+  querySelector: (sel: string) => El | null;
+  querySelectorAll: (sel: string) => Iterable<El>;
 };
 
 const boot = async (url: string, { tutorial = -1 } = {}) => {
@@ -356,6 +358,136 @@ Deno.test("Ctrl+/ opens the shortcut sheet and Escape closes it", async () => {
   assert(!text().includes("Keyboard shortcuts"), "Escape should close it again");
 });
 
+Deno.test("the library says which feeds ran and which are failing", async () => {
+  const { app, all, settle, doc } = await boot("http://localhost/");
+  // The header row is the one carrying the sort handles; a column's position is
+  // read off it rather than counted, so a column added before it cannot silently
+  // move what these assertions read.
+  const header = () => [...doc.querySelectorAll("tbody tr")].find((r: El) => r.querySelector("span.sort"));
+  const columns = () => [...header().querySelectorAll("span.sort")].map((s: El) => s.textContent);
+  const freshnessOf = (id: string) => {
+    const at = [...header().querySelectorAll("td")]
+      .findIndex((td: El) => td.querySelector("span.sort")?.textContent?.startsWith("freshness"));
+    const row = [...doc.querySelectorAll("tbody tr")].find((r: El) => r.querySelector(`a[href="/${id}"]`));
+    assert(row, `no library row for ${id}`);
+    return [...row.querySelectorAll("td")][at].textContent?.trim() ?? "";
+  };
+
+  // An anonymous visitor is sent nothing, so there is no column at all. A blank
+  // one over every sheet would read as a library where nothing is wrong.
+  assert(!columns().includes("freshness"), `expected no freshness column yet, got: ${columns().join("|")}`);
+
+  // Two sheets of the caller's own, which is where a net-http or alert sheet
+  // lives; the bundled examples are neither.
+  app.ports.librarySynced.send({
+    ...shelf,
+    "net-http:feed": { name: "prices feed", tags: [] },
+    "alert:budget": { name: "budget alert", tags: [] },
+  });
+  app.ports.freshnessLoaded.send([
+    { sheet_id: "net-http:feed", last_run: "2026-08-23T14:02:11.000Z", failures_since_ok: "3" },
+    { sheet_id: "alert:budget", last_run: null, failures_since_ok: 0 },
+  ]);
+  await settle();
+
+  assert(columns().includes("freshness"), `expected a freshness column, got: ${columns().join("|")}`);
+  assertEquals(freshnessOf("net-http:feed"), "2026-08-23 14:02 · 3 failed");
+  // A sheet that has never run is exactly the failure this read is for, which is
+  // why both of its joins are lateral. It must not read as a sheet with no feed.
+  assertEquals(freshnessOf("alert:budget"), "never run");
+  // library:freshness answers for net-http and alert sheets only. Everything
+  // else has no freshness, and no freshness is nothing -- not a zero.
+  assertEquals(freshnessOf("table:countries"), "");
+  assert(all("tbody tr").length > 3, "the library still lists its sheets");
+});
+
+Deno.test("a feed health answer that cannot be read is reported, not swallowed", async () => {
+  // The alternative is a column that quietly shows nothing because the server
+  // renamed a field: a healthy-looking library is the one lie this must not tell.
+  const { app, settle, text } = await boot("http://localhost/");
+  app.ports.freshnessLoaded.send([{ sheet_id: "net-http:feed", last_run: null, failures: 2 }]);
+  await settle();
+  assert(text().includes("feed health"), `expected the failure named, got: ${text().slice(0, 300)}`);
+});
+
+Deno.test("a failing sheet is marked in the gallery strip, where it is opened from", async () => {
+  const { app, all, settle } = await boot("http://localhost/");
+  const chip = () => all("a.chip").find((a) => a.getAttribute("title") === "query:budget-burn");
+  assert(chip(), "expected the budget demo in the strip");
+  assert(!(chip()?.textContent ?? "").includes("⚠"), "a sheet with no freshness carries no mark");
+
+  app.ports.freshnessLoaded.send([
+    { sheet_id: "query:budget-burn", last_run: "2026-08-23T14:02:11.000Z", failures_since_ok: 2 },
+  ]);
+  await settle();
+  assert((chip()?.textContent ?? "").includes("⚠"), "a failing sheet is marked in the strip");
+  // The title is still the bare id: it is how the strip is read back, here and
+  // in the test above.
+  assertEquals(chip()?.getAttribute("title"), "query:budget-burn");
+});
+
+Deno.test("Ctrl+K opens the palette, which jumps to a sheet and runs a command", async () => {
+  const { dom, doc, settle, text } = await boot("http://localhost/");
+  const key = async (el: El, init: Record<string, unknown>) => {
+    el.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, ...init }));
+    await settle();
+  };
+  const type = async (value: string) => {
+    const input = doc.getElementById("palette");
+    input.value = value;
+    input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+    await settle();
+  };
+  // A row is its label followed by the id or key it runs, so the label is what
+  // is left once the hint is taken off the end.
+  const rows = () =>
+    [...doc.querySelectorAll(".scrim .panel button")].map((b: El) => {
+      const whole = b.textContent ?? "";
+      return whole.slice(0, whole.length - (b.querySelector("span.mono")?.textContent ?? "").length).trim();
+    });
+  const hints = () => [...doc.querySelectorAll(".scrim .panel button span.mono")].map((s: El) => s.textContent ?? "");
+
+  await key(doc.body, { key: "k", ctrlKey: true });
+  assert(doc.getElementById("palette"), "Ctrl+K should open the palette");
+  // Nothing typed: every shortcut the sheet lists as runnable is on offer, which
+  // is the point of the palette reading that list rather than keeping its own.
+  for (const label of ["select all", "copy", "find", "replace", "undo", "redo", "shortcut sheet"])
+    assert(rows().includes(label), `expected "${label}" in the palette, got: ${rows().join("|")}`);
+
+  await type("budget");
+  assert(!rows().includes("select all"), `typing narrows the list, got: ${rows().join("|")}`);
+  assert(rows().length > 1, "several sheets match budget");
+
+  // The hint on each row is the sheet's id, so the second row names where
+  // ArrowDown then Enter must land -- without hard-coding which sheet that is.
+  const second = hints()[1];
+  await key(doc.getElementById("palette"), { key: "ArrowDown" });
+  await key(doc.getElementById("palette"), { key: "Enter" });
+  assertEquals(doc.location.pathname, "/" + second, "Enter opens the row the arrow moved to");
+  assertEquals(doc.getElementById("palette"), null, "running a row closes the palette");
+
+  // A command, not a sheet. The palette is a second door onto what already
+  // exists, so this opens the very sheet that lists it.
+  await key(doc.body, { key: "k", ctrlKey: true });
+  await type("shortcut");
+  await key(doc.getElementById("palette"), { key: "Enter" });
+  assert(text().includes("Keyboard shortcuts"), "the palette should run the command it offered");
+  assert(text().includes("Ctrl/⌘+K"), "and the shortcut sheet should list the palette itself");
+});
+
+Deno.test("Escape closes the palette without running anything", async () => {
+  const { dom, doc, settle } = await boot("http://localhost/table:countries");
+  const at = doc.location.pathname;
+  doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+  await settle();
+  const input = doc.getElementById("palette");
+  assert(input, "Ctrl+K should open the palette here too");
+  input.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  await settle();
+  assertEquals(doc.getElementById("palette"), null, "Escape closes it");
+  assertEquals(doc.location.pathname, at, "and nothing was opened");
+});
+
 Deno.test("?embed=1 renders the sheet with no chrome around it", async () => {
   const { doc, all } = await boot("http://localhost/table:countries?embed=1");
   assert(all("tbody tr").length > 190, "an embed still renders the sheet");
@@ -648,4 +780,67 @@ Deno.test("the resolver remembers the columns a typo should be matched against",
     assert(columns.includes(name), `expected ${name} among ${columns.join(", ")}`);
   assertEquals(engine.rows("table:countries")?.length, 198);
   assertEquals(engine.types("table:countries")?.length, 8);
+});
+
+Deno.test("a query result carries the type its select list produced, not its name's", async () => {
+  // The page typed the sheet you are editing off that query document's own
+  // `cols` map, so `cast(price as string) as price` still read usd and
+  // `count(*) as n` read text, while POST /query answered the truth off the very
+  // same text. Two engines disagreeing about a type is what the parity promise
+  // forbids. runSql now stamps every column with selectTypes over the loaded
+  // sheets, which is the map the server stamps its own answer with, and
+  // src/index.html reads the type off the column.
+  const typesOf = async (code: string) => {
+    const { columns } = await resolver().runSql(code, { "": null });
+    return Object.fromEntries(
+      (columns as { columnid: string; type?: string }[]).map((c) => [c.columnid, c.type]),
+    );
+  };
+
+  // The cast is the lie this closes: gdp_usd_b is usd in the sheet, and text
+  // once the query casts it. An item nothing can type carries no type at all,
+  // which is what leaves the query sheet's own declared cols the last word.
+  assertEquals(
+    await typesOf(
+      "select code, cast(gdp_usd_b as string) as gdp_usd_b, gdp_usd_b * 2 as doubled from @table:countries where code = 'JP'",
+    ),
+    {
+      code: "text",
+      gdp_usd_b: "text",
+      doubled: undefined,
+    },
+  );
+
+  // count answers an int whatever it counts. sum and avg answer whatever their
+  // argument is, so the money column stays money and the ratio stays a number.
+  assertEquals(
+    await typesOf(
+      "select region, count(*) as n, sum(gdp_usd_b) as gdp, avg(area_km2) as area from @table:countries group by region",
+    ),
+    {
+      region: "enum:Africa,Americas,Asia,Europe,Oceania",
+      n: "int",
+      gdp: "usd",
+      area: "num",
+    },
+  );
+
+  // And the same types across a @query ref, which is the sheet a downstream
+  // query and `describe` both read.
+  const { data } = await resolver().runSql("describe @query:lybunt", { "": null });
+  assertEquals(
+    (data as Record<string, unknown>[]).map((r) => [r.column, r.type]),
+    [
+      ["donor_id", "int"],
+      ["donor", "text"],
+      ["segment", "enum:foundation,major,sustainer,annual"],
+      [
+        "gifts",
+        "int",
+      ],
+      ["lifetime", "usd"],
+      ["largest", "usd"],
+      ["last_gift", "text"],
+    ],
+  );
 });

@@ -2,7 +2,9 @@ port module Main exposing
     ( ClipboardData
     , ClipboardFormat(..)
     , Doc(..)
+    , Freshness
     , Index
+    , Peers(..)
     , Rect
     , Sheet
     , SortOrder(..)
@@ -21,10 +23,13 @@ port module Main exposing
     , emptySheet
     , expandSelection
     , filterAndSortIndexed
+    , freshnessCell
+    , freshnessDecoder
     , main
     , moveSelection
     , nextSortOrder
     , normalizeRect
+    , paletteCommands
     , parseCsv
     , parseDay
     , parseJson
@@ -547,6 +552,15 @@ port insertAtCursor : String -> Cmd msg
 port saveTutorial : Int -> Cmd msg
 
 
+{-| One row of `library:freshness` per net-http and alert sheet the caller can
+read. It arrives through a port rather than Elm's own Http for the reason
+sharing does: the JWT lives in index.html. An anonymous visitor is sent nothing
+at all, which is why the library's column is absent rather than a row of blanks
+that would read as "nothing is wrong".
+-}
+port freshnessLoaded : (D.Value -> msg) -> Sub msg
+
+
 {-| Sharing runs through JS because the JWT lives there, same as changeDoc.
 `action` is one of list, add, remove, public, link, hook. The answer comes back
 carrying the same `id` and `action`, so ShareLoad can tell an answer about this
@@ -619,9 +633,27 @@ type alias Model =
     , showSettings : Bool
     , share : Share
     , showShortcuts : Bool
+    , palette : Maybe Palette
+    , freshness : Dict Id Freshness
     , tutorial : Maybe Int
     , embed : Bool
     }
+
+
+{-| What `library:freshness` says about one sheet: when it last ran, and how
+many runs since its last good one. A sheet with no entry has no freshness at
+all, which is a different fact from zero failures -- most sheets are neither a
+feed nor an alert, and the read answers for nothing else.
+-}
+type alias Freshness =
+    { lastRun : Maybe String, failures : Int }
+
+
+{-| The command palette: what has been typed, and which match is selected.
+Nothing is closed.
+-}
+type alias Palette =
+    { query : String, selected : Int }
 
 
 type alias Auth =
@@ -1141,6 +1173,42 @@ shopDecoder =
     D.field "data" tableDecoder
 
 
+{-| The rows of `library:freshness`, keyed by the sheet each is about. Every
+field is required: a renamed column would otherwise read as a library where
+every feed is fine, which is the one answer this read must never invent.
+`failures_since_ok` is a count(\*), which postgres sends as a string.
+-}
+freshnessDecoder : D.Decoder (Dict Id Freshness)
+freshnessDecoder =
+    D.list
+        (D.map3 (\id lastRun failures -> ( id, Freshness lastRun (round failures) ))
+            (D.field "sheet_id" D.string)
+            (D.field "last_run" (D.nullable D.string))
+            (D.field "failures_since_ok" number)
+        )
+        |> D.map Dict.fromList
+
+
+{-| One library row's worth of feed health. A sheet the read does not answer for
+gets nothing -- not a zero and not a timestamp -- because "never polled" and
+"polled and fine" are different facts and a blank cell claims neither.
+-}
+freshnessCell : Maybe Freshness -> String
+freshnessCell fresh =
+    case fresh of
+        Nothing ->
+            ""
+
+        Just { lastRun, failures } ->
+            String.join " · " <|
+                List.filterMap identity
+                    [ -- A full ISO timestamp in a library row is noise past the
+                      -- minute, and a sheet that has never run says so.
+                      Just (lastRun |> Maybe.map (String.left 16 >> String.replace "T" " ") |> Maybe.withDefault "never run")
+                    , iif (failures > 0) (Just (String.fromInt failures ++ " failed")) Nothing
+                    ]
+
+
 
 ---- INIT ---------------------------------------------------------------------
 
@@ -1175,6 +1243,8 @@ init flags url nav =
                 , embed = False
                 , share = emptyShare
                 , showShortcuts = False
+                , palette = Nothing
+                , freshness = Dict.empty
                 , tutorial = iif (tutorialStep < 0) Nothing (Just (clamp 0 4 tutorialStep))
                 }
     in
@@ -1241,6 +1311,11 @@ type Msg
     | ShareLink
     | ShareHook
     | ShortcutsToggle Bool
+    | FreshnessLoad D.Value
+    | Goto Id
+    | PaletteToggle Bool
+    | PaletteNav Int
+    | PaletteRun Int
     | SettingsNameChange String
     | SettingsTagsChange String
     | KeyDown KeyEvent
@@ -1330,6 +1405,7 @@ type Input
     | ChartX
     | ChartY
     | DashboardTiles
+    | PaletteQuery
 
 
 
@@ -1351,6 +1427,7 @@ subs model =
         , requestCopy (always ClipboardCopy)
         , queryEditorState QueryEditorUpdate
         , shareLoaded ShareLoad
+        , freshnessLoaded FreshnessLoad
         , case model.sheet.resizing of
             Just _ ->
                 Sub.batch
@@ -1406,6 +1483,34 @@ onEditorKeydown =
         )
 
 
+{-| Palette keys. It takes the selected index rather than reading it back out of
+the model, because the same message runs a row that was clicked.
+-}
+onPaletteKeydown : Int -> H.Attribute Msg
+onPaletteKeydown selected =
+    A.preventDefaultOn "keydown"
+        (D.field "key" D.string
+            |> D.andThen
+                (\key ->
+                    case key of
+                        "Enter" ->
+                            D.succeed ( PaletteRun selected, True )
+
+                        "ArrowDown" ->
+                            D.succeed ( PaletteNav 1, True )
+
+                        "ArrowUp" ->
+                            D.succeed ( PaletteNav -1, True )
+
+                        "Escape" ->
+                            D.succeed ( PaletteToggle False, True )
+
+                        _ ->
+                            D.fail "unhandled"
+                )
+        )
+
+
 onFindKeydown : H.Attribute Msg
 onFindKeydown =
     A.preventDefaultOn "keydown"
@@ -1446,7 +1551,7 @@ tableBounds model =
             { maxX = Array.length tbl.cols - 1, maxY = Array.length tbl.rows }
 
         Ok Library ->
-            { maxX = Array.length libraryCols - 1, maxY = Dict.size model.library }
+            { maxX = Array.length (libraryCols model) - 1, maxY = Dict.size model.library }
 
         _ ->
             { maxX = 0, maxY = 0 }
@@ -1669,7 +1774,7 @@ update msg ({ sheet, auth } as model) =
                                 id =
                                     libraryIdAtRow model y
                             in
-                            case Maybe.map .name (Array.get x libraryCols) of
+                            case Maybe.map .name (Array.get x (libraryCols model)) of
                                 Just "name" ->
                                     updateLibrary (Idd id { name = sheet.write, tags = Nothing })
 
@@ -2250,6 +2355,49 @@ update msg ({ sheet, auth } as model) =
         ShortcutsToggle show ->
             ( { model | showShortcuts = show }, Cmd.none )
 
+        FreshnessLoad value ->
+            -- Reported, never swallowed. A column that quietly shows nothing
+            -- because the answer changed shape is the failure this whole read
+            -- exists to surface, wearing the face of a healthy library.
+            case D.decodeValue freshnessDecoder value of
+                Ok fresh ->
+                    ( { model | freshness = fresh }, Cmd.none )
+
+                Err err ->
+                    ( { model | error = "The feed health answer arrived in a shape I could not read: " ++ D.errorToString err }, Cmd.none )
+
+        Goto id ->
+            ( model, Nav.pushUrl model.nav ("/" ++ id) )
+
+        PaletteToggle open ->
+            ( { model | palette = iif open (Just { query = "", selected = 0 }) Nothing }
+            , iif open (Task.attempt (always NoOp) (Dom.focus "palette")) Cmd.none
+            )
+
+        PaletteNav delta ->
+            case model.palette of
+                Just p ->
+                    let
+                        shown =
+                            List.length (paletteCommands model.library p.query)
+                    in
+                    ( { model | palette = Just { p | selected = iif (shown == 0) 0 (modBy shown (p.selected + delta)) } }
+                    , Cmd.none
+                    )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        PaletteRun i ->
+            case model.palette |> Maybe.andThen (\p -> paletteCommands model.library p.query |> List.drop i |> List.head) of
+                Just command ->
+                    -- Closed first, so a command that opens a dialog does not
+                    -- open it behind the palette.
+                    update command.run { model | palette = Nothing }
+
+                Nothing ->
+                    ( model, Cmd.none )
+
         SettingsNameChange newName ->
             ( model, updateLibrary (Idd sheet.id { name = Just newName, tags = Nothing }) )
 
@@ -2302,6 +2450,11 @@ update msg ({ sheet, auth } as model) =
                         Cmd.none
                 ]
             )
+
+        InputChange PaletteQuery x ->
+            -- A new query renumbers the matches, so the selection returns to the
+            -- first rather than pointing at whatever now sits at that index.
+            ( { model | palette = model.palette |> Maybe.map (\p -> { p | query = x, selected = 0 }) }, Cmd.none )
 
         InputChange CellWrite x ->
             ( { model | sheet = { sheet | write = Just x } }, Cmd.none )
@@ -2769,7 +2922,10 @@ update msg ({ sheet, auth } as model) =
 
         KeyDown event ->
             -- Handle global shortcuts first (Ctrl+F, Ctrl+H, Escape for find/replace)
-            if (event.ctrl || event.meta) && event.key == "/" then
+            if (event.ctrl || event.meta) && event.key == "k" then
+                update (PaletteToggle (model.palette == Nothing)) model
+
+            else if (event.ctrl || event.meta) && event.key == "/" then
                 update (ShortcutsToggle (not model.showShortcuts)) model
 
             else if
@@ -2793,6 +2949,9 @@ update msg ({ sheet, auth } as model) =
 
             else if (event.ctrl || event.meta) && event.key == "d" then
                 update (DocMsg (SheetFillDown sheet.select)) model
+
+            else if event.key == "Escape" && model.palette /= Nothing then
+                update (PaletteToggle False) model
 
             else if event.key == "Escape" && model.showShortcuts then
                 update (ShortcutsToggle False) model
@@ -2879,7 +3038,7 @@ update msg ({ sheet, auth } as model) =
                                         ( model, Cmd.none )
 
                                     id ->
-                                        ( model, Nav.pushUrl model.nav ("/" ++ id) )
+                                        update (Goto id) model
 
                             _ ->
                                 ( model, Cmd.none )
@@ -3396,17 +3555,23 @@ update msg ({ sheet, auth } as model) =
 ---- VIEW ---------------------------------------------------------------------
 
 
-libraryCols : Array Col
-libraryCols =
-    Array.fromList
-        [ Col "sheet_id" "" SheetId
-        , Col "thumb" "" Thumb
-
-        -- , Col "type" "type" Text
-        , Col "name" "name" Text
-        , Col "tags" "tags" (Many Text)
-        , Col "delete" "" Delete
-        ]
+libraryCols : Model -> Array Col
+libraryCols model =
+    Array.fromList <|
+        List.concat
+            [ [ Col "sheet_id" "" SheetId
+              , Col "thumb" "" Thumb
+              , Col "name" "name" Text
+              , Col "tags" "tags" (Many Text)
+              ]
+            , -- `library:freshness` answers for net-http and alert sheets and for
+              -- a caller it can identify, so an anonymous visitor gets no rows at
+              -- all. No rows means no column: a blank one over every sheet reads
+              -- as "nothing is wrong", which is the claim this column exists to
+              -- stop the page making.
+              iif (Dict.isEmpty model.freshness) [] [ Col "freshness" "freshness" Text ]
+            , [ Col "delete" "" Delete ]
+            ]
 
 
 viewModal : Msg -> List (Html Msg) -> Html Msg
@@ -3545,60 +3710,108 @@ viewDeleteConfirm maybeId =
                 ]
 
 
-shortcutGroups : List ( String, List ( String, String ) )
+{-| The list of what exists, and the palette's source. A third field carries the
+message the palette runs, so the two cannot drift into disagreeing about what the
+app can do -- `Nothing` is a key that only means something against a selection,
+which no palette row can supply. The palette itself is listed and not runnable:
+it is already open.
+-}
+shortcutGroups : List ( String, List ( String, String, Maybe Msg ) )
 shortcutGroups =
     [ ( "Navigate"
-      , [ ( "↑ ↓ ← →", "move" )
-        , ( "Shift+arrows", "extend selection" )
-        , ( "Tab / Shift+Tab", "next/prev cell" )
-        , ( "Home / End", "row start/end" )
-        , ( "Ctrl/⌘+Home / Ctrl/⌘+End", "sheet corners" )
+      , [ ( "↑ ↓ ← →", "move", Nothing )
+        , ( "Shift+arrows", "extend selection", Nothing )
+        , ( "Tab / Shift+Tab", "next/prev cell", Nothing )
+        , ( "Home / End", "row start/end", Nothing )
+        , ( "Ctrl/⌘+Home / Ctrl/⌘+End", "sheet corners", Nothing )
         ]
       )
     , ( "Edit"
-      , [ ( "Enter", "edit cell" )
-        , ( "any character", "edit with that character" )
-        , ( "Enter", "commit + down" )
-        , ( "Tab", "commit + right" )
-        , ( "Esc", "cancel edit" )
+      , [ ( "Enter", "edit cell", Nothing )
+        , ( "any character", "edit with that character", Nothing )
+        , ( "Enter", "commit + down", Nothing )
+        , ( "Tab", "commit + right", Nothing )
+        , ( "Esc", "cancel edit", Nothing )
         ]
       )
     , ( "Cells"
-      , [ ( "Delete / Backspace", "clear cells" )
-        , ( "Ctrl/⌘+Delete", "delete rows" )
-        , ( "Ctrl/⌘+Backspace", "delete columns" )
-        , ( "Ctrl/⌘+Enter", "insert rows above" )
-        , ( "Ctrl/⌘+Shift+Enter", "duplicate rows" )
-        , ( "Ctrl/⌘+D", "fill down" )
+      , [ ( "Delete / Backspace", "clear cells", Nothing )
+        , ( "Ctrl/⌘+Delete", "delete rows", Nothing )
+        , ( "Ctrl/⌘+Backspace", "delete columns", Nothing )
+        , ( "Ctrl/⌘+Enter", "insert rows above", Nothing )
+        , ( "Ctrl/⌘+Shift+Enter", "duplicate rows", Nothing )
+        , ( "Ctrl/⌘+D", "fill down", Nothing )
         ]
       )
     , ( "Select & clipboard"
-      , [ ( "Ctrl/⌘+A", "select all" )
-        , ( "Ctrl/⌘+C / Ctrl/⌘+V", "copy / paste" )
-        , ( "click / shift-click header", "sort / add a sort key" )
+      , [ ( "Ctrl/⌘+A", "select all", Just SelectAll )
+        , ( "Ctrl/⌘+C", "copy", Just ClipboardCopy )
+        , ( "Ctrl/⌘+V", "paste", Nothing )
+        , ( "click / shift-click header", "sort / add a sort key", Nothing )
         ]
       )
     , ( "Find"
-      , [ ( "Ctrl/⌘+F", "find" )
-        , ( "Ctrl/⌘+H", "replace" )
-        , ( "Enter", "next match" )
-        , ( "Esc", "close" )
+      , [ ( "Ctrl/⌘+F", "find", Just (FindOpen False) )
+        , ( "Ctrl/⌘+H", "replace", Just (FindOpen True) )
+        , ( "Enter", "next match", Nothing )
+        , ( "Esc", "close", Nothing )
         ]
       )
     , ( "History"
-      , [ ( "Ctrl/⌘+Z", "undo" )
-        , ( "Ctrl/⌘+Shift+Z / Ctrl/⌘+Y", "redo" )
+      , [ ( "Ctrl/⌘+Z", "undo", Just Undo )
+        , ( "Ctrl/⌘+Shift+Z / Ctrl/⌘+Y", "redo", Just Redo )
         ]
       )
     , ( "Library"
-      , [ ( "Enter", "open selected sheet" ) ]
+      , [ ( "Enter", "open selected sheet", Nothing ) ]
       )
     , ( "Help"
-      , [ ( "Ctrl/⌘+/ or ?", "shortcut sheet" )
-        , ( "Esc", "close dialogs" )
+      , [ ( "Ctrl/⌘+K", "command palette", Nothing )
+        , ( "Ctrl/⌘+/ or ?", "shortcut sheet", Just (ShortcutsToggle True) )
+        , ( "Esc", "close dialogs", Nothing )
         ]
       )
     ]
+
+
+type alias Command =
+    { label : String, hint : String, run : Msg }
+
+
+{-| What the palette offers for what has been typed: the runnable shortcuts
+first, then the sheets, each matched on both the words on screen and the id or
+key behind them. The shortcut sheet is the list of what the app can do, so this
+reads it rather than keeping a second copy beside it. Bounded, because a palette
+is a shortlist -- past a dozen rows you are reading rather than choosing, and
+typing one more letter is the way through.
+-}
+paletteCommands : Library -> String -> List Command
+paletteCommands shelf query =
+    let
+        needle =
+            String.toLower (String.trim query)
+
+        matches haystacks =
+            List.any (String.contains needle << String.toLower) haystacks
+
+        commands =
+            shortcutGroups
+                |> List.concatMap Tuple.second
+                |> List.filterMap
+                    (\( key, description, run ) ->
+                        run
+                            |> Maybe.andThen
+                                (\msg -> iif (matches [ description, key ]) (Just (Command description key msg)) Nothing)
+                    )
+
+        sheets =
+            shelf
+                |> Dict.filter (\k v -> k /= "" && not v.scratch && matches [ k, v.name ])
+                |> Dict.toList
+                |> List.map
+                    (\( k, v ) -> Command (iif (String.isEmpty (String.trim v.name)) k v.name) k (Goto k))
+    in
+    List.take 12 (commands ++ sheets)
 
 
 viewShortcuts : Bool -> Html Msg
@@ -3614,7 +3827,7 @@ viewShortcuts show =
                         [ H.h4 [ S.marginTop "0.75rem", S.marginBottom "0.25rem" ] [ text group ]
                         , H.div [ S.displayGrid, S.gridTemplateColumns "auto 1fr", S.gap "0.25rem 1rem", S.fontSizeRem 0.875 ] <|
                             List.concatMap
-                                (\( key, description ) ->
+                                (\( key, description, _ ) ->
                                     [ H.span [ A.class "mono" ] [ text key ]
                                     , H.span [] [ text description ]
                                     ]
@@ -3623,6 +3836,53 @@ viewShortcuts show =
                         ]
                     )
                     shortcutGroups
+
+
+viewPalette : Model -> Html Msg
+viewPalette model =
+    case model.palette of
+        Nothing ->
+            text ""
+
+        Just p ->
+            let
+                commands =
+                    paletteCommands model.library p.query
+            in
+            viewModal (PaletteToggle False)
+                [ H.input
+                    [ A.id "palette"
+                    , A.placeholder "jump to a sheet, or run a command"
+                    , A.value p.query
+                    , A.onInput (InputChange PaletteQuery)
+                    , onPaletteKeydown p.selected
+                    , S.width "100%"
+                    ]
+                    []
+                , H.div [ S.displayFlex, S.flexDirectionColumn, S.marginTopRem 0.5, S.maxHeight "60vh", S.overflowYAuto, S.fontSizeRem 0.875 ] <|
+                    case commands of
+                        [] ->
+                            [ H.span [ S.color "#666" ] [ text "nothing matches" ] ]
+
+                        _ ->
+                            List.indexedMap
+                                (\i command ->
+                                    H.button
+                                        [ A.onClick (PaletteRun i)
+                                        , S.displayFlex
+                                        , S.justifyContentSpaceBetween
+                                        , S.gapRem 1
+                                        , S.textAlignLeft
+                                        , S.border "none"
+                                        , S.padding "0.25rem 0.375rem"
+                                        , S.background (iif (i == p.selected) "#e8e8f8" "transparent")
+                                        ]
+                                        [ text command.label
+                                        , H.span [ A.class "mono", S.color "#666" ] [ text command.hint ]
+                                        ]
+                                )
+                                commands
+                ]
 
 
 viewFindReplace : Maybe FindReplace -> Html Msg
@@ -3976,7 +4236,7 @@ resolveTable model =
 
         ( Ok Library, _ ) ->
             Ok
-                { cols = libraryCols
+                { cols = libraryCols model
                 , rows =
                     model.library
                         |> Dict.filter (\k v -> k /= "" && not v.scratch && List.any (String.contains model.search) (k :: v.name :: v.tags))
@@ -3989,6 +4249,7 @@ resolveTable model =
                                     , ( "type", E.string (Maybe.withDefault "" <| List.head <| String.split ":" k) )
                                     , ( "name", E.string (iif (String.isEmpty (String.trim v.name)) "(untitled)" v.name) )
                                     , ( "tags", E.list E.string v.tags )
+                                    , ( "freshness", E.string (freshnessCell (Dict.get k model.freshness)) )
                                     , ( "delete", iif v.system E.null (E.string k) )
                                     ]
                             )
@@ -4755,10 +5016,28 @@ viewGallery model =
                 |> List.filter (\t -> not (List.member t [ "query", "example" ]))
                 |> Set.fromList
                 |> Set.toList
+
+        -- The strip is where a demo is opened from, so a sheet that has failed
+        -- since its last good run says so here rather than only in the library
+        -- column below. Marked by its own freshness, not by its type: the read
+        -- covers feeds and alerts today and is where connection health is
+        -- headed, and this rule needs no edit when it arrives.
+        rotten id =
+            model.freshness |> Dict.get id |> Maybe.map (\f -> f.failures > 0) |> Maybe.withDefault False
     in
     H.div [ S.paddingRem 0.5, S.backgroundColor "#f6f6f6", S.borderBottom "1px solid #aaa", S.displayFlex, S.flexWrapWrap, S.gapRem 0.375, S.alignItemsCenter, S.fontSizeRem 0.8125 ]
         (H.strong [] [ text "start from a demo" ]
-            :: List.map (\( k, v ) -> H.a [ A.class "chip", A.href ("/" ++ k), A.title k ] [ text v.name ]) demos
+            :: List.map
+                (\( k, v ) ->
+                    H.a
+                        [ A.class "chip"
+                        , A.href ("/" ++ k)
+                        , A.title k
+                        , iif (rotten k) (S.color "#b00") (A.classList [])
+                        ]
+                        [ text (iif (rotten k) (v.name ++ " ⚠") v.name) ]
+                )
+                demos
             ++ H.span [ S.color "#666", S.marginLeftRem 0.5 ] [ text "filter" ]
             :: List.map (\t -> H.button [ A.class "chip", A.onClick (InputChange SheetSearch t) ] [ text t ]) tags
         )
@@ -5389,6 +5668,7 @@ view ({ sheet } as model) =
             , viewDeleteConfirm model.deleteConfirm
             , viewSettings model.showSettings info model.share
             , viewShortcuts model.showShortcuts
+            , viewPalette model
             , viewTutorial model.tutorial
             , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
                 [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]

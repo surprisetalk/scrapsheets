@@ -599,10 +599,74 @@ suite =
                                 (\( group, keys ) ->
                                     (group /= "")
                                         && not (List.isEmpty keys)
-                                        && List.all (\( key, description ) -> key /= "" && description /= "") keys
+                                        && List.all (\( key, description, _ ) -> key /= "" && description /= "") keys
                                 )
                                 >> Expect.equal True
                             ]
+            ]
+        , describe "freshnessDecoder"
+            [ test "keys each row by the sheet it is about" <|
+                \_ ->
+                    D.decodeString freshnessDecoder """[{"sheet_id":"net-http:a","last_run":"2026-08-23T14:02:11.000Z","failures_since_ok":"3"}]"""
+                        |> Result.map (Dict.get "net-http:a")
+                        |> Expect.equal (Ok (Just (Freshness (Just "2026-08-23T14:02:11.000Z") 3)))
+            , test "a sheet that has never run carries no last run" <|
+                \_ ->
+                    D.decodeString freshnessDecoder """[{"sheet_id":"alert:b","last_run":null,"failures_since_ok":0}]"""
+                        |> Result.map (Dict.get "alert:b")
+                        |> Expect.equal (Ok (Just (Freshness Nothing 0)))
+            , test "a renamed field is an error, not a library where every feed is fine" <|
+                \_ ->
+                    D.decodeString freshnessDecoder """[{"sheet_id":"net-http:a","last_run":null,"failures":2}]"""
+                        |> Result.toMaybe
+                        |> Expect.equal Nothing
+            ]
+        , describe "freshnessCell"
+            [ test "a sheet the read does not answer for shows nothing at all" <|
+                \_ -> freshnessCell Nothing |> Expect.equal ""
+            , test "a sheet that has never run says so, rather than reading as fine" <|
+                \_ -> freshnessCell (Just (Freshness Nothing 0)) |> Expect.equal "never run"
+            , test "a good feed shows its last run to the minute" <|
+                \_ ->
+                    freshnessCell (Just (Freshness (Just "2026-08-23T14:02:11.000Z") 0))
+                        |> Expect.equal "2026-08-23 14:02"
+            , test "a failing feed shows how many runs since its last good one" <|
+                \_ ->
+                    freshnessCell (Just (Freshness (Just "2026-08-23T14:02:11.000Z") 4))
+                        |> Expect.equal "2026-08-23 14:02 · 4 failed"
+            ]
+        , describe "paletteCommands"
+            [ test "an empty query offers every runnable shortcut, in the order the sheet lists them" <|
+                \_ ->
+                    paletteCommands Dict.empty ""
+                        |> List.map .label
+                        |> Expect.equal [ "select all", "copy", "find", "replace", "undo", "redo", "shortcut sheet" ]
+            , test "a sheet is matched on its name" <|
+                \_ -> paletteCommands paletteShelf "countr" |> List.map .label |> Expect.equal [ "countries" ]
+            , test "a sheet is matched on its id too, which is what you remember of a net sheet" <|
+                \_ -> paletteCommands paletteShelf "table:us" |> List.map .label |> Expect.equal [ "us states" ]
+            , test "a command is matched on the words the shortcut sheet shows" <|
+                \_ -> paletteCommands paletteShelf "undo" |> List.map .label |> Expect.equal [ "undo" ]
+            , test "a shortcut that only means something against a selection is never offered" <|
+                \_ -> paletteCommands Dict.empty "paste" |> List.map .label |> Expect.equal []
+            , test "a scratch sheet is not a destination" <|
+                \_ ->
+                    paletteCommands (libraryOf [ ( "table:draft", "draft", True ) ]) "draft"
+                        |> List.map .label
+                        |> Expect.equal []
+            , test "the library itself is not a destination" <|
+                \_ ->
+                    paletteCommands (libraryOf [ ( "", "library-root", False ) ]) "library-root"
+                        |> List.map .label
+                        |> Expect.equal []
+            , test "the list is bounded, so a big library is narrowed by typing rather than scrolled" <|
+                \_ ->
+                    List.range 1 40
+                        |> List.map (\n -> ( "table:s" ++ String.fromInt n, "sheet " ++ String.fromInt n, False ))
+                        |> libraryOf
+                        |> (\shelf -> paletteCommands shelf "sheet")
+                        |> List.length
+                        |> Expect.equal 12
             ]
         , describe "Hidden columns"
             [ test "moving right steps over a hidden column" <|
@@ -631,6 +695,25 @@ suite =
                         |> (\sheet -> skipHidden sheet { maxX = 3, maxY = 5 } 1 0)
                         |> Expect.equal 0
             ]
+        ]
+
+
+{-| A library map from id, name and whether the sheet is scratch. `Library` and
+`SheetInfo` are not exposed, so this carries no annotation on purpose.
+-}
+libraryOf entries =
+    entries
+        |> List.map
+            (\( id, name, scratch ) ->
+                ( id, { name = name, tags = [], scratch = scratch, system = False, thumb = E.null, peers = Private } )
+            )
+        |> Dict.fromList
+
+
+paletteShelf =
+    libraryOf
+        [ ( "table:countries", "countries", False )
+        , ( "table:us-states", "us states", False )
         ]
 
 

@@ -20,6 +20,7 @@ import { DATASETS } from "./src/examples.mjs";
 import {
   applyWindows,
   chartSql,
+  checkColumnTypes,
   checkQueryRows,
   checkResultColumns,
   DESCRIBE_COLUMNS,
@@ -33,6 +34,7 @@ import {
   planQuery,
   register,
   scanRefs,
+  selectTypes,
   WINDOW_TYPES,
 } from "./src/sql.mjs";
 import Stripe from "stripe";
@@ -209,6 +211,13 @@ const hookVerify = async (secret: string, message: Uint8Array<ArrayBuffer>, sign
   return await crypto.subtle.verify("HMAC", await hmacKey(secret), bytes, message);
 };
 
+/** Caps a map by insertion order, oldest key first out. Sweeping by idle time
+ * alone loses to a caller minting keys faster than the 60-second broom runs, so
+ * every map that grows with traffic is capped here as well. */
+const bound = <V>(map: Map<string, V>, max: number): void => {
+  while (map.size > max) map.delete(map.keys().next().value!);
+};
+
 // Simple in-memory rate limiter (token bucket algorithm)
 const rateLimitBuckets = new Map<string, { tokens: number; lastRefill: number }>();
 const RATE_LIMIT_MAX_TOKENS = 1000; // Max burst per IP (debounced queries fire per keystroke)
@@ -222,8 +231,7 @@ const rateLimit = (identifier: string): boolean => {
   if (!bucket) {
     bucket = { tokens: RATE_LIMIT_MAX_TOKENS, lastRefill: now };
     rateLimitBuckets.set(identifier, bucket);
-    if (rateLimitBuckets.size > RATE_LIMIT_KEYS_MAX)
-      rateLimitBuckets.delete(rateLimitBuckets.keys().next().value!);
+    bound(rateLimitBuckets, RATE_LIMIT_KEYS_MAX);
   }
 
   // Refill tokens based on time elapsed
@@ -238,10 +246,11 @@ const rateLimit = (identifier: string): boolean => {
   return true;
 };
 
-// Bounded, and not only swept: sweeping is by idle time, so a caller who can
-// vary its own key mints entries faster than a 60-second broom removes them.
-// Insertion order is iteration order, so the oldest key is the first one out.
-const RATE_LIMIT_KEYS_MAX = 10_000;
+// How many keys one traffic-keyed map may hold. Shared by the rate-limit
+// buckets, the per-sheet delivery budgets and the poller's two due-time maps,
+// because a second number would be a second thing to tune and none of the four
+// wants a different one.
+export const RATE_LIMIT_KEYS_MAX = 10_000;
 
 ala.options.modifier = "RECORDSET";
 register(ala);
@@ -314,7 +323,9 @@ export type Template =
   | Tag<"net-socket", [NetSocket]>
   | Tag<`codex-${string}`, []>;
 export type Query = { lang: "sql" | "prql"; code: string; args: Args };
-export type NetHttp = { url: string; interval: number; headers?: string };
+// `cursor` names the query parameter this feed takes a since-value in. The
+// watermark itself is not here: it is the poller's, not the user's.
+export type NetHttp = { url: string; interval: number; headers?: string; cursor?: string };
 // An alert is a query plus somewhere to send it. The condition is the query's
 // own where clause: it fires when the query returns a row, which is the only
 // definition that needs no second language.
@@ -422,11 +433,14 @@ const sheet = async (
   // The failure log answers before the membership check, because a caller with
   // no share on it still owns the failures their own requests caused. The where
   // clause is the access rule: the operator reads every row through their
-  // viewer grant, everybody else reads the rows their own account caused, and
-  // an anonymous caller owns nothing and reads nothing. Safe to widen because
-  // the row stores header and query names only, never values.
+  // viewer grant, everybody else reads the rows their own account caused, and a
+  // failure nobody was signed in for carries no usr_id, so it stays the
+  // operator's alone. Safe to widen because the row stores header and query
+  // names only, never values.
   if (sheet_id === ERROR_SHEET) {
-    const usr_id = c.get("usr_id") ?? null;
+    // A string, always: the auth middleware refuses a token that names no
+    // account, so no route reaching this line has an anonymous caller.
+    const usr_id = c.get("usr_id");
     const [operator] = await sql`
       select true from sheet_usr where sheet_id = ${ERROR_SHEET} and usr_id = ${usr_id}
     `;
@@ -563,7 +577,9 @@ const executeSql = async (
     throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
   };
 
-  // Source column types by name, which is what the result columns are typed from.
+  // Source column types by name, and then what each select item makes of them.
+  // Two sheets with a column of one name and two types still collide here; the
+  // select list is read last, so a query's own alias wins over both.
   const nameToType: Record<string, Type> = {};
   let loaded = 0;
   const { docs, colsOf } = await loadRefs(sheet_ids, {
@@ -602,6 +618,15 @@ const executeSql = async (
   };
 
   for (const cols of Object.values(colsOf)) for (const col of cols) nameToType[col.name] = col.type;
+  // The columns the referenced sheets actually have, taken before anything the
+  // query invents is mixed in: this is what a typo is matched against, and a
+  // name only this query knows is not evidence that the sheets hold it.
+  // `min(code) as lowest` typed itself text and so excused its own empty column.
+  const known = Object.keys(nameToType);
+  // The author's own text, not the scanned rewrite, so the page infers from the
+  // same characters. An item selectTypes cannot type is left out, which leaves
+  // the source column of that name below -- what typing did before this existed.
+  Object.assign(nameToType, selectTypes(sqlCode, nameToType) as Record<string, Type>);
 
   if (described) {
     const rows = ((): Record<string, unknown>[] => {
@@ -689,7 +714,7 @@ const executeSql = async (
         (q: string, params: unknown[]) => (ala(q, params) as { data: Record<string, unknown>[] }).data,
       ));
     }
-    checkResultColumns(cols, rows, Object.keys(nameToType), sqlCode);
+    checkResultColumns(cols, rows, known, sqlCode);
   } catch (err) {
     return asBadRequest(err);
   }
@@ -1080,7 +1105,8 @@ export const automerge = new Repo({
 app.get(
   "/library/sync",
   upgradeWebSocket(async (c) => {
-    const auth = await verifyWsAuth(c.req.query().auth);
+    const query = c.req.query();
+    const auth = await verifyWsAuth(query.auth, query.pass);
     let shim: WsSocketShim | undefined;
     let joined: AM.PeerId | undefined;
     let queue = Promise.resolve();
@@ -1169,15 +1195,55 @@ app.get(
 // the ordinary sync socket rather than a second, parallel way in.
 export type WsAuth = { usr_id: string | null; share: string | null };
 
-const verifyWsAuth = async (auth: string | undefined): Promise<WsAuth> => {
+// What a share-link password is proved against. The "link:" prefix
+// domain-separates it from hookSecret(), which derives every sender's signing
+// key from the same root: one secret, two uses, and neither may produce the
+// other's output. The sheet id is inside the message, so a password that opens
+// one link does not open a link to another sheet.
+const linkMessage = (sheet_id: string, password: string): Uint8Array<ArrayBuffer> =>
+  new TextEncoder().encode(`link:${sheet_id}:${password}`);
+
+const verifyWsAuth = async (auth: string | undefined, pass?: string): Promise<WsAuth> => {
   if (!auth) return { usr_id: null, share: null };
-  try {
-    const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
-    const payload = await verify(token, JWT_SECRET, JWT_ALG);
-    return { usr_id: (payload.sub as string) ?? null, share: (payload.share as string) ?? null };
-  } catch {
-    return { usr_id: null, share: null };
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+  const payload = await verify(token, JWT_SECRET, JWT_ALG).catch(() => null);
+  // An unreadable or expired token is anonymous, not an error: an expired
+  // share link has to read as "no access", which is what expiring it means.
+  if (!payload) return { usr_id: null, share: null };
+  const share = (payload.share as string) ?? null;
+  const lock = payload.lock as string | undefined;
+  // This is the one place the share claim is read, so it is the one place the
+  // lock can be enforced -- a link gated on the socket and open anywhere else
+  // is worse than no gate. A locked link is refused rather than quietly
+  // downgraded to no access, so the reader is told which check failed instead
+  // of watching a sheet never load. Neither refusal prints the password or the
+  // digest: the digest is what an offline guesser would grind against, and the
+  // same oracle rule the webhook signature refusals follow applies here.
+  if (share && lock) {
+    if (!pass) {
+      throw new HTTPException(401, {
+        message: explain(`This link to ${share} is locked.`, {
+          Received: "a link with no password beside it",
+          Expected: "the password the link was minted with",
+          Source: "the lock claim on the share token",
+          Fix: "add &pass=<password> to the link, or ask whoever sent it for the password",
+        }),
+      });
+    }
+    // crypto.subtle.verify does the comparison, so no digest equality is
+    // written by hand here either.
+    if (!await hookVerify(TOKEN_SECRET, linkMessage(share, pass), lock)) {
+      throw new HTTPException(401, {
+        message: explain(`That password does not open this link to ${share}.`, {
+          Received: `a password of ${pass.length} characters`,
+          Expected: "the password the link was minted with",
+          Source: "the lock claim on the share token, recomputed under the server's own key",
+          Fix: "check the password for a typo, or ask the owner to mint a new link",
+        }),
+      });
+    }
   }
+  return { usr_id: (payload.sub as string) ?? null, share };
 };
 
 // --- live portals
@@ -1519,7 +1585,7 @@ const logFailure = async (c: Context, status: number, message: string): Promise<
   seen.at = at;
   logSeen.delete(key);
   logSeen.set(key, seen);
-  if (logSeen.size > LOG_KEYS_MAX) logSeen.delete(logSeen.keys().next().value!);
+  bound(logSeen, LOG_KEYS_MAX);
   await sql`insert into net ${
     sql({
       sheet_id: ERROR_SHEET,
@@ -1611,16 +1677,27 @@ export const flushFolds = async (now = Date.now()): Promise<void> => {
   }
 };
 
-// One broom, every RATE_LIMIT_WINDOW_MS. It evicts rate-limit buckets that have
-// gone idle and flushes the fold counts of bursts that stopped -- both are
-// bounded maps that a caller minting keys can grow, and both are swept on the
-// same minute LOG_EVERY_MS folds on.
+// One broom, every RATE_LIMIT_WINDOW_MS. It evicts rate-limit buckets and
+// per-sheet delivery budgets that have gone idle, drops the poller's due times
+// that have already passed, and flushes the fold counts of bursts that stopped
+// -- every one of those maps grows with traffic, every one is capped by bound(),
+// and every one is swept on the same minute LOG_EVERY_MS folds on. An idle
+// budget is a full one, so dropping it loses nothing.
 setInterval(() => {
   const now = Date.now();
   for (const [key, bucket] of rateLimitBuckets) {
     if (now - bucket.lastRefill > RATE_LIMIT_WINDOW_MS)
       rateLimitBuckets.delete(key);
   }
+  for (const [key, bucket] of hookBuckets) {
+    if (now - bucket.lastRefill > HOOK_WINDOW_S * 1000)
+      hookBuckets.delete(key);
+  }
+  // A due time already past says exactly what the map's absence says, so the
+  // entry is dead weight -- and this is how a sheet that was deleted, or a host
+  // nothing points at any more, stops being remembered.
+  for (const [key, due] of netDue) if (due <= now) netDue.delete(key);
+  for (const [key, due] of hostDue) if (due <= now) hostDue.delete(key);
   flushFolds().catch((err) => console.error("fold flush:", err));
 }, RATE_LIMIT_WINDOW_MS);
 
@@ -2369,6 +2446,45 @@ const verifyDelivery = async (
   });
 };
 
+// --- delivery budgets
+//
+// NET_BODY_CAP bounds one delivery and trimNet bounds one sheet, but nothing
+// bounded the sender: inside the global limiter's 100 requests a second, one
+// machine churns all NET_KEEP rows in ten seconds and every delivery the sheet
+// held before it is gone. The key is the **sheet**, not callerIp(): a webhook
+// sender is one machine that will not rotate its address, and what is being
+// protected is this sheet's row budget rather than this caller's share of the
+// server.
+//
+// Two bounds, because they fail differently. A count alone lets one 1 MB body a
+// second through; a byte budget alone lets a million empty rows through. They
+// share one bucket rather than two maps: one key, one refill, one broom, one
+// thing to bound.
+export const hookBuckets = new Map<string, { rows: number; bytes: number; lastRefill: number }>();
+export const HOOK_WINDOW_S = 60;
+export const HOOK_ROWS_PER_WINDOW = 60;
+export const HOOK_BYTES_PER_WINDOW = 4 * NET_BODY_CAP;
+
+/** This sheet's budget, refilled for the time since it was last read. Exported
+ * because the test drives the key cap through the same function the handler
+ * calls, rather than a second one that could agree with a bug in the first. */
+export const hookBucket = (sheet_id: string): { rows: number; bytes: number; lastRefill: number } => {
+  const now = Date.now();
+  let bucket = hookBuckets.get(sheet_id);
+  if (!bucket) {
+    bucket = { rows: HOOK_ROWS_PER_WINDOW, bytes: HOOK_BYTES_PER_WINDOW, lastRefill: now };
+    hookBuckets.set(sheet_id, bucket);
+    // A sheet id is not mintable at will, but a bound nothing enforces is not a
+    // bound.
+    bound(hookBuckets, RATE_LIMIT_KEYS_MAX);
+  }
+  const elapsed = (now - bucket.lastRefill) / 1000;
+  bucket.rows = Math.min(HOOK_ROWS_PER_WINDOW, bucket.rows + elapsed * HOOK_ROWS_PER_WINDOW / HOOK_WINDOW_S);
+  bucket.bytes = Math.min(HOOK_BYTES_PER_WINDOW, bucket.bytes + elapsed * HOOK_BYTES_PER_WINDOW / HOOK_WINDOW_S);
+  bucket.lastRefill = now;
+  return bucket;
+};
+
 app.post("/net/:id", async (c) => {
   const sheet_id = c.req.param("id");
   const heard = [...c.req.raw.headers.keys()].sort().join(", ") || "(none)";
@@ -2429,6 +2545,42 @@ app.post("/net/:id", async (c) => {
       }),
     });
   }
+  // Placed here on purpose, between the checks that cost nothing and the four
+  // round trips that follow. After the 404 and the 400, because a budget must
+  // be keyed on a sheet that exists -- keyed before them, a caller minting ids
+  // mints map keys -- and because those two already answer before the signature
+  // is checked, so a 429 here tells a caller holding a doc_id nothing the 404
+  // did not. Before verifyDelivery, the insert and the trim, which is what a
+  // refusal is worth shedding. Not before the body is read: the byte bound must
+  // spend the bytes actually sent rather than the content-length a flooder
+  // declares, and the body is on the wire either way, so refusing sooner saves
+  // nothing. A 429 is the one status app.onError does not log, so shedding load
+  // stays the cheap path.
+  const budget = hookBucket(sheet_id);
+  if (budget.rows < 1) {
+    throw new HTTPException(429, {
+      message: explain(`Sheet ${sheet_id} has taken too many deliveries.`, {
+        Received: `a delivery of ${size} bytes with no delivery budget left`,
+        Limit: `${HOOK_ROWS_PER_WINDOW} deliveries per ${HOOK_WINDOW_S} seconds, for this sheet`,
+        Source: "this sheet's delivery budget, which refills continuously",
+        Fix: `batch the events into fewer deliveries, or retry in ${
+          Math.ceil((1 - budget.rows) * HOOK_WINDOW_S / HOOK_ROWS_PER_WINDOW)
+        } seconds`,
+      }),
+    });
+  }
+  if (budget.bytes < size) {
+    throw new HTTPException(429, {
+      message: explain(`Sheet ${sheet_id} has taken too many bytes.`, {
+        Received: `${size} bytes against ${Math.floor(budget.bytes)} left in this window`,
+        Limit: `${HOOK_BYTES_PER_WINDOW} bytes per ${HOOK_WINDOW_S} seconds, for this sheet`,
+        Source: "this sheet's byte budget, which refills continuously",
+        Fix: `send a smaller body, or retry in ${
+          Math.ceil((size - budget.bytes) * HOOK_WINDOW_S / HOOK_BYTES_PER_WINDOW)
+        } seconds`,
+      }),
+    });
+  }
   // Every delivery is signed. There is no per-sheet opt-out: without this,
   // anyone who learns a net sheet's id can append rows to it. Which scheme is
   // checked comes off the sheet's stored secrets, never off the request.
@@ -2481,6 +2633,18 @@ app.post("/net/:id", async (c) => {
       }),
     });
   }
+  // Charged only by a delivery that landed. A 401 or a 409 spends nothing:
+  // charging every attempt would let one attacker replaying one captured
+  // delivery, or posting junk at an id it guessed, exhaust the budget of the
+  // sender that sheet belongs to -- the opposite of what the budget protects.
+  // The cost is that an unsigned flood is shed by callerIp()'s global limiter
+  // alone, and each of its requests still pays the secret lookup a spent budget
+  // would have refused before. Read again rather than reusing the bucket
+  // checked above, because the awaits between them span an eviction, and
+  // charging a bucket the map no longer holds charges nobody.
+  const spent = hookBucket(sheet_id);
+  spent.rows -= 1;
+  spent.bytes -= size;
   await trimNet(sheet_id);
   return c.json(null, 200);
 });
@@ -2515,7 +2679,10 @@ const safeFetch = async (start: string, headers: Record<string, string> = {}): P
     if (ips.some(ipBlocked)) throw new HTTPException(400, { message: "Internal URLs not allowed." });
     const res = await fetch(url, {
       redirect: "manual",
-      signal: AbortSignal.timeout(30_000),
+      // Ten seconds, not thirty: the poller runs on a 15s tick, and a request
+      // that can outlive two of them is a cycle that overlaps the next. The
+      // page waiting on /proxy has less patience than that anyway.
+      signal: AbortSignal.timeout(10_000),
       headers: {
         "User-Agent": "Scrapsheets/1.0",
         "Accept": "application/json, application/xml, text/xml, application/atom+xml, */*",
@@ -2607,36 +2774,112 @@ const fetchFailure = (
   repro: curlFor(res?.url || url, headers),
 });
 
-const netDue = new Map<string, number>();
+// Both hold a *future* due time: one entry per net-http sheet that ever polled
+// and one per host that ever answered, deleted sheets and dead hosts included,
+// so neither is bounded by anything the deployment holds. Evicting a live entry
+// re-polls that sheet or host early and loses nothing, which is what makes
+// insertion order a safe thing to evict on -- the oldest key can go without
+// asking what it was for.
+export const netDue = new Map<string, number>();
+// A host that asks to be retried later asked every sheet pointed at it, not
+// only the one that heard it. Two sheets on one API otherwise take turns
+// stampeding the host that just said stop.
+export const hostDue = new Map<string, number>();
 
-// Read at most `cap` bytes, then abandon the rest of the body.
-const readCapped = async (res: Response, cap: number): Promise<string> => {
+// The most failures in a row one feed retries before it stops and waits for its
+// own interval again. The row that gives up names this number and the count.
+const RETRY_MAX = 3;
+// The first retry delay, doubled per attempt. A retry is scheduled and never
+// slept: a cycle that waited here would still be waiting when the next tick
+// arrived, and a Retry-After of an hour would hold every other sheet with it.
+const RETRY_BACKOFF_MS = 30_000;
+// A cycle starts no further sheets past this. That budget, plus the single
+// request a sheet makes and safeFetch's 10s timeout, is how one cycle stays
+// inside the 15s tick that drives it; the tick itself refuses to start a second
+// cycle while one is still running, which covers a database that hangs too.
+const POLL_CYCLE_MS = 3_000;
+// A body arrives in chunks, and a host that trickles empty ones is a loop the
+// byte cap alone cannot end.
+const BODY_CHUNKS_MAX = 10_000;
+
+// RFC 9110: Retry-After is a delay in seconds or an HTTP-date. One that is
+// neither is this sheet's failure row -- the poller keeps its other sheets.
+const retryAfterMs = (raw: string, now: number): number => {
+  // Nine digits, because shape is not magnitude and this value is multiplied.
+  if (/^[0-9]{1,9}$/.test(raw.trim())) return Number(raw.trim()) * 1000;
+  const at = Date.parse(raw);
+  if (Number.isNaN(at)) {
+    throw new Error(
+      explain("This host asked to be retried at a time that cannot be read.", {
+        Received: `Retry-After: ${JSON.stringify(raw)}`,
+        Expected: "a delay in seconds, or an HTTP-date",
+        Source: "the response headers on this poll",
+        Fix: "the header is the host's to fix; until it is, this sheet waits its own interval",
+      }),
+    );
+  }
+  // A date already past means now.
+  return Math.max(0, at - now);
+};
+
+// A validator is only worth keeping if it can be sent back exactly as it
+// arrived, so an absurd one is dropped rather than stored and replayed forever.
+const validator = (raw: string | null): string | null => (raw && raw.length <= 200 ? raw : null);
+
+// The body, up to one byte past the cap. That byte is all it takes to know the
+// response is too large, and reading the rest of a runaway is the cost the cap
+// exists to refuse.
+const readBody = async (res: Response): Promise<Uint8Array> => {
   const reader = res.body?.getReader();
-  if (!reader) return "";
+  if (!reader) return new Uint8Array();
   const chunks: Uint8Array[] = [];
   let size = 0;
-  while (size < cap) {
+  for (let chunk = 0; size <= NET_BODY_CAP; chunk++) {
+    if (chunk >= BODY_CHUNKS_MAX) {
+      throw new Error(
+        explain("This response arrived in more pieces than a body may take.", {
+          Received: `${chunk} chunks holding ${size} bytes`,
+          Expected: `at most ${BODY_CHUNKS_MAX} chunks`,
+          Source: "the response stream on this poll",
+          Fix: "the host is trickling or sending empty chunks; point the sheet at another endpoint",
+        }),
+      );
+    }
     const { done, value } = await reader.read();
     if (done) break;
     chunks.push(value);
     size += value.byteLength;
   }
   await reader.cancel().catch(() => {});
-  const buf = new Uint8Array(Math.min(size, cap));
+  const buf = new Uint8Array(size);
   let offset = 0;
   for (const chunk of chunks) {
-    if (offset >= buf.length) break;
-    buf.set(chunk.subarray(0, Math.min(chunk.byteLength, buf.length - offset)), offset);
+    buf.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return new TextDecoder().decode(buf);
+  return buf;
+};
+
+// Every write to this log trims behind itself, the failures included: a feed
+// that only ever fails used to grow until the first success trimmed it.
+const netRow = async (sheet_id: string, body: string, meta: Record<string, unknown>): Promise<void> => {
+  await sql`insert into net (sheet_id, method, body, meta) values (${sheet_id}, 'GET', ${body}, ${sql.json(meta)})`;
+  await trimNet(sheet_id);
 };
 
 export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promise<void> => {
   const sheets = await sql`select sheet_id, doc_id from sheet where type = 'net-http'`;
+  const cycleStart = Date.now();
   for (const { sheet_id, doc_id } of sheets) {
     if ((netDue.get(sheet_id) ?? 0) > now) continue;
+    // A cycle that has spent its budget stops starting sheets rather than
+    // running long. Nothing here has moved this sheet's due time yet, so the
+    // next tick takes it.
+    if (Date.now() - cycleStart > POLL_CYCLE_MS) break;
     netDue.set(sheet_id, now + 3600_000);
+    // The only set here that can introduce a key: every later one this cycle is
+    // this same sheet, and Map.set on a key it holds keeps its position.
+    bound(netDue, RATE_LIMIT_KEYS_MAX);
     // Declared out here so the catch can name the URL and headers it failed on.
     let url = `sheet ${sheet_id}`, headers: Record<string, string> = {};
     try {
@@ -2646,36 +2889,199 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       if (!config.url) continue;
       url = config.url;
       headers = parseNetHeaders(config.headers);
+      const host = new URL(url).hostname;
+      const holdoff = hostDue.get(host) ?? 0;
+      // Waiting out what another sheet on this host was told. Nothing ran, so
+      // there is nothing to log.
+      if (holdoff > now) {
+        netDue.set(sheet_id, holdoff);
+        continue;
+      }
+      // The last row is where this feed's state lives: the validators the last
+      // good body carried, the watermark it was fetched at, and how many
+      // failures have happened in a row since. It lives in `net.meta` rather
+      // than in the automerge document because that document is what sync hands
+      // every viewer and what the user edits -- a poller writing to it every
+      // tick would fight those edits and mint a change for every open browser.
+      const [prev]: {
+        net_id: string;
+        meta: { etag?: string; last_modified?: string; cursor?: string; attempt?: number };
+      }[] = await sql`
+        select net_id, meta from net where sheet_id = ${sheet_id} order by net_id desc limit 1
+      `;
+      const was = prev?.meta ?? {};
       // Resolved into a separate object. `headers` is what a failure row is
       // built from, so a resolved token cannot reach the log even if curlFor
-      // one day prints more than the keys.
-      const sending = await resolveSecrets(sheet_id, headers);
+      // one day prints more than the keys. The conditional headers are ours and
+      // not the sheet's, for that rule in reverse: the repro line's job is to
+      // fetch the body by hand, and a conditional request answers 304.
+      const sending = {
+        ...await resolveSecrets(sheet_id, headers),
+        ...(was.etag ? { "If-None-Match": was.etag } : {}),
+        ...(was.last_modified ? { "If-Modified-Since": was.last_modified } : {}),
+      };
+      // The watermark is when the last good poll started, not when it finished:
+      // a row created while that request was in flight is asked for twice
+      // rather than missed once. It rides every good run, so a sheet that
+      // gains a cursor later resumes from its last poll instead of re-reading
+      // history it has already logged.
+      if (config.cursor) {
+        if (!/^[A-Za-z0-9_.-]{1,64}$/.test(config.cursor)) {
+          throw new Error(
+            explain("This sheet's cursor is not the name of a query parameter.", {
+              Received: JSON.stringify(config.cursor),
+              Expected: "letters, digits, dot, dash or underscore, at most 64 of them",
+              Source: "the cursor field on this net-http sheet",
+              Fix: "name the parameter this feed takes a since-value in, such as `since` or `updated_after`",
+            }),
+          );
+        }
+        const target = new URL(url);
+        if (was.cursor) target.searchParams.set(config.cursor, was.cursor);
+        url = target.href;
+      }
       const started = Date.now();
-      const res = await fetcher(url, sending);
-      const text = await readCapped(res, 65536);
+      // A string instead of a response is a failure off the wire: a timeout, a
+      // reset. Everything safeFetch refuses on its own arrives as an
+      // HTTPException instead, because a private address or a redirect loop
+      // answers a retry exactly as it answered this one.
+      const res = await fetcher(url, sending).catch((err) => {
+        if (err instanceof HTTPException) throw err;
+        return err instanceof Error ? err.message : String(err);
+      });
+      // A 5xx and a 429 are the host saying "later". A 404, a 401, an SSRF
+      // refusal are a "no", and retrying a "no" is noise on top of the failure
+      // row that already answered it.
+      if (typeof res === "string" || res.status === 429 || res.status >= 500) {
+        const answered = typeof res === "string" ? null : res;
+        const detail = typeof res === "string" ? res : new TextDecoder().decode(await readBody(res));
+        const after = answered?.headers.get("retry-after") ?? null;
+        // The wait is the host's and not this sheet's, so it holds every sheet
+        // pointed there. It is a floor and not a schedule: this sheet takes the
+        // later of it and its own backoff, which is what the host asked for.
+        if (after !== null) {
+          hostDue.set(host, now + retryAfterMs(after, now));
+          bound(hostDue, RATE_LIMIT_KEYS_MAX);
+        }
+        const attempt = Number(was.attempt ?? 0) + 1;
+        // Read back out of jsonb, so it is guarded like every other read out of
+        // jsonb: a count that is not a whole number lands as NaN in the next
+        // due time, and a sheet due at NaN is due on every tick forever.
+        if (!Number.isInteger(attempt) || attempt < 1) {
+          throw new Error(
+            explain("This feed's last run recorded a failure count that cannot be read.", {
+              Received: `attempt: ${JSON.stringify(was.attempt)}`,
+              Expected: "a whole number of failures in a row, or nothing at all",
+              Source: `meta on the newest row of ${sheet_id}`,
+              Fix: "delete that row; the next poll starts the count again",
+            }),
+          );
+        }
+        if (attempt >= RETRY_MAX) {
+          throw new Error(
+            explain(`This feed has failed ${attempt} polls in a row, which is the retry bound.`, {
+              Received: `${attempt} failures, the last of them: ${detail.slice(0, 200)}`,
+              Expected: `a 2xx within ${RETRY_MAX} attempts`,
+              Source: url,
+              Fix: "fix the feed or the sheet; the next scheduled poll starts the count again",
+            }),
+          );
+        }
+        const wait = Math.max(hostDue.get(host) ?? 0, now + RETRY_BACKOFF_MS * 2 ** (attempt - 1));
+        netDue.set(sheet_id, wait);
+        await netRow(
+          sheet_id,
+          JSON.stringify({
+            ...fetchFailure(url, headers, answered, detail),
+            attempt,
+            retry_at: new Date(wait).toISOString(),
+          }),
+          { status: answered?.status ?? 0, ms: Date.now() - started, bytes: detail.length, attempt },
+        );
+        continue;
+      }
+      const kept = {
+        etag: validator(res.headers.get("etag")) ?? was.etag ?? null,
+        last_modified: validator(res.headers.get("last-modified")) ?? was.last_modified ?? null,
+        cursor: new Date(now).toISOString(),
+      };
+      if (res.status === 304) {
+        // A 304 is a healthy poll that appended nothing: the feed answered, and
+        // what it answered is that the row already here is still current.
+        // POLL_OK and library:freshness both grade meta->>'status' between 200
+        // and 299, so the run is recorded as the 200 it semantically is and
+        // `not_modified` keeps the status that came off the wire -- otherwise a
+        // daily file polled hourly reads as a dead feed. Moving that row's
+        // created_at rather than appending an empty one is what a quiet alert
+        // tick does: liveness reads max(created_at), and 23 blank rows a day
+        // would push the feed's own data out past NET_KEEP.
+        if (!prev || !(was.etag || was.last_modified)) {
+          throw new Error(
+            explain("This feed answered 304 to a request that carried no validator.", {
+              Received: "HTTP 304 Not Modified",
+              Expected: "a 2xx, because this poll sent no If-None-Match and no If-Modified-Since",
+              Source: url,
+              Fix: "the host is answering a conditional request nobody made; point the sheet elsewhere",
+            }),
+          );
+        }
+        await sql`
+          update net
+          set created_at = now(),
+              meta = ${sql.json({ ...kept, status: 200, not_modified: true, ms: Date.now() - started, bytes: 0 })}
+          where net_id = ${prev.net_id}
+        `;
+        continue;
+      }
+      const raw = await readBody(res);
+      // A body over the cap is a failure row naming both numbers. A truncated
+      // success is a parse error further downstream, blamed on the data.
+      if (res.ok && raw.byteLength > NET_BODY_CAP) {
+        throw new Error(
+          explain("This feed's response is too large to store.", {
+            Received: `${res.headers.get("content-length") ?? `at least ${raw.byteLength}`} bytes`,
+            Limit: `${NET_BODY_CAP} bytes per response`,
+            Source: url,
+            Fix: "point the sheet at a paged or filtered endpoint, or give it a cursor",
+          }),
+        );
+      }
+      const text = new TextDecoder().decode(raw);
       // Errors become log rows too: the user who typed the URL must see them, and
       // must be able to run the same request by hand.
       const body = res.ok ? text : JSON.stringify(fetchFailure(url, headers, res, text));
       // The run beside the payload: whether a feed is slow, or 200-ing an error
       // page, is a question about the poll and not about the body it returned.
-      const meta = sql.json({ status: res.status, ms: Date.now() - started, bytes: text.length });
-      await sql`
-        insert into net (sheet_id, method, body, meta) values (${sheet_id}, 'GET', ${body}, ${meta})
-      `;
-      await trimNet(sheet_id);
+      // The validators and the watermark ride the good rows only, so the next
+      // poll asks its question about the body this sheet actually holds.
+      await netRow(sheet_id, body, {
+        status: res.status,
+        ms: Date.now() - started,
+        bytes: raw.byteLength,
+        ...(res.ok ? kept : {}),
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`net-http poll ${sheet_id}:`, message);
       const failure = fetchFailure(url, headers, null, message);
-      await sql`
-        insert into net (sheet_id, method, body, meta)
-        values (${sheet_id}, 'GET', ${JSON.stringify(failure)}, ${sql.json({ status: 0, ms: 0, bytes: 0 })})
-      `.catch((dbErr: unknown) => console.error(`net-http poll ${sheet_id}: could not record the error:`, dbErr));
+      // No attempt count: giving up, a malformed Retry-After and a sheet that
+      // cannot be read all land here, and the next scheduled poll starts over.
+      await netRow(sheet_id, JSON.stringify(failure), { status: 0, ms: 0, bytes: 0 })
+        .catch((dbErr: unknown) => console.error(`net-http poll ${sheet_id}: could not record the error:`, dbErr));
     }
   }
 };
 
-setInterval(() => pollNetOnce().catch((err) => console.error("net-http poll:", err)), 15_000);
+let polling = false;
+setInterval(() => {
+  // A tick that finds the cycle before it still running does nothing rather
+  // than starting a second one over the same due sheets.
+  if (polling) return;
+  polling = true;
+  pollNetOnce()
+    .catch((err) => console.error("net-http poll:", err))
+    .finally(() => polling = false);
+}, 15_000);
 
 // --- alerts
 //
@@ -2976,11 +3382,128 @@ app.get("/proxy", async (c) => {
 });
 
 // --- authenticated routes
+//
+// Two ways in. A person carries a JWT and reaches everything their account can.
+// A script carries a key for one sheet, minted by POST /library/:id/secret under
+// the name `api`: it is stored encrypted beside every other sheet secret, it
+// names its own sheet, and it opens that sheet and nothing else. A key that
+// carried the minter's whole authority is the thing this exists to prevent.
+const API_KEY_HEADER = "scrapsheets-key";
+const API_KEY_NAME = "api";
 
-app.use("*", jwt({ secret: JWT_SECRET, alg: JWT_ALG }));
+/** A key for one sheet: the sheet id, a dot, then 32 random bytes. The sheet id
+ * rides along so verifying reads at most SECRET_KEEP rows of one sheet rather
+ * than decrypting the whole table looking for a match. */
+const apiKeyFor = (sheet_id: string): string => `${sheet_id}.${hex(crypto.getRandomValues(new Uint8Array(32)))}`;
+
+// crypto.subtle.verify does the comparison, so no key equality is written by
+// hand: HMAC both under one fixed message and let WebCrypto compare the digests.
+const API_KEY_PROBE = new TextEncoder().encode(API_KEY_NAME);
+const sameKey = async (presented: string, stored: string): Promise<boolean> =>
+  await crypto.subtle.verify(
+    "HMAC",
+    await hmacKey(stored),
+    await hookMac(presented, API_KEY_PROBE) as Uint8Array<ArrayBuffer>,
+    API_KEY_PROBE,
+  );
+
+/** Who a presented key is, or a 401 that is not a key oracle: it never prints a
+ * key, a digest, or how close the one it received was. */
+const apiKeyScope = async (presented: string): Promise<{ usr_id: string; sheet_id: string }> => {
+  const cut = presented.lastIndexOf(".");
+  const sheet_id = cut < 0 ? "" : presented.slice(0, cut);
+  const refuse = () =>
+    new HTTPException(401, {
+      message: explain(`That ${API_KEY_HEADER} is not a key this server issued.`, {
+        Received: `a key naming ${sheet_id ? sheet_id : "no sheet at all"}`,
+        Expected: `the key POST /library/:id/secret answered with for that sheet`,
+        Source: `the ${API_KEY_HEADER} request header`,
+        Fix: `mint one with POST /library/<sheet_id>/secret {"name":"${API_KEY_NAME}"}; it is shown once, so a lost ` +
+          `key is replaced rather than recovered`,
+      }),
+    });
+  // Current and previous, the same rotation rule every other secret reads by.
+  const rows = sheet_id
+    ? await sql`
+      select value_encrypted from secret
+      where sheet_id = ${sheet_id} and name = ${API_KEY_NAME}
+      order by created_at desc, secret_id desc
+      limit ${SECRET_KEEP}
+    `
+    : [];
+  for (const row of rows) {
+    if (!await sameKey(presented, await decrypt(`${API_KEY_NAME} key`, String(row.value_encrypted)))) continue;
+    // The identity a key borrows is the sheet's creator: the key stands for one
+    // sheet, and the path check below is what bounds it, not the account.
+    const [owner] = await sql`select created_by from sheet where sheet_id = ${sheet_id}`;
+    if (!owner?.created_by) throw refuse();
+    return { usr_id: String(owner.created_by), sheet_id };
+  }
+  throw refuse();
+};
+
+const jwtAuth = jwt({ secret: JWT_SECRET, alg: JWT_ALG });
 
 app.use("*", async (c, next) => {
-  c.set("usr_id", c.get("jwtPayload")?.sub);
+  const presented = c.req.header(API_KEY_HEADER);
+  // No key header and the request takes exactly the path it always did.
+  if (!presented) return await jwtAuth(c, next);
+  const { usr_id, sheet_id } = await apiKeyScope(presented);
+  // A colon may arrive percent-encoded. One that cannot be decoded at all is
+  // not this key's sheet either, so it falls to the refusal below rather than
+  // to a URIError and a 500.
+  const path = (() => {
+    try {
+      return decodeURIComponent(c.req.path);
+    } catch {
+      return c.req.path;
+    }
+  })();
+  // The scope is checked on the path, before routing, so no handler has to
+  // remember to ask -- and a key that reached POST /library/:id/secret could
+  // mint itself a key for a sheet it was never given.
+  if (path !== `/sheet/${sheet_id}` && path !== `/openapi/${sheet_id}`) {
+    throw new HTTPException(403, {
+      message: explain(`This key opens ${sheet_id} and nothing else.`, {
+        Received: `${c.req.method} ${path}`,
+        Expected: `GET or POST /sheet/${sheet_id}, or GET /openapi/${sheet_id}`,
+        Source: `the ${API_KEY_HEADER} request header, which names the one sheet it is for`,
+        Fix: "mint a key on that sheet too, or call this route with the Authorization header of an account that " +
+          "can reach it",
+      }),
+    });
+  }
+  c.set("usr_id", usr_id);
+  await next();
+});
+
+// The one place a token becomes an identity, and so the one place a token that
+// carries none is refused. A share link is a real token this server minted, but
+// it claims a sheet and no `sub`: verifyWsAuth reads that claim on the sync
+// socket, and no HTTP route reads it at all. Every route past here interpolates
+// usr_id into SQL, so an identity-less one arrived at postgres.js as
+// UNDEFINED_VALUE -- a 500, a row in the operator's log and a point off the 5xx
+// grade, for a caller using the credential we handed them. The guard lives here
+// rather than beside each of those queries because there is one way in and six
+// places to forget, and because the honest answer is about the token and not
+// about the sheet it was pointed at.
+app.use("*", async (c, next) => {
+  const usr_id = c.get("jwtPayload")?.sub ?? c.get("usr_id");
+  if (!usr_id) {
+    const share = c.get("jwtPayload")?.share;
+    throw new HTTPException(403, {
+      message: explain("That token opens the sync socket and nothing else.", {
+        Received: share ? `a share link to ${share}, which names a sheet and no account` : "a token with no sub claim",
+        Expected: "the token POST /login answered with",
+        Source: "the Authorization header",
+        Fix: share
+          ? "open the link in the app, which reads it over the sync socket, or sign in and call this route with " +
+            "that account's token"
+          : "sign in again with POST /login",
+      }),
+    });
+  }
+  c.set("usr_id", usr_id);
   await next();
 });
 
@@ -3180,7 +3703,7 @@ const freshness = async (c: Context, { limit, offset }: Record<string, string>):
           and case when s.type = 'alert' then (${ALERT_OK()}) else (${POLL_OK()}) end
         order by n.created_at desc, n.net_id desc limit 1
       ) ok on true
-      where su.usr_id = ${c.get("usr_id") ?? null} and s.type in ('net-http', 'alert')
+      where su.usr_id = ${c.get("usr_id")} and s.type in ('net-http', 'alert')
     ) f`,
     where: [],
     // Stalest first, because that is the question. A sheet that has never run
@@ -3321,7 +3844,10 @@ app.get("/library/:id/share", async (c) => {
 app.post("/library/:id/share", async (c) => {
   const sheet_id = c.req.param("id");
   await assertSheetOwner(c, sheet_id);
-  const { email, role } = await c.req.json();
+  // A missing or malformed body is a 400 naming what arrived. Unguarded, the
+  // json() throw became an unexplained 500, and cost a row in the error log
+  // for a request the caller could have fixed from the message.
+  const { email, role } = await c.req.json().catch(() => ({} as Record<string, unknown>));
   if (typeof email !== "string" || !email.includes("@")) {
     throw new HTTPException(400, {
       message: `Expected an email address to share with, received ${JSON.stringify(email)}.`,
@@ -3351,7 +3877,15 @@ app.post("/library/:id/share", async (c) => {
 app.delete("/library/:id/share", async (c) => {
   const sheet_id = c.req.param("id");
   await assertSheetOwner(c, sheet_id);
-  const { email } = await c.req.json();
+  const { email } = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  // Unvalidated, a missing email reached the delete and came back as the 404
+  // "undefined is not a non-owner member of this sheet" -- a sentence about the
+  // sheet for a mistake in the request.
+  if (typeof email !== "string" || !email.includes("@")) {
+    throw new HTTPException(400, {
+      message: `Expected an email address to remove, received ${JSON.stringify(email)}.`,
+    });
+  }
   const [removed] = await sql`
     delete from sheet_usr
     where sheet_id = ${sheet_id}
@@ -3372,7 +3906,7 @@ app.delete("/library/:id/share", async (c) => {
 app.post("/library/:id/public", async (c) => {
   const sheet_id = c.req.param("id");
   await assertSheetOwner(c, sheet_id);
-  const { public: isPublic } = await c.req.json();
+  const { public: isPublic } = await c.req.json().catch(() => ({} as Record<string, unknown>));
   if (typeof isPublic !== "boolean") {
     throw new HTTPException(400, {
       message: `Expected public to be true or false, received ${JSON.stringify(isPublic)}.`,
@@ -3385,11 +3919,50 @@ app.post("/library/:id/public", async (c) => {
 
 // A view-only link is a JWT scoped to one sheet. The sync socket already accepts
 // ?auth=<jwt>, so this needs no new read path.
+//
+// A bearer credential that travels in a URL may not be immortal, so the owner
+// picks how long it lives, bounded rather than free. An empty body is the
+// page's own call and must keep minting the unlocked 30-day link it always did.
+const LINK_DAYS_MAX = 365;
+// A password a person types and reads out over the phone, not a key file.
+const LINK_PASSWORD_MAX = 128;
+
 app.post("/library/:id/link", async (c) => {
   const sheet_id = c.req.param("id");
   await assertSheetOwner(c, sheet_id);
+  const { days, password } = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  if (days !== undefined && (typeof days !== "number" || !(days > 0) || days > LINK_DAYS_MAX)) {
+    throw new HTTPException(400, {
+      message: explain(`That is not a usable lifetime for a link to ${sheet_id}.`, {
+        Received: JSON.stringify(days),
+        Expected: `a number above 0 and at most ${LINK_DAYS_MAX}`,
+        Source: "the days field of the request body",
+        Fix: "send days as a JSON number, or leave it out for a link that lives 30 days",
+      }),
+    });
+  }
+  if (password !== undefined && (typeof password !== "string" || !password || password.length > LINK_PASSWORD_MAX)) {
+    throw new HTTPException(400, {
+      message: explain(`That is not a usable password for a link to ${sheet_id}.`, {
+        // The value only reaches the message when it is not a string, so a real
+        // password can never be printed back.
+        Received: typeof password !== "string" ? JSON.stringify(password) : `${password.length} characters`,
+        Expected: `a non-empty string of at most ${LINK_PASSWORD_MAX} characters`,
+        Source: "the password field of the request body",
+        Fix: "send the password as a JSON string, or leave it out for a link anyone holding the url can open",
+      }),
+    });
+  }
   const token = await sign(
-    { share: sheet_id, exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 30 },
+    {
+      share: sheet_id,
+      // The password is never stored and never travels. What rides the token is
+      // an HMAC of it under TOKEN_SECRET, which the reader's password has to
+      // reproduce -- keyed by a server secret, so holding the link buys nobody
+      // an offline guess at the password.
+      ...(password === undefined ? {} : { lock: hex(await hookMac(TOKEN_SECRET, linkMessage(sheet_id, password))) }),
+      exp: Math.floor(Date.now() / 1000 + 60 * 60 * 24 * (days ?? 30)),
+    },
     JWT_SECRET,
     JWT_ALG,
   );
@@ -3489,7 +4062,34 @@ app.post("/library/:id/secret", async (c) => {
       }),
     });
   }
-  if (typeof value !== "string" || !value || value.length > SECRET_VALUE_CAP) {
+  // `api` is this sheet's own API key, and nothing else in that space is a name
+  // the middleware knows. An unknown one is refused where it is typed, the same
+  // way an unknown hook scheme is: written happily and then useless is worse.
+  if (name.startsWith(`${API_KEY_NAME}:`)) {
+    throw new HTTPException(400, {
+      message: explain(`${JSON.stringify(name)} is not a key name this server knows.`, {
+        Received: name,
+        Expected: API_KEY_NAME,
+        Source: "the name field of the request body",
+        Fix: `use ${API_KEY_NAME}, or a name that does not start with ${API_KEY_NAME}:`,
+      }),
+    });
+  }
+  // The server mints an API key rather than taking one: a key the owner chose is
+  // a key the owner reused somewhere else, and there is no way to check that
+  // from here. Writing one is rotating it, like every other secret on the sheet.
+  const minted = name === API_KEY_NAME ? apiKeyFor(sheet_id) : null;
+  if (minted && value !== undefined) {
+    throw new HTTPException(400, {
+      message: explain(`An ${API_KEY_NAME} key is minted here, not supplied.`, {
+        Received: `a value field alongside name ${API_KEY_NAME}`,
+        Expected: `just {"name":"${API_KEY_NAME}"}; the key comes back in the answer, once`,
+        Source: "the value field of the request body",
+        Fix: "drop the value field, and store what this route answers with",
+      }),
+    });
+  }
+  if (!minted && (typeof value !== "string" || !value || value.length > SECRET_VALUE_CAP)) {
     throw new HTTPException(400, {
       message: explain(`That is not a usable secret value on ${sheet_id}.`, {
         Received: typeof value !== "string" ? `a ${typeof value}` : `${value.length} characters`,
@@ -3534,7 +4134,7 @@ app.post("/library/:id/secret", async (c) => {
   //
   // The name cap above is a plain check because losing that race costs one name
   // over the limit; losing this one costs the sheet.
-  const value_encrypted = await encrypt(value);
+  const value_encrypted = await encrypt(minted ?? value);
   // The check and the insert are one transaction behind a lock on the sheet
   // row, because `insert ... where not exists` is only atomic against another
   // statement on the same connection. Two isolates each hold their own, so
@@ -3577,7 +4177,27 @@ app.post("/library/:id/secret", async (c) => {
         order by created_at desc, secret_id desc limit ${SECRET_KEEP}
       )
   `;
-  return c.json(null, 201);
+  if (!minted) return c.json(null, 201);
+  // Once, here, and never again: GET answers names and timestamps, and the
+  // value is sealed under DSN_ENCRYPTION_KEY behind a comparison that only ever
+  // answers yes or no. A long-lived key may not sit in a shared cache either.
+  const url = `${new URL(c.req.url).origin}/sheet/${sheet_id}`;
+  c.header("Cache-Control", "no-store");
+  return c.json({
+    data: {
+      url,
+      key: minted,
+      // A key and a sheet id are hex and base58, so neither can close the
+      // quoting the way a hand-pasted provider secret can.
+      repro: [
+        `curl '${url}' -H '${API_KEY_HEADER}: ${minted}'`,
+        `# the columns a row must carry, and their types:`,
+        `curl '${new URL(c.req.url).origin}/openapi/${sheet_id}' -H '${API_KEY_HEADER}: ${minted}'`,
+        `curl -X POST '${url}' -H '${API_KEY_HEADER}: ${minted}' \\`,
+        `  -H 'Content-Type: application/json' -d '{"rows":[{"column":"value"}]}'`,
+      ].join("\n"),
+    },
+  }, 201);
 });
 
 app.get("/library/:id/secret", async (c) => {
@@ -3755,17 +4375,25 @@ app.post("/import/csv", async (c) => {
     };
   });
 
-  // Build rows with proper type conversion
+  // A blank is no value, and it stays one. Number("") is 0, and a blank is in
+  // neither half of the boolean list, so the old shape stored "" in a num column
+  // and an invented false in a bool one -- a reading nobody took and a fact the
+  // file never stated. checkColumnTypes() in src/sql.mjs is the one place a
+  // blank becomes a null; an importer that disagrees with it makes the stored
+  // document and the query answer two different questions about one file. Only
+  // a text column keeps the empty string, because there it is a value.
   const rows: Row[] = dataRows.map(({ fields }) => {
     const obj: Row = {};
     cols.forEach((col, i) => {
       const val = fields[i] ?? "";
-      if (col.type === "num" && val.trim())
-        obj[col.key] = Number(val);
-      else if (col.type === "bool")
-        obj[col.key] = ["true", "t", "1", "yes"].includes(val.toLowerCase());
-      else
+      if (col.type === "text")
         obj[col.key] = val;
+      else if (!val.trim())
+        obj[col.key] = null;
+      else if (col.type === "num")
+        obj[col.key] = Number(val);
+      else
+        obj[col.key] = ["true", "t", "1", "yes"].includes(val.toLowerCase());
     });
     return obj;
   });
@@ -3960,6 +4588,253 @@ app.get(`/export/:id{.+\\.(${Object.keys(EXPORTS).join("|")})}`, async (c) => {
 
 // The one stable JSON read: every sheet type, access and pagination inherited from sheet().
 app.get("/sheet/:id", async (c) => page(c)(await sheet(c, c.req.param("id"), c.req.query())));
+
+// At most one batch, because the whole batch is checked before the document is
+// touched and the check holds every row in memory.
+const APPEND_ROWS_MAX = 1000;
+
+// The write half of that read. Rows arrive keyed by column **name** -- the
+// header a CSV would carry, and the shape checkColumnTypes reads -- and are
+// stored keyed by column key, which is what the document holds.
+app.post("/sheet/:id", async (c) => {
+  const sheet_id = c.req.param("id");
+  const [type, doc_id] = sheet_id.split(":");
+  // Only a table sheet owns rows. A query, chart or dashboard computes its rows
+  // from somewhere else, and a net sheet's arrive signed over POST /net/:id --
+  // appending to either would be writing into an answer, not into a sheet.
+  if (type !== "table") {
+    throw new HTTPException(400, {
+      message: explain(`Sheet ${sheet_id} has no rows of its own to append to.`, {
+        Received: `a ${type} sheet`,
+        Expected: "a table sheet",
+        Source: "the type prefix of the sheet id",
+        Fix: type?.startsWith("net-")
+          ? `send a signed delivery to POST /net/${sheet_id} instead`
+          : "append to the table this sheet reads from instead",
+      }),
+    });
+  }
+  // Owner or editor, read the way sync reads it, so the two paths cannot
+  // disagree about who may write: a viewer holding a share link, and anyone at
+  // all on a public sheet, can read this sheet and must not append to it.
+  const role = await syncRole({ usr_id: c.get("usr_id") ?? null, share: null }, doc_id);
+  if (role !== "owner" && role !== "editor") {
+    throw new HTTPException(403, {
+      message: explain(`You do not have write access to ${sheet_id}.`, {
+        Received: role ? `your role on this sheet is ${role}` : "you have no role on this sheet",
+        Expected: "role owner or editor",
+        Source: "sheet_usr.role, the same read the sync socket makes",
+        Fix: `ask an owner to run POST /library/${sheet_id}/share with your email and role editor`,
+      }),
+    });
+  }
+  const { rows } = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  if (!Array.isArray(rows) || !rows.length) {
+    throw new HTTPException(400, {
+      message: explain(`That is not a batch of rows to append to ${sheet_id}.`, {
+        Received: Array.isArray(rows) ? "an empty rows array" : `a ${typeof rows} rows field`,
+        Expected: `{"rows":[{...}]}, each row an object keyed by column name`,
+        Source: "the rows field of the request body",
+        Fix: `read the shape this sheet takes from GET /openapi/${sheet_id}`,
+      }),
+    });
+  }
+  if (rows.length > APPEND_ROWS_MAX) {
+    throw new HTTPException(413, {
+      message: explain(`That is more rows than one append may carry.`, {
+        Received: `${rows.length} rows`,
+        Expected: `at most ${APPEND_ROWS_MAX} rows per request`,
+        Source: "the rows field of the request body",
+        Fix: `send it in batches of ${APPEND_ROWS_MAX}, or import the whole file with POST /import/csv`,
+      }),
+    });
+  }
+  const hand = await automerge.find<{ type: string; data: Table }>(doc_id as AnyDocumentId).catch(() => {
+    throw new HTTPException(404, {
+      message:
+        `Expected an automerge document for sheet ${sheet_id}, received none. Source: doc_id ${doc_id}. The sheet row exists but its document is missing or unreadable; re-create the sheet, or claim it again with PUT /library/${sheet_id}.`,
+    });
+  });
+  const [colsRow] = hand.doc().data;
+  const cols = Object.values(colsRow ?? {}) as Col[];
+  if (!cols.length) {
+    throw new HTTPException(400, {
+      message: explain(`Sheet ${sheet_id} has no columns to append under.`, {
+        Received: "a document whose first row names no columns",
+        Expected: "a column row, which is data[0] of the document",
+        Source: "the automerge document",
+        Fix: "add a column in the sheet first, then append",
+      }),
+    });
+  }
+  const names = cols.map((col) => col.name);
+  // A short or long row is the commonest broken batch, and filling one in loses
+  // data silently, exactly as it does in a CSV. Name both counts, the field it
+  // stops at, and the row as sent.
+  for (const [i, row] of rows.entries()) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw new HTTPException(400, {
+        message: explain(`Row ${i + 1} of the request is not an object.`, {
+          Received: Array.isArray(row) ? `an array: ${JSON.stringify(row).slice(0, 200)}` : `${JSON.stringify(row)}`,
+          Expected: `an object keyed by column name: ${names.join(", ")}`,
+          Source: `rows[${i}] of the request body`,
+          Fix: "key each row by the column names, not by position",
+        }),
+      });
+    }
+    const keys = Object.keys(row);
+    const missing = names.filter((name) => !(name in row));
+    const extra = keys.filter((key) => !names.includes(key));
+    if (missing.length || extra.length) {
+      throw new HTTPException(400, {
+        message: explain(`Row ${i + 1} of the request does not match the sheet's columns.`, {
+          Expected: `${names.length} fields: ${names.join(", ")}`,
+          Received: `${keys.length} fields: ${JSON.stringify(row).slice(0, 200)}`,
+          Column: missing.length ? `nothing for "${missing[0]}"` : `an extra field "${extra[0]}"`,
+          Source: `rows[${i}] of the request body`,
+          Fix: missing.length
+            ? `send every column, with null for the ones you have no value for`
+            : `drop "${extra[0]}", or add a column of that name to the sheet`,
+        }),
+      });
+    }
+    for (const name of names) {
+      const val = (row as Row)[name];
+      if (val === null || ["string", "number", "boolean"].includes(typeof val)) continue;
+      throw new HTTPException(400, {
+        message: explain(`Row ${i + 1}, column "${name}" holds a value no cell can hold.`, {
+          Received: `a ${Array.isArray(val) ? "array" : typeof val}: ${JSON.stringify(val ?? null).slice(0, 200)}`,
+          Expected: "a string, a number, a boolean, or null",
+          Source: `rows[${i}]["${name}"] of the request body`,
+          Fix: "send it as a string; a json column holds the JSON text, the way the net read casts jsonb to text",
+        }),
+      });
+    }
+  }
+  // The declared types are checked by the same function every table sheet is
+  // checked by as it loads into a query, so a value this route lets through can
+  // never be one a query then refuses. Its row numbers are the request's, since
+  // nothing has landed yet.
+  try {
+    checkColumnTypes(sheet_id, cols, rows as Row[]);
+  } catch (err) {
+    throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
+  }
+  // All or nothing. Every row is checked above and the append is one change,
+  // because automerge cannot roll a change back: a batch half-written under a
+  // 201 is the silent failure this endpoint exists without.
+  hand.change((doc) => {
+    for (const row of rows as Row[])
+      doc.data.push(Object.fromEntries(cols.map((col) => [col.key, row[col.name]])) as Row);
+  });
+  return c.json({ data: { appended: rows.length, rows: hand.doc().data.length - 1 } }, 201);
+});
+
+// A column type, as JSON Schema says it. A structured type (an array, a tuple,
+// an object) has no scalar spelling, so it is described as "anything" rather
+// than as a lie.
+const JSON_TYPES: Record<string, { type: string; format?: string }> = {
+  type: { type: "string" },
+  text: { type: "string" },
+  create: { type: "string" },
+  json: { type: "string" },
+  usd: { type: "number" },
+  num: { type: "number" },
+  float: { type: "number" },
+  percentage: { type: "number" },
+  int: { type: "integer" },
+  bool: { type: "boolean" },
+  date: { type: "string", format: "date" },
+  timestamp: { type: "string", format: "date-time" },
+};
+
+// The spec for one sheet, derived from its own columns at request time and
+// never stored, so it cannot drift from the schema it describes. It documents
+// the two routes a key opens and the header the key is presented in -- which is
+// the whole point: a key with nothing to point at is a key nobody can use.
+app.get("/openapi/:id", async (c) => {
+  const sheet_id = c.req.param("id");
+  // sheet() is the access check and the column row in one read. One row,
+  // because the spec is about the shape and not about the rows.
+  const [colsRow] = (await sheet(c, sheet_id, { limit: "1" })).data;
+  const cols = Object.values(colsRow ?? {}) as Col[];
+  const url = `/sheet/${sheet_id}`;
+  const row = {
+    type: "object",
+    additionalProperties: false,
+    required: cols.map((col) => col.name),
+    properties: Object.fromEntries(cols.map((col) => [col.name, JSON_TYPES[String(col.type)] ?? {}])),
+  };
+  return c.json({
+    openapi: "3.1.0",
+    info: { title: sheet_id, version: "1" },
+    servers: [{ url: new URL(c.req.url).origin }],
+    security: [{ sheetKey: [] }],
+    components: {
+      securitySchemes: { sheetKey: { type: "apiKey", in: "header", name: API_KEY_HEADER } },
+      schemas: { Row: row },
+    },
+    paths: {
+      [url]: {
+        get: {
+          summary: `Read ${sheet_id}`,
+          parameters: ["limit", "offset"].map((name) => ({ name, in: "query", schema: { type: "integer" } })),
+          responses: {
+            "200": {
+              description: "The column row, then the data rows, each keyed by column key.",
+              content: {
+                "application/json": {
+                  schema: { type: "object", properties: { data: { type: "array", items: { type: "object" } } } },
+                },
+              },
+            },
+          },
+        },
+        // Only a table sheet has a write. A query or chart computes its rows, so
+        // a spec that offered a POST would be documenting a 400.
+        ...(sheet_id.startsWith("table:")
+          ? {
+            post: {
+              summary: `Append rows to ${sheet_id}`,
+              requestBody: {
+                required: true,
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      required: ["rows"],
+                      properties: {
+                        rows: { type: "array", maxItems: APPEND_ROWS_MAX, items: { $ref: "#/components/schemas/Row" } },
+                      },
+                    },
+                  },
+                },
+              },
+              responses: {
+                "201": {
+                  description: "Every row was appended, or none was.",
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        properties: {
+                          data: {
+                            type: "object",
+                            properties: { appended: { type: "integer" }, rows: { type: "integer" } },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          }
+          : {}),
+      },
+    },
+  });
+});
 
 app.get("/net/:id", async (c) => {
   const id = c.req.param("id");

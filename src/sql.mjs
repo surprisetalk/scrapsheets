@@ -41,6 +41,12 @@ const show = (v) =>
 // Naming only the first would send someone hunting a typo that is not there.
 const MISSING = "check the column name, or move the call into a subquery and group by the column it produces";
 
+// An empty cell. Number("") is 0 and Number(" ") is 0, so every place that
+// reached for a number without asking this first read a reading nobody took as a
+// reading of zero. checkColumnTypes() is the one place a blank turns into a
+// null; everywhere else it is refused or skipped, never converted.
+const absent = (v) => v === null || v === undefined || (typeof v === "string" && v.trim() === "");
+
 const str = (fn, arg, v) => {
   if (typeof v !== "string") {
     throw fail(
@@ -63,13 +69,13 @@ const nums = (fn, arg, v) => {
     );
   }
   return v.map((n) => {
-    const f = typeof n === "string" ? Number(n) : n;
+    const f = absent(n) ? null : typeof n === "string" ? Number(n) : n;
     if (typeof f !== "number" || !Number.isFinite(f)) {
       throw fail(
         `${fn}() argument ${arg}`,
         "only finite numbers",
         show(n),
-        n === undefined ? MISSING : "filter the nulls out with a where clause",
+        n === undefined ? MISSING : "filter the blanks out with a where clause",
       );
     }
     return f;
@@ -77,7 +83,7 @@ const nums = (fn, arg, v) => {
 };
 
 const num = (fn, arg, v) => {
-  const n = typeof v === "string" ? Number(v) : v;
+  const n = absent(v) ? null : typeof v === "string" ? Number(v) : v;
   if (typeof n !== "number" || !Number.isFinite(n)) {
     throw fail(
       `${fn}() argument ${arg}`,
@@ -460,22 +466,48 @@ export const describeRows = (id, cols, rows) => {
   });
 };
 
-// --- type mismatch
+// --- type mismatch, and the one coercion table
 //
 // A numeric column holding "n/a" reaches the engine as a string, and every sum
 // over it is wrong without saying so. The check belongs on the source sheet, not
 // the result: the sheet is the only place the declared type and the row number
 // both exist.
+//
+// The same pass is where a cell becomes what its column says it is, because the
+// declared type and the cell are only both in hand here. Two coercions, and no
+// others anywhere: a blank becomes null, and a numeric string becomes its
+// number. Both exist because AlaSQL computes with the raw JavaScript value and
+// gets a silently wrong answer otherwise — avg() over [1, "", 2, "", 3] answers
+// 1.2, counting each blank as a reading of zero, and avg() over ["1","2","3"]
+// answers 41, because "+" concatenated them into "123" first. A null it already
+// treats as absent, which is why null is what a blank becomes.
+//
+// Null, empty and zero stay three different things after this: only a numeric
+// column is touched, so an empty string in a text column is still the empty
+// string, and a blank that reaches a function anyway came from a text column or
+// a literal and is refused by name rather than read as a zero.
 
-const NUMERIC = ["num", "int", "float", "usd", "percentage"];
+// The column types a cell has to be a number to hold. Exported because the
+// tests assert what this pass promises, and a second copy of the list would
+// drift from the one the check reads.
+export const NUMERIC_TYPES = ["num", "int", "float", "usd", "percentage"];
 
 export const checkColumnTypes = (id, cols, rows) => {
   for (const col of cols) {
-    if (!NUMERIC.includes(col.type)) continue;
+    if (!NUMERIC_TYPES.includes(col.type)) continue;
     for (let i = 0; i < rows.length; i++) {
       const v = rows[i][col.name];
-      if (v === null || v === undefined || v === "" || typeof v === "number") continue;
-      if (typeof v === "string" && !Number.isNaN(Number(v.trim()))) continue;
+      if (absent(v)) {
+        rows[i][col.name] = null;
+        continue;
+      }
+      if (typeof v === "number") continue;
+      // Finite, not merely a number: "Infinity" parses and then serializes to
+      // null in every export, which is a blank the sheet never held.
+      if (typeof v === "string" && Number.isFinite(Number(v.trim()))) {
+        rows[i][col.name] = Number(v.trim());
+        continue;
+      }
       throw new Error(explain(`Column "${col.name}" of @${id} holds a value its type does not allow.`, {
         Expected: `${col.type}, so a number or a blank`,
         Received: `${typeof v} ${JSON.stringify(v)}`,
@@ -1043,7 +1075,7 @@ const winCompare = (a, b) => {
 };
 
 const winNum = (fn, v) => {
-  if (v === null || v === undefined || v === "") return null;
+  if (absent(v)) return null;
   const n = typeof v === "string" ? Number(v) : v instanceof Date ? v.getTime() : v;
   if (typeof n !== "number" || !Number.isFinite(n)) {
     throw new Error(explain(`${fn}() over a window received a value it cannot add up.`, {
@@ -1219,6 +1251,127 @@ export const applyWindows = ({ columns, data }, { windows, qualify, limit, offse
     columns: columns.filter((col) => !HIDDEN.test(col.columnid) && !LIFTED.test(col.columnid)),
     data: limit === null || limit === undefined ? kept : kept.slice(offset, offset + limit),
   };
+};
+
+// --- result types
+//
+// A query column used to be typed by its name alone: whatever column of that
+// name some loaded sheet declared, or text. So `cast(price as string) as price`
+// still read usd, `count(*) as n` read text, and every sheet downstream of that
+// query inherited the lie. A type is a property of the select item, so it is
+// read off the select item.
+//
+// This is WINDOW_TYPES for the rest of the select list, and null means the same
+// thing here as it does there: whatever its argument already was, which is what
+// makes sum(amount_usd) usd and round(avg(price), 2) usd as well.
+export const SELECT_TYPES = {
+  count: "int",
+  sum: null,
+  avg: null,
+  min: null,
+  max: null,
+  round: null,
+  min_text: "text",
+  max_text: "text",
+};
+
+// A cast is the one expression whose type is stated rather than inferred — but
+// only where AlaSQL performs the cast. `cast(x as text)`, `as bool` and `as json`
+// pass the value through untouched, and `cast('2026-01-02' as date)` answers the
+// string "26.01.01", so stating a type for any of those would be this bug again
+// in a new place. They are absent, which lands them in the fallback.
+const CAST_TYPES = {
+  string: "text",
+  varchar: "text",
+  char: "text",
+  int: "int",
+  integer: "int",
+  smallint: "int",
+  bigint: "int",
+  number: "num",
+  float: "num",
+  double: "num",
+  decimal: "num",
+  numeric: "num",
+  boolean: "bool",
+};
+
+// How deep a select item is peeled before the type stops being worth chasing.
+const SELECT_DEPTH = 8;
+
+// The matching close, or -1. closeParen() throws on an unbalanced one, which is
+// right where it is used and wrong here: this pass runs before the engine, so a
+// malformed expression has to reach AlaSQL, which is the one that can point at
+// the character.
+const closeAt = (s, depth, open) => {
+  for (let i = open + 1; i < s.length; i++) if (s[i] === ")" && depth[i] === depth[open]) return i;
+  return -1;
+};
+
+const itemType = (expr, nameToType) => {
+  let text = expr.trim();
+  let averaged = false;
+  for (let i = 0; i < SELECT_DEPTH; i++) {
+    if (/^'(?:[^']|'')*'$/.test(text)) return "text";
+    if (/^-?\d+(?:\.\d+)?$/.test(text)) return "num";
+    const plain = text.match(/^(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)$/);
+    // An average of whole numbers is not a whole number. Every other function
+    // that follows its argument hands the type back untouched.
+    if (plain) return averaged && nameToType[plain[1]] === "int" ? "num" : nameToType[plain[1]];
+    const head = text.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+    if (!head) return undefined;
+    const depth = topLevel(text);
+    const open = head[0].length - 1;
+    // The call has to be the whole item: `sum(a) + 1` is arithmetic, not a sum.
+    if (closeAt(text, depth, open) !== text.length - 1) return undefined;
+    const fn = head[1].toLowerCase();
+    const args = splitAt(text, depth, open + 1, text.length - 1, depth[open] + 1)
+      .map(([a, b]) => text.slice(a, b).trim());
+    if (fn === "cast") {
+      const as = findAt(text, depth, /\bas\b/gi, depth[open] + 1, open + 1, text.length - 1);
+      return as ? CAST_TYPES[text.slice(as.index + 2, text.length - 1).trim().toLowerCase()] : undefined;
+    }
+    if (!(fn in SELECT_TYPES)) return undefined;
+    if (SELECT_TYPES[fn]) return SELECT_TYPES[fn];
+    if (!args.length) return undefined;
+    averaged = averaged || fn === "avg";
+    text = args[0];
+  }
+  return undefined;
+};
+
+/** The type each top-level select item produces, keyed by the name its column
+ * will carry: its alias, or the column's own name.
+ *
+ * An item this cannot type is left out rather than guessed at, and the caller
+ * falls back to the source column of that name, which is all typing did before
+ * this existed. A type is a hint about an answer the engine already computed, so
+ * an expression nobody anticipated costs the hint and never the answer.
+ */
+export const selectTypes = (code, nameToType) => {
+  const depth = topLevel(code);
+  const select = findAt(code, depth, /\bselect\b/gi, 0);
+  if (!select) return {};
+  const listStart = select.index + select[0].length;
+  const tail = findAt(
+    code,
+    depth,
+    /\b(?:from|where|group|having|qualify|order|limit|offset|union|into)\b/gi,
+    0,
+    listStart,
+  );
+  const out = {};
+  for (const [a, b] of splitAt(code, depth, listStart, tail ? tail.index : code.length, 0)) {
+    // The first `as` written at the item's own depth. The one inside
+    // `cast(x as int)` sits a bracket deeper and is not an alias.
+    const as = findAt(code, depth, /\bas\s+["'`[]?([A-Za-z_][A-Za-z0-9_]*)/gi, 0, a, b);
+    const item = code.slice(a, b).trim();
+    const name = as ? as[1] : item.match(/^(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)$/)?.[1];
+    if (!name) continue;
+    const type = itemType(as ? code.slice(a, as.index) : item, nameToType);
+    if (type) out[name] = type;
+  }
+  return out;
 };
 
 // --- pivot and unpivot
@@ -1642,7 +1795,7 @@ export const register = (alasql) => {
   // this is one function rather than six primitives to compose wrongly.
   fn.haversine_km = (lat1, lon1, lat2, lon2) => {
     const rad = [lat1, lon1, lat2, lon2].map((v, i) => {
-      const n = typeof v === "string" ? Number(v) : v;
+      const n = absent(v) ? null : typeof v === "string" ? Number(v) : v;
       if (typeof n !== "number" || !Number.isFinite(n)) {
         throw fail(
           `haversine_km() argument ${i + 1}`,

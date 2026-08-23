@@ -112,6 +112,23 @@ technologies. It uses a hybrid architecture with:
   dropped, every encrypted DSN unreadable, and — since `TOKEN_SECRET` is the root `hookSecret()` derives every sender's
   signing key from — every webhook delivery refused with a message blaming the sender. A secret-less boot is not a
   recoverable state. `deno task test` sets all three; nothing else does
+- **One identity rule**: `usr_id` is a string in every handler, and the middleware that reads `jwtPayload.sub` is the
+  one place that decides it. A share link is a real token this server mints — it claims a sheet and carries no `sub` —
+  so over HTTP it set `usr_id` to `undefined`, which postgres.js refuses to interpolate: the holder of a link we handed
+  them got a 500, a row in `net-hook:errors` and a point off the 5xx grade, at six separate query sites. It is now a
+  **403** naming the token and not the sheet ("that token opens the sync socket and nothing else"), raised before any
+  route runs — which is what let the `?? null` fallbacks in `sheet()` and `freshness()` go: there is no anonymous caller
+  past that middleware, so a query defending against one is defending against a value that cannot arrive. The **CSV
+  importer** agrees with `checkColumnTypes()` about a blank: only a text column keeps the empty string, and a blank in a
+  `num` or `bool` column is stored as **null** rather than as a zero and an invented `false` — `avg()` over an imported
+  column and over the same column built by hand now answer the same number. And `bound(map, max)` is the one cap on
+  every bounded map, oldest key first out: `rateLimitBuckets`, `hookBuckets`, `logSeen` and the poller's
+  `netDue`/`hostDue` all go through it, and the 60-second broom now also drops a due time already in the past, which is
+  how a deleted sheet or a dead host stops being remembered. Both poller maps hold a _future_ due time, so evicting a
+  live entry re-polls early and loses nothing — that is why the oldest key may go without asking what it was for.
+  `RATE_LIMIT_KEYS_MAX` bounds four maps, two of which are not rate limits; the name stayed rather than mint a second
+  noun.
+
 - **Document types**: table, query, net-hook, net-http, net-socket, portal, alert, chart, codex-*
 - **Seeding**: a lazy-once middleware runs `seed()` (examples.sql + src/examples.mjs datasets) on the first request;
   idempotent via `on conflict (doc_id) do update`. It also grants `OPERATOR_EMAIL` a viewer row on `net-hook:errors`,
@@ -129,6 +146,36 @@ technologies. It uses a hybrid architecture with:
   newest, the same current-secret rule `hookKeys` uses. A failed fetch lands as a row too, shaped by `fetchFailure()`:
   status, the URL actually fetched after redirects, content type, a body snippet, and a `repro` curl line that names the
   header keys the sheet sent but never their values. `/proxy` returns the same shape
+- **Conditional polling and retry**: a poll no longer refetches what it already has. The newest `net` row is where a
+  feed's state lives — the `etag` and `last_modified` the last good body carried, the `cursor` watermark it was fetched
+  at, and how many failures have happened in a row since — because `net.meta` is already the log both the alert de-dupe
+  and `library:freshness` read back, while the automerge document is what sync hands every viewer and what the user
+  edits, so a poller writing to it every tick would fight those edits and mint a change for every open browser. Those
+  validators ride the good rows only and go into the sent headers rather than the sheet's, so `curlFor`'s repro line
+  still fetches a body by hand instead of reproducing a 304. **A 304 appends nothing and is recorded as `status: 200`
+  with `not_modified` beside it**: `POLL_OK` and `library:freshness` both grade `meta->>'status' between 200 and 299`,
+  so the status off the wire would read as a feed that has been failing for 23 hours, and it moves that row's
+  `created_at` the way a quiet alert tick does rather than appending 23 blank rows a day that would push the feed's own
+  data out past `NET_KEEP` — a 304 answering a request that carried no validator is a failure row, since folding it
+  would be inventing one. `cursor` on the sheet names the query parameter a feed takes a since-value in, and the
+  watermark is when the last good poll **started**, so a row written while that request was in flight is asked for twice
+  rather than missed once. A 5xx, a 429 and anything thrown off the wire are the host saying "later" and are retried; an
+  `HTTPException` — the SSRF refusal, a non-HTTP scheme, a redirect loop — and every other 4xx are a "no", and retrying
+  a "no" is noise on top of the failure row that already answered it. `RETRY_MAX` is 3 and the third failure **throws
+  with the counter and the bound in the message**, which lands as the give-up row and hands the sheet back to its own
+  interval; the count is read out of jsonb and guarded like every other read out of jsonb, because a count that is not a
+  whole number lands as `NaN` in the next due time and a sheet due at `NaN` is due on every tick forever. **Every
+  backoff is scheduled and never slept** — `Retry-After` is honoured per **host** (`hostDue`), so both sheets pointed at
+  one API wait rather than taking turns stampeding it, and a sheet deferred that way logs nothing because it never ran;
+  a malformed `Retry-After` is that sheet's failure row naming what it received, not the poller's problem. That, plus
+  `POLL_CYCLE_MS` stopping a cycle from starting further sheets (without advancing their due time, so the next tick
+  takes them) and `safeFetch`'s timeout cut from 30s to 10s, is how one cycle stays inside the 15s tick; the tick itself
+  refuses to start a second cycle while one runs, which covers a database that hangs. `readBody` reads one byte past
+  `NET_BODY_CAP` — the same cap one webhook delivery has, rather than a second number — and a 2xx over it is a failure
+  row naming the cap and the size: the old code truncated at 64 KiB silently, which is a parse error one layer down
+  blamed on the data. Its chunk loop is bounded too, because a host trickling empty chunks is a loop a byte cap cannot
+  end. Failure rows now trim behind themselves like every other write to `net`; a feed that only ever failed used to
+  grow until its first success trimmed it
 - **Webhook ingest**: `POST /net/:id` rejects an unknown sheet (404), a non-net sheet (400), a body carrying a **NUL
   byte** (400, naming the offset — the column is text and Postgres text cannot hold one, so correctly signed bytes used
   to reach the insert and come back as an unexplained 500) and a body over `NET_BODY_CAP` (413), each naming what it
@@ -183,6 +230,29 @@ technologies. It uses a hybrid architecture with:
   `hook`, behind a button, so a secret nobody asked for is never on screen, and `UrlChange` clears it so it cannot
   follow you to another sheet. A decode failure on that answer is reported rather than swallowed — the alternative is a
   button that does nothing and says nothing
+- **Per-sheet delivery budgets**: `NET_BODY_CAP` bounds one delivery and `trimNet` bounds one sheet, but nothing bounded
+  the _sender_ — inside the global limiter's 100 requests a second, one machine churns all `NET_KEEP` rows in ten
+  seconds and every delivery the sheet held before it is gone. `hookBucket()` is a token bucket keyed on the **sheet**,
+  not on `callerIp()`: a webhook sender is one machine that will not rotate its address, and what is being protected is
+  this sheet's row budget rather than this caller's share of the server. Two bounds in one bucket, because they fail
+  differently: `HOOK_ROWS_PER_WINDOW` deliveries and `HOOK_BYTES_PER_WINDOW` bytes per `HOOK_WINDOW_S`, since a count
+  alone lets one 1 MB body a second through and a byte budget alone lets a million empty rows through — one key, one
+  refill, one broom, one thing to bound, and `RATE_LIMIT_KEYS_MAX` and the same 60-second broom that evicts
+  `rateLimitBuckets` bound and sweep it, an idle budget being a full one so dropping it loses nothing. The refusal is
+  **429** and each of the two names its own bound, the window and a retry-in computed from the bucket's own deficit; 429
+  is the one status `app.onError` does not log, so shedding load stays the cheap path and the refusals condition in
+  `GET
+  /status` is not inflated by it. The check sits after the 404 and the 400 and before `verifyDelivery`, the
+  insert and the trim: keyed before the existence check a caller minting ids would mint map keys, and since those two
+  already answer before the signature is checked, a 429 there tells a caller holding a doc_id nothing the 404 did not.
+  It deliberately does **not** run before the body is read — the byte bound must spend the bytes actually sent rather
+  than the `content-length` a flooder declares, and the body is on the wire either way, so refusing sooner saves
+  nothing. The budget is **charged only by a delivery that landed**: a 401 or a 409 spends nothing, because charging
+  every attempt would let one attacker replaying one captured delivery exhaust the budget of the sender the sheet
+  belongs to, which is the opposite of what the budget protects. The cost is that an unsigned flood is shed by
+  `callerIp()`'s global limiter alone and still pays the secret lookup first. The charge re-reads the bucket rather than
+  reusing the one it checked, because the awaits between them span an eviction and charging a bucket the map no longer
+  holds charges nobody
 - **Sheet secrets**: `POST /library/:id/secret` takes `{name, value}` and **inserts**, because writing a secret is
   rotating it: the newest row for a name is current, the one before it still verifies, and everything past `SECRET_KEEP`
   is trimmed behind the write. `GET` answers names and timestamps and **never a value** — a value that can be read back
@@ -375,6 +445,52 @@ t.trade_id order by p.day desc) = 1` —
   non-numeric value in a `num`/`int`/`float`/`usd`/`percentage` column, naming the row, the declared type and the value.
   Without it a `sum()` over a column holding "n/a" was quietly wrong. Query sheets are exempt: their column types are
   the source column's, so `cast(price as string) as price` would trip a check meant for a bad cell
+- **Result types**: a query column used to be typed by its name alone — whatever column of that name some loaded sheet
+  declared, or `text` — so `cast(price as string) as price` still read usd, `count(*) as n` read text, and every sheet
+  downstream inherited the lie. `selectTypes()` in `src/sql.mjs` reads the type off the select item instead, keyed by
+  the name the column will carry, and `SELECT_TYPES` is `WINDOW_TYPES` for the rest of the select list: `null` means
+  "whatever its argument already was", which is what makes `sum(amount_usd)` usd and `round(avg(price), 2)` usd as well.
+  A cast is the one expression whose type is **stated**, and only where AlaSQL performs the cast — `cast(x as text)`,
+  `as bool` and `as json` pass the value through untouched and `cast('2026-01-02' as date)` answers the string
+  `"26.01.01"`, so those targets are absent from `CAST_TYPES` rather than stating a type that would be the same lie in a
+  new place; an average of whole numbers is a `num`, because it is not a whole number. An item it cannot type is **left
+  out** rather than guessed at, so the caller falls back to the source column of that name — a type is a hint about an
+  answer the engine already computed, and a hint must never be the reason a query that ran stops answering, which is
+  also why the pass finds its own closing bracket instead of calling `closeParen()` and never throws before AlaSQL has
+  had its say. `executeSql` snapshots `known` — the columns the referenced sheets actually have — **before** merging the
+  inferred types in, because a name only this query invented is not evidence the sheets hold it: with the alias merged
+  in, `min(code) as lowest` typed itself text and so excused its own empty column, silently retiring the min()-over-text
+  check. The page stamps a referenced query sheet's columns the same way in `src/page.mjs`, without which
+  `describe @query:x` reported every type as `undefined` there and the real one on the server, off the same query. A
+  qualified column is still resolved by its bare name, so two joined sheets with a `region` column of different types
+  collide exactly as they always did; `examples_test.ts` skips an ambiguous name and says so.
+
+- **Result types in the page**: `runSql()` in `src/page.mjs` stamps every column it returns with `selectTypes()` over
+  the columns of the sheets it loaded, so the sheet on screen and a referenced `@query:` are typed in one place rather
+  than two. `src/index.html` used to type the outermost result from the query document's stored `cols` map alone, which
+  left the sheet you are actually editing showing the old lie — `cast(price as string) as price` rendered usd,
+  `count(*) as n` rendered text — while `POST /query` and every downstream sheet reported the truth off the same
+  characters. The stored `cols` are now the **tail**: an item `selectTypes` declines carries no type at all, and the
+  sheet's own declaration is what fills it, which is where a hand-declared `percentage` on a ratio still comes from.
+  That last resort is the one place the two engines still differ — the server ends at `text`, the page at the
+  declaration or nothing — and it cannot be seen in a cell, since `Unknown` and `Text` render a value identically; it
+  shows in the footer's type name. A chart's `y` picks up its source column's type by the same route, which is what
+  `GET /sheet/chart:abc` already answered. Three known gaps, all on the page's side of that last resort: `describe`
+  results carry no type there, the `known` map is table refs only where the server's also carries a referenced query's
+  stamped columns, and `WINDOW_TYPES` is server-only, so a window alias falls to the stored cols.
+
+- **Null, empty and zero**: `checkColumnTypes()` is the one place a cell becomes what its column says it is — a blank
+  becomes `null` and a numeric string becomes its number — because `Number("")` is 0 and AlaSQL computes with the raw
+  JavaScript value: `avg()` over `[1, "", 2, "", 3]` answers 1.2, counting each blank as a reading of zero, and `avg()`
+  over `["1","2","3"]` answers 41, because `+` concatenated them into `"123"` first. A null AlaSQL already treats as
+  absent, which is why null is what a blank becomes. Only a numeric column is touched, so an empty string in a text
+  column is still the empty string and `min_text()` and `array_agg()` still keep it; every other coercion was deleted
+  rather than duplicated — `num()`, `nums()` and `haversine_km()` refused a null and read `""` as zero, and now refuse
+  both through the one `absent()` predicate `winNum()` already used. `NUMERIC_TYPES` is exported because the tests
+  assert what the pass promises and a second copy of the list would drift from the one the check reads. The pass
+  **mutates the rows it is given**, which is what carries the same rule into `POST /sheet/:id`. `total` is an AlaSQL
+  keyword and will not parse as an alias, the way `store` and `class` will not parse as column names
+
 - **Error shape**: `explain(headline, fields)` in `src/sql.mjs` is the one formatter for the aligned
   expected/received/source/fix block
 - **Rate limiting**: `callerIp(c)` is the bucket key, and it reads the **rightmost** `x-forwarded-for` entry — the one
@@ -398,6 +514,29 @@ t.trade_id order by p.day desc) = 1` —
   `POST /library/:id/link` which mints a viewer-scoped JWT. The link rides the sync socket's existing `?auth=`
   parameter, so there is one read path rather than two. `GET /library/:id/hook` (owner-only, net sheets only) is the
   webhook signing secret and a runnable curl line
+- **Share links expire and can be locked**: `POST /library/:id/link` takes `{ days, password }`, both optional, and an
+  **empty body still mints the unlocked 30-day link it always did** — that is the page's own call, and it may not need
+  an edit to keep working. `days` is bounded by `LINK_DAYS_MAX` and `password` by `LINK_PASSWORD_MAX`; anything else is
+  a 400 naming what arrived and the bound, and the password branch prints the value only when it is not a string, so a
+  real password can never be echoed back. The lock is **an HMAC of the password under `TOKEN_SECRET`, not the password
+  and not a hash of it**: nothing new is stored, no schema changes, and because the digest is keyed by a server secret,
+  holding the link buys nobody an offline guess. `linkMessage()` is `link:<sheet_id>:<password>` — the `link:` prefix
+  domain-separates it from `hookSecret()`'s `hook:`, since both derive from the same root and neither may produce the
+  other's output, and the sheet id is inside the message so a password that opens one link does not open a link to
+  another sheet. The reader sends the password as `?pass=` beside the token, which is the only channel a browser
+  WebSocket has. `verifyWsAuth` is **the one place the share claim is read**, so it is the one place the lock is
+  enforced — a link gated on the socket and open anywhere else is worse than no gate. It refuses rather than quietly
+  downgrading to no access, so the reader is told which check failed instead of watching a sheet never load, and the
+  comparison is `hookVerify` (`crypto.subtle.verify`) so no digest equality is written by hand. Neither refusal prints
+  the password or the digest: the digest is what an offline guesser would grind against, the same oracle rule the
+  delivery refusals in `POST /net/:id` follow. The refusal lands in the handshake, before any frame exists to carry it,
+  so it is an ordinary HTTP 401 — which a browser cannot read, so **the page must ask for the password and append
+  `&pass=` itself**; until it does, a locked link reads as a socket that will not connect. All four share routes now
+  `.catch(() => ({}))` on `c.req.json()`, the shape `POST /library/:id/secret` already used: unguarded, a missing or
+  unparseable body was an unexplained 500, a row in `net-hook:errors` and a point off the 5xx grade for a mistake the
+  caller could have fixed from the message. `DELETE /library/:id/share` validated nothing at all, so a missing email
+  reached the delete and came back as "undefined is not a non-owner member of this sheet" — a sentence about the sheet
+  for a mistake in the request
 - **Marketplace checkout**: `POST /buy/:id` fulfills `$0` listings immediately. A positive `sell_price` creates a Stripe
   Checkout Session (`STRIPE_SECRET_KEY`) and returns `{ checkout_url }`. `POST /stripe` verifies `stripe-signature`
   (`STRIPE_WEBHOOK_SECRET`) and fulfills `checkout.session.completed` with `payment_status=paid`. Checkout is card-only.
@@ -421,6 +560,30 @@ t.trade_id order by p.day desc) = 1` —
   asks for 100000 rows so a net or query sheet is not truncated at the default 50. The name-keyed formats (`json`,
   `ndjson`) refuse a sheet with two columns of the same name rather than overwrite one; `ics` needs a
   `date`/`timestamp`/`create` column and says so when there is none
+- **Sheet as an API**: `POST /sheet/:id` is the write half of the stable read, and it takes rows keyed by **column
+  name** — the header a CSV carries, and the shape `checkColumnTypes()` reads — storing them keyed by column key, so a
+  value this route accepts can never be one a query then refuses. It is **all-or-nothing**: every row is checked before
+  the document is touched and the append is one `handle.change`, because automerge cannot roll a change back and a batch
+  half-written under a 201 is a silent failure. Only a `table` sheet has rows of its own, so a query, chart or net sheet
+  is refused by name rather than with a 500; write access is read through `syncRole` and not `assertSheetAccess`, so a
+  viewer holding a share link — or anyone at all on a public sheet — can read it and cannot append. A short or long row
+  names both counts, the field it stops at and the row as sent, exactly as `POST /import/csv` does, and a non-scalar
+  value is refused because a cell holds a scalar. A script carries a **per-sheet key** rather than a user's JWT:
+  `POST
+  /library/:id/secret` with `{"name":"api"}` and no value mints `sheet_id.<32 random bytes>`, sealed with the
+  same `encrypt` every other sheet secret uses, so rotation, `SECRET_KEEP` trimming, names-without-values and revocation
+  all come from the routes that already existed rather than from a second store. The value is **minted, never supplied**
+  — a key the owner chose is a key the owner reused elsewhere — and `api:*` is refused where it is typed, the same rule
+  as an unknown `hook:*`. The sheet id rides inside the key so verifying reads at most `SECRET_KEEP` rows of one sheet,
+  and the comparison is `crypto.subtle.verify`'s, so no key equality is written by hand; the four refusals name what
+  arrived without printing a key, a digest, or how close it was. **The scope is a path check in the auth middleware,
+  before routing**: a key opens `/sheet/<its id>` and `/openapi/<its id>` and nothing else, which is what stops a key
+  minting itself another key, and is why no handler has to remember to ask. The identity it borrows is the sheet's
+  creator, because the path is the bound, not the account. With no `scrapsheets-key` header the request takes
+  byte-identically the path it always did. `GET /openapi/:id` is that key's target: an OpenAPI 3.1 document derived from
+  the sheet's own columns at request time and **never stored**, read through `sheet()` so its access rule is the sheet's
+  own, describing this one sheet's read, its write — omitted for a computed sheet, whose POST would be a 400 — and the
+  header the key is presented in
 - **CSV import**: `POST /import/csv` rejects a row whose field count does not match the header, naming the line, both
   counts, the raw text and the column it stops at. Type inference requires every non-blank value to parse: at the old
   80% threshold the other fifth became `NaN` silently
@@ -466,6 +629,28 @@ t.trade_id order by p.day desc) = 1` —
   `page_test.ts` drive the whole thing with neither
 - **UI chrome**: keyboard shortcut sheet (Ctrl/⌘+/ or "?"), library sparkline thumbnails (computed JS-side into
   localStorage entries), five-step first-run tutorial (localStorage `scrapsheets-tutorial`, -1 = dismissed)
+- **Feed health on the library, and a command palette**: `library:freshness` is read by `src/index.html` over
+  `GET
+  /library/freshness?limit=1000` and handed to Elm through the `freshnessLoaded` port — not by Elm's own `Http`,
+  for the reason sharing is not: the JWT lives in that file. A limit above the default page of 50, because a truncated
+  answer would report a rotten feed as a sheet with no freshness at all. No token means no request and no answer, which
+  is why `libraryCols` grows its `freshness` column **only when `model.freshness` is non-empty**: a blank column over
+  every row of a logged-out library reads as "nothing is wrong", which is the one claim this column exists to stop the
+  page making. Within an answer the same rule holds per row — `freshnessCell` renders nothing for a sheet the read does
+  not cover, `"never run"` for one that never has (the failure both of that query's lateral joins exist to surface), and
+  `last run · N failed` when it is failing — because "never polled" and "polled and fine" are different facts and a zero
+  would state the second about the first. A decode failure is reported into `model.error` rather than shown as an empty
+  column, since a renamed field would otherwise wear the face of a healthy library. A refresh every 60 seconds, because
+  the whole point is not waiting for the 15-minute status email. The gallery strip marks a failing sheet where a demo is
+  opened from, keyed on the sheet's own freshness rather than its type, so it needs no edit when connection health joins
+  that read. **The command palette** (Ctrl/⌘+K, which the shortcut sheet did not already claim) is a second door onto
+  what exists, not a new set of commands: `shortcutGroups` gained a third field carrying the `Msg` each key runs, and
+  `paletteCommands` reads that list rather than keeping a copy beside it — two hand-written lists drift, and the one
+  that drifts is the one nobody opens. `Nothing` there is a key that only means something against a selection, which no
+  palette row can supply; the palette lists itself and is not runnable, because it is already open. It matches sheets on
+  name **and** id (the id is what you remember of a net sheet), is bounded at twelve rows so a big library is narrowed
+  by typing rather than scrolled, and `PaletteRun` takes the index so Enter and a click are one message. `Goto Id` is
+  the one new navigation message, and the library's Enter key now uses it instead of inlining `Nav.pushUrl`
 - **Real-time sync**: Ports for Automerge integration
 - **UI**: Table-based interface with cell editing, selection, and statistics
 - **No runtime CDN**: every asset the page loads is served by us. `deno task vendor` uses esbuild to inline each

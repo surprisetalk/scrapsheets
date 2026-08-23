@@ -13,13 +13,21 @@ import {
   createJwt,
   createToken,
   flushFolds,
+  HOOK_BYTES_PER_WINDOW,
+  HOOK_ROWS_PER_WINDOW,
+  HOOK_WINDOW_S,
+  hookBucket,
+  hookBuckets,
   hookSecret,
   hookSign,
+  hostDue,
   LOG_EVERY_MS,
   NET_KEEP,
+  netDue,
   parseNetHeaders,
   pollAlertOnce,
   pollNetOnce,
+  RATE_LIMIT_KEYS_MAX,
   requireSecret,
   seed,
   sendDigestOnce,
@@ -1689,6 +1697,49 @@ Deno.test(async function allTests(_t) {
     const [cols_, ...rows] = await get<Table>(jwt, `/sheet/${sheet_id}`);
     assertEquals(Object.values(cols_)[0].type, "text");
     assertEquals(rows.map((r) => r["0"]), ["1", "2", "3", "4", "n/a"]);
+
+    // A blank is not a zero and it is not a false. The importer stored "" in a
+    // num column and an invented false in a bool one, so a file of two readings
+    // and one gap became three readings, and the false was a value the file
+    // never contained. checkColumnTypes() is the one place a blank turns into a
+    // null; an importer that disagrees with it makes the stored document and
+    // the query answer two different questions about the same file.
+    const gaps = await importCsv("qty,ok\n1,true\n,\n3,false\n");
+    const gapBody = await gaps.text();
+    assert(gaps.ok, `blanks are not a rejection: ${gapBody}`);
+    const { sheet_id: gapId } = JSON.parse(gapBody);
+    const [gapCols, ...gapRows] = await get<Table>(jwt, `/sheet/${gapId}`);
+    assertEquals(Object.values(gapCols).map((col) => col.type), ["num", "bool"]);
+    assertEquals(gapRows.map((r) => r["0"]), [1, null, 3]);
+    assertEquals(gapRows.map((r) => r["1"]), [true, null, false]);
+
+    // And the arithmetic over it is the arithmetic over a sheet built by hand.
+    // sum() and avg() are where a blank read as a zero actually shows: avg over
+    // [1, "", 3] answered 1.333, a reading nobody took.
+    const byHand = automerge.create<{ data: Sheet["data"] }>({
+      data: [
+        arrayify([{ name: "qty", type: "num", key: 0 }, { name: "ok", type: "bool", key: 1 }]),
+        { 0: 1, 1: true },
+        { 0: null, 1: null },
+        { 0: 3, 1: false },
+      ],
+    });
+    await put(jwt, `/library/table:${byHand.documentId}`, {});
+    const arithmetic = async (id: string) => {
+      const res = await app.request("/query", {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        body: JSON.stringify({
+          lang: "sql",
+          code: `select sum(qty) as sum_qty, avg(qty) as avg_qty, count(qty) as n_qty from @${id}`,
+        }),
+      });
+      const said = await res.text();
+      assert(res.ok, `arithmetic over @${id}: ${res.status} ${said}`);
+      return (JSON.parse(said).data as Table)[1];
+    };
+    assertEquals(await arithmetic(gapId), await arithmetic(`table:${byHand.documentId}`));
+    assertEquals(Number((await arithmetic(gapId)).avg_qty), 2, "the gap is not a reading of zero");
   }
 
   // A webhook sender only ever sees the response body, so the body diagnoses.
@@ -1815,6 +1866,163 @@ Deno.test(async function allTests(_t) {
         body: JSON.stringify({ lang: "sql", code: `select * from @${mineId}`, args: [] }),
       });
       assertEquals(res.status, 403, `a stranger's query should be refused as access, got: ${await res.text()}`);
+    }
+  }
+
+  // A query result carries its types forward. A result column used to be typed
+  // by its name alone -- whatever column of that name some loaded sheet
+  // declared, or text -- so `cast(price as string) as price` still read usd,
+  // `count(*) as n` read text, and every sheet downstream of that query
+  // inherited the lie. The type is a property of the select item, so it is read
+  // off the select item, in src/sql.mjs where both engines read it.
+  {
+    const { jwt } = await usr("tessa@example.com");
+    const hand = automerge.create<{ data: Sheet["data"] }>({
+      data: [
+        arrayify([
+          { name: "label", type: "text", key: 0 },
+          { name: "qty", type: "int", key: 1 },
+          { name: "price", type: "usd", key: 2 },
+        ]),
+        { 0: "widget", 1: 2, 2: 10 },
+        { 0: "gasket", 1: 3, 2: 4 },
+      ],
+    });
+    const id = `table:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+    const typesOf = async (code: string) => {
+      const { data: [cols_] }: { data: Table } = await post(jwt, `/query`, { lang: "sql", code, args: [] });
+      return Object.fromEntries(Object.values(cols_).map((col) => [col.name, col.type]));
+    };
+
+    // A bare column, a qualified one and an alias each keep the source type. A
+    // cast is the one expression whose type is stated rather than inferred.
+    assertEquals(
+      await typesOf(
+        `select label, t.price, qty as units, cast(price as string) as price_text, 'each' as sold_by, 7 as seven from @${id} t`,
+      ),
+      { label: "text", price: "usd", units: "int", price_text: "text", sold_by: "text", seven: "num" },
+    );
+    // ...and the value really is text, which is the half a type alone cannot say.
+    {
+      const { data: [, row] }: { data: Table } = await post(jwt, `/query`, {
+        lang: "sql",
+        code: `select cast(price as string) as price_text from @${id} order by price_text`,
+        args: [],
+      });
+      assertEquals(row.price_text, "10");
+    }
+
+    // An aggregate is typed by what it aggregates: count is a count, sum and
+    // min keep their argument's type, min_text compares as text, and an average
+    // of whole numbers is not a whole number. The sum is `takings` because
+    // `total` is an AlaSQL keyword and will not parse as an alias, the way
+    // `store` and `class` will not parse as column names.
+    assertEquals(
+      await typesOf(
+        `select count(*) as n, sum(price) as takings, avg(qty) as mean, avg(price) as spend, min_text(label) as lo, round(avg(price), 2) as typical from @${id}`,
+      ),
+      { n: "int", takings: "usd", mean: "num", spend: "usd", lo: "text", typical: "usd" },
+    );
+
+    // An expression the table cannot type falls back to what typing did before
+    // this existed -- the source column of that name, or text -- because a type
+    // is a hint about an answer the engine already computed, and a hint must
+    // never be the reason a query that ran stops answering.
+    assertEquals(
+      await typesOf(`select qty * price as gross, case when qty > 2 then price else 0 end as price from @${id}`),
+      { gross: "text", price: "usd" },
+    );
+
+    // The point of all of it: the sheet downstream reads the corrected type.
+    {
+      const q = automerge.create<Sheet>({
+        type: "query",
+        data: [{
+          lang: "sql",
+          code: `select count(*) as n, cast(price as string) as price_text from @${id} group by price`,
+          args: [],
+        }],
+      });
+      await put(jwt, `/library/query:${q.documentId}`, {});
+      assertEquals(await typesOf(`select n, price_text from @query:${q.documentId}`), {
+        n: "int",
+        price_text: "text",
+      });
+    }
+  }
+
+  // Null, empty and zero stay different. Number("") is 0, so a blank cell in a
+  // numeric column summed, averaged and plotted as a reading of zero rather
+  // than as a reading nobody took: AlaSQL skips a null and counts a "", and its
+  // avg() over ["1","2","3"] answers 41 because "+" concatenated them first.
+  // checkColumnTypes() is now the one place a cell becomes what its column says
+  // it is, and it is the only coercion there is.
+  {
+    const { jwt } = await usr("nils@example.com");
+    const hand = automerge.create<{ data: Sheet["data"] }>({
+      data: [
+        arrayify([{ name: "site", type: "text", key: 0 }, { name: "reading", type: "num", key: 1 }]),
+        { 0: "a", 1: 2 },
+        { 0: "b", 1: "" },
+        { 0: "c", 1: 4 },
+        { 0: "d", 1: null },
+        { 0: "e", 1: 6 },
+        { 0: "f", 1: "  " },
+        { 0: "", 1: 8 },
+        { 0: "h", 1: "10" },
+      ],
+    });
+    const id = `table:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+    const one = async (code: string) => {
+      const { data: [, row] }: { data: Table } = await post(jwt, `/query`, { lang: "sql", code, args: [] });
+      return row;
+    };
+
+    // Five readings and three blanks: the sum adds five values and the average
+    // divides by five. It used to divide by eight.
+    assertEquals(
+      await one(
+        `select sum(reading) as takings, avg(reading) as mean, count(reading) as taken, count(*) as rows_ from @${id}`,
+      ),
+      { takings: 30, mean: 6, taken: 5, rows_: 8 },
+    );
+    // A numeric string is that number, not the string that concatenates: avg()
+    // over ["1","2","3"] answers 41 without this.
+    assertEquals((await one(`select max(reading) as high from @${id}`)).high, 10);
+
+    // A blank is a legitimate null, not the rejection a "n/a" earns...
+    assertEquals(
+      (await one(`select count(*) as blanks from @${id} where reading is null`)).blanks,
+      3,
+    );
+    // ...and an empty string in a text column is still an empty string. Only a
+    // numeric column is touched, which is what keeps the three apart.
+    assertEquals((await one(`select count(*) as unnamed from @${id} where site = ''`)).unnamed, 1);
+
+    // A missing reading must not plot as zero. The chart reads the same rows
+    // through the same load, so a blank arrives as null and the page drops it.
+    {
+      const chart = automerge.create<{ data: [{ source: string; kind: string; x: string; y: string }] }>({
+        data: [{ source: `@${id}`, kind: "line", x: "site", y: "reading" }],
+      });
+      await put(jwt, `/library/chart:${chart.documentId}`, { name: "readings" });
+      const [, ...points] = await get<Table>(jwt, `/sheet/chart:${chart.documentId}`);
+      assertEquals(points.map((row) => row.y), [8, 2, null, 4, null, 6, null, 10]);
+    }
+
+    // A blank that reaches a function is refused by name rather than read as a
+    // zero, which is what silently pulled a median and a mad toward it.
+    {
+      const res = await app.request(`/query`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        body: JSON.stringify({ lang: "sql", code: `select mad(array(reading)) as m from @${id}`, args: [] }),
+      });
+      assertEquals(res.status, 400);
+      const said = await res.text();
+      assert(said.includes("filter the blanks out"), said);
     }
   }
 
@@ -1996,6 +2204,300 @@ Deno.test(async function allTests(_t) {
     assertThrows(() => parseNetHeaders("Authorization Bearer xyz"), Error, "Authorization Bearer xyz");
   }
 
+  // A feed that has not changed is not downloaded again. The validators ride
+  // the last good row, so what this sheet already holds is answered by the log
+  // itself. A 304 is a healthy poll that appends nothing: graded as the 304 it
+  // is on the wire, a daily file polled hourly would read to /status and to
+  // library:freshness as a feed that has been failing for 23 hours.
+  {
+    const { jwt } = await usr("ivy@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://etag.test/feed", interval: 120 }],
+    });
+    const id = `net-http:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+    const stamp = "Wed, 21 Oct 2026 07:28:00 GMT";
+    const calls: Record<string, string>[] = [];
+    let answer = () => new Response(`{"n":1}`, { headers: { etag: `"v1"`, "last-modified": stamp } });
+    const fetcher = (url: string, headers: Record<string, string> = {}) => {
+      if (url !== "https://etag.test/feed") return Promise.resolve(new Response(`{"ok":true}`));
+      calls.push(headers);
+      return Promise.resolve(answer());
+    };
+    const rows = async () => (await get<Table>(jwt, `/net/${id}`)).slice(1);
+    const t = Date.now() + 10_000_000;
+
+    await pollNetOnce(fetcher, t);
+    assertEquals(calls.length, 1);
+    assert(!("If-None-Match" in calls[0]), "the first poll has nothing to ask about");
+    assertEquals((await rows()).length, 1);
+
+    answer = () => new Response(null, { status: 304 });
+    await pollNetOnce(fetcher, t + 121_000);
+    assertEquals(calls[1]["If-None-Match"], `"v1"`, "the second poll sends back what the first was given");
+    assertEquals(calls[1]["If-Modified-Since"], stamp);
+    assertEquals((await rows()).length, 1, "a 304 appends nothing: the row already here is the answer");
+    const [{ meta }]: { meta: { status: number; not_modified: boolean; etag: string } }[] = await sql`
+      select meta from net where sheet_id = ${id}
+    `;
+    assertEquals(meta.status, 200, "and grades as the healthy poll it is, because POLL_OK reads 2xx");
+    assertEquals(meta.not_modified, true, "with the status off the wire kept beside it");
+    assertEquals(meta.etag, `"v1"`, "and the validator still there for the poll after that");
+
+    // A 304 to a request that carried no validator is a host answering a
+    // question nobody asked. Folding it onto a row would be inventing one.
+    const odd = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://etag.test/odd", interval: 120 }],
+    });
+    const oddId = `net-http:${odd.documentId}`;
+    await put(jwt, `/library/${oddId}`, {});
+    await pollNetOnce(
+      (url: string) =>
+        Promise.resolve(url === "https://etag.test/odd" ? new Response(null, { status: 304 }) : new Response(`{}`)),
+      t + 300_000,
+    );
+    const [oddRow] = (await get<Table>(jwt, `/net/${oddId}`)).slice(1);
+    assert(JSON.parse(String(oddRow.body)).error.includes("carried no validator"), String(oddRow.body));
+  }
+
+  // A flaky source recovers by itself and a broken one says so. A 5xx is the
+  // host saying "later" and is retried on a backoff; a 404 is a "no", and
+  // retrying it is noise on top of the failure row that already answered.
+  // Every retry is scheduled and never slept, which is what keeps one cycle
+  // short enough that it cannot still be running when the next tick starts.
+  {
+    const { jwt } = await usr("ivy@example.com");
+    const flaky = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://flaky.test/feed", interval: 600 }],
+    });
+    const gone = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://gone.test/feed", interval: 600 }],
+    });
+    const dead = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://dead.test/feed", interval: 600 }],
+    });
+    const [flakyId, goneId, deadId] = [flaky, gone, dead].map((h) => `net-http:${h.documentId}`);
+    for (const id of [flakyId, goneId, deadId]) await put(jwt, `/library/${id}`, {});
+    const hits: string[] = [];
+    let broken = true;
+    const fetcher = (url: string) => {
+      hits.push(url);
+      if (url === "https://flaky.test/feed")
+        return Promise.resolve(broken ? new Response("upstream is down", { status: 503 }) : new Response(`{"n":2}`));
+      if (url === "https://gone.test/feed") return Promise.resolve(new Response("no such feed", { status: 404 }));
+      if (url === "https://dead.test/feed") return Promise.resolve(new Response("still down", { status: 500 }));
+      return Promise.resolve(new Response(`{"ok":true}`));
+    };
+    const bodies = async (id: string) =>
+      (await get<Table>(jwt, `/net/${id}`)).slice(1).map((r) => JSON.parse(String(r.body)));
+    const times = (host: string) => hits.filter((u) => u.includes(host)).length;
+    const t = Date.now() + 20_000_000;
+
+    await pollNetOnce(fetcher, t);
+    assertEquals((await bodies(flakyId))[0].attempt, 1, "the first transient failure counts itself");
+    await pollNetOnce(fetcher, t + 10_000);
+    assertEquals(times("flaky"), 1, "and the backoff has not elapsed, so nothing is refetched");
+    broken = false;
+    await pollNetOnce(fetcher, t + 31_000);
+    assertEquals((await bodies(flakyId))[0].n, 2, "the poll after the backoff just works");
+
+    // A 404 answers the same to every retry, and the sheet's own interval is
+    // 600s, so a poll 31 seconds later must not touch it again.
+    assertEquals(times("gone"), 1, "a permanent failure is not retried");
+    assertEquals((await bodies(goneId)).length, 1, "and lands as exactly one failure row");
+    assert((await bodies(goneId))[0].error.includes("404"), "naming what it received");
+
+    // The bound. Three failures in a row is a crash carrying the counter, not a
+    // fourth attempt: an unbounded retry on a host that is down all day is the
+    // poller spending every tick on one sheet.
+    assertEquals((await bodies(deadId)).map((b) => b.attempt), [2, 1], "two attempts so far, newest first");
+    await pollNetOnce(fetcher, t + 92_000);
+    const gaveUp = (await bodies(deadId))[0];
+    assert(gaveUp.error.includes("failed 3 polls in a row"), gaveUp.error);
+    assert(gaveUp.error.includes("within 3 attempts"), gaveUp.error);
+    assertEquals(gaveUp.attempt, undefined, "giving up ends the count rather than continuing it");
+    await pollNetOnce(fetcher, t + 150_000);
+    assertEquals(times("dead"), 3, "and the sheet waits its own interval rather than backing off again");
+  }
+
+  // Retry-After is the host's answer and not one sheet's. Without that, two
+  // sheets pointed at one API take turns stampeding the host that just asked
+  // them to stop.
+  {
+    const { jwt } = await usr("ivy@example.com");
+    const [one, two] = ["a", "b"].map((path) =>
+      automerge.create<Sheet>({
+        type: "net-http",
+        data: [{ url: `https://stampede.test/${path}`, interval: 600 }],
+      })
+    );
+    const [oneId, twoId] = [one, two].map((h) => `net-http:${h.documentId}`);
+    await put(jwt, `/library/${oneId}`, {});
+    const hits: string[] = [];
+    let busy = true;
+    const fetcher = (url: string) => {
+      if (!url.includes("stampede.test")) return Promise.resolve(new Response(`{"ok":true}`));
+      hits.push(url);
+      return Promise.resolve(
+        busy ? new Response("slow down", { status: 429, headers: { "retry-after": "120" } }) : new Response(`{}`),
+      );
+    };
+    const t = Date.now() + 30_000_000;
+    await pollNetOnce(fetcher, t);
+    assertEquals(hits.length, 1);
+
+    // Registered after that answer, so the hold is already in place the first
+    // time this sheet comes due -- which is what makes the assertion about the
+    // host and not about which sheet the poller happened to reach first.
+    await put(jwt, `/library/${twoId}`, {});
+    await pollNetOnce(fetcher, t + 1_000);
+    assertEquals(hits.length, 1, "the second sheet waits out what the first was told");
+    assertEquals((await get<Table>(jwt, `/net/${twoId}`)).slice(1).length, 0, "and logs nothing: it never ran");
+    busy = false;
+    await pollNetOnce(fetcher, t + 121_000);
+    assertEquals(hits.length, 3, "and both go once the host's own wait is over");
+
+    // A Retry-After neither side can read is this sheet's failure row naming
+    // what it received. The poller keeps every other sheet.
+    const cranky = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://cranky.test/feed", interval: 600 }],
+    });
+    const crankyId = `net-http:${cranky.documentId}`;
+    await put(jwt, `/library/${crankyId}`, {});
+    await pollNetOnce(
+      (url: string) =>
+        Promise.resolve(
+          url === "https://cranky.test/feed"
+            ? new Response("later", { status: 503, headers: { "retry-after": "soon" } })
+            : new Response(`{}`),
+        ),
+      t + 200_000,
+    );
+    const [row] = (await get<Table>(jwt, `/net/${crankyId}`)).slice(1);
+    const failure = JSON.parse(String(row.body));
+    assert(failure.error.includes("cannot be read"), failure.error);
+    assert(failure.error.includes("soon"), "naming what it received");
+    assertEquals(failure.attempt, undefined, "a header nobody can read is not a retry");
+  }
+
+  // A body over the cap is a failure row naming both numbers. A truncated
+  // success is the same bug one layer down: a parse error blamed on the data.
+  {
+    const { jwt } = await usr("ivy@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://huge.test/feed", interval: 600 }],
+    });
+    const id = `net-http:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+    await pollNetOnce(
+      (url: string) =>
+        Promise.resolve(url === "https://huge.test/feed" ? new Response("x".repeat(2_000_000)) : new Response(`{}`)),
+      Date.now() + 40_000_000,
+    );
+    const [row] = (await get<Table>(jwt, `/net/${id}`)).slice(1);
+    const failure = JSON.parse(String(row.body));
+    assert(failure.error.includes("too large to store"), failure.error);
+    // Both numbers, and the size is what it actually read past the cap: no
+    // content-length declared one, and reading the rest of a runaway response
+    // is the cost the cap exists to refuse.
+    const size = Number(failure.error.match(/at least (\d+) bytes/)?.[1]);
+    const cap = Number(failure.error.match(/(\d+) bytes per response/)?.[1]);
+    assert(size > cap, `the size must name what it read past the cap it names: ${failure.error}`);
+    assert(!String(row.body).startsWith("xxx"), "and the payload is refused, not truncated into the log");
+  }
+
+  // A since-last-run cursor. The watermark is when the last good poll started
+  // rather than when it finished, so a row written while that request was in
+  // flight is asked for twice rather than missed once. It lives in net.meta
+  // beside the run that set it: the automerge document is what sync hands every
+  // viewer and what the user edits, and a poller writing to it every tick would
+  // fight those edits and mint a change for every open browser.
+  {
+    const { jwt } = await usr("ivy@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://cursor.test/feed?kind=orders", interval: 120, cursor: "since" }],
+    });
+    const id = `net-http:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+    const seen: string[] = [];
+    const fetcher = (url: string) => {
+      if (url.includes("cursor.test")) seen.push(url);
+      return Promise.resolve(new Response(`{"n":1}`));
+    };
+    const t = Date.now() + 50_000_000;
+    await pollNetOnce(fetcher, t);
+    assertEquals(seen[0], "https://cursor.test/feed?kind=orders", "the first poll asks for everything");
+    await pollNetOnce(fetcher, t + 121_000);
+    assertEquals(
+      new URL(seen[1]).searchParams.get("since"),
+      new Date(t).toISOString(),
+      "the next asks for what came after the last good poll",
+    );
+    assertEquals(new URL(seen[1]).searchParams.get("kind"), "orders", "without losing what the URL already carried");
+
+    const bad = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://cursor.test/bad", interval: 600, cursor: "since=1&sneaky" }],
+    });
+    const badId = `net-http:${bad.documentId}`;
+    await put(jwt, `/library/${badId}`, {});
+    await pollNetOnce(fetcher, t + 300_000);
+    const [row] = (await get<Table>(jwt, `/net/${badId}`)).slice(1);
+    assert(JSON.parse(String(row.body)).error.includes("query parameter"), String(row.body));
+  }
+
+  // The poller's two maps grow with traffic and nothing ever took anything out
+  // of them: one entry per net-http sheet that ever polled and one per host that
+  // ever answered, sheets long since deleted included. Every other map keyed on
+  // something traffic varies -- rate-limit buckets, delivery budgets, the error
+  // log's fold counts -- is capped by insertion order and swept by the same
+  // broom; these two were the exception. Both hold a future due time, so an
+  // evicted entry costs one early poll and no data, which is why the oldest key
+  // may go without asking what it was for.
+  {
+    const { jwt } = await usr("ivy@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://crowded.test/feed", interval: 600 }],
+    });
+    const id = `net-http:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+    // Further ahead than any real due time, so the ghosts are never polled and
+    // the broom would not sweep them either: only the cap can take them out.
+    const far = Number.MAX_SAFE_INTEGER;
+    for (let i = 0; i < RATE_LIMIT_KEYS_MAX + 5; i++) {
+      netDue.set(`net-http:ghost-${i}`, far);
+      hostDue.set(`ghost-${i}.test`, far);
+    }
+    const t = Date.now() + 60_000_000;
+    await pollNetOnce(
+      (url: string) =>
+        Promise.resolve(
+          url === "https://crowded.test/feed"
+            ? new Response("slow down", { status: 429, headers: { "retry-after": "120" } })
+            : new Response(`{}`),
+        ),
+      t,
+    );
+    assertEquals(netDue.size, RATE_LIMIT_KEYS_MAX, "the due-time map settles at its bound");
+    assertEquals(hostDue.size, RATE_LIMIT_KEYS_MAX, "and so does the per-host holdoff");
+    assert(netDue.has(id), "the sheet that just polled keeps its due time");
+    assert(hostDue.has("crowded.test"), "and the host that just asked to wait keeps its holdoff");
+    assert(!netDue.has("net-http:ghost-0"), "what goes is the oldest key, not the newest");
+    assert(!hostDue.has("ghost-0.test"), "on both maps, by the one rule");
+    // Nothing after this polls, and 10,000 ghosts are not this suite's state.
+    netDue.clear();
+    hostDue.clear();
+  }
+
   // MCP server: JSON-RPC 2.0 over POST /mcp/:id.
   {
     const { jwt } = await usr("mia@example.com");
@@ -2112,6 +2614,262 @@ Deno.test(async function allTests(_t) {
       assertEquals(got.status, 405);
       const unauthed = await mcp("", { jsonrpc: "2.0", id: 1, method: "ping" });
       assertEquals(unauthed.status, 401);
+    }
+  }
+
+  // A sheet takes rows over its own API. The boundary is the whole feature: a
+  // row that does not match the columns, or a value that does not parse at its
+  // declared type, has to be refused naming what arrived -- and refused with the
+  // sheet exactly as it was, because a half-written batch under a 201 is the
+  // silent failure this endpoint exists without.
+  {
+    const { jwt } = await usr("nina@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "table",
+      data: [
+        arrayify([{ name: "item", type: "text", key: "0" }, { name: "qty", type: "int", key: "1" }]),
+        { 0: "apple", 1: 3 },
+      ],
+    });
+    const sheet_id = `table:${hand.documentId}`;
+    await put(jwt, `/library/${sheet_id}`, {});
+
+    // Appended rows are the same rows the stable read and the query engine see.
+    {
+      const { data } = await post(jwt, `/sheet/${sheet_id}`, {
+        rows: [{ item: "banana", qty: 2 }, { item: "cherry", qty: 5 }],
+      });
+      assertEquals(data, { appended: 2, rows: 3 });
+      const read = await get<Table>(jwt, `/sheet/${sheet_id}`);
+      assertEquals(read.slice(1), [{ 0: "apple", 1: 3 }, { 0: "banana", 1: 2 }, { 0: "cherry", 1: 5 }]);
+      const { data: [, ...rows] }: { data: Table } = await post(jwt, `/query`, {
+        lang: "sql",
+        code: `select sum(qty) as n from @${sheet_id}`,
+        args: [],
+      });
+      assertEquals(rows, [{ n: 10 }]);
+    }
+
+    const refused = async (body: unknown, id = sheet_id, auth = jwt) => {
+      const res = await app.request(`/sheet/${id}`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${auth}` }),
+        body: JSON.stringify(body),
+      });
+      assert(400 <= res.status && res.status < 500, `Expected a 4xx, received ${res.status}`);
+      return { status: res.status, text: await res.text() };
+    };
+
+    // A sheet with no column row of its own is refused by name, not with a 500:
+    // a query computes its rows, so appending to one is writing into an answer.
+    {
+      const q = automerge.create<Sheet>({
+        type: "query",
+        data: [{ lang: "sql", code: `select 1 as n`, args: [] }],
+      });
+      await put(jwt, `/library/query:${q.documentId}`, {});
+      const { text } = await refused({ rows: [{ n: 1 }] }, `query:${q.documentId}`);
+      assert(text.includes("a query sheet") && text.includes("table sheet"), text);
+    }
+
+    // Wrong field count, both directions, naming both counts and the row as sent.
+    {
+      const short = await refused({ rows: [{ item: "date" }] });
+      assert(short.text.includes("2 fields: item, qty"), short.text);
+      assert(short.text.includes(`nothing for "qty"`), short.text);
+      assert(short.text.includes(`{"item":"date"}`), short.text);
+      const long = await refused({ rows: [{ item: "date", qty: 1, colour: "brown" }] });
+      assert(long.text.includes(`an extra field "colour"`), long.text);
+    }
+
+    // Wrong value type, named by row, by declared type and by value -- the same
+    // check every table sheet meets on the way into a query, so nothing this
+    // route accepts can be something a query then refuses.
+    {
+      const { text } = await refused({ rows: [{ item: "date", qty: "lots" }] });
+      assert(text.includes("qty") && text.includes("int") && text.includes(`"lots"`), text);
+      // A cell holds a scalar, so an object is refused rather than stored as one.
+      const nested = await refused({ rows: [{ item: { en: "date" }, qty: 1 }] });
+      assert(nested.text.includes("no cell can hold"), nested.text);
+      const empty = await refused({ rows: [] });
+      assert(empty.text.includes("empty rows array"), empty.text);
+    }
+
+    // No access at all, and read access that is not write access.
+    {
+      const stranger = await usr("pablo@example.com");
+      const denied = await refused({ rows: [{ item: "date", qty: 1 }] }, sheet_id, stranger.jwt);
+      assertEquals(denied.status, 403);
+      assert(denied.text.includes("no role on this sheet"), denied.text);
+      const looker = await usr("ulla@example.com");
+      await post(jwt, `/library/${sheet_id}/share`, { email: "ulla@example.com", role: "viewer" });
+      const viewer = await refused({ rows: [{ item: "date", qty: 1 }] }, sheet_id, looker.jwt);
+      assert(viewer.text.includes("your role on this sheet is viewer"), viewer.text);
+    }
+
+    // Every refusal above left the sheet where it was.
+    assertEquals((await get<Table>(jwt, `/sheet/${sheet_id}`)).length, 4);
+  }
+
+  // A script carries a key for one sheet rather than a person's JWT. Minting one
+  // is rotating it, so the key before it still opens the sheet and the one
+  // before that is retired; and a key that could reach a second sheet, or mint
+  // itself another, would be a JWT with extra steps -- which is the whole reason
+  // this exists.
+  {
+    const { jwt } = await usr("rosa@example.com");
+    const sheetOf = async (name: string) => {
+      const hand = automerge.create<Sheet>({
+        type: "table",
+        data: [arrayify([{ name: "n", type: "int", key: "0" }]), { 0: 1 }],
+      });
+      const sheet_id = `table:${hand.documentId}`;
+      await put(jwt, `/library/${sheet_id}`, { name });
+      return sheet_id;
+    };
+    const a = await sheetOf("a");
+    const b = await sheetOf("b");
+
+    const withKey = (key: string, path: string, options?: object) =>
+      app.request(path, {
+        headers: new Headers({ "Content-Type": "application/json", "scrapsheets-key": key }),
+        ...options,
+      });
+    const mint = async (id: string) => {
+      const res = await app.request(`/library/${id}/secret`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        body: JSON.stringify({ name: "api" }),
+      });
+      assertEquals(res.status, 201);
+      // A key is answered once, so it may not sit in a shared cache on the way.
+      assertEquals(res.headers.get("cache-control"), "no-store");
+      const { data } = await res.json();
+      assert(data.key.startsWith(`${id}.`), data.key);
+      assert(data.repro.includes("scrapsheets-key"), data.repro);
+      return data.key as string;
+    };
+
+    const first = await mint(a);
+
+    // The key reads and writes its own sheet, as its owner.
+    {
+      assertEquals((await withKey(first, `/sheet/${a}`)).status, 200);
+      const wrote = await withKey(first, `/sheet/${a}`, { method: "POST", body: JSON.stringify({ rows: [{ n: 2 }] }) });
+      assertEquals(wrote.status, 201);
+      assertEquals((await get<Table>(jwt, `/sheet/${a}`)).slice(1), [{ 0: 1 }, { 0: 2 }]);
+    }
+
+    // And nothing else. Not another sheet, and not the route that mints keys --
+    // a key that could mint would carry the owner's whole authority after all.
+    {
+      const other = await withKey(first, `/sheet/${b}`);
+      assertEquals(other.status, 403);
+      const text = await other.text();
+      assert(text.includes(`opens ${a}`) && text.includes(`GET /sheet/${b}`), text);
+      assertEquals((await withKey(first, `/library/${a}/secret`)).status, 403);
+      assertEquals(
+        (await withKey(first, `/library/${b}/secret`, { method: "POST", body: JSON.stringify({ name: "api" }) }))
+          .status,
+        403,
+      );
+      assertEquals((await withKey(`${a}.deadbeef`, `/sheet/${a}`)).status, 401);
+      assertEquals((await withKey("not-a-key-at-all", `/sheet/${a}`)).status, 401);
+    }
+
+    // Current and previous both open the sheet; the one before that is retired.
+    {
+      const second = await mint(a);
+      assertEquals((await withKey(first, `/sheet/${a}`)).status, 200);
+      assertEquals((await withKey(second, `/sheet/${a}`)).status, 200);
+      const third = await mint(a);
+      assertEquals((await withKey(first, `/sheet/${a}`)).status, 401);
+      assertEquals((await withKey(second, `/sheet/${a}`)).status, 200);
+      assertEquals((await withKey(third, `/sheet/${a}`)).status, 200);
+
+      // The names are readable and the values are not, the same rule every other
+      // sheet secret follows: a value that can be read back is a value a share
+      // link can eventually be pointed at.
+      const { secrets } = await get<{ secrets: { name: string }[] }>(jwt, `/library/${a}/secret`);
+      assertEquals(secrets.map((s) => s.name), ["api"]);
+      const listed = JSON.stringify(secrets);
+      for (const key of [first, second, third]) assert(!listed.includes(key.split(".")[1]), listed);
+
+      // Revoked is refused, and revoking takes the previous one with it.
+      await request(jwt, `/library/${a}/secret`, { method: "DELETE", body: JSON.stringify({ name: "api" }) });
+      assertEquals((await withKey(third, `/sheet/${a}`)).status, 401);
+      assertEquals((await withKey(second, `/sheet/${a}`)).status, 401);
+    }
+
+    // The key is minted here, never supplied, and nothing else in its namespace
+    // is a name the middleware knows.
+    {
+      await reject(jwt, `/library/${a}/secret`, {
+        method: "POST",
+        body: JSON.stringify({ name: "api", value: "sk-i-picked-this" }),
+      });
+      await reject(jwt, `/library/${a}/secret`, {
+        method: "POST",
+        body: JSON.stringify({ name: "api:readonly", value: "x" }),
+      });
+    }
+  }
+
+  // The spec is derived from the sheet's own columns at request time and never
+  // stored, so it cannot claim a column the sheet does not have. It is what the
+  // keys point at: a key with nothing to read from is a key nobody can use.
+  {
+    const { jwt } = await usr("sven@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "table",
+      data: [
+        arrayify([
+          { name: "item", type: "text", key: "0" },
+          { name: "qty", type: "int", key: "1" },
+          { name: "price", type: "usd", key: "2" },
+          { name: "due", type: "date", key: "3" },
+          { name: "paid", type: "bool", key: "4" },
+        ]),
+      ],
+    });
+    const sheet_id = `table:${hand.documentId}`;
+    await put(jwt, `/library/${sheet_id}`, {});
+    const doc = await request(jwt, `/openapi/${sheet_id}`);
+
+    assertEquals(doc.openapi, "3.1.0");
+    assertEquals(doc.components.schemas.Row.required, ["item", "qty", "price", "due", "paid"]);
+    assertEquals(doc.components.schemas.Row.properties, {
+      item: { type: "string" },
+      qty: { type: "integer" },
+      price: { type: "number" },
+      due: { type: "string", format: "date" },
+      paid: { type: "boolean" },
+    });
+    // The header a key is presented in is part of the document, or the spec
+    // describes a sheet nobody can call.
+    assertEquals(doc.components.securitySchemes.sheetKey.name, "scrapsheets-key");
+    const path = doc.paths[`/sheet/${sheet_id}`];
+    assert(path.get, "the read is described");
+    assertEquals(path.post.requestBody.content["application/json"].schema.properties.rows.items, {
+      $ref: "#/components/schemas/Row",
+    });
+
+    // A query sheet has a read and no write, because appending to one is a 400.
+    {
+      const q = automerge.create<Sheet>({
+        type: "query",
+        data: [{ lang: "sql", code: `select 1 as n, 'x' as t`, args: [] }],
+      });
+      await put(jwt, `/library/query:${q.documentId}`, {});
+      const spec = await request(jwt, `/openapi/query:${q.documentId}`);
+      assertEquals(Object.keys(spec.components.schemas.Row.properties), ["n", "t"]);
+      assert(!spec.paths[`/sheet/query:${q.documentId}`].post, "a computed sheet is not writable");
+    }
+
+    // The spec inherits the sheet's own access rule, because it is read through it.
+    {
+      const stranger = await usr("tomas@example.com");
+      await reject(stranger.jwt, `/openapi/${sheet_id}`);
     }
   }
 
@@ -2408,6 +3166,187 @@ Deno.test(async function allTests(_t) {
     const table = automerge.create<Sheet>({ type: "table", data: [arrayify([{ name: "a", type: "text", key: 0 }])] });
     await put(jwt, `/library/table:${table.documentId}`, {});
     await reject(jwt, `/library/table:${table.documentId}/hook`);
+  }
+
+  // The four share routes read a JSON body, and all four handed a missing or
+  // unparseable one straight to c.req.json(). That throw was an unexplained
+  // 500: a row in net-hook:errors and a point off the 5xx grade, for a mistake
+  // the caller could have fixed from the message.
+  //
+  // A share link is a bearer credential that travels in a URL, so it may not be
+  // immortal and it may not be openable by everyone who sees the url. The lock
+  // is an HMAC of the password under the server's own root secret, not the
+  // password and not a hash of it: nothing new is stored, and holding the link
+  // buys nobody an offline guess. Every refusal here has to name its own check
+  // without printing the password or the digest -- the same oracle rule the
+  // delivery refusals follow.
+  {
+    const { jwt } = await usr("zara@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "table",
+      data: [arrayify([{ name: "a", type: "num", key: 0 }]), { 0: 7 }],
+    });
+    const sheet_id = `table:${hand.documentId}`;
+    await put(jwt, `/library/${sheet_id}`, {});
+    const raw = (route: string, options?: object) =>
+      app.request(route, {
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        ...options,
+      });
+
+    for (
+      const [method, route] of [
+        ["POST", `/library/${sheet_id}/share`],
+        ["DELETE", `/library/${sheet_id}/share`],
+        ["POST", `/library/${sheet_id}/public`],
+      ] as const
+    ) {
+      for (const body of [undefined, "not json"]) {
+        const res = await raw(route, { method, ...(body === undefined ? {} : { body }) });
+        assertEquals(
+          res.status,
+          400,
+          `${method} ${route} with ${body ?? "no body"} is the caller's error: ${await res.text()}`,
+        );
+      }
+    }
+    // DELETE validated nothing at all, so a missing email reached the delete and
+    // came back as "undefined is not a non-owner member of this sheet" -- a
+    // sentence about the sheet for a mistake in the request.
+    const noEmail = await raw(`/library/${sheet_id}/share`, { method: "DELETE", body: JSON.stringify({}) });
+    assertEquals(noEmail.status, 400);
+    assert(
+      (await noEmail.text()).includes("received undefined"),
+      "the refusal has to name what arrived, not what the sheet holds",
+    );
+
+    // The link route's body is entirely optional, so no body is not an error
+    // there: that is the page's own call, and it must keep minting the
+    // thirty-day unlocked link it always did.
+    const day = 60 * 60 * 24;
+    const expOf = (token: string) => {
+      const b64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+      return JSON.parse(atob(b64 + "=".repeat((4 - b64.length % 4) % 4))) as { exp: number; lock?: string };
+    };
+    const now = Math.floor(Date.now() / 1000);
+    for (const options of [{ method: "POST" }, { method: "POST", body: "not json" }]) {
+      const res = await raw(`/library/${sheet_id}/link`, options);
+      const body = await res.text();
+      assert(res.ok, `an empty body still mints a link: ${res.status} ${body}`);
+      const { data: { token } } = JSON.parse(body);
+      assert(Math.abs(expOf(token).exp - (now + 30 * day)) < 120, "and it still lives thirty days");
+      assert(!expOf(token).lock, "and it is still openable by anyone holding it");
+    }
+
+    const { data: { token: plain } }: { data: { token: string } } = await post(jwt, `/library/${sheet_id}/link`, {});
+    const { data: { token: short } }: { data: { token: string } } = await post(
+      jwt,
+      `/library/${sheet_id}/link`,
+      { days: 1 },
+    );
+    assert(
+      Math.abs(expOf(short).exp - (now + day)) < 120,
+      `a chosen expiry has to reach the token: ${expOf(short).exp - now} seconds`,
+    );
+    // Zero, negative, over the bound, the right number as a string, and null.
+    for (const days of [0, -1, 366, "7", null])
+      await reject(jwt, `/library/${sheet_id}/link`, { method: "POST", body: JSON.stringify({ days }) });
+    for (const password of ["", 7, null, "x".repeat(129)])
+      await reject(jwt, `/library/${sheet_id}/link`, { method: "POST", body: JSON.stringify({ password }) });
+
+    const password = "correct horse battery staple";
+    const { data: { token: locked } }: { data: { token: string } } = await post(
+      jwt,
+      `/library/${sheet_id}/link`,
+      { password, days: 7 },
+    );
+    const digest = expOf(locked).lock;
+    assert(digest, "a locked link carries the lock claim");
+    assert(!locked.includes(btoa(password)), "and never the password itself");
+
+    // The socket refuses in the handshake, before any frame exists to carry a
+    // message, so the refusal is an ordinary HTTP answer on the sync route --
+    // which is why it is asked for here as one. A real client sees the
+    // connection fail; only this shape can read what it says.
+    const opens = (pass?: string) =>
+      app.request(
+        `/library/sync?auth=Bearer%20${encodeURIComponent(locked)}` +
+          (pass === undefined ? "" : `&pass=${encodeURIComponent(pass)}`),
+      );
+    const bare = await opens();
+    const wrong = await opens("wrong horse");
+    assertEquals(bare.status, 401);
+    assertEquals(wrong.status, 401);
+    const bareText = await bare.text();
+    const wrongText = await wrong.text();
+    assert(bareText.includes("is locked"), bareText);
+    assert(wrongText.includes("does not open"), wrongText);
+    for (const text of [bareText, wrongText]) {
+      assert(!text.includes(password), "a refusal must not print the password it wanted");
+      assert(!text.includes("wrong horse"), "nor the one that was tried");
+      assert(!text.includes(digest!), "nor the digest an offline guesser would grind against");
+    }
+    // The right password clears the lock: what answers now is the route past
+    // it, refusing a plain GET that asked for no upgrade.
+    const right = await opens(password);
+    const rightText = await right.text();
+    assert(
+      !rightText.includes("is locked") && !rightText.includes("does not open"),
+      `the right password clears the lock: ${right.status} ${rightText}`,
+    );
+
+    // And end to end over a real socket, which is the only path the share claim
+    // has ever had. A link gated on the socket and open anywhere else would be
+    // worse than no gate, so the claim is read in exactly one place.
+    const server = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, app.fetch);
+    const reads = async (peer: string, token: string, pass?: string) => {
+      const adapter = new WebSocketClientAdapter(
+        `ws://127.0.0.1:${server.addr.port}/library/sync?auth=Bearer%20${encodeURIComponent(token)}` +
+          (pass === undefined ? "" : `&pass=${encodeURIComponent(pass)}`),
+        100,
+      );
+      const repo = new AM.Repo({ network: [adapter], peerId: peer as AM.PeerId });
+      const outcome = await Promise.race([
+        repo.find<Sheet>(hand.documentId).then(() => "shared", () => "denied"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("refused"), 2000)),
+      ]);
+      adapter.disconnect();
+      return outcome;
+    };
+    assertEquals(await reads("client-locked-ok", locked, password), "shared", "the right password opens the link");
+    assertEquals(await reads("client-plain", plain), "shared", "an unlocked link is untouched by any of this");
+    await server.shutdown();
+
+    // Over plain HTTP the share claim buys nothing, locked or not: verifyWsAuth
+    // is the only place it is read, and no HTTP route reads it. What this pins
+    // is the next HTTP read path that honours the claim without going through
+    // that one reader, which would be a link gated on the socket and open
+    // everywhere else -- worse than no gate.
+    //
+    // Refused, and refused as the caller's mistake. A share token names a sheet
+    // and carries no `sub`, so usr_id was undefined and postgres.js refused to
+    // interpolate it: the holder of a link this server minted got 500 "Sorry,
+    // something went wrong", a row in the operator's log, and a point off the
+    // 5xx grade -- for using the credential we handed them. Nothing about that
+    // request is the server's failure, so nothing about it may be logged as one.
+    const crashes = async (path: string) => {
+      const [{ n }] = await sql`
+        select count(*) as n from net
+        where sheet_id = 'net-hook:errors' and meta->>'path' = ${path}
+          and coalesce(substring(meta->>'status' from '^[0-9]{1,9}$')::int, 0) >= 500
+      `;
+      return Number(n);
+    };
+    for (const token of [plain, locked]) {
+      const res = await app.request(`/sheet/${sheet_id}`, {
+        headers: new Headers({ Authorization: `Bearer ${token}` }),
+      });
+      const said = await res.text();
+      assertEquals(res.status, 403, `a share token must be refused, not crash: ${res.status} ${said}`);
+      assert(said.includes("sync socket"), `and the refusal must say where the token does work: ${said}`);
+    }
+    await new Promise((r) => setTimeout(r, 100));
+    assertEquals(await crashes(`/sheet/${sheet_id}`), 0, "a refusal the caller can fix is not the operator's failure");
   }
 
   // A sheet's own secrets: what a rollover needs, what a provider needs, and
@@ -2926,6 +3865,68 @@ Deno.test(async function allTests(_t) {
     // Nothing proxied us, so the socket's own peer is the caller.
     assertEquals(ip(undefined, "5.6.7.8"), "5.6.7.8");
     assertEquals(ip(undefined), "127.0.0.1");
+  }
+
+  // One noisy sender may not fill one sheet. NET_BODY_CAP bounds a delivery and
+  // trimNet bounds the log, so a sender posting flat out loses nothing of its
+  // own -- it evicts everything the sheet held before it. The budget is keyed on
+  // the sheet, not on callerIp(), because a webhook sender is one machine that
+  // will not rotate its address. So the ways this breaks are: a bound that leaks
+  // across sheets, a bound a refused delivery pays for, and a count bound alone,
+  // which one 1 MB body a second walks straight through.
+  {
+    const { jwt } = await usr("nyx-flood@example.com");
+    const netSheet = async () => {
+      const hand = automerge.create<Sheet>({ type: "net-hook", data: [] });
+      const id = `net-hook:${hand.documentId}`;
+      await put(jwt, `/library/${id}`, {});
+      return id;
+    };
+    // Bounded: a flood that never earns a 429 is the failure, so the loop
+    // crashes rather than running forever. Every body differs, or the unique
+    // signature index refuses the second one and nothing reaches the budget.
+    const flood = async (id: string, fill: string, cap: number) => {
+      for (let n = 1; n <= cap; n++) {
+        const res = await deliver(id, JSON.stringify({ n, fill }));
+        if (res.status === 429) return { n, text: await res.text() };
+        assert(res.ok, `delivery ${n} to ${id} was refused with ${res.status}: ${await res.text()}`);
+      }
+      throw new Error(`Expected a 429 within ${cap} deliveries to ${id}, received none.`);
+    };
+
+    // The count bound. Everything before the refusal landed, which is the honest
+    // sender: the budget only bites once the sender is past it.
+    const busy = await netSheet();
+    const many = await flood(busy, "", HOOK_ROWS_PER_WINDOW + 3);
+    assert(many.n > HOOK_ROWS_PER_WINDOW, `a sender inside the bound must not be refused, refused at ${many.n}`);
+    assert(many.text.includes(`${HOOK_ROWS_PER_WINDOW} deliveries`), `it must name the limit, got: ${many.text}`);
+    assert(many.text.includes(`${HOOK_WINDOW_S} seconds`), `it must name the window, got: ${many.text}`);
+    // A refused delivery writes no row, so the budget and the log agree.
+    const [{ n: kept }] = await sql`select count(*)::int as n from net where sheet_id = ${busy}`;
+    assertEquals(kept, many.n - 1, "a refused delivery must not be stored");
+
+    // The byte bound, which a count bound cannot see: few deliveries, each just
+    // under the per-delivery cap.
+    const fill = "x".repeat(900_000);
+    const each = Math.ceil(HOOK_BYTES_PER_WINDOW / fill.length);
+    const wide = await netSheet();
+    const big = await flood(wide, fill, each + 3);
+    assert(big.n <= each + 1, `the byte bound must refuse by delivery ${each + 1}, refused at ${big.n}`);
+    assert(big.n < HOOK_ROWS_PER_WINDOW, "and it must refuse long before the count bound does");
+    assert(big.text.includes(`${HOOK_BYTES_PER_WINDOW} bytes`), `it must name the byte limit, got: ${big.text}`);
+    assert(big.text.includes(`${HOOK_WINDOW_S} seconds`), `it must name the window, got: ${big.text}`);
+
+    // The bound belongs to the sheet, so two sheets over budget refuse nothing
+    // on a third.
+    const quiet = await netSheet();
+    const alone = await deliver(quiet, JSON.stringify({ event: "quiet" }));
+    assert(alone.ok, `a sheet nobody flooded must still take deliveries, got: ${alone.status}`);
+
+    // Bounded like rateLimitBuckets and for the same reason: sweeping by idle
+    // time alone loses to a caller minting keys faster than the broom runs.
+    for (let i = 0; i <= RATE_LIMIT_KEYS_MAX; i++) hookBucket(`net-hook:minted-${i}`);
+    assertEquals(hookBuckets.size, RATE_LIMIT_KEYS_MAX, "the delivery budget map must stay bounded");
+    hookBuckets.clear();
   }
 
   // The status check. Every condition is graded so that 1.0 is the minimum pass,

@@ -12,20 +12,26 @@ items are deleted — what shipped is described in `claude.md`. Anything below t
 
 The next things to build, in this order.
 
-- [ ] **A malformed request body is answered, not thrown at.** The four share routes — `POST` and `DELETE` on
-      `/library/:id/share`, and `POST` on `/public` and `/link` — all call `await c.req.json()` unguarded, so a missing
-      or non-JSON body is a 500 reading "Sorry, something went wrong". It costs a row in `net-hook:errors` and a point
-      off the 5xx status condition, for a request the caller could have fixed from the message. The secret routes
-      already do this correctly.
-  1. `.catch(() => ({}))` on each, so the field validation below it produces the 400 it already knows how to write.
-  2. There are four call sites, which is when a shared helper earns its name; until then it is four `.catch`es.
+- [ ] **You open a locked share link from the page.** `POST /library/:id/link` takes `{ days, password }` and the lock
+      is enforced in `verifyWsAuth`, but the refusal lands in the WebSocket handshake as an HTTP 401 that a browser
+      cannot read. A locked link is a socket that will not connect, so nothing in the UI can mint one or open one.
+  1. The share panel offers an expiry and a password when it mints a link.
+  2. Opening a sheet whose socket refused asks for the password and re-opens with `&pass=`, rather than retrying
+     forever. The handshake status is unreadable from script, so the prompt is what a failed connect falls back to.
+  3. `/portal/*/sync` passes no `pass` to `verifyWsAuth` and so refuses every locked token. Decide whether a portal ever
+     honours one, and make the call site say so either way.
 
-- [ ] **You see a run fail without opening the log.** `library:freshness` answers the question but nothing links to it,
-      so the first thing anyone learns about a dead feed is still the 15-minute status email.
-  1. The library table gains a column reading `library:freshness` — last run and failures since, per row.
-  2. A sheet whose `failures_since_ok` is above zero is marked in the gallery strip too, because that is where a demo is
-     opened from.
-  3. No new endpoint: the page reads the sheet it already can.
+- [ ] **Freshness covers every sheet that can go stale, not two types.** `freshness()` answers only for `net-http` and
+      `alert` sheets, so the library column and the gallery mark that read it can never fire for anything else.
+  1. Widen the read to any sheet with a run history in `net`, which is what makes a codex connection's health show up on
+     its downstream sheets — the second point of "A rotated credential does not break live sheets."
+  2. The page already marks any sheet the read answers for, so this is a server change alone.
+
+- [ ] **A sheet's read and its write agree about column names.** `GET /sheet/:id` returns rows keyed by column **key**
+      and `POST /sheet/:id` takes them keyed by column **name**. The generated OpenAPI document states both honestly,
+      which is the tell: one endpoint pair, two spellings of the same row.
+  1. Pick one and migrate the other. The read is the older contract, so changing it is the breaking half.
+  2. Whichever loses, the spec is generated from the columns and needs no edit.
 
 ---
 
@@ -51,17 +57,6 @@ The single biggest gap. Most of the Demo Gallery dies here first.
   1. Store UTC; `date`, `time`, `datetime` and `timestamptz` are four distinct column types, not one.
   2. Render in the viewer's zone, which is a per-user setting and not the browser's guess.
   3. `table:timezones` ships the offsets; the transition dates are what the arithmetic needs and are still open.
-
-- [ ] **Null, empty and zero stay different.** They are coerced into each other in several places, which is how a
-      missing reading becomes a zero in a chart.
-  1. One coercion table, enforced at the load boundary in `checkColumnTypes()` and nowhere else.
-  2. A blank cell in a numeric column is null, never zero; the chart already drops a non-numeric y and must keep doing
-     so.
-
-- [ ] **A query result carries its types forward.** Column types come back as the source column's, so `cast(x as int)`
-      lies and every downstream sheet reads text.
-  1. Infer the result type per select item, the way `WINDOW_TYPES` already does for a window alias.
-  2. A cast is the one expression whose type is stated rather than inferred.
 
 - [ ] **A forty-sheet chain does not re-run on every keystroke.** Nothing is cached, so the editor's debounce is the
       only thing between a chain and the CPU.
@@ -222,18 +217,11 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
   3. PDF table extraction, because half of government data ships as PDF.
   4. Payload mapping is the same job on the `net-hook` side: JSON path to column, so a webhook lands as typed rows.
 
-- [ ] **You fetch only what is new.** Every poll refetches everything.
-  1. Pagination: page, offset, cursor and Link-header, each with a stop condition.
-  2. Conditional requests: ETag and If-Modified-Since, so a daily file is not downloaded hourly.
-  3. A since-last-run cursor, with the watermark stored on the sheet.
-  4. Write mode per sheet: append, replace, or upsert by key.
-
-- [ ] **A flaky source recovers by itself and a broken one says so.** A failure is one row and the next poll is an hour
-      later.
-  1. Retry with backoff, distinguishing transient from permanent.
-  2. Per-host concurrency and delay, and respect for Retry-After.
-  3. Response size and time caps with a clear message rather than a hung sheet.
-  4. Keep the original bytes, so a parser fix can be replayed without re-fetching.
+- [ ] **A feed that answers in pages is read to the end.** Conditional requests and the since-last-run cursor ship; one
+      poll is still one request, so a paged API delivers its first page forever.
+  1. Pagination: page, offset, cursor and Link-header, each with a stop condition, and the page count bounded so a feed
+     that never says "last" is a failure row rather than a loop.
+  2. Write mode per sheet: append, replace, or upsert by key. Append is what every net sheet does today.
 
 - [ ] **You test the request before you save it.** The first thing a new sheet does is wait an hour to fail.
   1. A pre-flight button: fetch once, show the parsed preview, then save.
@@ -252,11 +240,6 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 - [ ] **You forward an email or a text and it becomes rows.** Neither address exists.
   1. An email-in address per sheet; body and attachments become a row.
   2. Inbound SMS on the same path, through the Twilio-shaped webhook the signature work already covers.
-
-- [ ] **One noisy sender cannot fill a sheet.** `NET_BODY_CAP` and `trimNet` bound a delivery and a sheet; nothing
-      bounds a sender.
-  1. Per-hook rate limits and size caps, keyed the way `callerIp()` keys the global one.
-  2. The refusal names the limit and the window, as every other refusal does.
 
 ---
 
@@ -452,9 +435,10 @@ The Excel add-in market lives here.
   2. SSO, SAML and SCIM, which is table stakes for any org-sized customer.
   3. Ownership transfer and offboarding: what happens to sheets when someone leaves.
 
-- [ ] **A share link can expire.** `POST /library/:id/link` mints a 30-day viewer JWT and nothing else.
-  1. Chosen expiry and an optional password.
-  2. An audit log of reads and writes, exportable and queryable as a sheet.
+- [ ] **You can read who opened a sheet and what they changed.** A link now carries a chosen expiry and an optional
+      password, and nothing records what it was used for.
+  1. An audit log of reads and writes, exportable and queryable as a sheet — which is the same log the agent writes and
+     the same one an action needs, so build it once.
 
 - [ ] **You cannot publish a secret by accident.** Nothing is scanned.
   1. Refuse to publish a sheet containing an API key.
@@ -506,11 +490,10 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
 
 ## Sheet as an API
 
-- [ ] **You POST rows to a sheet.** `GET /sheet/:id` is the stable read for every sheet type; there is no write.
-  1. `POST /sheet/:id` appending rows, validated at the boundary against the column types.
-  2. Per-sheet API keys, so a script does not carry a user's JWT.
-  3. An OpenAPI spec derived from the column types, so the keys have something to point at.
-  4. Configurable per-sheet rate limits for public sheet APIs.
+- [ ] **A public sheet API has its own limit.** `POST /sheet/:id`, per-sheet keys and the generated OpenAPI document
+      ship. `hookBucket()` bounds a net sheet's deliveries and nothing bounds a sheet's API.
+  1. Per-sheet rate limits for the read and the write, keyed on the sheet the way `hookBucket()` is.
+  2. The refusal names the limit and the window, and stays a 429 so it is not logged.
 
 - [ ] **Something is told when a sheet changes.** Change flows in and never out.
   1. Outbound change webhooks, signed the way inbound deliveries are verified.
@@ -569,9 +552,9 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
   2. Bulk operations: multi-select, move, tag, delete, share.
   3. Recently viewed, and back/forward.
 
-- [ ] **Everything is reachable from the keyboard.** The shortcut sheet lists what exists; there is no palette.
-  1. A command palette: jump to any sheet, run any command.
-  2. Full keyboard-only operation, screen reader support, contrast and focus order.
+- [ ] **Everything is reachable without a mouse or a screen.** Ctrl/⌘+K opens a palette over every sheet and every
+      runnable shortcut; nothing below it is done.
+  1. Full keyboard-only operation, screen reader support, contrast and focus order.
 
 - [ ] **Deleting a sheet is undoable.** It is not.
   1. Trash and restore.

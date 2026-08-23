@@ -16,6 +16,7 @@ import { assert, assertEquals } from "@std/assert";
 import server from "alasql";
 import page from "./src/alasql.mjs";
 import { DATASETS, EXAMPLES } from "./src/examples.mjs";
+import { sheets } from "./src/page.mjs";
 import {
   applyWindows,
   chartSql,
@@ -25,10 +26,12 @@ import {
   checkResultColumns,
   describeRef,
   describeRows,
+  NUMERIC_TYPES,
   register,
   rewriteUnpivot,
   rewriteWindows,
   scanRefs,
+  selectTypes,
 } from "./src/sql.mjs";
 
 type Row = Record<string, unknown>;
@@ -76,6 +79,19 @@ const replay = (engine: Engine) => {
       Object.fromEntries((Object.values(cols_) as { name: string; key: string }[]).map((c) => [c.name, row[c.key]]))
     );
     checkColumnTypes(id, Object.values(cols_), loaded[id]);
+    // checkColumnTypes is the one coercion there is, so this is what it
+    // promises: a numeric column holds numbers and nulls, never a blank that
+    // sums as a zero and never a string that concatenates.
+    for (const c of Object.values(cols_) as { name: string; type: string }[]) {
+      if (!NUMERIC_TYPES.includes(c.type)) continue;
+      for (const row of loaded[id]) {
+        const v = row[c.name];
+        assert(
+          v === null || typeof v === "number",
+          `${id}.${c.name} is ${c.type} but still holds ${JSON.stringify(v)} after the load`,
+        );
+      }
+    }
   }
 
   const byId = EXAMPLES as unknown as Record<string, { doc: { type: string; data: [{ code: string }] } }>;
@@ -93,7 +109,7 @@ const replay = (engine: Engine) => {
     let rows: Row[];
     if (described) rows = describeRows(described, cols(described), loaded[described]) as Row[];
     else {
-      const { sql, cells } = scanRefs(code);
+      const { sql, ids, cells } = scanRefs(code);
       const colsOf = Object.fromEntries(
         Object.entries(loaded).map(([ref, rows_]) => [ref, Object.keys(rows_[0] ?? {}).map((name) => ({ name }))]),
       );
@@ -122,6 +138,37 @@ const replay = (engine: Engine) => {
         Object.values(loaded).flatMap((rows_) => Object.keys(rows_[0] ?? {})),
         code,
       );
+      // A result column's type is a claim about its values, and both engines
+      // make the same claim off the same text. A wrong entry in SELECT_TYPES
+      // reads as a num column full of strings, here rather than in a chart.
+      // Typed against the sheets this query names, which is the map the server
+      // builds -- flattening all of them instead types a `district` column by
+      // whichever of the two sheets holding one loaded last.
+      const typeOf: Record<string, string> = {};
+      const ambiguous = new Set<string>();
+      for (const ref of ids) {
+        if (ref.startsWith("table:")) {
+          for (const c of cols(ref) as { name: string; type: string }[]) {
+            if (typeOf[c.name] && typeOf[c.name] !== c.type) ambiguous.add(c.name);
+            typeOf[c.name] = c.type;
+          }
+        }
+      }
+      for (const [name, type] of Object.entries(selectTypes(code, typeOf) as Record<string, string>)) {
+        // us-states.region is an enum and fema-regions.region is an int, and
+        // query:state-crosswalk joins both: a map keyed by name alone cannot
+        // tell them apart, and neither can the server's. Naming which sheet a
+        // qualified column belongs to needs the from clause, which is a bigger
+        // change than this one; until then an ambiguous name has no promise to
+        // check.
+        if (ambiguous.has(name)) continue;
+        for (const row of rows) {
+          const v = row[name];
+          if (v === null || v === undefined) continue;
+          const want = NUMERIC_TYPES.includes(type) ? "number" : type === "text" ? "string" : typeof v;
+          assertEquals(typeof v, want, `${id}: "${name}" is typed ${type} but holds ${JSON.stringify(v)}`);
+        }
+      }
     }
     assert(rows.length > 0, `${id} returned no rows`);
     ran.add(id);
@@ -209,4 +256,27 @@ Deno.test("the page engine still needs min_text(), and still has the UDFs", () =
       hi: "c",
     }, `${name}: src/sql.mjs should be registered on this engine`);
   }
+});
+
+Deno.test("a query sheet's columns carry their types in the page as well", async () => {
+  // The server stamps a query sheet's columns with the types its select list
+  // produced, and a sheet reading that query inherits them. The page builds the
+  // same row through page.mjs's sheets(), and used to leave every type
+  // undefined -- so `describe @query:x` answered one thing here and another on
+  // the server, off the same query.
+  const shelf = {
+    "table:t": { doc: { type: "table", data: [{ 0: { key: "0", name: "price", type: "usd" } }, { 0: 10 }] } },
+    "query:q": {
+      doc: {
+        type: "query",
+        data: [{ code: "select count(*) as n, cast(price as string) as price_text, price from @table:t" }],
+      },
+    },
+  };
+  const engine = sheets(page, () => shelf, () => Promise.resolve(undefined));
+  const { data } = await engine.runSql("describe @query:q", { "": null });
+  assertEquals(
+    (data as Row[]).map((r) => [r.column, r.type]),
+    [["n", "int"], ["price_text", "text"], ["price", "usd"]],
+  );
 });
