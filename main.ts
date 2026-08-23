@@ -1537,7 +1537,13 @@ const STATUS_AGO = [0, 3600, 86400];
 // claiming the old one. DB_BYTES_CAP is Neon's free-tier ceiling and
 // HEAP_BYTES_CAP the heap a Deno Deploy isolate gets: both live outside this
 // code, which is why they are written down rather than derived.
-const LATENCY_MS = 100;
+// 250, not 100: a select 1 from Deno Deploy to Neon is ~98ms of network before
+// the database does anything, so a 100ms bar sat 2ms inside its own threshold
+// and failed one run in four on jitter alone. An alarm that fires every hour
+// with nothing wrong is one that gets muted, and it takes the twelve real
+// conditions with it. At 250 the condition means the database is degraded --
+// a saturated pool, a cold start, a query queue -- rather than a slow packet.
+const LATENCY_MS = 250;
 const REFUSALS_MAX = 20;
 const POLL_STALE_S = 7200;
 const DB_BYTES_CAP = 4_000_000_000;
