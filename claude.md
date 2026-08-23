@@ -179,7 +179,11 @@ technologies. It uses a hybrid architecture with:
   renamed is worse than no check. The numbers a sentence quotes (`LATENCY_MS`, `REFUSALS_MAX`, `POLL_STALE_S`,
   `DB_BYTES_CAP`, `HEAP_BYTES_CAP`) are read into the sentence, so a changed limit cannot leave the prose claiming the
   old one. The historical conditions are one query evaluated at three instants — the offsets are a join, not three round
-  trips — and the current-state ones carry `"0"` alone. **Every cast out of jsonb is guarded**
+  trips — and the current-state ones carry `"0"` alone. The latency condition throws away its **first** `select 1` and
+  times the second: a cold isolate pays TCP, TLS and auth on the first, and a suspended Neon instance pays its own
+  wake-up (~1s against ~98ms warm), so timing it graded how cold the caller was rather than how fast the database
+  answers — and since nothing keeps a 15-minute cron warm, that failed nearly every scheduled run. Connection setup is a
+  different failure mode, and the endpoint timing out is where it already shows. **Every cast out of jsonb is guarded**
   (`substring(x from '^[0-9]+$')::int`, and `is json` in the where clause, which an aggregate's `filter` is evaluated
   after): one row this code did not write used to take the endpoint to 500, and an uptime checker cannot tell that from
   a dead server. Two conditions are shaped by what an anonymous caller can do — rejections are counted as **deliveries

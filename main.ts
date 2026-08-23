@@ -1568,6 +1568,15 @@ const grade = (condition: string, n: number): number => {
 export const status = async (): Promise<Record<string, Record<string, number>>> => {
   // A round trip, not a workload: timing the aggregates below would grade the
   // heaviest statement in the file as "a query".
+  //
+  // The first one is thrown away. An isolate that has just started pays TCP,
+  // TLS and auth on it, and a Neon instance that has suspended pays its own
+  // wake-up -- about a second against 98ms warm. Timing that graded how cold
+  // the caller was, not how fast the database answers, and since nothing keeps
+  // a 15-minute cron warm it failed nearly every scheduled run. Connection
+  // setup is a different failure mode, and the endpoint timing out is where it
+  // already shows.
+  await sql`select 1`;
   const started = Date.now();
   await sql`select 1`;
   const dbMs = Date.now() - started;
