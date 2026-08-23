@@ -2542,6 +2542,51 @@ export const parseNetHeaders = (raw = ""): Record<string, string> =>
     }),
   );
 
+// A header value may name a secret instead of carrying one. The document keeps
+// the reference and never the value, which is the whole point: sync hands that
+// document to every viewer and every share-link holder, so a token written into
+// a header is a token a share link can be pointed at.
+const SECRET_REF = /\{\{secret:([a-z0-9][a-z0-9:_-]{0,63})\}\}/g;
+
+/** The headers to actually send, with every `{{secret:name}}` replaced by the
+ * newest secret of that name on this sheet. Answers a fresh object rather than
+ * editing the one it was given, so the caller keeps the unresolved headers and
+ * only names can reach a log. */
+const resolveSecrets = async (
+  sheet_id: string,
+  headers: Record<string, string>,
+): Promise<Record<string, string>> => {
+  const wanted = [
+    ...new Set<string>(Object.values(headers).flatMap((v) => [...v.matchAll(SECRET_REF)].map((m) => m[1]))),
+  ];
+  if (!wanted.length) return headers;
+  // Newest per name, which is the same current-secret rule hookKeys reads by:
+  // rotating a key a feed uses is a write, not an outage.
+  const rows = await sql`
+    select distinct on (name) name, value_encrypted from secret
+    where sheet_id = ${sheet_id} and name in ${sql(wanted)}
+    order by name, created_at desc, secret_id desc
+  `;
+  const held = new Map<string, string>();
+  for (const row of rows) held.set(String(row.name), await decrypt(`secret ${row.name}`, String(row.value_encrypted)));
+  const missing = wanted.filter((name) => !held.has(name));
+  if (missing.length) {
+    // Sending the request without the header instead would come back as
+    // somebody else's 401 and read as the API's fault. This names ours.
+    throw new Error(
+      explain(`This sheet's headers name ${missing.length > 1 ? "secrets" : "a secret"} it does not hold.`, {
+        Received: missing.map((name) => `{{secret:${name}}}`).join(", "),
+        Expected: `a secret of ${missing.length > 1 ? "each of those names" : "that name"} on this sheet`,
+        Source: "the headers on this net-http sheet, against the secret table",
+        Fix: `store it with POST /library/${sheet_id}/secret, or take the reference out of the header`,
+      }),
+    );
+  }
+  return Object.fromEntries(
+    Object.entries(headers).map(([k, v]) => [k, v.replace(SECRET_REF, (_, name) => held.get(name)!)]),
+  );
+};
+
 // A failure the user can reproduce. The curl line names the header keys the sheet
 // sent but never their values: a net-http header may carry a token.
 const curlFor = (url: string, headers: Record<string, string>): string =>
@@ -2601,8 +2646,12 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       if (!config.url) continue;
       url = config.url;
       headers = parseNetHeaders(config.headers);
+      // Resolved into a separate object. `headers` is what a failure row is
+      // built from, so a resolved token cannot reach the log even if curlFor
+      // one day prints more than the keys.
+      const sending = await resolveSecrets(sheet_id, headers);
       const started = Date.now();
-      const res = await fetcher(url, headers);
+      const res = await fetcher(url, sending);
       const text = await readCapped(res, 65536);
       // Errors become log rows too: the user who typed the URL must see them, and
       // must be able to run the same request by hand.

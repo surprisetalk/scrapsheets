@@ -38,6 +38,10 @@ curl -X POST "https://api.sheets.scrap.land$path" -H 'Content-Type: application/
   -H "scrapsheets-signature: t=$t,v2=$sig" -d "$body"
 ```
 
+A net-http sheet reads a key from there too: write `X-Api-Key: {{secret:weather}}` in its headers and the value is
+resolved at fetch time, so the document holds the reference and never the token. Rotating the secret needs no edit to
+the sheet.
+
 A sheet can hold its own secrets instead. `POST /library/<sheet_id>/secret` with `{"name":"hook","value":"..."}` sets
 the signing key; writing it again rotates it, and the one before still verifies until a third write retires it. `GET`
 answers with the names and timestamps and never a value. Name it `hook:stripe`, `hook:github` or `hook:shopify` instead

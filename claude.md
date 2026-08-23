@@ -119,9 +119,16 @@ technologies. It uses a hybrid architecture with:
   logged into, so `/share` cannot reach it. A password-less row is not an account; `POST /signup/:token` upserts on the
   email, so signing up later adopts it along with the grant
 - **net-http polling**: `pollNetOnce` scans net-http sheets every 15s, fetches due URLs through the safeFetch SSRF
-  guard, and appends bodies to the `net` table. A failed fetch lands as a row too, shaped by `fetchFailure()`: status,
-  the URL actually fetched after redirects, content type, a body snippet, and a `repro` curl line that names the header
-  keys the sheet sent but never their values. `/proxy` returns the same shape
+  guard, and appends bodies to the `net` table. A header value may be `{{secret:name}}` rather than a token:
+  `resolveSecrets()` replaces it with the newest secret of that name on the sheet at fetch time, so the automerge
+  document — which sync hands to every viewer and every share-link holder — keeps the reference and never the value. It
+  resolves into a **separate** object, so the unresolved headers are what a failure row is built from and a resolved
+  token cannot reach the log even if `curlFor` one day prints more than the keys. A reference to a secret the sheet does
+  not hold is a failure row naming it, **not** a request sent without the header: that would come back as somebody
+  else's 401 and read as the API's fault. Rotating the secret needs no edit to the sheet — the next poll reads the
+  newest, the same current-secret rule `hookKeys` uses. A failed fetch lands as a row too, shaped by `fetchFailure()`:
+  status, the URL actually fetched after redirects, content type, a body snippet, and a `repro` curl line that names the
+  header keys the sheet sent but never their values. `/proxy` returns the same shape
 - **Webhook ingest**: `POST /net/:id` rejects an unknown sheet (404), a non-net sheet (400), a body carrying a **NUL
   byte** (400, naming the offset — the column is text and Postgres text cannot hold one, so correctly signed bytes used
   to reach the insert and come back as an unexplained 500) and a body over `NET_BODY_CAP` (413), each naming what it

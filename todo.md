@@ -12,33 +12,10 @@ items are deleted — what shipped is described in `claude.md`. Anything below t
 
 The next things to build, in this order.
 
-- [ ] **You point a net-http sheet at an API that needs a key.** Per-sheet headers ship, but their values sit in the
-      automerge document in plain text, which is what sync hands a viewer or a share-link holder. The `secret` table is
-      the place to put them and already exists.
-  1. `NetHttp` gains `headers` values of the form `{{secret:name}}`; `pollNetOnce` resolves them out of `secret` at
-     fetch time and never writes a resolved value anywhere.
-  2. `fetchFailure()` already names header keys and never their values, so the `repro` line needs no change — check that
-     the resolved value cannot reach `body` either.
-  3. A header naming a secret the sheet does not hold is a failure row that says which name is missing, not a request
-     sent without the header.
-
-- [ ] **You give a query sheet a schedule and it runs without you.** `pollNetOnce` and `pollAlertOnce` are two copies of
-      the same 15-second scan; a query sheet has no runner at all, so every pipeline in the Demo Gallery stops at
-      "somebody opens the tab".
-  1. `schedule` on the sheet: an interval in seconds, the same shape `alert` already uses, validated the same way (a
-     present-but-not-positive value is a crash, not a guessed hour).
-  2. `pollQueryOnce(now)` runs each due query sheet **as its owner** with `createJwt(created_by)`, exactly as
-     `pollAlertOnce` does, and writes the run to `net` with `method = 'QUERY'` and the `meta` shape already in use.
-  3. Two runs of one sheet must not overlap: skip if the previous run has not landed, and record the skip, or a slow
-     query queues behind itself forever.
-  4. `library:freshness` already reads `net` by method — add `'QUERY'` to its `case` and the new runner is visible the
-     day it ships.
-
-- [ ] **A malformed request body is answered, not thrown at.** `POST/DELETE /library/:id/share`,
-      `POST
-      /library/:id/public` and `POST /library/:id/link` all call `await c.req.json()` unguarded, so a
-      missing or non-JSON body is a 500 reading "Sorry, something went wrong" — and costs a row in `net-hook:errors` and
-      a point off the 5xx status condition for a request the caller could have fixed from the message. The secret routes
+- [ ] **A malformed request body is answered, not thrown at.** The four share routes — `POST` and `DELETE` on
+      `/library/:id/share`, and `POST` on `/public` and `/link` — all call `await c.req.json()` unguarded, so a missing
+      or non-JSON body is a 500 reading "Sorry, something went wrong". It costs a row in `net-hook:errors` and a point
+      off the 5xx status condition, for a request the caller could have fixed from the message. The secret routes
       already do this correctly.
   1. `.catch(() => ({}))` on each, so the field validation below it produces the 400 it already knows how to write.
   2. There are four call sites, which is when a shared helper earns its name; until then it is four `.catch`es.

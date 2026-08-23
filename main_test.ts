@@ -1935,6 +1935,61 @@ Deno.test(async function allTests(_t) {
       assertEquals(await countRows(), 2);
     }
 
+    // A header that names a secret instead of carrying one. The value lives in
+    // the secret table; the document keeps only the reference, because sync
+    // hands that document to every viewer and every share-link holder.
+    {
+      const keyed = automerge.create<Sheet>({
+        type: "net-http",
+        data: [{
+          url: "https://feeds.test/keyed",
+          interval: 120,
+          headers: "X-Api-Key: {{secret:weather}}\nAuthorization: Bearer {{secret:weather}}",
+        }],
+      });
+      const keyedId = `net-http:${keyed.documentId}`;
+      await put(jwt, `/library/${keyedId}`, {});
+
+      // Every due net-http sheet is polled, so only this one's calls count.
+      const seen: Record<string, string>[] = [];
+      const fetcher = (url: string, headers: Record<string, string> = {}) => {
+        if (url === "https://feeds.test/keyed") seen.push(headers);
+        return Promise.resolve(new Response(`{"ok":true}`));
+      };
+      const rowsOf = async () => (await get<Table>(jwt, `/net/${keyedId}`)).slice(1);
+      const t1 = Date.now() + 500_000;
+
+      // Before the secret exists: a failure row naming what is missing, and no
+      // request at all -- sending it without the header would come back as
+      // somebody else's 401 and read as the API's fault.
+      await pollNetOnce(fetcher, t1);
+      assertEquals(seen.length, 0, "a header that cannot be built must not be sent without it");
+      const [failed] = await rowsOf();
+      const failure = JSON.parse(String(failed.body));
+      assert(failure.error.includes("{{secret:weather}}"), `it must name the reference: ${failure.error}`);
+      assert(failure.error.includes("does not hold"), failure.error);
+      assert(failure.repro.includes("X-Api-Key: <value>"), "the repro still names keys and not values");
+
+      await post(jwt, `/library/${keyedId}/secret`, { name: "weather", value: "sk-live-1" });
+      await pollNetOnce(fetcher, t1 + 200_000);
+      assertEquals(seen.length, 1, "with the secret stored, the request goes");
+      assertEquals(seen[0], { "X-Api-Key": "sk-live-1", Authorization: "Bearer sk-live-1" });
+
+      // Writing the secret again rotates it, and the feed picks the newest up
+      // on its next poll rather than needing the sheet edited.
+      await post(jwt, `/library/${keyedId}/secret`, { name: "weather", value: "sk-live-2" });
+      await pollNetOnce(fetcher, t1 + 400_000);
+      assertEquals(seen[1]["X-Api-Key"], "sk-live-2", "a rotated secret reaches the next poll");
+
+      // The value must be nowhere a viewer can read: not in the log, and not in
+      // the sheet row the shop copies from.
+      const log = JSON.stringify(await rowsOf());
+      assert(!log.includes("sk-live-1") && !log.includes("sk-live-2"), "a resolved value must not reach the log");
+      const [row] = await sql`select row_0::text as r from sheet where sheet_id = ${keyedId}`;
+      assert(String(row.r).includes("{{secret:weather}}"), "the document keeps the reference");
+      assert(!String(row.r).includes("sk-live-"), "and never the value");
+    }
+
     // Header parsing: one "Name: value" per line; malformed lines throw loudly.
     assertEquals(parseNetHeaders("A: b\nC: d: e"), { A: "b", C: "d: e" });
     assertEquals(parseNetHeaders(""), {});
