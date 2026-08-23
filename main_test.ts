@@ -12,8 +12,10 @@ import {
   callerIp,
   createJwt,
   createToken,
+  flushFolds,
   hookSecret,
   hookSign,
+  LOG_EVERY_MS,
   NET_KEEP,
   parseNetHeaders,
   pollAlertOnce,
@@ -80,13 +82,14 @@ const put = (jwt: string, route: string, body: unknown) =>
 
 // Every delivery is signed, so the tests sign it the way a sender does: through
 // the server's own hookSign, rather than a second implementation that could
-// agree with a bug in the first.
+// agree with a bug in the first. The target is signed alongside the body, so it
+// is passed in rather than assumed.
 const deliver = async (sheet_id: string, body: string, query = "") =>
   await app.request(`/net/${sheet_id}${query}`, {
     method: "POST",
     headers: new Headers({
       "Content-Type": "application/json",
-      "scrapsheets-signature": await hookSign(sheet_id, body),
+      "scrapsheets-signature": await hookSign(await hookSecret(sheet_id), `/net/${sheet_id}${query}`, body),
     }),
     body,
   });
@@ -2268,7 +2271,8 @@ Deno.test(async function allTests(_t) {
         body,
       });
 
-    const first = await hookSign(id, body);
+    const target = `/net/${id}`;
+    const first = await hookSign(secret, target, body);
     assert((await send(first)).ok, "a correctly signed delivery must land");
 
     // A captured delivery, sent again unchanged. The skew window bounds a replay
@@ -2292,7 +2296,7 @@ Deno.test(async function allTests(_t) {
     // what decides it; the insert is what asks.
     {
       const burst = JSON.stringify({ event: "burst" });
-      const signature = await hookSign(id, burst);
+      const signature = await hookSign(secret, target, burst);
       const answers = await Promise.all(
         Array.from({ length: 10 }, () =>
           app.request(`/net/${id}`, {
@@ -2321,30 +2325,303 @@ Deno.test(async function allTests(_t) {
     // care about case -- while reading as a different string, so every case
     // variant of one captured signature used to be a free replay. A hex digest
     // has one spelling here.
-    const upper = (await hookSign(id, body)).replace(/v1=(.*)$/, (_, hex) => `v1=${hex.toUpperCase()}`);
-    assert(/^t=\d+,v1=[0-9A-F]{64}$/.test(upper), `only the digest may be upper-cased, got: ${upper}`);
+    const upper = (await hookSign(secret, target, body)).replace(/v2=(.*)$/, (_, hex) => `v2=${hex.toUpperCase()}`);
+    assert(/^t=\d+,v2=[0-9A-F]{64}$/.test(upper), `only the digest may be upper-cased, got: ${upper}`);
     await refused(upper, "is malformed");
     // Signed correctly, but for a moment outside the replay window.
     const stale = Math.floor(Date.now() / 1000) - 3600;
-    const staleText = await refused(await hookSign(id, body, stale), "outside the replay window");
+    const staleText = await refused(await hookSign(secret, target, body, stale), "outside the replay window");
     assert(staleText.includes("3600 seconds old"), `it must name the skew, got: ${staleText}`);
     // The right shape over the wrong bytes: the one failure a sender misreads as
     // a wrong secret.
-    await refused(await hookSign(id, body + " "), "does not match its body");
+    await refused(await hookSign(secret, target, body + " "), "does not match its body");
     // The right shape under another sheet's secret.
     const other = automerge.create<Sheet>({ type: "net-hook", data: [] });
-    await refused(await hookSign(`net-hook:${other.documentId}`, body), "does not match its body");
+    await refused(
+      await hookSign(await hookSecret(`net-hook:${other.documentId}`), target, body),
+      "does not match its body",
+    );
 
     // The owner reads the secret; nobody else does, and a non-net sheet has none.
     const hook = await get<{ url: string; secret: string; repro: string }>(jwt, `/library/${id}/hook`);
     assertEquals(hook.secret, secret);
     assert(hook.url.endsWith(`/net/${id}`), `the hook url must be the delivery url, got: ${hook.url}`);
     assert(hook.repro.includes(secret) && hook.repro.includes("openssl"), "the repro must be runnable");
+    assert(hook.repro.includes("v2=$sig"), `the repro must sign the way the server verifies, got: ${hook.repro}`);
     const { jwt: strangerJwt } = await usr("wanda@example.com");
     await reject(strangerJwt, `/library/${id}/hook`);
     const table = automerge.create<Sheet>({ type: "table", data: [arrayify([{ name: "a", type: "text", key: 0 }])] });
     await put(jwt, `/library/table:${table.documentId}`, {});
     await reject(jwt, `/library/table:${table.documentId}/hook`);
+  }
+
+  // A sheet's own secrets: what a rollover needs, what a provider needs, and
+  // what makes a delivery's identity the thing the sender varies.
+  {
+    const { jwt } = await usr("xena@example.com");
+    const hand = automerge.create<Sheet>({ type: "net-hook", data: [] });
+    const id = `net-hook:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+    const target = `/net/${id}`;
+    const derived = await hookSecret(id);
+    const send = (sheet: string, headers: Record<string, string>, body: string, query = "") =>
+      app.request(`/net/${sheet}${query}`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", ...headers }),
+        body,
+      });
+    const signed = (signature: string, body: string, query = "") =>
+      send(id, { "scrapsheets-signature": signature }, body, query);
+    const hmac = async (secret: string, message: string) => {
+      const key = await crypto.subtle.importKey(
+        "raw",
+        new TextEncoder().encode(secret),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"],
+      );
+      return new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message)));
+    };
+    const hexOf = (buf: Uint8Array) => Array.from(buf).map((b) => b.toString(16).padStart(2, "0")).join("");
+    // A v1 sender, written the way the old readme told it to: the timestamp, a
+    // dot, and the body. Hand-rolled on purpose -- this is the one scheme where
+    // an independent implementation is the point, because it is what every
+    // sender already in the field has.
+    const signV1 = async (secret: string, body: string, t = Math.floor(Date.now() / 1000)) =>
+      `t=${t},v1=${hexOf(await hmac(secret, `${t}.${body}`))}`;
+
+    // What identifies a delivery is what the sender varies. Two of them, the
+    // same body in the same second, discriminated by query string: under v1
+    // they were one delivery and the second was refused as a replay.
+    const reading = JSON.stringify({ reading: 21.5 });
+    const second = Math.floor(Date.now() / 1000);
+    const one = await signed(await hookSign(derived, `${target}?sensor=1`, reading, second), reading, "?sensor=1");
+    const two = await signed(await hookSign(derived, `${target}?sensor=2`, reading, second), reading, "?sensor=2");
+    assert(one.ok && two.ok, "two deliveries differing only by query string are two deliveries");
+    // Signing the target is the whole of the fix, so a v2 signature over one
+    // path must not verify against another.
+    const moved = await signed(await hookSign(derived, `${target}?sensor=1`, reading, second), reading, "?sensor=9");
+    assertEquals(moved.status, 401, "a signature over one path must not carry to another");
+
+    // Verified bytes that Postgres text cannot hold. The signature is right, so
+    // this reaches the insert -- and used to come back as an unexplained 500.
+    const nulBody = "{\u0000}";
+    const nulRes = await signed(await hookSign(derived, target, nulBody), nulBody);
+    assertEquals(nulRes.status, 400, "a byte that cannot be stored is a rejection, not a 500");
+    const nulText = await nulRes.text();
+    assert(nulText.includes("NUL byte at offset 1"), `it must name the byte and where: ${nulText}`);
+    // Every other byte is kept as sent, valid UTF-8 or not.
+    const oddBody = new TextDecoder().decode(new Uint8Array([0x22, 0xff, 0xfe, 0x22]));
+    assert((await signed(await hookSign(derived, target, oddBody), oddBody)).ok, "invalid UTF-8 still lands");
+
+    // v1 is still accepted, because refusing it would be the missed delivery
+    // this whole section exists to avoid -- and meta.scheme is how you find out
+    // who is still sending it.
+    const legacy = JSON.stringify({ event: "legacy" });
+    assert((await signed(await signV1(derived, legacy), legacy)).ok, "an old sender must keep working");
+    const scheme = async (body: string) => {
+      const [row] = await sql`select meta->>'scheme' as s, meta->>'secret_at' as at from net
+                              where sheet_id = ${id} and body = ${body} limit 1`;
+      return row as { s: string; at: string };
+    };
+    assertEquals((await scheme(legacy)).s, "v1", "the row records which scheme verified it");
+    assertEquals((await scheme(reading)).s, "v2");
+    assertEquals((await scheme(legacy)).at, "derived", "and which key, so a rollover has a visible end");
+
+    // Rotation. Writing a secret is rotating it: the new one signs, the one
+    // before it still verifies, and the derived key is the implicit previous
+    // until a second rotation retires it -- without which storing a sheet's
+    // first secret would drop every sender still using the derived one.
+    const say = async (secret: string, note: string) => {
+      const body = JSON.stringify({ note });
+      return { res: await signed(await hookSign(secret, target, body), body), body };
+    };
+    await post(jwt, `/library/${id}/secret`, { name: "hook", value: "rolled-one" });
+    assert(
+      (await say(derived, "derived-after-first")).res.ok,
+      "the first stored secret does not retire the derived one",
+    );
+    const first = await say("rolled-one", "first");
+    assert(first.res.ok, "the stored secret signs");
+    const firstAt = (await scheme(first.body)).at;
+    assert(firstAt !== "derived", `the row must name the stored key, got: ${firstAt}`);
+
+    await post(jwt, `/library/${id}/secret`, { name: "hook", value: "rolled-two" });
+    assert((await say("rolled-one", "still-previous")).res.ok, "the previous secret still verifies");
+    assert((await say("rolled-two", "current")).res.ok, "and so does the current one");
+    assertEquals(
+      (await say(derived, "derived-retired")).res.status,
+      401,
+      "a second rotation retires the derived key",
+    );
+
+    // Names and timestamps come back. A value never does: one that can be read
+    // back is one a share link can eventually be pointed at.
+    const listed = await get<{ secrets: { name: string; created_at: string; previous_at: string }[] }>(
+      jwt,
+      `/library/${id}/secret`,
+    );
+    assertEquals(listed.secrets.map((x) => x.name), ["hook"]);
+    assert(listed.secrets[0].previous_at, "a rollover in progress says so");
+    assert(!JSON.stringify(listed).includes("rolled-two"), "a secret value must never be readable");
+    const { jwt: strangerJwt } = await usr("yuri@example.com");
+    await reject(strangerJwt, `/library/${id}/secret`);
+    await reject(jwt, `/library/${id}/secret`, { method: "POST", body: JSON.stringify({ name: "Hook!", value: "x" }) });
+    await reject(jwt, `/library/${id}/secret`, { method: "POST", body: JSON.stringify({ name: "hook", value: "" }) });
+    // A body that is missing or is not JSON must be answered, not thrown at.
+    for (const options of [{ method: "POST" }, { method: "DELETE" }, { method: "POST", body: "not json" }]) {
+      const res = await app.request(`/library/${id}/secret`, {
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        ...options,
+      });
+      assert(res.status >= 400 && res.status < 500, `a malformed body is the caller's error: ${res.status}`);
+    }
+    // `hook:*` is the space verifyDelivery reads, so a name in it that no
+    // verifier knows would be written happily and then fail every delivery.
+    await reject(jwt, `/library/${id}/secret`, {
+      method: "POST",
+      body: JSON.stringify({ name: "hook:acme", value: "x" }),
+    });
+    // A general name is fine, and stays out of the verifier's way.
+    await post(jwt, `/library/${id}/secret`, { name: "weather-api-key", value: "k" });
+    assert((await say("rolled-two", "still-ours")).res.ok, "an unrelated secret does not change the scheme");
+
+    // The hook panel shows the current key, not the derived one it replaced.
+    const hook = await get<{ secret: string; repro: string }>(jwt, `/library/${id}/hook`);
+    assertEquals(hook.secret, "rolled-two", "the panel shows the key that is signing now");
+    // A secret is pasted by hand. One apostrophe in it ended the shell quoting,
+    // so the documented line ran and signed something else.
+    const quotey = automerge.create<Sheet>({ type: "net-hook", data: [] });
+    const quoteyId = `net-hook:${quotey.documentId}`;
+    await put(jwt, `/library/${quoteyId}`, {});
+    await post(jwt, `/library/${quoteyId}/secret`, { name: "hook", value: "a'b" });
+    const quoted = await get<{ repro: string }>(jwt, `/library/${quoteyId}/hook`);
+    assert(quoted.repro.includes(`-hmac 'a'\\''b'`), `the secret must stay inside its quotes: ${quoted.repro}`);
+
+    // A provider signs its own way, and which verifier runs is read off the
+    // sheet's stored secrets. A spoofed header must not be able to pick it.
+    const gh = automerge.create<Sheet>({ type: "net-hook", data: [] });
+    const ghId = `net-hook:${gh.documentId}`;
+    await put(jwt, `/library/${ghId}`, {});
+    const spoof = JSON.stringify({ action: "opened" });
+    const spoofed = await app.request(`/net/${ghId}`, {
+      method: "POST",
+      headers: new Headers({
+        "Content-Type": "application/json",
+        "x-hub-signature-256": `sha256=${hexOf(await hmac("gh-secret", spoof))}`,
+      }),
+      body: spoof,
+    });
+    assertEquals(spoofed.status, 401, "a provider header on a sheet with no provider secret signs nothing");
+    assert(
+      (await spoofed.text()).includes("is not signed"),
+      "and it is refused as unsigned, not verified against a secret nobody set",
+    );
+
+    await post(jwt, `/library/${ghId}/secret`, { name: "hook:github", value: "gh-secret" });
+    const ghSign = async (body: string, secret = "gh-secret") => ({
+      "x-hub-signature-256": `sha256=${hexOf(await hmac(secret, body))}`,
+    });
+    const ghBody = JSON.stringify({ action: "opened", number: 1 });
+    const ghFirst = await send(ghId, await ghSign(ghBody), ghBody);
+    assert(ghFirst.ok, `a GitHub delivery lands on its own scheme: ${ghFirst.status} ${await ghFirst.text()}`);
+    // The replay index keys on the signature that verified. Keyed on a header
+    // name instead, a captured provider delivery replayed with a junk
+    // scrapsheets-signature beside it takes a new key and lands every time.
+    assertEquals((await send(ghId, await ghSign(ghBody), ghBody)).status, 409, "a GitHub replay is refused");
+    const decoy = await send(ghId, {
+      ...(await ghSign(ghBody)),
+      "scrapsheets-signature": `t=${Math.floor(Date.now() / 1000)},v2=${"0".repeat(64)}`,
+    }, ghBody);
+    assertEquals(decoy.status, 409, "a header the verifier never read must not buy a replay a new key");
+
+    // The key is the digest that verified, canonically spelled -- not the header
+    // as sent. Stripe's header is a tolerant field list, so a captured delivery
+    // with one junk field appended verifies against the same secret over the
+    // same message, and keyed on the raw header each junk suffix was a fresh
+    // replay for the whole skew window.
+    const st = automerge.create<Sheet>({ type: "net-hook", data: [] });
+    const stId = `net-hook:${st.documentId}`;
+    await put(jwt, `/library/${stId}`, {});
+    await post(jwt, `/library/${stId}/secret`, { name: "hook:stripe", value: "whsec_test" });
+    const stBody = JSON.stringify({ type: "checkout.session.completed" });
+    const stamp = Math.floor(Date.now() / 1000);
+    const stDigest = hexOf(await hmac("whsec_test", `${stamp}.${stBody}`));
+    const stripeSig = (extra: string) => ({ "stripe-signature": `t=${stamp},v1=${stDigest}${extra}` });
+    assert((await send(stId, stripeSig(""), stBody)).ok, "a Stripe delivery lands on its own scheme");
+    assertEquals((await send(stId, stripeSig(""), stBody)).status, 409, "and its replay is refused");
+    assertEquals((await send(stId, stripeSig(",z=1"), stBody)).status, 409, "a junk field must not buy a new key");
+    assertEquals(
+      (await send(stId, stripeSig(`,v1=${stDigest}`), stBody)).status,
+      409,
+      "nor may repeating the digest Stripe already sent",
+    );
+
+    // Shopify's digest is base64, and the last character of a 32-byte digest
+    // carries two bits nothing reads -- four spellings, one digest. Shopify
+    // signs no timestamp, so each spelling would be a replay that never stales.
+    const sh = automerge.create<Sheet>({ type: "net-hook", data: [] });
+    const shId = `net-hook:${sh.documentId}`;
+    await put(jwt, `/library/${shId}`, {});
+    await post(jwt, `/library/${shId}/secret`, { name: "hook:shopify", value: "shpss_test" });
+    const shBody = JSON.stringify({ id: 1, total: "9.99" });
+    const raw = await hmac("shpss_test", shBody);
+    const b64of = (buf: Uint8Array) => btoa(Array.from(buf).map((b) => String.fromCharCode(b)).join(""));
+    const canonical = b64of(raw);
+    const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const variants = [
+      ...new Set(
+        ALPHABET.split("").map((ch) => canonical.slice(0, 42) + ch + "=").filter((v) =>
+          b64of(Uint8Array.from(atob(v), (ch) => ch.charCodeAt(0))) === canonical
+        ),
+      ),
+    ];
+    assert(variants.length > 1, `base64 must actually have slack here, got ${variants.length}`);
+    assert((await send(shId, { "x-shopify-hmac-sha256": canonical }, shBody)).ok, "a Shopify delivery lands");
+    for (const spelling of variants) {
+      assertEquals(
+        (await send(shId, { "x-shopify-hmac-sha256": spelling }, shBody)).status,
+        409,
+        `a re-spelled digest is the same delivery: ${spelling}`,
+      );
+    }
+    const wrong = await send(ghId, await ghSign(ghBody, "not-it"), ghBody);
+    assertEquals(wrong.status, 401);
+    assert((await wrong.text()).includes("does not match its body"));
+    // Our own header is no longer what this sheet is checked against.
+    const ours = await send(ghId, {
+      "scrapsheets-signature": await hookSign(await hookSecret(ghId), `/net/${ghId}`, ghBody),
+    }, ghBody);
+    assertEquals(ours.status, 401, "a sheet configured for GitHub is not also on our scheme");
+
+    // One scheme per sheet: with two, the header a sender chose would decide
+    // which check it faced. The insert is what asks, so two at once cannot both
+    // land and leave the sheet refusing every delivery.
+    await reject(jwt, `/library/${ghId}/secret`, {
+      method: "POST",
+      body: JSON.stringify({ name: "hook:stripe", value: "whsec_x" }),
+    });
+    const race = automerge.create<Sheet>({ type: "net-hook", data: [] });
+    const raceId = `net-hook:${race.documentId}`;
+    await put(jwt, `/library/${raceId}`, {});
+    const both = await Promise.all(
+      ["hook:stripe", "hook:shopify"].map((name) =>
+        app.request(`/library/${raceId}/secret`, {
+          method: "POST",
+          headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+          body: JSON.stringify({ name, value: "v" }),
+        })
+      ),
+    );
+    assertEquals(both.filter((res) => res.ok).length, 1, "exactly one of two concurrent schemes may land");
+    // Both landing leaves the sheet unable to answer at all: verifyDelivery
+    // refuses to guess which scheme was meant, so every delivery becomes a 500.
+    const judged = await send(raceId, { "x-shopify-hmac-sha256": `${"A".repeat(43)}=` }, "{}");
+    assertEquals(judged.status, 401, `a delivery must still be judged, not crash: ${await judged.text()}`);
+    await request(jwt, `/library/${ghId}/secret`, { method: "DELETE", body: JSON.stringify({ name: "hook:github" }) });
+    const after = JSON.stringify({ action: "after" });
+    assertEquals((await send(ghId, await ghSign(after), after)).status, 401, "deleting the secret ends the scheme");
+    await reject(jwt, `/library/${ghId}/secret`, { method: "DELETE", body: JSON.stringify({ name: "hook:github" }) });
   }
 
   // Every failure lands on one sheet, so "what is breaking, and where" is a
@@ -2397,6 +2674,65 @@ Deno.test(async function allTests(_t) {
     await settle();
     assertEquals(await counted(elsewhere), 1, "suppression is per status and path, never global");
 
+    // A burst that stops must not read as one failure. What a suppressed minute
+    // hid sits in memory until that key writes again, which never comes once
+    // the burst ends -- so the broom flushes it. Counted the way the two
+    // conditions out of this sheet count it: each row is itself plus its folds.
+    const occurrences = async (path: string) => {
+      const [{ n }] = await sql`
+        select coalesce(sum(1 + coalesce(substring(meta->>'folded' from '^[0-9]{1,9}$')::int, 0)), 0) as n
+        from net where sheet_id = 'net-hook:errors' and meta->>'path' = ${path}
+      `;
+      return Number(n);
+    };
+    const burst = `/no-such-route-${crypto.randomUUID()}`;
+    for (let i = 0; i < 6; i++) await app.request(burst);
+    await settle();
+    assertEquals(await counted(burst), 1, "six rejections inside one minute are one row");
+    assertEquals(await occurrences(burst), 1, "and the other five are still only in memory");
+    await flushFolds(Date.now() + LOG_EVERY_MS + 1);
+    assertEquals(await counted(burst), 2, "the flush is a second row, not a rewrite of the first");
+    assertEquals(await occurrences(burst), 6, "every one of the six is counted");
+    await flushFolds(Date.now() + LOG_EVERY_MS + 1);
+    assertEquals(await occurrences(burst), 6, "a burst already flushed is not counted a second time");
+
+    // Your own failures, without a share on the operator's sheet. Safe to widen
+    // because the row keeps header and query names and never their values, so
+    // this read leaks nothing the operator's read does not.
+    const frank = await usr("frank@example.com");
+    const gina = await usr("gina@example.com");
+    const franks = `/no-such-route-${crypto.randomUUID()}`;
+    const ginas = `/no-such-route-${crypto.randomUUID()}`;
+    await app.request(franks, { headers: new Headers({ Authorization: `Bearer ${frank.jwt}` }) });
+    await app.request(ginas, { headers: new Headers({ Authorization: `Bearer ${gina.jwt}` }) });
+    await settle();
+    const paths = async (token: string) => {
+      const [, ...rows] = await get<Table>(token, "/sheet/net-hook:errors");
+      return rows.map((r) => JSON.parse(String(r.meta)).path);
+    };
+    assert((await paths(frank.jwt)).includes(franks), "you read back the failure your own request caused");
+    // A 5xx body is the stack the 500 response deliberately withheld. Reading
+    // your own failures must not hand it back.
+    await sql`insert into net ${
+      sql({
+        sheet_id: "net-hook:errors",
+        body: "Error: boom\n    at /Users/somebody/main.ts:1:1",
+        method: "GET",
+        req_headers: sql.json({ names: "(none)" }),
+        query_params: sql.json({ names: "(none)" }),
+        meta: sql.json({ status: 500, path: "/boom", usr_id: frank.usr_id }),
+      })
+    }`;
+    const [, ...franksRows] = await get<Table>(frank.jwt, "/sheet/net-hook:errors");
+    const franksLog = JSON.stringify(franksRows);
+    assert(franksLog.includes("/boom"), "you still see that it failed, and where");
+    assert(!franksLog.includes("main.ts:1:1"), "but never the stack the 500 response withheld");
+    const [, ...operatorRows] = await get<Table>(jwt, "/sheet/net-hook:errors");
+    assert(JSON.stringify(operatorRows).includes("main.ts:1:1"), "the operator's log still keeps it");
+    assert(!(await paths(frank.jwt)).includes(ginas), "and never the one somebody else's did");
+    const operator = await paths(jwt);
+    assert(operator.includes(franks) && operator.includes(ginas), "the operator still reads every row");
+
     // A suppressed write must not clear `logWriteFailures`. Cleared by a
     // suppression, a database refusing every insert reads as a service with no
     // failures -- and the two conditions counted out of this sheet read an
@@ -2423,6 +2759,100 @@ Deno.test(async function allTests(_t) {
     await app.request(healed);
     await settle();
     assertEquals((await status())[reaching]["0"], 1, "one real write clears it again");
+  }
+
+  // Which feed stopped refreshing. /status grades them in aggregate and names
+  // none of them, so this is the read that says which one is rotten.
+  {
+    const { jwt } = await usr("zoe@example.com");
+    const fresh = automerge.create<Sheet>({ type: "net-http", data: [{ url: "https://example.com/a", interval: 60 }] });
+    const rotten = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://example.com/b", interval: 60 }],
+    });
+    const silent = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://example.com/c", interval: 60 }],
+    });
+    const ids = [fresh, rotten, silent].map((h) => `net-http:${h.documentId}`);
+    for (const [i, hand] of [fresh, rotten, silent].entries())
+      await put(jwt, `/library/net-http:${hand.documentId}`, { name: `feed-${i}` });
+    const run = (sheet_id: string, status: number, ago: string) =>
+      sql`insert into net (sheet_id, method, body, meta, created_at)
+          values (${sheet_id}, 'GET', '{}', ${sql.json({ status, ms: 5, bytes: 2 })}, now() - ${ago}::interval)`;
+    await run(ids[0], 200, "1 minute");
+    // Two failures since the last good one, which is the number the alarm
+    // cannot give you today.
+    await run(ids[1], 200, "3 hours");
+    await run(ids[1], 500, "2 hours");
+    await run(ids[1], 0, "1 hour");
+    // ids[2] has never run at all -- a poller that never fired once, which an
+    // inner join would drop and so report as healthy.
+
+    const rows = async (token: string) => {
+      const [cols, ...body] = await get<Table>(token, "/sheet/library:freshness");
+      return { names: Object.values(cols).map((c) => (c as Col).name), body };
+    };
+    const { names, body } = await rows(jwt);
+    assertEquals(
+      names.join(),
+      "sheet_id,name,type,last_run,last_ok,failures_since_ok,last_meta",
+      "the freshness sheet has a stable shape, because a query sheet selects from it",
+    );
+    const byId = Object.fromEntries(body.map((r) => [String(r.sheet_id), r]));
+    assertEquals(Object.keys(byId).sort(), [...ids].sort(), "one row per feed the caller can read");
+    assertEquals(Number(byId[ids[0]].failures_since_ok), 0);
+    assertEquals(Number(byId[ids[1]].failures_since_ok), 2, "the failures since the last good run are counted");
+    assertEquals(byId[ids[2]].last_run, null, "a feed that never ran is the failure this read is for");
+    assertEquals(String(body[0].sheet_id), ids[2], "stalest first: never-run sorts above everything");
+    // The meta of that run rides along, cast to text, so a query sheet can read
+    // it with json_extract the way it reads a net sheet's headers.
+    assertEquals(JSON.parse(String(byId[ids[1]].last_meta)).status, 0);
+
+    // Two runs sharing a timestamp. Compared on created_at alone, last_ok equals
+    // last_run and the count is zero, so the failing sheet reads healthy --
+    // which is the one thing this read exists to prevent.
+    const tied = automerge.create<Sheet>({ type: "net-http", data: [{ url: "https://example.com/t", interval: 60 }] });
+    const tiedId = `net-http:${tied.documentId}`;
+    await put(jwt, `/library/${tiedId}`, { name: "feed-tied" });
+    await sql`
+      insert into net (sheet_id, method, body, meta) values
+        (${tiedId}, 'GET', 'ok', ${sql.json({ status: 200 })}),
+        (${tiedId}, 'GET', 'bad', ${sql.json({ status: 500 })})
+    `;
+    const tiedRow = (await rows(jwt)).body.find((r) => String(r.sheet_id) === tiedId);
+    assertEquals(Number(tiedRow?.failures_since_ok), 1, "a tie on the timestamp is broken by net_id, not ignored");
+
+    // Shape is not magnitude: '99999999999999999999' is all digits and still
+    // out of range for an int, and it used to take both this read and the
+    // status check -- the alarm itself -- to 500.
+    await sql`
+      insert into net (sheet_id, method, body, meta)
+      values (${ids[0]}, 'GET', 'x', ${sql.json({ status: "99999999999999999999" })})
+    `;
+    assertEquals((await rows(jwt)).body.length > 0, true, "one unreadable status must not empty the answer");
+    assertEquals(Object.keys(await status()).length, 13, "nor take the alarm down with it");
+    await sql`delete from net where sheet_id = ${ids[0]} and body = 'x'`;
+
+    // Somebody else's feeds are not in it, and the route is the same answer.
+    const { jwt: outsider } = await usr("zane@example.com");
+    assertEquals((await rows(outsider)).body.length, 0, "you see the feeds you can read and no others");
+    const viaRoute = await get<Table>(jwt, "/library/freshness");
+    assertEquals(viaRoute.length, (await rows(jwt)).body.length + 1, "GET /library/freshness is the same sheet");
+
+    // It exports and a query sheet selects from it, because it goes through
+    // sheet() like everything else.
+    const csv = await app.request("/export/library:freshness.csv", {
+      headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+    });
+    assert(csv.ok, `the freshness sheet must export: ${csv.status}`);
+    assert((await csv.text()).includes(ids[1]), "and the export must carry the rotten feed");
+    const answer = await post(jwt, "/query", {
+      lang: "sql",
+      code: `select count(*) as n from @library:freshness where failures_since_ok > 0`,
+    }).then((res) => res.data);
+    // The rotten feed and the tied one; the never-run feed has failed nothing.
+    assertEquals(Number((answer as Table)[1].n), 2, "a query sheet can select from it");
   }
 
   // The bucket a flood is counted against must be one the flood cannot choose.
@@ -2562,7 +2992,7 @@ Deno.test(async function allTests(_t) {
     const [{ refused: refusedRows }] = await sql`
       select count(*) as refused from net
       where sheet_id = 'net-hook:errors'
-        and substring(meta->>'status' from '^[0-9]+$')::int = 401
+        and substring(meta->>'status' from '^[0-9]{1,9}$')::int = 401
         and meta->>'path' like '/net/%'
     `;
     assertEquals(Number(refusedRows), 1, "the refusals condition must count rows this app wrote");

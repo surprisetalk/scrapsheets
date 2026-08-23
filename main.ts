@@ -78,7 +78,12 @@ const dsnAesKey = crypto.subtle
   .digest("SHA-256", new TextEncoder().encode(DSN_KEY))
   .then((bits) => crypto.subtle.importKey("raw", bits, "AES-GCM", false, ["encrypt", "decrypt"]));
 
-const encryptDsn = async (plain: string): Promise<string> => {
+// Application-level AES-256-GCM under DSN_ENCRYPTION_KEY, for the two things
+// that must not sit in the database in the clear: a codex connection string and
+// a sheet's own secrets. `what` is only ever read back in the failure message,
+// which has to name the thing that could not be decrypted -- one key, two
+// kinds of value, and "could not decrypt" alone does not say which.
+const encrypt = async (plain: string): Promise<string> => {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const cipher = new Uint8Array(
     await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await dsnAesKey, new TextEncoder().encode(plain)),
@@ -89,7 +94,7 @@ const encryptDsn = async (plain: string): Promise<string> => {
   return b64(buf);
 };
 
-const decryptDsn = async (stored: string): Promise<string> => {
+const decrypt = async (what: string, stored: string): Promise<string> => {
   try {
     const buf = unb64(stored);
     const plain = await crypto.subtle.decrypt(
@@ -100,7 +105,12 @@ const decryptDsn = async (stored: string): Promise<string> => {
     return new TextDecoder().decode(plain);
   } catch {
     throw new HTTPException(500, {
-      message: "Could not decrypt DSN. Was DSN_ENCRYPTION_KEY changed? Re-save the connection string.",
+      message: explain(`Could not decrypt the ${what}.`, {
+        Received: "ciphertext this key does not open",
+        Expected: "a value encrypted under the current DSN_ENCRYPTION_KEY",
+        Source: "DSN_ENCRYPTION_KEY, which every stored secret and DSN is sealed with",
+        Fix: `restore the previous DSN_ENCRYPTION_KEY, or save the ${what} again under this one`,
+      }),
     });
   }
 };
@@ -155,27 +165,36 @@ const hookMac = async (secret: string, message: Uint8Array<ArrayBuffer>): Promis
 export const hookSecret = async (sheet_id: string): Promise<string> =>
   hex(await hookMac(TOKEN_SECRET, new TextEncoder().encode(`hook:${sheet_id}`)));
 
-// What is actually signed: the timestamp exactly as it appears in the header, a
-// dot, then the body's own bytes. Bytes rather than a decoded string, because
-// decoding a non-UTF-8 payload replaces characters and would make a correctly
-// signed delivery unverifiable.
-const hookMessage = (t: string, body: Uint8Array): Uint8Array<ArrayBuffer> => {
-  const prefix = new TextEncoder().encode(`${t}.`);
+// What is actually signed. v1 is the timestamp exactly as it appears in the
+// header, a dot, then the body's own bytes. v2 puts the request target between
+// them, because under v1 a delivery's identity was the body alone: two
+// genuinely different deliveries carrying the same body in the same second were
+// one delivery, so a fan-out that discriminates by query string lost every copy
+// after the first to a replay refusal. The delimiter is a newline, since a URL
+// cannot carry a raw one while a path can carry any number of dots.
+//
+// Bytes rather than a decoded string, because decoding a non-UTF-8 payload
+// replaces characters and would make a correctly signed delivery unverifiable.
+const hookMessage = (scheme: "v1" | "v2", t: string, target: string, body: Uint8Array): Uint8Array<ArrayBuffer> => {
+  const prefix = new TextEncoder().encode(scheme === "v1" ? `${t}.` : `${t}\n${target}\n`);
   const message = new Uint8Array(prefix.length + body.length);
   message.set(prefix);
   message.set(body, prefix.length);
   return message;
 };
 
-/** The `scrapsheets-signature` header value for one delivery. Exported because
- * the tests sign the same way a sender does, rather than re-deriving it. */
+/** The `scrapsheets-signature` header value for one delivery, in the current
+ * scheme. Takes the secret rather than the sheet id, because that is what a
+ * sender holds -- and because a sheet's secret is no longer always the derived
+ * one. Exported so the tests sign the same way a sender does. */
 export const hookSign = async (
-  sheet_id: string,
+  secret: string,
+  target: string,
   body: string,
   t: number = Math.floor(Date.now() / 1000),
 ): Promise<string> => {
-  const mac = await hookMac(await hookSecret(sheet_id), hookMessage(String(t), new TextEncoder().encode(body)));
-  return `t=${t},v1=${hex(mac)}`;
+  const mac = await hookMac(secret, hookMessage("v2", String(t), target, new TextEncoder().encode(body)));
+  return `t=${t},v2=${hex(mac)}`;
 };
 
 // crypto.subtle.verify does the comparison, so no digest equality is written by
@@ -184,7 +203,7 @@ export const hookSign = async (
 const hookVerify = async (secret: string, message: Uint8Array<ArrayBuffer>, signature: string): Promise<boolean> => {
   const bytes = Uint8Array.from((signature.match(/../g) ?? []).map((pair) => {
     const byte = parseInt(pair, 16);
-    if (!Number.isInteger(byte)) throw new Error(`Expected two hex digits in a v1 signature, received ${pair}.`);
+    if (!Number.isInteger(byte)) throw new Error(`Expected two hex digits in a signature digest, received ${pair}.`);
     return byte;
   }));
   return await crypto.subtle.verify("HMAC", await hmacKey(secret), bytes, message);
@@ -223,15 +242,6 @@ const rateLimit = (identifier: string): boolean => {
 // vary its own key mints entries faster than a 60-second broom removes them.
 // Insertion order is iteration order, so the oldest key is the first one out.
 const RATE_LIMIT_KEYS_MAX = 10_000;
-
-// Cleanup stale rate limit entries periodically
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, bucket] of rateLimitBuckets) {
-    if (now - bucket.lastRefill > RATE_LIMIT_WINDOW_MS)
-      rateLimitBuckets.delete(key);
-  }
-}, RATE_LIMIT_WINDOW_MS);
 
 ala.options.modifier = "RECORDSET";
 register(ala);
@@ -405,6 +415,45 @@ const sheet = async (
   path_: string[] = [],
 ): Promise<Page> => {
   const [type, doc_id] = sheet_id.split(":");
+  // Sheets the server computes rather than stores answer before the document
+  // lookup: they have no automerge document and no sheet row, and their own
+  // where clause is the access rule.
+  if (sheet_id === FRESHNESS_SHEET) return await freshness(c, { limit, offset });
+  // The failure log answers before the membership check, because a caller with
+  // no share on it still owns the failures their own requests caused. The where
+  // clause is the access rule: the operator reads every row through their
+  // viewer grant, everybody else reads the rows their own account caused, and
+  // an anonymous caller owns nothing and reads nothing. Safe to widen because
+  // the row stores header and query names only, never values.
+  if (sheet_id === ERROR_SHEET) {
+    const usr_id = c.get("usr_id") ?? null;
+    const [operator] = await sql`
+      select true from sheet_usr where sheet_id = ${ERROR_SHEET} and usr_id = ${usr_id}
+    `;
+    return await cselect({
+      cols: null,
+      // A 5xx body is the stack `onError` recorded: file paths, line numbers,
+      // dependency internals, and the failing SQL out of a postgres.js error.
+      // The 500 response deliberately answers "Sorry, something went wrong",
+      // and this read must not undo that. A 4xx body is the explain() block
+      // about the caller's own request and is theirs to read.
+      select: operator
+        ? sql`select n.created_at, n.body, n.method,
+                     n.req_headers::text, n.query_params::text, n.meta::text`
+        : sql`select n.created_at,
+                     case when coalesce(substring(n.meta->>'status' from '^[0-9]{1,9}$')::int, 500) < 500
+                          then n.body
+                          else 'The server failed on this request. The message is in the operator log.' end as body,
+                     n.method, n.req_headers::text, n.query_params::text, n.meta::text`,
+      from: sql`from net n`,
+      where: operator
+        ? [sql`n.sheet_id = ${ERROR_SHEET}`]
+        : [sql`n.sheet_id = ${ERROR_SHEET}`, sql`n.meta->>'usr_id' = ${usr_id}`],
+      order: sql`order by n.created_at desc, n.net_id desc`,
+      limit,
+      offset,
+    });
+  }
   await assertSheetAccess(c, sheet_id);
   const hand = await automerge
     .find<{ data: Sheet["data"] }>(doc_id as AnyDocumentId)
@@ -1439,11 +1488,10 @@ let logWriteFailures = 0;
 // keystroke, that is most of them. The alternative is a key that includes the
 // message, which folds nothing at all on exactly the flood it exists for.
 //
-// A burst that stops is undercounted by whatever it did in its final window:
-// that count sits in memory until the key writes again, which never happens if
-// the burst ended. A sender that cannot sign keeps retrying, which is the case
-// the refusals condition is written for, so it flushes every minute.
-const LOG_EVERY_MS = 60_000;
+// A message is kept for the first failure of a window and not for the rest, so
+// the count is complete and the diagnosis is a sample. flushFolds below is what
+// keeps the count complete when a burst stops rather than retrying.
+export const LOG_EVERY_MS = 60_000;
 // Bounded, because a scanner walking unknown paths mints a key per request.
 // Insertion order is iteration order, so the oldest key is the first one out.
 const LOG_KEYS_MAX = 1_000;
@@ -1456,6 +1504,7 @@ const logSeen = new Map<string, { at: number; folded: number }>();
  * which is the one thing this log cannot report about itself. */
 const logFailure = async (c: Context, status: number, message: string): Promise<boolean> => {
   const path = new URL(c.req.url).pathname;
+  const usr_id = c.get("usr_id");
   const key = `${status} ${path}`;
   const seen = logSeen.get(key) ?? { at: 0, folded: 0 };
   const at = Date.now();
@@ -1482,7 +1531,11 @@ const logFailure = async (c: Context, status: number, message: string): Promise<
       // token into a sheet that can be shared and exported.
       req_headers: sql.json({ names: [...c.req.raw.headers.keys()].sort().join(", ") || "(none)" }),
       query_params: sql.json({ names: Object.keys(c.req.query()).sort().join(", ") || "(none)" }),
-      meta: sql.json({ status, path, ...(folded ? { folded } : {}) }),
+      // Who caused it, so a caller can read back their own failures without a
+      // share on the operator's sheet. Absent on an unauthenticated failure and
+      // on one the jwt middleware itself raised, which is the honest answer:
+      // nobody owns it.
+      meta: sql.json({ status, path, ...(folded ? { folded } : {}), ...(usr_id ? { usr_id } : {}) }),
     })
   }`;
   // Subtract what this row carried rather than zeroing: onError does not await
@@ -1494,6 +1547,82 @@ const logFailure = async (c: Context, status: number, message: string): Promise<
   await trimNet(ERROR_SHEET);
   return true;
 };
+
+/** Writes what a burst that stopped never got to say. logFailure folds repeats
+ * onto the entry in `logSeen`, and they ride the next row that key writes --
+ * which never comes once the burst ends, so 6,000 refused deliveries inside one
+ * minute that then stops used to read as one.
+ *
+ * A row in this sheet stands for itself plus its folds, because that is how the
+ * two conditions counted out of it add suppression back (`sum(1 + folded)`). So
+ * `n` pending occurrences are written as `folded: n - 1`: declaring `n` would
+ * count the burst once too often, which is the same lie in the other direction.
+ *
+ * No usr_id and no header names: the key is a status and a path, so the row may
+ * span several callers and there is no request left to read anything off. That
+ * is also what tells "one failure" apart from "one failure we kept a message
+ * for". */
+export const flushFolds = async (now = Date.now()): Promise<void> => {
+  for (const [key, seen] of logSeen) {
+    if (now - seen.at < LOG_EVERY_MS) continue;
+    if (!seen.folded) {
+      // An expired window with nothing pending has nothing left to say, and the
+      // next failure on this key writes a fresh row anyway. This is the only
+      // eviction by time logSeen has; LOG_KEYS_MAX is the one by count.
+      logSeen.delete(key);
+      continue;
+    }
+    // Claimed synchronously, before the await. logFailure subtracts after its
+    // insert instead, because it sets `seen.at` first and so every failure
+    // arriving during the round trip is suppressed onto the same entry. This
+    // one leaves `at` expired on purpose -- the next failure on this key should
+    // write a row with its own message -- so a failure landing mid-flush takes
+    // the write path, and both writers would carry the same count. Zeroing
+    // first is what makes the flush the only owner of it.
+    const folded = seen.folded;
+    seen.folded = 0;
+    const cut = key.indexOf(" ");
+    const status = Number(key.slice(0, cut));
+    const path = key.slice(cut + 1);
+    try {
+      await sql`insert into net ${
+        sql({
+          sheet_id: ERROR_SHEET,
+          body: `${folded} more failures on this status and path inside one minute. The first kept its ` +
+            `message; this row is the rest of the count.`,
+          method: "FOLD",
+          req_headers: sql.json({ names: "(none)" }),
+          query_params: sql.json({ names: "(none)" }),
+          meta: sql.json({ status, path, ...(folded > 1 ? { folded: folded - 1 } : {}) }),
+        })
+      }`;
+      logWriteFailures = 0;
+      await trimNet(ERROR_SHEET);
+    } catch (err) {
+      // Added back rather than assigned, because a failure suppressed during
+      // the round trip has folded onto the entry since it was claimed.
+      seen.folded += folded;
+      // A logging failure must never replace the failure being logged, and
+      // there is no response here to replace it with. It is counted instead,
+      // which is the one fact about this log that cannot be read out of it.
+      logWriteFailures++;
+      console.error(`error log ${ERROR_SHEET}:`, err);
+    }
+  }
+};
+
+// One broom, every RATE_LIMIT_WINDOW_MS. It evicts rate-limit buckets that have
+// gone idle and flushes the fold counts of bursts that stopped -- both are
+// bounded maps that a caller minting keys can grow, and both are swept on the
+// same minute LOG_EVERY_MS folds on.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of rateLimitBuckets) {
+    if (now - bucket.lastRefill > RATE_LIMIT_WINDOW_MS)
+      rateLimitBuckets.delete(key);
+  }
+  flushFolds().catch((err) => console.error("fold flush:", err));
+}, RATE_LIMIT_WINDOW_MS);
 
 app.onError((err, c) => {
   const known = err instanceof HTTPException;
@@ -1530,6 +1659,22 @@ app.onError((err, c) => {
 // Each key is the sentence the grade is about. Each value maps a seconds-ago
 // offset to the grade as of then, so the reader sees a trend and not a
 // snapshot. A condition that can only be measured now carries "0" alone.
+// What a good run looks like, for each of the two kinds of run there are. Both
+// GET /status and the library:freshness sheet read these, because two hand-
+// copied copies had already drifted: a run that said "sent" with a delivery
+// that failed was a failure to one and a success to the other, so the sheet
+// whose whole job is naming the rotten alert read healthy on exactly that one.
+//
+// Both name the alias `n`, and every read out of jsonb is guarded inside a
+// case rather than beside it with `and`: Postgres does not promise to evaluate
+// `and` left to right, so a guard next to the cast is a guard the planner may
+// run second.
+const POLL_OK = () => sql`substring(n.meta->>'status' from '^[0-9]{1,9}$')::int between 200 and 299`;
+const ALERT_OK = () =>
+  sql`(case when n.body is json then n.body::jsonb end)->>'status' <> 'error'
+      and ((case when n.body is json then n.body::jsonb end)->>'delivery' in ('sent', ${HELD})
+           or (case when n.body is json then n.body::jsonb end)->>'status' in ('clear', 'unchanged', 'idle'))`;
+
 const STATUS_AGO = [0, 3600, 86400];
 
 // The numbers each condition's sentence quotes. They are read into the sentence
@@ -1587,9 +1732,14 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
   //
   // Every cast out of jsonb is guarded, because a single row this code did not
   // write would otherwise take the whole endpoint to 500 -- and an uptime
-  // checker cannot tell that from a dead server. `substring(x from '^[0-9]+$')`
-  // answers null rather than raising, and `is json` sits in the where clause,
-  // which an aggregate's filter is evaluated after.
+  // checker cannot tell that from a dead server. `substring(x from
+  // '^[0-9]{1,9}$')` answers null rather than raising, and `is json` sits in
+  // the where clause, which an aggregate's filter is evaluated after.
+  //
+  // Nine digits, not `+`: shape is not magnitude, and `'99999999999999999999'`
+  // is all digits and still out of range for an int. That took this endpoint to
+  // 500 on one row nobody here wrote, which is the exact failure this guard is
+  // for -- and this endpoint is the alarm.
   const overTime = await sql`
     with at as (select seconds, now() - make_interval(secs => seconds) as t
                 from unnest(${STATUS_AGO}::int[]) as seconds)
@@ -1600,31 +1750,25 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
       -- minutes did failures span", and any burst inside REFUSALS_MAX minutes
       -- would pass at any volume.
       1.0 / (1 + (
-        select coalesce(sum(1 + coalesce(substring(n.meta->>'folded' from '^[0-9]+$')::int, 0)), 0) from net n
+        select coalesce(sum(1 + coalesce(substring(n.meta->>'folded' from '^[0-9]{1,9}$')::int, 0)), 0) from net n
         where n.sheet_id = ${ERROR_SHEET}
           and n.created_at > at.t - interval '1 hour' and n.created_at <= at.t
-          and substring(n.meta->>'status' from '^[0-9]+$')::int >= 500
+          and substring(n.meta->>'status' from '^[0-9]{1,9}$')::int >= 500
       )) as no_5xx,
       ${REFUSALS_MAX}::numeric / greatest(1, (
-        select coalesce(sum(1 + coalesce(substring(n.meta->>'folded' from '^[0-9]+$')::int, 0)), 0) from net n
+        select coalesce(sum(1 + coalesce(substring(n.meta->>'folded' from '^[0-9]{1,9}$')::int, 0)), 0) from net n
         where n.sheet_id = ${ERROR_SHEET}
           and n.created_at > at.t - interval '1 hour' and n.created_at <= at.t
-          and substring(n.meta->>'status' from '^[0-9]+$')::int = 401
+          and substring(n.meta->>'status' from '^[0-9]{1,9}$')::int = 401
           and n.meta->>'path' like '/net/%'
       )) as refusals,
       (select case when count(*) = 0 then 1
-                   else count(*) filter (
-                     where substring(n.meta->>'status' from '^[0-9]+$')::int between 200 and 299
-                   )::numeric / count(*) end
+                   else count(*) filter (where ${POLL_OK()})::numeric / count(*) end
        from net n inner join sheet s using (sheet_id)
        where s.type = 'net-http' and n.method = 'GET'
          and n.created_at > at.t - interval '1 hour' and n.created_at <= at.t) as polls_ok,
       (select case when count(*) = 0 then 1
-                   else count(*) filter (
-                     where n.body::jsonb->>'status' <> 'error'
-                       and (n.body::jsonb->>'delivery' in ('sent', ${HELD})
-                            or n.body::jsonb->>'status' in ('clear', 'unchanged', 'idle'))
-                   )::numeric / count(*) end
+                   else count(*) filter (where ${ALERT_OK()})::numeric / count(*) end
        from net n
        where n.method = 'ALERT' and n.body is json
          and n.created_at > at.t - interval '1 day' and n.created_at <= at.t) as alerts_delivered,
@@ -1655,7 +1799,7 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
       (select coalesce(min((2 * interval_s)::numeric / greatest(1, extract(epoch from (now() - last)))), 1)
        from (select coalesce(max(n.created_at), s.created_at) as last,
                     coalesce(
-                      (array_agg(substring(n.meta->>'interval' from '^[0-9]+$')::int
+                      (array_agg(substring(n.meta->>'interval' from '^[0-9]{1,9}$')::int
                                  order by n.created_at desc))[1], 3600) as interval_s
              from sheet s left join net n on n.sheet_id = s.sheet_id and n.method = 'ALERT'
              where s.type = 'alert' group by s.sheet_id, s.created_at) runs) as alerts_fresh,
@@ -1988,6 +2132,243 @@ export const trimNet = async (sheet_id: string): Promise<void> => {
   `.catch((err: unknown) => console.error(`net retention ${sheet_id}:`, err));
 };
 
+// --- delivery signatures
+//
+// Ours is one scheme and every provider signs its own way, so a sheet's stored
+// secrets decide which verifier runs. Never the request: a header the sender
+// chose must not be able to pick the check it is measured against, or a spoofed
+// stripe-signature would select the verifier for a secret nobody set.
+const HOOK_HEADERS: Record<string, string> = {
+  "hook": "scrapsheets-signature",
+  "hook:stripe": "stripe-signature",
+  "hook:github": "x-hub-signature-256",
+  "hook:shopify": "x-shopify-hmac-sha256",
+};
+
+// Current and previous, tried in that order. Two is what a rollover needs and
+// one more than that is a secret nobody meant to leave working.
+const SECRET_KEEP = 2;
+
+type HookKey = { value: string; at: string };
+
+/** Which scheme this sheet is signed with, and the keys a delivery may carry,
+ * newest first.
+ *
+ * The derived key rides along as the implicit previous one until a second
+ * rotation retires it. Without that, storing a sheet's first secret would drop
+ * every sender still using the derived one at the instant it was written --
+ * which is the missed delivery the rollover exists to avoid. */
+const hookKeys = async (sheet_id: string): Promise<{ name: string; keys: HookKey[] }> => {
+  const rows = await sql`
+    select name, value_encrypted, created_at from secret
+    where sheet_id = ${sheet_id} and (name = 'hook' or name like 'hook:%')
+    order by created_at desc, secret_id desc
+  `;
+  const names: string[] = [...new Set<string>(rows.map((row: { name: string }) => String(row.name)))];
+  if (names.length > 1) {
+    // POST /library/:id/secret refuses the second one, so reaching here means
+    // the table was written around the route. Guessing which scheme was meant
+    // is the one thing this must not do.
+    throw new HTTPException(500, {
+      message: explain(`Sheet ${sheet_id} is configured for more than one signing scheme.`, {
+        Received: `secrets named ${names.sort().join(", ")}`,
+        Expected: "at most one of " + Object.keys(HOOK_HEADERS).join(", "),
+        Source: "the secret table",
+        Fix: `delete the ones that do not apply with DELETE /library/${sheet_id}/secret`,
+      }),
+    });
+  }
+  const name = names[0] ?? "hook";
+  if (!HOOK_HEADERS[name]) {
+    throw new HTTPException(500, {
+      message: explain(`Sheet ${sheet_id} names a signing scheme this server does not know.`, {
+        Received: `a secret named ${JSON.stringify(name)}`,
+        Expected: Object.keys(HOOK_HEADERS).join(", "),
+        Source: "the secret table",
+        Fix: `delete it with DELETE /library/${sheet_id}/secret`,
+      }),
+    });
+  }
+  const keys: HookKey[] = [];
+  for (const row of rows.slice(0, SECRET_KEEP)) {
+    keys.push({
+      value: await decrypt(`${name} secret`, String(row.value_encrypted)),
+      at: new Date(row.created_at as string).toISOString(),
+    });
+  }
+  if (name === "hook" && keys.length < SECRET_KEEP) keys.push({ value: await hookSecret(sheet_id), at: "derived" });
+  return { name, keys };
+};
+
+// None of these prints the secret or the expected digest: a rejection that does
+// is a signing oracle. Each names its own check, because "401" tells a sender
+// nothing about which half of the handshake it got wrong. The type annotation
+// is on the binding rather than the arrow, which is what lets a call to it read
+// as terminal and spare every caller a trailing throw.
+const unsigned: (message: string, fields: Record<string, string>) => never = (message, fields) => {
+  throw new HTTPException(401, { message: explain(message, fields) });
+};
+
+const skewed = (sheet_id: string, sent: number): void => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (Math.abs(nowSec - sent) > HOOK_SKEW) {
+    unsigned(`The signature on this delivery to ${sheet_id} is outside the replay window.`, {
+      Received: `t=${sent}, which is ${Math.abs(nowSec - sent)} seconds ${sent < nowSec ? "old" : "in the future"}`,
+      Expected: `a t within ${HOOK_SKEW} seconds of ${nowSec}, this server's clock`,
+      Source: "the t field of the signature header",
+      Fix: "sign with the current time rather than a stored header, and check the sender's clock",
+    });
+  }
+};
+
+/** Checks one delivery against the sheet's own scheme and its own keys, and
+ * answers which scheme and which key said yes -- both of which ride the row, so
+ * "is anyone still sending the old secret" is a query rather than a guess, and
+ * a rollover has a visible end. */
+const verifyDelivery = async (
+  c: Context,
+  sheet_id: string,
+  raw: Uint8Array<ArrayBuffer>,
+  size: number,
+  heard: string,
+): Promise<{ scheme: string; secret_at: string; sig: string }> => {
+  const { name, keys } = await hookKeys(sheet_id);
+  const provider = name.slice("hook:".length);
+  const header = HOOK_HEADERS[name];
+  const url = new URL(c.req.url);
+  const target = url.pathname + url.search;
+  const signature = c.req.header(header);
+  if (!signature) {
+    unsigned(`This delivery to ${sheet_id} is not signed.`, {
+      Received: `headers ${heard}`,
+      Expected: name === "hook"
+        ? "a scrapsheets-signature header, formatted t=<unix seconds>,v2=<64 lowercase hex characters>"
+        : `a ${header} header, which is what ${provider} signs with`,
+      Source: `the request headers, checked against this sheet's ${name} secret`,
+      Fix: name === "hook"
+        ? `read this sheet's signing secret with GET /library/${sheet_id}/hook, then sign ` +
+          `"<t>\\n<path and query>\\n<body>" with HMAC-SHA256`
+        : `send this delivery from ${provider}, or delete the ${name} secret to use scrapsheets' own scheme`,
+    });
+  }
+
+  if (name === "hook") {
+    // Lowercase only. parseInt is case-insensitive, so an upper-cased digest
+    // verifies against the same secret while reading as a different string --
+    // and the uniqueness that refuses a replay is over the header as sent, so
+    // every one of the 2^64 case variants of one captured signature was a free
+    // replay. A hex digest has one canonical spelling; this is where it is
+    // required.
+    //
+    // v1 is still accepted: it is what every sender writing against the old
+    // readme implements, and refusing it would be the missed delivery this
+    // whole section exists to avoid. It signs the body alone, so it keeps the
+    // old identity semantics -- no worse than before, and meta.scheme is how
+    // you find out who is still on it.
+    const parts = signature.match(/^t=(\d{1,10}),(v1|v2)=([0-9a-f]{64})$/);
+    if (!parts) {
+      unsigned(`The signature on this delivery to ${sheet_id} is malformed.`, {
+        Received: JSON.stringify(signature),
+        Expected: "t=<unix seconds>,v2=<64 lowercase hex characters>, in that order, with no spaces",
+        Source: "the scrapsheets-signature header",
+        Fix: 'build it as `t=$(date +%s),v2=$(printf "%s\\n%s\\n%s" "$t" "$path" "$body" | openssl dgst -sha256 ' +
+          `-hmac "$secret" -r | cut -d' ' -f1)\``,
+      });
+    }
+    const t = parts[1];
+    // The regex above admits v1 and v2 and nothing else, which is what makes
+    // this narrowing total rather than a default.
+    const scheme = parts[2] as "v1" | "v2";
+    const digest = parts[3];
+    skewed(sheet_id, Number(t));
+    for (const key of keys) {
+      if (await hookVerify(key.value, hookMessage(scheme, t, target, raw), digest))
+        return { scheme, secret_at: key.at, sig: `t=${t},${scheme}=${digest}` };
+    }
+    unsigned(`The signature on this delivery to ${sheet_id} does not match its body.`, {
+      Received: `${scheme} starting ${digest.slice(0, 8)}, over ${size} bytes`,
+      Expected: scheme === "v2"
+        ? `HMAC-SHA256 of "${t}\\n${target}\\n<body>" under this sheet's signing secret`
+        : `HMAC-SHA256 of "${t}.<body>" under this sheet's signing secret`,
+      Source: `the ${scheme} field of the scrapsheets-signature header, tried against ${keys.length} current keys`,
+      // The target is the path as it travels, percent-encoding and all, which
+      // is not the spelling `type:doc_id` has in a sheet id.
+      Fix: "sign the exact bytes you send, unmodified, sign the path exactly as it appears in the request line, " +
+        "and check the secret is this sheet's",
+    });
+  }
+
+  if (name === "hook:stripe") {
+    // Stripe's header is a comma-separated scheme list and may carry more than
+    // one v1, which is exactly how it rolls its own secrets over. Every one is
+    // tried.
+    const stamp = signature.match(/(?:^|,)t=(\d{1,10})(?=,|$)/);
+    const digests = [...signature.matchAll(/(?:^|,)v1=([0-9a-f]{64})(?=,|$)/g)].map((m) => m[1]);
+    if (!stamp || !digests.length) {
+      unsigned(`The stripe-signature on this delivery to ${sheet_id} is malformed.`, {
+        Received: JSON.stringify(signature),
+        Expected: "t=<unix seconds> and at least one v1=<64 lowercase hex characters>, comma separated",
+        Source: "the stripe-signature header",
+        Fix: "forward the header Stripe sent, unmodified",
+      });
+    }
+    skewed(sheet_id, Number(stamp[1]));
+    for (const key of keys) {
+      for (const digest of digests) {
+        if (await hookVerify(key.value, hookMessage("v1", stamp[1], target, raw), digest))
+          return { scheme: "stripe", secret_at: key.at, sig: `t=${stamp[1]},v1=${digest}` };
+      }
+    }
+    unsigned(`The stripe-signature on this delivery to ${sheet_id} does not match its body.`, {
+      Received: `${digests.length} v1 digests over ${size} bytes`,
+      Expected: `HMAC-SHA256 of "${stamp[1]}.<body>" under this sheet's stored Stripe signing secret`,
+      Source: `the stripe-signature header, tried against ${keys.length} stored keys`,
+      Fix: "check the endpoint secret stored on this sheet is the one for this Stripe endpoint",
+    });
+  }
+
+  // GitHub and Shopify sign no timestamp, so neither has a replay window and
+  // the unique index is the whole of their replay protection -- which trimNet
+  // can eventually free on a very busy sheet. Said out loud because it is a
+  // real difference from our own scheme, not an oversight.
+  const digest = name === "hook:github"
+    ? signature.match(/^sha256=([0-9a-f]{64})$/)?.[1]
+    : /^[A-Za-z0-9+/]{43}=$/.test(signature)
+    ? signature
+    : undefined;
+  if (!digest) {
+    unsigned(`The ${header} on this delivery to ${sheet_id} is malformed.`, {
+      Received: JSON.stringify(signature),
+      Expected: name === "hook:github"
+        ? "sha256=<64 lowercase hex characters>"
+        : "a base64 HMAC-SHA256 digest, 44 characters",
+      Source: `the ${header} header`,
+      Fix: `forward the header ${provider} sent, unmodified`,
+    });
+  }
+  for (const key of keys) {
+    if (name === "hook:github") {
+      if (await hookVerify(key.value, raw, digest))
+        return { scheme: provider, secret_at: key.at, sig: `sha256=${digest}` };
+    } else {
+      // Re-encoded from the bytes, not taken from the header. The last base64
+      // character of a 32-byte digest carries four data bits and two ignored
+      // ones, so four header spellings decode to the same digest -- and
+      // Shopify signs no timestamp, so each of those spellings would be a
+      // replay that never goes stale.
+      const bytes = unb64(digest);
+      if (await crypto.subtle.verify("HMAC", await hmacKey(key.value), bytes, raw))
+        return { scheme: provider, secret_at: key.at, sig: b64(bytes) };
+    }
+  }
+  unsigned(`The ${header} on this delivery to ${sheet_id} does not match its body.`, {
+    Received: `a digest over ${size} bytes`,
+    Expected: `HMAC-SHA256 of the body alone under this sheet's stored ${provider} signing secret`,
+    Source: `the ${header} header, tried against ${keys.length} stored keys`,
+    Fix: `check the secret stored on this sheet is the one ${provider} signs this endpoint with`,
+  });
+};
+
 app.post("/net/:id", async (c) => {
   const sheet_id = c.req.param("id");
   const heard = [...c.req.raw.headers.keys()].sort().join(", ") || "(none)";
@@ -2023,6 +2404,21 @@ app.post("/net/:id", async (c) => {
     : new Uint8Array<ArrayBuffer>(await c.req.arrayBuffer());
   const size = declared > NET_BODY_CAP ? declared : raw.byteLength;
   const body = new TextDecoder().decode(raw);
+  // Postgres text cannot hold a NUL, and the column is text because a body is
+  // a body. Verified bytes that cannot be stored used to reach the insert and
+  // come back as an unexplained 500 -- the one 500 a sheet's own owner can
+  // trigger by accident, by pointing a protobuf or a gzip sender at it.
+  const nul = raw.indexOf(0);
+  if (nul >= 0) {
+    throw new HTTPException(400, {
+      message: explain(`This delivery to ${sheet_id} carries a byte that cannot be stored.`, {
+        Received: `a NUL byte at offset ${nul} of ${size}`,
+        Expected: "a body with no NUL bytes; every other byte, valid UTF-8 or not, is kept as sent",
+        Source: "the request body, against the text column it is stored in",
+        Fix: "send text or JSON; base64 the payload if it is binary",
+      }),
+    });
+  }
   if (size > NET_BODY_CAP) {
     throw new HTTPException(413, {
       message: explain(`This delivery to ${sheet_id} is too large to store.`, {
@@ -2034,62 +2430,9 @@ app.post("/net/:id", async (c) => {
     });
   }
   // Every delivery is signed. There is no per-sheet opt-out: without this,
-  // anyone who learns a net sheet's id can append rows to it. The four
-  // rejections below each name their own check, because "401" tells a sender
-  // nothing about which half of the handshake it got wrong -- and none of them
-  // prints the secret or the expected digest, which would make the message a
-  // signing oracle.
-  const signature = c.req.header("scrapsheets-signature");
-  if (!signature) {
-    throw new HTTPException(401, {
-      message: explain(`This delivery to ${sheet_id} is not signed.`, {
-        Received: `headers ${heard}`,
-        Expected: "a scrapsheets-signature header, formatted t=<unix seconds>,v1=<64 lowercase hex characters>",
-        Source: "the request headers",
-        Fix: `read this sheet's signing secret with GET /library/${sheet_id}/hook, then sign ` +
-          `"<t>.<body>" with HMAC-SHA256`,
-      }),
-    });
-  }
-  // Lowercase only. parseInt is case-insensitive, so an upper-cased v1 verifies
-  // against the same secret while reading as a different string -- and the
-  // uniqueness that refuses a replay is over the header as sent, so every one of
-  // the 2^64 case variants of one captured signature was a free replay. A hex
-  // digest has one canonical spelling; this is where it is required.
-  const parts = signature.match(/^t=(\d{1,10}),v1=([0-9a-f]{64})$/);
-  if (!parts) {
-    throw new HTTPException(401, {
-      message: explain(`The signature on this delivery to ${sheet_id} is malformed.`, {
-        Received: JSON.stringify(signature),
-        Expected: "t=<unix seconds>,v1=<64 lowercase hex characters>, in that order, with no spaces",
-        Source: "the scrapsheets-signature header",
-        Fix: 'build it as `t=$(date +%s),v1=$(printf "%s.%s" "$t" "$body" | openssl dgst -sha256 -hmac "$secret" -r ' +
-          "| cut -d' ' -f1)`",
-      }),
-    });
-  }
-  const sent = Number(parts[1]);
-  const nowSec = Math.floor(Date.now() / 1000);
-  if (Math.abs(nowSec - sent) > HOOK_SKEW) {
-    throw new HTTPException(401, {
-      message: explain(`The signature on this delivery to ${sheet_id} is outside the replay window.`, {
-        Received: `t=${sent}, which is ${Math.abs(nowSec - sent)} seconds ${sent < nowSec ? "old" : "in the future"}`,
-        Expected: `a t within ${HOOK_SKEW} seconds of ${nowSec}, this server's clock`,
-        Source: "the t field of the scrapsheets-signature header",
-        Fix: "sign with the current time rather than a stored header, and check the sender's clock",
-      }),
-    });
-  }
-  if (!(await hookVerify(await hookSecret(sheet_id), hookMessage(parts[1], raw), parts[2]))) {
-    throw new HTTPException(401, {
-      message: explain(`The signature on this delivery to ${sheet_id} does not match its body.`, {
-        Received: `v1 starting ${parts[2].slice(0, 8)}, over ${size} bytes`,
-        Expected: `HMAC-SHA256 of "${sent}.<body>" under this sheet's signing secret`,
-        Source: "the v1 field of the scrapsheets-signature header",
-        Fix: "sign the exact bytes you send, unmodified, and check the secret is this sheet's",
-      }),
-    });
-  }
+  // anyone who learns a net sheet's id can append rows to it. Which scheme is
+  // checked comes off the sheet's stored secrets, never off the request.
+  const { scheme, secret_at, sig } = await verifyDelivery(c, sheet_id, raw, size, heard);
   // The skew window bounds a replay to HOOK_SKEW seconds, which is not the same
   // as never: a delivery captured off the wire can be sent again, unchanged,
   // until its t goes stale. The unique index on (sheet_id, signature) is what
@@ -2107,21 +2450,34 @@ app.post("/net/:id", async (c) => {
       method: c.req.method,
       req_headers: sql.json(Object.fromEntries(c.req.raw.headers)),
       query_params: sql.json(c.req.query()),
-      meta: sql.json({ bytes: size }),
+      // Which scheme and which key said yes, and the exact signature that did.
+      // The first two make "is anyone still sending the old secret, or the old
+      // scheme" a query, so a rollover has a visible end. The third is what the
+      // unique index keys on: a header name cannot be the key once a sheet may
+      // be signed by a provider, because then the sender chooses which header
+      // the index reads and a replay costs one junk header.
+      meta: sql.json({ bytes: size, scheme, secret_at, sig }),
     })
-  } on conflict (sheet_id, (req_headers->>'scrapsheets-signature')) do nothing returning net_id`;
+  } on conflict (sheet_id, (meta->>'sig')) do nothing returning net_id`;
   if (!stored) {
     throw new HTTPException(409, {
       message: explain(`This delivery to ${sheet_id} has already been stored.`, {
         Received: "a signature this sheet has already accepted",
-        // The signature covers t and the body, and nothing else -- so two
-        // deliveries carrying the same body in the same second are one
-        // delivery here, however their headers or query strings differ. A
-        // sender that must send the same body twice has to say so in the body.
-        Expected: "one delivery per signature, where a signature is this second plus these bytes",
-        Source: "the scrapsheets-signature header, against this sheet's log",
-        Fix: "put a delivery id in the body, or wait for the next second; a query string is not signed, " +
-          "so varying it does not make a second delivery",
+        // Under v2 a signature covers the second, the request target and the
+        // bytes, so what identifies a delivery is what the sender varies. Under
+        // v1 it was the bytes alone, which made two genuinely different
+        // deliveries carrying the same body in the same second one delivery.
+        Expected: scheme === "v2"
+          ? "one delivery per signature, where a signature is this second, this path and these bytes"
+          : scheme === "v1"
+          ? "one delivery per signature, where a v1 signature is this second and these bytes alone"
+          : `one delivery per ${scheme} signature`,
+        Source: "the signature header, against this sheet's log",
+        Fix: scheme === "v2"
+          ? "put a delivery id in the body or the query string; this exact request has already landed"
+          : scheme === "v1"
+          ? "sign with v2, which covers the path and query too, or put a delivery id in the body"
+          : `${scheme} sends each delivery one signature; this one has already landed`,
       }),
     });
   }
@@ -2714,6 +3070,79 @@ app.post("/sell/:id", async (c) => {
   return c.json(null, 200);
 });
 
+// --- freshness
+//
+// GET /status grades the feeds in aggregate -- "every net-http poll returned
+// 2xx", "every net-http sheet was polled in the past two hours" -- and names
+// none of them, so the alarm says something is rotten without saying what. A
+// dashboard over `net` cannot answer it either: `net` is not a sheet, and every
+// @net-http:x ref reads one feed's rows, so there is nothing to group by.
+//
+// It is a sheet rather than a route, so it pages, exports and can be selected
+// from a query sheet through the paths every other sheet already uses. It has
+// no automerge document and no sheet row, so it answers before the lookup and
+// before the membership check in sheet(): the join to sheet_usr below is the
+// access rule.
+const FRESHNESS_SHEET = "library:freshness";
+
+const freshness = async (c: Context, { limit, offset }: Record<string, string>): Promise<Page> =>
+  await cselect({
+    cols: null,
+    select: sql`select f.*`,
+    // The whole query is the from clause because cselect counts with
+    // `select count(*) ${from} ${where}` and reuses neither the order nor a
+    // group by -- so a grouped query written any other way pages against a
+    // count that is not its own.
+    from: sql`from (
+      select s.sheet_id, s.name, s.type,
+             last.created_at as last_run,
+             ok.created_at as last_ok,
+             -- Rows since the last good one. For an alert this counts rows and
+             -- not runs, because a repeated quiet tick moves the previous row's
+             -- created_at rather than adding another -- which is the same thing
+             -- for this question, since a quiet run is not a failure.
+             -- Compared on the same key the laterals order by. On created_at
+             -- alone, a good run and a bad one sharing a timestamp left
+             -- last_ok equal to last_run and the count at zero, so the sheet
+             -- this read exists to surface reported itself healthy.
+             (select count(*) from net n
+               where n.sheet_id = s.sheet_id
+                 and n.method = case when s.type = 'alert' then 'ALERT' else 'GET' end
+                 and (n.created_at, n.net_id)
+                     > (coalesce(ok.created_at, '-infinity'::timestamp), coalesce(ok.net_id, -1)))
+               as failures_since_ok,
+             last.meta::text as last_meta
+      from sheet s
+      inner join sheet_usr su using (sheet_id)
+      -- Left, both of them. A sheet that has never run at all is exactly the
+      -- failure this read is for, and an inner join drops it.
+      left join lateral (
+        select n.created_at, n.meta from net n
+        where n.sheet_id = s.sheet_id and n.method = case when s.type = 'alert' then 'ALERT' else 'GET' end
+        order by n.created_at desc, n.net_id desc limit 1
+      ) last on true
+      left join lateral (
+        select n.created_at, n.net_id from net n
+        where n.sheet_id = s.sheet_id
+          and n.method = case when s.type = 'alert' then 'ALERT' else 'GET' end
+          -- The same two predicates GET /status grades on, read from the same
+          -- place, so the two cannot drift into disagreeing about what a good
+          -- run is. They already had.
+          and case when s.type = 'alert' then (${ALERT_OK()}) else (${POLL_OK()}) end
+        order by n.created_at desc, n.net_id desc limit 1
+      ) ok on true
+      where su.usr_id = ${c.get("usr_id") ?? null} and s.type in ('net-http', 'alert')
+    ) f`,
+    where: [],
+    // Stalest first, because that is the question. A sheet that has never run
+    // sorts above one that ran a month ago, and sheet_id breaks the ties.
+    order: sql`order by f.last_run asc nulls first, f.sheet_id`,
+    limit,
+    offset,
+  });
+
+app.get("/library/freshness", async (c) => page(c)(await freshness(c, c.req.query())));
+
 app.get("/library", async (c) => {
   const { limit, offset, ...qs } = c.req.query();
   return page(c)(
@@ -2936,23 +3365,207 @@ app.get("/library/:id/hook", async (c) => {
       }),
     });
   }
-  const secret = await hookSecret(sheet_id);
-  const url = `${new URL(c.req.url).origin}/net/${sheet_id}`;
+  // The current key, which is the newest stored one if this sheet has any and
+  // the derived one otherwise. A sheet configured for a provider has no line to
+  // print: the secret is the provider's, and we never had it to give back.
+  const { name, keys } = await hookKeys(sheet_id);
+  if (name !== "hook") {
+    throw new HTTPException(400, {
+      message: explain(`Sheet ${sheet_id} is signed by ${name.slice("hook:".length)}, not by scrapsheets.`, {
+        Received: `a sheet holding a ${name} secret`,
+        Expected: "a sheet on scrapsheets' own signing scheme",
+        Source: "the secret table",
+        Fix: `read the endpoint secret from ${name.slice("hook:".length)}, or delete the ${name} secret with ` +
+          `DELETE /library/${sheet_id}/secret`,
+      }),
+    });
+  }
+  const secret = keys[0].value;
+  // Escaped the way curlFor escapes a url: a secret is pasted by hand, and one
+  // apostrophe in it otherwise ends the quoting, so the documented line runs
+  // and quietly signs the wrong thing.
+  const quoted = secret.replace(/'/g, "'\\''");
+  const path = `/net/${sheet_id}`;
+  const url = `${new URL(c.req.url).origin}${path}`;
   // A long-lived secret may not sit in a shared cache.
   c.header("Cache-Control", "no-store");
   return c.json({
     data: {
       url,
       secret,
+      // The path is signed alongside the body, so a query string makes a second
+      // delivery instead of a replay. That is why $path is a variable here: a
+      // sender that varies it has to sign what it varied.
       repro: [
         `body='{"hello":"world"}'`,
+        `path='${path}'`,
         `t=$(date +%s)`,
-        `sig=$(printf '%s.%s' "$t" "$body" | openssl dgst -sha256 -hmac '${secret}' -r | cut -d' ' -f1)`,
-        `curl -X POST '${url}' -H 'Content-Type: application/json' \\`,
-        `  -H "scrapsheets-signature: t=$t,v1=$sig" -d "$body"`,
+        `sig=$(printf '%s\\n%s\\n%s' "$t" "$path" "$body" | openssl dgst -sha256 -hmac '${quoted}' -r | cut -d' ' -f1)`,
+        `curl -X POST '${new URL(c.req.url).origin}'"$path" -H 'Content-Type: application/json' \\`,
+        `  -H "scrapsheets-signature: t=$t,v2=$sig" -d "$body"`,
       ].join("\n"),
     },
   });
+});
+
+// --- secrets
+//
+// A sheet's own secrets. Owner-only to write, and there is no read: a value
+// that can be read back is a value a share link can eventually be pointed at,
+// and these never enter the automerge document, which is what sync hands a
+// viewer. Writing one IS rotating it -- the newest is current, the one before
+// it still verifies, and everything older is trimmed behind the write.
+const SECRET_NAME = /^[a-z0-9][a-z0-9:_-]{0,63}$/;
+const SECRET_VALUE_CAP = 4096;
+// Bounded, because this is an owner-writable store and nothing else trims it
+// across names -- SECRET_KEEP trims within one.
+const SECRET_NAMES_MAX = 32;
+
+app.post("/library/:id/secret", async (c) => {
+  const sheet_id = c.req.param("id");
+  await assertSheetOwner(c, sheet_id);
+  // A missing or malformed body is a 400 naming what arrived. Unguarded, the
+  // json() throw became an unexplained 500, and cost a row in the error log
+  // for a request the caller could have fixed from the message.
+  const { name, value } = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  if (typeof name !== "string" || !SECRET_NAME.test(name)) {
+    throw new HTTPException(400, {
+      message: explain(`That is not a usable secret name on ${sheet_id}.`, {
+        Received: JSON.stringify(name),
+        Expected: "1 to 64 characters of a-z, 0-9, colon, underscore or hyphen, starting with a letter or digit",
+        Source: "the name field of the request body",
+        Fix: `name it for what it is: hook for this sheet's own signing secret, or one of ${
+          Object.keys(HOOK_HEADERS).filter((k) => k !== "hook").join(", ")
+        } to have that provider verify deliveries instead`,
+      }),
+    });
+  }
+  if (typeof value !== "string" || !value || value.length > SECRET_VALUE_CAP) {
+    throw new HTTPException(400, {
+      message: explain(`That is not a usable secret value on ${sheet_id}.`, {
+        Received: typeof value !== "string" ? `a ${typeof value}` : `${value.length} characters`,
+        Expected: `a non-empty string of at most ${SECRET_VALUE_CAP} characters`,
+        Source: "the value field of the request body",
+        Fix: "send the secret as a JSON string; a key file belongs in a codex connection, not here",
+      }),
+    });
+  }
+  // `hook` and `hook:*` are the names verifyDelivery reads, so a name in that
+  // space that no verifier knows would be written happily here and then fail
+  // every delivery to this sheet. Refused where it is typed instead.
+  const scheme = name === "hook" || name.startsWith("hook:");
+  if (scheme && !HOOK_HEADERS[name]) {
+    throw new HTTPException(400, {
+      message: explain(`${JSON.stringify(name)} is not a signing scheme this server knows.`, {
+        Received: name,
+        Expected: Object.keys(HOOK_HEADERS).join(", "),
+        Source: "the name field of the request body",
+        Fix: "use one of those, or a name that does not start with hook",
+      }),
+    });
+  }
+  const [{ names }] = await sql`
+    select count(distinct name)::int as names from secret where sheet_id = ${sheet_id} and name <> ${name}
+  `;
+  if (names >= SECRET_NAMES_MAX) {
+    throw new HTTPException(409, {
+      message: explain(`Sheet ${sheet_id} holds as many secrets as it may.`, {
+        Received: `${names} names already, and a request to add ${name}`,
+        Expected: `at most ${SECRET_NAMES_MAX} distinct names per sheet`,
+        Source: "the secret table",
+        Fix: `delete one you no longer need with DELETE /library/${sheet_id}/secret`,
+      }),
+    });
+  }
+  // At most one signing scheme per sheet. With two, which verifier runs would
+  // have to be decided by the headers the sender chose to send, which is the
+  // one thing that must never pick the check -- so the **insert** asks, rather
+  // than a select before it: two concurrent writes of different schemes both
+  // pass a check and both land, and the sheet then refuses every delivery.
+  //
+  // The name cap above is a plain check because losing that race costs one name
+  // over the limit; losing this one costs the sheet.
+  const value_encrypted = await encrypt(value);
+  // The check and the insert are one transaction behind a lock on the sheet
+  // row, because `insert ... where not exists` is only atomic against another
+  // statement on the same connection. Two isolates each hold their own, so
+  // under read committed both saw no clashing row and both landed -- and a
+  // sheet with two schemes refuses every delivery, since verifyDelivery will
+  // not guess which one was meant. The lock is what serializes them; the row
+  // exists already, because assertSheetOwner just read it.
+  const clash = await sql.begin(async (tx: typeof sql) => {
+    await tx`select 1 from sheet where sheet_id = ${sheet_id} for update`;
+    const taken = scheme
+      ? await tx`
+        select distinct name from secret
+        where sheet_id = ${sheet_id} and (name = 'hook' or name like 'hook:%') and name <> ${name}
+      `
+      : [];
+    if (taken.length) return taken as unknown as { name: string }[];
+    await tx`
+      insert into secret (sheet_id, name, value_encrypted) values (${sheet_id}, ${name}, ${value_encrypted})
+    `;
+    return null;
+  });
+  if (clash) {
+    throw new HTTPException(409, {
+      message: explain(`Sheet ${sheet_id} already has a signing scheme.`, {
+        Received: `a request to add ${name} beside ${clash.map((r: { name: string }) => r.name).sort().join(", ")}`,
+        Expected: "at most one of " + Object.keys(HOOK_HEADERS).join(", ") + " per sheet",
+        Source: "the secret table",
+        Fix: `delete the other one first with DELETE /library/${sheet_id}/secret`,
+      }),
+    });
+  }
+  // Keep current and previous. A third is a secret nobody meant to leave
+  // working, and the rollover has to end somewhere visible.
+  await sql`
+    delete from secret
+    where sheet_id = ${sheet_id} and name = ${name}
+      and secret_id not in (
+        select secret_id from secret
+        where sheet_id = ${sheet_id} and name = ${name}
+        order by created_at desc, secret_id desc limit ${SECRET_KEEP}
+      )
+  `;
+  return c.json(null, 201);
+});
+
+app.get("/library/:id/secret", async (c) => {
+  const sheet_id = c.req.param("id");
+  await assertSheetOwner(c, sheet_id);
+  // Names and timestamps, never values. `previous_at` is what says a rollover
+  // is still open, and `meta.secret_at` on this sheet's deliveries is what says
+  // whether anyone is still using the older one.
+  const rows = await sql`
+    select name,
+           max(created_at) as created_at,
+           (array_agg(created_at order by created_at desc, secret_id desc))[2] as previous_at
+    from secret where sheet_id = ${sheet_id}
+    group by name order by name
+  `;
+  c.header("Cache-Control", "no-store");
+  return c.json({ data: { secrets: rows } });
+});
+
+app.delete("/library/:id/secret", async (c) => {
+  const sheet_id = c.req.param("id");
+  await assertSheetOwner(c, sheet_id);
+  const { name } = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  const removed = typeof name === "string"
+    ? await sql`delete from secret where sheet_id = ${sheet_id} and name = ${name} returning secret_id`
+    : [];
+  if (!removed.length) {
+    throw new HTTPException(404, {
+      message: explain(`Sheet ${sheet_id} holds no secret named ${JSON.stringify(name)}.`, {
+        Received: JSON.stringify(name),
+        Expected: "a name GET /library/" + sheet_id + "/secret lists",
+        Source: "the secret table",
+        Fix: "read the names back first; a value is never readable, but a name always is",
+      }),
+    });
+  }
+  return c.json(null, 200);
 });
 
 // CSV Import - parse CSV and create a new table sheet
@@ -3333,7 +3946,7 @@ app.get("/codex/:id", async (c) => {
           message: `No DSN found.`,
         });
       }
-      db.dsn = await decryptDsn(db.dsn);
+      db.dsn = await decrypt("connection string", db.dsn);
       // Block connections to the application's own database
       const appDbUrl = Deno.env.get("DATABASE_URL") ?? "postgresql://postgres@127.0.0.1:5434/postgres";
       try {
@@ -3437,7 +4050,7 @@ app.post("/codex-db/:id", async (c) => {
   const dsn = await c.req.json();
   await sql`
     insert into db (sheet_id, dsn)
-    select ${sheet_id}, ${await encryptDsn(dsn)}
+    select ${sheet_id}, ${await encrypt(dsn)}
     where exists (select true from sheet_usr su where (su.sheet_id,su.usr_id) = (${sheet_id},${
     c.get(
       "usr_id",

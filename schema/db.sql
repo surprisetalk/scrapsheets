@@ -33,6 +33,26 @@ create table db
 , dsn text not null
 );
 
+-- A sheet's own secrets, encrypted with the same AES-GCM key the codex DSNs
+-- use. Never in the automerge document and never in a cell: the document is
+-- what sync hands a viewer, so a net-http auth header living there is a token
+-- a share link can be pointed at.
+--
+-- There is no unique key on (sheet_id, name) on purpose. The newest row for a
+-- name is the current secret and the second newest is the previous one, which
+-- is what lets a sender roll over without a missed delivery: writing a secret
+-- IS rotating it, and both are tried in that order. Older rows are trimmed
+-- behind the write, the way net is.
+create table secret
+( secret_id bigint not null generated always as identity primary key
+, sheet_id text not null references sheet(sheet_id)
+, name text not null
+, value_encrypted text not null
+, created_at timestamp default now()
+);
+
+create index secret_sheet_id_name_created_at_idx on secret (sheet_id, name, created_at desc);
+
 create table sheet_usr
 ( sheet_id text not null references sheet(sheet_id)
 , usr_id bigint not null references usr(usr_id)
@@ -61,7 +81,18 @@ create index net_sheet_id_created_at_idx on net (sheet_id, created_at desc);
 -- the only thing that decides it under concurrency. The expression is null on
 -- every row that is not a signed delivery (a poll, an alert run, an error), and
 -- nulls do not collide, so nothing else in this table is constrained.
-create unique index net_hook_signature_idx on net (sheet_id, (req_headers->>'scrapsheets-signature'));
+--
+-- The key is the signature that actually verified, which POST /net/:id writes to
+-- meta.sig. Keying on a header name instead cannot work once a sheet may be
+-- signed by a provider: a coalesce over the four header names picks by a fixed
+-- order and not by which one was checked, so a captured Stripe delivery replayed
+-- with a junk scrapsheets-signature beside it took a different key every time and
+-- landed every time. Only the verifier knows which value it trusted.
+--
+-- Rows written before this index existed carry no meta.sig, and nulls do not
+-- collide, so a delivery captured before it shipped is unconstrained here -- by
+-- which point the skew check has refused it for HOOK_SKEW seconds anyway.
+create unique index net_hook_signature_idx on net (sheet_id, (meta->>'sig'));
 
 create table payment
 ( payment_id bigint not null generated always as identity primary key

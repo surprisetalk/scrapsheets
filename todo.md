@@ -1,1126 +1,820 @@
-# Scrapsheets Roadmap
+# Scrapsheets — todo
 
 > Programmable data OS: every table is a database, every query is a table, every sheet is an API.
 
----
-
-## Phase 2 — Growth
-
-Build the features that create network effects. This is where the spreadsheet OS vision comes alive.
-
-- [ ] 100 daily active users
-- [ ] **Scrapscript WASM runtime**: compile Scrapscript interpreter to WASM for browser execution
-- [ ] **Scrapscript query language**: wire up the existing `Scrapscript` lang type in Main.elm to execute Scrapscript
-      programs against sheet data
-- [ ] **Scrapscript cell formulas**: `=#` prefix in cells triggers Scrapscript evaluation
-- [ ] **Content-addressable formulas**: cross-sheet references via Scrapscript hashes instead of fragile @sheet_id
-      strings
-- [ ] **Scrapscript marketplace**: sell/share self-contained Scrapscript functions as composable sheet utilities
-- [ ] **Formula parser**: `=` prefix in cells triggers formula mode using the existing `Formula` lang type in Main.elm
-- [ ] **Basic arithmetic**: =A1 + B1, =SUM(A1:A10), =AVERAGE, =COUNT, =MIN, =MAX
-- [ ] **Cross-sheet references**: =@table:abc123.A1
-- [ ] **Dependency tracking**: topological sort for evaluation order, cycle detection
-- [ ] **Reactive recalculation**: formulas re-evaluate when referenced cells change
-- [ ] **Schedule field on sheet**: cron expression or interval for recurring query execution
-- [ ] **Server-side query runner**: Deno cron job executing scheduled queries
-- [ ] **Pipeline composition**: net-http (extract) -> query (transform) -> table (load)
-- [ ] **Execution log**: track pipeline runs, successes, failures per sheet
-- [ ] **Google Sheets codex**: OAuth flow for reading Google Sheets as codex data source
-- [ ] **Airtable codex**: OAuth flow for reading Airtable bases as codex data source
-- [ ] **Notion codex**: OAuth flow for reading Notion databases as codex data source
-- [ ] **Bidirectional sync**: write Scrapsheet data back to external sources
+A queue, not a history. Every item is a capability someone gains, and carries the instructions to build it. Finished
+items are deleted — what shipped is described in `claude.md`. Anything below that turns out to need research goes to
+**Research** first and comes back as an item, or does not come back.
 
 ---
 
-## Phase 3 — Moonshot
+## Now
 
-Transform Scrapsheets into a platform. Each feature creates a new axis of composability.
+The next things to build, in this order.
 
-- [ ] **REST writes**: `GET /sheet/:id` returns JSON for every sheet type; POST to write rows does not exist
-- [ ] **API key auth**: per-sheet API keys (not just JWT) for programmatic access
-- [ ] **OpenAPI auto-generation**: derive OpenAPI spec from sheet column types
-- [ ] **Change webhooks**: notify external URLs when sheet data changes
-- [ ] **Rate limits per sheet**: configurable throttling for public sheet APIs
-- [ ] **User-defined portal sources**: provide a WebSocket URL or HTTP polling config to create custom portals
-- [ ] **Portal marketplace**: sell live data feeds as portal sheets
-- [ ] **Portal composition**: query across multiple live portals in real-time
-- [ ] **Embed code generator**: copy-pasteable iframe snippet in sheet settings
-- [ ] **Interactive embeds**: viewers can sort/filter embedded sheets. An embed drops the filter bar with the rest of
-      the chrome, so today it is a picture of the sheet, not a copy of it
-- [ ] **Live dashboard mode**: combine portal data + embeds for real-time dashboards
-- [ ] **Cursor presence**: show other users' cursor positions with colored indicators
-- [ ] **Active user list**: display connected collaborators in sheet header
-- [ ] **Cell comments**: annotation system with threads on individual cells
-- [ ] **Presence indicators in library**: show which sheets have active editors
-- [ ] **Timeline view**: slider showing document state over time (Automerge stores full history)
-- [ ] **Diff view**: visual diff between any two versions
-- [ ] **Named snapshots**: user-created bookmarks in the version timeline
-- [ ] **Rollback**: restore sheet to any historical state
-- [ ] **PWA manifest**: installable progressive web app with offline support
-- [ ] **IndexedDB-first sync**: Automerge already uses IndexedDB; optimize for offline editing
-- [ ] **Responsive mobile layout**: touch-friendly cell editing, swipe navigation
-- [ ] **Conflict resolution UI**: surface Automerge merge conflicts for user review
+- [ ] **You point a net-http sheet at an API that needs a key.** Per-sheet headers ship, but their values sit in the
+      automerge document in plain text, which is what sync hands a viewer or a share-link holder. The `secret` table is
+      the place to put them and already exists.
+  1. `NetHttp` gains `headers` values of the form `{{secret:name}}`; `pollNetOnce` resolves them out of `secret` at
+     fetch time and never writes a resolved value anywhere.
+  2. `fetchFailure()` already names header keys and never their values, so the `repro` line needs no change — check that
+     the resolved value cannot reach `body` either.
+  3. A header naming a secret the sheet does not hold is a failure row that says which name is missing, not a request
+     sent without the header.
 
----
+- [ ] **You give a query sheet a schedule and it runs without you.** `pollNetOnce` and `pollAlertOnce` are two copies of
+      the same 15-second scan; a query sheet has no runner at all, so every pipeline in the Demo Gallery stops at
+      "somebody opens the tab".
+  1. `schedule` on the sheet: an interval in seconds, the same shape `alert` already uses, validated the same way (a
+     present-but-not-positive value is a crash, not a guessed hour).
+  2. `pollQueryOnce(now)` runs each due query sheet **as its owner** with `createJwt(created_by)`, exactly as
+     `pollAlertOnce` does, and writes the run to `net` with `method = 'QUERY'` and the `meta` shape already in use.
+  3. Two runs of one sheet must not overlap: skip if the previous run has not landed, and record the skip, or a slow
+     query queues behind itself forever.
+  4. `library:freshness` already reads `net` by method — add `'QUERY'` to its `case` and the new runner is visible the
+     day it ships.
 
-## Go-to-Market
+- [ ] **A malformed request body is answered, not thrown at.** `POST/DELETE /library/:id/share`,
+      `POST
+      /library/:id/public` and `POST /library/:id/link` all call `await c.req.json()` unguarded, so a
+      missing or non-JSON body is a 500 reading "Sorry, something went wrong" — and costs a row in `net-hook:errors` and
+      a point off the 5xx status condition for a request the caller could have fixed from the message. The secret routes
+      already do this correctly.
+  1. `.catch(() => ({}))` on each, so the field validation below it produces the 400 it already knows how to write.
+  2. There are four call sites, which is when a shared helper earns its name; until then it is four `.catch`es.
 
-- [ ] **Seller payouts**: Stripe Connect for marketplace payouts (platform collects on Checkout today)
-
-- [ ] **Public demo post**: skip the pitch deck; post a compelling demo and say you're looking for angels
-- [ ] **Dev launch**: file real GitHub issues, publish the demo + a blog post, rally contributors
-- [ ] **User testing round**: sit with Clark, Kirk, Jake; convert findings into issues
-- [ ] **Investor track**: demo-first deck at /scrapland once the dev launch lands
-- [ ] **Podcast circuit**: pitch spreadsheet/data podcasts for interviews
-- [ ] **Customer funnel**: define the signup -> first sheet -> paid path and instrument it
-- [ ] **Paid acquisition test**: advertise scrapsheets on Reddit and adjacent communities
-- [ ] **Community position**: become the face of data analysis, curation, and sanitization
-- [ ] **Reach out to Ellen Chisa**: intro via Brandon, lead with the demo
-- [ ] **Public-entity data authority**: seed the shop with orgs, people, parcels, colors, songs — every public dataset
-      worth owning
-- [ ] **Local events database**: build the giant events table as a flagship public dataset
+- [ ] **You see a run fail without opening the log.** `library:freshness` answers the question but nothing links to it,
+      so the first thing anyone learns about a dead feed is still the 15-minute status email.
+  1. The library table gains a column reading `library:freshness` — last run and failures since, per row.
+  2. A sheet whose `failures_since_ok` is above zero is marked in the gallery strip too, because that is where a demo is
+     opened from.
+  3. No new endpoint: the page reads the sheet it already can.
 
 ---
 
-## Demo Gallery
+## Query engine
 
-End-to-end use-cases, written as sheet pipelines (`net-http` / `net-hook` / `portal` / `codex` -> `query` -> `table`).
-Nothing here is finished. What already ships is in `src/examples.mjs` under the `demo` tag, run by `examples_test.ts` in
-both engines — that file is the index, not this list. Some entries below name the query half that ships and the ingest
-half that does not. The point of this list is coverage: later passes mine it for the missing features and the datasets
-worth seeding in the shop. Every one of them dies at the same place, the ingest half, because a seeded table is a feed
-nobody has connected yet.
+The single biggest gap. Most of the Demo Gallery dies here first.
 
-### Flagship (best whole-stack stories)
+- [ ] **Your money arithmetic is exact.** Every numeric column is a float today, so a cent disappears in any long sum
+      and no invoice total can be trusted.
+  1. A `Decimal` type carrying scale, stored as a string, compared and summed as scaled integers.
+  2. `usd` becomes a `Decimal` with scale 2 rather than a display hint over a float.
+  3. `checkColumnTypes()` rejects a value that does not parse at the declared scale, naming the row — the same shape it
+     already uses for a non-numeric value in a numeric column.
 
-- [ ] **Restaurant group weekly P&L**: POS `net-hook` + USDA commodity `net-http` + labor `codex` -> `query` plate cost,
-      labor %, and store-level margin -> one embedded dashboard the owner reads on Sunday night. `table:pos-weekly` ->
-      `query:store-margin` ships the prime-cost read, with a 4-week moving average and a rank per week; the POS hook,
-      the commodity feed and the embed are open
-- [ ] **Fund 13F drift**: EDGAR `net-http` quarterly filings -> `query` diffing consecutive quarters -> `table` of
-      position adds/trims valued live by a price `portal`; publish the diff table to the shop
-- [ ] **Contractor WIP schedule**: cost-code `table` + timecard `net-hook` -> `query` percent-complete revenue,
-      over/under billing -> the exact schedule the bonding agent and the CPA both ask for. `table:job-costs` ->
-      `query:wip-schedule` ships the schedule itself, including the estimate movement that turns a job upside down; the
-      timecard hook is open
-- [ ] **Municipal budget watchdog**: city checkbook `net-http` -> `query` department burn rate vs adopted budget ->
-      public embed a local reporter can cite, republished monthly. `table:city-checkbook` -> `query:budget-ytd` ->
-      `query:budget-burn` ships the burn rate and the projected year-end variance; the checkbook pull and the embed are
-      open
-- [ ] **Solo consultant's whole business**: proposal `net-hook` form -> pipeline `query` -> invoice `table` -> Stripe
-      `net-hook` -> cash-collected `query`; the whole back office in six sheets
+- [ ] **A currency cannot be added to another currency by accident.** A `usd` column and an `eur` column sum today, and
+      the answer is a number with no meaning.
+  1. Money is value plus ISO 4217 code; `table:currencies` already ships the codes and minor units.
+  2. Addition across two codes is an error naming both, and says the fix is an explicit rate.
+  3. A rate is a join, not an operator: the error points at it rather than inventing one.
 
-### Finance & Accounting
+- [ ] **A timestamp means the same thing in two timezones.** Stored values are naive, rendered naive, and the zone is
+      guessed at both ends.
+  1. Store UTC; `date`, `time`, `datetime` and `timestamptz` are four distinct column types, not one.
+  2. Render in the viewer's zone, which is a per-user setting and not the browser's guess.
+  3. `table:timezones` ships the offsets; the transition dates are what the arithmetic needs and are still open.
 
-- [ ] **Three-statement rolling forecast**: ERP GL `codex` -> `query` actuals by account -> driver-assumption `table` ->
-      `query` producing P&L, balance sheet, and cash flow that refresh at each monthly close
-- [ ] **Sales commission calculator**: closed-won `net-hook` from CRM -> `query` joining quota, accelerator tiers, and
-      clawback rules -> per-rep payout `table`; sell the whole thing as a shop template
-- [ ] **Debt covenant monitor**: GL `codex` -> `query` computing DSCR, leverage, and fixed-charge coverage -> webhook
-      alert when any ratio lands inside a warning band before the quarter closes
-- [ ] **FX exposure and hedge sizing**: rate `portal` + open-invoice `table` by currency -> `query` net exposure per
-      currency with suggested forward notional
-- [ ] **Overhead allocation**: headcount, square footage, and machine-hour `table`s -> `query` allocating shared cost
-      pools to cost centers with a switchable allocation basis
-- [ ] **Revenue recognition (ASC 606)**: contract `table` with performance obligations -> `query` producing the monthly
-      recognition schedule and deferred revenue rollforward
-- [ ] **AR aging and collections queue**: invoice `codex` -> `query` aging buckets + payment-behavior score -> dunning
-      `net-hook` that fires the right email at the right bucket. `table:invoices` -> `query:ar-aging` ships the buckets
-      and the running exposure; the codex, the behaviour score and the dunning hook are open
-- [ ] **Purchase-price allocation and earnout tracking**: deal `table` -> `query` earnout attainment against actuals
-      each period
+- [ ] **Null, empty and zero stay different.** They are coerced into each other in several places, which is how a
+      missing reading becomes a zero in a chart.
+  1. One coercion table, enforced at the load boundary in `checkColumnTypes()` and nowhere else.
+  2. A blank cell in a numeric column is null, never zero; the chart already drops a non-numeric y and must keep doing
+     so.
 
-### Trading & Markets
+- [ ] **A query result carries its types forward.** Column types come back as the source column's, so `cast(x as int)`
+      lies and every downstream sheet reads text.
+  1. Infer the result type per select item, the way `WINDOW_TYPES` already does for a window alias.
+  2. A cast is the one expression whose type is stated rather than inferred.
 
-- [ ] **Pairs-trade monitor**: price `portal` for two tickers -> `query` rolling spread z-score -> alert `net-hook` on
-      entry/exit bands. `table:pair-prices` -> `query:pair-spread` -> `query:pair-zscore` ships the rolling band and the
-      entry signal off a 10-day window frame, with the band width read from `@table:assumptions.entry_z`; the live price
-      portal and the alert hook are open
-- [ ] **Options chain screener**: chain `net-http` -> `query` filtering IV rank, spread width, and days-to-expiry ->
-      candidate `table` refreshed intraday
-- [ ] **Crypto treasury view**: exchange balance `net-hook` + on-chain `net-http` -> `query` consolidated position, cost
-      basis, and unrealized P&L across wallets and venues
-- [ ] **Earnings-day calendar**: filings `net-http` + implied-move `query` -> `table` of positions with an event inside
-      the holding window
-- [ ] **Alt-data backtest sheet**: any shop dataset -> `query` joining to forward returns -> `table` of information
-      coefficient by lag; the pitch to data vendors selling on Scrapsheets
+- [ ] **A forty-sheet chain does not re-run on every keystroke.** Nothing is cached, so the editor's debounce is the
+      only thing between a chain and the CPU.
+  1. Cache a query sheet's result keyed by its code plus the version of every sheet it reads.
+  2. An explicit refresh, and an automatic one when a dependency's version changes — the dependency list is what
+     `scanRefs()` already returns.
+  3. Recompute only the sheets downstream of what changed.
 
-### Healthcare
+- [ ] **A million-row join does not need a million rows in the tab.** `MAX_QUERY_ROWS` refuses the work instead, which
+      is the right guard and the wrong answer.
+  1. Chunked execution on the server for anything over the cap, with the page reading pages of the result.
+  2. `checkQueryRows()` keeps its message and gains "or run it on the server", with the route that does.
 
-- [ ] **Hospital price transparency comparison**: machine-readable price file `net-http` across N hospitals -> `query`
-      normalizing negotiated rates per CPT -> a shop dataset nobody else has cleaned
-- [ ] **Medicare PS&R reconciliation**: scheduled PS&R report pull -> `query` against the internal patient log ->
-      variance `table` for the cost report
-- [ ] **Drug shortage exposure**: FDA shortage feed `net-http` + formulary/inventory `table` -> `query` at-risk items
-      with days-on-hand
-- [ ] **Clinical trial competitive map**: ClinicalTrials.gov `net-http` -> `query` overlapping sites, indications, and
-      enrollment velocity by sponsor
-- [ ] **Infection surveillance**: lab result `net-hook` -> `query` rolling rate per unit per 1000 patient-days ->
-      `portal`-fed ward dashboard
-- [ ] **Prior-auth turnaround**: payer portal `net-hook` -> `query` median days by payer and service line; the number to
-      bring to contract renegotiation
-- [ ] **Physician productivity (wRVU)**: encounter `codex` -> `query` wRVU per FTE vs compensation plan thresholds
+- [ ] **A codex filter runs on the far database.** The whole table is transferred and then filtered, which is the
+      difference between a demo and a product on any real table.
+  1. Push the where clause into the DSN query for `codex-db`, and only what is provably safe to push.
+  2. `describe` already reads the remote schema; the pushdown uses the same read.
 
-### Insurance
+- [ ] **You can see which step of a query is slow.** There is no profile, so a slow sheet is a guess.
+  1. `explain <query>` beside the existing `describe <ref>`, intercepted the same way in both engines.
+  2. Rows in and out per stage, and the milliseconds each took.
 
-- [ ] **Catastrophe exposure**: storm track `portal` + geocoded policy `table` -> `query` total insured value inside the
-      cone, refreshed as the track updates
-- [ ] **Producer commission reconciliation**: carrier statement `net-hook` -> `query` against the book of business ->
-      missing/short-paid commission `table`
-- [ ] **Claims leakage audit**: closed-claim `codex` -> `query` stratified sample with outlier flags for the audit team
-- [ ] **Rate filing comparison**: state DOI filing `net-http` -> `query` competitor rate changes by territory and class
+- [ ] **The editor suggests the sheets and columns you actually have.** `nearest()` names a typo after the fact; there
+      is nothing before it.
+  1. Autocomplete `@type:doc_id` from the library, and columns from the sheet once the ref resolves.
+  2. Same source as `describe`, so a suggestion cannot disagree with the schema.
 
-### Legal
+- [ ] **You name an expression once and use it in five sheets.** Every demo repeats the same case statement.
+  1. A `snippet` sheet holding named expressions; `planQuery()` expands them before the engine runs.
+  2. Expansion is textual and bounded like `MAX_REF_DEPTH`, and a cycle is reported as the path that closes it.
+  3. This is the seam Scrapscript eventually replaces.
 
-- [ ] **Docket watch**: court RSS/PACER `net-http` -> `query` matching client and adverse-party names -> alert `table`
-      with new filings each morning
-- [ ] **Realization and write-off analysis**: practice-management `codex` -> `query` realization by matter, partner, and
-      client -> the table that drives rate discussions
-- [ ] **Entity and lien monitoring**: Secretary of State `net-http` -> `query` detecting officer changes, new liens, and
-      status lapses across a client portfolio
-- [ ] **Patent landscape**: USPTO/EPO `net-http` -> `query` CPC class counts by assignee over time -> a whitespace map
-- [ ] **Discovery volume and cost tracking**: vendor invoice `net-hook` -> `query` cost per GB per custodian
+- [ ] **A top-N-per-group does not materialize every candidate.** `qualify` covers the as-of join, but the pairs are
+      still built before the filter, and AlaSQL cannot parse `lateral` at all.
+  1. A dedicated as-of join that walks two sorted inputs.
+  2. It is the same missing piece as nearest-neighbour in **Geospatial**, so build it once.
 
-### Real Estate
-
-- [ ] **Property tax appeal**: assessor `net-http` -> `query` assessment-to-sale ratio against comparables -> appeal
-      packet `table`
-- [ ] **Construction draw request**: budget `table` + invoice `net-hook` -> `query` percent-complete draw schedule the
-      lender can accept as-is
-- [ ] **Short-term rental pricing**: occupancy + local event `portal` -> `query` suggested nightly rate by date
-- [ ] **Deal underwriting model**: assumption `table` -> `query` producing IRR, equity multiple, and DSCR across a rent
-      growth / exit cap sensitivity grid
-- [ ] **CAM reconciliation**: expense `codex` + lease `table` -> `query` per-tenant CAM true-up with the pro-rata math
-      shown
-
-### Construction
-
-- [ ] **RFI and submittal log**: email/Procore `net-hook` -> `query` aging by ball-in-court -> escalation `table`
-- [ ] **Material escalation clause**: BLS PPI series `net-http` -> `query` computing the contractual price adjustment
-      per material line
-- [ ] **Weather-at-risk schedule**: NWS forecast `portal` + schedule `table` -> `query` pours and lifts at risk in the
-      next 10 days
-- [ ] **Equipment utilization**: telematics `net-hook` -> `query` idle vs productive hours per machine -> rent-vs-own
-      `table`
-- [ ] **Certified payroll compliance**: timecard `net-hook` -> `query` prevailing wage check by classification ->
-      WH-347-shaped output
-- [ ] **Punch list to closeout**: field `net-hook` form -> `query` open items by trade and floor
-
-### Manufacturing
-
-- [ ] **OEE by line**: PLC/MES count `net-hook` -> `query` availability x performance x quality -> shift `table` with
-      the top loss reason
-- [ ] **Multi-level BOM cost roll-up**: component `table` -> recursive `query` exploding the BOM with current purchase
-      prices
-- [ ] **Supplier quality scorecard**: receipt/inspection `codex` -> `query` PPM defective, on-time, and cost of poor
-      quality by supplier
-- [ ] **Preventive maintenance scheduling**: runtime `portal` -> `query` next service due by machine hours, not calendar
-- [ ] **Capacity and takt planning**: demand `table` + cycle-time `table` -> `query` line balance and required shifts
-
-### Logistics & Supply Chain
-
-- [ ] **Landed cost per SKU**: BOM `table` + HTS/tariff `net-http` + FX and freight index `portal` -> `query` true
-      landed cost, re-run whenever a duty changes
-- [ ] **Carrier scorecard**: EDI 214 status `net-hook` -> `query` on-time %, dwell, and accessorial spend by lane
-- [ ] **Inbound container ETA**: AIS vessel `portal` -> `query` ETA slip vs promised date -> exceptions to the planner
-- [ ] **Safety stock and reorder points**: WMS `codex` -> `query` deriving reorder point from demand variance and lead
-      time variance
-- [ ] **Cold chain excursions**: IoT temperature `net-hook` -> `query` excursion events with duration above threshold ->
-      quarantine `table`
-- [ ] **Tariff and trade rule change impact**: Federal Register `net-http` -> `query` affected HTS codes joined to the
-      active SKU list
-
-### Retail & E-commerce
-
-- [ ] **Competitor repricing**: competitor page `net-http` -> `query` undercut and margin floor rules -> repricing
-      `table` pushed back out by webhook
-- [ ] **Marketplace settlement reconciliation**: Shopify/Amazon payout `net-hook` -> `query` fee-by-fee vs expected ->
-      dispute `table`
-- [ ] **Multi-channel inventory allocation**: channel demand `table` -> `query` allocating constrained stock by margin
-      and velocity
-- [ ] **Return abuse detection**: return `net-hook` -> `query` outlier return rate per customer and per SKU
-- [ ] **Assortment gap**: search trend `portal` + catalog `table` -> `query` demanded categories with no SKU
-- [ ] **Promo lift measurement**: sales `codex` -> `query` comparing promo weeks to a matched baseline
-
-### Restaurants & Hospitality
-
-- [ ] **Recipe costing and menu engineering**: recipe `table` + commodity price `net-http` -> `query` plate cost,
-      contribution margin, and the stars/dogs quadrant
-- [ ] **Labor vs sales, hourly**: POS `net-hook` -> `query` labor % against forecast by daypart -> overtime alert before
-      it happens
-- [ ] **Multi-unit P&L rollup**: per-store `codex` -> `query` consolidated P&L with per-store variance flags
-- [ ] **Theoretical vs actual usage**: purchase `table` + sales mix `query` -> variance `table` showing where the food
-      went
-- [ ] **Health inspection watch**: city inspection `net-http` -> `query` own stores and competitors, with score history
-- [ ] **Hotel RevPAR and pace**: booking `net-hook` -> `query` pace vs same-time-last-year by segment
-
-### Energy & Utilities
-
-- [ ] **Day-ahead vs real-time spread**: ISO price `portal` -> `query` hourly LMP spread by node -> arbitrage `table`
-- [ ] **Solar fleet performance ratio**: inverter `net-hook` + irradiance `portal` -> `query` expected vs actual per
-      site -> underperformer `table` ranked by lost revenue
-- [ ] **Demand response event**: grid signal `portal` -> webhook shedding loads -> `query` measuring realized
-      curtailment against the baseline for settlement
-- [ ] **Utility bill audit**: bill `net-hook` -> `query` recomputing the tariff -> billing-error `table` and a
-      rate-switch recommendation
-- [ ] **Scope 1/2/3 carbon inventory**: activity `table` + emission factor `net-http` -> `query` inventory with factor
-      provenance per line
-
-### Agriculture
-
-- [ ] **Irrigation scheduling**: soil moisture `net-hook` + evapotranspiration `portal` -> `query` next irrigation by
-      zone
-- [ ] **Grain marketing and hedge ratio**: CME futures `portal` + bushels-on-hand `table` -> `query` basis, hedged
-      percentage, and breakeven
-- [ ] **Crop insurance documentation**: NDVI `net-http` -> `query` stressed acreage timeline for the claim file
-- [ ] **Livestock traceability and rations**: animal `table` + feed `table` -> `query` cost of gain per head
-- [ ] **Farmers market inventory and CSA shares**: `net-hook` order form -> `query` pick list by route
-
-### Government & Civic
-
-- [ ] **Budget vs actual burn rate**: checkbook `net-http` -> `query` department burn against adopted budget with a
-      year-end projection
-- [ ] **Permit backlog**: permit portal `net-http` -> `query` median days to issue by type and reviewer
-- [ ] **Campaign finance network**: FEC `net-http` -> `query` donor overlap between committees -> shareable graph table
-- [ ] **Lobbying vs voting record**: disclosure `net-http` + roll call `net-http` -> `query` correlating spend to votes
-- [ ] **Public records request tracker**: intake `net-hook` form -> `query` statutory deadline -> webhook reminder
-- [ ] **Grant subrecipient monitoring**: award `table` -> `query` spend-down rate and reporting deadlines by
-      subrecipient
-
-### Education
-
-- [ ] **Grant effort reporting**: payroll `codex` -> `query` effort % vs award commitment per investigator
-- [ ] **Early-warning student risk**: LMS `net-hook` -> `query` attendance, submission, and grade slope -> advisor
-      worklist
-- [ ] **Enrollment funnel**: inquiry -> application -> deposit -> matriculation `query` by source and cohort
-- [ ] **District spending vs outcomes**: state finance and assessment `net-http` -> `query` per-pupil spend vs growth ->
-      public shop dataset
-- [ ] **Course demand forecasting**: historical registration `codex` -> `query` sections needed next term
-
-### Nonprofit & Grants
-
-- [ ] **Grant opportunity pipeline**: Grants.gov `net-http` -> `query` scoring fit by eligibility and keyword ->
-      go/no-go `table`
-- [ ] **Form 990 peer benchmarking**: IRS 990 XML `net-http` -> `query` program-expense ratio and comp benchmarks
-      against peers
-- [ ] **Program outcome reporting**: intake `net-hook` form -> `query` producing the exact table each funder demands
-- [ ] **Restricted fund tracking**: `query` net assets with and without donor restriction, release schedule included
-- [ ] **Volunteer scheduling and hours**: signup `net-hook` -> `query` coverage gaps by shift
-
-### Media & Journalism
-
-- [ ] **Story data pipeline**: scrape `net-http` -> cleaning `query` -> `table` -> embedded interactive chart in the
-      published article, updating itself after publication
-- [ ] **FOIA tracker**: request `table` -> `query` statutory deadlines and appeal windows -> webhook nudges
-- [ ] **Newsletter and audience analytics**: ESP event `net-hook` -> `query` open/click cohorts and churn by acquisition
-      source
-- [ ] **Ad sales pacing**: insertion order `table` -> `query` delivered vs contracted impressions with make-good risk
-- [ ] **Beat entity database**: people, orgs, and properties `table`s a newsroom maintains and shares across reporters
-
-### Music & Entertainment
-
-- [ ] **Tour routing and gross potential**: venue `table` + ticket sales `portal` -> `query` routing distance, capacity,
-      and settlement projection per night
-- [ ] **Catalog and setlist analytics**: Setlist.fm `net-http` -> `query` song performance frequency vs streaming lift
-- [ ] **Sync licensing pipeline**: brief `net-hook` -> `query` catalog matches by mood, tempo, and clearance status
-- [ ] **Merch inventory per show**: sale `net-hook` -> `query` sell-through by size and city -> restock `table`
-- [ ] **Film production budget vs actual**: cost report `codex` -> `query` variance by account and department
-
-### Sports
-
-- [ ] **Player efficiency model**: box score `net-http` -> `query` per-possession metrics and rolling form -> rankings
-      `table`
-- [ ] **Athlete load management**: wearable `net-hook` -> `query` acute:chronic workload ratio -> flag `table` for the
-      trainer
-- [ ] **Youth league scheduling**: team, field, and official `table`s -> `query` producing a conflict-free schedule with
-      travel balance
-- [ ] **Secondary market ticket pricing**: resale `portal` -> `query` dynamic price recommendation per section
-- [ ] **Recruiting board**: prospect `table` + results `net-http` -> `query` ranked board with position needs
-
-### Science & Research
-
-- [ ] **Literature watch**: PubMed/arXiv `net-http` -> `query` matching a saved topic with dedupe against what was
-      already read
-- [ ] **Instrument run QC**: instrument `net-hook` -> `query` control-sample pass/fail with drift detection -> rerun
-      queue
-- [ ] **Variant annotation**: variant `table` -> `query` joined against a ClinVar `codex` -> annotated report
-- [ ] **Field survey collection**: mobile `net-hook` form -> `query` validating observations -> a citable dataset
-      published to the shop
-- [ ] **Reproducible analysis artifact**: dataset + `query` published together as a content-addressed, re-runnable
-      citation
-
-### Marketing & Growth
-
-- [ ] **Blended CAC and payback**: ad platform `net-hook` -> `query` spend joined to cohort revenue -> CAC by channel
-      and week
-- [ ] **SERP rank tracking**: SERP `net-http` -> `query` rank deltas, cannibalization, and lost-featured-snippet alerts
-- [ ] **Multi-touch attribution**: event `net-hook` -> `query` over ordered touchpoint sequences with a switchable model
-- [ ] **Influencer and affiliate ROI**: promo code `net-hook` -> `query` incremental revenue per creator
-- [ ] **Content calendar to performance**: plan `table` joined to analytics `query` so the calendar grades itself
-
-### Sales & CRM Ops
-
-- [ ] **Pipeline hygiene**: CRM `codex` -> `query` stale, mis-staged, and missing-next-step deals -> nudge webhook per
-      rep
-- [ ] **Territory and quota planning**: account `table` -> `query` balancing territories by TAM and travel
-- [ ] **Lead enrichment and scoring**: signup `net-hook` -> firmographic `net-http` -> `query` fit x intent score ->
-      routing `table`
-- [ ] **Renewal risk**: product usage `codex` + support ticket `codex` -> `query` churn signal ranked by ARR at risk
-- [ ] **Deal desk approvals**: discount request `net-hook` -> `query` approval tier by margin impact
-- [ ] **Partner-sourced revenue**: partner `table` -> `query` attributed pipeline and payout
-
-### HR & Recruiting
-
-- [ ] **Applicant funnel**: ATS `net-hook` -> `query` pass-through rate by stage and source, time-to-fill by role
-- [ ] **Headcount plan vs actual**: plan `table` -> `query` feeding the finance forecast directly, no re-keying
-- [ ] **Immigration and certification dates**: `table` -> `query` upcoming expirations -> webhook to HR and the employee
-- [ ] **Onboarding and offboarding checklists**: `net-hook` trigger -> `query` open tasks by owner and day
-- [ ] **Engagement survey analysis**: response `net-hook` -> `query` driver analysis by team with small-cell suppression
-
-### Software & DevOps
-
-- [ ] **Incident metrics**: alert `net-hook` -> `query` MTTA/MTTR by service and severity -> reliability review `table`
-- [ ] **CVE exposure**: OSV feed `net-http` + SBOM `table` -> `query` affected services ranked by exploitability and
-      blast radius
-- [ ] **DORA metrics**: deploy and incident `net-hook` -> `query` deploy frequency, lead time, change failure rate
-- [ ] **On-call fairness**: rotation `table` + page `net-hook` -> `query` nights and weekends carried per person
-- [ ] **Support ticket triage as an MCP sheet**: ticket `codex` -> `query` -> a sheet an AI agent reads and writes back
-      through the MCP endpoint
-- [ ] **Feature flag cleanup**: flag `net-http` + usage `query` -> stale flags with owner and age
-
-### Transportation & Aviation
-
-- [ ] **Hours-of-service compliance**: ELD `net-hook` -> `query` violations and near-violations before dispatch
-- [ ] **Flight ops on-time analysis**: ADS-B `portal` + schedule `table` -> `query` tail utilization, turn time, and
-      delay cause
-- [ ] **Charter quoting**: aircraft `table` + fuel `portal` -> `query` quote with positioning legs and crew duty limits
-- [ ] **Transit reliability**: GTFS-RT `portal` -> `query` headway adherence by route and hour -> public embed
-
-### Climate & Environment
-
-- [ ] **Neighborhood air quality**: sensor `portal` -> `query` exceedance hours by location -> public dashboard
-- [ ] **Water sampling compliance**: lab result `net-hook` -> `query` against permit limits -> exceedance report on the
-      regulator's schedule
-- [ ] **Facility emissions benchmarking**: EPA `net-http` -> `query` intensity per unit output vs sector peers
-- [ ] **Wildfire and flood asset risk**: hazard layer `net-http` + asset `table` -> `query` exposure by property
-- [ ] **Recycling and waste diversion**: hauler invoice `net-hook` -> `query` diversion rate by stream and site
-
-### Household & Personal
-
-- [ ] **Job search tracker**: application `table` + posting `net-http` -> `query` stale applications and follow-up dates
-- [ ] **Renovation bid comparison**: bid `table` -> `query` normalized line-by-line comparison with scope gaps flagged
-- [ ] **Collection catalog**: records, books, or plants `table` + price `net-http` -> `query` current value and gaps
-- [ ] **Event planning**: RSVP `net-hook` form -> `query` seating, dietary counts, and vendor headcount deadline
-- [ ] **Fantasy league and pick pool**: score `portal` -> `query` standings that update themselves during games
-
----
-
-## Capability Backlog
-
-Everything the Demo Gallery needs that does not exist yet. Untriaged on purpose: this is the raw list, and a later pass
-sorts it into phases. Where a line deepens something already in Phase 2/3, it says so.
-
-### Query engine
-
-The single biggest gap. Most demos die here first.
-
-- [ ] **Exact decimal arithmetic**: money must not be a float; typed `Decimal` with scale, no silent precision loss
-- [ ] **min()/max() over text**: AlaSQL compiles both inline, restricted to numbers and dates, and drops a text value,
+- [ ] **`min()` over text answers.** AlaSQL compiles `min`/`max` inline over numbers and dates and drops a text value,
       so `min(code)` returns nothing. `min_text()`/`max_text()` are the workaround and `checkResultColumns()` names the
-      case; a real fix is upstream
-- [ ] **Timezone-correct timestamps**: store UTC, render local, never guess the zone
-- [ ] **Lateral joins and correlated subqueries**: AlaSQL cannot parse `lateral` at all. As-of joins no longer depend on
-      it — `qualify` covers that case — but top-N-per-group over an expensive subquery still materializes everything
-      first. A scalar subquery in an expression does work, which is what a cell reference is built on (partition by
-      t.trade_id order by p.day desc) =
-      1`.`query:asof-price`is the worked demo. The candidate pairs are still materialized before the filter, so a
-      dedicated`asof
-      join` that walks two sorted inputs is open
-- [ ] **Strict null semantics**: distinguish null, empty string, and zero everywhere; no silent coercion
-- [ ] **Typed query output**: query results carry column types forward, not strings
-- [ ] **Materialized query results**: cache with an explicit refresh, so a 40-sheet dependency chain is not re-run per
-      keystroke
-- [ ] **Incremental query execution**: recompute only what changed since the last run
-- [ ] **Chunked / larger-than-memory execution**: a million-row join should not need a million rows in the tab
-- [ ] **Predicate pushdown to codex**: filter on the external database, not after transferring the whole table
-- [ ] **Explain / profile**: show which step is slow and how many rows each stage produced
-- [ ] **@sheet autocomplete**: suggest sheets and columns as the user types, from the real schema
-- [ ] **Saved query snippets / UDFs**: reusable named expressions across sheets (leads into Scrapscript)
+      case.
+  1. The real fix is upstream in AlaSQL, so decide: patch the vendored bundle, or keep the workaround forever and say so
+     in the message.
 
-### Error messages
+---
 
-Per house style, an ambiguous error is the worst bug in the system.
+## Types & validation
 
-- [ ] **A burst that stops is counted, not rounded to one**: `logFailure` writes one row per (status, path) per minute
-      and folds the rest onto `meta.folded`, which the two conditions counted out of that sheet add back. The last
-      window of a burst never flushes: its count sits in `logSeen` until that key writes again, which never happens if
-      the burst ended. 6,000 refused deliveries in a minute that then stops read as one.
-  1. Flush the pending folds from the sweep `setInterval` that already runs beside `rateLimitBuckets`, as a row carrying
-     the count and no headers — there is no request left to read them off.
-  2. The same row is what tells the difference between "one failure" and "one failure we kept a message for".
-- [ ] **A share answer says which sheet it is about**: the `shareLoaded` payload carries no id and no action, so a
-      `list` for sheet A that resolves after the user opened sheet B writes A's member list and public flag into B's
-      panel, silently. `UrlChange` keeps them when settings stay open, so navigating between two sheets with the panel
-      up shows the first sheet's permissions as the second's. `ShareLoad` reports a field it cannot read, but it cannot
-      see a field that was renamed away either — an absent field and a renamed one look the same from there.
-  1. `index.html` sends `{ id, action, ... }`; `ShareLoad` drops a payload whose id is not `model.sheet.id`.
-  2. With the action named, each branch can require the fields that action promises, which is what makes a renamed field
-     an error rather than an absence.
-- [ ] **You read back the failures your own account caused**: every failure lands in `net-hook:errors`, which is the
-      operator's sheet — a toast is still all anyone else gets, and it is gone on the next render.
-  1. `logFailure` writes `usr_id` into `meta`, from `c.get("usr_id")`. It is absent on an unauthenticated failure, which
-     is the honest answer: nobody owns it.
-  2. One sheet, not one per account: `GET /sheet/net-hook:errors` gains a read that filters `meta->>'usr_id'` to the
-     caller and needs no `sheet_usr` row, beside the operator read that filters on nothing.
-  3. The row still carries header and query **names only**, so this read leaks nothing the operator's does not.
+- [ ] **A cell can hold the things a spreadsheet holds.** Six types are missing and each blocks a whole class of sheet.
+  1. Percent, ratio and basis points — display against stored value handled once.
+  2. Duration and interval, for hours worked, dwell time, cycle time.
+  3. Enum and multi-select, with a defined option list, and the list may come from another sheet.
+  4. Reference: a cell pointing at a row in another sheet, a real foreign key rather than a string id.
+  5. Attachment: files, images and PDFs per cell.
+  6. Unit of measure: quantity plus unit with conversion, so lbs and kg cannot silently add.
+  7. Geo: point, polygon and address. `point_in_polygon()` and `polygon_area_km2()` already take the shapes.
 
-### Types & validation
+- [ ] **A bad row is refused at the boundary, not coerced.** CSV import rejects; `POST /net/:id` and cell edits do not,
+      and nothing is quarantined.
+  1. Column constraints: not-null, unique, range, regex, allowed values, referential integrity.
+  2. `POST /net/:id` and cell edits run the same check the CSV importer runs.
+  3. A refused row lands in a dead-letter sheet with the reason, rather than being dropped — inspectable, requeueable,
+     and the same sheet the action queue uses.
 
-- [ ] **Money with currency code**: value + ISO currency, arithmetic refuses to mix currencies without a rate
-- [ ] **Percent, ratio, and basis-point types**: display vs stored value handled once, correctly
-- [ ] **Date, time, datetime, and timezone-aware timestamp as distinct types**
-- [ ] **Duration and interval type**: for hours worked, dwell time, cycle time
-- [ ] **Enum / single-select and multi-select**: with a defined option list
-- [ ] **Reference type**: a cell that points at a row in another sheet (real foreign keys, not string ids)
-- [ ] **Attachment type**: files, images, and PDFs stored per cell
-- [ ] **Geo types**: point, polygon, and address
-- [ ] **Unit-of-measure type**: quantity + unit with conversion, so lbs and kg cannot silently add
-- [ ] **Column constraints**: not-null, unique, range, regex, allowed-values, referential integrity
-- [ ] **Validation on write**: reject bad rows loudly at the ingest boundary, quarantine rather than coerce. CSV import
-      rejects; `POST /net/:id` and cell edits still do not, and nothing is quarantined
-- [ ] **Type inference on import with manual override**: guess, show the guess, let the user correct it
-- [ ] **Schema drift detection**: alert when an upstream feed adds, drops, or retypes a column
-- [ ] **Computed columns**: a column defined by an expression over its own row
-- [ ] **Column-level defaults and generated values**: created-at, row hash, sequence
+- [ ] **You see the type guess and correct it.** Import infers silently and there is no way back.
+  1. Show the inferred type per column on the import preview.
+  2. Let the user override before the sheet is created; remember the mapping for the next file with the same header.
 
-### Table UX
+- [ ] **You are told when an upstream feed changes shape.** A dropped column reads as a sheet of blanks.
+  1. Record each feed's column set per run in `net.meta`.
+  2. A run whose set differs from the last is a failure row naming the added, dropped and retyped columns.
+  3. It is the same alert path everything else uses, not a new one.
+
+- [ ] **A column can be an expression over its own row.** Every derived value is a whole query sheet today.
+  1. A computed column on a table sheet, evaluated by the same engine the query sheets use.
+  2. Column-level defaults and generated values ride the same field: created-at, row hash, sequence.
+
+---
+
+## Table UX
 
 The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
-- [ ] **Saved views**: named sort/filter/hidden-column combinations per sheet
-- [ ] **Column reorder and pin**: drag-resize and hide already ship; these two do not. Both need a persisted column
-      order rather than the display-only hide set
-- [ ] **Row drag-reorder**: insert, delete and duplicate ship (`Ctrl/⌘+Enter`, `Ctrl/⌘+Shift+Enter`, `Ctrl/⌘+Delete`);
-      reorder needs drag state, not a splice
-- [ ] **Drag-fill series**: dates, numbers, patterns. Plain fill-down ships as `Ctrl/⌘+D`
-- [ ] **Number formatting**: decimals, thousands separators, currency symbol, percent, scientific, custom masks
-- [ ] **Conditional formatting**: color scales, data bars, icon sets, rule-based cell coloring
-- [ ] **Group by / outline rows**: collapsible groups with subtotals
-- [ ] **Pivot table UI**: drag fields into rows/columns/values without writing SQL
-- [ ] **Data cleaning verbs**: trim, dedupe rows, split column, text-to-columns, change case, remove blanks. Binning a
-      numeric column is done: `width_bucket(v, lo, hi, n)`, with 0 below the range and n+1 above it so the tails stay
-      visible instead of being folded into the end buckets. Filling a gap forward is done:
-      `last_value(x) ignore nulls over (order by t rows between unbounded preceding and current
-      row)`, with
-      `query:meter-daily` as the worked demo. The rest are UI verbs, not SQL
-- [ ] **Fuzzy dedupe UI**: cluster near-duplicate rows and merge with a chosen survivor
-- [ ] **Dropdown options sourced from another sheet**: checkbox and enum cells already ship
-- [ ] **Cell notes**: distinct from threaded comments in Phase 3
-- [ ] **Sparklines and mini-charts in cells**
-- [ ] **Virtualized rendering**: smooth scrolling on very large sheets
+- [ ] **Your sort, filter and hidden columns survive a reload.** They live in the model and die with the tab.
+  1. A named view per sheet, holding sort keys, filters and the hidden set.
+  2. Stored on the sheet, so it travels with a share rather than living in one browser.
 
-### Charts & dashboards
+- [ ] **You reorder and pin columns.** Drag-resize and hide ship; both of these need a persisted column order rather
+      than the display-only hide set.
+  1. An explicit order array on the sheet; `skipHidden` already proves navigation can step over a display rule without
+     touching selection indices.
+  2. Pinning is that order plus a frozen count.
 
-- [ ] **Core chart set**: line, bar, stacked bar, area, scatter, box plot. Line and bar ship, drawn as SVG from
-      `elm/svg`, with the baseline pinned to zero unless the data goes below it — a bar chart that starts anywhere else
-      misstates every comparison on it. A row whose y is not a number is dropped rather than read as zero. **Histogram
-      needs no chart kind**: `width_bucket(v, lo, hi, n)` bins in SQL and a `bar` chart draws the bins, which is
-      `query:no-show-lead` and `chart:no-show-lead`. A `histogram` kind would only mean teaching `viewChart` a fourth
-      word for the bars it already draws
-- [ ] **Time-series handling**: date axis, gap handling, downsampling for long series
-- [ ] **Maps**: point maps and choropleths driven by a geo column
-- [ ] **Heatmap and matrix charts**: cohort grids and loss triangles read naturally as heatmaps
-- [ ] **KPI tiles**: single number with a delta and a sparkline
-- [ ] **Chart annotations**: mark an event on the axis (a release, a price change, a storm)
-- [ ] **Dual axis and secondary series**
+- [ ] **You drag a row where it belongs, and drag a series down.** Insert, delete and duplicate ship; reorder needs drag
+      state rather than a splice, and fill-down is plain today.
+  1. Row drag-reorder.
+  2. Drag-fill that continues dates, numbers and simple patterns rather than repeating the cell.
 
-### Ingest — net-http
+- [ ] **A number looks like the number it is.** There is no formatting layer at all.
+  1. Decimals, thousands separators, currency symbol, percent, scientific, custom mask — per column.
+  2. Locale-aware, from a per-user setting rather than the browser's guess.
 
-- [ ] **Secrets for authenticated requests**: per-sheet headers already ship, but the values sit in the document in
-      plain text, where sync hands them to a viewer. Needs **A sheet holds a secret nothing else can read**, below
-- [ ] **OAuth token handling**: authorization code flow plus automatic refresh
-- [ ] **Non-GET requests**: POST/PUT with a templated body
-- [ ] **Response parsers**: JSON path, CSV/TSV, NDJSON, XML, RSS/Atom, HTML with CSS selectors, XLSX, Parquet
-- [ ] **Archive handling**: zip and gzip, including "the one CSV inside this daily zip"
-- [ ] **PDF table extraction**: half of government data ships as PDF
-- [ ] **Pagination**: page, offset, cursor, and Link-header styles, with a stop condition
-- [ ] **Conditional requests**: ETag and If-Modified-Since so a daily file is not re-downloaded hourly
-- [ ] **Since-last-run cursor**: fetch only new records, with the watermark stored on the sheet
-- [ ] **Append vs replace vs upsert-by-key**: choose the write mode per sheet
-- [ ] **Retry with backoff and a failure log**: distinguishing transient from permanent
-- [ ] **Rate limiting and politeness**: per-host concurrency and delay, respect for Retry-After
-- [ ] **Raw response archive**: keep the original bytes so a parser fix can be replayed without re-fetching
-- [ ] **Response size and time caps**: with a clear message rather than a hung sheet
-- [ ] **Pre-flight test button**: fetch once, show the parsed preview, then save
-- [ ] **Static egress IP**: many enterprise sources require allowlisting
+- [ ] **A cell can be coloured by a rule.** Nothing conditions on value today.
+  1. Colour scales, data bars, icon sets and rule-based cell colour, per column.
+  2. The rule is an expression over the row, the same one computed columns take.
 
-### Ingest — net-hook & forms
+- [ ] **You group rows and see subtotals without writing SQL.** `group by` exists only in a query sheet.
+  1. Collapsible groups with subtotals over the rows on screen, the way the totals row already respects the filter.
+  2. A pivot UI over the same machinery — AlaSQL's `pivot` is correct once `checkPivot()` has had its say.
 
-- [ ] **A sheet holds a secret nothing else can read**: three items below and **Secrets for authenticated requests**
-      under `Ingest — net-http` all stop here. `hookSecret()` derives its key from `TOKEN_SECRET` because there is
-      nowhere to put one, and a net-http sheet's auth header sits in the automerge document in plain text, where a
-      viewer or a share-link holder reads it.
-  1. `create table secret (sheet_id, name, value_encrypted, created_at, primary key (sheet_id, name))`, encrypted with
-     the `encryptDsn`/`decryptDsn` pair `main.ts` already uses for codex DSNs, under `DSN_ENCRYPTION_KEY`.
-  2. Owner-only write, no read-back: `POST /library/:id/secret` takes `{name, value}` and `GET` answers the names alone.
-     A value that can be read back is a value a share link can be pointed at.
-  3. Never into the automerge document, and never into a cell: the document is what sync hands to a viewer.
-- [ ] **You send a Stripe or GitHub webhook straight at a sheet**: ours is one scheme, and every provider signs its own
-      way, so today a hook has to be relayed by something that re-signs it. Needs the secret store above — a shared
-      secret cannot be derived.
-  1. Read the provider off the sheet's config, not off the request: a spoofed header must not pick the verifier.
-  2. Verify Stripe's `stripe-signature`, GitHub's `x-hub-signature-256` and Shopify's base64 HMAC against the stored
-     secret, each in its own function, each refusing by name the way the four checks in `POST /net/:id` already do.
-  3. The replay refusal already in that route keys on `scrapsheets-signature`; give it the provider's own header
-     instead, or a provider delivery becomes replayable again.
-- [ ] **You rotate a hook's secret without a missed delivery**: `hookSecret()` derives from `TOKEN_SECRET`, so today
-      rotating one sheet rotates every sheet — and every outstanding email-verification link with it. Needs the secret
-      store above.
-  1. Two secrets per sheet during a rollover, `current` and `previous`, tried in that order.
-  2. Record which one a delivery verified against, in `meta`, so "is anyone still sending the old one" is a query rather
-     than a guess, and the rollover has a visible end.
-- [ ] **A sender says which delivery this is**: the signature covers `t` and the body and nothing else, and the unique
-      index that refuses a replay is over exactly that — so two genuinely different deliveries carrying the same body in
-      the same second are one delivery here, however their headers or query strings differ. A fan-out that discriminates
-      by query string, or a sensor repeating a reading, loses the second one to a 409 that says it replayed.
-  1. Sign the path and the query string alongside the body, so what identifies a delivery is what the sender varies.
-  2. That changes the scheme every existing sender implements, so it needs the two-secret rollover above to land without
-     a missed delivery.
-- [ ] **Payload mapping**: JSON path -> column mapping, so a webhook lands as typed rows not a blob
-- [ ] **Filters**: drop events that do not match a predicate before they hit the table
-- [ ] **Dead-letter table**: malformed payloads are kept and inspectable, never dropped
-- [ ] **Delivery log**: every request with status, latency, and body, queryable like any sheet
-- [ ] **Per-hook rate limits and size caps**
-- [ ] **Public form sheets**: generate a real form from column types, with validation and a thank-you page
-- [ ] **Form file uploads**: attachments land in the attachment column
-- [ ] **Email-in address per sheet**: forward an email and its body/attachments become rows
-- [ ] **Inbound SMS**: same idea for a phone number
-- [ ] **Response templating**: return a chosen status and body so the sheet can answer a callback synchronously
+- [ ] **You clean a column without writing SQL.** Binning and forward-fill are done in SQL (`width_bucket()`,
+      `last_value(x) ignore nulls`); the rest are UI verbs and do not exist.
+  1. Trim, dedupe rows, split column, text-to-columns, change case, remove blanks.
+  2. Fuzzy dedupe: cluster near-duplicate rows and merge with a chosen survivor. `fuzzy` matching already ships as a
+     UDF, so this is the UI over it.
 
-### Ingest — files & drives
+- [ ] **A very large sheet scrolls.** Every row renders.
+  1. Virtualized rendering.
+  2. Server-side pagination behind it, for sheets too big to send at all.
 
-- [ ] **XLSX and JSON upload**: CSV drag-and-drop with type inference already ships
-- [ ] **Import mapping UI**: map incoming columns to existing ones, remember the mapping for next time
-- [ ] **Multi-sheet XLSX**: pick the tab, handle merged headers and junk header rows
-- [ ] **Cloud drive pull**: Drive, Dropbox, Box, OneDrive, S3/R2, SFTP, with a watched folder
-- [ ] **Streaming import for large files**: progress bar, resumable, no browser-tab death
-- [ ] **OCR and document extraction**: invoices, receipts, and scanned reports into rows
-- [ ] **Recurring file import**: the same daily drop, imported on a schedule, with dedupe
-
-### Codex — databases
-
-- [ ] **More engines**: MySQL, SQLite, SQL Server, DuckDB/Parquet, BigQuery, Snowflake, Redshift, ClickHouse, MongoDB,
-      Athena
-- [ ] **Schema browser and table picker**: choose tables without writing SQL first
-- [ ] **Read-only enforcement**: a codex must not be able to write unless explicitly granted
-- [ ] **Incremental sync with a watermark column**: pull deltas, not the whole table
-- [ ] **CDC / logical replication**: for sources that support it
-- [ ] **SSH tunnel and TLS options**: the two things every enterprise connection needs
-- [ ] **Connection health checks**: surfaced as freshness on every downstream sheet
-- [ ] **Credential rotation**: without breaking live sheets
-- [ ] **Row and column masking**: expose a subset of a sensitive table
-- [ ] **Sampling for preview**: never `select *` a billion-row table to render a thumbnail
-
-### Codex — SaaS connectors
-
-Ordered roughly by how many demos each unblocks.
-
-- [ ] **Accounting**: QuickBooks, Xero, NetSuite, Sage, SAP, Dynamics
-- [ ] **Payments and banking**: Stripe, Square, Plaid, Mercury, Ramp, Brex, PayPal, Adyen. The reference half ships:
-      `table:iban-formats` (length per country, the cheapest check on an account number and the one that fails before
-      anything reaches a bank), `table:card-networks` (issuer prefixes, lengths, Luhn) and `table:mcc-ranges` (ISO 18245
-      merchant categories by range, the only grouping the standard itself defines)
-- [ ] **Commerce**: Shopify, Amazon SP-API, WooCommerce, BigCommerce, Etsy, eBay
-- [ ] **CRM**: Salesforce, HubSpot, Pipedrive, Close, Attio
-- [ ] **Support**: Zendesk, Intercom, Front, Help Scout
-- [ ] **Product and project**: Jira, Linear, Asana, Monday, ClickUp, Notion, Airtable, Trello
-- [ ] **Dev**: GitHub, GitLab, Sentry, Datadog, PagerDuty, CircleCI, Vercel, Cloudflare
-- [ ] **Marketing and ads**: Google Ads, Meta Ads, LinkedIn Ads, TikTok Ads, GA4, Search Console, Klaviyo, Mailchimp,
-      Braze
-- [ ] **Analytics**: Segment, Mixpanel, Amplitude, PostHog
-- [ ] **HR and payroll**: Gusto, Rippling, ADP, Workday, BambooHR, Greenhouse, Lever, Ashby
-- [ ] **Comms and calendar**: Slack, Discord, Gmail, Outlook, Google Calendar, Zoom, Calendly, Twilio, DocuSign
-- [ ] **Vertical systems**: Procore, ServiceTitan, Toast, Lightspeed, Epic/FHIR, Availity, Clio, MINDBODY, Shipstation
-- [ ] **Connector SDK**: a declarative connector definition so users and sellers add their own without a code change
-
-### Scheduling & runs
-
-Phase 2 has the runner. These are what the demos need on top of it.
-
-- [ ] **Cron plus interval plus "on upstream change"**: three trigger kinds, not one
-- [ ] **Timezone- and DST-aware schedules**: "9am local on business days" must mean it
-- [ ] **Business-day and fiscal-calendar triggers**: third business day after month end
-- [ ] **Run now, pause, and disable**: with a visible next-run time
-- [ ] **Run history**: start, duration, rows in/out, status, error, per sheet. Every row in `net` now carries a `meta`
-      column beside its body — `{status, ms, bytes}` for a net-http poll, `{ms}` for an alert run — so "is this feed
-      slow, is it 200-ing an error page" is a query. A scheduled runner has no history because it has no runner
-- [ ] **Idempotency keys**: a re-run must not double-append
-- [ ] **Backfill**: run a schedule over a historical date range
-- [ ] **Concurrency control**: skip or queue if the previous run is still going
-- [ ] **Dependency-ordered runs**: a DAG execution order derived from @sheet refs
-- [ ] **Partial-failure semantics**: one failed source must not silently empty a downstream table
-- [ ] **Run budgets and quotas**: per user and per sheet, with a clear message at the limit
-- [ ] **Manual approval step**: pause a pipeline for a human to confirm before the write
-
-### Alerts & notifications
-
-- [ ] **Threshold, change, and anomaly conditions**: value crosses X, value changed by Y%, value outside its usual band.
-      Threshold and change are a where clause over a query that already has window functions; an anomaly band needs the
-      forecasting work in **Stats & modeling**
-- [ ] **Destinations**: email, SMS, Slack, Discord, Teams, webhook, push. Email ships, through the Resend key the signup
-      flow already uses; a refusal from Resend is recorded on the alert rather than swallowed
-- [ ] **Snooze, acknowledge, and escalate**
-- [ ] **Subscribe to a sheet**: get told when a sheet you follow changes, without owning it
-
-### Actions & write-back
-
-The missing other half: sheets that do something, not just show something.
-
-- [ ] **HTTP action**: POST/PUT to an external API from a sheet, with a templated body
-- [ ] **Per-row actions**: run an action for each row matching a predicate, once
-- [ ] **Action queue**: retries, backoff, idempotency keys, and a dead-letter table
-- [ ] **Dry-run mode**: show exactly what would be sent before anything is sent
-- [ ] **Approval gate**: a human confirms before an action batch executes
-- [ ] **Secrets vault**: encrypted per-user and per-sheet secrets, never rendered in a cell
-- [ ] **Action audit log**: who ran what, against which rows, with which payload
-- [ ] **Rate limits and blast-radius caps**: refuse to email 40,000 people by accident
-- [ ] **Built-in actions**: send email, send SMS, post to Slack, create a calendar event, write to a codex table
-
-### Lineage, tests & freshness
-
-- [ ] **Dependency graph view**: which sheets feed this one, and what it feeds
-- [ ] **Impact analysis**: what breaks if this column is renamed or removed
-- [ ] **Freshness indicator**: last-updated and expected-update per sheet, shown in the library
-- [ ] **Staleness alerts**: tell me when a feed silently stopped updating
-- [ ] **Data assertions**: not-null, unique, accepted values, row-count range, freshness bound, referential integrity
-- [ ] **Assertion results in the run log**: with quarantine of failing rows instead of a silent pass
-- [ ] **Row-level provenance**: which source and which run produced this row
-- [ ] **Downstream change notification**: warn dependents before a schema change lands
-
-### Stats & modeling
-
-The Excel add-in market lives here (see the add-in research item).
-
-- [ ] **Regression**: `regr_slope()`, `regr_intercept()`, `r2()`, `corr()`, `regr_predict()` and `regr_stderr()` ship —
-      the fitted value and the spread of the points around the line, in the units of y, because a slope with no standard
-      error beside it is a number nobody can argue with. Multiple and logistic regression, and per-row residuals, are
-      open
-- [ ] **Forecasting**: `regr_predict()` is the straight-line baseline and `fit_exponential()` the log-linear one.
-      Seasonal decomposition is open, and it needs a series-to-series function, which neither the aggregate protocol nor
-      the window pass can express today
-- [ ] **Monte Carlo simulation**: distributions on input cells, sampled outputs, percentile results (the @RISK slot)
-- [ ] **Sensitivity and tornado analysis**: which input moves the output most
-- [ ] **Scenario manager**: named sets of assumptions, compared side by side
-- [ ] **Goal seek and solver**: constrained optimization over a sheet
-- [ ] **Clustering and segmentation**
-- [ ] **Cohort and retention helpers**: `query:cohort-retention` and `query:cohort-grid` are the worked SQL, which is
-      the thing to generalise from — deriving the cohort from the first order, then a pivot. A helper that writes it is
-      open
-- [ ] **Curve fitting**: `fit_exponential()` and `fit_power()` fit by the transform that straightens the curve — a log
-      on y, a log on both — and refuse a value at or below zero by name rather than dropping it and bending the fit.
-      That covers exponential decline and learning curves. Hyperbolic decline needs nonlinear least squares and is open;
-      loss development factors turned out to be a self-join, not a fit (`query:loss-factors`)
-
-### Geospatial
-
-- [ ] **Geocoding and reverse geocoding**: address <-> point, with a match-confidence score
-- [ ] **Address normalization and dedupe**: the hard part of every property and customer dataset
-- [ ] **Spatial joins**: `point_in_polygon()` ships and works as a join predicate — `query:buildable-sites` joins a
-      parcel to its zoning district on the geometry, since nothing on the parcel row says which district it is in.
-      Within-distance is `haversine_km(...) <= n` in a where clause (`query:below-market`). Nearest still materializes
-      every pair first, which is the same missing piece as the as-of join
-- [ ] **Distance, area, and drive-time**: `haversine_km()`, `bearing_deg()` and `polygon_area_km2()` ship in both
-      engines, the last spherical rather than planar, because a county-sized polygon read as flat is wrong by more than
-      the decision it is feeding. A ring that crosses the antimeridian is refused rather than answered inside out.
-      Drive-time does not exist and nothing reprojects
-- [ ] **Boundary datasets as sheets**: counties, tracts, ZCTAs, districts, custom territories
-- [ ] **Map rendering**: points, choropleths, and heatmaps in a chart sheet
-
-### AI & MCP
-
-- [ ] **AI column**: classify, extract, summarize, or translate per row, with results cached by row hash
-- [ ] **Document to table**: PDF, invoice, or contract into structured rows
-- [ ] **Natural language to query**: schema-aware, showing the generated SQL for review before it runs
-- [ ] **Entity resolution via embeddings**: match "Acme Corp." to "ACME CORPORATION" across sheets
-- [ ] **Semantic search across a library**: find the sheet, not the filename
-- [ ] **Cost caps and token budgets**: per sheet and per user, enforced before the spend
-- [ ] **MCP write safety**: scoped tokens, per-tool permissions, an audit trail for agent writes
-- [ ] **MCP resource exposure**: sheets as resources and prompts, not only tools
-- [ ] **Prompt eval sheet**: test cases and scores for an AI column, as a normal sheet
-
-### Reports & export
-
-- [ ] **Export formats**: XLSX with formatting and Parquet. `GET /export/:id.<format>` ships csv, json, ndjson and md
-      for every sheet type, and `GET /sheet/:id` is still the API-shaped JSON read
-- [ ] **PDF report generation**: a print layout with headers, page breaks, and a title page
-- [ ] **Scheduled report delivery**: emailed on a schedule with the file attached
-- [ ] **Report templates**: prose plus live sheet embeds, so the narrative regenerates with the numbers
-
-### Permissions & governance
-
-Extends the Phase 2 roles work.
-
-- [ ] **Row-level and column-level permissions**: hide salary from the team that should not see it
-- [ ] **Teams, groups, and org accounts**: permissions granted to a group, not one email at a time
-- [ ] **SSO / SAML / SCIM**: table stakes for any org-sized customer
-- [ ] **Share links with expiry and password**
-- [ ] **Ownership transfer and offboarding**: what happens to sheets when someone leaves
-- [ ] **Audit log**: reads and writes, exportable, queryable as a sheet
-- [ ] **PII tagging and masking**: mark a column sensitive; masked by default in shares and embeds
-- [ ] **Secrets scanning on publish**: refuse to publish a sheet containing an API key
-- [ ] **PII scanning on publish**: warn before a dataset with personal data goes public
-- [ ] **Retention policies and legal hold**
-- [ ] **Backup and restore**: whole-workspace export and reimport
-- [ ] **Region pinning**: for customers who must keep data in one jurisdiction
-
-### Search, shop & discovery
-
-- [ ] **Global search**: across sheet names, column names, and cell contents
-- [ ] **Shop browse and facets**: by category, source, update cadence, license, and price
-- [ ] **Tags and collections**: curated bundles of related sheets
-- [ ] **Ratings, reviews, and usage counts**: "used by N sheets" as the trust signal
-- [ ] **Free samples**: preview the first rows before buying
-- [ ] **Dataset changelogs**: what changed in this dataset since last month
-- [ ] **Provenance display**: source URL, license, fetch date, and transformation chain on every published dataset
-
-### Marketplace economics
-
-Extends the Stripe Checkout work, which ships platform-side.
-
-- [ ] **Subscriptions**: recurring price for a dataset that keeps updating (the real model for feeds)
-- [ ] **Usage-based pricing and metering**: per query, per row, per API call
-- [ ] **Tiered and free plans**: free up to a row cap, paid above
-- [ ] **Trials, coupons, and refunds**
-- [ ] **License enforcement**: what a buyer may do with a purchased dataset, and what happens on cancellation
-- [ ] **Seller dashboard**: revenue, subscribers, churn, and per-sheet analytics
-- [ ] **Tax and VAT handling**: plus invoices and receipts
-- [ ] **Private and org-only listings**
-- [ ] **Bundles**: sell a pipeline of sheets as one product
-- [ ] **Referral and affiliate credit**
-
-### Performance & scale
-
-- [ ] **Automerge document size limits**: compaction, history pruning, and a graceful path for large tables
-- [ ] **Columnar storage for large sheets**: Automerge for collaborative editing, columnar for bulk data
-- [ ] **Server-side pagination and virtual scroll**: for sheets too big to send to the browser
-- [ ] **Background computation with progress**: long queries do not block the UI
-- [ ] **Cold row archiving**: keep history without keeping it hot
-- [ ] **Per-sheet resource metering**: rows, bytes, compute, and fetches, visible to the user before the limit hits
-
-### Developer surface
-
-Extends the Phase 3 API work.
-
-- [ ] **CLI**: push and pull CSVs, run queries, tail run logs
-- [ ] **Sheet-as-code**: a text definition of a sheet and its pipeline, checked into git
-- [ ] **Staging copies**: clone a sheet, change the query, review the diff, promote
-- [ ] **Branch and merge a sheet**: Automerge makes this genuinely possible; nobody else can offer it
-- [ ] **Self-host and docker image**: for the customers who cannot send data anywhere
-- [ ] **Workspace export/import**: no lock-in, stated loudly as a feature
-- [ ] **Client SDKs**: a thin typed wrapper over the REST API
-- [ ] **Sandbox / test mode**: fake webhook deliveries and dry-run schedules
-
-### Navigation & workspace UX
-
-- [ ] **Folders, workspaces, and favorites**: the library does not scale to hundreds of sheets flat
-- [ ] **Command palette**: jump to any sheet or run any command from the keyboard
-- [ ] **Recently viewed and back/forward**
-- [ ] **Bulk library operations**: multi-select, move, tag, delete, share
-- [ ] **Sheet duplication and templating from an existing sheet**
-- [ ] **Accessibility**: keyboard-only operation, screen reader support, contrast, focus order
-- [ ] **Locale-aware number and date formatting**: and per-user timezone
-- [ ] **Trash and restore**: deleting a sheet must be undoable
-
-### Trust, safety & abuse
-
-- [ ] **Per-user quotas**: fetches, rows, storage, and outbound actions
-- [ ] **Scraping etiquette controls**: per-host limits and a documented user agent
-- [ ] **Shop moderation**: report a listing, review queue, takedown path
-- [ ] **Source terms compliance**: record whether a dataset may be redistributed before it can be sold
-- [ ] **Abuse detection on outbound actions**: rate anomalies that look like a sheet being used as a spam cannon
+- [ ] **A cell can carry a note and a sparkline.** Neither exists.
+  1. Cell notes, distinct from the threaded comments below.
+  2. Mini-charts in a cell, drawn the way the library thumbnails already are.
 
 ---
 
-## Dataset Backlog
+## Charts & dashboards
 
-The shop inventory implied by the Demo Gallery. Most are public, most are ugly, and cleaning them is the product. Each
-should land as a sheet with a stated source, license, update cadence, and provenance.
+- [ ] **The chart set covers what people plot.** Line and bar ship, baseline pinned to zero, non-numeric y dropped.
+      Histogram needs no kind — `width_bucket()` bins and a bar chart draws it.
+  1. Stacked bar, area, scatter, box plot.
+  2. Dual axis and a secondary series.
+  3. Heatmap and matrix, because cohort grids and loss triangles read naturally that way.
 
-### Spines (the entity backbones everything joins to)
+- [ ] **A time axis behaves like time.** The x axis is ordinal today, so a gap in the data is a gap in nothing.
+  1. Date axis with real spacing, explicit gap handling, and downsampling for a long series.
+  2. Annotations: mark a release, a price change, a storm on the axis.
 
-- [ ] **Organizations**: legal entity, brand, domain, ticker, LEI, EIN, NAICS, address; the join key for half the demos
-- [ ] **People**: public figures, officers, physicians, licensees, with disambiguated ids
-- [ ] **Places**: countries, states, counties, cities, ZIP/ZCTA, CBSA, census tracts, with geometries. `table:countries`
-      and `table:us-states` ship, plus `table:airports` and `table:seaports` as point spines with coordinates. Counties,
-      ZCTAs, CBSAs, tracts and every geometry are open
-- [ ] **Parcels and buildings**: parcel boundaries, ownership, zoning, footprints
-- [ ] **Products**: GTIN/UPC catalog and category taxonomy. `table:gs1-prefixes` ships the prefix-to-issuer ranges,
-      which is what reads a barcode's origin; the catalog and taxonomy are open
-- [ ] **Events**: the flagship local-events dataset already promised in Go-to-Market
-- [ ] **Securities**: ticker <-> CIK <-> LEI <-> ISIN <-> domain crosswalk. `table:exchanges` ships the ISO 10383 MIC
-      spine every trade record names the venue by; the identifier crosswalk itself is open
-- [ ] **Songs and recordings**: MusicBrainz, ISRC/ISWC, Discogs
-- [ ] **Colors**: already promised; the fun one that gets shared
+- [ ] **A single number gets its own tile.** A dashboard of one-row charts is the workaround.
+  1. A KPI tile: value, delta against a prior period, and a sparkline.
+  2. It is a `chart` kind, not a new sheet type.
 
-### Reference & crosswalks
+- [ ] **A geo column draws a map.** Nothing renders geometry.
+  1. Point maps and choropleths from a geo column.
+  2. Boundary datasets as sheets — counties, tracts, ZCTAs, districts — are the other half and live in **Inventory**.
 
-- [ ] **Calendars**: business days, public holidays by country and state, fiscal calendars, ISO weeks. `table:holidays`
-      ships US federal holidays for 2026-2027 with statutory and observed dates, and `table:fiscal-calendars` the fiscal
-      year start months that `fiscal_year()` takes as an argument; `business_days()` and `iso_week()` cover the derived
-      parts. Every country and state outside the US is open
-- [ ] **Time zones and DST rules**. `table:timezones` ships 96 IANA zones with standard and daylight offsets and an ISO
-      3166 country code; the transition dates themselves are open
-- [ ] **Currencies and FX rates**: daily and historical, plus a live rate portal. `table:currencies` ships the ISO 4217
-      codes with symbol and minor units; the rates themselves are the open half
-- [ ] **Geographic crosswalks**: ZIP <-> county <-> CBSA <-> tract <-> congressional district. `table:zip-ranges` ships
-      the three-digit ZIP prefix ranges per state — a ZIP is not a shape and does not nest inside a county, but the
-      first three digits land in exactly one state, which is the join an address list actually needs. `table:us-states`
-      now carries `fips` and its Census `division` beside the region, and `table:fema-regions` and `table:epa-regions`
-      ship the two federal groupings that are numbered alike and staffed from different cities. Counties, CBSAs, tracts
-      and districts are open
-- [ ] **Industry classification**: NAICS, SIC, GICS, with mappings between them. `table:naics-subsectors` ships the
-      NAICS 2022 three-digit subsectors keyed to the sector table, which is the level most business data is reported at.
-      `table:naics` (20 NAICS 2022 sectors), `table:sic` (11 divisions, which is what EDGAR stamps on a filer) and
-      `table:gics` (11 sectors, 25 industry groups) all ship. The 6-digit codes and the crosswalks between the three are
-      open, and GICS-to-NAICS never maps cleanly: one classifies revenue, the other establishments
-- [ ] **Occupations**: SOC and O*NET codes and descriptions. `table:soc` ships the 23 SOC 2018 major groups; the
-      detailed codes and all of O*NET are open
+---
 
-### Economy & government
+## Ingest — net-http
 
-- [ ] **BLS**: CPI, PPI by commodity, employment, OES wages by area and occupation
-- [ ] **BEA**: GDP, personal income by county, industry accounts
-- [ ] **FRED / Treasury**: rates, yield curve, spreads, money supply. `table:fed-districts` ships the 12 districts with
-      their serial letter, which is what a call report and a Beige Book entry are keyed to
-- [ ] **Census**: ACS demographics, County Business Patterns, Building Permits Survey, TIGER geometries
-- [ ] **Federal Register and regulations**: rule changes with effective dates. `table:cfr-titles` ships all 50 titles,
-      the first grouping any notice feed needs; the notices themselves are open
-- [ ] **USAspending and SAM.gov**: contracts, grants, and registered entities. `table:agencies` ships 71 federal
-      agencies with the department each bureau sits under, which is the handle three of these feeds disagree on the
-      spelling of
-- [ ] **Grants.gov**: open funding opportunities with eligibility
-- [ ] **FEC**: committees, contributions, expenditures
-- [ ] **Congress**: bills, roll-call votes, sponsors, committees
-- [ ] **Lobbying disclosures**: LDA filings and registrants
-- [ ] **IRS**: Form 990 filings and the exempt-organization master file
-- [ ] **State business registries**: entities, officers, status, and UCC liens
-- [ ] **Sanctions and PEP lists**: OFAC SDN, EU, UN consolidated
+- [ ] **A feed that needs more than one GET works.** One unauthenticated GET per interval is the whole of it.
+  1. POST and PUT with a templated body.
+  2. OAuth authorization code flow plus automatic refresh, on top of the secret store.
+  3. Static egress IP, which many enterprise sources require before they will talk at all.
 
-### Finance & markets
+- [ ] **The response is parsed, not stored as a blob.** JSON lands as one cell.
+  1. Parsers: JSON path, CSV/TSV, NDJSON, XML, RSS/Atom, HTML with CSS selectors, XLSX, Parquet.
+  2. Archives: zip and gzip, including "the one CSV inside this daily zip".
+  3. PDF table extraction, because half of government data ships as PDF.
+  4. Payload mapping is the same job on the `net-hook` side: JSON path to column, so a webhook lands as typed rows.
 
-- [ ] **SEC EDGAR**: 10-K/10-Q, 8-K, 13F, N-PORT, Form 4, S-1, with XBRL financials extracted. `table:sec-forms` ships
-      the form-type spine with who files each and when it is due, which is all a filing index gives you to group by
-- [ ] **Equity prices**: end-of-day history plus a live quote portal, with splits and dividends applied
-- [ ] **Options chains**: strikes, expiries, implied volatility
-- [ ] **Futures and commodities**: CME settlements, LME, energy and ag spot prices
-- [ ] **Crypto**: exchange prices, on-chain balances, token metadata
-- [ ] **Short interest and insider trades**
-- [ ] **Earnings calendar and transcripts**
-- [ ] **Bankruptcies and credit events**
-- [ ] **Bank and credit union data**: FDIC, NCUA call reports
+- [ ] **You fetch only what is new.** Every poll refetches everything.
+  1. Pagination: page, offset, cursor and Link-header, each with a stop condition.
+  2. Conditional requests: ETag and If-Modified-Since, so a daily file is not downloaded hourly.
+  3. A since-last-run cursor, with the watermark stored on the sheet.
+  4. Write mode per sheet: append, replace, or upsert by key.
 
-### Health
+- [ ] **A flaky source recovers by itself and a broken one says so.** A failure is one row and the next poll is an hour
+      later.
+  1. Retry with backoff, distinguishing transient from permanent.
+  2. Per-host concurrency and delay, and respect for Retry-After.
+  3. Response size and time caps with a clear message rather than a hung sheet.
+  4. Keep the original bytes, so a parser fix can be replayed without re-fetching.
 
-- [ ] **CMS**: NPI registry, hospital and physician compare, cost reports, fee schedules, Part D prescribing
-- [ ] **Hospital price transparency files**: the normalized cross-hospital rate table nobody has cleaned well
-- [ ] **FDA**: drug shortages, recalls, adverse events, NDC directory, device clearances
-- [ ] **ClinicalTrials.gov**: trials, sites, sponsors, enrollment
-- [ ] **Code sets**: ICD-10, HCPCS, LOINC, RxNorm, SNOMED — note the ones that need a license (CPT). `table:icd10` ships
-      the 22 ICD-10-CM chapter ranges and `table:hcpcs-ranges` the Level II letter ranges, which is the whole Level II
-      taxonomy: the letter says which benefit category a line falls in before anyone reads the code. `table:pos-codes`
-      ships the CMS place-of-service codes, the two digits that decide which of two prices a procedure is paid at, and
-      `table:carc` the common claim adjustment reason codes with an `appealable` column. The detailed code sets, LOINC,
-      RxNorm and SNOMED are open
-- [ ] **CDC**: notifiable disease surveillance, wastewater, mortality, vaccination
-- [ ] **Genomics references**: ClinVar, dbSNP, gene and transcript annotations
+- [ ] **You test the request before you save it.** The first thing a new sheet does is wait an hour to fail.
+  1. A pre-flight button: fetch once, show the parsed preview, then save.
 
-### Weather, climate & hazard
+---
 
-- [ ] **NWS/NOAA forecasts and observations**: plus a live conditions portal
-- [ ] **Historical weather and climate normals**: with growing degree days derived
-- [ ] **Storm tracks and severe weather**: hurricanes, hail, wind, tornado reports. `table:hazard-scales` ships
-      Saffir-Simpson, Enhanced Fujita, Beaufort, moment magnitude, US AQI and UV index as one bandable table; the
-      observations themselves are open
-- [ ] **FEMA**: flood maps, disaster declarations, NFIP claims
-- [ ] **Wildfire perimeters and risk**: NIFC and related
-- [ ] **Air quality**: regulatory monitors plus low-cost sensor networks
-- [ ] **Water**: USGS streamflow, quality sampling, drought monitor
-- [ ] **Earthquakes and seismic hazard**
+## Ingest — net-hook & forms
 
-### Energy & environment
+- [ ] **A form on the internet writes rows into a sheet.** A net-hook sheet takes JSON from something that can sign;
+      nothing renders a form.
+  1. Generate a real form from the column types, with validation and a thank-you page.
+  2. File uploads land in an attachment column.
+  3. Filters drop events that do not match a predicate before they reach the table.
+  4. Response templating: choose the status and body, so the sheet can answer a callback synchronously.
 
-- [ ] **EIA**: generation, fuel prices, consumption, capacity
-- [ ] **ISO/RTO price feeds**: CAISO, ERCOT, PJM, MISO, ISO-NE, NYISO day-ahead and real-time LMP.
-      `table:grid-operators` ships the 9 North American operators as the spine; every price feed is open
-- [ ] **Solar resource**: irradiance and modeled production
-- [ ] **State oil and gas production**: well-level, by state agency
-- [ ] **Emissions factors**: eGRID, EPA, DEFRA, for carbon accounting. `table:emission-factors` ships the EPA combustion
-      factors per mmBtu and per physical unit plus the eGRID US average; DEFRA and the per-subregion grid factors are
-      open
-- [ ] **EPA enforcement and emissions**: ECHO, GHG reporting, TRI
+- [ ] **You forward an email or a text and it becomes rows.** Neither address exists.
+  1. An email-in address per sheet; body and attachments become a row.
+  2. Inbound SMS on the same path, through the Twilio-shaped webhook the signature work already covers.
 
-### Property & construction
+- [ ] **One noisy sender cannot fill a sheet.** `NET_BODY_CAP` and `trimNet` bound a delivery and a sheet; nothing
+      bounds a sender.
+  1. Per-hook rate limits and size caps, keyed the way `callerIp()` keys the global one.
+  2. The refusal names the limit and the window, as every other refusal does.
 
-- [ ] **Assessor rolls and deed transfers**: by county
-- [ ] **Zoning and land-use codes**: normalized across jurisdictions
-- [ ] **Building permits**: by city, plus the national survey
-- [ ] **Rent and home price indices**: by ZIP and metro
-- [ ] **HUD**: fair market rents, income limits, housing programs
-- [ ] **Construction cost indices**: material PPI series and labor rates
-- [ ] **Prevailing wage determinations**: Davis-Bacon and state equivalents
-- [ ] **OSHA inspections and violations**
+---
 
-### Trade & logistics
+## Codex — databases
 
-- [ ] **HTS tariff schedule**: with duty rates and change history. `table:hs-chapters` ships all 97 HS 2022 chapters
-      grouped into their 21 sections, which is the join key; the duty rates and the history are open
-- [ ] **Trade flows**: Census trade data and UN Comtrade. `table:edi-transactions` ships the X12 transaction set codes —
-      810, 214, 850, 856 and the rest — which is the number that says what an EDI file is and the only thing a logistics
-      or claims feed tells you about its own shape
-- [ ] **Vessel positions and port calls**: AIS-derived. `table:vessel-types` ships the AIS ship-and-cargo codes, the
-      only description a position report carries; the positions are open
-- [ ] **Port throughput and congestion**. `table:containers` ships the ISO 6346 types with the TEU each counts as, which
-      is what makes a throughput figure comparable; the throughput itself is open
-- [ ] **Fuel surcharge basis**: DOE diesel price series
-- [ ] **Carrier registry and safety**: FMCSA SAFER, inspections, crashes
-- [ ] **Air cargo and flight data**: schedules, ADS-B positions, on-time performance. `table:airports` and
-      `table:airlines` ship the IATA/ICAO spines — a schedule carries the IATA code and an ADS-B feed the ICAO one, so
-      both are needed to join them. Every movement feed is open
-- [ ] **Freight rate indices**: container and truckload spot
+- [ ] **You connect the database you actually have.** Postgres only.
+  1. MySQL, SQLite, SQL Server, DuckDB/Parquet, BigQuery, Snowflake, Redshift, ClickHouse, MongoDB, Athena.
+  2. SSH tunnel and TLS options, which is what every enterprise connection needs before it connects.
 
-### Retail, food & hospitality
+- [ ] **You pick a table without writing SQL first.** The first screen is an empty query box.
+  1. Schema browser and table picker, off the same read `describe` uses.
+  2. Sampling for preview: never `select *` a billion-row table to draw a thumbnail.
 
-- [ ] **Food prices**: USDA commodity and retail price series
-- [ ] **Food composition and nutrition**: FoodData Central
-- [ ] **Restaurant health inspections**: by city, normalized into one schema
-- [ ] **Product catalog and taxonomy**: GTIN, categories, attributes
-- [ ] **Search and shopping trend indices**
-- [ ] **Alcohol, tobacco, and regulated product registries**
+- [ ] **A codex cannot write unless you said so.** The session is set read-only, which is the right default and not a
+      permission.
+  1. An explicit write grant per connection, off by default.
+  2. Row and column masking, so a subset of a sensitive table can be exposed.
 
-### Agriculture
+- [ ] **A big table syncs by delta.** The whole table moves every time.
+  1. Incremental sync with a watermark column.
+  2. CDC or logical replication for sources that support it.
 
-- [ ] **USDA NASS**: yields, acreage, prices received, by county. `table:hardiness-zones` ships the USDA plant hardiness
-      half-zones with their temperature bands — a zone is a temperature, not a place, which is why it joins to a
-      planting table rather than to a map
-- [ ] **Soil survey**: SSURGO properties by map unit
-- [ ] **Satellite vegetation indices**: NDVI time series per field
-- [ ] **Crop insurance program data**: RMA actuarial and loss history
-- [ ] **Livestock and dairy reports**: prices, inventories, cold storage
+- [ ] **A rotated credential does not break live sheets.** There is no rotation path.
+  1. Two DSNs during a rollover, tried in order — the `secret` table already has this shape.
+  2. Connection health surfaced as freshness on every downstream sheet, through `library:freshness`.
 
-### Education, labor & people
+---
 
-- [ ] **IPEDS and NCES**: institutions, enrollment, finance, outcomes
-- [ ] **College Scorecard**: earnings and completion by program
-- [ ] **School districts and boundaries**: with per-pupil finance
-- [ ] **State assessment results**: normalized across states
-- [ ] **H-1B and PERM disclosure data**: employer, role, wage
-- [ ] **Job postings**: aggregated, with title and skill normalization
-- [ ] **Professional licenses**: by state and profession
+## Scheduling & runs
 
-### Legal & compliance
+The runner is in **Now**. These are what the Demo Gallery needs on top of it.
 
-- [ ] **Court dockets and opinions**: federal and available state. `table:circuits` ships the 13 courts of appeals with
-      the states each covers and its authorized judgeships; the dockets are open
-- [ ] **Patents and trademarks**: USPTO grants, applications, assignments, CPC codes. `table:nice-classes` ships the 45
-      Nice classes, the only subject key a trademark register carries; CPC and the filings are open
-- [ ] **UCC filings and liens**
-- [ ] **Regulatory enforcement actions**: SEC, FTC, CFPB, state AGs
-- [ ] **Statutes and administrative codes**: with citation structure. `table:cfr-titles` is the top of the CFR citation
-      tree; parts, sections and the US Code are open
+- [ ] **A schedule can mean what you meant.** An interval in seconds is the only trigger.
+  1. Cron, interval, and "on upstream change" — three kinds, not one.
+  2. Timezone- and DST-aware, so "9am local on business days" means it. `table:timezones` ships the offsets.
+  3. Business-day and fiscal-calendar triggers: third business day after month end. `business_days()` and
+     `fiscal_period()` already do the arithmetic.
 
-### Media, culture & sport
+- [ ] **You can run it now, pause it, and see when it runs next.** Nothing is visible or controllable.
+  1. Run now, pause, disable, with the next-run time on the sheet.
+  2. Backfill: run a schedule over a historical date range.
 
-- [ ] **News and RSS corpus**: with publisher and topic metadata
-- [ ] **Wikipedia / Wikidata entity extracts**: as the fallback join key for anything
-- [ ] **Sports schedules and box scores**: per league, with a player-id crosswalk
-- [ ] **Betting odds**: line history across books
-- [ ] **Box office and streaming charts**
-- [ ] **Setlists, tour dates, and venue capacities**
+- [ ] **A re-run does not double-append.** Nothing is idempotent.
+  1. An idempotency key per run, the way `net_hook_signature_idx` refuses a duplicate delivery.
+  2. Partial-failure semantics: one failed source must not silently empty a downstream table.
 
-### Technology
+- [ ] **Sheets run in dependency order.** Each runs on its own timer, so a downstream sheet can run before its source.
+  1. A DAG derived from the `@sheet` refs `scanRefs()` already returns.
+  2. A cycle is refused as the path that closes it, exactly as `checkRefPath` reports one.
 
-- [ ] **Vulnerabilities**: NVD, OSV, CISA KEV, with package and version ranges. The CVSS v3.1 severity bands ride
-      `table:hazard-scales` as the `cvss-v3` scale, since a score is banded the same way a wind speed is; the feeds are
-      open
-- [ ] **Package registries**: npm, PyPI, crates, Maven metadata and download counts
-- [ ] **Cloud pricing**: AWS, GCP, Azure SKU prices and regions. `table:cloud-regions` ships 73 regions across the three
-      clouds with the coordinates of the city each is named for, so a latency or residency question answers without a
-      price list; the SKU prices are open
-- [ ] **Domain, DNS, and certificate transparency data**. `table:dns-records` ships the IANA record types by number,
-      which is the form a wire capture carries; the zone, WHOIS and CT feeds are open
-- [ ] **Public status pages and incident history**. `table:http-status` ships the IANA status registry with a `retry`
-      column, which is what turns a log of statuses into an answer about whether an integration is broken or busy
+- [ ] **A runaway pipeline hits a limit with a clear message.** Nothing is metered per user.
+  1. Run budgets and quotas per user and per sheet.
+  2. A manual approval step, so a pipeline can pause for a human before a write.
 
-### Dataset infrastructure
+---
 
-Not datasets, but the machinery every dataset above needs to be sellable.
+## Alerts & notifications
 
-- [ ] **Dataset manifest**: source URL, license, attribution requirement, cadence, owner, and refresh status per sheet
-- [ ] **Redistribution flag**: whether a source may legally be resold, checked before a listing goes live
-- [ ] **Versioned publishing**: buyers pin a version; a changelog explains each release
-- [ ] **You see which dataset stopped refreshing**: `GET /status` grades the feeds in aggregate — "every net-http poll
-      returned 2xx", "every net-http sheet was polled in the past two hours" — but names none of them, so the alarm says
-      something is rotten without saying what. A dashboard over `net` cannot answer it: `net` is not a sheet, and every
-      `@net-http:x` ref reads one feed's rows, so there is nothing to group by.
-  1. `GET /library/freshness` answers one row per net-http and alert sheet the caller can read: sheet_id, name, last
-     run, the `meta` of that run, and consecutive failures. One query, grouped in SQL, on the index `net` already has.
-  2. It is a sheet-shaped read, so it pages and exports through the same route the others do, and a `query` sheet can
-     select from it.
-  3. The status check stays a fixed list of sentences. One condition per feed is the wrong shape — a check whose
-     conditions come and go with the data cannot be read by an uptime checker.
-- [ ] **Normalization conventions**: shared column names, date formats, and code sets across all shop datasets
-- [ ] **Sample and preview generation**: a free first-N-rows sheet for every paid dataset
-- [ ] **Seeding pipeline**: the datasets themselves defined as Scrapsheets pipelines, dogfooding the product
+- [ ] **An alert can fire on a change, not only on a row.** The condition is the query's where clause, which covers
+      threshold and change but not "outside its usual band".
+  1. Change conditions read the previous run out of the log the alert already writes.
+  2. An anomaly band needs the forecasting work under **Stats & modeling**, and waits for it.
+
+- [ ] **An alert reaches you where you are.** Email ships, through the Resend key signup already uses.
+  1. SMS, Slack, Discord, Teams, webhook, push.
+  2. A refused delivery is recorded on the alert and retried next interval, which is already the rule for email.
+
+- [ ] **You can silence an alert without deleting it.** There is no acknowledgement of any kind.
+  1. Snooze, acknowledge, escalate.
+  2. Subscribe to a sheet: be told when a sheet you follow changes, without owning it.
+
+---
+
+## Actions & write-back
+
+The missing other half: sheets that do something, not just show something.
+
+- [ ] **A sheet can send something.** Every pipeline ends in a table.
+  1. An HTTP action: POST or PUT to an external API with a templated body, through the `safeFetch` SSRF guard.
+  2. Built-in actions: send email, send SMS, post to Slack, create a calendar event, write to a codex table.
+  3. Per-row actions: run once for each row matching a predicate, exactly once.
+
+- [ ] **Nothing is sent that you did not see first.** An action with no dry run is a mail merge with no preview.
+  1. Dry-run mode showing exactly what would be sent.
+  2. An approval gate before a batch executes.
+  3. Rate limits and blast-radius caps: refuse to email 40,000 people by accident, and say so.
+
+- [ ] **A failed action is retried and then kept.** Nothing survives a failure.
+  1. An action queue with retries, backoff and idempotency keys, sharing the dead-letter sheet from **Types &
+     validation**.
+  2. An audit log: who ran what, against which rows, with which payload.
+
+---
+
+## Lineage, tests & freshness
+
+- [ ] **You can see what feeds a sheet and what it feeds.** The refs are known and never shown.
+  1. A dependency graph view off `scanRefs()`.
+  2. Impact analysis: what breaks if this column is renamed or removed.
+  3. Warn dependents before a schema change lands.
+
+- [ ] **A sheet states what must be true of it.** Nothing is asserted.
+  1. Assertions: not-null, unique, accepted values, row-count range, freshness bound, referential integrity.
+  2. Results land in the run log, and failing rows are quarantined rather than passed silently.
+  3. Row-level provenance: which source and which run produced this row.
+
+---
+
+## Stats & modeling
+
+The Excel add-in market lives here.
+
+- [ ] **A regression answers more than one shape.** `regr_slope()`, `regr_intercept()`, `r2()`, `corr()`,
+      `regr_predict()` and `regr_stderr()` ship.
+  1. Multiple regression, logistic regression, and per-row residuals.
+
+- [ ] **A seasonal series can be forecast.** `regr_predict()` is the straight line and `fit_exponential()` the
+      log-linear one.
+  1. Seasonal decomposition, which needs a series-to-series function — neither the aggregate protocol nor the window
+     pass can express one today, so that is the actual work.
+
+- [ ] **You can put a distribution on an input and read percentiles out.** The @RISK slot, and nothing occupies it.
+  1. Monte Carlo: distributions on input cells, sampled outputs, percentile results.
+  2. Sensitivity and tornado analysis: which input moves the output most.
+  3. A scenario manager: named sets of assumptions compared side by side. `table:assumptions` is the one-row sheet the
+     demos already read parameters from, so this generalises it.
+
+- [ ] **You can solve for an input.** No goal seek, no solver.
+  1. Goal seek over one cell, then constrained optimization over a sheet.
+
+- [ ] **A cohort table writes itself.** `query:cohort-retention` and `query:cohort-grid` are the worked SQL — derive the
+      cohort from the first order, then pivot.
+  1. A helper that writes that SQL from a source, a date column and a key.
+  2. Clustering and segmentation is the same shape of helper over a different verb.
+
+- [ ] **A hyperbolic decline curve fits.** `fit_exponential()` and `fit_power()` fit by the transform that straightens
+      the curve and refuse a value at or below zero by name.
+  1. Nonlinear least squares, which is what hyperbolic decline actually needs.
+
+---
+
+## Geospatial
+
+- [ ] **An address becomes a point.** Nothing geocodes.
+  1. Geocoding and reverse geocoding, with a match-confidence score.
+  2. Address normalization and dedupe, which is the hard part of every property and customer dataset.
+
+- [ ] **A nearest-neighbour join does not materialize every pair.** `point_in_polygon()` works as a join predicate and
+      within-distance is `haversine_km(...) <= n`; nearest still builds every pair first.
+  1. The same sorted-input join as the as-of join under **Query engine**. Build it once.
+  2. Drive-time distance, and something that reprojects — neither exists.
+
+---
+
+## AI & MCP
+
+- [ ] **A column can be filled by a model.** Nothing calls one.
+  1. Classify, extract, summarize or translate per row, cached by row hash so a re-run is free.
+  2. Document to table: PDF, invoice or contract into structured rows.
+  3. Entity resolution by embedding, to match "Acme Corp." to "ACME CORPORATION" across sheets.
+  4. Cost caps and token budgets per sheet and per user, enforced **before** the spend.
+
+- [ ] **You ask for a query in words and read the SQL before it runs.** There is no natural-language path.
+  1. Schema-aware generation off the same read `describe` uses.
+  2. The generated SQL is shown for review, never run unseen.
+  3. A prompt eval sheet — test cases and scores — is a normal sheet, and is how this stays honest.
+
+- [ ] **An agent can be trusted with write access.** MCP writes carry the caller's whole authority.
+  1. Scoped tokens and per-tool permissions.
+  2. An audit trail for agent writes, sharing the action audit log.
+  3. Sheets exposed as MCP resources and prompts, not only tools.
+
+---
+
+## Reports & export
+
+- [ ] **A report arrives looking like a report.** `csv`, `json`, `ndjson`, `md` and `ics` ship through one route.
+  1. XLSX with formatting, and Parquet.
+  2. PDF with a print layout: headers, page breaks, title page.
+  3. Prose plus live sheet embeds, so the narrative regenerates with the numbers.
+  4. Scheduled delivery, emailed with the file attached — the runner in **Now** is what it rides.
+
+---
+
+## Permissions & governance
+
+- [ ] **A column can be hidden from someone who can read the sheet.** Access is per sheet.
+  1. Row-level and column-level permissions.
+  2. PII tagging: mark a column sensitive, masked by default in shares and embeds.
+
+- [ ] **You grant access to a group, not to twelve addresses.** `sheet_usr` is per user.
+  1. Teams, groups and org accounts.
+  2. SSO, SAML and SCIM, which is table stakes for any org-sized customer.
+  3. Ownership transfer and offboarding: what happens to sheets when someone leaves.
+
+- [ ] **A share link can expire.** `POST /library/:id/link` mints a 30-day viewer JWT and nothing else.
+  1. Chosen expiry and an optional password.
+  2. An audit log of reads and writes, exportable and queryable as a sheet.
+
+- [ ] **You cannot publish a secret by accident.** Nothing is scanned.
+  1. Refuse to publish a sheet containing an API key.
+  2. Warn before a dataset with personal data goes public.
+  3. Retention policies, legal hold, whole-workspace backup and restore, and region pinning are the rest of this row,
+     and each is its own item once one customer asks.
+
+---
+
+## Search, shop & discovery
+
+- [ ] **You find a sheet by what is in it.** Search is over the library table on screen.
+  1. Global search across sheet names, column names and cell contents.
+  2. Semantic search across a library: find the sheet, not the filename.
+
+- [ ] **The shop can be browsed.** It is one flat list ordered by name.
+  1. Facets: category, source, update cadence, license, price.
+  2. Tags and collections — curated bundles of related sheets.
+  3. "Used by N sheets" as the trust signal, plus ratings and reviews.
+
+- [ ] **You see a dataset before you buy it.** There is no preview.
+  1. A free first-N-rows sample sheet for every paid dataset.
+  2. A changelog per dataset, and provenance on every published one: source URL, license, fetch date, transformation
+     chain.
+
+---
+
+## Marketplace economics
+
+Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
+
+- [ ] **A seller gets paid.** Money lands on the platform account and stays there.
+  1. Stripe Connect onboarding and payouts.
+  2. Tax and VAT handling, plus invoices and receipts.
+
+- [ ] **A feed can be sold as a subscription.** One-off purchase is the only model, which is the wrong one for anything
+      that keeps updating.
+  1. Recurring price for a dataset that keeps updating.
+  2. Usage-based pricing and metering: per query, per row, per API call.
+  3. Tiered and free plans: free up to a row cap, paid above.
+  4. Trials, coupons and refunds.
+
+- [ ] **A seller can see what is selling.** There is no dashboard.
+  1. Revenue, subscribers, churn and per-sheet analytics.
+  2. License enforcement: what a buyer may do with a purchased dataset, and what happens on cancellation.
+  3. Private and org-only listings, bundles, and referral credit.
+
+---
+
+## Sheet as an API
+
+- [ ] **You POST rows to a sheet.** `GET /sheet/:id` is the stable read for every sheet type; there is no write.
+  1. `POST /sheet/:id` appending rows, validated at the boundary against the column types.
+  2. Per-sheet API keys, so a script does not carry a user's JWT.
+  3. An OpenAPI spec derived from the column types, so the keys have something to point at.
+  4. Configurable per-sheet rate limits for public sheet APIs.
+
+- [ ] **Something is told when a sheet changes.** Change flows in and never out.
+  1. Outbound change webhooks, signed the way inbound deliveries are verified.
+  2. They are the "on upstream change" trigger under **Scheduling & runs**, seen from the other side.
+
+---
+
+## Collaboration
+
+- [ ] **You see who else is in the sheet.** Automerge syncs the document and nothing else.
+  1. Cursor presence with coloured indicators.
+  2. An active-user list in the sheet header, and presence in the library so you can see which sheets are live.
+
+- [ ] **You can argue about a cell in the cell.** There is nowhere to put a comment.
+  1. Threaded comments on individual cells.
+
+- [ ] **You can go back.** Automerge stores the full history and nothing reads it.
+  1. A timeline slider showing document state over time.
+  2. A visual diff between any two versions.
+  3. Named snapshots, and rollback to any historical state.
+  4. A conflict-resolution view, for the merges Automerge cannot decide.
+
+---
+
+## Offline & mobile
+
+- [ ] **The app works on a phone and on a plane.** The layout assumes a mouse and a connection.
+  1. Responsive touch-friendly cell editing and swipe navigation.
+  2. A PWA manifest, installable, with offline support.
+  3. IndexedDB-first sync — Automerge already uses it, so this is optimisation rather than new machinery.
+
+---
+
+## Developer surface
+
+- [ ] **A sheet can live in git.** Everything is clicked.
+  1. A text definition of a sheet and its pipeline, checked in.
+  2. A CLI: push and pull CSVs, run queries, tail run logs.
+  3. Thin typed client SDKs over the REST API.
+
+- [ ] **You can change a pipeline without breaking the live one.** Every edit is live.
+  1. Staging copies: clone a sheet, change the query, review the diff, promote.
+  2. Branch and merge a sheet — Automerge makes this genuinely possible and nobody else can offer it.
+  3. A sandbox: fake webhook deliveries and dry-run schedules.
+
+- [ ] **You can run it yourself.** There is no self-host path.
+  1. A docker image, for the customers who cannot send data anywhere.
+  2. Workspace export and import, stated loudly as a feature rather than buried.
+
+---
+
+## Navigation & workspace UX
+
+- [ ] **A library of hundreds of sheets is navigable.** It is one flat list.
+  1. Folders, workspaces and favourites.
+  2. Bulk operations: multi-select, move, tag, delete, share.
+  3. Recently viewed, and back/forward.
+
+- [ ] **Everything is reachable from the keyboard.** The shortcut sheet lists what exists; there is no palette.
+  1. A command palette: jump to any sheet, run any command.
+  2. Full keyboard-only operation, screen reader support, contrast and focus order.
+
+- [ ] **Deleting a sheet is undoable.** It is not.
+  1. Trash and restore.
+
+---
+
+## Performance & scale
+
+- [ ] **A large sheet does not choke the tab.** Automerge holds the whole document in memory.
+  1. Document size limits, compaction and history pruning, with a graceful path for large tables.
+  2. Columnar storage for bulk data, with Automerge kept for collaborative editing.
+  3. Cold row archiving: keep history without keeping it hot.
+
+- [ ] **A long query does not freeze the UI.** The engine is single-threaded and cannot be preempted, which is why
+      `MAX_QUERY_ROWS` is the real guard.
+  1. Background computation with progress.
+  2. Per-sheet resource metering — rows, bytes, compute, fetches — visible before the limit hits.
+
+---
+
+## Trust, safety & abuse
+
+- [ ] **One account cannot exhaust the service.** `rateLimit()` bounds requests per IP and nothing bounds a user.
+  1. Per-user quotas: fetches, rows, storage, outbound actions.
+  2. Abuse detection on outbound actions: rate anomalies that look like a sheet being used as a spam cannon.
+
+- [ ] **We are a polite scraper.** `safeFetch` guards our network and not theirs.
+  1. Per-host limits and a documented user agent.
+  2. Record whether a source may legally be redistributed, checked before a listing goes live.
+  3. Shop moderation: report a listing, review queue, takedown path.
+
+---
+
+## Scrapscript
+
+The moat, and the reason the formula work below is shaped the way it is.
+
+- [ ] **A formula is a content-addressed program.** The `Scrapscript` and `Formula` lang types exist in `Main.elm` and
+      execute nothing.
+  1. Compile the Scrapscript interpreter to WASM for browser execution.
+  2. Wire the `Scrapscript` lang type to run programs against sheet data.
+  3. `=#` in a cell triggers Scrapscript evaluation; `=` triggers the formula mode below.
+  4. Cross-sheet references by hash rather than by the fragile `@sheet_id` string.
+  5. Sell and share self-contained Scrapscript functions as composable sheet utilities — the saved-snippets item under
+     **Query engine** is the seam this replaces.
+
+- [ ] **`=A1 + B1` works.** There is no formula evaluation at all.
+  1. A parser behind the `Formula` lang type: arithmetic, `SUM`, `AVERAGE`, `COUNT`, `MIN`, `MAX`.
+  2. Cross-sheet references: `=@table:abc123.A1`. The cell-reference rewrite in `scanRefs()` is the same idea in SQL.
+  3. Dependency tracking with a topological sort and cycle detection, reported as the path that closes it.
+  4. Reactive recalculation when a referenced cell changes.
+
+---
+
+## Go-to-market
+
+- [ ] **Somebody outside this repo has used it.** No launch has happened.
+  1. Post a compelling demo and say you are looking for angels. Skip the deck.
+  2. File real GitHub issues, publish the demo plus a blog post, rally contributors.
+  3. Sit with Clark, Kirk and Jake; convert findings into issues.
+  4. Reach out to Ellen Chisa, intro via Brandon, lead with the demo.
+
+- [ ] **The path from signup to paid is instrumented.** `GET /status` grades one usage condition and it does not page.
+  1. Define signup → first sheet → paid, and instrument each step.
+  2. Test paid acquisition on Reddit and adjacent communities against that funnel.
+  3. Demo-first deck at /scrapland once the dev launch lands.
+  4. Pitch spreadsheet and data podcasts; become the face of data cleaning and curation.
+
+- [ ] **The shop has something nobody else has.** It has the seeded examples.
+  1. Seed the public-entity spines: orgs, people, parcels, colors, songs.
+  2. Build the giant local-events table as the flagship public dataset.
+
+---
+
+## Inventory
+
+Raw lists, mined by later passes rather than worked top to bottom. Nothing here is a task until it comes out as one.
+
+### Demo Gallery
+
+End-to-end use cases written as sheet pipelines. **`src/examples.mjs` is the index** — the sheets tagged `demo` are what
+ships, run by `examples_test.ts` in both engines. Every unbuilt one dies at the same place, the ingest half, because a
+seeded table is a feed nobody has connected yet. That is what **Now** and **Ingest** are for; when a pipeline is worth
+building, it comes out of here as one item naming the feed it needs.
+
+- [ ] **Flagship**: restaurant-group weekly P&L, fund 13F drift, contractor WIP schedule, municipal budget watchdog, the
+      solo consultant's whole business in six sheets. Four of the five already ship their query half.
+- [ ] **Finance, trading and insurance**: three-statement forecast, commission calculator, covenant monitor, FX
+      exposure, overhead allocation, ASC 606, AR aging, earnout tracking, pairs trade, options screener, crypto
+      treasury, earnings calendar, alt-data backtest, catastrophe exposure, producer commission reconciliation, claims
+      leakage, rate filing comparison.
+- [ ] **Healthcare, legal and real estate**: hospital price transparency, PS&R reconciliation, drug shortage exposure,
+      trial competitive map, infection surveillance, prior-auth turnaround, wRVU productivity, docket watch, realization
+      analysis, entity and lien monitoring, patent landscape, discovery cost, property tax appeal, construction draw,
+      short-term rental pricing, deal underwriting, CAM reconciliation.
+- [ ] **Operations**: construction (RFI log, material escalation, weather-at-risk, equipment utilization, certified
+      payroll, punch list), manufacturing (OEE, BOM roll-up, supplier scorecard, preventive maintenance, takt planning),
+      logistics (landed cost, carrier scorecard, container ETA, safety stock, cold chain, tariff impact).
+- [ ] **Commerce and hospitality**: competitor repricing, settlement reconciliation, inventory allocation, return abuse,
+      assortment gap, promo lift, recipe costing, hourly labor, multi-unit rollup, theoretical vs actual usage, health
+      inspection watch, hotel pace.
+- [ ] **Public and civic**: budget burn rate, permit backlog, campaign finance network, lobbying vs votes, records
+      request tracker, grant subrecipient monitoring, effort reporting, student risk, enrollment funnel, district
+      spending vs outcomes, course demand, grant pipeline, 990 benchmarking, outcome reporting, restricted funds,
+      volunteer scheduling.
+- [ ] **Energy, agriculture, climate**: day-ahead spread, solar performance ratio, demand response settlement, utility
+      bill audit, carbon inventory, irrigation scheduling, grain hedge ratio, crop insurance documentation, livestock
+      rations, CSA pick list, air quality, water sampling compliance, facility emissions, wildfire and flood risk, waste
+      diversion.
+- [ ] **Media, sport, science and personal**: story data pipeline, FOIA tracker, newsletter analytics, ad pacing, beat
+      entity database, tour routing, setlist analytics, sync licensing, merch inventory, film budget variance, player
+      efficiency, athlete load, youth league scheduling, ticket pricing, recruiting board, literature watch, instrument
+      QC, variant annotation, field survey, reproducible analysis artifact, job search tracker, renovation bids,
+      collection catalog, event planning, fantasy league.
+- [ ] **Go-to-market functions**: blended CAC, SERP tracking, multi-touch attribution, influencer ROI, content calendar,
+      pipeline hygiene, territory planning, lead scoring, renewal risk, deal desk, partner revenue, applicant funnel,
+      headcount plan, certification dates, onboarding checklists, engagement survey, incident metrics, CVE exposure,
+      DORA metrics, on-call fairness, MCP ticket triage, feature flag cleanup, hours-of-service, flight ops, charter
+      quoting, transit reliability.
+
+### Datasets
+
+The shop inventory the Demo Gallery implies. Most are public, most are ugly, and cleaning them is the product. Each
+lands as a sheet with a stated source, license, cadence and provenance. Roughly forty reference tables already ship —
+`src/examples.mjs` is the list, not this one.
+
+- [ ] **Spines**: organizations, people, places, parcels and buildings, products, events, securities, songs, colors.
+      `table:countries`, `table:us-states`, `table:airports`, `table:seaports`, `table:exchanges` and
+      `table:gs1-prefixes` are the parts that ship; every geometry and every identifier crosswalk is open.
+- [ ] **Reference and crosswalks**: calendars, timezone transitions, FX rates, ZIP↔county↔CBSA↔tract, NAICS/SIC/GICS
+      detail codes, SOC and O*NET detail. The top level of each already ships; the detail and the mappings do not.
+- [ ] **Economy and government**: BLS, BEA, FRED and Treasury, Census, Federal Register, USAspending and SAM,
+      Grants.gov, FEC, Congress, lobbying, IRS 990, state business registries, sanctions and PEP lists.
+- [ ] **Finance and markets**: EDGAR filings with XBRL, equity prices with splits and dividends, options chains, futures
+      and commodities, crypto, short interest and insider trades, earnings calendar, bankruptcies, FDIC and NCUA call
+      reports.
+- [ ] **Health**: CMS (NPI, compare, cost reports, fee schedules, Part D), hospital price transparency, FDA, trials, the
+      detailed code sets (ICD-10, HCPCS, LOINC, RxNorm, SNOMED — note CPT needs a license), CDC, genomics references.
+- [ ] **Weather, climate and hazard**: NWS/NOAA, historical normals, storm tracks, FEMA, wildfire, air quality, water,
+      earthquakes.
+- [ ] **Energy and environment**: EIA, ISO/RTO LMP feeds, solar resource, state oil and gas, emission factors beyond the
+      EPA set, EPA enforcement.
+- [ ] **Property, trade and logistics**: assessor rolls and deeds, zoning, building permits, rent and price indices,
+      HUD, construction cost indices, prevailing wage, OSHA; HTS duty rates, trade flows, vessel positions, port
+      throughput, fuel surcharge, FMCSA, flight movements, freight rate indices.
+- [ ] **Retail, food, agriculture, education and legal**: USDA prices and NASS, FoodData Central, restaurant
+      inspections, product taxonomy, trend indices; soil survey, NDVI, RMA, livestock reports; IPEDS, College Scorecard,
+      districts, assessments, H-1B and PERM, job postings, licenses; dockets and opinions, patents and trademarks, UCC,
+      enforcement actions, statutes.
+- [ ] **Media and technology**: news corpus, Wikidata extracts, sports schedules and box scores, betting odds, box
+      office, setlists; NVD/OSV/KEV feeds, package registries, cloud SKU prices, DNS and CT logs, status pages.
+
+- [ ] **The machinery that makes a dataset sellable.** Without it none of the above can be listed honestly.
+  1. A dataset manifest per sheet: source URL, license, attribution requirement, cadence, owner, refresh status.
+  2. A redistribution flag, checked before a listing goes live.
+  3. Versioned publishing: buyers pin a version, a changelog explains each release.
+  4. Shared normalization conventions — column names, date formats, code sets — across every shop dataset.
+  5. The datasets themselves defined as Scrapsheets pipelines, which is the dogfood.
+
+### Codex — SaaS connectors
+
+Ordered roughly by how many demos each unblocks. Each is the same work; the item that matters is the last one.
+
+- [ ] Accounting (QuickBooks, Xero, NetSuite, Sage, SAP, Dynamics); payments and banking (Stripe, Square, Plaid,
+      Mercury, Ramp, Brex, PayPal, Adyen); commerce (Shopify, Amazon SP-API, WooCommerce, BigCommerce, Etsy, eBay).
+- [ ] CRM (Salesforce, HubSpot, Pipedrive, Close, Attio); support (Zendesk, Intercom, Front, Help Scout); product and
+      project (Jira, Linear, Asana, Monday, ClickUp, Notion, Airtable, Trello).
+- [ ] Dev (GitHub, GitLab, Sentry, Datadog, PagerDuty, CircleCI, Vercel, Cloudflare); marketing and ads (Google, Meta,
+      LinkedIn, TikTok, GA4, Search Console, Klaviyo, Mailchimp, Braze); analytics (Segment, Mixpanel, Amplitude,
+      PostHog).
+- [ ] HR and payroll (Gusto, Rippling, ADP, Workday, BambooHR, Greenhouse, Lever, Ashby); comms and calendar (Slack,
+      Discord, Gmail, Outlook, Google Calendar, Zoom, Calendly, Twilio, DocuSign); vertical systems (Procore,
+      ServiceTitan, Toast, Lightspeed, Epic/FHIR, Availity, Clio, MINDBODY, Shipstation).
+- [ ] **A connector is added without a code change.** Every one above is otherwise a pull request.
+  1. A declarative connector definition — auth, endpoints, pagination, schema — that users and sellers write.
+  2. Google Sheets, Airtable and Notion are the three to build by hand first, because they are the migration path in and
+     the OAuth shape everything else reuses.
+  3. Bidirectional sync — writing Scrapsheets data back — is the same definition read the other way.
 
 ---
 
 ## Research
 
-Trains of thought worth chasing; each should end in either a checklist item or a decision to drop it.
+Each ends in an item above, or in a decision to drop it.
 
-- [ ] **TUI spreadsheet prior art**: read xleak, vex-tui, and CacTui for interaction ideas (github.com/bgreenwell/xleak,
-      CodeOne45/vex-tui, vkobinski/CacTui)
-- [ ] **Competitive teardown**: what Ultorg, Rowboat, Excel add-ons, Wolfram, Airtable, Retool, GSuite, and Linear/Jira
-      each do that Scrapsheets should absorb
-- [ ] **Template galleries**: study airtable.com/universe and sourcetable.com/excel-templates; decide which categories
-      seed the shop
-- [ ] **Smartsheet verticals**: catalog smartsheet.com/solutions (PMO, services delivery, marketing, construction,
-      education, government, manufacturing, energy) for template niches
+- [ ] **TUI spreadsheet prior art**: xleak, vex-tui, CacTui (github.com/bgreenwell/xleak, CodeOne45/vex-tui,
+      vkobinski/CacTui) for interaction ideas.
+- [ ] **Competitive teardown**: what Ultorg, Rowboat, Excel add-ons, Wolfram, Airtable, Retool, GSuite and Linear/Jira
+      each do that Scrapsheets should absorb. Include the data-virtualization end — Snowflake, Redshift, Denodo, MDM
+      tools, the human "data steward" workflow — and say where Scrapsheets fits.
+- [ ] **Template galleries and vertical niches**: airtable.com/universe, sourcetable.com/excel-templates,
+      smartsheet.com/solutions. Decide which categories seed the shop, and which verticals have no good tool at all.
 - [ ] **Excel add-in market**: which add-ins actually earn (@RISK, Crystal Ball, XLSTAT, JMP, Minitab, Kutools,
-      Ablebits, Power Query/Pivot) and which are replaceable by a sheet
-- [ ] **Vertical add-in niches**: healthcare, legal, energy, agriculture, retail, government, architecture, linguistics,
-      music, sports, real estate, education — find the ones with no good tool
-- [ ] **ERP/CRM connector survey**: what a codex connector needs for NetSuite, SAP, Dynamics, Salesforce, HubSpot, Jira,
-      Epic
-- [ ] **Data vendors as sellers**: small/mid feed providers lacking distribution (crypto, alt-data, news, weather,
-      sports, logistics, real estate) who could sell portal sheets
-- [ ] **Institutional feed providers**: Refinitiv, Bloomberg, IEX, Tiingo, Twelve Data, Sportradar, FlightAware — what a
-      firehose integration actually costs
-- [ ] **Finance-ops pain points**: interview controllers and FP&A on accruals, overhead allocation, revenue recognition,
-      variance analysis, commission calc — which are just net-http + query pipelines?
-- [ ] **Recurring-reconciliation verticals**: healthcare (Medicare PS&R), insurance IBNR, construction percent-complete,
-      government contractors (FAR/CAS), university grants — all pull public reports on a schedule
-- [ ] **Third-party data finance teams want**: economic indicators, industry benchmarks, commodity pricing, credit risk
-      scores, weather seasonality — package as portals
-- [ ] **Data-virtualization competition**: Snowflake, Redshift, Denodo, MDM tools, and the human "data steward" workflow
-      — where Scrapsheets fits
-- [ ] **Beachhead segments**: data vendors selling to hedge funds, mid-size food distributors, RIAs running multi-family
-      offices, restaurant-group controllers — pick one to target first
+      Ablebits, Power Query/Pivot) and which are replaceable by a sheet.
+- [ ] **Connector economics**: what a codex connector needs for NetSuite, SAP, Dynamics, Salesforce, HubSpot, Jira and
+      Epic; and what a firehose integration actually costs from Refinitiv, Bloomberg, IEX, Tiingo, Twelve Data,
+      Sportradar, FlightAware.
+- [ ] **Who buys this**: interview controllers and FP&A on accruals, overhead allocation, revenue recognition, variance
+      analysis and commission calc — which are just net-http plus query? Then the recurring-reconciliation verticals
+      (Medicare PS&R, insurance IBNR, construction percent-complete, FAR/CAS, university grants), and the third-party
+      data finance teams want. Pick one beachhead: data vendors selling to hedge funds, mid-size food distributors,
+      RIAs, restaurant-group controllers.
+- [ ] **Data vendors as sellers**: small and mid-size feed providers lacking distribution — crypto, alt-data, news,
+      weather, sports, logistics, real estate — who could sell portal sheets.
 - [ ] **Spreadsheet influencers**: ExcelIsFun, Leila Gharani, Kevin Stratvert, Chandoo, Excel Campus; podcasts
-      Spreadsheet Radio, MyExcelOnline, Humans of Data
-- [ ] **Read lexega.com/blog/how-lexega-turns-sql-into-signals**: SQL-into-signals framing may map onto query sheets
+      Spreadsheet Radio, MyExcelOnline, Humans of Data.
+- [ ] **Read lexega.com/blog/how-lexega-turns-sql-into-signals**: the SQL-into-signals framing may map onto query
+      sheets.
 
 ---
 
-## Strategic Notes
+## Strategic notes
 
-**The flywheel**: marketplace payments (1) attract template creators -> MCP server (1) makes sheets AI-accessible ->
-Scrapscript (2) is the moat no one can replicate -> pipelines (2) make sheets self-updating -> sheet-as-API (3) makes
-every sheet a microservice.
+**The flywheel**: marketplace payments attract template creators → the MCP server makes sheets AI-accessible →
+Scrapscript is the moat no one can replicate → pipelines make sheets self-updating → sheet-as-API makes every sheet a
+microservice.
 
-**What ships at 70%**: the foundation, MCP, and Stripe Checkout (platform-side) are done. Connect payouts are the one
-piece of the marketplace still missing. Everything else compounds on top.
+**Where it stands**: the foundation, MCP and Stripe Checkout are done platform-side. Connect payouts are the one piece
+of the marketplace still missing. Everything else compounds on top.
 
-**The unique position**: Scrapsheets is not Google Sheets. It is not Airtable. It is a programmable data OS where every
+**The unique position**: Scrapsheets is not Google Sheets and not Airtable. It is a programmable data OS where every
 table is a queryable database, every query result is a shareable table, every portal is a live data stream, every sheet
-is an API, and every formula is a content-addressable program!
+is an API, and every formula is a content-addressable program.

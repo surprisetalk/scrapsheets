@@ -209,12 +209,13 @@ Deno.test("clicking a header sorts, and shift-clicking adds a second key", async
 });
 
 Deno.test("a share answer that cannot be read says which field failed", async () => {
+  const here = { id: "table:countries", action: "list" };
   const { app, settle, text } = await boot("http://localhost/table:countries");
 
   // A member with no role. The panel used to keep the last list it understood
   // and say nothing, which is a permissions UI showing stale permissions as
   // current -- the one lie this screen must not tell.
-  app.ports.shareLoaded.send({ members: [{ email: "a@b.c" }], public: true });
+  app.ports.shareLoaded.send({ ...here, members: [{ email: "a@b.c" }], public: true });
   await settle();
   assert(text().includes("member list"), `expected the field named, got: ${text().slice(0, 400)}`);
   assert(text().includes("role"), `expected the missing field named, got: ${text().slice(0, 400)}`);
@@ -223,7 +224,7 @@ Deno.test("a share answer that cannot be read says which field failed", async ()
   // the public flag quietly shows the previous sheet's value is worse than one
   // that names both.
   const both = await boot("http://localhost/table:countries");
-  both.app.ports.shareLoaded.send({ members: [{ email: "a@b.c" }], public: "yes" });
+  both.app.ports.shareLoaded.send({ ...here, members: [{ email: "a@b.c" }], public: "yes" });
   await both.settle();
   assert(both.text().includes("member list"), `expected the member list named, got: ${both.text().slice(0, 400)}`);
   assert(both.text().includes("public flag"), `expected the public flag named too, got: ${both.text().slice(0, 400)}`);
@@ -232,9 +233,52 @@ Deno.test("a share answer that cannot be read says which field failed", async ()
   // member list, and reporting its absence would make every secret an error.
   // A fresh boot, because the banner stays up until it is dismissed.
   const quiet = await boot("http://localhost/table:countries");
-  quiet.app.ports.shareLoaded.send({ hook: { url: "u", secret: "s", repro: "r" } });
+  quiet.app.ports.shareLoaded.send({ ...here, action: "hook", hook: { url: "u", secret: "s", repro: "r" } });
   await quiet.settle();
   assert(!quiet.text().includes("could not read"), "an absent field is not an unreadable one");
+});
+
+Deno.test("a share answer names the sheet it is about, or it does not land", async () => {
+  // A list for sheet A that resolves after the user has opened sheet B used to
+  // write A's member list and public flag into B's panel, with nothing on
+  // screen to say so. The id is what makes that answer droppable.
+  const elsewhere = await boot("http://localhost/table:countries");
+  elsewhere.app.ports.shareLoaded.send({
+    id: "table:us-states",
+    action: "list",
+    members: [{ email: "somebody@else.example", role: "owner" }],
+    public: true,
+  });
+  await elsewhere.settle();
+  assert(
+    !elsewhere.text().includes("somebody@else.example"),
+    `another sheet's members must not land here, got: ${elsewhere.text().slice(0, 400)}`,
+  );
+  assert(
+    !elsewhere.text().includes("could not read"),
+    "an answer about another sheet is dropped, not reported",
+  );
+
+  // An answer that names neither is the one case this cannot resolve, so it
+  // says so rather than guessing which sheet asked.
+  const nameless = await boot("http://localhost/table:countries");
+  nameless.app.ports.shareLoaded.send({ members: [], public: false });
+  await nameless.settle();
+  assert(
+    nameless.text().includes("which sheet"),
+    `expected the answer to be refused by name, got: ${nameless.text().slice(0, 400)}`,
+  );
+
+  // A field this action promises but did not send is an error. An absent field
+  // and a renamed one look the same from here; the action is what tells them
+  // apart, and a renamed "members" must not read as an empty member list.
+  const renamed = await boot("http://localhost/table:countries");
+  renamed.app.ports.shareLoaded.send({ id: "table:countries", action: "list", people: [], public: true });
+  await renamed.settle();
+  assert(
+    renamed.text().includes("member list") && renamed.text().includes("missing, not empty"),
+    `expected a renamed field to be named as missing, got: ${renamed.text().slice(0, 400)}`,
+  );
 });
 
 Deno.test("hiding a column stops it rendering, and show-all brings it back", async () => {

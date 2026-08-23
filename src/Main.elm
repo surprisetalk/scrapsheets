@@ -548,7 +548,9 @@ port saveTutorial : Int -> Cmd msg
 
 
 {-| Sharing runs through JS because the JWT lives there, same as changeDoc.
-`action` is one of list, add, remove, public, link.
+`action` is one of list, add, remove, public, link, hook. The answer comes back
+carrying the same `id` and `action`, so ShareLoad can tell an answer about this
+sheet from one about the sheet you just left.
 -}
 port shareAction : { id : String, action : String, email : String, role : String, public : Bool } -> Cmd msg
 
@@ -1474,11 +1476,24 @@ update msg ({ sheet, auth } as model) =
                 next =
                     route url model
             in
-            ( { next | share = iif next.showSettings (\sh -> { sh | hook = Nothing }) (always emptyShare) next.share }
+            ( { next
+                | share =
+                    -- Whatever the panel holds belongs to the sheet it was
+                    -- loaded for, so a navigation empties it. A secret goes
+                    -- either way: it must not follow you to another sheet.
+                    iif (next.showSettings && next.id == model.id)
+                        (\sh -> { sh | hook = Nothing })
+                        (always emptyShare)
+                        next.share
+              }
             , Cmd.batch
                 [ changeId next.id
-                , -- Load the member list the moment the settings modal opens.
-                  iif (next.showSettings && not model.showSettings)
+                , -- Load the member list when the settings modal opens, and
+                  -- again when it stays open onto a different sheet. Without the
+                  -- second case, navigating with the panel up left the first
+                  -- sheet's permissions on screen with nothing in flight to
+                  -- correct them.
+                  iif (next.showSettings && (not model.showSettings || next.id /= model.id))
                     (shareAction { id = next.id, action = "list", email = "", role = "", public = False })
                     Cmd.none
                 ]
@@ -2071,76 +2086,133 @@ update msg ({ sheet, auth } as model) =
             ( { model | deleteConfirm = Nothing }, Cmd.none )
 
         ShareLoad value ->
-            let
-                share =
-                    model.share
+            -- Every answer names the sheet it is about and the action that
+            -- asked. Without the id, a list for sheet A that resolved after the
+            -- user opened sheet B wrote A's members and public flag into B's
+            -- panel, silently. Without the action, a field the server renamed
+            -- away read exactly like a field this action never sends, so the
+            -- one failure this payload most needed to report was the one it
+            -- could not see.
+            case value |> D.decodeValue (D.map2 Tuple.pair (D.field "id" D.string) (D.field "action" D.string)) of
+                Err err ->
+                    ( { model
+                        | error =
+                            "A share answer arrived without saying which sheet and which action it is about: "
+                                ++ D.errorToString err
+                      }
+                    , Cmd.none
+                    )
 
-                -- Whether a field was sent at all, which is what separates "this
-                -- payload is about something else" from "the answer arrived and
-                -- could not be read". Without the split, a field that arrives in
-                -- the wrong shape leaves the panel showing the last answer it
-                -- understood -- a permissions UI presenting a stale member list
-                -- as the current one. It cannot catch a field that was *renamed*
-                -- away: the payload carries no action, so an absent field and a
-                -- renamed one look the same from here.
-                sent field =
-                    value |> D.decodeValue (D.field field D.value) |> Result.toMaybe
-
-                members =
-                    value
-                        |> D.decodeValue
-                            (D.field "members" (D.list (D.map2 Member (D.field "email" D.string) (D.field "role" D.string))))
-
-                public =
-                    value |> D.decodeValue (D.field "public" D.bool)
-
-                link =
-                    value |> D.decodeValue (D.field "link" D.string)
-
-                hook =
-                    value
-                        |> D.decodeValue
-                            (D.field "hook"
-                                (D.map3 Hook (D.field "url" D.string) (D.field "secret" D.string) (D.field "repro" D.string))
-                            )
-
-                unreadable =
-                    [ ( "member list", sent "members", Result.map (always ()) members )
-                    , ( "public flag", sent "public", Result.map (always ()) public )
-                    , ( "share link", sent "link", Result.map (always ()) link )
-                    , ( "signing secret", sent "hook", Result.map (always ()) hook )
-                    ]
-                        |> List.filterMap
-                            (\( what, was, decoded ) ->
-                                case ( was, decoded ) of
-                                    ( Just _, Err err ) ->
-                                        Just ("The " ++ what ++ " arrived in a shape I could not read: " ++ D.errorToString err)
-
-                                    _ ->
-                                        Nothing
-                            )
-            in
-            ( { model
-                | share =
-                    { share
-                        | members = members |> Result.withDefault share.members
-                        , public = public |> Result.withDefault share.public
-                        , link = link |> Result.toMaybe |> orElse share.link
-                        , hook = hook |> Result.toMaybe |> orElse share.hook
-                    }
-
-                -- Every unreadable field, not the first: a banner about the
-                -- member list while the public flag quietly shows the previous
-                -- sheet's value is worse than one that names both.
-                , error =
-                    if List.isEmpty unreadable then
-                        model.error
+                Ok ( id, action ) ->
+                    if id /= model.id then
+                        -- A correct answer to a question about another sheet.
+                        -- Dropped rather than reported: navigating while a
+                        -- request is open is ordinary, and the bug was ever
+                        -- letting it land.
+                        ( model, Cmd.none )
 
                     else
-                        String.join " " unreadable
-              }
-            , Cmd.none
-            )
+                        let
+                            share =
+                                model.share
+
+                            -- Whether a field was sent at all, which separates a
+                            -- field this action does not carry from one that
+                            -- arrived and could not be read.
+                            sent field =
+                                value |> D.decodeValue (D.field field D.value) |> Result.toMaybe
+
+                            members =
+                                value
+                                    |> D.decodeValue
+                                        (D.field "members"
+                                            (D.list (D.map2 Member (D.field "email" D.string) (D.field "role" D.string)))
+                                        )
+
+                            public =
+                                value |> D.decodeValue (D.field "public" D.bool)
+
+                            link =
+                                value |> D.decodeValue (D.field "link" D.string)
+
+                            hook =
+                                value
+                                    |> D.decodeValue
+                                        (D.field "hook"
+                                            (D.map3 Hook
+                                                (D.field "url" D.string)
+                                                (D.field "secret" D.string)
+                                                (D.field "repro" D.string)
+                                            )
+                                        )
+
+                            -- What this action promises to carry. A promised
+                            -- field that is absent is an error, which is what
+                            -- makes a rename an error rather than a silence.
+                            promised =
+                                case action of
+                                    "hook" ->
+                                        [ "hook" ]
+
+                                    "link" ->
+                                        [ "members", "public", "link" ]
+
+                                    _ ->
+                                        [ "members", "public" ]
+
+                            checked what field decoded =
+                                if not (List.member field promised) then
+                                    Nothing
+
+                                else
+                                    case ( sent field, decoded ) of
+                                        ( Nothing, _ ) ->
+                                            Just
+                                                ("A "
+                                                    ++ action
+                                                    ++ " answer carries no "
+                                                    ++ what
+                                                    ++ ": the \""
+                                                    ++ field
+                                                    ++ "\" field is missing, not empty."
+                                                )
+
+                                        ( Just _, Err err ) ->
+                                            Just ("The " ++ what ++ " arrived in a shape I could not read: " ++ D.errorToString err)
+
+                                        _ ->
+                                            Nothing
+
+                            unreadable =
+                                List.filterMap identity
+                                    [ checked "member list" "members" (Result.map (always ()) members)
+                                    , checked "public flag" "public" (Result.map (always ()) public)
+                                    , checked "share link" "link" (Result.map (always ()) link)
+                                    , checked "signing secret" "hook" (Result.map (always ()) hook)
+                                    ]
+                        in
+                        ( { model
+                            | share =
+                                { share
+                                    | members = members |> Result.withDefault share.members
+                                    , public = public |> Result.withDefault share.public
+                                    , link = link |> Result.toMaybe |> orElse share.link
+                                    , hook = hook |> Result.toMaybe |> orElse share.hook
+                                }
+
+                            -- Every unreadable field, not the first: a banner
+                            -- about the member list while the public flag
+                            -- quietly shows the previous answer's value is worse
+                            -- than one that names both.
+                            , error =
+                                if List.isEmpty unreadable then
+                                    model.error
+
+                                else
+                                    String.join " " unreadable
+                          }
+                        , Cmd.none
+                        )
 
         ShareEmailChange email ->
             ( { model | share = (\s -> { s | email = email }) model.share }, Cmd.none )
@@ -2151,26 +2223,29 @@ update msg ({ sheet, auth } as model) =
         ShareAdd ->
             if String.contains "@" model.share.email then
                 ( { model | share = (\s -> { s | email = "" }) model.share }
-                , shareAction { id = model.sheet.id, action = "add", email = model.share.email, role = model.share.role, public = False }
+                , shareAction { id = model.id, action = "add", email = model.share.email, role = model.share.role, public = False }
                 )
 
             else
                 ( { model | error = "Enter the email address of the person to share with." }, Cmd.none )
 
         ShareRemove email ->
-            ( model, shareAction { id = model.sheet.id, action = "remove", email = email, role = "", public = False } )
+            ( model, shareAction { id = model.id, action = "remove", email = email, role = "", public = False } )
 
         SharePublic isPublic ->
-            ( model, shareAction { id = model.sheet.id, action = "public", email = "", role = "", public = isPublic } )
+            ( model, shareAction { id = model.id, action = "public", email = "", role = "", public = isPublic } )
 
         ShareLink ->
-            ( model, shareAction { id = model.sheet.id, action = "link", email = "", role = "", public = False } )
+            ( model, shareAction { id = model.id, action = "link", email = "", role = "", public = False } )
 
         ShareHook ->
-            ( model, shareAction { id = model.sheet.id, action = "hook", email = "", role = "", public = False } )
+            ( model, shareAction { id = model.id, action = "hook", email = "", role = "", public = False } )
 
         SettingsClose ->
-            ( { model | showSettings = False }, Nav.replaceUrl model.nav ("/" ++ model.sheet.id) )
+            -- model.id, not model.sheet.id: the second is set when the
+            -- document loads, so closing the panel before it has would
+            -- navigate back to the sheet you just left.
+            ( { model | showSettings = False }, Nav.replaceUrl model.nav ("/" ++ model.id) )
 
         ShortcutsToggle show ->
             ( { model | showShortcuts = show }, Cmd.none )

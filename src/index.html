@@ -268,6 +268,13 @@
 
           // Sharing lives here rather than in Elm because the JWT does. Every
           // action re-reads the member list, so the modal never shows stale state.
+          //
+          // Every answer names its sheet and its action. Without the id, a list
+          // for sheet A that resolved after the user opened sheet B wrote A's
+          // members and public flag into B's panel; without the action, a field
+          // that was renamed away looked exactly like a field that was never
+          // sent, so the one thing this payload cannot report is the one thing
+          // it most needs to.
           app.ports.shareAction.subscribe(catchy(async ({ id, action, email, role, public: isPublic }) => {
             const token = getAuthToken();
             if (!token) {
@@ -296,11 +303,11 @@
               // through to the member list: this panel is the aside, not the
               // settings modal, and it asked one question.
               const { data } = await send("/hook", "GET");
-              return app.ports.shareLoaded.send({ hook: data });
+              return app.ports.shareLoaded.send({ id, action, hook: data });
             }
 
             const { data } = await send("/share", "GET");
-            app.ports.shareLoaded.send({ members: data.members, public: data.public, ...(link ? { link } : {}) });
+            app.ports.shareLoaded.send({ id, action, members: data.members, public: data.public, ...(link ? { link } : {}) });
           }, 'shareAction'));
 
           // Register a document with the server, retrying on 404 (sync timing)

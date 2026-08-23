@@ -18,22 +18,35 @@ session, made every stored connection string unreadable, and re-rolled every web
 Every failure lands as a row on `net-hook:errors`, so `select * from @net-hook:errors` is the error log. It is owned by
 the seeded sentinel account, which has no password and cannot be logged into, so `/share` cannot reach it. Set
 `OPERATOR_EMAIL` instead: `seed()` grants that address a viewer row on the next boot, creating the account row if you
-have not signed up yet, and signing up later adopts it.
+have not signed up yet, and signing up later adopts it. Anyone else reading that sheet gets the failures their own
+account caused, and nothing else.
 
-A webhook delivery must be signed, and each signature is accepted once. The signature covers the timestamp and the body
-and nothing else, so two deliveries carrying the same body in the same second are one delivery — vary the body, not the
-query string.
+A webhook delivery must be signed, and each signature is accepted once. A `v2` signature covers the timestamp, the
+request path and query, and the body — so a fan-out that discriminates by query string sends two deliveries rather than
+one and a replay. The older `v1`, which covered the body alone, is still accepted; `meta.scheme` on each row says which
+one verified it.
 
-A webhook delivery must be signed. Read a net sheet's secret from its panel in the app, or with
-`GET /library/<sheet_id>/hook`, which also answers with a runnable line:
+Read a net sheet's secret from its panel in the app, or with `GET /library/<sheet_id>/hook`, which also answers with a
+runnable line:
 
 ```sh
 body='{"hello":"world"}'
+path="/net/$sheet_id"
 t=$(date +%s)
-sig=$(printf '%s.%s' "$t" "$body" | openssl dgst -sha256 -hmac "$secret" -r | cut -d' ' -f1)
-curl -X POST "https://api.sheets.scrap.land/net/$sheet_id" -H 'Content-Type: application/json' \
-  -H "scrapsheets-signature: t=$t,v1=$sig" -d "$body"
+sig=$(printf '%s\n%s\n%s' "$t" "$path" "$body" | openssl dgst -sha256 -hmac "$secret" -r | cut -d' ' -f1)
+curl -X POST "https://api.sheets.scrap.land$path" -H 'Content-Type: application/json' \
+  -H "scrapsheets-signature: t=$t,v2=$sig" -d "$body"
 ```
+
+A sheet can hold its own secrets instead. `POST /library/<sheet_id>/secret` with `{"name":"hook","value":"..."}` sets
+the signing key; writing it again rotates it, and the one before still verifies until a third write retires it. `GET`
+answers with the names and timestamps and never a value. Name it `hook:stripe`, `hook:github` or `hook:shopify` instead
+and that provider's own signature is what is checked, against its own header — which verifier runs is read off the
+stored secret, never off the headers the sender sent.
+
+`GET /library/freshness` names the feeds that stopped. One row per net-http and alert sheet you can read: when it last
+ran, when it last succeeded, and how many runs since. It is a sheet, so `select * from @library:freshness` and
+`/export/library:freshness.csv` both work.
 
 ```nu
 # watch mode
