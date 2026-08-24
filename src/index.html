@@ -305,7 +305,7 @@
           // that was renamed away looked exactly like a field that was never
           // sent, so the one thing this payload cannot report is the one thing
           // it most needs to.
-          app.ports.shareAction.subscribe(catchy(async ({ id, action, email, role, public: isPublic }) => {
+          app.ports.shareAction.subscribe(catchy(async ({ id, action, email, role, public: isPublic, days, password }) => {
             const token = getAuthToken();
             if (!token) {
               return app.ports.docErrored.send("Log in to share a sheet.");
@@ -317,7 +317,18 @@
                 headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
                 ...(body ? { body: JSON.stringify(body) } : {}),
               });
-              if (!res.ok) throw new Error((await res.json().catch(() => ({})))?.error ?? `${method} ${path} failed (${res.status}).`);
+              // As text, through the same reader the freshness call uses. Every
+              // refusal on these routes is an HTTPException carrying an
+              // explain() block, and Hono answers one with no `res` as plain
+              // text -- so reading it as JSON threw, was swallowed, and left
+              // "POST /link failed (400)." in place of a message that named the
+              // field, the bound and the fix.
+              if (!res.ok) {
+                throw new Error(
+                  httpErrorDetail(await res.text(), res.headers.get("Content-Type") ?? "") ||
+                    `${method} ${path} failed (${res.status}).`,
+                );
+              }
               return await res.json();
             };
 
@@ -326,7 +337,15 @@
             else if (action === "remove") await send("/share", "DELETE", { email });
             else if (action === "public") await send("/public", "POST", { public: isPublic });
             else if (action === "link") {
-              const { data } = await send("/link", "POST", {});
+              // Zero days and an empty password are "not asked for", and an
+              // empty body is what the server reads as the default link, so an
+              // untouched panel keeps minting the thirty-day unlocked one.
+              // The password is never put in the link: a lock the url carries
+              // is not a lock.
+              const { data } = await send("/link", "POST", {
+                ...(days ? { days } : {}),
+                ...(password ? { password } : {}),
+              });
               link = `${location.origin}/${id}?share=${data.token}`;
             } else if (action === "hook") {
               // A net sheet's signing secret. It returns here rather than falling
@@ -367,9 +386,35 @@
           // it rides the same ?auth= parameter, so there is one read path.
           const shareToken = new URLSearchParams(location.search).get("share");
           const token = getAuthToken() ?? shareToken;
+
+          // Whether this link was minted with a password. The claim is a hint
+          // and never a decision -- verifyWsAuth is still the only thing that
+          // checks a password, and the only place the share claim is read at
+          // all. It is asked for before the socket opens because the refusal
+          // lands in the handshake as an HTTP 401, which script cannot read:
+          // without this, a locked link is a sheet that spends twenty seconds
+          // failing to load and then says nothing about why.
+          const isLocked = (jwt) => {
+            try {
+              const claims = jwt.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+              return !!JSON.parse(atob(claims + "=".repeat((4 - claims.length % 4) % 4))).lock;
+            } catch {
+              // Unreadable is not locked: the server refuses an unreadable
+              // token on its own, and asking for a password here would be
+              // asking for one against a check that will never run.
+              return false;
+            }
+          };
+          // Only when the share token is the credential being used. A logged-in
+          // reader's own JWT wins above, so their sheet is not gated on a
+          // password for a link they are not opening with.
+          const linkPass = token === shareToken && shareToken && isLocked(shareToken)
+            ? prompt("This link is locked. Enter the password it was minted with:")
+            : null;
           const syncUrl =
             "wss://api.sheets.scrap.land/library/sync" +
-            (token ? `?auth=Bearer%20${encodeURIComponent(token)}` : "");
+            (token ? `?auth=Bearer%20${encodeURIComponent(token)}` : "") +
+            (linkPass ? `&pass=${encodeURIComponent(linkPass)}` : "");
 
           // Track sync connection status
           const syncStatus = {
@@ -821,6 +866,17 @@
             } catch (err) {
               debug.warn('repo.find failed:', err.message);
               sheet = null;
+            }
+
+            // A locked link whose password was wrong refuses the handshake, and
+            // that 401 is unreadable from script -- so the sheet simply never
+            // arrives. Nothing else can tell the two apart, so say which one is
+            // likelier rather than leaving an empty page to speak for itself.
+            // Reloading asks again, because the password is nowhere kept.
+            if (!sheet && linkPass) {
+              app.ports.docErrored.send(
+                "That password did not open this link, or the sheet is no longer shared. Reload the page to try the password again.",
+              );
             }
 
             await selectDoc(id, sheet);

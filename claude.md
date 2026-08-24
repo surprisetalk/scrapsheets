@@ -530,8 +530,30 @@ t.trade_id order by p.day desc) = 1` —
   comparison is `hookVerify` (`crypto.subtle.verify`) so no digest equality is written by hand. Neither refusal prints
   the password or the digest: the digest is what an offline guesser would grind against, the same oracle rule the
   delivery refusals in `POST /net/:id` follow. The refusal lands in the handshake, before any frame exists to carry it,
-  so it is an ordinary HTTP 401 — which a browser cannot read, so **the page must ask for the password and append
-  `&pass=` itself**; until it does, a locked link reads as a socket that will not connect. All four share routes now
+  so it is an ordinary HTTP 401 — which a browser cannot read. **The page therefore asks before it connects, not
+  after**: `lock` is a plain claim on the token, so `src/index.html` decodes the `?share=` token's payload and prompts
+  for the password when the claim is there, then appends `&pass=` to the sync url it was going to build anyway. The
+  claim is read as a **hint and never as a decision** — `verifyWsAuth` is still the only thing that checks a password —
+  and an unreadable token is treated as unlocked, since the server refuses it on its own and a password would be asked
+  for against a check that will never run. Asking after a failed connect was the other option and is worse: a timer
+  cannot tell a locked link from a dead server, and the reader waits out `repo.find`'s two ten-second attempts before
+  being asked anything. A wrong password still refuses the handshake, so the sheet never arrives; `changeId`'s
+  no-document branch says which of the two it likely was and that reloading asks again, which is the whole of the retry
+  — nothing keeps the password, so a reload re-prompts. The prompt fires only when the share token is the credential
+  actually in use: a logged-in reader's own JWT wins, and gating their sheet on a link they are not opening with would
+  be a password for nothing. `/portal/*/sync` passes `pass` through to the same reader. It discards the role on
+  purpose — a portal is a public synthetic stream and honours no share claim — but without the password beside it, the
+  lock check fired on the one socket where the link was never going to grant anything. The share panel mints the link:
+  a `days` box and a `password` box, both blank by default, and blank sends nothing, which is the empty body the route
+  already reads as the unlocked thirty-day link. A `days` box holding something that is not a whole number above zero
+  is refused **in the panel** rather than rounded down to blank: `String.toInt` answers `Nothing` for `7.5`, and
+  defaulting that to 0 would mint a thirty-day link for somebody who asked for seven and say nothing. The refusals the
+  **server** raises reach the user too, which they did not: `send()` in `src/index.html` read the body as JSON and fell
+  back to `"POST /link failed (400)."`, but Hono answers an `HTTPException` carrying no `res` as **plain text** — so
+  every `explain()` block these routes raise was parsed, thrown, swallowed by the `.catch(() => ({}))` and replaced by
+  the status. It reads the body through `httpErrorDetail()` now, the same reader the freshness call uses. The password
+  is never put in the url — a lock the link carries is not a lock — so the panel says so under a locked link rather
+  than leaving the minter to find out. All four share routes now
   `.catch(() => ({}))` on `c.req.json()`, the shape `POST /library/:id/secret` already used: unguarded, a missing or
   unparseable body was an unexplained 500, a row in `net-hook:errors` and a point off the 5xx grade for a mistake the
   caller could have fixed from the message. `DELETE /library/:id/share` validated nothing at all, so a missing email
@@ -544,25 +566,61 @@ t.trade_id order by p.day desc) = 1` —
 - **Freshness**: `library:freshness` is a sheet the server **computes rather than stores**, so it pages, exports and can
   be selected from a query sheet (`select * from @library:freshness`) through the paths every other sheet uses. It has
   no automerge document and no `sheet` row, so `sheet()` answers it before the document lookup and before
-  `assertSheetAccess`; the join to `sheet_usr` inside it is the access rule. One row per net-http and alert sheet the
-  caller can read: last run, last **good** run, and rows since. Both joins onto `net` are `left join lateral`, because a
+  `assertSheetAccess`; the join to `sheet_usr` inside it is the access rule. One row per sheet whose runs land in
+  `net` and are written down — a polled feed, a webhook, an alert — the caller can read: last run, last **good** run,
+  and rows since. Both joins onto `net` are `left join lateral`, because a
   sheet that has never run at all is exactly the failure this read is for; and `failures_since_ok` compares
   `(created_at, net_id)` rather than `created_at` alone, the same key the laterals order by — on the timestamp alone, a
   good run and a bad one sharing one left `last_ok` equal to `last_run` and the count at zero, so the sheet this read
-  exists to surface reported itself healthy. A good run is `POLL_OK`/`ALERT_OK`, the same two fragments `GET /status`
-  grades on, read from one place because two copies of them had already drifted. `GET /library/freshness` is the same
-  answer through a plain route. The status check is deliberately **not** extended: a check whose conditions come and go
+  exists to surface reported itself healthy. What counts as a run and what counts as a good one are `RUN_OF()` and
+  `RUN_OK()`, which sit beside `POLL_OK`/`ALERT_OK` and are spliced into this query **three** times — the count
+  subquery and both laterals — so the three cannot drift the way the two already had. A run is a different event per
+  type: a net-http sheet's is its poll (`method = 'GET'`, graded `POLL_OK`), an alert's is its tick
+  (`method = 'ALERT'`, graded `ALERT_OK`), and a net-hook sheet's is a delivery it was sent — every row, all of them
+  good, because a refused delivery never reaches the table. The where clause is
+  `s.type in ('net-http', 'net-hook', 'alert')`: deliberately **not** "sheets that have rows in `net`", because a
+  webhook nobody has delivered to is the failure this read is for, the same argument the left joins carry; and
+  deliberately **not** every type `net`'s check constraint admits, because a `net-socket` sheet is opened by the
+  browser against the user's own url and nothing server-side ever writes a run for it, so including it would report
+  "never run" forever about a sheet that works — the same false alarm as a blank cell on a rotten feed, pointed the
+  other way. Two consequences, both intended: `net-hook:errors` appears in the operator's
+  own freshness, and a net-hook's `last_ok` always equals its `last_run`. A `codex-*` sheet cannot appear at any
+  price — `net`'s check constraint refuses its id — so codex connection health needs a writer and a schema change
+  first. `GET /library/freshness` is the same answer through a plain route. The status check is deliberately **not** extended: a check whose conditions come and go
   with the data cannot be read by an uptime checker. **Known gap**: `@library:freshness` resolves on the server but not
   in the page, where `sheets()` looks a ref up in the library map or `repo.find`
 - **Reads and export**: `GET /sheet/:id` is the stable JSON read for every sheet type. `GET /export/:id.<format>` is the
   download path, one route over the `EXPORTS` table: `csv`, `json`, `ndjson`, `md`, `ics`. All go through `sheet()`, so
   they inherit `assertSheetAccess` (membership, purchase, and `public`), pagination, and query-sheet recursion. Export
-  asks for 100000 rows so a net or query sheet is not truncated at the default 50. The name-keyed formats (`json`,
-  `ndjson`) refuse a sheet with two columns of the same name rather than overwrite one; `ics` needs a
+  asks for 100000 rows so a net or query sheet is not truncated at the default 50. A sheet with two columns of the same
+  name is refused rather than overwritten — by every format now, not only `json` and `ndjson`, because `sheet()` itself
+  keys a row by name and there are no positions left for `csv` and `md` to carry; `ics` needs a
   `date`/`timestamp`/`create` column and says so when there is none
 - **Sheet as an API**: `POST /sheet/:id` is the write half of the stable read, and it takes rows keyed by **column
   name** — the header a CSV carries, and the shape `checkColumnTypes()` reads — storing them keyed by column key, so a
-  value this route accepts can never be one a query then refuses. It is **all-or-nothing**: every row is checked before
+  value this route accepts can never be one a query then refuses. **The read answers in the same spelling.** It did not:
+  `sheet()`'s `case "table"` handed back the automerge document verbatim, keyed by `col.key`, while every other branch
+  of that switch already answered by name — `cselect` stamps `key: col.name` off the postgres column and `executeSql`
+  stamps AlaSQL's `columnid` — so one endpoint pair had two spellings of one row and the two MCP read tools disagreed
+  with each other about the same sheet (`read_sheet` → `{"0":"apple"}`, `query_sheet` → `{item:"apple"}`). The table
+  branch now projects through `named()` and **restamps `key = name` on the column row**, which is what keeps it a
+  one-branch change: every consumer reads a cell as `row[col.key]` — `toRecords()`, all five `EXPORTS` renderers,
+  `/stats/:id` — and none of them had to learn a second convention. `POST /sheet/:id` is untouched, because it reads the
+  raw document's columns and so keeps storing by the real key; `key` stays the document's own spelling, minted as a
+  position and stable across a rename, and never leaves it. The price is paid by a sheet with **two columns of the same
+  name**, blanks included: it has no name-keyed row to give and is now refused on the read and on **every** export,
+  where `csv`/`md`/`ics` used to carry it positionally. That is the right way round — `toRecords()` has always collapsed
+  such a pair, so a query over that sheet was already wrong, silently. Two guards keep that refusal from being a trap
+  sprung far from its cause: the CSV importer refuses a duplicate header where the file is (see **CSV import**), and
+  `nameClash()` refuses a rename onto another column's name **in the editor** — the rename would otherwise sync
+  happily, leave the table on screen looking right, and 400 every export and every `select * from @this` from then on.
+  Renaming one of an already-colliding pair is not a clash but the repair, and renaming a column to what it is already
+  called is not one either. A document holding **rows under no columns** — every column deleted, the values left
+  behind — is refused too, rather than answered with one empty object per row: the write already refuses that shape
+  (`no columns to append under`), and a read that reports N rows of nothing as a healthy answer is the silent half of
+  the same bug. An empty sheet is still empty rather than an error, since there is nothing to lose.
+  `GET /openapi/:id`'s read response now `$ref`s the same `Row` the write takes, behind a `prefixItems` for `data[0]`,
+  which is the column row and is not a row. It is **all-or-nothing**: every row is checked before
   the document is touched and the append is one `handle.change`, because automerge cannot roll a change back and a batch
   half-written under a 201 is a silent failure. Only a `table` sheet has rows of its own, so a query, chart or net sheet
   is refused by name rather than with a 500; write access is read through `syncRole` and not `assertSheetAccess`, so a
@@ -586,7 +644,10 @@ t.trade_id order by p.day desc) = 1` —
   header the key is presented in
 - **CSV import**: `POST /import/csv` rejects a row whose field count does not match the header, naming the line, both
   counts, the raw text and the column it stops at. Type inference requires every non-blank value to parse: at the old
-  80% threshold the other fifth became `NaN` silently
+  80% threshold the other fifth became `NaN` silently. It also rejects a **header that names a column twice** — blanks
+  included, since a blank header is named for its position — because every read is name-keyed and such a file would
+  otherwise import happily and then be a sheet nothing can read back, refused by a message about the sheet rather than
+  about the file
 - **Deterministic reads**: `/library` had no `order by` at all and `/shop` ordered by a non-unique `name`, so paging
   either repeated and skipped rows. Both now carry a unique tiebreaker, as the `net` read already did
 - **Marketplace**: Buy/sell sheets with pricing system

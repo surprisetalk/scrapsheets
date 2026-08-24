@@ -1558,6 +1558,28 @@ Deno.test(async function allTests(_t) {
     });
     assert(qCsv.ok, `query export failed: ${qCsv.status}`);
 
+    // Deleting every column leaves the values in the document with nothing left
+    // to name them. Every read is name-keyed, so each of those rows projects to
+    // one empty object -- N rows of nothing, handed back as a healthy answer.
+    // Refused by name instead, and pointed at the sheet, which is where the
+    // values are still reachable and the deletion still undoable.
+    {
+      const orphan = automerge.create<{ data: Sheet["data"] }>({ data: [arrayify([]), { 0: "x" }] });
+      await put(jwt, `/library/table:${orphan.documentId}`, {});
+      const res = await app.request(`/sheet/table:${orphan.documentId}`, {
+        headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+      });
+      assertEquals(res.status, 400);
+      const said = await res.text();
+      assert(said.includes("under no columns"), said);
+      assert(said.includes("1 rows"), said);
+
+      // An empty sheet is empty, not broken: there is nothing to lose.
+      const blank = automerge.create<{ data: Sheet["data"] }>({ data: [arrayify([])] });
+      await put(jwt, `/library/table:${blank.documentId}`, {});
+      assertEquals((await get<Table>(jwt, `/sheet/table:${blank.documentId}`)).length, 1);
+    }
+
     // A table with no column row must say so, not fall over inside the CSV builder.
     const bare = automerge.create<{ data: Sheet["data"] }>({ data: [] });
     await put(jwt, `/library/table:${bare.documentId}`, {});
@@ -1651,8 +1673,13 @@ Deno.test(async function allTests(_t) {
       );
     }
 
-    // Two columns of the same name would silently overwrite each other in a
-    // name-keyed format, so those formats refuse it.
+    // Two columns of the same name collapse into one in a name-keyed row, so
+    // the read refuses the sheet rather than answering with one of the two.
+    // csv and md used to carry such a sheet positionally; they cannot any more,
+    // because every read is name-keyed now and there are no positions left to
+    // carry. That is the price, and it is the right way round: toRecords has
+    // always collapsed them, so a query over this sheet was already wrong --
+    // silently, which is the half worth fixing.
     {
       const dup = automerge.create<{ data: Sheet["data"] }>({
         data: [arrayify([{ name: "a", type: "text", key: 0 }, { name: "a", type: "text", key: 1 }]), {
@@ -1661,10 +1688,25 @@ Deno.test(async function allTests(_t) {
         }],
       });
       await put(jwt, `/library/table:${dup.documentId}`, {});
-      assert((await exp(`table:${dup.documentId}`, "csv")).ok, "csv carries positions, so duplicates are fine");
-      const json = await exp(`table:${dup.documentId}`, "json");
-      assertEquals(json.status, 400);
-      assert((await json.text()).includes("same name"), "the duplicate must be named");
+      for (const format of ["csv", "json", "ndjson", "md"]) {
+        const res = await exp(`table:${dup.documentId}`, format);
+        assertEquals(res.status, 400, `${format} must refuse a sheet it cannot key by name`);
+        assert((await res.text()).includes(`"a" appears more than once`), "and the duplicate must be named");
+      }
+      const read = await app.request(`/sheet/table:${dup.documentId}`, {
+        headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+      });
+      assertEquals(read.status, 400, "and so must the read the exports go through");
+
+      // The commonest pair is two columns nobody has named yet, and a message
+      // about `` appearing twice names nothing.
+      const blank = automerge.create<{ data: Sheet["data"] }>({
+        data: [arrayify([{ name: "", type: "text", key: 0 }, { name: "", type: "text", key: 1 }])],
+      });
+      await put(jwt, `/library/table:${blank.documentId}`, {});
+      const said = await (await exp(`table:${blank.documentId}`, "csv")).text();
+      assert(said.includes(`"" appears more than once`), said);
+      assert(said.includes("rename one of them"), said);
     }
   }
 
@@ -1684,6 +1726,15 @@ Deno.test(async function allTests(_t) {
     for (const part of ["Line 3", "3 fields", "2 fields", "Bob,25", "city"])
       assert(said.includes(part), `${part} missing from: ${said}`);
 
+    // Two columns of one name would import happily and then be unreadable, so
+    // the file is refused where the header that has to change is on screen.
+    // Blanks collide too, since a blank header is named for its position.
+    const twice = await importCsv("a,b,a\n1,2,3\n");
+    assertEquals(twice.status, 400);
+    const twiceSaid = await twice.text();
+    assert(twiceSaid.includes(`"a" appears more than once`), twiceSaid);
+    assert(twiceSaid.includes("line 1"), twiceSaid);
+
     // A quoted newline is one row, so the line number must survive it.
     const quoted = await importCsv('a,b\n"one\ntwo",2\nragged\n');
     assertEquals(quoted.status, 400);
@@ -1696,7 +1747,10 @@ Deno.test(async function allTests(_t) {
     const { sheet_id } = body;
     const [cols_, ...rows] = await get<Table>(jwt, `/sheet/${sheet_id}`);
     assertEquals(Object.values(cols_)[0].type, "text");
-    assertEquals(rows.map((r) => r["0"]), ["1", "2", "3", "4", "n/a"]);
+    // By name, which is the header the file carried and the shape the write
+    // takes back. The read used to answer r["0"] here and r.qty from a query
+    // over the same sheet.
+    assertEquals(rows.map((r) => r.qty), ["1", "2", "3", "4", "n/a"]);
 
     // A blank is not a zero and it is not a false. The importer stored "" in a
     // num column and an invented false in a bool one, so a file of two readings
@@ -1710,8 +1764,8 @@ Deno.test(async function allTests(_t) {
     const { sheet_id: gapId } = JSON.parse(gapBody);
     const [gapCols, ...gapRows] = await get<Table>(jwt, `/sheet/${gapId}`);
     assertEquals(Object.values(gapCols).map((col) => col.type), ["num", "bool"]);
-    assertEquals(gapRows.map((r) => r["0"]), [1, null, 3]);
-    assertEquals(gapRows.map((r) => r["1"]), [true, null, false]);
+    assertEquals(gapRows.map((r) => r.qty), [1, null, 3]);
+    assertEquals(gapRows.map((r) => r.ok), [true, null, false]);
 
     // And the arithmetic over it is the arithmetic over a sheet built by hand.
     // sum() and avg() are where a blank read as a zero actually shows: avg over
@@ -2568,7 +2622,17 @@ Deno.test(async function allTests(_t) {
       });
       assertEquals(out.structuredContent, { written: 3, rows: 2 });
       const read = await call(jwt, "read_sheet", {});
-      assertEquals(read.structuredContent.rows, [{ "0": "apple", "1": 2.25 }, { "0": "banana", "1": 0.5 }]);
+      assertEquals(read.structuredContent.rows, [{ item: "apple", price: 2.25 }, { item: "banana", price: 0.5 }]);
+    }
+
+    // The two read tools spell a row the same way. They did not: read_sheet
+    // answered {"0":"apple"} off the stored document while query_sheet answered
+    // {item:"apple"} off the engine, so a model reading one sheet through both
+    // had to guess which convention it was holding.
+    {
+      const read = await call(jwt, "read_sheet", {});
+      const queried = await call(jwt, "query_sheet", { code: `select item, price from @${sheet_id} order by item` });
+      assertEquals(read.structuredContent.rows, queried.structuredContent.rows);
     }
 
     // write_cells failures name the problem.
@@ -2640,8 +2704,16 @@ Deno.test(async function allTests(_t) {
         rows: [{ item: "banana", qty: 2 }, { item: "cherry", qty: 5 }],
       });
       assertEquals(data, { appended: 2, rows: 3 });
+      // The same rows in the same spelling they were sent in. They were not:
+      // the write took {item, qty} and the read answered {0, 1}, so one
+      // endpoint pair had two spellings of one row and the generated spec had
+      // to say so.
       const read = await get<Table>(jwt, `/sheet/${sheet_id}`);
-      assertEquals(read.slice(1), [{ 0: "apple", 1: 3 }, { 0: "banana", 1: 2 }, { 0: "cherry", 1: 5 }]);
+      assertEquals(read.slice(1), [
+        { item: "apple", qty: 3 },
+        { item: "banana", qty: 2 },
+        { item: "cherry", qty: 5 },
+      ]);
       const { data: [, ...rows] }: { data: Table } = await post(jwt, `/query`, {
         lang: "sql",
         code: `select sum(qty) as n from @${sheet_id}`,
@@ -2757,7 +2829,7 @@ Deno.test(async function allTests(_t) {
       assertEquals((await withKey(first, `/sheet/${a}`)).status, 200);
       const wrote = await withKey(first, `/sheet/${a}`, { method: "POST", body: JSON.stringify({ rows: [{ n: 2 }] }) });
       assertEquals(wrote.status, 201);
-      assertEquals((await get<Table>(jwt, `/sheet/${a}`)).slice(1), [{ 0: 1 }, { 0: 2 }]);
+      assertEquals((await get<Table>(jwt, `/sheet/${a}`)).slice(1), [{ n: 1 }, { n: 2 }]);
     }
 
     // And nothing else. Not another sheet, and not the route that mints keys --
@@ -2850,6 +2922,14 @@ Deno.test(async function allTests(_t) {
     assertEquals(doc.components.securitySchemes.sheetKey.name, "scrapsheets-key");
     const path = doc.paths[`/sheet/${sheet_id}`];
     assert(path.get, "the read is described");
+    // And described by the same Row the write takes, which is the whole of the
+    // read/write agreement: the document used to say the read was keyed by
+    // column key and hand back an untyped object, so a generated client had a
+    // type for what it sent and none for what came back.
+    assertEquals(
+      path.get.responses["200"].content["application/json"].schema.properties.data.items,
+      { $ref: "#/components/schemas/Row" },
+    );
     assertEquals(path.post.requestBody.content["application/json"].schema.properties.rows.items, {
       $ref: "#/components/schemas/Row",
     });
@@ -3315,7 +3395,30 @@ Deno.test(async function allTests(_t) {
     };
     assertEquals(await reads("client-locked-ok", locked, password), "shared", "the right password opens the link");
     assertEquals(await reads("client-plain", plain), "shared", "an unlocked link is untouched by any of this");
+    // There is deliberately no `reads(..., locked)` with no password here: the
+    // refusal lands in the handshake, and a client that meets it throws out of
+    // the ws library rather than resolving to anything a test can read. That is
+    // the fact itself, not a gap -- a browser cannot read that 401 either,
+    // which is why the page reads the lock claim off the token and asks for the
+    // password before it opens the socket. The HTTP shape above is the only
+    // place the message can be asserted.
     await server.shutdown();
+
+    // A portal honours no share claim, so a locked token buys nothing there --
+    // but it must not be refused there either. The call validates the token and
+    // throws the role away; without the password beside it, the lock check
+    // fired on a socket that was never going to grant anything.
+    const portalOpen = (pass?: string) =>
+      app.request(
+        `/portal/time/sync?auth=Bearer%20${encodeURIComponent(locked)}` +
+          (pass === undefined ? "" : `&pass=${encodeURIComponent(pass)}`),
+      );
+    assertEquals((await portalOpen()).status, 401, "a locked link with no password is still refused");
+    const portalPassed = await portalOpen(password);
+    assert(
+      !(await portalPassed.text()).includes("is locked"),
+      "and the password clears it there too, rather than there being no way to give one",
+    );
 
     // Over plain HTTP the share claim buys nothing, locked or not: verifyWsAuth
     // is the only place it is read, and no HTTP route reads it. What this pins
@@ -3827,6 +3930,56 @@ Deno.test(async function allTests(_t) {
     assertEquals((await rows(jwt)).body.length > 0, true, "one unreadable status must not empty the answer");
     assertEquals(Object.keys(await status()).length, 13, "nor take the alarm down with it");
     await sql`delete from net where sheet_id = ${ids[0]} and body = 'x'`;
+
+    // A poll is not the only kind of run. A net-hook sheet's run is the
+    // delivery it was sent, and a webhook that has gone quiet is exactly as
+    // stale as a feed that has stopped answering -- so the read covers every
+    // type whose runs land in `net`, which is every type that table's own check
+    // constraint admits. A delivery that reached the table landed, so every one
+    // of its rows is a good run and last_ok tracks last_run.
+    {
+      const talked = automerge.create<Sheet>({ type: "net-hook", data: [] });
+      const quiet = automerge.create<Sheet>({ type: "net-hook", data: [] });
+      const talkedId = `net-hook:${talked.documentId}`;
+      const quietId = `net-hook:${quiet.documentId}`;
+      for (const [i, id] of [talkedId, quietId].entries()) await put(jwt, `/library/${id}`, { name: `hook-${i}` });
+      assertEquals((await deliver(talkedId, `{"n":1}`)).status, 200);
+
+      const hooks = Object.fromEntries((await rows(jwt)).body.map((r) => [String(r.sheet_id), r]));
+      assert(hooks[talkedId], "a net-hook sheet that has been delivered to has a freshness");
+      assertEquals(
+        hooks[talkedId].last_ok,
+        hooks[talkedId].last_run,
+        "every delivery stored is a delivery that landed",
+      );
+      assertEquals(Number(hooks[talkedId].failures_since_ok), 0);
+      // The one this widening is for: not "has rows in net", which would drop
+      // the silent webhook, which is the failure worth naming.
+      assert(hooks[quietId], "a net-hook sheet nobody has delivered to is the failure this read is for");
+      assertEquals(hooks[quietId].last_run, null, "and it says so rather than being absent");
+
+      // A net-socket sheet is opened by the browser against the user's own url,
+      // so no run of it is ever recorded here. It is left out rather than
+      // reported as never run, which is what it would say forever about a sheet
+      // that works.
+      const socket = automerge.create<Sheet>({ type: "net-socket", data: [{ url: "ws://127.0.0.1:5051/x" }] });
+      await put(jwt, `/library/net-socket:${socket.documentId}`, { name: "live" });
+      assert(
+        !(await rows(jwt)).body.some((r) => String(r.sheet_id) === `net-socket:${socket.documentId}`),
+        "a sheet whose liveness is not recorded here is left out, not reported as never run",
+      );
+
+      // A sheet with no runs to be stale has no row at all. It is not a zero.
+      const table = automerge.create<Sheet>({
+        type: "table",
+        data: [arrayify([{ name: "a", type: "text", key: "0" }])],
+      });
+      await put(jwt, `/library/table:${table.documentId}`, { name: "not-a-feed" });
+      assert(
+        !(await rows(jwt)).body.some((r) => String(r.sheet_id) === `table:${table.documentId}`),
+        "a table sheet has no runs, so it has no freshness",
+      );
+    }
 
     // Somebody else's feeds are not in it, and the route is the same answer.
     const { jwt: outsider } = await usr("zane@example.com");

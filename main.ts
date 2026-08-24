@@ -481,8 +481,40 @@ const sheet = async (
     }));
   switch (type) {
     case "table": {
-      const doc = hand.doc().data as Table;
-      return { data: doc, count: doc.length - 1, offset: 0 };
+      const [colsRow, ...rows] = hand.doc().data as Table;
+      const cols = Object.values(colsRow ?? {}) as Col[];
+      // Values with no names left to key them by. Every read is name-keyed, so
+      // this sheet's rows would come back as one empty object each -- N rows of
+      // nothing, reported as a healthy answer. Refused instead, and refused
+      // only when there is something to lose: an empty sheet is empty, and a
+      // document with no column row at all is handed back as it is, because the
+      // callers that refuse that by name read data[0] to decide.
+      if (!cols.length && rows.length) {
+        throw new HTTPException(400, {
+          message: explain(`Sheet ${sheet_id} holds rows under no columns.`, {
+            Received: `${rows.length} rows and a column row naming nothing`,
+            Expected: "one column per value in a row",
+            Source: "data[0] of the automerge document",
+            Fix: "undo the column deletion in the sheet, which is where the values are still reachable",
+          }),
+        });
+      }
+      if (!colsRow) return { data: hand.doc().data as Table, count: 0, offset: 0 };
+      // Keyed by name, the way every other branch of this switch already
+      // answers -- cselect stamps `key: col.name` off the postgres column and
+      // executeSql stamps AlaSQL's columnid -- and the way POST /sheet/:id
+      // already takes them. `key` is the document's own spelling: minted as a
+      // position, stable across a rename, and none of the caller's business. It
+      // stays inside the document, which is what the page syncs and edits.
+      //
+      // Restamped onto the column row as well, so every consumer that reads a
+      // cell as row[col.key] -- toRecords, all five exports, /stats/:id --
+      // keeps working off the answer rather than off a second convention.
+      return {
+        data: [arrayify(cols.map((col) => ({ ...col, key: col.name }))), ...named(sheet_id, cols, rows)],
+        count: rows.length,
+        offset: 0,
+      };
     }
     case "net-hook":
     case "net-http":
@@ -1253,8 +1285,13 @@ const portal = (name: string, ms: number, init: () => any, tick: (s: any) => { c
   app.get(
     `/portal/${name}/sync`,
     upgradeWebSocket(async (c) => {
-      const { auth } = c.req.query();
-      await verifyWsAuth(auth);
+      const { auth, pass } = c.req.query();
+      // A portal is a public synthetic stream: this validates the token and
+      // discards the role on purpose, since a portal honours no share claim and
+      // an absent token is anonymous rather than an error. `pass` rides along so
+      // that a locked share link is not refused by the one socket where it was
+      // never going to grant anything anyway.
+      await verifyWsAuth(auth, pass);
       const state = init();
       let interval: ReturnType<typeof setInterval> | undefined;
       return {
@@ -1751,6 +1788,19 @@ const ALERT_OK = () =>
   sql`(case when n.body is json then n.body::jsonb end)->>'status' <> 'error'
       and ((case when n.body is json then n.body::jsonb end)->>'delivery' in ('sent', ${HELD})
            or (case when n.body is json then n.body::jsonb end)->>'status' in ('clear', 'unchanged', 'idle'))`;
+
+// Which rows of `net` are one sheet's runs, and which of those went well --
+// per sheet type, because a run is a different event for each. A net-http
+// sheet's run is the poll it made; an alert's is the tick it fired; a net-hook
+// sheet's run is the delivery it was sent, and every delivery that reached the
+// table landed, since a refused one is never stored. Both name `s` and `n`, and
+// RUN_OF is spliced into freshness() three times -- the count subquery and both
+// laterals -- so it lives here rather than as three hand-copied copies, which
+// is exactly how POLL_OK and ALERT_OK came to live here.
+const RUN_OF = () =>
+  sql`case s.type when 'alert' then n.method = 'ALERT' when 'net-http' then n.method = 'GET' else true end`;
+const RUN_OK = () =>
+  sql`case s.type when 'alert' then (${ALERT_OK()}) when 'net-http' then (${POLL_OK()}) else true end`;
 
 const STATUS_AGO = [0, 3600, 86400];
 
@@ -3679,7 +3729,7 @@ const freshness = async (c: Context, { limit, offset }: Record<string, string>):
              -- this read exists to surface reported itself healthy.
              (select count(*) from net n
                where n.sheet_id = s.sheet_id
-                 and n.method = case when s.type = 'alert' then 'ALERT' else 'GET' end
+                 and (${RUN_OF()})
                  and (n.created_at, n.net_id)
                      > (coalesce(ok.created_at, '-infinity'::timestamp), coalesce(ok.net_id, -1)))
                as failures_since_ok,
@@ -3690,20 +3740,31 @@ const freshness = async (c: Context, { limit, offset }: Record<string, string>):
       -- failure this read is for, and an inner join drops it.
       left join lateral (
         select n.created_at, n.meta from net n
-        where n.sheet_id = s.sheet_id and n.method = case when s.type = 'alert' then 'ALERT' else 'GET' end
+        where n.sheet_id = s.sheet_id and (${RUN_OF()})
         order by n.created_at desc, n.net_id desc limit 1
       ) last on true
       left join lateral (
         select n.created_at, n.net_id from net n
         where n.sheet_id = s.sheet_id
-          and n.method = case when s.type = 'alert' then 'ALERT' else 'GET' end
-          -- The same two predicates GET /status grades on, read from the same
+          and (${RUN_OF()})
+          -- The same predicates GET /status grades on, read from the same
           -- place, so the two cannot drift into disagreeing about what a good
           -- run is. They already had.
-          and case when s.type = 'alert' then (${ALERT_OK()}) else (${POLL_OK()}) end
+          and (${RUN_OK()})
         order by n.created_at desc, n.net_id desc limit 1
       ) ok on true
-      where su.usr_id = ${c.get("usr_id")} and s.type in ('net-http', 'alert')
+      -- Every type whose runs are recorded here: a net-http sheet's polls, a
+      -- net-hook sheet's deliveries, an alert's ticks. Deliberately not "sheets
+      -- that have rows in net", because a webhook nobody has delivered to is
+      -- the failure this read is for -- the same argument the two left joins
+      -- above carry. And deliberately not every type net's own check constraint
+      -- admits: a net-socket sheet is opened by the browser against a url the
+      -- user gave, so nothing server-side ever writes a run for it, and it
+      -- would read "never run" forever. Saying nothing about a sheet it cannot
+      -- answer for is what this read does; a permanent "never run" on a working
+      -- sheet is the same false alarm as a blank cell on a rotten one, pointed
+      -- the other way.
+      where su.usr_id = ${c.get("usr_id")} and s.type in ('net-http', 'net-hook', 'alert')
     ) f`,
     where: [],
     // Stalest first, because that is the question. A sheet that has never run
@@ -4365,15 +4426,30 @@ app.post("/import/csv", async (c) => {
     return "text";
   };
 
+  // Two columns of one name have no name-keyed row, and every read is
+  // name-keyed -- so a file imported with a duplicate header would land as a
+  // sheet nothing can read back, refused by a message about the sheet rather
+  // than about the file. Refuse it here, where the header that has to change is
+  // in front of the person who can change it.
+  const headers = headerRow.fields.map((name, i) => name.trim() || `Column ${i + 1}`);
+  const twice = headers.filter((name, i) => headers.indexOf(name) !== i);
+  if (twice.length) {
+    throw new HTTPException(400, {
+      message: explain(`The CSV header names a column more than once.`, {
+        Received: `${[...new Set(twice)].map((name) => JSON.stringify(name)).join(", ")} appears more than once`,
+        Expected: `one column per name: ${headers.join(", ")}`,
+        Source: `line ${headerRow.line} of the uploaded file`,
+        Fix: "rename one of them in the file, because a row is keyed by column name",
+      }),
+    });
+  }
+
   // Build column definitions
-  const cols: Col[] = headerRow.fields.map((name, i) => {
-    const colValues = dataRows.map((row) => row.fields[i] || "");
-    return {
-      name: name.trim() || `Column ${i + 1}`,
-      type: inferType(colValues) as Type,
-      key: String(i),
-    };
-  });
+  const cols: Col[] = headers.map((name, i) => ({
+    name,
+    type: inferType(dataRows.map((row) => row.fields[i] || "")) as Type,
+    key: String(i),
+  }));
 
   // A blank is no value, and it stays one. Number("") is 0, and a blank is in
   // neither half of the boolean list, so the old shape stored "" in a num column
@@ -4475,15 +4551,24 @@ const icsStamp = (val: string): string => {
 
 const DATE_TYPES = ["date", "timestamp", "create"];
 
-// Records keyed by column name, for the formats that carry names into every row.
+// Records keyed by column name. This is the shape of every read -- sheet()
+// projects a table sheet through it, and the name-keyed exports re-label
+// through it -- so the refusal below is the one place a name that cannot key a
+// row is caught. Two columns of one name collapse into one, which is a wrong
+// answer rather than a missing one; a query already collapses them silently in
+// toRecords, so refusing here is the loud version of a bug that exists either
+// way. An unnamed column is a name, so two of them collide like any other pair.
 const named = (sheet_id: string, cols: Col[], rows: Row[]): Record<string, unknown>[] => {
   const seen = cols.map((col) => col.name).filter((name, i, all) => all.indexOf(name) !== i);
   if (seen.length) {
     throw new HTTPException(400, {
       message: explain(`Sheet ${sheet_id} has two columns with the same name.`, {
-        Received: `${seen.join(", ")} appears more than once`,
+        // Quoted, because the commonest pair is two columns nobody has named
+        // yet, and `  appears more than once` names nothing.
+        Received: `${[...new Set(seen)].map((name) => JSON.stringify(name)).join(", ")} appears more than once`,
+        Expected: "one column per name, since a row is keyed by name",
         Source: "the column row of the sheet, or the select list of its query",
-        Fix: "alias one of them, e.g. select a, b as b2, then export again",
+        Fix: "rename one of them in the sheet, or alias one in the query, e.g. select a, b as b2",
       }),
     });
   }
@@ -4781,10 +4866,25 @@ app.get("/openapi/:id", async (c) => {
           parameters: ["limit", "offset"].map((name) => ({ name, in: "query", schema: { type: "integer" } })),
           responses: {
             "200": {
-              description: "The column row, then the data rows, each keyed by column key.",
+              // The same Row the write takes. One schema for both halves is the
+              // whole point: the read used to key a table sheet's rows by
+              // column key while the write took them by name, so a generated
+              // client had a type for what it sent and none for what came back.
+              description: "The column row, then the data rows, each keyed by column name.",
               content: {
                 "application/json": {
-                  schema: { type: "object", properties: { data: { type: "array", items: { type: "object" } } } },
+                  schema: {
+                    type: "object",
+                    properties: {
+                      data: {
+                        type: "array",
+                        // data[0] is the column row and is not a Row; every
+                        // element after it is the same Row the write takes.
+                        prefixItems: [{ type: "object", description: "the columns, by position" }],
+                        items: { $ref: "#/components/schemas/Row" },
+                      },
+                    },
+                  },
                 },
               },
             },

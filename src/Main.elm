@@ -1,6 +1,7 @@
 port module Main exposing
     ( ClipboardData
     , ClipboardFormat(..)
+    , Col
     , Doc(..)
     , Freshness
     , Index
@@ -27,6 +28,7 @@ port module Main exposing
     , freshnessDecoder
     , main
     , moveSelection
+    , nameClash
     , nextSortOrder
     , normalizeRect
     , paletteCommands
@@ -552,11 +554,11 @@ port insertAtCursor : String -> Cmd msg
 port saveTutorial : Int -> Cmd msg
 
 
-{-| One row of `library:freshness` per net-http and alert sheet the caller can
-read. It arrives through a port rather than Elm's own Http for the reason
-sharing does: the JWT lives in index.html. An anonymous visitor is sent nothing
-at all, which is why the library's column is absent rather than a row of blanks
-that would read as "nothing is wrong".
+{-| One row of `library:freshness` per sheet whose runs are written down: a
+polled feed, a webhook, an alert. It arrives through a port rather than Elm's
+own Http for the reason sharing does: the JWT lives in index.html. An anonymous
+visitor is sent nothing at all, which is why the library's column is absent
+rather than a row of blanks that would read as "nothing is wrong".
 -}
 port freshnessLoaded : (D.Value -> msg) -> Sub msg
 
@@ -566,7 +568,27 @@ port freshnessLoaded : (D.Value -> msg) -> Sub msg
 carrying the same `id` and `action`, so ShareLoad can tell an answer about this
 sheet from one about the sheet you just left.
 -}
-port shareAction : { id : String, action : String, email : String, role : String, public : Bool } -> Cmd msg
+port shareAction : ShareAsk -> Cmd msg
+
+
+{-| What `shareAction` carries. One shape for six actions, so most of it is
+unused at any one call site: `shareAsk` is the whole of it doing nothing, and
+each caller is written as the difference from that.
+-}
+type alias ShareAsk =
+    { id : String
+    , action : String
+    , email : String
+    , role : String
+    , public : Bool
+    , days : Int
+    , password : String
+    }
+
+
+shareAsk : ShareAsk
+shareAsk =
+    { id = "", action = "", email = "", role = "", public = False, days = 0, password = "" }
 
 
 port shareLoaded : (D.Value -> msg) -> Sub msg
@@ -642,8 +664,8 @@ type alias Model =
 
 {-| What `library:freshness` says about one sheet: when it last ran, and how
 many runs since its last good one. A sheet with no entry has no freshness at
-all, which is a different fact from zero failures -- most sheets are neither a
-feed nor an alert, and the read answers for nothing else.
+all, which is a different fact from zero failures -- a table or a query has no
+runs to be stale, and the read answers for nothing that has none.
 -}
 type alias Freshness =
     { lastRun : Maybe String, failures : Int }
@@ -696,6 +718,12 @@ type alias Share =
     , hook : Maybe Hook
     , email : String
     , role : String
+
+    -- What the next minted link is asked for. Both blank by default, and blank
+    -- means "leave it out": the server's own default is a thirty-day link
+    -- anyone holding the url can open, and an empty body is what asks for it.
+    , days : String
+    , password : String
     }
 
 
@@ -709,7 +737,15 @@ type alias Hook =
 
 emptyShare : Share
 emptyShare =
-    { members = [], public = False, link = Nothing, hook = Nothing, email = "", role = "viewer" }
+    { members = []
+    , public = False
+    , link = Nothing
+    , hook = Nothing
+    , email = ""
+    , role = "viewer"
+    , days = ""
+    , password = ""
+    }
 
 
 type alias Sheet =
@@ -1305,6 +1341,8 @@ type Msg
     | ShareLoad D.Value
     | ShareEmailChange String
     | ShareRoleChange String
+    | ShareDaysChange String
+    | SharePasswordChange String
     | ShareAdd
     | ShareRemove String
     | SharePublic Bool
@@ -1599,7 +1637,7 @@ update msg ({ sheet, auth } as model) =
                   -- sheet's permissions on screen with nothing in flight to
                   -- correct them.
                   iif (next.showSettings && (not model.showSettings || next.id /= model.id))
-                    (shareAction { id = next.id, action = "list", email = "", role = "", public = False })
+                    (shareAction { shareAsk | id = next.id, action = "list" })
                     Cmd.none
                 ]
             )
@@ -2144,6 +2182,17 @@ update msg ({ sheet, auth } as model) =
                                         Nothing ->
                                             ( [], [] )
 
+                        renameClash =
+                            case ( edit, sheet.write ) of
+                                -- y is 0 for a header rename and -1 for a type
+                                -- write, which is the same header cell and not
+                                -- a name at all.
+                                ( SheetWrite { x, y }, Just write ) ->
+                                    iif (y == 0) (nameClash table.cols x write) Nothing
+
+                                _ ->
+                                    Nothing
+
                         -- Update undo stack if we have patches to track
                         newUndoStack =
                             if List.isEmpty forwardPatches || List.isEmpty backwardPatches then
@@ -2160,21 +2209,31 @@ update msg ({ sheet, auth } as model) =
                             else
                                 []
                     in
-                    if List.isEmpty forwardPatches then
-                        ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
-
-                    else
-                        advanceTutorial 1
+                    case renameClash of
+                        Just name ->
                             ( { model
-                                | sheet =
-                                    { sheet
-                                        | write = Nothing
-                                        , undoStack = newUndoStack
-                                        , redoStack = newRedoStack
-                                    }
+                                | sheet = { sheet | write = Nothing }
+                                , error = "This sheet already has a column called \"" ++ name ++ "\". Two columns of one name have no row a reader can key, so every export and every query over this sheet would refuse it."
                               }
-                            , changeDoc { id = sheet.id, data = forwardPatches }
+                            , Cmd.none
                             )
+
+                        Nothing ->
+                            if List.isEmpty forwardPatches then
+                                ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
+
+                            else
+                                advanceTutorial 1
+                                    ( { model
+                                        | sheet =
+                                            { sheet
+                                                | write = Nothing
+                                                , undoStack = newUndoStack
+                                                , redoStack = newRedoStack
+                                            }
+                                      }
+                                    , changeDoc { id = sheet.id, data = forwardPatches }
+                                    )
 
                 _ ->
                     ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
@@ -2325,26 +2384,58 @@ update msg ({ sheet, auth } as model) =
         ShareRoleChange role ->
             ( { model | share = (\s -> { s | role = role }) model.share }, Cmd.none )
 
+        ShareDaysChange days ->
+            ( { model | share = (\s -> { s | days = days }) model.share }, Cmd.none )
+
+        SharePasswordChange password ->
+            ( { model | share = (\s -> { s | password = password }) model.share }, Cmd.none )
+
         ShareAdd ->
             if String.contains "@" model.share.email then
                 ( { model | share = (\s -> { s | email = "" }) model.share }
-                , shareAction { id = model.id, action = "add", email = model.share.email, role = model.share.role, public = False }
+                , shareAction { shareAsk | id = model.id, action = "add", email = model.share.email, role = model.share.role }
                 )
 
             else
                 ( { model | error = "Enter the email address of the person to share with." }, Cmd.none )
 
         ShareRemove email ->
-            ( model, shareAction { id = model.id, action = "remove", email = email, role = "", public = False } )
+            ( model, shareAction { shareAsk | id = model.id, action = "remove", email = email } )
 
         SharePublic isPublic ->
-            ( model, shareAction { id = model.id, action = "public", email = "", role = "", public = isPublic } )
+            ( model, shareAction { shareAsk | id = model.id, action = "public", public = isPublic } )
 
         ShareLink ->
-            ( model, shareAction { id = model.id, action = "link", email = "", role = "", public = False } )
+            -- Blank is "not asked for", and zero days is what the port carries
+            -- that as: the server reads an empty body as the thirty-day
+            -- unlocked link, so an untouched panel mints what it always did.
+            -- Anything typed that is not a whole number of days is refused
+            -- here rather than rounded down to blank, which would silently
+            -- mint a thirty-day link for someone who asked for seven.
+            case ( String.trim model.share.days, String.toInt (String.trim model.share.days) ) of
+                ( "", _ ) ->
+                    ( model, shareAction { shareAsk | id = model.id, action = "link", password = model.share.password } )
+
+                ( _, Just days ) ->
+                    if days > 0 then
+                        ( model
+                        , shareAction
+                            { shareAsk
+                                | id = model.id
+                                , action = "link"
+                                , days = days
+                                , password = model.share.password
+                            }
+                        )
+
+                    else
+                        ( { model | error = "A link has to live at least a day. Enter a whole number above 0, or leave it blank for 30." }, Cmd.none )
+
+                ( typed, Nothing ) ->
+                    ( { model | error = "\"" ++ typed ++ "\" is not a number of days. Enter a whole number, or leave it blank for 30." }, Cmd.none )
 
         ShareHook ->
-            ( model, shareAction { id = model.id, action = "hook", email = "", role = "", public = False } )
+            ( model, shareAction { shareAsk | id = model.id, action = "hook" } )
 
         SettingsClose ->
             -- model.id, not model.sheet.id: the second is set when the
@@ -3564,11 +3655,11 @@ libraryCols model =
               , Col "name" "name" Text
               , Col "tags" "tags" (Many Text)
               ]
-            , -- `library:freshness` answers for net-http and alert sheets and for
-              -- a caller it can identify, so an anonymous visitor gets no rows at
-              -- all. No rows means no column: a blank one over every sheet reads
-              -- as "nothing is wrong", which is the claim this column exists to
-              -- stop the page making.
+            , -- `library:freshness` answers for the sheets whose runs are
+              -- written down, and for a caller it can identify, so an anonymous
+              -- visitor gets no rows at all. No rows means no column: a blank
+              -- one over every sheet reads as "nothing is wrong", which is the
+              -- claim this column exists to stop the page making.
               iif (Dict.isEmpty model.freshness) [] [ Col "freshness" "freshness" Text ]
             , [ Col "delete" "" Delete ]
             ]
@@ -3665,11 +3756,50 @@ viewSettings show info share =
                         [ H.input [ A.type_ "checkbox", A.checked share.public, A.onCheck SharePublic ] []
                         , text (iif share.public "public: anyone can read" "private")
                         ]
-                    , H.button [ A.onClick ShareLink ] [ text "copy view-only link" ]
+                    , H.button [ A.onClick ShareLink ] [ text "mint view-only link" ]
+                    ]
+
+                -- Both blank mint the link this button always minted: thirty
+                -- days, openable by anyone holding the url. The server reads an
+                -- empty body as exactly that, so an untouched panel sends one.
+                , H.div [ S.displayFlex, S.gapRem 0.25, S.marginTop "0.25rem" ]
+                    [ H.input
+                        [ A.type_ "number"
+                        , A.value share.days
+                        , A.onInput ShareDaysChange
+                        , A.placeholder "30 days"
+                        , A.title "how many days the link lives"
+                        , S.width "8rem"
+                        ]
+                        []
+                    , H.input
+                        [ A.type_ "password"
+                        , A.value share.password
+                        , A.onInput SharePasswordChange
+                        , A.placeholder "password (optional)"
+                        , A.title "a password the reader has to type to open the link"
+                        , S.flexGrow "1"
+                        ]
+                        []
                     ]
                 , case share.link of
                     Just link ->
-                        H.input [ A.type_ "text", A.value link, A.readonly True, A.attribute "onfocus" "this.select()", S.width "100%", S.marginTop "0.25rem", S.fontSizeRem 0.75 ] []
+                        H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.marginTop "0.25rem" ]
+                            [ H.div [ S.displayFlex, S.gapRem 0.25 ]
+                                [ H.input [ A.type_ "text", A.value link, A.readonly True, A.attribute "onfocus" "this.select()", S.flexGrow "1", S.fontSizeRem 0.75 ] []
+                                , H.button [ A.onClick (CopyText link) ] [ text "copy" ]
+                                ]
+
+                            -- The password is not in the link, on purpose: a
+                            -- lock the url carries is not a lock. Whoever mints
+                            -- it has to send it by some other channel, and
+                            -- nothing here can do that for them.
+                            , iif (String.isEmpty share.password)
+                                (text "")
+                                (H.small [ S.color "#666" ]
+                                    [ text "This link is locked. The password is not in it — send it separately, or nobody can open the sheet." ]
+                                )
+                            ]
 
                     Nothing ->
                         text ""
@@ -4167,6 +4297,27 @@ replaceMatches model sheet fr tbl matches =
           }
         , changeDoc { id = sheet.id, data = forward }
         )
+
+
+{-| The column this rename would collide with, if any. Every read of a sheet is
+keyed by column name, so two columns of one name have no row a reader can key:
+the rename syncs happily, the table on screen looks right, and every export,
+every `select * from @this` and the sheet's own API answer 400 from then on,
+far from the edit that caused it. `POST /import/csv` refuses the same shape in a
+file, for the same reason.
+
+Renaming a column to what it is already called is not a clash, and neither is
+renaming one of an already-colliding pair to something new -- that one is the
+repair.
+
+-}
+nameClash : Array Col -> Int -> String -> Maybe String
+nameClash cols x write =
+    if Maybe.map .name (Array.get x cols) == Just write then
+        Nothing
+
+    else
+        cols |> Array.filter (\col -> col.name == write) |> Array.get 0 |> Maybe.map .name
 
 
 orElse : Maybe a -> Maybe a -> Maybe a

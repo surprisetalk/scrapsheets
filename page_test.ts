@@ -106,6 +106,12 @@ const boot = async (url: string, { tutorial = -1 } = {}) => {
     flags: { tutorial },
   });
 
+  // What the page asked the server for. Nothing here answers -- index.html is
+  // what talks to the API -- but what Elm sends is half the contract and was
+  // never asserted.
+  const asks: Record<string, unknown>[] = [];
+  app.ports.shareAction.subscribe((ask: Record<string, unknown>) => asks.push(ask));
+
   app.ports.librarySynced.send(shelf);
   // src/index.html:850 does this: an id that resolves to nothing falls back to
   // the library rather than leaving the page on "loading" forever.
@@ -132,9 +138,17 @@ const boot = async (url: string, { tutorial = -1 } = {}) => {
   };
   const text = () => doc.body.textContent?.replace(/\s+/g, " ") ?? "";
   const all = (sel: string): El[] => [...doc.querySelectorAll(sel)];
+  // Elm's onInput listens for the `input` event, so a value set without one is
+  // a value the model never hears about.
+  const type_ = async (el: El | undefined | null, value: string) => {
+    assert(el, "nothing to type into");
+    (el as unknown as { value: string }).value = value;
+    el.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+    await settle();
+  };
 
   await settle();
-  return { dom, doc, app, settle, click, text, all };
+  return { dom, doc, app, settle, click, text, all, type_, asks };
 };
 
 Deno.test("the page boots: Elm initializes and renders the library", async () => {
@@ -842,5 +856,63 @@ Deno.test("a query result carries the type its select list produced, not its nam
       ["largest", "usd"],
       ["last_gift", "text"],
     ],
+  );
+});
+
+Deno.test("a share link is minted with the expiry and password that were typed", async () => {
+  // The panel could only ever ask for the default link: index.html posted an
+  // empty body, and the port had no field to carry anything else. The server
+  // has taken { days, password } and enforced the lock since before any of it
+  // was reachable from here.
+  const { all, click, type_, asks, app, settle, text } = await boot(
+    "http://localhost/table:countries#settings",
+  );
+
+  const button = all("button").find((b) => b.textContent?.includes("view-only link"));
+  assert(button, `expected a link button in the settings panel, got: ${text().slice(0, 400)}`);
+
+  // Untouched, it asks for what it always asked for: the server reads zero days
+  // and no password as the thirty-day link anyone holding the url can open.
+  await click(button);
+  assertEquals(asks.at(-1)?.action, "link");
+  assertEquals(asks.at(-1)?.days, 0);
+  assertEquals(asks.at(-1)?.password, "");
+
+  // By placeholder, not by type: the login form owns a password input too.
+  await type_(all('input[placeholder="30 days"]')[0], "7");
+  await type_(all('input[placeholder="password (optional)"]')[0], "correct horse");
+  await click(button);
+  assertEquals(asks.at(-1)?.days, 7, "the typed expiry has to reach the port as a number");
+  assertEquals(asks.at(-1)?.password, "correct horse");
+
+  // A number of days that is not one is refused rather than rounded down to
+  // blank, which would mint a thirty-day link for somebody who asked for seven.
+  const sent = asks.length;
+  await type_(all('input[placeholder="30 days"]')[0], "7.5");
+  await click(button);
+  assertEquals(asks.length, sent, "nothing is asked for until the expiry parses");
+  assert(text().includes("not a number of days"), `expected the typed value refused, got: ${text().slice(0, 400)}`);
+
+  // And the answer lands: the link is shown, and the panel says the password is
+  // not in it -- which is the one thing a reader of this link needs told, since
+  // a lock the url carries would be no lock.
+  app.ports.shareLoaded.send({
+    id: "table:countries",
+    action: "link",
+    members: [],
+    public: false,
+    link: "http://localhost/table:countries?share=eyJhbGciOiJIUzI1NiJ9.e30.x",
+  });
+  await settle();
+  // Read off the input, not the page text: the link is rendered as a readonly
+  // <input>, so it is a property and never a text node.
+  const shown = all("input[readonly]").map((el) => (el as unknown as { value: string }).value);
+  assert(
+    shown.some((v) => v.includes("?share=")),
+    `expected the minted link in a readonly input, got: ${JSON.stringify(shown)}`,
+  );
+  assert(
+    text().includes("password is not in it"),
+    `expected the panel to say the password travels separately, got: ${text().slice(0, 400)}`,
   );
 });

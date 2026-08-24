@@ -512,6 +512,28 @@ suite =
                     D.decodeString docDecoder """{"type":"dashboard","data":[{}]}"""
                         |> Expect.equal (Ok (Dashboard []))
             ]
+        , describe "nameClash"
+            [ test "a rename onto another column's name is refused" <|
+                \_ ->
+                    nameClash (namedCols [ "a", "b", "c" ]) 2 "a"
+                        |> Expect.equal (Just "a")
+            , test "renaming a column to what it is already called is not a clash" <|
+                \_ ->
+                    nameClash (namedCols [ "a", "b" ]) 0 "a"
+                        |> Expect.equal Nothing
+            , test "a name nothing else carries is free" <|
+                \_ ->
+                    nameClash (namedCols [ "a", "b" ]) 1 "c"
+                        |> Expect.equal Nothing
+            , test "renaming one of an already-colliding pair is the repair, not a clash" <|
+                \_ ->
+                    nameClash (namedCols [ "a", "a" ]) 1 "b"
+                        |> Expect.equal Nothing
+            , test "a blank name collides like any other, since a blank is a name" <|
+                \_ ->
+                    nameClash (namedCols [ "", "b" ]) 1 ""
+                        |> Expect.equal (Just "")
+            ]
         , describe "chartPoints"
             [ test "reads the x label and the y number, in the order given" <|
                 \_ ->
@@ -752,3 +774,22 @@ chartTable points =
             |> List.map (\( x, y ) -> Dict.fromList [ ( "x", E.string x ), ( "y", y ) ])
             |> Array.fromList
     }
+
+
+{-| Columns as the page actually receives them: decoded from a table document,
+rather than built by hand against a constructor only this test would need.
+-}
+namedCols : List String -> Array.Array Col
+namedCols names =
+    let
+        json =
+            names
+                |> List.indexedMap (\i name -> E.object [ ( "key", E.string (String.fromInt i) ), ( "name", E.string name ), ( "type", E.string "text" ) ])
+                |> E.list identity
+    in
+    case D.decodeValue docDecoder (E.object [ ( "type", E.string "table" ), ( "data", E.list identity [ json ] ) ]) of
+        Ok (Tab table) ->
+            table.cols
+
+        _ ->
+            Array.empty

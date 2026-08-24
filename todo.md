@@ -12,26 +12,18 @@ items are deleted — what shipped is described in `claude.md`. Anything below t
 
 The next things to build, in this order.
 
-- [ ] **You open a locked share link from the page.** `POST /library/:id/link` takes `{ days, password }` and the lock
-      is enforced in `verifyWsAuth`, but the refusal lands in the WebSocket handshake as an HTTP 401 that a browser
-      cannot read. A locked link is a socket that will not connect, so nothing in the UI can mint one or open one.
-  1. The share panel offers an expiry and a password when it mints a link.
-  2. Opening a sheet whose socket refused asks for the password and re-opens with `&pass=`, rather than retrying
-     forever. The handshake status is unreadable from script, so the prompt is what a failed connect falls back to.
-  3. `/portal/*/sync` passes no `pass` to `verifyWsAuth` and so refuses every locked token. Decide whether a portal ever
-     honours one, and make the call site say so either way.
-
-- [ ] **Freshness covers every sheet that can go stale, not two types.** `freshness()` answers only for `net-http` and
-      `alert` sheets, so the library column and the gallery mark that read it can never fire for anything else.
-  1. Widen the read to any sheet with a run history in `net`, which is what makes a codex connection's health show up on
-     its downstream sheets — the second point of "A rotated credential does not break live sheets."
-  2. The page already marks any sheet the read answers for, so this is a server change alone.
-
-- [ ] **A sheet's read and its write agree about column names.** `GET /sheet/:id` returns rows keyed by column **key**
-      and `POST /sheet/:id` takes them keyed by column **name**. The generated OpenAPI document states both honestly,
-      which is the tell: one endpoint pair, two spellings of the same row.
-  1. Pick one and migrate the other. The read is the older contract, so changing it is the breaking half.
-  2. Whichever loses, the spec is generated from the columns and needs no edit.
+- [ ] **Feed health covers a connection and a live socket, not only a poll.** `library:freshness` answers for
+      `net-http`, `net-hook` and `alert`, which is every sheet whose runs something writes down. Two kinds are missing
+      for the same reason: nothing records a run for them.
+  1. A `codex-*` sheet cannot hold a row in `net` at all — that table's check constraint is
+     `sheet_id ilike 'net-%' or ilike 'alert:%'` — so decide where a connection's health lives: widen the constraint, or
+     give `db` its own log.
+  2. A `net-socket` sheet is opened by the browser against the user's own url, so the server never sees whether it is
+     connected. It is left out of the read on purpose; including it would report "never run" forever about a sheet that
+     works. The page would have to report its own connection state before it can appear.
+  3. Both are then a `RUN_OF()`/`RUN_OK()` arm and a type in the where clause, and the column fills itself, since the
+     page marks a sheet by its own freshness rather than by its type.
+  4. The first is the second point of "A rotated credential does not break live sheets" under **Codex — databases**.
 
 ---
 

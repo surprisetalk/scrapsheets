@@ -49,8 +49,10 @@ and that provider's own signature is what is checked, against its own header —
 stored secret, never off the headers the sender sent.
 
 A sheet is also an API. `POST /sheet/<sheet_id>` appends rows keyed by column name, checked against the column types
-before anything is written — a batch is all-or-nothing, because a half-written append under a 201 is a lie. A script
-carries a key for one sheet rather than your login: `POST /library/<sheet_id>/secret` with `{"name":"api"}` and no value
+before anything is written — a batch is all-or-nothing, because a half-written append under a 201 is a lie.
+`GET /sheet/<sheet_id>` answers in the same spelling, so what you read back is what you would send. That costs one
+thing: a sheet with two columns of the same name has no name-keyed row to give, and is refused by name until you rename
+one. A script carries a key for one sheet rather than your login: `POST /library/<sheet_id>/secret` with `{"name":"api"}` and no value
 mints one, answers it once, and it opens that sheet and nothing else. `GET /openapi/<sheet_id>` describes the read and
 the write, generated from the sheet's own columns, so it cannot drift from them.
 
@@ -59,17 +61,22 @@ curl -X POST "https://api.sheets.scrap.land/sheet/$sheet_id" -H "scrapsheets-key
   -H 'Content-Type: application/json' -d '{"rows":[{"city":"Oslo","population":709037}]}'
 ```
 
-`GET /library/freshness` names the feeds that stopped. One row per net-http and alert sheet you can read: when it last
-ran, when it last succeeded, and how many runs since. It is a sheet, so `select * from @library:freshness` and
-`/export/library:freshness.csv` both work.
+`GET /library/freshness` names the feeds that stopped. One row per sheet whose runs are recorded — every polled feed,
+every webhook and every alert you can read: when it last ran, when it last succeeded, and how many runs since. A webhook nobody
+has delivered to in three days says so beside a poll that has been failing. It is a sheet, so
+`select * from @library:freshness` and `/export/library:freshness.csv` both work.
 
 The library table shows the same answer per row — last run, and failures since — and the demo strip marks a sheet whose
 feed is failing, so a dead feed is visible where you open it rather than only in the 15-minute alarm email. Ctrl/⌘+K
 opens a palette over every sheet and every shortcut; Ctrl/⌘+/ still lists the keys.
 
-`POST /library/<sheet_id>/link` mints a view-only link. It takes `{"days": 7}` for an expiry and `{"password": "..."}`
-for a lock — the password is never stored, only an HMAC of it under `TOKEN_SECRET`, so holding the link buys nobody an
-offline guess. A locked link is opened with `&pass=` beside the token.
+The share panel mints a view-only link, with a box for how many days it lives and a box for a password. Both are
+optional and blank means the link it always minted: thirty days, openable by anyone holding the url. The password is
+never stored and never put in the link — what rides the token is an HMAC of it under `TOKEN_SECRET`, so holding the
+link buys nobody an offline guess, and you have to send the password some other way. Opening a locked link asks for it
+before the sheet loads: the token says it is locked, and the refusal would otherwise land in a WebSocket handshake,
+where no browser can read it. `POST /library/<sheet_id>/link` is the same thing over HTTP, taking `{"days": 7}` and
+`{"password": "..."}`.
 
 ```nu
 # watch mode
