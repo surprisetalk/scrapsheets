@@ -12,18 +12,23 @@ items are deleted — what shipped is described in `claude.md`. Anything below t
 
 The next things to build, in this order.
 
-- [ ] **Feed health covers a connection and a live socket, not only a poll.** `library:freshness` answers for
-      `net-http`, `net-hook` and `alert`, which is every sheet whose runs something writes down. Two kinds are missing
-      for the same reason: nothing records a run for them.
-  1. A `codex-*` sheet cannot hold a row in `net` at all — that table's check constraint is
-     `sheet_id ilike 'net-%' or ilike 'alert:%'` — so decide where a connection's health lives: widen the constraint, or
-     give `db` its own log.
-  2. A `net-socket` sheet is opened by the browser against the user's own url, so the server never sees whether it is
-     connected. It is left out of the read on purpose; including it would report "never run" forever about a sheet that
-     works. The page would have to report its own connection state before it can appear.
-  3. Both are then a `RUN_OF()`/`RUN_OK()` arm and a type in the where clause, and the column fills itself, since the
+- [ ] **Feed health covers a live socket.** `library:freshness` now answers for `net-http`, `net-hook`, `alert` and
+      `codex-*` — every sheet whose runs the **server** writes down. A `net-socket` sheet is opened by the browser
+      against the user's own url, so the server never sees whether it is connected, and it is left out on purpose:
+      including it would report "never run" forever about a sheet that works.
+  1. Decide first, and write the answer here before touching code. A socket's health is reported by whoever has the tab
+     open, so a sheet nobody is looking at goes stale by definition. Either that is acceptable and the column means
+     "last seen", or it is not and this item is deleted rather than shipped as a column that lies. A codex sheet has the
+     same shape and was accepted, but the two are not the same: opening a codex sheet is an act somebody took, and
+     leaving a socket tab open is not.
+  2. The page already computes the three states it would send — `connected`, `disconnected`, `error connecting to <url>`
+     — beside the `docNotified` call in `src/index.html`. The work is a route that callback also POSTs to, writing one
+     `net` row per state change with `method = 'SOCKET'` and the `meta.status` shape `POLL_OK` already grades.
+  3. Write access is `syncRole`, not `assertSheetAccess`: a viewer holding a share link watches the same socket and must
+     not be able to write its health. Bound it per sheet the way `hookBucket()` bounds a delivery — a page stuck in a
+     reconnect loop is a sender that will not stop.
+  4. Then it is one `RUN_OF()`/`RUN_OK()` arm and one type in the where clause, and the column fills itself, since the
      page marks a sheet by its own freshness rather than by its type.
-  4. The first is the second point of "A rotated credential does not break live sheets" under **Codex — databases**.
 
 ---
 
@@ -48,10 +53,10 @@ one is written into the item.
   4. The commented-out constructors above `type Type` in `src/Main.elm` name `Date`, `Link` and `Image`, which the live
      union below them already has. Delete the block.
   5. `Lang` in `src/Main.elm` is write-only. `langDecoder` builds it, no `case` anywhere reads it, and the one
-     `queryDoc` send and the one `newDoc` that names a lang both hardcode `"sql"`. Its whole effect is to refuse a
-     query sheet whose `lang` is not one of five strings, three of which run nothing anywhere. Delete `Lang`, `langs`
-     and `langDecoder`; the field stays the string the server reads. `Formula` and `Scrapscript` keep their place
-     under **Scrapscript** as items, which is where an unbuilt thing belongs — a constructor is not a plan.
+     `queryDoc` send and the one `newDoc` that names a lang both hardcode `"sql"`. Its whole effect is to refuse a query
+     sheet whose `lang` is not one of five strings, three of which run nothing anywhere. Delete `Lang`, `langs` and
+     `langDecoder`; the field stays the string the server reads. `Formula` and `Scrapscript` keep their place under
+     **Scrapscript** as items, which is where an unbuilt thing belongs — a constructor is not a plan.
   6. Decide about PRQL, and write the answer here before touching it. `prql-js` is a WASM dependency carried for one
      branch of `querify()`, one assertion in `main_test.ts`, and zero bundled examples; with `Lang` gone the page cannot
      ask for it at all. Either delete the branch, the dependency and the `"prql"` arm of `Query["lang"]`, or ship one
@@ -86,8 +91,8 @@ one is written into the item.
      its fields. A vague message outranks the bug behind it.
   4. `err instanceof Error ? err.message : String(err)` repeats as well; one `reason(err)` beside `bad()`.
 
-- [ ] **The suite finishes in seconds.** It is over the ten-second bound — `time deno task test` — and `page_test.ts`
-      is most of it.
+- [ ] **The suite finishes in seconds.** It is over the ten-second bound — `time deno task test` — and `page_test.ts` is
+      most of it.
   1. `boot()` reads `dist/index.js` and `new Function()`-compiles it once per test, half a megabyte each time. Read and
      compile once at module scope and `.call(scope)` per boot: the fresh `this` is the only part that has to be new,
      which the comment there already says.
@@ -367,7 +372,9 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
 - [ ] **A rotated credential does not break live sheets.** There is no rotation path.
   1. Two DSNs during a rollover, tried in order — the `secret` table already has this shape.
-  2. Connection health surfaced as freshness on every downstream sheet, through `library:freshness`.
+  2. The codex sheet itself already has freshness: `GET /codex/:id` writes a `method = 'CODEX'` run and
+     `library:freshness` grades it. The **downstream** half is what is missing — a query sheet selecting from
+     `@codex-db:x` says nothing about the connection under it, so a dead credential reads as an empty result.
 
 ---
 

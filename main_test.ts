@@ -3969,6 +3969,49 @@ Deno.test(async function allTests(_t) {
         "a sheet whose liveness is not recorded here is left out, not reported as never run",
       );
 
+      // A codex sheet's run is the connection GET /codex/:id opened. There is
+      // no poller for one, so the only moment anybody learns whether the far
+      // database still answers is when somebody opens the sheet -- which is
+      // why a connection nobody has opened reads "never run" rather than being
+      // left out: it has never been verified, and that is the fact.
+      const conn = automerge.create<Sheet>({ type: "codex-db", data: [] });
+      const cold = automerge.create<Sheet>({ type: "codex-db", data: [] });
+      const own = automerge.create<Sheet>({ type: "codex-scrapsheets", data: [] });
+      const connId = `codex-db:${conn.documentId}`;
+      const coldId = `codex-db:${cold.documentId}`;
+      const ownId = `codex-scrapsheets:${own.documentId}`;
+      for (const [i, id] of [connId, coldId, ownId].entries()) await put(jwt, `/library/${id}`, { name: `codex-${i}` });
+
+      // No DSN saved yet, so the connection cannot be opened. The refusal is
+      // the run: this is what a rotated credential looks like from here.
+      await reject(jwt, `/codex/${connId}`);
+      await get<Table>(jwt, `/codex/${ownId}`);
+
+      const conns = Object.fromEntries((await rows(jwt)).body.map((r) => [String(r.sheet_id), r]));
+      assert(conns[connId], "a codex sheet has a freshness, because a connection is a run");
+      assertEquals(conns[connId].last_ok, null, "a refused connection is not a good run");
+      assert(conns[connId].last_run, "but it is a run, and it is the one worth seeing");
+      assertEquals(Number(conns[connId].failures_since_ok), 1);
+      assertEquals(
+        JSON.parse(String(conns[connId].last_meta)).status,
+        400,
+        "graded by POLL_OK off the same meta.status a poll writes, not a second spelling of it",
+      );
+      assertEquals(conns[ownId].last_ok, conns[ownId].last_run, "a connection that answered is a good run");
+      assertEquals(Number(conns[ownId].failures_since_ok), 0);
+      assertEquals(conns[coldId].last_run, null, "a connection nobody has opened has never been verified");
+
+      // Somebody else holding the doc_id must not be able to write failures
+      // into this sheet's freshness, which is why the access check runs before
+      // the clock starts.
+      const { jwt: stranger } = await usr("zeb@example.com");
+      await reject(stranger, `/codex/${connId}`);
+      assertEquals(
+        Number((await rows(jwt)).body.find((r) => String(r.sheet_id) === connId)?.failures_since_ok),
+        1,
+        "a refused reader is not a connection that failed",
+      );
+
       // A sheet with no runs to be stale has no row at all. It is not a zero.
       const table = automerge.create<Sheet>({
         type: "table",
@@ -3998,8 +4041,9 @@ Deno.test(async function allTests(_t) {
       lang: "sql",
       code: `select count(*) as n from @library:freshness where failures_since_ok > 0`,
     }).then((res) => res.data);
-    // The rotten feed and the tied one; the never-run feed has failed nothing.
-    assertEquals(Number((answer as Table)[1].n), 2, "a query sheet can select from it");
+    // The rotten feed, the tied one, and the codex connection with no DSN. The
+    // never-run feed and the never-opened connection have failed nothing.
+    assertEquals(Number((answer as Table)[1].n), 3, "a query sheet can select from it");
   }
 
   // The bucket a flood is counted against must be one the flood cannot choose.

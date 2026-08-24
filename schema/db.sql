@@ -61,9 +61,15 @@ create table sheet_usr
 , primary key (sheet_id, usr_id)
 );
 
+-- The run log, for every sheet whose runs somebody writes down: a net-http
+-- poll, a net-hook delivery, an alert tick, and a codex connection attempt. A
+-- codex sheet is here rather than in a table of its own because a connection's
+-- health is a run like any other, and `net` already carries the retention
+-- (trimNet), the index, the paging order and the read that library:freshness
+-- grades. A second log would be a second noun with a second copy of all four.
 create table net
 ( net_id bigint not null generated always as identity primary key
-, sheet_id text not null references sheet(sheet_id) check (sheet_id ilike 'net-%' or sheet_id ilike 'alert:%')
+, sheet_id text not null references sheet(sheet_id) check (sheet_id ilike 'net-%' or sheet_id ilike 'alert:%' or sheet_id ilike 'codex-%')
 , created_at timestamp default now()
 , method text not null default 'POST'
 , req_headers jsonb not null default '{}'::jsonb

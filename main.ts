@@ -344,7 +344,10 @@ export type Sheet =
   | Tag<"net-socket", [NetSocket]>
   | Tag<"query", [Query]>
   | Tag<"portal", Args>
-  | Tag<"codex", []>;
+  // A prefix, the way Template already spells it and the way the sheet table's
+  // own check constraint reads it. No sheet is ever typed the bare "codex":
+  // that arm named a type that cannot exist while refusing the two that do.
+  | Tag<`codex-${string}`, []>;
 
 export type Page = {
   data: Table;
@@ -1791,16 +1794,28 @@ const ALERT_OK = () =>
 
 // Which rows of `net` are one sheet's runs, and which of those went well --
 // per sheet type, because a run is a different event for each. A net-http
-// sheet's run is the poll it made; an alert's is the tick it fired; a net-hook
-// sheet's run is the delivery it was sent, and every delivery that reached the
-// table landed, since a refused one is never stored. Both name `s` and `n`, and
-// RUN_OF is spliced into freshness() three times -- the count subquery and both
-// laterals -- so it lives here rather than as three hand-copied copies, which
-// is exactly how POLL_OK and ALERT_OK came to live here.
+// sheet's run is the poll it made; an alert's is the tick it fired; a codex
+// sheet's is the connection GET /codex/:id opened; a net-hook sheet's run is
+// the delivery it was sent, and every delivery that reached the table landed,
+// since a refused one is never stored. Both name `s` and `n`, and RUN_OF is
+// spliced into freshness() three times -- the count subquery and both laterals
+// -- so it lives here rather than as three hand-copied copies, which is exactly
+// how POLL_OK and ALERT_OK came to live here.
+//
+// Searched rather than `case s.type when`, because a codex type is a prefix
+// (codex-db, codex-scrapsheets) and not one string to compare against. A codex
+// run is graded by POLL_OK: it records the same `meta.status` a poll does, so
+// grading it by a second predicate spelling the same rule is how the two copies
+// this pair exists to prevent get made.
 const RUN_OF = () =>
-  sql`case s.type when 'alert' then n.method = 'ALERT' when 'net-http' then n.method = 'GET' else true end`;
+  sql`case when s.type = 'alert' then n.method = 'ALERT'
+           when s.type = 'net-http' then n.method = 'GET'
+           when s.type like 'codex-%' then n.method = 'CODEX'
+           else true end`;
 const RUN_OK = () =>
-  sql`case s.type when 'alert' then (${ALERT_OK()}) when 'net-http' then (${POLL_OK()}) else true end`;
+  sql`case when s.type = 'alert' then (${ALERT_OK()})
+           when s.type = 'net-http' or s.type like 'codex-%' then (${POLL_OK()})
+           else true end`;
 
 const STATUS_AGO = [0, 3600, 86400];
 
@@ -3754,17 +3769,24 @@ const freshness = async (c: Context, { limit, offset }: Record<string, string>):
         order by n.created_at desc, n.net_id desc limit 1
       ) ok on true
       -- Every type whose runs are recorded here: a net-http sheet's polls, a
-      -- net-hook sheet's deliveries, an alert's ticks. Deliberately not "sheets
-      -- that have rows in net", because a webhook nobody has delivered to is
-      -- the failure this read is for -- the same argument the two left joins
-      -- above carry. And deliberately not every type net's own check constraint
-      -- admits: a net-socket sheet is opened by the browser against a url the
-      -- user gave, so nothing server-side ever writes a run for it, and it
-      -- would read "never run" forever. Saying nothing about a sheet it cannot
-      -- answer for is what this read does; a permanent "never run" on a working
-      -- sheet is the same false alarm as a blank cell on a rotten one, pointed
-      -- the other way.
-      where su.usr_id = ${c.get("usr_id")} and s.type in ('net-http', 'net-hook', 'alert')
+      -- net-hook sheet's deliveries, an alert's ticks, a codex sheet's
+      -- connections. Deliberately not "sheets that have rows in net", because a
+      -- webhook nobody has delivered to is the failure this read is for -- the
+      -- same argument the two left joins above carry. And deliberately not
+      -- every type net's own check constraint admits: a net-socket sheet is
+      -- opened by the browser against a url the user gave, so nothing
+      -- server-side ever writes a run for it, and it would read "never run"
+      -- forever. Saying nothing about a sheet it cannot answer for is what this
+      -- read does; a permanent "never run" on a working sheet is the same false
+      -- alarm as a blank cell on a rotten one, pointed the other way.
+      --
+      -- A codex sheet is in, and its "never run" is not that false alarm: a
+      -- connection has no poller, so the only moment anybody learns whether the
+      -- far database still answers is when somebody opens the sheet, and a
+      -- connection nobody has ever opened is a connection nobody has ever
+      -- verified. That is the fact, and the read states it.
+      where su.usr_id = ${c.get("usr_id")}
+        and (s.type in ('net-http', 'net-hook', 'alert') or s.type like 'codex-%')
     ) f`,
     where: [],
     // Stalest first, because that is the question. A sheet that has never run
@@ -4957,115 +4979,162 @@ app.post("/query", async (c) => {
 
 // --- codex (external databases)
 
+// One row of `net` per connection attempt. A codex sheet has no poller and no
+// delivery, so opening it is the only moment anybody learns whether the far
+// database still answers -- which is what library:freshness reads back, and
+// what tells a rotated credential from a quiet afternoon. `net` is where a run
+// already lives: trimNet bounds it, RUN_OF/RUN_OK grade it, and the freshness
+// laterals needed one arm rather than a second log with its own retention,
+// index and read.
+//
+// `status` is the shape a poll writes, because POLL_OK grades both: a status
+// this code invents rather than reads off a wire, but the same field, so the
+// two are not graded by two spellings of one rule.
+//
+// Written after the answer is known, never in front of it, and its own failure
+// is swallowed the way trimNet's is: a log that cannot be written must not fail
+// the read it is about. The failure message is stored as raised -- it names the
+// host or the parse error, which is what the sheet's own members need in order
+// to fix it, and neither the DSN nor its password reaches it.
+const codexRun = async (sheet_id: string, started: number, status: number, body: string) => {
+  await sql`
+    insert into net (sheet_id, method, body, meta)
+    values (${sheet_id}, 'CODEX', ${body}, ${sql.json({ status, ms: Date.now() - started })})
+  `.catch((err: unknown) => console.error(`codex run ${sheet_id}:`, err));
+  await trimNet(sheet_id);
+};
+
 app.get("/codex/:id", async (c) => {
   if (!rateLimit(`codex:${c.get("usr_id")}`))
     throw new HTTPException(429, { message: "Too many codex queries. Please slow down." });
   const sheet_id = c.req.param("id");
   const [type, _doc_id] = sheet_id.split(":");
-  switch (type) {
-    case "codex-db": {
-      const [db] = await sql`select dsn from db where sheet_id = ${sheet_id}`;
-      if (!db) {
-        throw new HTTPException(400, {
-          message: `No DSN found.`,
+  // Before the clock starts, because a caller with no share on this sheet is
+  // not a connection that failed: logging their refusal would let anyone
+  // holding a doc_id write failures into somebody else's freshness.
+  await assertSheetAccess(c, sheet_id);
+  const started = Date.now();
+  try {
+    switch (type) {
+      case "codex-db": {
+        const [db] = await sql`select dsn from db where sheet_id = ${sheet_id}`;
+        if (!db) {
+          throw new HTTPException(400, {
+            message: `No DSN found.`,
+          });
+        }
+        db.dsn = await decrypt("connection string", db.dsn);
+        // Block connections to the application's own database
+        const appDbUrl = Deno.env.get("DATABASE_URL") ?? "postgresql://postgres@127.0.0.1:5434/postgres";
+        try {
+          const app_ = new URL(appDbUrl);
+          const ext = new URL(db.dsn);
+          const blockedHosts = ["localhost", "127.0.0.1", "0.0.0.0", "::1"];
+          const appHost = blockedHosts.includes(app_.hostname) ? "127.0.0.1" : app_.hostname;
+          const extHost = blockedHosts.includes(ext.hostname) ? "127.0.0.1" : ext.hostname;
+          if (extHost === appHost && (ext.port || "5432") === (app_.port || "5432"))
+            throw new HTTPException(403, { message: "Cannot connect to this database." });
+        } catch (e) {
+          if (e instanceof HTTPException) throw e;
+          throw new HTTPException(400, {
+            message: `Expected a parseable postgres DSN, received one that failed to parse: ${
+              e instanceof Error ? e.message : String(e)
+            }. Source: the dsn stored for ${
+              c.req.param("id")
+            }. Re-save it as postgresql://user:password@host:port/database.`,
+          });
+        }
+        const sql_ = pg(db.dsn, {
+          onnotice: (msg: { severity?: string }) => msg.severity !== "DEBUG" && console.log(msg),
+          connect_timeout: 5,
+          idle_timeout: 10,
         });
+        try {
+          await sql_`SET statement_timeout = '10s'`;
+          await sql_`SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`;
+          const rows = await sql_`
+            select
+              table_name as name,
+              '[[{"name":"name","type":"text","key":"column_name"},{"name":"type","type":"text","key":"data_type"},{"name":"key","type":"int","key":"ordinal_position"}]]'::jsonb || jsonb_agg(t)::jsonb as columns
+            from information_schema.tables t
+            inner join information_schema.columns c using (table_catalog,table_schema,table_name)
+            where table_schema = 'public'
+            group by table_name, table_type
+          `;
+          const cols = rows.columns.map((col: { name: string }) => ({
+            name: col.name,
+            type: "text",
+            key: col.name,
+          })); // TODO:
+          await codexRun(sheet_id, started, 200, "");
+          return c.json({ data: [cols, ...rows] }, 200);
+        } finally {
+          await sql_.end();
+        }
       }
-      db.dsn = await decrypt("connection string", db.dsn);
-      // Block connections to the application's own database
-      const appDbUrl = Deno.env.get("DATABASE_URL") ?? "postgresql://postgres@127.0.0.1:5434/postgres";
-      try {
-        const app_ = new URL(appDbUrl);
-        const ext = new URL(db.dsn);
-        const blockedHosts = ["localhost", "127.0.0.1", "0.0.0.0", "::1"];
-        const appHost = blockedHosts.includes(app_.hostname) ? "127.0.0.1" : app_.hostname;
-        const extHost = blockedHosts.includes(ext.hostname) ? "127.0.0.1" : ext.hostname;
-        if (extHost === appHost && (ext.port || "5432") === (app_.port || "5432"))
-          throw new HTTPException(403, { message: "Cannot connect to this database." });
-      } catch (e) {
-        if (e instanceof HTTPException) throw e;
-        throw new HTTPException(400, {
-          message: `Expected a parseable postgres DSN, received one that failed to parse: ${
-            e instanceof Error ? e.message : String(e)
-          }. Source: the dsn stored for ${
-            c.req.param("id")
-          }. Re-save it as postgresql://user:password@host:port/database.`,
-        });
-      }
-      const sql_ = pg(db.dsn, {
-        onnotice: (msg: { severity?: string }) => msg.severity !== "DEBUG" && console.log(msg),
-        connect_timeout: 5,
-        idle_timeout: 10,
-      });
-      try {
-        await sql_`SET statement_timeout = '10s'`;
-        await sql_`SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`;
-        const rows = await sql_`
-          select
-            table_name as name,
-            '[[{"name":"name","type":"text","key":"column_name"},{"name":"type","type":"text","key":"data_type"},{"name":"key","type":"int","key":"ordinal_position"}]]'::jsonb || jsonb_agg(t)::jsonb as columns
-          from information_schema.tables t
-          inner join information_schema.columns c using (table_catalog,table_schema,table_name)
-          where table_schema = 'public'
-          group by table_name, table_type
-        `;
-        const cols = rows.columns.map((col: { name: string }) => ({
-          name: col.name,
-          type: "text",
-          key: col.name,
-        })); // TODO:
-        return c.json({ data: [cols, ...rows] }, 200);
-      } finally {
-        await sql_.end();
-      }
-    }
-    case "codex-scrapsheets": {
-      return c.json(
-        {
-          data: [
-            [
-              { name: "name", type: "text", key: "name" },
-              { name: "columns", type: "table", key: "columns" },
+      case "codex-scrapsheets": {
+        await codexRun(sheet_id, started, 200, "");
+        return c.json(
+          {
+            data: [
+              [
+                { name: "name", type: "text", key: "name" },
+                { name: "columns", type: "table", key: "columns" },
+              ],
+              {
+                name: "shop",
+                columns: [
+                  [
+                    { name: "name", type: "text", key: 0 },
+                    { name: "type", type: "text", key: 1 },
+                    { name: "key", type: "int", key: 2 },
+                  ],
+                  ["created_at", "text", 0],
+                  ["sell_id", "text", 1],
+                  ["sell_type", "text", 2],
+                  ["sell_price", "text", 3],
+                  ["name", "text", 4],
+                ],
+              },
+              {
+                name: "library",
+                columns: [
+                  [
+                    { name: "name", type: "text", key: 0 },
+                    { name: "type", type: "text", key: 1 },
+                    { name: "key", type: "int", key: 2 },
+                  ],
+                  ["s.created_at", "text", 0],
+                  ["s.type", "text", 1],
+                  ["s.doc_id", "text", 2],
+                  ["s.name", "text", 3],
+                  ["s.tags", "text", 4],
+                  ["s.sell_price", "text", 5],
+                ],
+              },
             ],
-            {
-              name: "shop",
-              columns: [
-                [
-                  { name: "name", type: "text", key: 0 },
-                  { name: "type", type: "text", key: 1 },
-                  { name: "key", type: "int", key: 2 },
-                ],
-                ["created_at", "text", 0],
-                ["sell_id", "text", 1],
-                ["sell_type", "text", 2],
-                ["sell_price", "text", 3],
-                ["name", "text", 4],
-              ],
-            },
-            {
-              name: "library",
-              columns: [
-                [
-                  { name: "name", type: "text", key: 0 },
-                  { name: "type", type: "text", key: 1 },
-                  { name: "key", type: "int", key: 2 },
-                ],
-                ["s.created_at", "text", 0],
-                ["s.type", "text", 1],
-                ["s.doc_id", "text", 2],
-                ["s.name", "text", 3],
-                ["s.tags", "text", 4],
-                ["s.sell_price", "text", 5],
-              ],
-            },
-          ],
-        },
-        200,
+          },
+          200,
+        );
+      }
+      default:
+        throw new HTTPException(400, {
+          message: `Unrecognized codex type: ${type}`,
+        });
+    }
+  } catch (err) {
+    // A refusal about the id itself is not a connection that failed, and
+    // `net` refuses the row anyway: its check constraint takes a net-, an
+    // alert: or a codex- sheet and nothing else.
+    if (type.startsWith("codex-")) {
+      await codexRun(
+        sheet_id,
+        started,
+        err instanceof HTTPException ? err.status : 500,
+        err instanceof Error ? err.message : String(err),
       );
     }
-    default:
-      throw new HTTPException(400, {
-        message: `Unrecognized codex type: ${type}`,
-      });
+    throw err;
   }
 });
 

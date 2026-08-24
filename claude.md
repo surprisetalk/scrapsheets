@@ -541,24 +541,23 @@ t.trade_id order by p.day desc) = 1` —
   no-document branch says which of the two it likely was and that reloading asks again, which is the whole of the retry
   — nothing keeps the password, so a reload re-prompts. The prompt fires only when the share token is the credential
   actually in use: a logged-in reader's own JWT wins, and gating their sheet on a link they are not opening with would
-  be a password for nothing. `/portal/*/sync` passes `pass` through to the same reader. It discards the role on
-  purpose — a portal is a public synthetic stream and honours no share claim — but without the password beside it, the
-  lock check fired on the one socket where the link was never going to grant anything. The share panel mints the link:
-  a `days` box and a `password` box, both blank by default, and blank sends nothing, which is the empty body the route
-  already reads as the unlocked thirty-day link. A `days` box holding something that is not a whole number above zero
-  is refused **in the panel** rather than rounded down to blank: `String.toInt` answers `Nothing` for `7.5`, and
-  defaulting that to 0 would mint a thirty-day link for somebody who asked for seven and say nothing. The refusals the
-  **server** raises reach the user too, which they did not: `send()` in `src/index.html` read the body as JSON and fell
-  back to `"POST /link failed (400)."`, but Hono answers an `HTTPException` carrying no `res` as **plain text** — so
-  every `explain()` block these routes raise was parsed, thrown, swallowed by the `.catch(() => ({}))` and replaced by
-  the status. It reads the body through `httpErrorDetail()` now, the same reader the freshness call uses. The password
-  is never put in the url — a lock the link carries is not a lock — so the panel says so under a locked link rather
-  than leaving the minter to find out. All four share routes now
-  `.catch(() => ({}))` on `c.req.json()`, the shape `POST /library/:id/secret` already used: unguarded, a missing or
-  unparseable body was an unexplained 500, a row in `net-hook:errors` and a point off the 5xx grade for a mistake the
-  caller could have fixed from the message. `DELETE /library/:id/share` validated nothing at all, so a missing email
-  reached the delete and came back as "undefined is not a non-owner member of this sheet" — a sentence about the sheet
-  for a mistake in the request
+  be a password for nothing. `/portal/*/sync` passes `pass` through to the same reader. It discards the role on purpose
+  — a portal is a public synthetic stream and honours no share claim — but without the password beside it, the lock
+  check fired on the one socket where the link was never going to grant anything. The share panel mints the link: a
+  `days` box and a `password` box, both blank by default, and blank sends nothing, which is the empty body the route
+  already reads as the unlocked thirty-day link. A `days` box holding something that is not a whole number above zero is
+  refused **in the panel** rather than rounded down to blank: `String.toInt` answers `Nothing` for `7.5`, and defaulting
+  that to 0 would mint a thirty-day link for somebody who asked for seven and say nothing. The refusals the **server**
+  raises reach the user too, which they did not: `send()` in `src/index.html` read the body as JSON and fell back to
+  `"POST /link failed (400)."`, but Hono answers an `HTTPException` carrying no `res` as **plain text** — so every
+  `explain()` block these routes raise was parsed, thrown, swallowed by the `.catch(() => ({}))` and replaced by the
+  status. It reads the body through `httpErrorDetail()` now, the same reader the freshness call uses. The password is
+  never put in the url — a lock the link carries is not a lock — so the panel says so under a locked link rather than
+  leaving the minter to find out. All four share routes now `.catch(() => ({}))` on `c.req.json()`, the shape
+  `POST /library/:id/secret` already used: unguarded, a missing or unparseable body was an unexplained 500, a row in
+  `net-hook:errors` and a point off the 5xx grade for a mistake the caller could have fixed from the message.
+  `DELETE /library/:id/share` validated nothing at all, so a missing email reached the delete and came back as
+  "undefined is not a non-owner member of this sheet" — a sentence about the sheet for a mistake in the request
 - **Marketplace checkout**: `POST /buy/:id` fulfills `$0` listings immediately. A positive `sell_price` creates a Stripe
   Checkout Session (`STRIPE_SECRET_KEY`) and returns `{ checkout_url }`. `POST /stripe` verifies `stripe-signature`
   (`STRIPE_WEBHOOK_SECRET`) and fulfills `checkout.session.completed` with `payment_status=paid`. Checkout is card-only.
@@ -566,29 +565,34 @@ t.trade_id order by p.day desc) = 1` —
 - **Freshness**: `library:freshness` is a sheet the server **computes rather than stores**, so it pages, exports and can
   be selected from a query sheet (`select * from @library:freshness`) through the paths every other sheet uses. It has
   no automerge document and no `sheet` row, so `sheet()` answers it before the document lookup and before
-  `assertSheetAccess`; the join to `sheet_usr` inside it is the access rule. One row per sheet whose runs land in
-  `net` and are written down — a polled feed, a webhook, an alert — the caller can read: last run, last **good** run,
-  and rows since. Both joins onto `net` are `left join lateral`, because a
-  sheet that has never run at all is exactly the failure this read is for; and `failures_since_ok` compares
-  `(created_at, net_id)` rather than `created_at` alone, the same key the laterals order by — on the timestamp alone, a
-  good run and a bad one sharing one left `last_ok` equal to `last_run` and the count at zero, so the sheet this read
-  exists to surface reported itself healthy. What counts as a run and what counts as a good one are `RUN_OF()` and
-  `RUN_OK()`, which sit beside `POLL_OK`/`ALERT_OK` and are spliced into this query **three** times — the count
-  subquery and both laterals — so the three cannot drift the way the two already had. A run is a different event per
-  type: a net-http sheet's is its poll (`method = 'GET'`, graded `POLL_OK`), an alert's is its tick
-  (`method = 'ALERT'`, graded `ALERT_OK`), and a net-hook sheet's is a delivery it was sent — every row, all of them
-  good, because a refused delivery never reaches the table. The where clause is
-  `s.type in ('net-http', 'net-hook', 'alert')`: deliberately **not** "sheets that have rows in `net`", because a
-  webhook nobody has delivered to is the failure this read is for, the same argument the left joins carry; and
-  deliberately **not** every type `net`'s check constraint admits, because a `net-socket` sheet is opened by the
-  browser against the user's own url and nothing server-side ever writes a run for it, so including it would report
+  `assertSheetAccess`; the join to `sheet_usr` inside it is the access rule. One row per sheet whose runs land in `net`
+  and are written down — a polled feed, a webhook, an alert, a codex connection — the caller can read: last run, last
+  **good** run, and rows since. Both joins onto `net` are `left join lateral`, because a sheet that has never run at all
+  is exactly the failure this read is for; and `failures_since_ok` compares `(created_at, net_id)` rather than
+  `created_at` alone, the same key the laterals order by — on the timestamp alone, a good run and a bad one sharing one
+  left `last_ok` equal to `last_run` and the count at zero, so the sheet this read exists to surface reported itself
+  healthy. What counts as a run and what counts as a good one are `RUN_OF()` and `RUN_OK()`, which sit beside
+  `POLL_OK`/`ALERT_OK` and are spliced into this query **three** times — the count subquery and both laterals — so the
+  three cannot drift the way the two already had. A run is a different event per type: a net-http sheet's is its poll
+  (`method = 'GET'`, graded `POLL_OK`), an alert's is its tick (`method = 'ALERT'`, graded `ALERT_OK`), a codex sheet's
+  is the connection `GET /codex/:id` opened (`method = 'CODEX'`, graded `POLL_OK`, because it records the same
+  `meta.status` a poll does and a second predicate spelling one rule is how `POLL_OK`/`ALERT_OK` came to live in one
+  place), and a net-hook sheet's is a delivery it was sent — every row, all of them good, because a refused delivery
+  never reaches the table. Both `RUN_OF()` and `RUN_OK()` are **searched** `case`s rather than `case s.type when`, since
+  a codex type is a prefix and not one string to compare against. The where clause is
+  `s.type in ('net-http', 'net-hook', 'alert') or s.type like 'codex-%'`: deliberately **not** "sheets that have rows in
+  `net`", because a webhook nobody has delivered to is the failure this read is for, the same argument the left joins
+  carry; and deliberately **not** every type `net`'s check constraint admits, because a `net-socket` sheet is opened by
+  the browser against the user's own url and nothing server-side ever writes a run for it, so including it would report
   "never run" forever about a sheet that works — the same false alarm as a blank cell on a rotten feed, pointed the
-  other way. Two consequences, both intended: `net-hook:errors` appears in the operator's
-  own freshness, and a net-hook's `last_ok` always equals its `last_run`. A `codex-*` sheet cannot appear at any
-  price — `net`'s check constraint refuses its id — so codex connection health needs a writer and a schema change
-  first. `GET /library/freshness` is the same answer through a plain route. The status check is deliberately **not** extended: a check whose conditions come and go
-  with the data cannot be read by an uptime checker. **Known gap**: `@library:freshness` resolves on the server but not
-  in the page, where `sheets()` looks a ref up in the library map or `repo.find`
+  other way. A codex sheet is **in**, and its "never run" is not that false alarm: a connection has no poller, so the
+  only moment anybody learns whether the far database still answers is when somebody opens the sheet, and a connection
+  nobody has opened is one nobody has verified. Three consequences, all intended: `net-hook:errors` appears in the
+  operator's own freshness, a net-hook's `last_ok` always equals its `last_run`, and a codex sheet's freshness is as old
+  as the last time somebody looked at it. `GET /library/freshness` is the same answer through a plain route. The status
+  check is deliberately **not** extended: a check whose conditions come and go with the data cannot be read by an uptime
+  checker. **Known gap**: `@library:freshness` resolves on the server but not in the page, where `sheets()` looks a ref
+  up in the library map or `repo.find`
 - **Reads and export**: `GET /sheet/:id` is the stable JSON read for every sheet type. `GET /export/:id.<format>` is the
   download path, one route over the `EXPORTS` table: `csv`, `json`, `ndjson`, `md`, `ics`. All go through `sheet()`, so
   they inherit `assertSheetAccess` (membership, purchase, and `public`), pagination, and query-sheet recursion. Export
@@ -612,36 +616,35 @@ t.trade_id order by p.day desc) = 1` —
   where `csv`/`md`/`ics` used to carry it positionally. That is the right way round — `toRecords()` has always collapsed
   such a pair, so a query over that sheet was already wrong, silently. Two guards keep that refusal from being a trap
   sprung far from its cause: the CSV importer refuses a duplicate header where the file is (see **CSV import**), and
-  `nameClash()` refuses a rename onto another column's name **in the editor** — the rename would otherwise sync
-  happily, leave the table on screen looking right, and 400 every export and every `select * from @this` from then on.
-  Renaming one of an already-colliding pair is not a clash but the repair, and renaming a column to what it is already
-  called is not one either. A document holding **rows under no columns** — every column deleted, the values left
-  behind — is refused too, rather than answered with one empty object per row: the write already refuses that shape
+  `nameClash()` refuses a rename onto another column's name **in the editor** — the rename would otherwise sync happily,
+  leave the table on screen looking right, and 400 every export and every `select * from @this` from then on. Renaming
+  one of an already-colliding pair is not a clash but the repair, and renaming a column to what it is already called is
+  not one either. A document holding **rows under no columns** — every column deleted, the values left behind — is
+  refused too, rather than answered with one empty object per row: the write already refuses that shape
   (`no columns to append under`), and a read that reports N rows of nothing as a healthy answer is the silent half of
-  the same bug. An empty sheet is still empty rather than an error, since there is nothing to lose.
-  `GET /openapi/:id`'s read response now `$ref`s the same `Row` the write takes, behind a `prefixItems` for `data[0]`,
-  which is the column row and is not a row. It is **all-or-nothing**: every row is checked before
-  the document is touched and the append is one `handle.change`, because automerge cannot roll a change back and a batch
-  half-written under a 201 is a silent failure. Only a `table` sheet has rows of its own, so a query, chart or net sheet
-  is refused by name rather than with a 500; write access is read through `syncRole` and not `assertSheetAccess`, so a
-  viewer holding a share link — or anyone at all on a public sheet — can read it and cannot append. A short or long row
-  names both counts, the field it stops at and the row as sent, exactly as `POST /import/csv` does, and a non-scalar
-  value is refused because a cell holds a scalar. A script carries a **per-sheet key** rather than a user's JWT:
-  `POST
-  /library/:id/secret` with `{"name":"api"}` and no value mints `sheet_id.<32 random bytes>`, sealed with the
-  same `encrypt` every other sheet secret uses, so rotation, `SECRET_KEEP` trimming, names-without-values and revocation
-  all come from the routes that already existed rather than from a second store. The value is **minted, never supplied**
-  — a key the owner chose is a key the owner reused elsewhere — and `api:*` is refused where it is typed, the same rule
-  as an unknown `hook:*`. The sheet id rides inside the key so verifying reads at most `SECRET_KEEP` rows of one sheet,
-  and the comparison is `crypto.subtle.verify`'s, so no key equality is written by hand; the four refusals name what
-  arrived without printing a key, a digest, or how close it was. **The scope is a path check in the auth middleware,
-  before routing**: a key opens `/sheet/<its id>` and `/openapi/<its id>` and nothing else, which is what stops a key
-  minting itself another key, and is why no handler has to remember to ask. The identity it borrows is the sheet's
-  creator, because the path is the bound, not the account. With no `scrapsheets-key` header the request takes
-  byte-identically the path it always did. `GET /openapi/:id` is that key's target: an OpenAPI 3.1 document derived from
-  the sheet's own columns at request time and **never stored**, read through `sheet()` so its access rule is the sheet's
-  own, describing this one sheet's read, its write — omitted for a computed sheet, whose POST would be a 400 — and the
-  header the key is presented in
+  the same bug. An empty sheet is still empty rather than an error, since there is nothing to lose. `GET /openapi/:id`'s
+  read response now `$ref`s the same `Row` the write takes, behind a `prefixItems` for `data[0]`, which is the column
+  row and is not a row. It is **all-or-nothing**: every row is checked before the document is touched and the append is
+  one `handle.change`, because automerge cannot roll a change back and a batch half-written under a 201 is a silent
+  failure. Only a `table` sheet has rows of its own, so a query, chart or net sheet is refused by name rather than with
+  a 500; write access is read through `syncRole` and not `assertSheetAccess`, so a viewer holding a share link — or
+  anyone at all on a public sheet — can read it and cannot append. A short or long row names both counts, the field it
+  stops at and the row as sent, exactly as `POST /import/csv` does, and a non-scalar value is refused because a cell
+  holds a scalar. A script carries a **per-sheet key** rather than a user's JWT: `POST
+  /library/:id/secret` with
+  `{"name":"api"}` and no value mints `sheet_id.<32 random bytes>`, sealed with the same `encrypt` every other sheet
+  secret uses, so rotation, `SECRET_KEEP` trimming, names-without-values and revocation all come from the routes that
+  already existed rather than from a second store. The value is **minted, never supplied** — a key the owner chose is a
+  key the owner reused elsewhere — and `api:*` is refused where it is typed, the same rule as an unknown `hook:*`. The
+  sheet id rides inside the key so verifying reads at most `SECRET_KEEP` rows of one sheet, and the comparison is
+  `crypto.subtle.verify`'s, so no key equality is written by hand; the four refusals name what arrived without printing
+  a key, a digest, or how close it was. **The scope is a path check in the auth middleware, before routing**: a key
+  opens `/sheet/<its id>` and `/openapi/<its id>` and nothing else, which is what stops a key minting itself another
+  key, and is why no handler has to remember to ask. The identity it borrows is the sheet's creator, because the path is
+  the bound, not the account. With no `scrapsheets-key` header the request takes byte-identically the path it always
+  did. `GET /openapi/:id` is that key's target: an OpenAPI 3.1 document derived from the sheet's own columns at request
+  time and **never stored**, read through `sheet()` so its access rule is the sheet's own, describing this one sheet's
+  read, its write — omitted for a computed sheet, whose POST would be a 400 — and the header the key is presented in
 - **CSV import**: `POST /import/csv` rejects a row whose field count does not match the header, naming the line, both
   counts, the raw text and the column it stops at. Type inference requires every non-blank value to parse: at the old
   80% threshold the other fifth became `NaN` silently. It also rejects a **header that names a column twice** — blanks
@@ -652,7 +655,12 @@ t.trade_id order by p.day desc) = 1` —
   either repeated and skipped rows. Both now carry a unique tiebreaker, as the `net` read already did
 - **Marketplace**: Buy/sell sheets with pricing system
 - **Real-time data**: WebSocket portals for live data (time, stock prices)
-- **Database codex**: Connect external PostgreSQL databases
+- **Database codex**: Connect external PostgreSQL databases. `GET /codex/:id` checks `assertSheetAccess` **before** it
+  starts the clock — a caller with no share is not a connection that failed, and logging their refusal would let anyone
+  holding a `doc_id` write failures into somebody else's freshness — and writes one `net` row per attempt afterwards
+  (`codexRun`), never in front of the answer, its own failure swallowed the way `trimNet`'s is. The failure message is
+  stored as raised: it names the host or the parse error, which is what the sheet's members need in order to fix it, and
+  neither the DSN nor its password reaches it
 
 ### Frontend Architecture (src/Main.elm)
 
@@ -753,12 +761,15 @@ t.trade_id order by p.day desc) = 1` —
 - **secret**: A sheet's own secrets, `value_encrypted` under `DSN_ENCRYPTION_KEY`. **No unique key on `(sheet_id, name)`
   on purpose**: the newest row for a name is current and the one before it is previous, which is what lets a sender roll
   over without a missed delivery
-- **net**: Webhook data storage for net-\* sheets, and the run log for `alert` sheets, which is why the sheet_id check
-  allows both prefixes. The read projects `created_at, body, method, req_headers, query_params` — the last three
-  appended, so existing column positions and `select body from @net-hook:x` still hold. The three jsonb columns are cast
-  `::text` in that projection, so those cells hold the raw JSON and `json_extract()` reads them; without the cast
-  postgresjs parses jsonb into an object, which no cell can hold. `meta` is what the run itself cost:
-  `{status, ms, bytes}` for a net-http poll, `{ms, interval}` for an alert run, `{bytes}` for a webhook delivery, and
+- **net**: Webhook data storage for net-\* sheets, and the run log for `alert` and `codex-*` sheets, which is why the
+  sheet_id check allows all three prefixes. A codex connection lives here rather than in a log of its own because a
+  connection's health is a run like any other, and this table already carries the retention (`trimNet`), the index, the
+  paging order and the read `library:freshness` grades — a second log would be a second noun with a second copy of all
+  four. The read projects `created_at, body, method, req_headers, query_params` — the last three appended, so existing
+  column positions and `select body from @net-hook:x` still hold. The three jsonb columns are cast `::text` in that
+  projection, so those cells hold the raw JSON and `json_extract()` reads them; without the cast postgresjs parses jsonb
+  into an object, which no cell can hold. `meta` is what the run itself cost: `{status, ms, bytes}` for a net-http poll,
+  `{ms, interval}` for an alert run, `{bytes}` for a webhook delivery, `{status, ms}` for a codex connection, and
   `{status, path, folded?}` on `net-hook:errors`. `net_id` identity PK, an index on `(sheet_id, created_at desc)`, and a
   unique index `net_hook_signature_idx` on `(sheet_id, (req_headers->>'scrapsheets-signature'))` — the expression is
   null on every row that is not a signed delivery, and nulls do not collide, so nothing else in the table is
