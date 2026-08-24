@@ -1,3 +1,12 @@
+// The whole server, in one file on purpose.
+//
+// It was measured against splitting at the `// ---` sections below. Every
+// candidate -- polling, status, the MCP endpoint -- needs `sql`, `app`, `sheet`
+// and `safeFetch`, all defined here, so each new file either imports back from
+// this one (a cycle) or takes them as arguments (which changes the signatures
+// main_test.ts calls). Both cost more than the size does. The section comments
+// are the navigation; keep them accurate and keep new code inside one of them.
+
 import { HTTPException } from "@hono/hono/http-exception";
 import { Context, Hono } from "@hono/hono";
 import { logger } from "@hono/hono/logger";
@@ -13,10 +22,10 @@ import type { AnyDocumentId } from "@automerge/automerge-repo";
 import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import ala from "alasql";
-import * as prql from "prql-js";
 import * as path from "@std/path";
 import examplesSql from "./examples.sql" with { type: "text" };
 import { DATASETS } from "./src/examples.mjs";
+import { PORTALS } from "./src/portals.mjs";
 import {
   applyWindows,
   chartSql,
@@ -35,9 +44,37 @@ import {
   register,
   scanRefs,
   selectTypes,
+  show,
   WINDOW_TYPES,
 } from "./src/sql.mjs";
 import Stripe from "stripe";
+
+// --- refusals
+//
+// Every refusal this server raises is one call, and every one carries the four
+// fields: what was expected, what arrived, where it came from, and what to do
+// about it. A message without them is visibly the odd one out here, which is
+// the point -- a vague error outranks the bug behind it.
+//
+// The few `throw new HTTPException` left are passthroughs: their message is an
+// explain() block src/sql.mjs already built, and re-wrapping it would replace a
+// message about the query with one about the request.
+
+type Status = ConstructorParameters<typeof HTTPException>[0];
+type Fields = Record<string, string | undefined>;
+
+// The type annotation is on the binding rather than the arrow, which is what
+// lets a call read as terminal: TypeScript narrows control flow past a
+// never-returning call only when the callee is declared that way, and without
+// it every `bad()` standing in for a `throw` would leave the code after it
+// re-checking values the refusal already ruled out.
+const bad: (status: Status, headline: string, fields: Fields) => never = (status, headline, fields) => {
+  throw new HTTPException(status, { message: explain(headline, fields) });
+};
+
+// What a caught thing has to say for itself. `throw "nope"` is legal and lands
+// here as the string, rather than as "undefined".
+const reason = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 // --- secrets & crypto
 
@@ -106,13 +143,11 @@ const decrypt = async (what: string, stored: string): Promise<string> => {
     );
     return new TextDecoder().decode(plain);
   } catch {
-    throw new HTTPException(500, {
-      message: explain(`Could not decrypt the ${what}.`, {
-        Received: "ciphertext this key does not open",
-        Expected: "a value encrypted under the current DSN_ENCRYPTION_KEY",
-        Source: "DSN_ENCRYPTION_KEY, which every stored secret and DSN is sealed with",
-        Fix: `restore the previous DSN_ENCRYPTION_KEY, or save the ${what} again under this one`,
-      }),
+    bad(500, `Could not decrypt the ${what}.`, {
+      Received: "ciphertext this key does not open",
+      Expected: "a value encrypted under the current DSN_ENCRYPTION_KEY",
+      Source: "DSN_ENCRYPTION_KEY, which every stored secret and DSN is sealed with",
+      Fix: `restore the previous DSN_ENCRYPTION_KEY, or save the ${what} again under this one`,
     });
   }
 };
@@ -269,18 +304,11 @@ ala.from.SHEET = (
   const rows = loaded[id as string];
   if (!rows) {
     const hit = nearest(String(id), Object.keys(loaded));
-    throw new HTTPException(400, {
-      message: [
-        `I could not load the sheet "@${id}".`,
-        ``,
-        hit
-          ? `  Did you mean: @${hit}`
-          : `  Loaded:       ${Object.keys(loaded).join(", ") || "(no @sheet is referenced)"}`,
-        `  Source:       the @sheet refs in this query`,
-        `  Fix:          ${
-          hit ? `write @${hit} instead` : "reference the sheet as @type:doc_id so it loads before the query runs"
-        }`,
-      ].join("\n"),
+    bad(400, `I could not load the sheet "@${id}".`, {
+      "Did you mean": hit ? `@${hit}` : undefined,
+      Loaded: hit ? undefined : Object.keys(loaded).join(", ") || "(no @sheet is referenced)",
+      Source: "the @sheet refs in this query",
+      Fix: hit ? `write @${hit} instead` : "reference the sheet as @type:doc_id so it loads before the query runs",
     });
   }
   return typeof cb === "function" ? cb(rows, idx, query) : rows;
@@ -322,7 +350,7 @@ export type Template =
   | Tag<"net-http", [NetHttp]>
   | Tag<"net-socket", [NetSocket]>
   | Tag<`codex-${string}`, []>;
-export type Query = { lang: "sql" | "prql"; code: string; args: Args };
+export type Query = { lang: "sql"; code: string; args: Args };
 // `cursor` names the query parameter this feed takes a since-value in. The
 // watermark itself is not here: it is the poller's, not the user's.
 export type NetHttp = { url: string; interval: number; headers?: string; cursor?: string };
@@ -384,15 +412,13 @@ const assertSheetAccess = async (c: Context, sheet_id: string): Promise<void> =>
     // Deliberately no owner emails: any signed-in user can name any sheet_id, so
     // the message says how access is granted without saying who holds it.
     const [exists] = await sql`select type from sheet where sheet_id = ${sheet_id}`;
-    throw new HTTPException(403, {
-      message: explain(`You do not have read access to ${sheet_id}.`, {
-        Received: exists ? `no membership, no purchase, and the sheet is not public` : `no sheet with that id exists`,
-        Expected: "a share on the sheet, a purchase of its listing, or sheet.public",
-        Source: "sheet_usr, the payment-derived buy_id/sell_id link, and sheet.public",
-        Fix: exists
-          ? `ask an owner to run POST /library/${sheet_id}/share with your email, or POST /library/${sheet_id}/public`
-          : "check the id: it is type:doc_id, e.g. table:abc123",
-      }),
+    bad(403, `You do not have read access to ${sheet_id}.`, {
+      Received: exists ? `no membership, no purchase, and the sheet is not public` : `no sheet with that id exists`,
+      Expected: "a share on the sheet, a purchase of its listing, or sheet.public",
+      Source: "sheet_usr, the payment-derived buy_id/sell_id link, and sheet.public",
+      Fix: exists
+        ? `ask an owner to run POST /library/${sheet_id}/share with your email, or POST /library/${sheet_id}/public`
+        : "check the id: it is type:doc_id, e.g. table:abc123",
     });
   }
 };
@@ -409,13 +435,11 @@ const assertSheetOwner = async (c: Context, sheet_id: string): Promise<void> => 
   `;
   if (!owner) {
     const [mine] = await sql`select role from sheet_usr where sheet_id = ${sheet_id} and usr_id = ${c.get("usr_id")}`;
-    throw new HTTPException(403, {
-      message: explain(`Only an owner can change ${sheet_id}.`, {
-        Received: mine ? `your role on this sheet is ${mine.role}` : "you have no role on this sheet",
-        Expected: "role owner, or having created the sheet",
-        Source: "sheet_usr.role and sheet.created_by",
-        Fix: `ask an owner to run POST /library/${sheet_id}/share with your email and role owner`,
-      }),
+    bad(403, `Only an owner can change ${sheet_id}.`, {
+      Received: mine ? `your role on this sheet is ${mine.role}` : "you have no role on this sheet",
+      Expected: "role owner, or having created the sheet",
+      Source: "sheet_usr.role and sheet.created_by",
+      Fix: `ask an owner to run POST /library/${sheet_id}/share with your email and role owner`,
     });
   }
 };
@@ -476,9 +500,12 @@ const sheet = async (
     .find<{ data: Sheet["data"] }>(doc_id as AnyDocumentId)
     .catch(() => ({
       doc: () => {
-        throw new HTTPException(404, {
-          message:
-            `Expected an automerge document for sheet ${sheet_id}, received none. Source: doc_id ${doc_id}. The sheet row exists but its document is missing or unreadable; re-create the sheet, or claim it again with PUT /library/${sheet_id}.`,
+        bad(404, `Sheet ${sheet_id} has a row but no document.`, {
+          Expected: "an automerge document",
+          Received: "none",
+          Source: `doc_id ${doc_id}`,
+          Fix:
+            `the document is missing or unreadable; re-create the sheet, or claim it again with PUT /library/${sheet_id}`,
         });
       },
     }));
@@ -493,13 +520,11 @@ const sheet = async (
       // document with no column row at all is handed back as it is, because the
       // callers that refuse that by name read data[0] to decide.
       if (!cols.length && rows.length) {
-        throw new HTTPException(400, {
-          message: explain(`Sheet ${sheet_id} holds rows under no columns.`, {
-            Received: `${rows.length} rows and a column row naming nothing`,
-            Expected: "one column per value in a row",
-            Source: "data[0] of the automerge document",
-            Fix: "undo the column deletion in the sheet, which is where the values are still reachable",
-          }),
+        bad(400, `Sheet ${sheet_id} holds rows under no columns.`, {
+          Received: `${rows.length} rows and a column row naming nothing`,
+          Expected: "one column per value in a row",
+          Source: "data[0] of the automerge document",
+          Fix: "undo the column deletion in the sheet, which is where the values are still reachable",
         });
       }
       if (!colsRow) return { data: hand.doc().data as Table, count: 0, offset: 0 };
@@ -511,8 +536,8 @@ const sheet = async (
       // stays inside the document, which is what the page syncs and edits.
       //
       // Restamped onto the column row as well, so every consumer that reads a
-      // cell as row[col.key] -- toRecords, all five exports, /stats/:id --
-      // keeps working off the answer rather than off a second convention.
+      // cell as row[col.key] -- toRecords, all five exports -- keeps working
+      // off the answer rather than off a second convention.
       return {
         data: [arrayify(cols.map((col) => ({ ...col, key: col.name }))), ...named(sheet_id, cols, rows)],
         count: rows.length,
@@ -560,7 +585,7 @@ const sheet = async (
       try {
         code = chartSql(hand.doc().data[0] as unknown as Chart);
       } catch (err) {
-        throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
+        throw new HTTPException(400, { message: reason(err) });
       }
       return await executeSql(c, code, path_);
     }
@@ -571,21 +596,25 @@ const sheet = async (
         ...qs,
       }, path_);
     case "template":
-      throw new HTTPException(400, {
-        message:
-          `Expected a readable sheet, received the template ${sheet_id}. A template is a listing, not a sheet with rows. Buy it with POST /buy/:sell_id and read the copy you get back.`,
+      bad(400, `A template is a listing, not a sheet with rows.`, {
+        Expected: "a readable sheet",
+        Received: `the template ${sheet_id}`,
+        Source: "the type prefix on this sheet id",
+        Fix: "buy it with POST /buy/:sell_id and read the copy you get back",
       });
     case "portal":
-      throw new HTTPException(400, {
-        message:
-          `Expected a readable sheet, received the portal ${sheet_id}. A portal has no stored rows. Read it live over GET /portal/${doc_id}/sync, or through GET /portal/:id if you bought it.`,
+      bad(400, `A portal has no stored rows.`, {
+        Expected: "a readable sheet",
+        Received: `the portal ${sheet_id}`,
+        Source: "the type prefix on this sheet id",
+        Fix: `read it live over GET /portal/${doc_id}/sync, or through GET /portal/:id if you bought it`,
       });
     default:
-      throw new HTTPException(400, {
-        message:
-          `Expected sheet type table, net-hook, net-http, net-socket, alert, chart, dashboard, or query, received ${
-            JSON.stringify(type)
-          } from sheet id ${sheet_id}. Fix the type prefix on the id.`,
+      bad(400, `That is not a sheet type this server can read.`, {
+        Expected: "table, net-hook, net-http, net-socket, alert, chart, dashboard, or query",
+        Received: show(type),
+        Source: `the type prefix on sheet id ${sheet_id}`,
+        Fix: "fix the type prefix on the id",
       });
   }
 };
@@ -609,7 +638,7 @@ const executeSql = async (
   // it would turn "you cannot see this" into "your SQL is wrong".
   const asBadRequest = (err: unknown): never => {
     if (err instanceof HTTPException) throw err;
-    throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
+    throw new HTTPException(400, { message: reason(err) });
   };
 
   // Source column types by name, and then what each select item makes of them.
@@ -631,14 +660,10 @@ const executeSql = async (
         `;
         const hit = nearest(sheet_id, mine.map((r) => r.sheet_id));
         if (!hit) throw err;
-        throw new HTTPException(400, {
-          message: [
-            `I could not load the sheet "@${sheet_id}".`,
-            ``,
-            `  Did you mean: @${hit}`,
-            `  Source:       the @sheet refs in this query`,
-            `  Fix:          write @${hit} instead`,
-          ].join("\n"),
+        bad(400, `I could not load the sheet "@${sheet_id}".`, {
+          "Did you mean": `@${hit}`,
+          Source: "the @sheet refs in this query",
+          Fix: `write @${hit} instead`,
         });
       }),
     // The row budget, spent as each sheet lands rather than after all of them:
@@ -779,23 +804,15 @@ const querify = async (
   _reqQuery: Record<string, string>,
   path_: string[] = [],
 ): Promise<Page> => {
-  if (lang === "sql")
-    return await executeSql(c, code, path_);
-  else if (lang === "prql") {
-    // Compile PRQL to SQL, then execute
-    try {
-      const sqlResult = prql.compile(code);
-      if (!sqlResult)
-        throw new HTTPException(400, { message: "PRQL compilation returned empty result" });
-      return await executeSql(c, sqlResult, path_);
-    } catch (err) {
-      if (err instanceof HTTPException) throw err;
-      const message = err instanceof Error ? err.message : "PRQL compilation failed";
-      throw new HTTPException(400, { message: `PRQL error: ${message}` });
-    }
-  } else {
-    throw new HTTPException(400, { message: `Unsupported query language: ${lang}` });
+  if (lang !== "sql") {
+    bad(400, `A query sheet is SQL.`, {
+      Expected: `"sql"`,
+      Received: show(lang ?? null),
+      Source: `the "lang" field of this query sheet`,
+      Fix: `set lang to "sql"; it is the only language this engine runs`,
+    });
   }
+  return await executeSql(c, code, path_);
 };
 
 export const createJwt = async (usr_id: string) =>
@@ -942,8 +959,14 @@ export const callerIp = (c: Context): string =>
   "127.0.0.1";
 
 app.use("*", async (c, next) => {
-  if (!rateLimit(callerIp(c)))
-    throw new HTTPException(429, { message: "Too many requests. Please slow down." });
+  if (!rateLimit(callerIp(c))) {
+    bad(429, `Too many requests from this address.`, {
+      Expected: `a burst of at most ${RATE_LIMIT_MAX_TOKENS}, refilling at ${RATE_LIMIT_REFILL_RATE} per second`,
+      Received: "one request past that",
+      Source: "the address this request arrived from",
+      Fix: "wait a second and send it again",
+    });
+  }
 
   await next();
 });
@@ -1000,7 +1023,7 @@ let seeded: Promise<unknown> | undefined;
 app.use("*", async (_c, next) => {
   await (seeded ??= seed().catch((err) => {
     seeded = undefined;
-    throw new Error(`seed() failed applying examples.sql/DATASETS: ${err instanceof Error ? err.message : err}`);
+    throw new Error(`seed() failed applying examples.sql/DATASETS: ${reason(err)}`);
   }));
   await next();
 });
@@ -1256,25 +1279,21 @@ const verifyWsAuth = async (auth: string | undefined, pass?: string): Promise<Ws
   // same oracle rule the webhook signature refusals follow applies here.
   if (share && lock) {
     if (!pass) {
-      throw new HTTPException(401, {
-        message: explain(`This link to ${share} is locked.`, {
-          Received: "a link with no password beside it",
-          Expected: "the password the link was minted with",
-          Source: "the lock claim on the share token",
-          Fix: "add &pass=<password> to the link, or ask whoever sent it for the password",
-        }),
+      bad(401, `This link to ${share} is locked.`, {
+        Received: "a link with no password beside it",
+        Expected: "the password the link was minted with",
+        Source: "the lock claim on the share token",
+        Fix: "add &pass=<password> to the link, or ask whoever sent it for the password",
       });
     }
     // crypto.subtle.verify does the comparison, so no digest equality is
     // written by hand here either.
     if (!await hookVerify(TOKEN_SECRET, linkMessage(share, pass), lock)) {
-      throw new HTTPException(401, {
-        message: explain(`That password does not open this link to ${share}.`, {
-          Received: `a password of ${pass.length} characters`,
-          Expected: "the password the link was minted with",
-          Source: "the lock claim on the share token, recomputed under the server's own key",
-          Fix: "check the password for a typo, or ask the owner to mint a new link",
-        }),
+      bad(401, `That password does not open this link to ${share}.`, {
+        Received: `a password of ${pass.length} characters`,
+        Expected: "the password the link was minted with",
+        Source: "the lock claim on the share token, recomputed under the server's own key",
+        Fix: "check the password for a typo, or ask the owner to mint a new link",
       });
     }
   }
@@ -1309,261 +1328,22 @@ const portal = (name: string, ms: number, init: () => any, tick: (s: any) => { c
     }),
   );
 
-portal("time", 10, () => null, () => ({
-  cols: [{ key: 0, name: "time", type: "int" }],
-  rows: [{ 0: new Date().getTime() }],
-}));
-
-portal("stonks", 100, () => ({
-  AAPL: 645.32,
-  MSFT: 412.78,
-  GOOGL: 823.45,
-  AMZN: 567.91,
-  NVDA: 789.23,
-  META: 345.67,
-  TSLA: 892.14,
-  BRKB: 234.56,
-  JPM: 478.9,
-  V: 656.23,
-  JNJ: 321.45,
-  WMT: 754.89,
-  PG: 423.67,
-  UNH: 587.12,
-  HD: 698.34,
-  DIS: 276.45,
-  MA: 812.56,
-  PYPL: 389.78,
-  BAC: 523.91,
-  NFLX: 734.23,
-  ADBE: 456.78,
-  CRM: 621.34,
-  PFE: 298.56,
-  ABT: 865.23,
-  CSCO: 342.67,
-  CVX: 778.9,
-  PEP: 512.34,
-}), (stonks) => {
-  for (const i in stonks) stonks[i] += 0.5 - Math.random();
-  return {
-    cols: [{ key: 1, name: "price", type: "usd" }, { key: 0, name: "ticker", type: "text" }],
-    rows: Object.entries(stonks) as unknown as Row[],
-  };
-});
-
-portal("dice", 500, () => {
-  const dice: Record<string, number> = { d4: 4, d6: 6, d8: 8, d10: 10, d12: 12, d20: 20, d100: 100, coin: 2 };
-  const state: Record<string, { roll: number; total: number; rolls: number }> = {};
-  for (const d in dice) state[d] = { roll: 0, total: 0, rolls: 0 };
-  return { dice, state };
-}, ({ dice, state }) => {
-  for (const d in dice) {
-    state[d].roll = Math.ceil(Math.random() * dice[d]);
-    state[d].total += state[d].roll;
-    state[d].rolls++;
-  }
-  return {
-    cols: [
-      { key: 0, name: "die", type: "text" },
-      { key: 1, name: "roll", type: "int" },
-      { key: 2, name: "total", type: "int" },
-      { key: 3, name: "rolls", type: "int" },
-      { key: 4, name: "average", type: "percentage" },
-    ],
-    rows: (Object.entries(state) as [string, { roll: number; total: number; rolls: number }][])
-      .sort((a, b) => b[1].roll - a[1].roll)
-      .map(([name, s]) => ({ 0: name, 1: s.roll, 2: s.total, 3: s.rolls, 4: s.total / s.rolls / dice[name] })),
-  };
-});
-
-portal("orbit", 100, () => ({
-  planets: [
-    ["Mercury", 40, 4],
-    ["Venus", 55, 7],
-    ["Earth", 75, 12],
-    ["Mars", 95, 20],
-    ["Jupiter", 130, 50],
-    ["Saturn", 170, 80],
-    ["Uranus", 210, 140],
-    ["Neptune", 260, 250],
-  ] as [string, number, number][],
-  seasons: ["spring", "summer", "autumn", "winter"],
-}), ({ planets, seasons }) => {
-  const now = Date.now();
-  return {
-    cols: [
-      { key: 0, name: "planet", type: "text" },
-      { key: 1, name: "distance", type: "int" },
-      { key: 2, name: "x", type: "int" },
-      { key: 3, name: "y", type: "int" },
-      { key: 4, name: "year", type: "percentage" },
-      { key: 5, name: "season", type: "text" },
-    ],
-    rows: planets.map(([name, dist, period]: [string, number, number]) => {
-      const angle = (now / (period * 1000)) * 2 * Math.PI;
-      const pct = (angle % (2 * Math.PI)) / (2 * Math.PI);
-      return {
-        0: name,
-        1: dist,
-        2: Math.round(dist * Math.cos(angle)),
-        3: Math.round(dist * Math.sin(angle)),
-        4: pct,
-        5: seasons[Math.floor(pct * 4) % 4],
-      };
-    }),
-  };
-});
-
-portal("cafe", 500, () => ({
-  names: ["Ada", "Grace", "Alan", "Linus", "Matz", "Guido", "Bjarne", "Haskell", "Elm", "Rust"],
-  drinks: [
-    ["espresso", 3.5],
-    ["latte", 5.0],
-    ["cappuccino", 4.5],
-    ["cortado", 4.0],
-    ["cold brew", 4.5],
-    ["matcha", 5.5],
-    ["chai", 4.0],
-    ["americano", 3.0],
-  ] as [string, number][],
-  orders: [] as { customer: string; drink: string; price: number; wait: number; status: string; _t: number }[],
-  tick: 0,
-}), (s) => {
-  s.tick++;
-  for (const o of s.orders) o.wait = s.tick - o._t;
-  if (Math.random() < 0.3) {
-    const b = s.orders.find((o: { status: string }) => o.status === "ordered");
-    if (b) b.status = "brewing";
-  }
-  if (Math.random() < 0.3) {
-    const r = s.orders.find((o: { status: string }) => o.status === "brewing");
-    if (r) r.status = "ready";
-  }
-  for (let i = s.orders.length - 1; i >= 0; i--)
-    if (s.orders[i].status === "ready" && s.orders[i].wait > 6) s.orders.splice(i, 1);
-  if (Math.random() < 0.4 && s.orders.length < 8) {
-    const [drink, price] = s.drinks[Math.floor(Math.random() * s.drinks.length)];
-    s.orders.push({
-      customer: s.names[Math.floor(Math.random() * s.names.length)],
-      drink,
-      price,
-      wait: 0,
-      status: "ordered",
-      _t: s.tick,
-    });
-  }
-  const rank: Record<string, number> = { ordered: 0, brewing: 1, ready: 2 };
-  const sorted = [...s.orders].sort((a, b) => (rank[a.status] ?? 3) - (rank[b.status] ?? 3));
-  return {
-    cols: [
-      { key: 0, name: "customer", type: "text" },
-      { key: 1, name: "drink", type: "text" },
-      { key: 2, name: "price", type: "usd" },
-      { key: 3, name: "wait", type: "int" },
-      { key: 4, name: "status", type: "text" },
-    ],
-    rows: sorted.map((o) => ({ 0: o.customer, 1: o.drink, 2: o.price, 3: o.wait, 4: o.status })),
-  };
-});
-
-portal(
-  "forest",
-  1000,
-  () =>
-    ["oak", "pine", "maple", "birch", "willow", "cedar", "elm", "ash", "cherry", "palm", "bamboo", "cactus"]
-      .map((name) => ({ name, age: Math.floor(Math.random() * 100), health: 0.5 + Math.random() * 0.5 })),
-  (trees) => {
-    for (const t of trees) {
-      t.age++;
-      t.health = Math.max(0.05, Math.min(1.0, t.health + (Math.random() - 0.45) * 0.1));
-      if (Math.random() < 0.01) {
-        t.age = 0;
-        t.health = 0.3;
-      }
-    }
-    return {
-      cols: [
-        { key: 0, name: "tree", type: "text" },
-        { key: 1, name: "age", type: "int" },
-        { key: 2, name: "height", type: "text" },
-        { key: 3, name: "health", type: "percentage" },
-        { key: 4, name: "status", type: "text" },
-      ],
-      rows: trees.map((t: { name: string; age: number; health: number }) => ({
-        0: t.name,
-        1: t.age,
-        2: ".".repeat(Math.min(20, Math.floor(t.age / 10))),
-        3: t.health,
-        4: t.age < 10 ? "seed" : t.age < 50 ? "sapling" : t.age < 200 ? "mature" : "ancient",
-      })),
-    };
-  },
-);
-
-portal("words", 200, () => {
-  const targets = ["cat", "dog", "hi", "elm", "yes", "no", "go", "ok"];
-  return {
-    targets,
-    target: targets[Math.floor(Math.random() * targets.length)],
-    targetAge: 0,
-    monkeys: ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank"].map((name) => ({
-      name,
-      attempt: "",
-      match: 0,
-      attempts: 0,
-      best: 0,
-    })),
-  };
-}, (s) => {
-  s.targetAge++;
-  if (s.targetAge > 150) {
-    s.target = s.targets[Math.floor(Math.random() * s.targets.length)];
-    s.targetAge = 0;
-  }
-  let solved = false;
-  for (const m of s.monkeys) {
-    m.attempt = Array.from({ length: s.target.length }, () => String.fromCharCode(97 + Math.floor(Math.random() * 26)))
-      .join("");
-    let hits = 0;
-    for (let i = 0; i < s.target.length; i++) if (m.attempt[i] === s.target[i]) hits++;
-    m.match = hits / s.target.length;
-    m.attempts++;
-    if (m.match > m.best) m.best = m.match;
-    if (m.match === 1) solved = true;
-  }
-  if (solved) {
-    s.target = s.targets[Math.floor(Math.random() * s.targets.length)];
-    s.targetAge = 0;
-    for (const m of s.monkeys) m.best = 0;
-  }
-  return {
-    cols: [
-      { key: 0, name: "monkey", type: "text" },
-      { key: 1, name: "target", type: "text" },
-      { key: 2, name: "attempt", type: "text" },
-      { key: 3, name: "match", type: "percentage" },
-      { key: 4, name: "attempts", type: "int" },
-      { key: 5, name: "best", type: "percentage" },
-    ],
-    rows: s.monkeys.map((m: { name: string; attempt: string; match: number; attempts: number; best: number }) => ({
-      0: m.name,
-      1: s.target,
-      2: m.attempt,
-      3: m.match,
-      4: m.attempts,
-      5: m.best,
-    })),
-  };
-});
+// The feeds themselves are synthetic demo data with no server logic in them,
+// so they live in src/portals.mjs beside the rest of the bundled make-believe.
+// This loop and the wrapper above are the server's half: one socket per feed,
+// and the auth check.
+for (const feed of PORTALS) portal(feed.name, feed.ms, feed.init, feed.tick);
 
 // --- public routes
 
 app.use("*", cors());
 
 app.notFound((c) => {
-  throw new HTTPException(404, {
-    message: `Expected a known route, received ${c.req.method} ${
-      new URL(c.req.url).pathname
-    }. Check the path and the method.`,
+  bad(404, `No route answers that.`, {
+    Expected: "a known path and method",
+    Received: `${c.req.method} ${new URL(c.req.url).pathname}`,
+    Source: "this request line",
+    Fix: "check the path and the method",
   });
 });
 
@@ -1843,7 +1623,7 @@ const grade = (condition: string, n: number): number => {
   const value = Math.floor(Number(n) * 100) / 100;
   if (!Number.isFinite(value)) {
     throw new Error(explain(`The status condition "${condition}" did not grade to a number.`, {
-      Received: JSON.stringify(n) ?? String(n),
+      Received: show(n),
       Expected: "a finite grade, where 1.0 is the minimum pass",
       Source: "status()",
       Fix: "check the SQL alias this condition reads; a renamed column grades as undefined",
@@ -2004,13 +1784,11 @@ app.get("/status", async (c) => {
   const grades = await status();
   const missing = REPORTED_ONLY.filter((condition) => !(condition in grades));
   if (missing.length) {
-    throw new HTTPException(500, {
-      message: explain(`A condition excused from paging is not one this check grades.`, {
-        Received: missing.join("; "),
-        Expected: "a sentence that status() actually returns",
-        Source: "REPORTED_ONLY",
-        Fix: "match the sentence exactly, or it silently starts paging again",
-      }),
+    bad(500, `A condition excused from paging is not one this check grades.`, {
+      Received: missing.join("; "),
+      Expected: "a sentence that status() actually returns",
+      Source: "REPORTED_ONLY",
+      Fix: "match the sentence exactly, or it silently starts paging again",
     });
   }
   const failing = Object.entries(grades)
@@ -2056,10 +1834,11 @@ const stripeCall = async <T>(what: string, run: () => Promise<T>): Promise<T> =>
     return await run();
   } catch (err) {
     if (err instanceof HTTPException) throw err;
-    throw new HTTPException(502, {
-      message: `Expected Stripe to ${what}, received ${
-        err instanceof Error ? err.message : err
-      }. Check STRIPE_SECRET_KEY and that api.stripe.com is reachable.`,
+    bad(502, `Stripe did not answer.`, {
+      Expected: `Stripe to ${what}`,
+      Received: reason(err),
+      Source: "api.stripe.com",
+      Fix: "check STRIPE_SECRET_KEY and that api.stripe.com is reachable",
     });
   }
 };
@@ -2085,8 +1864,11 @@ const fulfillPurchase = async (
   const live = stripe_session_id ? sql`` : sql`and sell_price >= 0`;
   const [sheet] = await tx`select * from sheet where sell_id = ${sell_id} ${live}`;
   if (!sheet) {
-    throw new HTTPException(404, {
-      message: `Expected a shop listing with sell_id ${sell_id}, received none. The listing may have been taken down.`,
+    bad(404, `No shop listing with that sell_id.`, {
+      Expected: `a live listing with sell_id ${sell_id}`,
+      Received: "no row",
+      Source: "the sheet table, where a listing is a row with a sell_id",
+      Fix: "the listing may have been taken down; re-read GET /shop",
     });
   }
   if (stripe_session_id) {
@@ -2101,8 +1883,11 @@ const fulfillPurchase = async (
     if (pay?.sheet_id) return pay.sheet_id;
   }
   if (!sheet.sell_type) {
-    throw new HTTPException(400, {
-      message: `Expected sell_type on listing ${sell_id}, received null. Only templates and live sheets can be sold.`,
+    bad(400, `That listing does not say what it sells.`, {
+      Expected: `a sell_type on listing ${sell_id}`,
+      Received: "null",
+      Source: "the sheet row behind this listing",
+      Fix: "only templates and live sheets can be sold; the seller must re-list it",
     });
   }
   const row_0 = sheet.type === "template" ? sheet.row_0.data : [];
@@ -2121,9 +1906,11 @@ const fulfillPurchase = async (
     select sheet_id from buy
   `;
   if (!bought?.sheet_id) {
-    throw new HTTPException(403, {
-      message:
-        `Expected listing ${sell_id} to be purchasable by usr ${usr_id}, received no row. Source: the insert selects from sheet where sell_id matches and the listing is live. The listing was taken down, or you already own it, or you are its seller.`,
+    bad(403, `That listing is not yours to buy.`, {
+      Expected: `listing ${sell_id} to be purchasable by usr ${usr_id}`,
+      Received: "no row",
+      Source: "the insert selects from sheet where sell_id matches and the listing is live",
+      Fix: "the listing was taken down, or you already own it, or you are its seller",
     });
   }
   const { sheet_id } = bought;
@@ -2144,16 +1931,20 @@ const fulfillPurchase = async (
 app.post("/stripe", async (c) => {
   const secret = Deno.env.get("STRIPE_WEBHOOK_SECRET");
   if (!secret) {
-    throw new HTTPException(500, {
-      message:
-        "Expected STRIPE_WEBHOOK_SECRET (a Stripe webhook signing secret starting with whsec_), received nothing. Set STRIPE_WEBHOOK_SECRET in the environment.",
+    bad(500, `This server cannot verify a Stripe webhook.`, {
+      Expected: "STRIPE_WEBHOOK_SECRET, a Stripe webhook signing secret starting with whsec_",
+      Received: "nothing",
+      Source: "the process environment",
+      Fix: "set STRIPE_WEBHOOK_SECRET in the environment and restart",
     });
   }
   const sig = c.req.header("stripe-signature");
   if (!sig) {
-    throw new HTTPException(400, {
-      message:
-        "Expected stripe-signature header, received none. Stripe signs every webhook; configure the endpoint and STRIPE_WEBHOOK_SECRET.",
+    bad(400, `This delivery is not signed.`, {
+      Expected: "a stripe-signature header",
+      Received: "none",
+      Source: "the request headers",
+      Fix: "Stripe signs every webhook; configure the endpoint and STRIPE_WEBHOOK_SECRET",
     });
   }
   const raw = await c.req.text();
@@ -2161,46 +1952,50 @@ app.post("/stripe", async (c) => {
   try {
     event = await Stripe.webhooks.constructEventAsync(raw, sig, secret);
   } catch (err) {
-    throw new HTTPException(400, {
-      message:
-        `Expected a stripe-signature header matching STRIPE_WEBHOOK_SECRET, received a payload that failed verification: ${
-          err instanceof Error ? err.message : err
-        }. Check STRIPE_WEBHOOK_SECRET and that the raw body is not parsed before verification.`,
+    bad(400, `That stripe-signature does not verify.`, {
+      Expected: "a stripe-signature matching STRIPE_WEBHOOK_SECRET",
+      Received: reason(err),
+      Source: "the raw request body, as sent",
+      Fix: "check STRIPE_WEBHOOK_SECRET and that the raw body is not parsed before verification",
     });
   }
   if (event.type !== "checkout.session.completed") return c.json(null, 200);
   const session = event.data.object;
   if (session.payment_status !== "paid") return c.json(null, 200);
   if (typeof session.id !== "string" || !session.id) {
-    throw new HTTPException(400, {
-      message: `Expected checkout.session id, received ${
-        JSON.stringify(session.id)
-      }. Create the session through POST /buy/:id.`,
+    bad(400, `That event carries no Checkout Session id.`, {
+      Expected: "a checkout.session id",
+      Received: show(session.id),
+      Source: "the Stripe event body",
+      Fix: "create the session through POST /buy/:id",
     });
   }
   const usr_id = session.metadata?.usr_id;
   const sell_id = session.metadata?.sell_id;
   if (!usr_id || !sell_id) {
-    throw new HTTPException(400, {
-      message: `Expected checkout.session metadata.usr_id and metadata.sell_id, received ${
-        JSON.stringify(session.metadata)
-      }. Create the session through POST /buy/:id.`,
+    bad(400, `That Checkout Session says nothing about what was bought.`, {
+      Expected: "metadata.usr_id and metadata.sell_id",
+      Received: show(session.metadata),
+      Source: "the Checkout Session's metadata",
+      Fix: "create the session through POST /buy/:id",
     });
   }
   const [buyer] = await sql`select usr_id from usr where usr_id::text = ${usr_id}`;
   if (!buyer) {
-    throw new HTTPException(400, {
-      message: `Expected checkout.session metadata.usr_id to be a usr, received ${
-        JSON.stringify(usr_id)
-      }. Create the session through POST /buy/:id.`,
+    bad(400, `That Checkout Session names no buyer this server knows.`, {
+      Expected: "metadata.usr_id to be a usr",
+      Received: show(usr_id),
+      Source: "the usr table",
+      Fix: "create the session through POST /buy/:id",
     });
   }
   const amount_total = session.amount_total;
   if (typeof amount_total !== "number" || !Number.isInteger(amount_total) || amount_total < 1) {
-    throw new HTTPException(400, {
-      message: `Expected checkout.session amount_total in cents, received ${
-        JSON.stringify(amount_total)
-      }. The session must be a paid Checkout Session.`,
+    bad(400, `That Checkout Session names no amount.`, {
+      Expected: "amount_total, a whole number of cents above zero",
+      Received: show(amount_total),
+      Source: "the Checkout Session",
+      Fix: "the session must be a paid Checkout Session",
     });
   }
   const payment_intent = session.payment_intent;
@@ -2311,24 +2106,20 @@ const hookKeys = async (sheet_id: string): Promise<{ name: string; keys: HookKey
     // POST /library/:id/secret refuses the second one, so reaching here means
     // the table was written around the route. Guessing which scheme was meant
     // is the one thing this must not do.
-    throw new HTTPException(500, {
-      message: explain(`Sheet ${sheet_id} is configured for more than one signing scheme.`, {
-        Received: `secrets named ${names.sort().join(", ")}`,
-        Expected: "at most one of " + Object.keys(HOOK_HEADERS).join(", "),
-        Source: "the secret table",
-        Fix: `delete the ones that do not apply with DELETE /library/${sheet_id}/secret`,
-      }),
+    bad(500, `Sheet ${sheet_id} is configured for more than one signing scheme.`, {
+      Received: `secrets named ${names.sort().join(", ")}`,
+      Expected: "at most one of " + Object.keys(HOOK_HEADERS).join(", "),
+      Source: "the secret table",
+      Fix: `delete the ones that do not apply with DELETE /library/${sheet_id}/secret`,
     });
   }
   const name = names[0] ?? "hook";
   if (!HOOK_HEADERS[name]) {
-    throw new HTTPException(500, {
-      message: explain(`Sheet ${sheet_id} names a signing scheme this server does not know.`, {
-        Received: `a secret named ${JSON.stringify(name)}`,
-        Expected: Object.keys(HOOK_HEADERS).join(", "),
-        Source: "the secret table",
-        Fix: `delete it with DELETE /library/${sheet_id}/secret`,
-      }),
+    bad(500, `Sheet ${sheet_id} names a signing scheme this server does not know.`, {
+      Received: `a secret named ${JSON.stringify(name)}`,
+      Expected: Object.keys(HOOK_HEADERS).join(", "),
+      Source: "the secret table",
+      Fix: `delete it with DELETE /library/${sheet_id}/secret`,
     });
   }
   const keys: HookKey[] = [];
@@ -2342,14 +2133,11 @@ const hookKeys = async (sheet_id: string): Promise<{ name: string; keys: HookKey
   return { name, keys };
 };
 
-// None of these prints the secret or the expected digest: a rejection that does
-// is a signing oracle. Each names its own check, because "401" tells a sender
-// nothing about which half of the handshake it got wrong. The type annotation
-// is on the binding rather than the arrow, which is what lets a call to it read
-// as terminal and spare every caller a trailing throw.
-const unsigned: (message: string, fields: Record<string, string>) => never = (message, fields) => {
-  throw new HTTPException(401, { message: explain(message, fields) });
-};
+// bad(401) under a name that says which refusal it is. None of these prints the
+// secret or the expected digest: a rejection that does is a signing oracle. Each
+// names its own check, because "401" tells a sender nothing about which half of
+// the handshake it got wrong.
+const unsigned: (message: string, fields: Fields) => never = (message, fields) => bad(401, message, fields);
 
 const skewed = (sheet_id: string, sent: number): void => {
   const nowSec = Math.floor(Date.now() / 1000);
@@ -2410,7 +2198,7 @@ const verifyDelivery = async (
     const parts = signature.match(/^t=(\d{1,10}),(v1|v2)=([0-9a-f]{64})$/);
     if (!parts) {
       unsigned(`The signature on this delivery to ${sheet_id} is malformed.`, {
-        Received: JSON.stringify(signature),
+        Received: show(signature),
         Expected: "t=<unix seconds>,v2=<64 lowercase hex characters>, in that order, with no spaces",
         Source: "the scrapsheets-signature header",
         Fix: 'build it as `t=$(date +%s),v2=$(printf "%s\\n%s\\n%s" "$t" "$path" "$body" | openssl dgst -sha256 ' +
@@ -2448,7 +2236,7 @@ const verifyDelivery = async (
     const digests = [...signature.matchAll(/(?:^|,)v1=([0-9a-f]{64})(?=,|$)/g)].map((m) => m[1]);
     if (!stamp || !digests.length) {
       unsigned(`The stripe-signature on this delivery to ${sheet_id} is malformed.`, {
-        Received: JSON.stringify(signature),
+        Received: show(signature),
         Expected: "t=<unix seconds> and at least one v1=<64 lowercase hex characters>, comma separated",
         Source: "the stripe-signature header",
         Fix: "forward the header Stripe sent, unmodified",
@@ -2480,7 +2268,7 @@ const verifyDelivery = async (
     : undefined;
   if (!digest) {
     unsigned(`The ${header} on this delivery to ${sheet_id} is malformed.`, {
-      Received: JSON.stringify(signature),
+      Received: show(signature),
       Expected: name === "hook:github"
         ? "sha256=<64 lowercase hex characters>"
         : "a base64 HMAC-SHA256 digest, 44 characters",
@@ -2555,25 +2343,26 @@ app.post("/net/:id", async (c) => {
   const heard = [...c.req.raw.headers.keys()].sort().join(", ") || "(none)";
   // Every rejection below names the delivery, not just the status: a webhook
   // sender sees only the response body, so the body has to carry the diagnosis.
+  //
+  // This 404 and the 400 under it answer before the signature is checked, which
+  // is an existence oracle to anyone already holding a doc_id. Accepted: a
+  // doc_id is 22 unguessable characters, and a sender who cannot tell "no such
+  // sheet" from "wrong secret" has nothing to debug with.
   const [target] = await sql`select type from sheet where sheet_id = ${sheet_id}`;
   if (!target) {
-    throw new HTTPException(404, {
-      message: explain(`No sheet with id ${sheet_id} accepts deliveries.`, {
-        Received: `POST /net/${sheet_id} carrying headers ${heard}`,
-        Expected: "the sheet_id of an existing net-hook, net-http, or net-socket sheet",
-        Source: "the sheet table",
-        Fix: `create the sheet first with PUT /library/net-hook:<doc_id>, then post to /net/net-hook:<doc_id>`,
-      }),
+    bad(404, `No sheet with id ${sheet_id} accepts deliveries.`, {
+      Received: `POST /net/${sheet_id} carrying headers ${heard}`,
+      Expected: "the sheet_id of an existing net-hook, net-http, or net-socket sheet",
+      Source: "the sheet table",
+      Fix: `create the sheet first with PUT /library/net-hook:<doc_id>, then post to /net/net-hook:<doc_id>`,
     });
   }
   if (!String(target.type).startsWith("net-")) {
-    throw new HTTPException(400, {
-      message: explain(`Sheet ${sheet_id} does not accept deliveries.`, {
-        Received: `a ${target.type} sheet`,
-        Expected: "a net-hook, net-http, or net-socket sheet",
-        Source: "sheet.type",
-        Fix: "post to a net-hook sheet, or change this sheet's type prefix",
-      }),
+    bad(400, `Sheet ${sheet_id} does not accept deliveries.`, {
+      Received: `a ${target.type} sheet`,
+      Expected: "a net-hook, net-http, or net-socket sheet",
+      Source: "sheet.type",
+      Fix: "post to a net-hook sheet, or change this sheet's type prefix",
     });
   }
   const declared = Number(c.req.header("content-length") ?? NaN);
@@ -2591,23 +2380,19 @@ app.post("/net/:id", async (c) => {
   // trigger by accident, by pointing a protobuf or a gzip sender at it.
   const nul = raw.indexOf(0);
   if (nul >= 0) {
-    throw new HTTPException(400, {
-      message: explain(`This delivery to ${sheet_id} carries a byte that cannot be stored.`, {
-        Received: `a NUL byte at offset ${nul} of ${size}`,
-        Expected: "a body with no NUL bytes; every other byte, valid UTF-8 or not, is kept as sent",
-        Source: "the request body, against the text column it is stored in",
-        Fix: "send text or JSON; base64 the payload if it is binary",
-      }),
+    bad(400, `This delivery to ${sheet_id} carries a byte that cannot be stored.`, {
+      Received: `a NUL byte at offset ${nul} of ${size}`,
+      Expected: "a body with no NUL bytes; every other byte, valid UTF-8 or not, is kept as sent",
+      Source: "the request body, against the text column it is stored in",
+      Fix: "send text or JSON; base64 the payload if it is binary",
     });
   }
   if (size > NET_BODY_CAP) {
-    throw new HTTPException(413, {
-      message: explain(`This delivery to ${sheet_id} is too large to store.`, {
-        Received: `${size} bytes`,
-        Limit: `${NET_BODY_CAP} bytes per delivery`,
-        Source: "the request body",
-        Fix: "send the payload in pages, or post a URL the sheet can fetch instead",
-      }),
+    bad(413, `This delivery to ${sheet_id} is too large to store.`, {
+      Received: `${size} bytes`,
+      Limit: `${NET_BODY_CAP} bytes per delivery`,
+      Source: "the request body",
+      Fix: "send the payload in pages, or post a URL the sheet can fetch instead",
     });
   }
   // Placed here on purpose, between the checks that cost nothing and the four
@@ -2623,27 +2408,23 @@ app.post("/net/:id", async (c) => {
   // stays the cheap path.
   const budget = hookBucket(sheet_id);
   if (budget.rows < 1) {
-    throw new HTTPException(429, {
-      message: explain(`Sheet ${sheet_id} has taken too many deliveries.`, {
-        Received: `a delivery of ${size} bytes with no delivery budget left`,
-        Limit: `${HOOK_ROWS_PER_WINDOW} deliveries per ${HOOK_WINDOW_S} seconds, for this sheet`,
-        Source: "this sheet's delivery budget, which refills continuously",
-        Fix: `batch the events into fewer deliveries, or retry in ${
-          Math.ceil((1 - budget.rows) * HOOK_WINDOW_S / HOOK_ROWS_PER_WINDOW)
-        } seconds`,
-      }),
+    bad(429, `Sheet ${sheet_id} has taken too many deliveries.`, {
+      Received: `a delivery of ${size} bytes with no delivery budget left`,
+      Limit: `${HOOK_ROWS_PER_WINDOW} deliveries per ${HOOK_WINDOW_S} seconds, for this sheet`,
+      Source: "this sheet's delivery budget, which refills continuously",
+      Fix: `batch the events into fewer deliveries, or retry in ${
+        Math.ceil((1 - budget.rows) * HOOK_WINDOW_S / HOOK_ROWS_PER_WINDOW)
+      } seconds`,
     });
   }
   if (budget.bytes < size) {
-    throw new HTTPException(429, {
-      message: explain(`Sheet ${sheet_id} has taken too many bytes.`, {
-        Received: `${size} bytes against ${Math.floor(budget.bytes)} left in this window`,
-        Limit: `${HOOK_BYTES_PER_WINDOW} bytes per ${HOOK_WINDOW_S} seconds, for this sheet`,
-        Source: "this sheet's byte budget, which refills continuously",
-        Fix: `send a smaller body, or retry in ${
-          Math.ceil((size - budget.bytes) * HOOK_WINDOW_S / HOOK_BYTES_PER_WINDOW)
-        } seconds`,
-      }),
+    bad(429, `Sheet ${sheet_id} has taken too many bytes.`, {
+      Received: `${size} bytes against ${Math.floor(budget.bytes)} left in this window`,
+      Limit: `${HOOK_BYTES_PER_WINDOW} bytes per ${HOOK_WINDOW_S} seconds, for this sheet`,
+      Source: "this sheet's byte budget, which refills continuously",
+      Fix: `send a smaller body, or retry in ${
+        Math.ceil((size - budget.bytes) * HOOK_WINDOW_S / HOOK_BYTES_PER_WINDOW)
+      } seconds`,
     });
   }
   // Every delivery is signed. There is no per-sheet opt-out: without this,
@@ -2677,25 +2458,23 @@ app.post("/net/:id", async (c) => {
     })
   } on conflict (sheet_id, (meta->>'sig')) do nothing returning net_id`;
   if (!stored) {
-    throw new HTTPException(409, {
-      message: explain(`This delivery to ${sheet_id} has already been stored.`, {
-        Received: "a signature this sheet has already accepted",
-        // Under v2 a signature covers the second, the request target and the
-        // bytes, so what identifies a delivery is what the sender varies. Under
-        // v1 it was the bytes alone, which made two genuinely different
-        // deliveries carrying the same body in the same second one delivery.
-        Expected: scheme === "v2"
-          ? "one delivery per signature, where a signature is this second, this path and these bytes"
-          : scheme === "v1"
-          ? "one delivery per signature, where a v1 signature is this second and these bytes alone"
-          : `one delivery per ${scheme} signature`,
-        Source: "the signature header, against this sheet's log",
-        Fix: scheme === "v2"
-          ? "put a delivery id in the body or the query string; this exact request has already landed"
-          : scheme === "v1"
-          ? "sign with v2, which covers the path and query too, or put a delivery id in the body"
-          : `${scheme} sends each delivery one signature; this one has already landed`,
-      }),
+    bad(409, `This delivery to ${sheet_id} has already been stored.`, {
+      Received: "a signature this sheet has already accepted",
+      // Under v2 a signature covers the second, the request target and the
+      // bytes, so what identifies a delivery is what the sender varies. Under
+      // v1 it was the bytes alone, which made two genuinely different
+      // deliveries carrying the same body in the same second one delivery.
+      Expected: scheme === "v2"
+        ? "one delivery per signature, where a signature is this second, this path and these bytes"
+        : scheme === "v1"
+        ? "one delivery per signature, where a v1 signature is this second and these bytes alone"
+        : `one delivery per ${scheme} signature`,
+      Source: "the signature header, against this sheet's log",
+      Fix: scheme === "v2"
+        ? "put a delivery id in the body or the query string; this exact request has already landed"
+        : scheme === "v1"
+        ? "sign with v2, which covers the path and query too, or put a delivery id in the body"
+        : `${scheme} sends each delivery one signature; this one has already landed`,
     });
   }
   // Charged only by a delivery that landed. A 401 or a 409 spends nothing:
@@ -2727,21 +2506,44 @@ const ipBlocked = (ipRaw: string): boolean => {
   return v6 === "::" || v6 === "::1" || /^f[cd]/.test(v6) || /^fe[89ab]/.test(v6);
 };
 
+// How many hops one fetch may follow. Named rather than written twice: the
+// refusal at the end of the loop quotes the same number the loop counts to.
+const REDIRECT_MAX = 5;
+
 // SSRF guard: block internal hosts by literal IP and by resolved DNS; follow redirects manually re-validating each hop.
 const safeFetch = async (start: string, headers: Record<string, string> = {}): Promise<Response> => {
   let url = start;
-  for (let hop = 0; hop < 5; hop++) {
+  for (let hop = 0; hop < REDIRECT_MAX; hop++) {
     const u = new URL(url);
-    if (!["http:", "https:"].includes(u.protocol))
-      throw new HTTPException(400, { message: "Only HTTP(S) URLs allowed." });
+    if (!["http:", "https:"].includes(u.protocol)) {
+      bad(400, `That is not a url this server will fetch.`, {
+        Expected: "an http:// or https:// url",
+        Received: show(u.protocol),
+        Source: "the url this sheet was pointed at",
+        Fix: "point it at an http or https url",
+      });
+    }
     const host = u.hostname.replace(/^\[|\]$/g, "");
-    if (host === "localhost" || host.endsWith(".local"))
-      throw new HTTPException(400, { message: "Internal URLs not allowed." });
+    if (host === "localhost" || host.endsWith(".local")) {
+      bad(400, `That url points inside this server's own network.`, {
+        Expected: "a public host",
+        Received: u.hostname,
+        Source: "the url this sheet was pointed at",
+        Fix: "point it at a host reachable from the public internet",
+      });
+    }
     const isLiteral = /^[0-9.]+$/.test(host) || host.includes(":");
     const ips = isLiteral ? [host] : (await Promise.all(
       (["A", "AAAA"] as const).map((t) => Deno.resolveDns(host, t).catch(() => [] as string[])),
     )).flat();
-    if (ips.some(ipBlocked)) throw new HTTPException(400, { message: "Internal URLs not allowed." });
+    if (ips.some(ipBlocked)) {
+      bad(400, `That host resolves inside this server's own network.`, {
+        Expected: "a host resolving to a public address",
+        Received: `${u.hostname} -> ${ips.join(", ")}`,
+        Source: "the DNS answer for this url",
+        Fix: "point it at a host reachable from the public internet",
+      });
+    }
     const res = await fetch(url, {
       redirect: "manual",
       // Ten seconds, not thirty: the poller runs on a 15s tick, and a request
@@ -2760,7 +2562,12 @@ const safeFetch = async (start: string, headers: Record<string, string> = {}): P
     if (!location) return res;
     url = new URL(location, url).href;
   }
-  throw new HTTPException(400, { message: "Too many redirects." });
+  bad(400, `That url redirected too many times.`, {
+    Expected: `at most ${REDIRECT_MAX} redirects`,
+    Received: `${REDIRECT_MAX} of them, still not a final answer`,
+    Source: `the redirect chain from ${url}`,
+    Fix: "fetch the url the chain ends at directly",
+  });
 };
 
 // --- net-http polling
@@ -2994,7 +2801,7 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
         if (!/^[A-Za-z0-9_.-]{1,64}$/.test(config.cursor)) {
           throw new Error(
             explain("This sheet's cursor is not the name of a query parameter.", {
-              Received: JSON.stringify(config.cursor),
+              Received: show(config.cursor),
               Expected: "letters, digits, dot, dash or underscore, at most 64 of them",
               Source: "the cursor field on this net-http sheet",
               Fix: "name the parameter this feed takes a since-value in, such as `since` or `updated_after`",
@@ -3012,7 +2819,7 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       // answers a retry exactly as it answered this one.
       const res = await fetcher(url, sending).catch((err) => {
         if (err instanceof HTTPException) throw err;
-        return err instanceof Error ? err.message : String(err);
+        return reason(err);
       });
       // A 5xx and a 429 are the host saying "later". A 404, a 401, an SSRF
       // refusal are a "no", and retrying a "no" is noise on top of the failure
@@ -3126,7 +2933,7 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
         ...(res.ok ? kept : {}),
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = reason(err);
       console.error(`net-http poll ${sheet_id}:`, message);
       const failure = fetchFailure(url, headers, null, message);
       // No attempt count: giving up, a malformed Retry-After and a sheet that
@@ -3242,7 +3049,7 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
       // be graded against the default instead.
       if (config.interval !== undefined && config.interval !== null && !(Number(config.interval) > 0)) {
         throw new Error(explain(`The interval on ${sheet_id} is not a number of seconds.`, {
-          Received: JSON.stringify(config.interval),
+          Received: show(config.interval),
           Expected: "a positive number of seconds, or no interval at all for the default 3600",
           Source: "data[0].interval on the alert document",
           Fix: "put seconds in the interval cell, or clear it",
@@ -3338,7 +3145,7 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
           : "no destination, so nothing was sent",
       };
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = reason(err);
       console.error(`alert ${sheet_id}:`, message);
       record = { status: "error", rows: 0, fingerprint: await digest(message), error: message };
     }
@@ -3440,9 +3247,8 @@ app.get("/proxy", async (c) => {
       "X-Proxy-Status": String(res.status),
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Unknown error";
     if (err instanceof HTTPException) return c.json(fetchFailure(url, {}, null, err.message), err.status);
-    return c.json(fetchFailure(url, {}, null, `Fetch failed: ${message}`), 502);
+    return c.json(fetchFailure(url, {}, null, `Fetch failed: ${reason(err)}`), 502);
   }
 });
 
@@ -3528,14 +3334,12 @@ app.use("*", async (c, next) => {
   // remember to ask -- and a key that reached POST /library/:id/secret could
   // mint itself a key for a sheet it was never given.
   if (path !== `/sheet/${sheet_id}` && path !== `/openapi/${sheet_id}`) {
-    throw new HTTPException(403, {
-      message: explain(`This key opens ${sheet_id} and nothing else.`, {
-        Received: `${c.req.method} ${path}`,
-        Expected: `GET or POST /sheet/${sheet_id}, or GET /openapi/${sheet_id}`,
-        Source: `the ${API_KEY_HEADER} request header, which names the one sheet it is for`,
-        Fix: "mint a key on that sheet too, or call this route with the Authorization header of an account that " +
-          "can reach it",
-      }),
+    bad(403, `This key opens ${sheet_id} and nothing else.`, {
+      Received: `${c.req.method} ${path}`,
+      Expected: `GET or POST /sheet/${sheet_id}, or GET /openapi/${sheet_id}`,
+      Source: `the ${API_KEY_HEADER} request header, which names the one sheet it is for`,
+      Fix: "mint a key on that sheet too, or call this route with the Authorization header of an account that " +
+        "can reach it",
     });
   }
   c.set("usr_id", usr_id);
@@ -3556,16 +3360,14 @@ app.use("*", async (c, next) => {
   const usr_id = c.get("jwtPayload")?.sub ?? c.get("usr_id");
   if (!usr_id) {
     const share = c.get("jwtPayload")?.share;
-    throw new HTTPException(403, {
-      message: explain("That token opens the sync socket and nothing else.", {
-        Received: share ? `a share link to ${share}, which names a sheet and no account` : "a token with no sub claim",
-        Expected: "the token POST /login answered with",
-        Source: "the Authorization header",
-        Fix: share
-          ? "open the link in the app, which reads it over the sync socket, or sign in and call this route with " +
-            "that account's token"
-          : "sign in again with POST /login",
-      }),
+    bad(403, "That token opens the sync socket and nothing else.", {
+      Received: share ? `a share link to ${share}, which names a sheet and no account` : "a token with no sub claim",
+      Expected: "the token POST /login answered with",
+      Source: "the Authorization header",
+      Fix: share
+        ? "open the link in the app, which reads it over the sync socket, or sign in and call this route with " +
+          "that account's token"
+        : "sign in again with POST /login",
     });
   }
   c.set("usr_id", usr_id);
@@ -3577,21 +3379,28 @@ app.post("/buy/:id", async (c) => {
   const usr_id = c.get("usr_id");
   const [sheet] = await sql`select * from sheet where sell_id = ${sell_id} and sell_price >= 0`;
   if (!sheet) {
-    throw new HTTPException(404, {
-      message: `Expected a shop listing with sell_id ${sell_id}, received none. The listing may have been taken down.`,
+    bad(404, `No shop listing with that sell_id.`, {
+      Expected: `a live listing with sell_id ${sell_id}`,
+      Received: "no row",
+      Source: "the sheet table, where a listing is a row with a sell_id",
+      Fix: "the listing may have been taken down; re-read GET /shop",
     });
   }
   if (!sheet.sell_type) {
-    throw new HTTPException(400, {
-      message: `Expected sell_type on listing ${sell_id}, received null. Only templates and live sheets can be sold.`,
+    bad(400, `That listing does not say what it sells.`, {
+      Expected: `a sell_type on listing ${sell_id}`,
+      Received: "null",
+      Source: "the sheet row behind this listing",
+      Fix: "only templates and live sheets can be sold; the seller must re-list it",
     });
   }
   const dollars = Number(sheet.sell_price);
   if (!Number.isFinite(dollars)) {
-    throw new HTTPException(400, {
-      message: `Expected sell_price to be a number of dollars, received ${
-        JSON.stringify(sheet.sell_price)
-      } from sheet ${sheet.sheet_id}. Re-list the sheet with a numeric price.`,
+    bad(400, `That listing has no price this server can charge.`, {
+      Expected: "sell_price, a number of dollars",
+      Received: show(sheet.sell_price),
+      Source: `sheet ${sheet.sheet_id}`,
+      Fix: "re-list the sheet with a numeric price",
     });
   }
   if (dollars === 0) {
@@ -3609,23 +3418,30 @@ app.post("/buy/:id", async (c) => {
   }
   const cents = Math.round(dollars * 100);
   if (cents < 1) {
-    throw new HTTPException(400, {
-      message:
-        `Expected sell_price of at least $0.01, received ${sheet.sell_price} on ${sheet.sheet_id}. Re-list at a whole-cent price or 0.`,
+    bad(400, `That price is smaller than a cent.`, {
+      Expected: "a sell_price of at least $0.01, or 0 to give it away",
+      Received: String(sheet.sell_price),
+      Source: `sheet ${sheet.sheet_id}`,
+      Fix: "re-list at a whole-cent price or 0",
     });
   }
   const key = Deno.env.get("STRIPE_SECRET_KEY");
   if (!key) {
-    throw new HTTPException(500, {
-      message:
-        "Expected STRIPE_SECRET_KEY (a Stripe secret key starting with sk_), received nothing. Set STRIPE_SECRET_KEY in the environment.",
+    bad(500, `This server cannot take a payment.`, {
+      Expected: "STRIPE_SECRET_KEY, a Stripe secret key starting with sk_",
+      Received: "nothing",
+      Source: "the process environment",
+      Fix: "set STRIPE_SECRET_KEY in the environment and restart",
     });
   }
   const stripe = new Stripe(key);
   const [usr] = await sql`select email, stripe_customer_id from usr where usr_id = ${usr_id}`;
   if (!usr) {
-    throw new HTTPException(401, {
-      message: `Expected a usr row for usr_id ${usr_id}, received none. Sign in again.`,
+    bad(401, `This token names an account that no longer exists.`, {
+      Expected: `a usr row for usr_id ${usr_id}`,
+      Received: "no row",
+      Source: "the usr table",
+      Fix: "sign in again",
     });
   }
   let { stripe_customer_id } = usr;
@@ -3642,9 +3458,11 @@ app.post("/buy/:id", async (c) => {
     const [again] = await sql`select stripe_customer_id from usr where usr_id = ${usr_id}`;
     stripe_customer_id = again.stripe_customer_id;
     if (!stripe_customer_id) {
-      throw new HTTPException(500, {
-        message:
-          `Expected usr.stripe_customer_id after creating a Stripe customer, received null for usr_id ${usr_id}. Retry the purchase.`,
+      bad(500, `The Stripe customer was created and not written down.`, {
+        Expected: "usr.stripe_customer_id to be set after creating a Stripe customer",
+        Received: `null for usr_id ${usr_id}`,
+        Source: "the usr row this purchase updated",
+        Fix: "retry the purchase",
       });
     }
   }
@@ -3666,8 +3484,11 @@ app.post("/buy/:id", async (c) => {
       cancel_url: "https://sheets.scrap.land/",
     }));
   if (!session.url) {
-    throw new HTTPException(502, {
-      message: `Expected Stripe Checkout Session url, received none for session ${session.id}. Retry the purchase.`,
+    bad(502, `Stripe made a session with nowhere to send you.`, {
+      Expected: "a Checkout Session url",
+      Received: `none, for session ${session.id}`,
+      Source: "the Stripe Checkout Session",
+      Fix: "retry the purchase",
     });
   }
   return c.json({ data: { checkout_url: session.url } }, 200);
@@ -3677,21 +3498,20 @@ app.post("/sell/:id", async (c) => {
   const body = await c.req.json();
   const { price } = body;
   if (price === undefined) {
-    throw new HTTPException(400, {
-      message: `Expected a "price" field in the body, received ${
-        JSON.stringify(body)
-      }. Post {"price": 0} to list it for free.`,
+    bad(400, `A listing needs a price.`, {
+      Expected: `a "price" field in the body`,
+      Received: show(body),
+      Source: "the request body",
+      Fix: `post {"price": 0} to list it for free`,
     });
   }
   // An alert holds someone's email address and sends mail on a timer. Selling
   // copies would hand a stranger a thing that emails the seller.
   if (c.req.param("id").startsWith("alert:")) {
-    throw new HTTPException(400, {
-      message: explain(`An alert cannot be listed for sale.`, {
-        Received: c.req.param("id"),
-        Cause: "an alert carries a destination address and sends mail on its own, so a copy would mail its author",
-        Fix: "sell the query the alert watches instead, and let the buyer point their own alert at it",
-      }),
+    bad(400, `An alert cannot be listed for sale.`, {
+      Received: c.req.param("id"),
+      Cause: "an alert carries a destination address and sends mail on its own, so a copy would mail its author",
+      Fix: "sell the query the alert watches instead, and let the buyer point their own alert at it",
     });
   }
   const updated = await sql`
@@ -3702,8 +3522,14 @@ app.post("/sell/:id", async (c) => {
       and buy_price is null
     returning sheet_id
   `;
-  if (!updated.length)
-    throw new HTTPException(400, { message: "Cannot sell this sheet. Purchased sheets cannot be resold." });
+  if (!updated.length) {
+    bad(400, `A purchased sheet cannot be resold.`, {
+      Expected: "a sheet you created",
+      Received: `${c.req.param("id")}, which was bought, or is not yours`,
+      Source: "the sheet row this update looked for",
+      Fix: "sell a sheet of your own, or fork this one and sell the fork",
+    });
+  }
   return c.json(null, 200);
 });
 
@@ -3853,17 +3679,22 @@ app.put("/library/:id", async (c) => {
   const [existingSheet] = await sql`select sheet_id from sheet where sheet_id = ${sheet_id}`;
 
   if (existingSheet) {
-    throw new HTTPException(403, {
-      message:
-        `Expected write access to ${sheet_id} for usr ${usr_id}, received none. Source: sheet_usr membership. The sheet is already claimed by someone else; ask an owner to share it with you.`,
+    bad(403, `That sheet is already claimed by someone else.`, {
+      Expected: `write access to ${sheet_id} for usr ${usr_id}`,
+      Received: "no owner or editor row",
+      Source: "sheet_usr membership",
+      Fix: "ask an owner to share it with you",
     });
   }
 
   // Sheet doesn't exist - create it (user is claiming a new automerge doc)
   const [type, doc_id] = sheet_id.split(":");
   if (!type || !doc_id) {
-    throw new HTTPException(400, {
-      message: `Expected a sheet id shaped type:doc_id, received ${JSON.stringify(sheet_id)}. Use e.g. table:abc123.`,
+    bad(400, `That is not a sheet id.`, {
+      Expected: "type:doc_id, e.g. table:abc123",
+      Received: show(sheet_id),
+      Source: "the :id in this path",
+      Fix: "pass the full id, type prefix included",
     });
   }
 
@@ -3874,9 +3705,11 @@ app.put("/library/:id", async (c) => {
     .find<{ data: Table }>(doc_id as AnyDocumentId)
     .then((hand) => hand.doc()?.data?.[0] ?? {})
     .catch(() => {
-      throw new HTTPException(404, {
-        message:
-          `Expected automerge document ${doc_id} to be reachable, received none. Source: the sync server, which reads it from your client during the claim. Keep the tab open and retry, so the document can be pushed.`,
+      bad(404, `The document behind that sheet never arrived.`, {
+        Expected: `automerge document ${doc_id} to be reachable`,
+        Received: "none",
+        Source: "the sync server, which reads it from your client during the claim",
+        Fix: "keep the tab open and retry, so the document can be pushed",
       });
     });
 
@@ -3916,9 +3749,11 @@ app.get("/library/:id/share", async (c) => {
   `;
   const [sheet] = await sql`select public from sheet where sheet_id = ${sheet_id}`;
   if (!sheet) {
-    throw new HTTPException(404, {
-      message:
-        `Expected a sheet row for ${sheet_id}, received none. Source: the sheet table. Claim it first with PUT /library/${sheet_id}.`,
+    bad(404, `This server has never heard of that sheet.`, {
+      Expected: `a sheet row for ${sheet_id}`,
+      Received: "none",
+      Source: "the sheet table",
+      Fix: `claim it first with PUT /library/${sheet_id}`,
     });
   }
   return c.json({ data: { members: rows, public: sheet.public } });
@@ -3932,20 +3767,29 @@ app.post("/library/:id/share", async (c) => {
   // for a request the caller could have fixed from the message.
   const { email, role } = await c.req.json().catch(() => ({} as Record<string, unknown>));
   if (typeof email !== "string" || !email.includes("@")) {
-    throw new HTTPException(400, {
-      message: `Expected an email address to share with, received ${JSON.stringify(email)}.`,
+    bad(400, `A share needs somebody to share with.`, {
+      Expected: "an email address",
+      Received: show(email),
+      Source: `the "email" field of the request body`,
+      Fix: `post {"email": "them@example.com", "role": "viewer"}`,
     });
   }
   if (!ROLES.includes(role)) {
-    throw new HTTPException(400, {
-      message: `Expected role to be one of ${ROLES.join(", ")}, received ${JSON.stringify(role)}.`,
+    bad(400, `That is not a role a share can grant.`, {
+      Expected: ROLES.join(", "),
+      Received: show(role),
+      Source: `the "role" field of the request body`,
+      Fix: `pick one of ${ROLES.join(", ")}`,
     });
   }
 
   const [target] = await sql`select usr_id from usr where email = ${email}`;
   if (!target) {
-    throw new HTTPException(404, {
-      message: `No account for ${email}. They need to sign up before the sheet can be shared with them.`,
+    bad(404, `Nobody here goes by that address.`, {
+      Expected: `a usr with email ${email}`,
+      Received: "no row",
+      Source: "the usr table",
+      Fix: "they need to sign up before the sheet can be shared with them",
     });
   }
 
@@ -3965,8 +3809,11 @@ app.delete("/library/:id/share", async (c) => {
   // "undefined is not a non-owner member of this sheet" -- a sentence about the
   // sheet for a mistake in the request.
   if (typeof email !== "string" || !email.includes("@")) {
-    throw new HTTPException(400, {
-      message: `Expected an email address to remove, received ${JSON.stringify(email)}.`,
+    bad(400, `A removal needs somebody to remove.`, {
+      Expected: "an email address",
+      Received: show(email),
+      Source: `the "email" field of the request body`,
+      Fix: `post {"email": "them@example.com"}`,
     });
   }
   const [removed] = await sql`
@@ -3977,8 +3824,11 @@ app.delete("/library/:id/share", async (c) => {
     returning usr_id
   `;
   if (!removed) {
-    throw new HTTPException(404, {
-      message: `${email} is not a non-owner member of this sheet, so there was nothing to remove.`,
+    bad(404, `There was nothing to remove.`, {
+      Expected: `${email} to be an editor or viewer of this sheet`,
+      Received: "no such row",
+      Source: "sheet_usr membership; an owner cannot be removed this way",
+      Fix: "check the address, or read the members with GET /library/:id/share",
     });
   }
   invalidateSync(sheet_id.split(":")[1]);
@@ -3991,8 +3841,11 @@ app.post("/library/:id/public", async (c) => {
   await assertSheetOwner(c, sheet_id);
   const { public: isPublic } = await c.req.json().catch(() => ({} as Record<string, unknown>));
   if (typeof isPublic !== "boolean") {
-    throw new HTTPException(400, {
-      message: `Expected public to be true or false, received ${JSON.stringify(isPublic)}.`,
+    bad(400, `A sheet is either public or it is not.`, {
+      Expected: "true or false",
+      Received: show(isPublic),
+      Source: `the "public" field of the request body`,
+      Fix: `post {"public": true} or {"public": false}`,
     });
   }
   await sql`update sheet set public = ${isPublic} where sheet_id = ${sheet_id}`;
@@ -4015,25 +3868,21 @@ app.post("/library/:id/link", async (c) => {
   await assertSheetOwner(c, sheet_id);
   const { days, password } = await c.req.json().catch(() => ({} as Record<string, unknown>));
   if (days !== undefined && (typeof days !== "number" || !(days > 0) || days > LINK_DAYS_MAX)) {
-    throw new HTTPException(400, {
-      message: explain(`That is not a usable lifetime for a link to ${sheet_id}.`, {
-        Received: JSON.stringify(days),
-        Expected: `a number above 0 and at most ${LINK_DAYS_MAX}`,
-        Source: "the days field of the request body",
-        Fix: "send days as a JSON number, or leave it out for a link that lives 30 days",
-      }),
+    bad(400, `That is not a usable lifetime for a link to ${sheet_id}.`, {
+      Received: show(days),
+      Expected: `a number above 0 and at most ${LINK_DAYS_MAX}`,
+      Source: "the days field of the request body",
+      Fix: "send days as a JSON number, or leave it out for a link that lives 30 days",
     });
   }
   if (password !== undefined && (typeof password !== "string" || !password || password.length > LINK_PASSWORD_MAX)) {
-    throw new HTTPException(400, {
-      message: explain(`That is not a usable password for a link to ${sheet_id}.`, {
-        // The value only reaches the message when it is not a string, so a real
-        // password can never be printed back.
-        Received: typeof password !== "string" ? JSON.stringify(password) : `${password.length} characters`,
-        Expected: `a non-empty string of at most ${LINK_PASSWORD_MAX} characters`,
-        Source: "the password field of the request body",
-        Fix: "send the password as a JSON string, or leave it out for a link anyone holding the url can open",
-      }),
+    bad(400, `That is not a usable password for a link to ${sheet_id}.`, {
+      // The value only reaches the message when it is not a string, so a real
+      // password can never be printed back.
+      Received: typeof password !== "string" ? JSON.stringify(password) : `${password.length} characters`,
+      Expected: `a non-empty string of at most ${LINK_PASSWORD_MAX} characters`,
+      Source: "the password field of the request body",
+      Fix: "send the password as a JSON string, or leave it out for a link anyone holding the url can open",
     });
   }
   const token = await sign(
@@ -4061,13 +3910,11 @@ app.get("/library/:id/hook", async (c) => {
   await assertSheetOwner(c, sheet_id);
   const [target] = await sql`select type from sheet where sheet_id = ${sheet_id}`;
   if (!target || !String(target.type).startsWith("net-")) {
-    throw new HTTPException(400, {
-      message: explain(`Sheet ${sheet_id} has no delivery endpoint.`, {
-        Received: target ? `a ${target.type} sheet` : "no sheet row",
-        Expected: "a net-hook, net-http, or net-socket sheet",
-        Source: "sheet.type",
-        Fix: "ask for the hook of a net-hook sheet",
-      }),
+    bad(400, `Sheet ${sheet_id} has no delivery endpoint.`, {
+      Received: target ? `a ${target.type} sheet` : "no sheet row",
+      Expected: "a net-hook, net-http, or net-socket sheet",
+      Source: "sheet.type",
+      Fix: "ask for the hook of a net-hook sheet",
     });
   }
   // The current key, which is the newest stored one if this sheet has any and
@@ -4075,14 +3922,12 @@ app.get("/library/:id/hook", async (c) => {
   // print: the secret is the provider's, and we never had it to give back.
   const { name, keys } = await hookKeys(sheet_id);
   if (name !== "hook") {
-    throw new HTTPException(400, {
-      message: explain(`Sheet ${sheet_id} is signed by ${name.slice("hook:".length)}, not by scrapsheets.`, {
-        Received: `a sheet holding a ${name} secret`,
-        Expected: "a sheet on scrapsheets' own signing scheme",
-        Source: "the secret table",
-        Fix: `read the endpoint secret from ${name.slice("hook:".length)}, or delete the ${name} secret with ` +
-          `DELETE /library/${sheet_id}/secret`,
-      }),
+    bad(400, `Sheet ${sheet_id} is signed by ${name.slice("hook:".length)}, not by scrapsheets.`, {
+      Received: `a sheet holding a ${name} secret`,
+      Expected: "a sheet on scrapsheets' own signing scheme",
+      Source: "the secret table",
+      Fix: `read the endpoint secret from ${name.slice("hook:".length)}, or delete the ${name} secret with ` +
+        `DELETE /library/${sheet_id}/secret`,
     });
   }
   const secret = keys[0].value;
@@ -4134,28 +3979,24 @@ app.post("/library/:id/secret", async (c) => {
   // for a request the caller could have fixed from the message.
   const { name, value } = await c.req.json().catch(() => ({} as Record<string, unknown>));
   if (typeof name !== "string" || !SECRET_NAME.test(name)) {
-    throw new HTTPException(400, {
-      message: explain(`That is not a usable secret name on ${sheet_id}.`, {
-        Received: JSON.stringify(name),
-        Expected: "1 to 64 characters of a-z, 0-9, colon, underscore or hyphen, starting with a letter or digit",
-        Source: "the name field of the request body",
-        Fix: `name it for what it is: hook for this sheet's own signing secret, or one of ${
-          Object.keys(HOOK_HEADERS).filter((k) => k !== "hook").join(", ")
-        } to have that provider verify deliveries instead`,
-      }),
+    bad(400, `That is not a usable secret name on ${sheet_id}.`, {
+      Received: show(name),
+      Expected: "1 to 64 characters of a-z, 0-9, colon, underscore or hyphen, starting with a letter or digit",
+      Source: "the name field of the request body",
+      Fix: `name it for what it is: hook for this sheet's own signing secret, or one of ${
+        Object.keys(HOOK_HEADERS).filter((k) => k !== "hook").join(", ")
+      } to have that provider verify deliveries instead`,
     });
   }
   // `api` is this sheet's own API key, and nothing else in that space is a name
   // the middleware knows. An unknown one is refused where it is typed, the same
   // way an unknown hook scheme is: written happily and then useless is worse.
   if (name.startsWith(`${API_KEY_NAME}:`)) {
-    throw new HTTPException(400, {
-      message: explain(`${JSON.stringify(name)} is not a key name this server knows.`, {
-        Received: name,
-        Expected: API_KEY_NAME,
-        Source: "the name field of the request body",
-        Fix: `use ${API_KEY_NAME}, or a name that does not start with ${API_KEY_NAME}:`,
-      }),
+    bad(400, `${JSON.stringify(name)} is not a key name this server knows.`, {
+      Received: name,
+      Expected: API_KEY_NAME,
+      Source: "the name field of the request body",
+      Fix: `use ${API_KEY_NAME}, or a name that does not start with ${API_KEY_NAME}:`,
     });
   }
   // The server mints an API key rather than taking one: a key the owner chose is
@@ -4163,23 +4004,19 @@ app.post("/library/:id/secret", async (c) => {
   // from here. Writing one is rotating it, like every other secret on the sheet.
   const minted = name === API_KEY_NAME ? apiKeyFor(sheet_id) : null;
   if (minted && value !== undefined) {
-    throw new HTTPException(400, {
-      message: explain(`An ${API_KEY_NAME} key is minted here, not supplied.`, {
-        Received: `a value field alongside name ${API_KEY_NAME}`,
-        Expected: `just {"name":"${API_KEY_NAME}"}; the key comes back in the answer, once`,
-        Source: "the value field of the request body",
-        Fix: "drop the value field, and store what this route answers with",
-      }),
+    bad(400, `An ${API_KEY_NAME} key is minted here, not supplied.`, {
+      Received: `a value field alongside name ${API_KEY_NAME}`,
+      Expected: `just {"name":"${API_KEY_NAME}"}; the key comes back in the answer, once`,
+      Source: "the value field of the request body",
+      Fix: "drop the value field, and store what this route answers with",
     });
   }
   if (!minted && (typeof value !== "string" || !value || value.length > SECRET_VALUE_CAP)) {
-    throw new HTTPException(400, {
-      message: explain(`That is not a usable secret value on ${sheet_id}.`, {
-        Received: typeof value !== "string" ? `a ${typeof value}` : `${value.length} characters`,
-        Expected: `a non-empty string of at most ${SECRET_VALUE_CAP} characters`,
-        Source: "the value field of the request body",
-        Fix: "send the secret as a JSON string; a key file belongs in a codex connection, not here",
-      }),
+    bad(400, `That is not a usable secret value on ${sheet_id}.`, {
+      Received: typeof value !== "string" ? `a ${typeof value}` : `${value.length} characters`,
+      Expected: `a non-empty string of at most ${SECRET_VALUE_CAP} characters`,
+      Source: "the value field of the request body",
+      Fix: "send the secret as a JSON string; a key file belongs in a codex connection, not here",
     });
   }
   // `hook` and `hook:*` are the names verifyDelivery reads, so a name in that
@@ -4187,26 +4024,22 @@ app.post("/library/:id/secret", async (c) => {
   // every delivery to this sheet. Refused where it is typed instead.
   const scheme = name === "hook" || name.startsWith("hook:");
   if (scheme && !HOOK_HEADERS[name]) {
-    throw new HTTPException(400, {
-      message: explain(`${JSON.stringify(name)} is not a signing scheme this server knows.`, {
-        Received: name,
-        Expected: Object.keys(HOOK_HEADERS).join(", "),
-        Source: "the name field of the request body",
-        Fix: "use one of those, or a name that does not start with hook",
-      }),
+    bad(400, `${JSON.stringify(name)} is not a signing scheme this server knows.`, {
+      Received: name,
+      Expected: Object.keys(HOOK_HEADERS).join(", "),
+      Source: "the name field of the request body",
+      Fix: "use one of those, or a name that does not start with hook",
     });
   }
   const [{ names }] = await sql`
     select count(distinct name)::int as names from secret where sheet_id = ${sheet_id} and name <> ${name}
   `;
   if (names >= SECRET_NAMES_MAX) {
-    throw new HTTPException(409, {
-      message: explain(`Sheet ${sheet_id} holds as many secrets as it may.`, {
-        Received: `${names} names already, and a request to add ${name}`,
-        Expected: `at most ${SECRET_NAMES_MAX} distinct names per sheet`,
-        Source: "the secret table",
-        Fix: `delete one you no longer need with DELETE /library/${sheet_id}/secret`,
-      }),
+    bad(409, `Sheet ${sheet_id} holds as many secrets as it may.`, {
+      Received: `${names} names already, and a request to add ${name}`,
+      Expected: `at most ${SECRET_NAMES_MAX} distinct names per sheet`,
+      Source: "the secret table",
+      Fix: `delete one you no longer need with DELETE /library/${sheet_id}/secret`,
     });
   }
   // At most one signing scheme per sheet. With two, which verifier runs would
@@ -4240,13 +4073,11 @@ app.post("/library/:id/secret", async (c) => {
     return null;
   });
   if (clash) {
-    throw new HTTPException(409, {
-      message: explain(`Sheet ${sheet_id} already has a signing scheme.`, {
-        Received: `a request to add ${name} beside ${clash.map((r: { name: string }) => r.name).sort().join(", ")}`,
-        Expected: "at most one of " + Object.keys(HOOK_HEADERS).join(", ") + " per sheet",
-        Source: "the secret table",
-        Fix: `delete the other one first with DELETE /library/${sheet_id}/secret`,
-      }),
+    bad(409, `Sheet ${sheet_id} already has a signing scheme.`, {
+      Received: `a request to add ${name} beside ${clash.map((r: { name: string }) => r.name).sort().join(", ")}`,
+      Expected: "at most one of " + Object.keys(HOOK_HEADERS).join(", ") + " per sheet",
+      Source: "the secret table",
+      Fix: `delete the other one first with DELETE /library/${sheet_id}/secret`,
     });
   }
   // Keep current and previous. A third is a secret nobody meant to leave
@@ -4308,13 +4139,11 @@ app.delete("/library/:id/secret", async (c) => {
     ? await sql`delete from secret where sheet_id = ${sheet_id} and name = ${name} returning secret_id`
     : [];
   if (!removed.length) {
-    throw new HTTPException(404, {
-      message: explain(`Sheet ${sheet_id} holds no secret named ${JSON.stringify(name)}.`, {
-        Received: JSON.stringify(name),
-        Expected: "a name GET /library/" + sheet_id + "/secret lists",
-        Source: "the secret table",
-        Fix: "read the names back first; a value is never readable, but a name always is",
-      }),
+    bad(404, `Sheet ${sheet_id} holds no secret named ${JSON.stringify(name)}.`, {
+      Received: show(name),
+      Expected: "a name GET /library/" + sheet_id + "/secret lists",
+      Source: "the secret table",
+      Fix: "read the names back first; a value is never readable, but a name always is",
     });
   }
   return c.json(null, 200);
@@ -4334,10 +4163,11 @@ app.post("/import/csv", async (c) => {
     const formData = await c.req.formData();
     const file = formData.get("file") as File | null;
     if (!file) {
-      throw new HTTPException(400, {
-        message: `Expected a multipart field named "file", received fields: ${
-          [...formData.keys()].join(", ") || "(none)"
-        }. Send the CSV as -F file=@data.csv, or post the raw text with Content-Type: text/csv.`,
+      bad(400, `That upload carries no file.`, {
+        Expected: `a multipart field named "file"`,
+        Received: `fields: ${[...formData.keys()].join(", ") || "(none)"}`,
+        Source: "the multipart request body",
+        Fix: "send the CSV as -F file=@data.csv, or post the raw text with Content-Type: text/csv",
       });
     }
     csvText = await file.text();
@@ -4348,9 +4178,11 @@ app.post("/import/csv", async (c) => {
   }
 
   if (!csvText.trim()) {
-    throw new HTTPException(400, {
-      message:
-        `Expected CSV text, received ${csvText.length} characters of whitespace. Source: the request body. Send at least a header row.`,
+    bad(400, `There is nothing in that file.`, {
+      Expected: "CSV text",
+      Received: `${csvText.length} characters of whitespace`,
+      Source: "the request body",
+      Fix: "send at least a header row",
     });
   }
 
@@ -4411,9 +4243,11 @@ app.post("/import/csv", async (c) => {
 
   const parsed = parseCSV(csvText);
   if (parsed.length < 1) {
-    throw new HTTPException(400, {
-      message:
-        `Expected at least a header row, received ${parsed.length} parsed rows from ${csvText.length} characters. Source: the request body. Check the delimiter and the line endings.`,
+    bad(400, `Nothing in that file parsed as a row.`, {
+      Expected: "at least a header row",
+      Received: `${parsed.length} parsed rows from ${csvText.length} characters`,
+      Source: "the request body",
+      Fix: "check the delimiter and the line endings",
     });
   }
 
@@ -4424,16 +4258,14 @@ app.post("/import/csv", async (c) => {
   const ragged = dataRows.find((row) => row.fields.length !== headerRow.fields.length);
   if (ragged) {
     const at = Math.min(ragged.fields.length, headerRow.fields.length);
-    throw new HTTPException(400, {
-      message: explain(`Line ${ragged.line} of the CSV does not match its header.`, {
-        Expected: `${headerRow.fields.length} fields: ${headerRow.fields.join(", ")}`,
-        Received: `${ragged.fields.length} fields: ${ragged.raw.slice(0, 200)}`,
-        Column: ragged.fields.length < headerRow.fields.length
-          ? `nothing for "${headerRow.fields[at]}"`
-          : `an extra field after "${headerRow.fields[at - 1]}"`,
-        Source: `line ${ragged.line} of the uploaded file`,
-        Fix: "quote the field that contains a comma, or fill in the missing column",
-      }),
+    bad(400, `Line ${ragged.line} of the CSV does not match its header.`, {
+      Expected: `${headerRow.fields.length} fields: ${headerRow.fields.join(", ")}`,
+      Received: `${ragged.fields.length} fields: ${ragged.raw.slice(0, 200)}`,
+      Column: ragged.fields.length < headerRow.fields.length
+        ? `nothing for "${headerRow.fields[at]}"`
+        : `an extra field after "${headerRow.fields[at - 1]}"`,
+      Source: `line ${ragged.line} of the uploaded file`,
+      Fix: "quote the field that contains a comma, or fill in the missing column",
     });
   }
 
@@ -4456,13 +4288,11 @@ app.post("/import/csv", async (c) => {
   const headers = headerRow.fields.map((name, i) => name.trim() || `Column ${i + 1}`);
   const twice = headers.filter((name, i) => headers.indexOf(name) !== i);
   if (twice.length) {
-    throw new HTTPException(400, {
-      message: explain(`The CSV header names a column more than once.`, {
-        Received: `${[...new Set(twice)].map((name) => JSON.stringify(name)).join(", ")} appears more than once`,
-        Expected: `one column per name: ${headers.join(", ")}`,
-        Source: `line ${headerRow.line} of the uploaded file`,
-        Fix: "rename one of them in the file, because a row is keyed by column name",
-      }),
+    bad(400, `The CSV header names a column more than once.`, {
+      Received: `${[...new Set(twice)].map((name) => JSON.stringify(name)).join(", ")} appears more than once`,
+      Expected: `one column per name: ${headers.join(", ")}`,
+      Source: `line ${headerRow.line} of the uploaded file`,
+      Fix: "rename one of them in the file, because a row is keyed by column name",
     });
   }
 
@@ -4583,15 +4413,13 @@ const DATE_TYPES = ["date", "timestamp", "create"];
 const named = (sheet_id: string, cols: Col[], rows: Row[]): Record<string, unknown>[] => {
   const seen = cols.map((col) => col.name).filter((name, i, all) => all.indexOf(name) !== i);
   if (seen.length) {
-    throw new HTTPException(400, {
-      message: explain(`Sheet ${sheet_id} has two columns with the same name.`, {
-        // Quoted, because the commonest pair is two columns nobody has named
-        // yet, and `  appears more than once` names nothing.
-        Received: `${[...new Set(seen)].map((name) => JSON.stringify(name)).join(", ")} appears more than once`,
-        Expected: "one column per name, since a row is keyed by name",
-        Source: "the column row of the sheet, or the select list of its query",
-        Fix: "rename one of them in the sheet, or alias one in the query, e.g. select a, b as b2",
-      }),
+    bad(400, `Sheet ${sheet_id} has two columns with the same name.`, {
+      // Quoted, because the commonest pair is two columns nobody has named
+      // yet, and `  appears more than once` names nothing.
+      Received: `${[...new Set(seen)].map((name) => JSON.stringify(name)).join(", ")} appears more than once`,
+      Expected: "one column per name, since a row is keyed by name",
+      Source: "the column row of the sheet, or the select list of its query",
+      Fix: "rename one of them in the sheet, or alias one in the query, e.g. select a, b as b2",
     });
   }
   return rows.map((row) => Object.fromEntries(cols.map((col) => [col.name, row[col.key] ?? null])));
@@ -4631,13 +4459,11 @@ const EXPORTS: Record<string, { mime: string; render: (id: string, cols: Col[], 
     render: (id, cols, rows) => {
       const when = cols.find((col) => DATE_TYPES.includes(String(col.type)));
       if (!when) {
-        throw new HTTPException(400, {
-          message: explain(`Sheet ${id} has no date column to build a calendar from.`, {
-            Received: cols.map((col) => `${col.name} (${JSON.stringify(col.type)})`).join(", ") || "(no columns)",
-            Expected: `one column typed ${DATE_TYPES.join(", ")}`,
-            Source: "the column row of the sheet",
-            Fix: "set a column's type to date, then export .ics again",
-          }),
+        bad(400, `Sheet ${id} has no date column to build a calendar from.`, {
+          Received: cols.map((col) => `${col.name} (${JSON.stringify(col.type)})`).join(", ") || "(no columns)",
+          Expected: `one column typed ${DATE_TYPES.join(", ")}`,
+          Source: "the column row of the sheet",
+          Fix: "set a column's type to date, then export .ics again",
         });
       }
       const title = cols.find((col) => col.key !== when.key && String(col.type) === "text") ?? when;
@@ -4679,9 +4505,11 @@ app.get(`/export/:id{.+\\.(${Object.keys(EXPORTS).join("|")})}`, async (c) => {
   const { data } = await sheet(c, sheet_id, { limit: "100000", ...c.req.query() });
   const [colsRow, ...rows] = data;
   if (!colsRow) {
-    throw new HTTPException(400, {
-      message:
-        `Expected sheet ${sheet_id} to have a column row, received a document with no rows at all. Source: data[0] of the automerge document. Add a column before exporting.`,
+    bad(400, `That sheet has no columns to export.`, {
+      Expected: `sheet ${sheet_id} to have a column row`,
+      Received: "a document with no rows at all",
+      Source: "data[0] of the automerge document",
+      Fix: "add a column before exporting",
     });
   }
   const { mime, render } = EXPORTS[format];
@@ -4710,15 +4538,13 @@ app.post("/sheet/:id", async (c) => {
   // from somewhere else, and a net sheet's arrive signed over POST /net/:id --
   // appending to either would be writing into an answer, not into a sheet.
   if (type !== "table") {
-    throw new HTTPException(400, {
-      message: explain(`Sheet ${sheet_id} has no rows of its own to append to.`, {
-        Received: `a ${type} sheet`,
-        Expected: "a table sheet",
-        Source: "the type prefix of the sheet id",
-        Fix: type?.startsWith("net-")
-          ? `send a signed delivery to POST /net/${sheet_id} instead`
-          : "append to the table this sheet reads from instead",
-      }),
+    bad(400, `Sheet ${sheet_id} has no rows of its own to append to.`, {
+      Received: `a ${type} sheet`,
+      Expected: "a table sheet",
+      Source: "the type prefix of the sheet id",
+      Fix: type?.startsWith("net-")
+        ? `send a signed delivery to POST /net/${sheet_id} instead`
+        : "append to the table this sheet reads from instead",
     });
   }
   // Owner or editor, read the way sync reads it, so the two paths cannot
@@ -4726,52 +4552,47 @@ app.post("/sheet/:id", async (c) => {
   // all on a public sheet, can read this sheet and must not append to it.
   const role = await syncRole({ usr_id: c.get("usr_id") ?? null, share: null }, doc_id);
   if (role !== "owner" && role !== "editor") {
-    throw new HTTPException(403, {
-      message: explain(`You do not have write access to ${sheet_id}.`, {
-        Received: role ? `your role on this sheet is ${role}` : "you have no role on this sheet",
-        Expected: "role owner or editor",
-        Source: "sheet_usr.role, the same read the sync socket makes",
-        Fix: `ask an owner to run POST /library/${sheet_id}/share with your email and role editor`,
-      }),
+    bad(403, `You do not have write access to ${sheet_id}.`, {
+      Received: role ? `your role on this sheet is ${role}` : "you have no role on this sheet",
+      Expected: "role owner or editor",
+      Source: "sheet_usr.role, the same read the sync socket makes",
+      Fix: `ask an owner to run POST /library/${sheet_id}/share with your email and role editor`,
     });
   }
   const { rows } = await c.req.json().catch(() => ({} as Record<string, unknown>));
   if (!Array.isArray(rows) || !rows.length) {
-    throw new HTTPException(400, {
-      message: explain(`That is not a batch of rows to append to ${sheet_id}.`, {
-        Received: Array.isArray(rows) ? "an empty rows array" : `a ${typeof rows} rows field`,
-        Expected: `{"rows":[{...}]}, each row an object keyed by column name`,
-        Source: "the rows field of the request body",
-        Fix: `read the shape this sheet takes from GET /openapi/${sheet_id}`,
-      }),
+    bad(400, `That is not a batch of rows to append to ${sheet_id}.`, {
+      Received: Array.isArray(rows) ? "an empty rows array" : `a ${typeof rows} rows field`,
+      Expected: `{"rows":[{...}]}, each row an object keyed by column name`,
+      Source: "the rows field of the request body",
+      Fix: `read the shape this sheet takes from GET /openapi/${sheet_id}`,
     });
   }
   if (rows.length > APPEND_ROWS_MAX) {
-    throw new HTTPException(413, {
-      message: explain(`That is more rows than one append may carry.`, {
-        Received: `${rows.length} rows`,
-        Expected: `at most ${APPEND_ROWS_MAX} rows per request`,
-        Source: "the rows field of the request body",
-        Fix: `send it in batches of ${APPEND_ROWS_MAX}, or import the whole file with POST /import/csv`,
-      }),
+    bad(413, `That is more rows than one append may carry.`, {
+      Received: `${rows.length} rows`,
+      Expected: `at most ${APPEND_ROWS_MAX} rows per request`,
+      Source: "the rows field of the request body",
+      Fix: `send it in batches of ${APPEND_ROWS_MAX}, or import the whole file with POST /import/csv`,
     });
   }
   const hand = await automerge.find<{ type: string; data: Table }>(doc_id as AnyDocumentId).catch(() => {
-    throw new HTTPException(404, {
-      message:
-        `Expected an automerge document for sheet ${sheet_id}, received none. Source: doc_id ${doc_id}. The sheet row exists but its document is missing or unreadable; re-create the sheet, or claim it again with PUT /library/${sheet_id}.`,
+    bad(404, `Sheet ${sheet_id} has a row but no document.`, {
+      Expected: "an automerge document",
+      Received: "none",
+      Source: `doc_id ${doc_id}`,
+      Fix:
+        `the document is missing or unreadable; re-create the sheet, or claim it again with PUT /library/${sheet_id}`,
     });
   });
   const [colsRow] = hand.doc().data;
   const cols = Object.values(colsRow ?? {}) as Col[];
   if (!cols.length) {
-    throw new HTTPException(400, {
-      message: explain(`Sheet ${sheet_id} has no columns to append under.`, {
-        Received: "a document whose first row names no columns",
-        Expected: "a column row, which is data[0] of the document",
-        Source: "the automerge document",
-        Fix: "add a column in the sheet first, then append",
-      }),
+    bad(400, `Sheet ${sheet_id} has no columns to append under.`, {
+      Received: "a document whose first row names no columns",
+      Expected: "a column row, which is data[0] of the document",
+      Source: "the automerge document",
+      Fix: "add a column in the sheet first, then append",
     });
   }
   const names = cols.map((col) => col.name);
@@ -4780,41 +4601,35 @@ app.post("/sheet/:id", async (c) => {
   // stops at, and the row as sent.
   for (const [i, row] of rows.entries()) {
     if (!row || typeof row !== "object" || Array.isArray(row)) {
-      throw new HTTPException(400, {
-        message: explain(`Row ${i + 1} of the request is not an object.`, {
-          Received: Array.isArray(row) ? `an array: ${JSON.stringify(row).slice(0, 200)}` : `${JSON.stringify(row)}`,
-          Expected: `an object keyed by column name: ${names.join(", ")}`,
-          Source: `rows[${i}] of the request body`,
-          Fix: "key each row by the column names, not by position",
-        }),
+      bad(400, `Row ${i + 1} of the request is not an object.`, {
+        Received: Array.isArray(row) ? `an array: ${JSON.stringify(row).slice(0, 200)}` : `${JSON.stringify(row)}`,
+        Expected: `an object keyed by column name: ${names.join(", ")}`,
+        Source: `rows[${i}] of the request body`,
+        Fix: "key each row by the column names, not by position",
       });
     }
     const keys = Object.keys(row);
     const missing = names.filter((name) => !(name in row));
     const extra = keys.filter((key) => !names.includes(key));
     if (missing.length || extra.length) {
-      throw new HTTPException(400, {
-        message: explain(`Row ${i + 1} of the request does not match the sheet's columns.`, {
-          Expected: `${names.length} fields: ${names.join(", ")}`,
-          Received: `${keys.length} fields: ${JSON.stringify(row).slice(0, 200)}`,
-          Column: missing.length ? `nothing for "${missing[0]}"` : `an extra field "${extra[0]}"`,
-          Source: `rows[${i}] of the request body`,
-          Fix: missing.length
-            ? `send every column, with null for the ones you have no value for`
-            : `drop "${extra[0]}", or add a column of that name to the sheet`,
-        }),
+      bad(400, `Row ${i + 1} of the request does not match the sheet's columns.`, {
+        Expected: `${names.length} fields: ${names.join(", ")}`,
+        Received: `${keys.length} fields: ${JSON.stringify(row).slice(0, 200)}`,
+        Column: missing.length ? `nothing for "${missing[0]}"` : `an extra field "${extra[0]}"`,
+        Source: `rows[${i}] of the request body`,
+        Fix: missing.length
+          ? `send every column, with null for the ones you have no value for`
+          : `drop "${extra[0]}", or add a column of that name to the sheet`,
       });
     }
     for (const name of names) {
       const val = (row as Row)[name];
       if (val === null || ["string", "number", "boolean"].includes(typeof val)) continue;
-      throw new HTTPException(400, {
-        message: explain(`Row ${i + 1}, column "${name}" holds a value no cell can hold.`, {
-          Received: `a ${Array.isArray(val) ? "array" : typeof val}: ${JSON.stringify(val ?? null).slice(0, 200)}`,
-          Expected: "a string, a number, a boolean, or null",
-          Source: `rows[${i}]["${name}"] of the request body`,
-          Fix: "send it as a string; a json column holds the JSON text, the way the net read casts jsonb to text",
-        }),
+      bad(400, `Row ${i + 1}, column "${name}" holds a value no cell can hold.`, {
+        Received: `a ${Array.isArray(val) ? "array" : typeof val}: ${JSON.stringify(val ?? null).slice(0, 200)}`,
+        Expected: "a string, a number, a boolean, or null",
+        Source: `rows[${i}]["${name}"] of the request body`,
+        Fix: "send it as a string; a json column holds the JSON text, the way the net read casts jsonb to text",
       });
     }
   }
@@ -4825,7 +4640,7 @@ app.post("/sheet/:id", async (c) => {
   try {
     checkColumnTypes(sheet_id, cols, rows as Row[]);
   } catch (err) {
-    throw new HTTPException(400, { message: err instanceof Error ? err.message : String(err) });
+    throw new HTTPException(400, { message: reason(err) });
   }
   // All or nothing. Every row is checked above and the append is one change,
   // because automerge cannot roll a change back: a batch half-written under a
@@ -4964,10 +4779,11 @@ app.get("/net/:id", async (c) => {
     ? id
     : await sql`select sheet_id from sheet where doc_id = ${id}`.then(([s]: [{ sheet_id: string }?]) => s?.sheet_id);
   if (!sheet_id) {
-    throw new HTTPException(404, {
-      message: `Expected a net sheet id or doc_id, received ${
-        JSON.stringify(id)
-      }, which matches no sheet. Source: the sheet table. Pass the full id, e.g. net-hook:abc123.`,
+    bad(404, `No net sheet answers to that.`, {
+      Expected: "a net sheet id or doc_id",
+      Received: show(id),
+      Source: "the sheet table",
+      Fix: "pass the full id, e.g. net-hook:abc123",
     });
   }
   return page(c)(await sheet(c, sheet_id, c.req.query()));
@@ -5005,8 +4821,14 @@ const codexRun = async (sheet_id: string, started: number, status: number, body:
 };
 
 app.get("/codex/:id", async (c) => {
-  if (!rateLimit(`codex:${c.get("usr_id")}`))
-    throw new HTTPException(429, { message: "Too many codex queries. Please slow down." });
+  if (!rateLimit(`codex:${c.get("usr_id")}`)) {
+    bad(429, `Too many codex queries from this account.`, {
+      Expected: `a burst of at most ${RATE_LIMIT_MAX_TOKENS}, refilling at ${RATE_LIMIT_REFILL_RATE} per second`,
+      Received: "one query past that",
+      Source: `the codex budget for usr ${c.get("usr_id")}`,
+      Fix: "wait a second and ask again",
+    });
+  }
   const sheet_id = c.req.param("id");
   const [type, _doc_id] = sheet_id.split(":");
   // Before the clock starts, because a caller with no share on this sheet is
@@ -5019,8 +4841,11 @@ app.get("/codex/:id", async (c) => {
       case "codex-db": {
         const [db] = await sql`select dsn from db where sheet_id = ${sheet_id}`;
         if (!db) {
-          throw new HTTPException(400, {
-            message: `No DSN found.`,
+          bad(400, `That codex sheet is not connected to anything.`, {
+            Expected: `a stored dsn for ${sheet_id}`,
+            Received: "no row",
+            Source: "the db table",
+            Fix: "save a connection string with PUT /codex/:id first",
           });
         }
         db.dsn = await decrypt("connection string", db.dsn);
@@ -5032,16 +4857,21 @@ app.get("/codex/:id", async (c) => {
           const blockedHosts = ["localhost", "127.0.0.1", "0.0.0.0", "::1"];
           const appHost = blockedHosts.includes(app_.hostname) ? "127.0.0.1" : app_.hostname;
           const extHost = blockedHosts.includes(ext.hostname) ? "127.0.0.1" : ext.hostname;
-          if (extHost === appHost && (ext.port || "5432") === (app_.port || "5432"))
-            throw new HTTPException(403, { message: "Cannot connect to this database." });
+          if (extHost === appHost && (ext.port || "5432") === (app_.port || "5432")) {
+            bad(403, `A codex cannot point at this server's own database.`, {
+              Expected: "a host other than this server's own",
+              Received: `${extHost}:${ext.port || "5432"}`,
+              Source: "the dsn stored for this codex sheet",
+              Fix: "point it at an external database",
+            });
+          }
         } catch (e) {
           if (e instanceof HTTPException) throw e;
-          throw new HTTPException(400, {
-            message: `Expected a parseable postgres DSN, received one that failed to parse: ${
-              e instanceof Error ? e.message : String(e)
-            }. Source: the dsn stored for ${
-              c.req.param("id")
-            }. Re-save it as postgresql://user:password@host:port/database.`,
+          bad(400, `That connection string will not parse.`, {
+            Expected: "a postgres DSN",
+            Received: reason(e),
+            Source: `the dsn stored for ${c.req.param("id")}`,
+            Fix: "re-save it as postgresql://user:password@host:port/database",
           });
         }
         const sql_ = pg(db.dsn, {
@@ -5118,8 +4948,11 @@ app.get("/codex/:id", async (c) => {
         );
       }
       default:
-        throw new HTTPException(400, {
-          message: `Unrecognized codex type: ${type}`,
+        bad(400, `That is not a codex this server can open.`, {
+          Expected: "codex-db",
+          Received: show(type),
+          Source: `the type prefix on sheet id ${sheet_id}`,
+          Fix: "fix the type prefix on the id",
         });
     }
   } catch (err) {
@@ -5131,7 +4964,7 @@ app.get("/codex/:id", async (c) => {
         sheet_id,
         started,
         err instanceof HTTPException ? err.status : 500,
-        err instanceof Error ? err.message : String(err),
+        reason(err),
       );
     }
     throw err;
@@ -5167,10 +5000,11 @@ app.get("/codex/:id/connect", async (c) => {
   `;
 
   if (!access) {
-    throw new HTTPException(403, {
-      message: `Expected membership of codex-${type}:${doc_id} for usr ${
-        c.get("usr_id")
-      }, received none. Source: sheet_usr. Ask an owner to share the codex with you.`,
+    bad(403, `That codex is not shared with you.`, {
+      Expected: `membership of codex-${type}:${doc_id} for usr ${c.get("usr_id")}`,
+      Received: "no row",
+      Source: "sheet_usr membership",
+      Fix: "ask an owner to share the codex with you",
     });
   }
 
@@ -5216,10 +5050,11 @@ app.get("/codex/:id/callback", (c) => {
   const { provider, code, state: _state } = c.req.query();
 
   if (!provider || !code) {
-    throw new HTTPException(400, {
-      message: `Expected both "provider" and "code" query parameters, received provider=${
-        JSON.stringify(provider ?? null)
-      } code=${code ? "(present)" : "(missing)"}. Start the flow at GET /codex/:id/connect.`,
+    bad(400, `That callback is missing half of what it needs.`, {
+      Expected: `both "provider" and "code" query parameters`,
+      Received: `provider=${JSON.stringify(provider ?? null)} code=${code ? "(present)" : "(missing)"}`,
+      Source: "this request's query string",
+      Fix: "start the flow at GET /codex/:id/connect",
     });
   }
 
@@ -5241,102 +5076,14 @@ app.get("/portal/:id", async (c) => {
       and su.sheet_id = ${"portal:" + c.req.param("id")}
   `;
   if (!sheet_) {
-    throw new HTTPException(404, {
-      message: `Expected a purchased portal for usr ${c.get("usr_id")}, received none for portal:${
-        c.req.param("id")
-      }. Source: your sheet_usr rows joined to the seller's listing. Buy it with POST /buy/:sell_id first.`,
+    bad(404, `You have not bought that portal.`, {
+      Expected: `a purchased portal for usr ${c.get("usr_id")}`,
+      Received: `none for portal:${c.req.param("id")}`,
+      Source: "your sheet_usr rows joined to the seller's listing",
+      Fix: "buy it with POST /buy/:sell_id first",
     });
   }
   return page(c)(await sheet(c, sheet_.sheet_id, c.req.query()));
-});
-
-app.get("/stats/:id", async (c) => {
-  const sheet_id = c.req.param("id");
-  const sheetData = await sheet(c, sheet_id, c.req.query());
-  const [colsRow, ...rows] = sheetData.data;
-  const cols = Object.values(colsRow) as Col[];
-
-  // Compute statistics for each column
-  const stats = cols.map((col) => {
-    const values = rows.map((row) => row[col.key]).filter((v) => v != null);
-    const numericValues = values
-      .map((v) => (typeof v === "number" ? v : parseFloat(String(v))))
-      .filter((n) => !isNaN(n));
-
-    const isNumeric = numericValues.length > values.length / 2;
-
-    if (isNumeric && numericValues.length > 0) {
-      const sum = numericValues.reduce((a, b) => a + b, 0);
-      const min = Math.min(...numericValues);
-      const max = Math.max(...numericValues);
-      const mean = sum / numericValues.length;
-      const sorted = [...numericValues].sort((a, b) => a - b);
-      const median = sorted[Math.floor(sorted.length / 2)];
-
-      return {
-        column: col.name,
-        type: "numeric",
-        count: numericValues.length,
-        null_count: rows.length - values.length,
-        min,
-        max,
-        sum,
-        mean,
-        median,
-      };
-    } else {
-      // Text/categorical stats
-      const lengths = values.map((v) => String(v).length);
-      const histogram: Record<string, number> = {};
-      for (const v of values) {
-        const key = String(v).slice(0, 100); // Truncate long values
-        histogram[key] = (histogram[key] || 0) + 1;
-      }
-
-      // Get top 10 most frequent values
-      const topValues = Object.entries(histogram)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 10)
-        .map(([value, count]) => ({ value, count }));
-
-      return {
-        column: col.name,
-        type: "text",
-        count: values.length,
-        null_count: rows.length - values.length,
-        unique_count: Object.keys(histogram).length,
-        min_length: lengths.length ? Math.min(...lengths) : 0,
-        max_length: lengths.length ? Math.max(...lengths) : 0,
-        avg_length: lengths.length ? lengths.reduce((a, b) => a + b, 0) / lengths.length : 0,
-        top_values: topValues,
-      };
-    }
-  });
-
-  // Format as a table
-  const statsCols = [
-    { name: "column", type: "text", key: "column" },
-    { name: "type", type: "text", key: "type" },
-    { name: "count", type: "int", key: "count" },
-    { name: "null_count", type: "int", key: "null_count" },
-    { name: "unique_count", type: "int", key: "unique_count" },
-    { name: "min", type: "text", key: "min" },
-    { name: "max", type: "text", key: "max" },
-    { name: "mean", type: "text", key: "mean" },
-    { name: "top_values", type: "json", key: "top_values" },
-  ];
-
-  return c.json({
-    data: [
-      arrayify(statsCols),
-      ...stats.map((s) => ({
-        ...s,
-        min: s.type === "numeric" ? s.min : s.min_length,
-        max: s.type === "numeric" ? s.max : s.max_length,
-        mean: s.type === "numeric" ? s.mean?.toFixed(2) : s.avg_length?.toFixed(1),
-      })),
-    ],
-  }, 200);
 });
 
 // --- mcp
@@ -5373,28 +5120,24 @@ const mcpTools: Record<string, McpTool> = {
     },
   },
   query_sheet: {
-    description: "Run SQL (AlaSQL dialect; reference sheets as @type:doc_id) or PRQL.",
+    description: "Run SQL (AlaSQL dialect; reference sheets as @type:doc_id).",
     inputSchema: {
       type: "object",
       required: ["code"],
       properties: {
-        lang: { type: "string", enum: ["sql", "prql"], default: "sql" },
         code: { type: "string" },
       },
     },
     handler: async (c, args) => {
       if (typeof args.code !== "string") {
-        throw new HTTPException(400, {
-          message: `query_sheet needs a "code" string, got: ${JSON.stringify(args.code)}`,
+        bad(400, `query_sheet has nothing to run.`, {
+          Expected: `a "code" string`,
+          Received: show(args.code),
+          Source: "the tool call's arguments",
+          Fix: `pass {"code": "select 1"}`,
         });
       }
-      const lang = args.lang ?? "sql";
-      if (lang !== "sql" && lang !== "prql") {
-        throw new HTTPException(400, {
-          message: `query_sheet lang must be "sql" or "prql", got: ${JSON.stringify(lang)}`,
-        });
-      }
-      const { data, count } = await querify(c, { lang, code: args.code, args: [] }, {});
+      const { data, count } = await querify(c, { lang: "sql", code: args.code, args: [] }, {});
       const [cols, ...rows] = data;
       return { cols: Object.values(cols), rows, count };
     },
@@ -5441,21 +5184,49 @@ const mcpTools: Record<string, McpTool> = {
     handler: async (c, args) => {
       const sheet_id = mcpSheetId(c, args);
       const [type, doc_id] = sheet_id.split(":");
-      if (type !== "table")
-        throw new HTTPException(400, { message: `write_cells only works on table sheets, got: ${sheet_id}` });
-      if (!Array.isArray(args.cells) || !args.cells.length)
-        throw new HTTPException(400, { message: `write_cells needs a non-empty "cells" array.` });
+      if (type !== "table") {
+        bad(400, `Only a table sheet has cells to write.`, {
+          Expected: "a table sheet",
+          Received: sheet_id,
+          Source: "the type prefix on that sheet id",
+          Fix: "point write_cells at a table: sheet, or edit the query behind a computed one",
+        });
+      }
+      if (!Array.isArray(args.cells) || !args.cells.length) {
+        bad(400, `write_cells has nothing to write.`, {
+          Expected: `a non-empty "cells" array`,
+          Received: show(args.cells ?? null),
+          Source: "the tool call's arguments",
+          Fix: `pass {"cells": [{"row": 0, "col": "name", "value": "x"}]}`,
+        });
+      }
       await assertSheetAccess(c, sheet_id);
       const hand = await automerge.find<{ type: string; data: Table }>(doc_id as AnyDocumentId).catch(() => {
-        throw new HTTPException(404, {
-          message:
-            `Expected an automerge document for sheet ${sheet_id}, received none. Source: doc_id ${doc_id}. List the sheets you can reach with the list_sheets tool.`,
+        bad(404, `Sheet ${sheet_id} has a row but no document.`, {
+          Expected: "an automerge document",
+          Received: "none",
+          Source: `doc_id ${doc_id}`,
+          Fix: "list the sheets you can reach with the list_sheets tool",
         });
       });
       const doc = hand.doc();
-      if (!doc?.data) throw new HTTPException(500, { message: `Sheet ${sheet_id} has no data.` });
+      if (!doc?.data) {
+        bad(500, `That document holds no rows at all.`, {
+          Expected: `a data array on sheet ${sheet_id}`,
+          Received: "nothing",
+          Source: `the automerge document ${doc_id}`,
+          Fix: "re-create the sheet; the document is corrupt",
+        });
+      }
       const [colsRow, ...rows] = doc.data;
-      if (!colsRow) throw new HTTPException(500, { message: `Sheet ${sheet_id} has no columns row.` });
+      if (!colsRow) {
+        bad(500, `That document has rows under no columns.`, {
+          Expected: `a column row at data[0] of sheet ${sheet_id}`,
+          Received: "nothing",
+          Source: `the automerge document ${doc_id}`,
+          Fix: "add a column before writing cells",
+        });
+      }
       const cols = Object.values(colsRow);
       // Validate every cell before mutating anything: no partial writes.
       const writes: { rowIndex: number; key: string | number; value: unknown }[] = [];
@@ -5463,36 +5234,44 @@ const mcpTools: Record<string, McpTool> = {
         const { row, col, value } = cell as { row: unknown; col: unknown; value: unknown };
         const target = cols.find((x) => x.key === col) ?? cols.find((x) => x.name === col);
         if (!target) {
-          throw new HTTPException(400, {
-            message: `cells[${i}]: no column ${JSON.stringify(col)}. Columns: ` +
-              cols.map((x) => `${x.name} (key ${JSON.stringify(x.key)})`).join(", "),
+          bad(400, `That sheet has no such column.`, {
+            Expected: cols.map((x) => `${x.name} (key ${JSON.stringify(x.key)})`).join(", "),
+            Received: show(col),
+            Source: `cells[${i}] of this tool call`,
+            Fix: "name a column by its name or its key",
           });
         }
         if (typeof row !== "number" || !Number.isInteger(row) || row < 0 || row > rows.length) {
-          throw new HTTPException(400, {
-            message: `cells[${i}]: row ${JSON.stringify(row)} is out of range. The sheet has ${rows.length} rows` +
-              ` (row ${rows.length} appends one new row).`,
+          bad(400, `That row is outside the sheet.`, {
+            Expected:
+              `a whole number from 0 to ${rows.length}, since the sheet has ${rows.length} rows and row ${rows.length} appends one`,
+            Received: show(row),
+            Source: `cells[${i}] of this tool call`,
+            Fix: "read the sheet first, then write within its row count",
           });
         }
         if (typeof target.type !== "string") {
-          throw new HTTPException(400, {
-            message:
-              `cells[${i}]: column ${target.name} has a structured type; write_cells only writes scalar columns.`,
+          bad(400, `That column does not hold a scalar.`, {
+            Expected: "a column of a scalar type",
+            Received: `column ${target.name}, which has a structured type`,
+            Source: `cells[${i}] of this tool call`,
+            Fix: "write_cells only writes scalar columns; edit a structured column in the page",
           });
         }
         const t = target.type;
-        const bad = ["num", "int", "float", "usd", "percentage"].includes(t)
+        const mismatched = ["num", "int", "float", "usd", "percentage"].includes(t)
           ? typeof value !== "number" || (t === "int" && !Number.isInteger(value))
           : t === "bool"
           ? typeof value !== "boolean"
           : t === "json"
           ? value === undefined
           : typeof value !== "string";
-        if (bad) {
-          throw new HTTPException(400, {
-            message: `cells[${i}] (row ${row}, ${target.name}): expected ${t}, got ${typeof value} ${
-              JSON.stringify(value)
-            }`,
+        if (mismatched) {
+          bad(400, `That value does not match the column it is written to.`, {
+            Expected: `${t}, which column ${target.name} declares`,
+            Received: `${typeof value} ${JSON.stringify(value)}`,
+            Source: `cells[${i}] of this tool call, row ${row}`,
+            Fix: `send a ${t}, or change the column's type first`,
           });
         }
         writes.push({ rowIndex: row, key: target.key, value });
@@ -5514,10 +5293,21 @@ app.post("/mcp/:id", async (c) => {
     method?: string;
     params?: { name?: string; arguments?: Record<string, unknown>; protocolVersion?: string };
   } = await c.req.json().catch(() => {
-    throw new HTTPException(400, { message: "MCP requests must be JSON." });
+    bad(400, `That is not a request this endpoint can read.`, {
+      Expected: "a JSON body",
+      Received: "something that would not parse",
+      Source: "the request body",
+      Fix: "post JSON-RPC 2.0 with Content-Type: application/json",
+    });
   });
-  if (msg?.jsonrpc !== "2.0")
-    throw new HTTPException(400, { message: `Expected JSON-RPC 2.0, got: ${JSON.stringify(msg?.jsonrpc)}` });
+  if (msg?.jsonrpc !== "2.0") {
+    bad(400, `That is not JSON-RPC 2.0.`, {
+      Expected: `"2.0"`,
+      Received: show(msg?.jsonrpc),
+      Source: `the "jsonrpc" field of the request body`,
+      Fix: `send {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}`,
+    });
+  }
   if (msg.id === undefined) return c.body(null, 202);
   const rpc = (result: unknown) => c.json({ jsonrpc: "2.0", id: msg.id, result });
   const rpcErr = (code: number, message: string) => c.json({ jsonrpc: "2.0", id: msg.id, error: { code, message } });

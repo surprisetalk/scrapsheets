@@ -62,7 +62,6 @@
     "@std/assert": "jsr:@std/assert@^1.0.19",
     "jsdom": "npm:jsdom@^26.1.0",
     "alasql": "npm:alasql@^4.17.3",
-    "prql-js": "npm:prql-js@^0.12.1",
     "elm": "npm:elm@0.19.2-0",
     "elm-format": "npm:elm-format@^0.8.8",
     "elm-review": "npm:elm-review@^2.13.5",

@@ -32,117 +32,6 @@ The next things to build, in this order.
 
 ---
 
-## Rewrite
-
-No new capability and no user-visible change: every item here is a deletion or a de-duplication, and every one ends with
-`deno task test` green and `deno task review` clean. Ordered lowest-hanging first. Nothing needs a decision except where
-one is written into the item.
-
-- [ ] **Nothing in the tree is unreachable.** Dead code is read as if it ran, and each of these has been read that way
-      at least once.
-  1. `GET /stats/:id` has no caller —
-     `grep -rn 'stats/' --include='*.ts' --include='*.mjs' --include='*.html' --include='*.elm' .` finds its own
-     definition and two comments. It re-guesses a column's type from more than half its values parsing, which is the
-     coercion `checkColumnTypes()` exists to refuse, and it answers what `describe @sheet` already answers correctly.
-     Delete the route, its `statsCols` table, and the sentence about it in `claude.md`.
-  2. `CHART_KINDS` in `src/sql.mjs` is exported and read nowhere. `chartSql()` does not consult it and the page does not
-     import it, so the list of kinds a chart may have is enforced nowhere it claims to be. Delete it, or make
-     `chartSql()` refuse a kind that is not in it — do not leave a constant that looks like a check.
-  3. `checkRefPath`, `MAX_QUERY_ROWS`, `MAX_REF_DEPTH` and `SELECT_TYPES` carry `export` and are used only inside
-     `src/sql.mjs`. Drop the keyword; keep the values.
-  4. The commented-out constructors above `type Type` in `src/Main.elm` name `Date`, `Link` and `Image`, which the live
-     union below them already has. Delete the block.
-  5. `Lang` in `src/Main.elm` is write-only. `langDecoder` builds it, no `case` anywhere reads it, and the one
-     `queryDoc` send and the one `newDoc` that names a lang both hardcode `"sql"`. Its whole effect is to refuse a query
-     sheet whose `lang` is not one of five strings, three of which run nothing anywhere. Delete `Lang`, `langs` and
-     `langDecoder`; the field stays the string the server reads. `Formula` and `Scrapscript` keep their place under
-     **Scrapscript** as items, which is where an unbuilt thing belongs — a constructor is not a plan.
-  6. Decide about PRQL, and write the answer here before touching it. `prql-js` is a WASM dependency carried for one
-     branch of `querify()`, one assertion in `main_test.ts`, and zero bundled examples; with `Lang` gone the page cannot
-     ask for it at all. Either delete the branch, the dependency and the `"prql"` arm of `Query["lang"]`, or ship one
-     bundled PRQL example so the second language is exercised by `examples_test.ts` like every other claim. Deleting is
-     the default: removal needs no justification and a second query language does.
-
-- [ ] **One fact has one spelling.** Each of these is a value written down twice or more, and the copies are free to
-      drift because nothing compares them.
-  1. `API_BASE` in `src/page.mjs` is exported and imported nowhere, while `src/index.html` spells the host out by hand
-     and `src/Main.elm` does too: `grep -rn 'api.sheets.scrap.land' src/`. Import it in `index.html`, and hand Elm the
-     base through the flags record it already takes, so the shop url, the csv export link and the net-hook url stop
-     being three literals.
-  2. The `scrapsheets-*` localStorage keys and the `JSON.parse(localStorage.getItem(k) ?? "{}")` around them repeat
-     through `src/index.html`. One read/write pair beside `Library`, keyed by name.
-  3. `closeParen()` and `closeAt()` in `src/sql.mjs` are the same loop, and the comment above the second one says so.
-     `closeParen` becomes `const i = closeAt(...)` plus the throw; the difference between them is the throw, which is
-     the only part worth writing twice and now is not.
-  4. `typeWidthPx` and `typeWidth` in `src/Main.elm` are one table of numbers in two units. Keep the px table and derive
-     the rem attribute from it, so a column width cannot be changed in one and missed in the other.
-  5. `typeName`, `typeAlign` and `typeWidth` are three `case` statements over one union, and two of them end in `_ ->`.
-     A new column type therefore compiles, renders left-aligned at the default width, and says nothing. One
-     `spec : Type -> { name : String, align : ..., px : Int }` with no wildcard: adding a constructor then fails to
-     compile, which is the point. `cellDecoder` stays as it is — it produces `Html` per cell and is not the same table.
-
-- [ ] **A refusal is one call, and every refusal carries its four fields.** Compare
-      `grep -c 'throw new HTTPException' main.ts` with `grep -c 'message: explain(' main.ts`: fewer than half of them
-      state expected, received, source and fix, and all of them spend three lines on the same ritual.
-  1. `bad(status, headline, fields)` in `main.ts` beside the imported `explain()`: it formats the block and throws the
-     `HTTPException`.
-  2. Rewrite every `throw new HTTPException(4xx, { message: explain(...) })` as one `bad(...)`.
-  3. What is left is exactly the refusals that never had the four fields, now visibly the odd ones out. Give each one
-     its fields. A vague message outranks the bug behind it.
-  4. `err instanceof Error ? err.message : String(err)` repeats as well; one `reason(err)` beside `bad()`.
-
-- [ ] **The suite finishes in seconds.** It is over the ten-second bound — `time deno task test` — and `page_test.ts` is
-      most of it.
-  1. `boot()` reads `dist/index.js` and `new Function()`-compiles it once per test, half a megabyte each time. Read and
-     compile once at module scope and `.call(scope)` per boot: the fresh `this` is the only part that has to be new,
-     which the comment there already says.
-  2. Measure the files apart, before and after:
-     `for f in *_test.ts; do printf '%s ' $f; /usr/bin/time -p deno test --allow-all $f 2>&1 | grep ^real; done` under
-     the three secrets `deno task test` sets.
-  3. If it is still over, the next cost is one JSDOM per test. Share one window and reset `localStorage` and the `#elm`
-     node between boots — but only then, and only if a shared window does not make one test's leftovers another test's
-     pass.
-
-- [ ] **A failing test names itself, and one test can be run alone.** `main_test.ts` is a single `Deno.test`:
-      `grep -c 't.step' main_test.ts` answers 0. The first failure hides every block after it, and `--filter` selects
-      all of them or none.
-  1. The prose comment above each block is already its name. Turn each block into
-     `await t.step("<that sentence>", async () => { ... })` and rename the parameter from `_t`.
-  2. The PGlite listener, `pglite.exec(dbSql)`, the operator address and `seed()` stay in the enclosing test, which is
-     what the steps share.
-  3. The tradeoff, stated upfront: steps run in order against one database, so a step still depends on what ran before
-     it. What this buys is a name in the failure and a working `--filter`, not isolation. Do not chase isolation after
-     starting — if a step turns out to need its own database, stop and revise this item.
-
-- [ ] **A reason is written once, beside the code it is about.** `grep -n 'oldest key' claude.md main.ts main_test.ts`
-      finds one fact in three files, and `claude.md` holds the longest copy of it. Three copies of a reason means two of
-      them are eventually wrong about code that changed.
-  1. `claude.md` keeps the map and only the map: what each file is, what each command does, what the schema holds, and
-     the invariants a change must not break.
-  2. Every paragraph in it explaining why one function is written the way it is moves into the comment above that
-     function, or is deleted where that comment already says it.
-  3. A test comment says what the test proves. The reason the code exists belongs with the code, not with its test.
-  4. `readme.md` stays what a stranger reads first, and stays short.
-
-- [ ] **No file needs `grep` to be read.** `main.ts` and `src/Main.elm` are both past the size a reader can hold, which
-      is the one case where splitting beats one file.
-  1. `update` in `src/Main.elm` is a third of that file. Split it by `Msg` family — document, auth, selection, share —
-     each `Msg -> Model -> ( Model, Cmd Msg )`, with `update` left as the dispatch. Same module: the exposing list is
-     already as wide as the tests need, and a second module would widen it again.
-  2. The seven `portal(...)` calls in `main.ts` are synthetic demo data with no server logic in them. Move the tick
-     functions to `src/portals.mjs`, beside `src/examples.mjs` where the rest of the bundled make-believe lives, and
-     have `PORTALS` in `src/page.mjs` read its names from there instead of listing them a second time. The `portal()`
-     wrapper and its `verifyWsAuth` call stay in `main.ts`, because that part is the server.
-  3. Then `main.ts` splits at the section comments it already has: polling (`pollNetOnce`, `pollAlertOnce`,
-     `sendDigestOnce` and their maps), status (`grade`, `status`, `POLL_OK`, `ALERT_OK`, `RUN_OF`, `RUN_OK`), and the
-     MCP endpoint. Each becomes a file `main.ts` imports and nothing else does.
-  4. The tension, stated upfront: every new file is a tax, and one file is the default. This is the exception the size
-     rule names, so take only the three cuts above and stop. If a fourth looks tempting, that is the signal to delete
-     something instead.
-  5. `deno task test` and `deno task review` are the gate. A move that needs a test edit is not a move.
-
----
-
 ## Query engine
 
 The single biggest gap. Most of the Demo Gallery dies here first.
@@ -702,17 +591,21 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
 
 The moat, and the reason the formula work below is shaped the way it is.
 
-- [ ] **A formula is a content-addressed program.** The `Scrapscript` and `Formula` lang types exist in `Main.elm` and
-      execute nothing.
+- [ ] **A formula is a content-addressed program.** Nothing exists. The `Lang` union that named `Scrapscript` and
+      `Formula` was deleted — it decoded five strings and read none of them, and a constructor is not a plan. A query
+      sheet's `lang` is now a plain string, and `querify()` refuses anything but `"sql"` by name, which is the one place
+      a second language has to be admitted.
   1. Compile the Scrapscript interpreter to WASM for browser execution.
-  2. Wire the `Scrapscript` lang type to run programs against sheet data.
+  2. Admit `"scrapscript"` in `querify()` and in `queryDoc`'s switch in `src/index.html`, and run programs against sheet
+     data. Both engines have to learn it together or a sheet means two things.
   3. `=#` in a cell triggers Scrapscript evaluation; `=` triggers the formula mode below.
   4. Cross-sheet references by hash rather than by the fragile `@sheet_id` string.
   5. Sell and share self-contained Scrapscript functions as composable sheet utilities — the saved-snippets item under
      **Query engine** is the seam this replaces.
 
 - [ ] **`=A1 + B1` works.** There is no formula evaluation at all.
-  1. A parser behind the `Formula` lang type: arithmetic, `SUM`, `AVERAGE`, `COUNT`, `MIN`, `MAX`.
+  1. A parser behind a `"formula"` lang, admitted in both engines the way the item above admits Scrapscript: arithmetic,
+     `SUM`, `AVERAGE`, `COUNT`, `MIN`, `MAX`.
   2. Cross-sheet references: `=@table:abc123.A1`. The cell-reference rewrite in `scanRefs()` is the same idea in SQL.
   3. Dependency tracking with a topological sort and cycle detection, reported as the path that closes it.
   4. Reactive recalculation when a referenced cell changes.

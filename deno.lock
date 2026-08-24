@@ -41,7 +41,6 @@
     "npm:esbuild@~0.25.10": "0.25.10",
     "npm:jsdom@^26.1.0": "26.1.0",
     "npm:pg-gateway@~0.3.0-beta.4": "0.3.0-beta.4",
-    "npm:prql-js@~0.12.1": "0.12.1",
     "npm:stripe@22.5.0": "22.5.0"
   },
   "jsr": {
@@ -2099,9 +2098,6 @@
         "sisteransi"
       ]
     },
-    "prql-js@0.12.1": {
-      "integrity": "sha512-YfhOkqi5G2Z8LW1pn5SVrC9icUA0Wgdxap5Z2AYIr+SwBakRz4M6SURVhr5rEMMQYjDtSYjSORNXcGcghOGzNQ=="
-    },
     "pump@3.0.4": {
       "integrity": "sha512-VS7sjc6KR7e1ukRFhQSY5LM2uBWAUPiOPa/A3mkKmiMwSmRFUITt0xuj+/lesgnCv+dPIEYlkzrcyXgquIHMcA==",
       "dependencies": [
@@ -2948,7 +2944,6 @@
       "npm:esbuild@~0.25.10",
       "npm:jsdom@^26.1.0",
       "npm:pg-gateway@~0.3.0-beta.4",
-      "npm:prql-js@~0.12.1",
       "npm:stripe@22.5.0"
     ]
   }

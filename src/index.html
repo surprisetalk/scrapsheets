@@ -31,6 +31,7 @@
       import { IndexedDBStorageAdapter } from "/automerge-repo-idb.mjs";
       import { BrowserWebSocketClientAdapter } from "/automerge-repo-ws.mjs";
       import {
+        API_BASE,
         docThumb,
         httpErrorDetail,
         httpFailure,
@@ -49,6 +50,8 @@
         register,
       } from "/sql.mjs";
       import alasql from "/alasql.mjs";
+      // The same host the fetches use, over the scheme a socket takes.
+      const WS_BASE = API_BASE.replace(/^http/, "ws");
       // Was a CDN <script> that defined a global. Keep the global so query code
       // and the browser tests can reach it the same way.
       globalThis.alasql = alasql;
@@ -63,6 +66,23 @@
         };
       }
 
+      // Everything this browser remembers, under one prefix and through one
+      // parse. `fallback` is what a missing or unparseable entry reads as: a
+      // page that will not load because one saved preference is corrupt is
+      // worse than one that forgets it.
+      const Stored = {
+        get: (name, fallback = {}) => {
+          try {
+            const raw = localStorage.getItem(`scrapsheets-${name}`);
+            return raw === null ? fallback : JSON.parse(raw);
+          } catch {
+            return fallback;
+          }
+        },
+        set: (name, value) => localStorage.setItem(`scrapsheets-${name}`, JSON.stringify(value)),
+        clear: (name) => localStorage.removeItem(`scrapsheets-${name}`),
+      };
+
       // Declared out here so the catch below can still reach it. Inside the try
       // it is out of scope exactly when the handler runs.
       let app;
@@ -70,14 +90,13 @@
         app = Elm.Main.init({
           node: document.getElementById("elm"),
           flags: {
-            tutorial: ((v) => (Number.isFinite(v) ? v : 0))(
-              parseInt(localStorage.getItem("scrapsheets-tutorial") ?? "0", 10),
-            ),
+            api: API_BASE,
+            tutorial: Stored.get("tutorial", 0),
           },
         });
 
         app.ports.saveTutorial.subscribe((n) =>
-          localStorage.setItem("scrapsheets-tutorial", String(n)),
+          Stored.set("tutorial", n),
         );
 
         // Debug logging - set localStorage.debug = 'scrapsheets' to enable verbose logging
@@ -110,34 +129,18 @@
           // Memoized: docThumb over the bundled datasets is too costly per call.
           cache: null,
           get: () =>
-            Library.cache ??= library(
-              JSON.parse(localStorage.getItem("scrapsheets-library") ?? "{}"),
-            ),
+            Library.cache ??= library(Stored.get("library")),
           // `stored`, not `library`: the imported library() builds the merged
           // shelf, and shadowing it here would be a trap for whoever edits next.
           set: (id, info) => {
             for (const i in info) if (info[i] === null) delete info[i];
-            const stored = JSON.parse(
-              localStorage.getItem("scrapsheets-library") ?? "{}",
-            );
-            localStorage.setItem(
-              "scrapsheets-library",
-              JSON.stringify({
-                ...stored,
-                [id]: { ...stored[id], ...info },
-              }),
-            );
+            const stored = Stored.get("library");
+            Stored.set("library", { ...stored, [id]: { ...stored[id], ...info } });
             Library.cache = null;
             app.ports.librarySynced.send(Library.get());
           },
           delete: (id) => {
-            const stored = JSON.parse(
-              localStorage.getItem("scrapsheets-library") ?? "{}",
-            );
-            localStorage.setItem(
-              "scrapsheets-library",
-              JSON.stringify({ ...stored, [id]: undefined }),
-            );
+            Stored.set("library", { ...Stored.get("library"), [id]: undefined });
             Library.cache = null;
             app.ports.librarySynced.send(Library.get());
           },
@@ -255,16 +258,7 @@
 
         {
           // Initialize the Automerge Repo with storage and network adapters
-          const getAuthToken = () => {
-            try {
-              const userData = JSON.parse(
-                localStorage.getItem("scrapsheets-user") || "{}",
-              );
-              return userData.jwt || null;
-            } catch {
-              return null;
-            }
-          };
+          const getAuthToken = () => Stored.get("user").jwt ?? null;
 
           // `library:freshness` is a sheet the server computes rather than
           // stores, and this is the same answer GET /sheet/library:freshness
@@ -278,7 +272,7 @@
             // Above the default page of 50. A truncated answer would report a
             // rotten feed as a sheet with no freshness at all.
             const res = await fetch(
-              "https://api.sheets.scrap.land/library/freshness?limit=1000",
+              `${API_BASE}/library/freshness?limit=1000`,
               { headers: { Authorization: `Bearer ${token}` } },
             );
             if (!res.ok)
@@ -310,7 +304,7 @@
             if (!token) {
               return app.ports.docErrored.send("Log in to share a sheet.");
             }
-            const api = `https://api.sheets.scrap.land/library/${id}`;
+            const api = `${API_BASE}/library/${id}`;
             const send = async (path, method, body) => {
               const res = await fetch(api + path, {
                 method,
@@ -368,7 +362,7 @@
               if (attempt > 0) {
                 await new Promise(r => setTimeout(r, 100 * Math.pow(2, attempt)));
               }
-              const res = await fetch(`https://api.sheets.scrap.land/library/${id}`, {
+              const res = await fetch(`${API_BASE}/library/${id}`, {
                 method: "PUT",
                 headers: {
                   "Content-Type": "application/json",
@@ -412,7 +406,7 @@
             ? prompt("This link is locked. Enter the password it was minted with:")
             : null;
           const syncUrl =
-            "wss://api.sheets.scrap.land/library/sync" +
+            WS_BASE + "/library/sync" +
             (token ? `?auth=Bearer%20${encodeURIComponent(token)}` : "") +
             (linkPass ? `&pass=${encodeURIComponent(linkPass)}` : "");
 
@@ -676,7 +670,7 @@
           let ws;
           let netInterval;
           const storedThumb = (id, doc) => {
-            if (JSON.parse(localStorage.getItem("scrapsheets-library") ?? "{}")[id])
+            if (Stored.get("library")[id])
               Library.set(id, { thumb: docThumb(doc) });
           };
           const storedThumbDebounced = debounce(storedThumb, 500);
@@ -728,7 +722,7 @@
               storedThumbDebounced(id, data.doc);
             });
             if (type === "portal") {
-              const portalUrl = `wss://api.sheets.scrap.land/${type}/${doc_id}/sync`;
+              const portalUrl = `${WS_BASE}/${type}/${doc_id}/sync`;
               let retries = 0;
               const maxRetries = 5;
               const connect = () => {
@@ -780,7 +774,7 @@
                   });
                   return;
                 }
-                const res = await fetch(`https://api.sheets.scrap.land/net/${id}`, {
+                const res = await fetch(`${API_BASE}/net/${id}`, {
                   headers: { Authorization: `Bearer ${token}` },
                 });
                 if (!res.ok) {
@@ -1025,7 +1019,7 @@
               try {
                 const formData = new FormData();
                 formData.append('file', new File([content], filename, { type: 'text/csv' }));
-                const res = await fetch('https://api.sheets.scrap.land/import/csv', {
+                const res = await fetch(`${API_BASE}/import/csv`, {
                   method: 'POST',
                   headers: {
                     'Authorization': `Bearer ${token}`,
@@ -1046,16 +1040,14 @@
           );
 
           // Restore a logged-in session from a previous visit so the UI shows LoggedIn on load.
-          try {
-            const stored = JSON.parse(localStorage.getItem('scrapsheets-user') || 'null');
-            if (stored?.usr_id) app.ports.authResult.send({ usr_id: String(stored.usr_id) });
-          } catch { /* ignore malformed storage */ }
+          const restored = Stored.get("user");
+          if (restored.usr_id) app.ports.authResult.send({ usr_id: String(restored.usr_id) });
 
           // Signup: request a verification email. Never leaves the form locked.
           app.ports.signup.subscribe(async (email) => {
             try {
               const res = await fetch(
-                `https://api.sheets.scrap.land/signup?email=${encodeURIComponent(email)}`,
+                `${API_BASE}/signup?email=${encodeURIComponent(email)}`,
                 { method: 'POST' },
               );
               app.ports.authResult.send({});
@@ -1073,7 +1065,7 @@
           // Login: store { usr_id, jwt } then reload so the sync socket reconnects authenticated.
           app.ports.login.subscribe(async ({ email, password }) => {
             try {
-              const res = await fetch('https://api.sheets.scrap.land/login', {
+              const res = await fetch(`${API_BASE}/login`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ email, password }),
@@ -1084,10 +1076,7 @@
                 return;
               }
               const { data } = await res.json();
-              localStorage.setItem(
-                'scrapsheets-user',
-                JSON.stringify({ usr_id: data.usr_id, jwt: data.jwt }),
-              );
+              Stored.set("user", { usr_id: data.usr_id, jwt: data.jwt });
               location.reload();
             } catch (err) {
               app.ports.authResult.send({ error: err?.message ?? 'Login failed.' });
@@ -1097,7 +1086,7 @@
 
           // Logout: drop the token and reload so the sync socket reconnects anonymously.
           app.ports.logout.subscribe(() => {
-            localStorage.removeItem('scrapsheets-user');
+            Stored.clear("user");
             location.reload();
           });
 

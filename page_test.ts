@@ -16,6 +16,7 @@ import { assert, assertEquals } from "@std/assert";
 import { JSDOM } from "jsdom";
 import { EXAMPLES } from "./src/examples.mjs";
 import {
+  API_BASE,
   atomToJson,
   docThumb,
   httpErrorDetail,
@@ -44,6 +45,12 @@ const ensureDist = () =>
     }).output();
     assertEquals(code, 0, `deno task build failed: ${new TextDecoder().decode(stderr)}`);
   })();
+
+// Read and compiled once. `new Function` over dist/index.js is most of what a
+// boot costs, and nothing in it depends on which test is running.
+let elmSource: Promise<() => void> | undefined;
+const compiled = () =>
+  elmSource ??= (async () => new Function(await Deno.readTextFile(dir + "dist/index.js")) as () => void)();
 
 // The library the page itself builds, not a copy of it written for the test:
 // that is the reason src/page.mjs exists. Nothing is stored, so this is the
@@ -95,15 +102,17 @@ const boot = async (url: string, { tutorial = -1 } = {}) => {
 
   // Elm's compiled output is an IIFE that hangs `Elm` off its `this`. A module's
   // `this` is undefined, and a second boot onto the same object crashes with
-  // "there are two Elm.Main modules", so each boot gets a scope of its own.
-  const src = await Deno.readTextFile(dir + "dist/index.js");
+  // "there are two Elm.Main modules", so each boot gets a scope of its own --
+  // the fresh `this` is the only part that has to be new. Reading and compiling
+  // half a megabyte per test is not: that is hoisted to module scope, and every
+  // boot is one `.call`.
   const scope: { Elm?: { Main: { init: (o: unknown) => { ports: Ports } } } } = {};
-  new Function(src).call(scope);
+  (await compiled()).call(scope);
   assert(scope.Elm?.Main, "dist/index.js should define Elm.Main");
 
   const app = scope.Elm.Main.init({
     node: dom.window.document.getElementById("elm"),
-    flags: { tutorial },
+    flags: { api: API_BASE, tutorial },
   });
 
   // What the page asked the server for. Nothing here answers -- index.html is
@@ -123,12 +132,26 @@ const boot = async (url: string, { tutorial = -1 } = {}) => {
   );
 
   const doc = dom.window.document;
-  // Elm paints on an animation frame, so every assertion waits for a few rather
-  // than reading the DOM the instant a message is sent.
-  const settle = (frames = 12) =>
+  // Elm paints on an animation frame, so every assertion waits rather than
+  // reading the DOM the instant a message is sent. It waits for the page to stop
+  // changing, not for a fixed count: a click that goes out through a port and
+  // back needs several frames, and a fixed count large enough for that was
+  // spending 200ms on every assertion that needed one. QUIET_FRAMES of no change
+  // is settled; SETTLE_MAX bounds the wait, and reaching it is not an error --
+  // a page that never stops changing fails on the test's own assertion, which
+  // says more than a timeout would.
+  const QUIET_FRAMES = 3;
+  const SETTLE_MAX = 24;
+  const settle = () =>
     new Promise<void>((resolve) => {
-      let n = 0;
-      const tick = () => (++n >= frames ? resolve() : dom.window.requestAnimationFrame(tick));
+      let frames = 0, quiet = 0, last = "";
+      const tick = () => {
+        const now = doc.body.innerHTML;
+        quiet = now === last ? quiet + 1 : 0;
+        last = now;
+        if (quiet >= QUIET_FRAMES || ++frames >= SETTLE_MAX) return resolve();
+        dom.window.requestAnimationFrame(tick);
+      };
       dom.window.requestAnimationFrame(tick);
     });
   const click = async (el: El | undefined | null, init: Record<string, unknown> = {}) => {
@@ -557,12 +580,12 @@ Deno.test("only a third-party url goes through the proxy", () => {
   const ours = httpTarget("http://localhost/net/abc", { q: "x" }, "http://localhost");
   assertEquals([ours.viaProxy, ours.url], [false, "http://localhost/net/abc?q=x"]);
 
-  const api = httpTarget("https://api.sheets.scrap.land/sheet/table:abc", {}, "http://localhost");
+  const api = httpTarget(`${API_BASE}/sheet/table:abc`, {}, "http://localhost");
   assertEquals(api.viaProxy, false, "our own api is not third-party");
 
   const theirs = httpTarget("https://export.arxiv.org/api/query", { search_query: "all:" }, "http://localhost");
   assertEquals(theirs.viaProxy, true);
-  assert(theirs.url.startsWith("https://api.sheets.scrap.land/proxy?url="), theirs.url);
+  assert(theirs.url.startsWith(`${API_BASE}/proxy?url=`), theirs.url);
   // The whole target, query string included, is encoded into one parameter --
   // splitting it would let the second parameter escape into the proxy's own.
   assertEquals(

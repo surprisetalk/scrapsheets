@@ -111,7 +111,7 @@ const usr = async (email: string) => {
   return { usr_id, jwt: await createJwt(usr_id) };
 };
 
-Deno.test(async function allTests(_t) {
+Deno.test(async function allTests(t) {
   const listener = Deno.listen({ hostname: "127.0.0.1", port: 5434 });
   const pglite = new PGlite({ extensions: { citext } });
 
@@ -136,22 +136,18 @@ Deno.test(async function allTests(_t) {
   Deno.env.set("OPERATOR_EMAIL", "erin@example.com");
   await seed();
 
-  // A secret-less boot is a crash, not a warning: the three roots used to fall
-  // back to Math.random(), so a restart re-rolled every session, every encrypted
-  // DSN, and every sender's webhook signing key. That this suite loaded main.ts
-  // at all is the other half of the proof -- `deno task test` is the one place
-  // the three are set.
-  {
+  // That this suite loaded main.ts at all is the other half of the proof -- `deno task test` is the one place the
+  // three are set.
+  await t.step("A secret-less boot is a crash, not a warning", async () => {
     assertThrows(
       () => requireSecret("SCRAPSHEETS_SECRET_THAT_IS_NEVER_SET"),
       Error,
       "SCRAPSHEETS_SECRET_THAT_IS_NEVER_SET",
     );
     assertEquals(requireSecret("JWT_SECRET"), Deno.env.get("JWT_SECRET"));
-  }
+  });
 
-  // Signup completion + login round-trip (app-level password hashing, no pgcrypto).
-  {
+  await t.step("Signup completion + login round-trip (app-level password hashing, no pgcrypto)", async () => {
     const email = "carol@example.com";
     const password = "s3cret-pass";
     const token = await createToken(email);
@@ -170,10 +166,9 @@ Deno.test(async function allTests(_t) {
     await reject("", `/login`, { method: "POST", body: JSON.stringify({ email, password }) });
     const { data: data2 } = await post("", `/login`, { email, password: newPassword });
     assert(data2.jwt, "login with rotated password should succeed");
-  }
+  });
 
-  // POST /signup must send the verification email through resend with the api key.
-  {
+  await t.step("POST /signup must send the verification email through resend with the api key", async () => {
     Deno.env.set("RESEND_API_KEY", "re_test_key");
     const origFetch = globalThis.fetch;
     let req: Request | undefined;
@@ -192,9 +187,9 @@ Deno.test(async function allTests(_t) {
     assertEquals(body.to, "dave@example.com");
     assertEquals(body.from, "hello@sheets.scrap.land");
     assert(body.text.includes("https://sheets.scrap.land/password?email=dave%40example.com&token="));
-  }
+  });
 
-  {
+  await t.step("Alice creates every sheet type, shares them, and syncs over the real socket", async () => {
     const { jwt } = await usr("alice@example.com");
 
     // Alice creates templates.
@@ -285,10 +280,9 @@ Deno.test(async function allTests(_t) {
         assertEquals(sell_price, "0");
       }
     }
-  }
+  });
 
-  // Automerge sync over the real websocket route (CBOR join/peer protocol).
-  {
+  await t.step("Automerge sync over the real websocket route (CBOR join/peer protocol)", async () => {
     const { jwt } = await usr("erin@example.com");
     const server = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, app.fetch);
     const wsUrl = (auth?: string) =>
@@ -492,17 +486,16 @@ Deno.test(async function allTests(_t) {
     }
 
     await server.shutdown();
-  }
+  });
 
-  // The shop is publicly viewable.
-  {
+  await t.step("The shop is publicly viewable", async () => {
     const [cols_, ...rows] = await get<Table>("", `/shop`);
     const cols = Object.values(cols_);
     assert(cols.length);
     assert(rows.length);
-  }
+  });
 
-  {
+  await t.step("Bob buys from the shop, then queries across the sheets he owns", async () => {
     const { jwt } = await usr("bob@example.com");
 
     // Bob purchases items from the shop.
@@ -1034,21 +1027,6 @@ Deno.test(async function allTests(_t) {
       assertEquals(rows.length, 2);
     }
 
-    // Bob runs a PRQL query - tests that PRQL compiles to SQL and executes
-    // NOTE: PRQL's from_text doesn't translate to AlaSQL-compatible SQL,
-    // so we verify the compilation works by checking for valid response structure
-    {
-      const res: { data: Table } = await post(jwt, `/query`, {
-        lang: "prql",
-        code: `from_text format:json '[{"a":1}]' | select {a}`,
-        args: [],
-      });
-      // Just verify we get a valid response with column structure
-      assert(res.data, "Expected data in response");
-      const [cols_] = res.data;
-      assert(cols_, "Expected columns in response");
-    }
-
     // The UDFs registered by src/sql.mjs. These run in the browser too, from the
     // same module, so a passing case here is a passing case there.
     {
@@ -1498,10 +1476,9 @@ Deno.test(async function allTests(_t) {
         `expected the error to name the path that closes the cycle, got: ${body}`,
       );
     }
-  }
+  });
 
-  // CSV import -> export round-trip.
-  {
+  await t.step("CSV import -> export round-trip", async () => {
     const { jwt } = await usr("dave@example.com");
     const csv = "name,age\nAlice,30\nBob,25";
     const form = new FormData();
@@ -1708,10 +1685,9 @@ Deno.test(async function allTests(_t) {
       assert(said.includes(`"" appears more than once`), said);
       assert(said.includes("rename one of them"), said);
     }
-  }
+  });
 
-  // A CSV that does not match its own header is a rejection, not a coercion.
-  {
+  await t.step("A CSV that does not match its own header is a rejection, not a coercion", async () => {
     const { jwt } = await usr("ruth@example.com");
     const importCsv = (text: string) =>
       app.request("/import/csv", {
@@ -1794,10 +1770,9 @@ Deno.test(async function allTests(_t) {
     };
     assertEquals(await arithmetic(gapId), await arithmetic(`table:${byHand.documentId}`));
     assertEquals(Number((await arithmetic(gapId)).avg_qty), 2, "the gap is not a reading of zero");
-  }
+  });
 
-  // A webhook sender only ever sees the response body, so the body diagnoses.
-  {
+  await t.step("A webhook sender only ever sees the response body, so the body diagnoses", async () => {
     const { jwt } = await usr("sam@example.com");
 
     const missing = await deliver("net-hook:nosuchdoc", "{}");
@@ -1816,10 +1791,9 @@ Deno.test(async function allTests(_t) {
     assertEquals(big.status, 413);
     assert((await big.text()).includes("1048577 bytes"), "it must name the size it received");
     assert((await deliver(`net-hook:${hook.documentId}`, "{}")).ok, "a valid delivery still lands");
-  }
+  });
 
-  // describe @sheet, cost guards, and the source-type check.
-  {
+  await t.step("describe @sheet, cost guards, and the source-type check", async () => {
     const { jwt } = await usr("quinn@example.com");
     const hand = automerge.create<{ data: Sheet["data"] }>({
       data: [
@@ -1921,15 +1895,13 @@ Deno.test(async function allTests(_t) {
       });
       assertEquals(res.status, 403, `a stranger's query should be refused as access, got: ${await res.text()}`);
     }
-  }
+  });
 
-  // A query result carries its types forward. A result column used to be typed
-  // by its name alone -- whatever column of that name some loaded sheet
-  // declared, or text -- so `cast(price as string) as price` still read usd,
-  // `count(*) as n` read text, and every sheet downstream of that query
-  // inherited the lie. The type is a property of the select item, so it is read
-  // off the select item, in src/sql.mjs where both engines read it.
-  {
+  // A result column used to be typed by its name alone -- whatever column of that name some loaded sheet declared, or
+  // text -- so `cast(price as string) as price` still read usd, `count(*) as n` read text, and every sheet downstream
+  // of that query inherited the lie. The type is a property of the select item, so it is read off the select item, in
+  // src/sql.mjs where both engines read it.
+  await t.step("A query result carries its types forward", async () => {
     const { jwt } = await usr("tessa@example.com");
     const hand = automerge.create<{ data: Sheet["data"] }>({
       data: [
@@ -2004,15 +1976,13 @@ Deno.test(async function allTests(_t) {
         price_text: "text",
       });
     }
-  }
+  });
 
-  // Null, empty and zero stay different. Number("") is 0, so a blank cell in a
-  // numeric column summed, averaged and plotted as a reading of zero rather
-  // than as a reading nobody took: AlaSQL skips a null and counts a "", and its
-  // avg() over ["1","2","3"] answers 41 because "+" concatenated them first.
-  // checkColumnTypes() is now the one place a cell becomes what its column says
+  // Number("") is 0, so a blank cell in a numeric column summed, averaged and plotted as a reading of zero rather
+  // than as a reading nobody took: AlaSQL skips a null and counts a "", and its avg() over ["1","2","3"] answers 41
+  // because "+" concatenated them first. checkColumnTypes() is now the one place a cell becomes what its column says
   // it is, and it is the only coercion there is.
-  {
+  await t.step("Null, empty and zero stay different", async () => {
     const { jwt } = await usr("nils@example.com");
     const hand = automerge.create<{ data: Sheet["data"] }>({
       data: [
@@ -2078,10 +2048,9 @@ Deno.test(async function allTests(_t) {
       const said = await res.text();
       assert(said.includes("filter the blanks out"), said);
     }
-  }
+  });
 
-  // net-hook ingestion + net-http polling.
-  {
+  await t.step("net-hook ingestion + net-http polling", async () => {
     const { jwt } = await usr("nadia@example.com");
     const hookHand = automerge.create<Sheet>({ type: "net-hook", data: [] });
     const hookId = `net-hook:${hookHand.documentId}`;
@@ -2256,14 +2225,12 @@ Deno.test(async function allTests(_t) {
     assertEquals(parseNetHeaders("A: b\nC: d: e"), { A: "b", C: "d: e" });
     assertEquals(parseNetHeaders(""), {});
     assertThrows(() => parseNetHeaders("Authorization Bearer xyz"), Error, "Authorization Bearer xyz");
-  }
+  });
 
-  // A feed that has not changed is not downloaded again. The validators ride
-  // the last good row, so what this sheet already holds is answered by the log
-  // itself. A 304 is a healthy poll that appends nothing: graded as the 304 it
-  // is on the wire, a daily file polled hourly would read to /status and to
-  // library:freshness as a feed that has been failing for 23 hours.
-  {
+  // The validators ride the last good row, so what this sheet already holds is answered by the log itself. A 304 is a
+  // healthy poll that appends nothing: graded as the 304 it is on the wire, a daily file polled hourly would read to
+  // /status and to library:freshness as a feed that has been failing for 23 hours.
+  await t.step("A feed that has not changed is not downloaded again", async () => {
     const { jwt } = await usr("ivy@example.com");
     const hand = automerge.create<Sheet>({
       type: "net-http",
@@ -2314,14 +2281,12 @@ Deno.test(async function allTests(_t) {
     );
     const [oddRow] = (await get<Table>(jwt, `/net/${oddId}`)).slice(1);
     assert(JSON.parse(String(oddRow.body)).error.includes("carried no validator"), String(oddRow.body));
-  }
+  });
 
-  // A flaky source recovers by itself and a broken one says so. A 5xx is the
-  // host saying "later" and is retried on a backoff; a 404 is a "no", and
-  // retrying it is noise on top of the failure row that already answered.
-  // Every retry is scheduled and never slept, which is what keeps one cycle
+  // A 5xx is the host saying "later" and is retried on a backoff; a 404 is a "no", and retrying it is noise on top of
+  // the failure row that already answered. Every retry is scheduled and never slept, which is what keeps one cycle
   // short enough that it cannot still be running when the next tick starts.
-  {
+  await t.step("A flaky source recovers by itself and a broken one says so", async () => {
     const { jwt } = await usr("ivy@example.com");
     const flaky = automerge.create<Sheet>({
       type: "net-http",
@@ -2377,12 +2342,10 @@ Deno.test(async function allTests(_t) {
     assertEquals(gaveUp.attempt, undefined, "giving up ends the count rather than continuing it");
     await pollNetOnce(fetcher, t + 150_000);
     assertEquals(times("dead"), 3, "and the sheet waits its own interval rather than backing off again");
-  }
+  });
 
-  // Retry-After is the host's answer and not one sheet's. Without that, two
-  // sheets pointed at one API take turns stampeding the host that just asked
-  // them to stop.
-  {
+  // Without that, two sheets pointed at one API take turns stampeding the host that just asked them to stop.
+  await t.step("Retry-After is the host's answer and not one sheet's", async () => {
     const { jwt } = await usr("ivy@example.com");
     const [one, two] = ["a", "b"].map((path) =>
       automerge.create<Sheet>({
@@ -2438,11 +2401,10 @@ Deno.test(async function allTests(_t) {
     assert(failure.error.includes("cannot be read"), failure.error);
     assert(failure.error.includes("soon"), "naming what it received");
     assertEquals(failure.attempt, undefined, "a header nobody can read is not a retry");
-  }
+  });
 
-  // A body over the cap is a failure row naming both numbers. A truncated
-  // success is the same bug one layer down: a parse error blamed on the data.
-  {
+  // A truncated success is the same bug one layer down: a parse error blamed on the data.
+  await t.step("A body over the cap is a failure row naming both numbers", async () => {
     const { jwt } = await usr("ivy@example.com");
     const hand = automerge.create<Sheet>({
       type: "net-http",
@@ -2465,15 +2427,13 @@ Deno.test(async function allTests(_t) {
     const cap = Number(failure.error.match(/(\d+) bytes per response/)?.[1]);
     assert(size > cap, `the size must name what it read past the cap it names: ${failure.error}`);
     assert(!String(row.body).startsWith("xxx"), "and the payload is refused, not truncated into the log");
-  }
+  });
 
-  // A since-last-run cursor. The watermark is when the last good poll started
-  // rather than when it finished, so a row written while that request was in
-  // flight is asked for twice rather than missed once. It lives in net.meta
-  // beside the run that set it: the automerge document is what sync hands every
-  // viewer and what the user edits, and a poller writing to it every tick would
-  // fight those edits and mint a change for every open browser.
-  {
+  // The watermark is when the last good poll started rather than when it finished, so a row written while that
+  // request was in flight is asked for twice rather than missed once. It lives in net.meta beside the run that set
+  // it: the automerge document is what sync hands every viewer and what the user edits, and a poller writing to it
+  // every tick would fight those edits and mint a change for every open browser.
+  await t.step("A since-last-run cursor", async () => {
     const { jwt } = await usr("ivy@example.com");
     const hand = automerge.create<Sheet>({
       type: "net-http",
@@ -2506,17 +2466,9 @@ Deno.test(async function allTests(_t) {
     await pollNetOnce(fetcher, t + 300_000);
     const [row] = (await get<Table>(jwt, `/net/${badId}`)).slice(1);
     assert(JSON.parse(String(row.body)).error.includes("query parameter"), String(row.body));
-  }
+  });
 
-  // The poller's two maps grow with traffic and nothing ever took anything out
-  // of them: one entry per net-http sheet that ever polled and one per host that
-  // ever answered, sheets long since deleted included. Every other map keyed on
-  // something traffic varies -- rate-limit buckets, delivery budgets, the error
-  // log's fold counts -- is capped by insertion order and swept by the same
-  // broom; these two were the exception. Both hold a future due time, so an
-  // evicted entry costs one early poll and no data, which is why the oldest key
-  // may go without asking what it was for.
-  {
+  await t.step("The poller's two maps grow with traffic and nothing ever took anything out of them", async () => {
     const { jwt } = await usr("ivy@example.com");
     const hand = automerge.create<Sheet>({
       type: "net-http",
@@ -2550,10 +2502,9 @@ Deno.test(async function allTests(_t) {
     // Nothing after this polls, and 10,000 ghosts are not this suite's state.
     netDue.clear();
     hostDue.clear();
-  }
+  });
 
-  // MCP server: JSON-RPC 2.0 over POST /mcp/:id.
-  {
+  await t.step("MCP server: JSON-RPC 2.0 over POST /mcp/:id", async () => {
     const { jwt } = await usr("mia@example.com");
     const hand = automerge.create<Sheet>({
       type: "table",
@@ -2642,7 +2593,10 @@ Deno.test(async function allTests(_t) {
       assert(badCol.content[0].text.includes("item"), `should list valid columns, got: ${badCol.content[0].text}`);
       const badType = await call(jwt, "write_cells", { cells: [{ row: 0, col: "price", value: "expensive" }] });
       assertEquals(badType.isError, true);
-      assert(badType.content[0].text.includes("expected usd"), badType.content[0].text);
+      assert(
+        badType.content[0].text.includes("usd") && badType.content[0].text.includes("price"),
+        badType.content[0].text,
+      );
       const badRow = await call(jwt, "write_cells", { cells: [{ row: 9, col: "price", value: 1 }] });
       assertEquals(badRow.isError, true);
       assert(badRow.content[0].text.includes("appends"), badRow.content[0].text);
@@ -2679,14 +2633,12 @@ Deno.test(async function allTests(_t) {
       const unauthed = await mcp("", { jsonrpc: "2.0", id: 1, method: "ping" });
       assertEquals(unauthed.status, 401);
     }
-  }
+  });
 
-  // A sheet takes rows over its own API. The boundary is the whole feature: a
-  // row that does not match the columns, or a value that does not parse at its
-  // declared type, has to be refused naming what arrived -- and refused with the
-  // sheet exactly as it was, because a half-written batch under a 201 is the
-  // silent failure this endpoint exists without.
-  {
+  // The boundary is the whole feature: a row that does not match the columns, or a value that does not parse at its
+  // declared type, has to be refused naming what arrived -- and refused with the sheet exactly as it was, because a
+  // half-written batch under a 201 is the silent failure this endpoint exists without.
+  await t.step("A sheet takes rows over its own API", async () => {
     const { jwt } = await usr("nina@example.com");
     const hand = automerge.create<Sheet>({
       type: "table",
@@ -2781,14 +2733,12 @@ Deno.test(async function allTests(_t) {
 
     // Every refusal above left the sheet where it was.
     assertEquals((await get<Table>(jwt, `/sheet/${sheet_id}`)).length, 4);
-  }
+  });
 
-  // A script carries a key for one sheet rather than a person's JWT. Minting one
-  // is rotating it, so the key before it still opens the sheet and the one
-  // before that is retired; and a key that could reach a second sheet, or mint
-  // itself another, would be a JWT with extra steps -- which is the whole reason
-  // this exists.
-  {
+  // Minting one is rotating it, so the key before it still opens the sheet and the one before that is retired; and a
+  // key that could reach a second sheet, or mint itself another, would be a JWT with extra steps -- which is the
+  // whole reason this exists.
+  await t.step("A script carries a key for one sheet rather than a person's JWT", async () => {
     const { jwt } = await usr("rosa@example.com");
     const sheetOf = async (name: string) => {
       const hand = automerge.create<Sheet>({
@@ -2885,12 +2835,11 @@ Deno.test(async function allTests(_t) {
         body: JSON.stringify({ name: "api:readonly", value: "x" }),
       });
     }
-  }
+  });
 
-  // The spec is derived from the sheet's own columns at request time and never
-  // stored, so it cannot claim a column the sheet does not have. It is what the
-  // keys point at: a key with nothing to read from is a key nobody can use.
-  {
+  // The spec is derived from the sheet's own columns at request time and never stored, so it cannot claim a column
+  // the sheet does not have. It is what the keys point at: a key with nothing to read from is a key nobody can use.
+  await t.step("The OpenAPI spec is derived from the sheet's own columns and never stored", async () => {
     const { jwt } = await usr("sven@example.com");
     const hand = automerge.create<Sheet>({
       type: "table",
@@ -2951,10 +2900,10 @@ Deno.test(async function allTests(_t) {
       const stranger = await usr("tomas@example.com");
       await reject(stranger.jwt, `/openapi/${sheet_id}`);
     }
-  }
+  });
 
   // Proxy guards. Each rejection must name its own cause, never a bare status.
-  {
+  await t.step("Every proxy rejection names its own cause, never a bare status", async () => {
     // `code` is the proxy's own status; the body's `status` is the origin's.
     const proxy = async (url?: string) => {
       const res = await app.request(
@@ -2965,20 +2914,23 @@ Deno.test(async function allTests(_t) {
     assertEquals(await proxy(), { code: 400, error: "Missing url parameter" });
     {
       const { code, error, repro } = await proxy("ftp://example.com/x");
-      assertEquals([code, error], [400, "Only HTTP(S) URLs allowed."]);
+      // The scheme it refused, not just that it refused one.
+      assertEquals(code, 400);
+      assert(error.includes("ftp:") && error.includes("https://"), error);
       // A failure has to be reproducible by hand, not just described.
       assertEquals(repro, "curl -i 'ftp://example.com/x'");
     }
     for (
-      const url of [
-        "http://localhost/x",
-        "http://foo.local/x",
-        "http://127.0.0.1/x",
-        "http://169.254.169.254/latest/meta-data",
+      const [url, host] of [
+        ["http://localhost/x", "localhost"],
+        ["http://foo.local/x", "foo.local"],
+        ["http://127.0.0.1/x", "127.0.0.1"],
+        ["http://169.254.169.254/latest/meta-data", "169.254.169.254"],
       ]
     ) {
       const { code, error, repro } = await proxy(url);
-      assertEquals([code, error, repro], [400, "Internal URLs not allowed.", `curl -i '${url}'`], url);
+      assertEquals([code, repro], [400, `curl -i '${url}'`], url);
+      assert(error.includes(host), `${url} should be refused by name, got: ${error}`);
     }
     const { code, error } = await proxy("notaurl");
     assertEquals(code, 502);
@@ -2986,11 +2938,9 @@ Deno.test(async function allTests(_t) {
       error.includes("Invalid URL") && error.includes("notaurl"),
       `A malformed url should say which url is malformed, got: ${error}`,
     );
-  }
+  });
 
-  // Every seeded example must survive a visit with no ?q= param: a free-text
-  // search that interpolates a null @params builds a request its API rejects.
-  {
+  await t.step("Every seeded example must survive a visit with no ?q= param", async () => {
     const lines = examplesSql.split("\n");
     assert(
       lines.filter((line) => line.includes("@params->('')")).length > 10,
@@ -3002,10 +2952,9 @@ Deno.test(async function allTests(_t) {
       `examples.sql interpolates @params->('') with no default on these lines, so opening ` +
         `those sheets without ?q= sends an empty search term. Wrap it in coalesce(...).`,
     );
-  }
+  });
 
-  // Stripe checkout regressions: only cases that actually broke.
-  {
+  await t.step("Stripe checkout regressions", async () => {
     const { jwt: sellerJwt } = await usr("stripe-seller@example.com");
     const { jwt: buyerJwt, usr_id: buyerId } = await usr("stripe-buyer@example.com");
     const webhookSecret = "whsec_hunt";
@@ -3142,12 +3091,11 @@ Deno.test(async function allTests(_t) {
       assert(text.includes("Stripe"), `error must name Stripe, got: ${text}`);
       assertEquals((await sql`select * from sheet where buy_id = ${listing.sell_id}`).length, 0);
     }
-  }
+  });
 
-  // Signing. Without it, anyone who learns a net sheet's id can write rows to it,
-  // so every rejection has to say which half of the handshake was wrong -- and
-  // none of them may print the secret, which would make the message an oracle.
-  {
+  // Signing. Without it, anyone who learns a net sheet's id can write rows to it, so every rejection has to say which
+  // half of the handshake was wrong -- and none of them may print the secret, which would make the message an oracle.
+  await t.step("Every delivery must be signed, and each rejection names its own check", async () => {
     const { jwt } = await usr("wes@example.com");
     const hand = automerge.create<Sheet>({ type: "net-hook", data: [] });
     const id = `net-hook:${hand.documentId}`;
@@ -3246,21 +3194,16 @@ Deno.test(async function allTests(_t) {
     const table = automerge.create<Sheet>({ type: "table", data: [arrayify([{ name: "a", type: "text", key: 0 }])] });
     await put(jwt, `/library/table:${table.documentId}`, {});
     await reject(jwt, `/library/table:${table.documentId}/hook`);
-  }
+  });
 
-  // The four share routes read a JSON body, and all four handed a missing or
-  // unparseable one straight to c.req.json(). That throw was an unexplained
-  // 500: a row in net-hook:errors and a point off the 5xx grade, for a mistake
-  // the caller could have fixed from the message.
-  //
-  // A share link is a bearer credential that travels in a URL, so it may not be
-  // immortal and it may not be openable by everyone who sees the url. The lock
-  // is an HMAC of the password under the server's own root secret, not the
-  // password and not a hash of it: nothing new is stored, and holding the link
-  // buys nobody an offline guess. Every refusal here has to name its own check
-  // without printing the password or the digest -- the same oracle rule the
-  // delivery refusals follow.
-  {
+  // The four share routes read a JSON body, and all four handed a missing or unparseable one straight to
+  // c.req.json(). That throw was an unexplained 500: a row in net-hook:errors and a point off the 5xx grade, for a
+  // mistake the caller could have fixed from the message. A share link is a bearer credential that travels in a URL,
+  // so it may not be immortal and it may not be openable by everyone who sees the url. The lock is an HMAC of the
+  // password under the server's own root secret, not the password and not a hash of it: nothing new is stored, and
+  // holding the link buys nobody an offline guess. Every refusal here has to name its own check without printing the
+  // password or the digest -- the same oracle rule the delivery refusals follow.
+  await t.step("A share route with a missing or unparseable body is the caller's error", async () => {
     const { jwt } = await usr("zara@example.com");
     const hand = automerge.create<Sheet>({
       type: "table",
@@ -3295,9 +3238,10 @@ Deno.test(async function allTests(_t) {
     // sentence about the sheet for a mistake in the request.
     const noEmail = await raw(`/library/${sheet_id}/share`, { method: "DELETE", body: JSON.stringify({}) });
     assertEquals(noEmail.status, 400);
+    const noEmailText = await noEmail.text();
     assert(
-      (await noEmail.text()).includes("received undefined"),
-      "the refusal has to name what arrived, not what the sheet holds",
+      /Received: {4}\S/.test(noEmailText) && !noEmailText.includes("member of this sheet"),
+      `the refusal has to name what arrived, not what the sheet holds: ${noEmailText}`,
     );
 
     // The link route's body is entirely optional, so no body is not an error
@@ -3450,11 +3394,9 @@ Deno.test(async function allTests(_t) {
     }
     await new Promise((r) => setTimeout(r, 100));
     assertEquals(await crashes(`/sheet/${sheet_id}`), 0, "a refusal the caller can fix is not the operator's failure");
-  }
+  });
 
-  // A sheet's own secrets: what a rollover needs, what a provider needs, and
-  // what makes a delivery's identity the thing the sender varies.
-  {
+  await t.step("A sheet's own secrets", async () => {
     const { jwt } = await usr("xena@example.com");
     const hand = automerge.create<Sheet>({ type: "net-hook", data: [] });
     const id = `net-hook:${hand.documentId}`;
@@ -3719,12 +3661,11 @@ Deno.test(async function allTests(_t) {
     const after = JSON.stringify({ action: "after" });
     assertEquals((await send(ghId, await ghSign(after), after)).status, 401, "deleting the secret ends the scheme");
     await reject(jwt, `/library/${ghId}/secret`, { method: "DELETE", body: JSON.stringify({ name: "hook:github" }) });
-  }
+  });
 
-  // Every failure lands on one sheet, so "what is breaking, and where" is a
-  // query. It must carry the path and the status, and it must never carry a
-  // header value: an Authorization in a log outlives the request that sent it.
-  {
+  // It must carry the path and the status, and it must never carry a header value: an Authorization in a log outlives
+  // the request that sent it.
+  await t.step('Every failure lands on one sheet, so "what is breaking, and where" is a query', async () => {
     // No psql prompt: seed() granted OPERATOR_EMAIL the viewer row, and erin
     // signed up afterwards onto the account row seed() had already made.
     const { jwt } = await usr("erin@example.com");
@@ -3856,11 +3797,10 @@ Deno.test(async function allTests(_t) {
     await app.request(healed);
     await settle();
     assertEquals((await status())[reaching]["0"], 1, "one real write clears it again");
-  }
+  });
 
-  // Which feed stopped refreshing. /status grades them in aggregate and names
-  // none of them, so this is the read that says which one is rotten.
-  {
+  // /status grades them in aggregate and names none of them, so this is the read that says which one is rotten.
+  await t.step("Which feed stopped refreshing", async () => {
     const { jwt } = await usr("zoe@example.com");
     const fresh = automerge.create<Sheet>({ type: "net-http", data: [{ url: "https://example.com/a", interval: 60 }] });
     const rotten = automerge.create<Sheet>({
@@ -4044,10 +3984,9 @@ Deno.test(async function allTests(_t) {
     // The rotten feed, the tied one, and the codex connection with no DSN. The
     // never-run feed and the never-opened connection have failed nothing.
     assertEquals(Number((answer as Table)[1].n), 3, "a query sheet can select from it");
-  }
+  });
 
-  // The bucket a flood is counted against must be one the flood cannot choose.
-  {
+  await t.step("The bucket a flood is counted against must be one the flood cannot choose", async () => {
     const ip = (xff: string | undefined, remote?: string) =>
       callerIp(
         {
@@ -4062,16 +4001,14 @@ Deno.test(async function allTests(_t) {
     // Nothing proxied us, so the socket's own peer is the caller.
     assertEquals(ip(undefined, "5.6.7.8"), "5.6.7.8");
     assertEquals(ip(undefined), "127.0.0.1");
-  }
+  });
 
-  // One noisy sender may not fill one sheet. NET_BODY_CAP bounds a delivery and
-  // trimNet bounds the log, so a sender posting flat out loses nothing of its
-  // own -- it evicts everything the sheet held before it. The budget is keyed on
-  // the sheet, not on callerIp(), because a webhook sender is one machine that
-  // will not rotate its address. So the ways this breaks are: a bound that leaks
-  // across sheets, a bound a refused delivery pays for, and a count bound alone,
-  // which one 1 MB body a second walks straight through.
-  {
+  // NET_BODY_CAP bounds a delivery and trimNet bounds the log, so a sender posting flat out loses nothing of its own
+  // -- it evicts everything the sheet held before it. The budget is keyed on the sheet, not on callerIp(), because a
+  // webhook sender is one machine that will not rotate its address. So the ways this breaks are: a bound that leaks
+  // across sheets, a bound a refused delivery pays for, and a count bound alone, which one 1 MB body a second walks
+  // straight through.
+  await t.step("One noisy sender may not fill one sheet", async () => {
     const { jwt } = await usr("nyx-flood@example.com");
     const netSheet = async () => {
       const hand = automerge.create<Sheet>({ type: "net-hook", data: [] });
@@ -4124,12 +4061,11 @@ Deno.test(async function allTests(_t) {
     for (let i = 0; i <= RATE_LIMIT_KEYS_MAX; i++) hookBucket(`net-hook:minted-${i}`);
     assertEquals(hookBuckets.size, RATE_LIMIT_KEYS_MAX, "the delivery budget map must stay bounded");
     hookBuckets.clear();
-  }
+  });
 
-  // The status check. Every condition is graded so that 1.0 is the minimum pass,
-  // which is what lets an uptime check read the whole thing without knowing what
-  // any of it means.
-  {
+  // The status check. Every condition is graded so that 1.0 is the minimum pass, which is what lets an uptime check
+  // read the whole thing without knowing what any of it means.
+  await t.step("Every status condition is graded so that 1.0 is the minimum pass", async () => {
     const grades = await status();
     const conditions = Object.keys(grades);
     assertEquals(conditions.length, 13);
@@ -4266,7 +4202,7 @@ Deno.test(async function allTests(_t) {
     for (const series of Object.values(body as Record<string, Record<string, number>>))
       for (const value of Object.values(series)) assertEquals(typeof value, "number");
     await sql`delete from net where sheet_id = 'net-hook:errors' and body = 'boom'`;
-  }
+  });
 
   await sql.end();
   listener.close();

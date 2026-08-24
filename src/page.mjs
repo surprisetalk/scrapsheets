@@ -10,6 +10,7 @@
 // proves the copy works.
 
 import { Col, EXAMPLES, Table } from "./examples.mjs";
+import { PORTALS as FEEDS } from "./portals.mjs";
 import {
   applyWindows,
   DESCRIBE_COLUMNS,
@@ -25,9 +26,11 @@ import {
 
 // --- the library
 //
-// Seven live feeds the server hosts. They have no document of their own: the
-// page opens a socket per portal and the rows arrive over it.
-export const PORTALS = ["time", "stonks", "dice", "orbit", "cafe", "forest", "words"];
+// The live feeds the server hosts. They have no document of their own: the page
+// opens a socket per portal and the rows arrive over it, so only the names
+// matter here -- and they are read off the one list rather than written down a
+// second time.
+export const PORTALS = FEEDS.map((feed) => feed.name);
 
 const tutorial = Table(
   ["step::text", "how::text"].map(Col),

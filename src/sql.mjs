@@ -26,7 +26,7 @@ export const explain = (headline, fields) =>
 // JSON.stringify() renders Infinity and NaN as "null", so a message about a
 // number that is not finite used to read "received number null" -- which names
 // neither the value nor the problem.
-const show = (v) =>
+export const show = (v) =>
   v === null
     ? "null"
     : v === undefined
@@ -412,11 +412,11 @@ export const checkCells = (cells, rowsOf, colsOf = {}) => {
   }
 };
 
-export const MAX_REF_DEPTH = 8;
+const MAX_REF_DEPTH = 8;
 
 // Bounds the @query -> @query chain. A cycle is reported as the path that closes
 // it, because "nested too deeply" sends you looking for the wrong problem.
-export const checkRefPath = (path, id) => {
+const checkRefPath = (path, id) => {
   if (path.includes(id)) {
     throw new Error(
       `Query references form a cycle: ${
@@ -525,7 +525,7 @@ export const checkColumnTypes = (id, cols, rows) => {
 // the rows loaded, not the time spent. MAX_QUERY_MS bounds how long a caller
 // waits for an answer; the work itself still finishes in the background.
 
-export const MAX_QUERY_ROWS = 200_000;
+const MAX_QUERY_ROWS = 200_000;
 export const MAX_QUERY_MS = 15_000;
 
 export const checkQueryRows = (total, id) => {
@@ -713,8 +713,19 @@ const findAt = (s, depth, re, level, from = 0, to = s.length) => {
   return null;
 };
 
-const closeParen = (s, depth, open) => {
+// The matching close, or -1. The select-type pass runs before the engine, so an
+// unbalanced expression has to reach AlaSQL, which is the one that can point at
+// the character.
+const closeAt = (s, depth, open) => {
   for (let i = open + 1; i < s.length; i++) if (s[i] === ")" && depth[i] === depth[open]) return i;
+  return -1;
+};
+
+// The same search for the window pass, where an unbalanced bracket is this
+// pass's own to explain: nothing downstream will ever see the over(...) clause.
+const closeParen = (s, depth, open) => {
+  const i = closeAt(s, depth, open);
+  if (i >= 0) return i;
   throw new Error(explain(`A window function is missing a closing bracket.`, {
     Received: s.slice(open, open + 40),
     Source: "the over(...) clause in this query",
@@ -1264,7 +1275,7 @@ export const applyWindows = ({ columns, data }, { windows, qualify, limit, offse
 // This is WINDOW_TYPES for the rest of the select list, and null means the same
 // thing here as it does there: whatever its argument already was, which is what
 // makes sum(amount_usd) usd and round(avg(price), 2) usd as well.
-export const SELECT_TYPES = {
+const SELECT_TYPES = {
   count: "int",
   sum: null,
   avg: null,
@@ -1298,15 +1309,6 @@ const CAST_TYPES = {
 
 // How deep a select item is peeled before the type stops being worth chasing.
 const SELECT_DEPTH = 8;
-
-// The matching close, or -1. closeParen() throws on an unbalanced one, which is
-// right where it is used and wrong here: this pass runs before the engine, so a
-// malformed expression has to reach AlaSQL, which is the one that can point at
-// the character.
-const closeAt = (s, depth, open) => {
-  for (let i = open + 1; i < s.length; i++) if (s[i] === ")" && depth[i] === depth[open]) return i;
-  return -1;
-};
 
 const itemType = (expr, nameToType) => {
   let text = expr.trim();
@@ -1463,8 +1465,6 @@ export const rewriteUnpivot = (code, columnsOf) => {
 // A chart is a sheet: a source ref, a kind, and the two columns to plot. Both
 // engines build the same query out of that, so the picture the page draws and
 // the rows the server exports are the same answer.
-
-export const CHART_KINDS = ["line", "bar"];
 
 const chartIdent = (what, value) => {
   if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(value ?? "")) return value;

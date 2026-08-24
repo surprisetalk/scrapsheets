@@ -645,6 +645,7 @@ type alias Library =
 
 type alias Model =
     { nav : Nav.Key
+    , api : String
     , id : String
     , search : String
     , error : String
@@ -873,27 +874,8 @@ type alias Table =
     }
 
 
-type Lang
-    = Prql
-    | Sql
-    | Formula
-    | Scrapscript
-    | Python
-
-
-langs : Dict String Lang
-langs =
-    Dict.fromList
-        [ ( "prql", Prql )
-        , ( "sql", Sql )
-        , ( "formula", Formula )
-        , ( "scrapscript", Scrapscript )
-        , ( "python", Python )
-        ]
-
-
 type alias Query_ =
-    { lang : Lang
+    { lang : String
     , code : String
     , args : Args
     , examples : List String
@@ -916,23 +898,7 @@ type alias Args =
     Dict String Type
 
 
-type
-    Type
-    -- | Bytes
-    -- | Tag
-    -- | List
-    -- | Date
-    -- | Color
-    -- | Image
-    -- | Subsheet
-    -- | Shape2d
-    -- | Shape3d
-    -- | Vector
-    -- | Rows (List Type)
-    -- | Doc
-    -- | Plot
-    -- | Map
-    -- | Link
+type Type
     = Unknown
     | Text
     | Number
@@ -953,62 +919,73 @@ type
     | Thumb
 
 
-typeName : Type -> String
-typeName typ =
+{-| Everything the table knows about a column type: what it is called, which
+way its cells read, and how wide it starts, in px. One table with no wildcard,
+so a new constructor fails to compile here rather than rendering left-aligned at
+the default width and saying nothing. `width = Nothing` is a column that sizes
+itself.
+-}
+spec : Type -> { name : String, align : H.Attribute Msg, width : Maybe Int }
+spec typ =
     case typ of
         Unknown ->
-            "unknown"
+            { name = "unknown", align = S.textAlignLeft, width = Nothing }
 
         Text ->
-            "text"
+            { name = "text", align = S.textAlignLeft, width = Nothing }
 
         Number ->
-            "num"
+            { name = "num", align = S.textAlignRight, width = Just 80 }
 
         Usd ->
-            "usd"
+            { name = "usd", align = S.textAlignRight, width = Just 80 }
 
         Boolean ->
-            "bool"
+            { name = "bool", align = S.textAlignCenter, width = Just 32 }
 
         Percentage ->
-            "pct"
+            { name = "pct", align = S.textAlignRight, width = Just 64 }
 
         Date ->
-            "date"
+            { name = "date", align = S.textAlignLeft, width = Just 112 }
 
         Many typ_ ->
-            "list " ++ typeName typ_
+            { name = "list " ++ typeName typ_, align = S.textAlignLeft, width = Nothing }
 
         Link ->
-            "link"
+            { name = "link", align = S.textAlignLeft, width = Nothing }
 
         SheetId ->
-            "sheet_id"
+            { name = "sheet_id", align = S.textAlignCenter, width = Just 48 }
 
         Json ->
-            "json"
+            { name = "json", align = S.textAlignLeft, width = Nothing }
 
         Timestamp ->
-            "timestamp"
+            { name = "timestamp", align = S.textAlignLeft, width = Nothing }
 
         Image ->
-            "image"
-
-        Create ->
-            "create"
+            { name = "image", align = S.textAlignLeft, width = Nothing }
 
         Delete ->
-            "delete"
+            { name = "delete", align = S.textAlignCenter, width = Just 64 }
+
+        Create ->
+            { name = "create", align = S.textAlignRight, width = Just 160 }
 
         Form ->
-            "form"
+            { name = "form", align = S.textAlignCenter, width = Nothing }
 
         Enum options ->
-            "enum:" ++ String.join "," options
+            { name = "enum:" ++ String.join "," options, align = S.textAlignLeft, width = Nothing }
 
         Thumb ->
-            "thumb"
+            { name = "thumb", align = S.textAlignLeft, width = Just 64 }
+
+
+typeName : Type -> String
+typeName typ =
+    (spec typ).name
 
 
 
@@ -1117,7 +1094,7 @@ docDecoder =
                             D.index 0 <|
                                 D.map Query
                                     (D.map5 Query_
-                                        (D.field "lang" langDecoder)
+                                        (D.field "lang" D.string)
                                         (D.field "code" D.string)
                                         -- TODO
                                         (D.maybe (D.field "args" (D.succeed Dict.empty)) |> D.map (Maybe.withDefault Dict.empty))
@@ -1199,11 +1176,6 @@ colDecoder =
         ]
 
 
-langDecoder : D.Decoder Lang
-langDecoder =
-    D.string |> D.andThen (flip Dict.get langs >> Maybe.map D.succeed >> Maybe.withDefault (D.fail "Invalid query language."))
-
-
 shopDecoder : D.Decoder Table
 shopDecoder =
     D.field "data" tableDecoder
@@ -1260,13 +1232,26 @@ init flags url nav =
         tutorialStep =
             D.decodeValue (D.field "tutorial" D.int) flags |> Result.withDefault 0
 
+        -- The one spelling of the API host, handed in by the page rather than
+        -- written down a second time here. No default: a blank base would send
+        -- every request at whatever origin served the page, which is a wrong
+        -- answer wearing the face of a working one.
+        ( api, apiError ) =
+            case D.decodeValue (D.field "api" D.string) flags of
+                Ok base ->
+                    ( base, "" )
+
+                Err err ->
+                    ( "", "The page did not hand Elm an api base: " ++ D.errorToString err )
+
         model : Model
         model =
             route url
                 { nav = nav
+                , api = api
                 , id = ""
                 , search = ""
-                , error = ""
+                , error = apiError
                 , library = Dict.empty
                 , sheet = emptySheet
                 , auth =
@@ -1608,6 +1593,13 @@ advanceTutorial n ( model, cmd ) =
         ( model, cmd )
 
 
+{-| One exhaustive `case` over every `Msg`, with no wildcard: a new constructor
+has to fail to compile here rather than compile and do nothing. That is why this
+is not split into per-family `Msg -> Model -> ( Model, Cmd Msg )` functions --
+each would need a `_ ->` arm for the messages it does not handle, which is the
+silent default all over again. The four branches long enough to be their own
+subject are named functions below instead.
+-}
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg ({ sheet, auth } as model) =
     case msg of
@@ -1698,7 +1690,7 @@ update msg ({ sheet, auth } as model) =
             , case data.data.doc |> D.decodeValue docDecoder of
                 Ok Shop ->
                     Http.get
-                        { url = "https://api.sheets.scrap.land/shop"
+                        { url = model.api ++ "/shop"
                         , expect = Http.expectJson ShopFetch shopDecoder
                         }
 
@@ -1802,441 +1794,7 @@ update msg ({ sheet, auth } as model) =
             )
 
         DocMsg edit ->
-            case sheet.doc of
-                Ok Library ->
-                    ( { model | sheet = { sheet | write = Nothing } }
-                    , case edit of
-                        SheetWrite { x, y } ->
-                            let
-                                id : String
-                                id =
-                                    libraryIdAtRow model y
-                            in
-                            case Maybe.map .name (Array.get x (libraryCols model)) of
-                                Just "name" ->
-                                    updateLibrary (Idd id { name = sheet.write, tags = Nothing })
-
-                                Just "tags" ->
-                                    updateLibrary (Idd id { name = Nothing, tags = sheet.write |> Maybe.map (String.split ", " >> List.map String.trim) })
-
-                                _ ->
-                                    Cmd.none
-
-                        _ ->
-                            Cmd.none
-                    )
-
-                Ok (Tab table) ->
-                    let
-                        -- Map a display row coordinate to its document row coordinate (accounts for sort/filter/search)
-                        toDoc : Int -> Int
-                        toDoc y =
-                            displayYToDocY model.search sheet table.rows y
-
-                        -- Helper to get old cell value as E.Value (rowIdx is a document coordinate)
-                        getOldValue : Int -> String -> E.Value
-                        getOldValue rowIdx key =
-                            table.rows
-                                |> Array.get (rowIdx - 1)
-                                |> Maybe.andThen (Dict.get key)
-                                |> Maybe.map (\v -> D.decodeValue D.value v |> Result.withDefault E.null)
-                                |> Maybe.withDefault E.null
-
-                        -- Compute forward and backward patches based on edit type
-                        ( forwardPatches, backwardPatches ) =
-                            case edit of
-                                SheetWrite { x, y } ->
-                                    case ( max 0 y, Array.get x table.cols ) of
-                                        ( 0, Just col ) ->
-                                            -- Editing column header (row 0)
-                                            let
-                                                forward =
-                                                    sheet.write
-                                                        |> Maybe.map
-                                                            (\write ->
-                                                                [ { action = "set"
-                                                                  , path = [ E.int 0, E.string (String.fromInt x) ]
-                                                                  , value =
-                                                                        if y == -1 then
-                                                                            E.object [ ( "name", E.string col.name ), ( "type", E.string write ), ( "key", E.string col.key ) ]
-
-                                                                        else
-                                                                            E.object [ ( "name", E.string write ), ( "type", E.string (typeName col.typ) ), ( "key", E.string col.key ) ]
-                                                                  }
-                                                                ]
-                                                            )
-                                                        |> Maybe.withDefault []
-
-                                                backward =
-                                                    [ { action = "set"
-                                                      , path = [ E.int 0, E.string (String.fromInt x) ]
-                                                      , value = E.object [ ( "name", E.string col.name ), ( "type", E.string (typeName col.typ) ), ( "key", E.string col.key ) ]
-                                                      }
-                                                    ]
-                                            in
-                                            ( forward, backward )
-
-                                        ( rowY, Just col ) ->
-                                            -- Editing data cell (translate display row to document row).
-                                            -- No write means a cancelled edit or a blur after cancel: leave the cell untouched.
-                                            case sheet.write of
-                                                Nothing ->
-                                                    ( [], [] )
-
-                                                Just write ->
-                                                    let
-                                                        docY =
-                                                            toDoc rowY
-
-                                                        forward =
-                                                            [ { action = "set"
-                                                              , path = [ E.int docY, E.string col.key ]
-                                                              , value = E.string write
-                                                              }
-                                                            ]
-
-                                                        backward =
-                                                            [ { action = "set"
-                                                              , path = [ E.int docY, E.string col.key ]
-                                                              , value = getOldValue docY col.key
-                                                              }
-                                                            ]
-                                                    in
-                                                    ( forward, backward )
-
-                                        _ ->
-                                            ( [], [] )
-
-                                SheetRowPush ->
-                                    let
-                                        rowCount =
-                                            Array.length table.rows + 1
-
-                                        forward =
-                                            [ { action = "push"
-                                              , path = []
-                                              , value = E.list identity [ E.object [] ]
-                                              }
-                                            ]
-
-                                        backward =
-                                            [ { action = "splice"
-                                              , path = []
-                                              , value = E.list E.int [ rowCount, 1 ]
-                                              }
-                                            ]
-                                    in
-                                    ( forward, backward )
-
-                                SheetColumnPush ->
-                                    let
-                                        colCount =
-                                            Array.length table.cols
-
-                                        forward =
-                                            [ { action = "push"
-                                              , path = [ E.int 0 ]
-                                              , value = E.list identity [ E.object [ ( "name", E.string "" ), ( "type", E.string "text" ), ( "key", E.int colCount ) ] ]
-                                              }
-                                            ]
-
-                                        backward =
-                                            [ { action = "splice"
-                                              , path = [ E.int 0 ]
-                                              , value = E.list E.int [ colCount, 1 ]
-                                              }
-                                            ]
-                                    in
-                                    ( forward, backward )
-
-                                SheetRowInsert indices ->
-                                    rowSplices (\_ -> Just Dict.empty) 0 indices toDoc
-
-                                SheetRowDuplicate indices ->
-                                    rowSplices (\i -> Array.get (i - 1) table.rows) 1 indices toDoc
-
-                                SheetRowDelete indices ->
-                                    let
-                                        docYs =
-                                            indices |> List.map toDoc |> List.sort
-
-                                        forward =
-                                            docYs
-                                                |> List.reverse
-                                                |> List.map
-                                                    (\i ->
-                                                        { action = "splice"
-                                                        , path = []
-                                                        , value = E.list E.int [ i, 1 ]
-                                                        }
-                                                    )
-
-                                        -- Re-insert lowest first, so each row lands back at
-                                        -- its original index. Doc row i is rows[i - 1].
-                                        backward =
-                                            docYs
-                                                |> List.filterMap
-                                                    (\i ->
-                                                        Array.get (i - 1) table.rows
-                                                            |> Maybe.map
-                                                                (\row ->
-                                                                    { action = "splice"
-                                                                    , path = []
-                                                                    , value = E.list identity [ E.int i, E.int 0, E.dict identity identity row ]
-                                                                    }
-                                                                )
-                                                    )
-                                    in
-                                    ( forward, backward )
-
-                                SheetColumnDelete indices ->
-                                    let
-                                        colKeys =
-                                            indices
-                                                |> List.filterMap (\i -> Array.get i table.cols)
-                                                |> List.map .key
-
-                                        colPatches =
-                                            indices
-                                                |> List.sort
-                                                |> List.reverse
-                                                |> List.map
-                                                    (\i ->
-                                                        { action = "splice"
-                                                        , path = [ E.int 0 ]
-                                                        , value = E.list E.int [ i, 1 ]
-                                                        }
-                                                    )
-
-                                        rowPatches =
-                                            table.rows
-                                                |> Array.toIndexedList
-                                                |> List.concatMap
-                                                    (\( rowIdx, _ ) ->
-                                                        colKeys
-                                                            |> List.map
-                                                                (\key ->
-                                                                    { action = "del"
-                                                                    , path = [ E.int (rowIdx + 1), E.string key ]
-                                                                    , value = E.null
-                                                                    }
-                                                                )
-                                                    )
-
-                                        -- Put each column definition back at its own index
-                                        -- (lowest first), then restore the cells it held.
-                                        backColPatches =
-                                            indices
-                                                |> List.sort
-                                                |> List.filterMap
-                                                    (\i ->
-                                                        Array.get i table.cols
-                                                            |> Maybe.map
-                                                                (\col ->
-                                                                    { action = "splice"
-                                                                    , path = [ E.int 0 ]
-                                                                    , value =
-                                                                        E.list identity
-                                                                            [ E.int i
-                                                                            , E.int 0
-                                                                            , E.object
-                                                                                [ ( "name", E.string col.name )
-                                                                                , ( "type", E.string (typeName col.typ) )
-                                                                                , ( "key", E.string col.key )
-                                                                                ]
-                                                                            ]
-                                                                    }
-                                                                )
-                                                    )
-
-                                        backRowPatches =
-                                            table.rows
-                                                |> Array.toIndexedList
-                                                |> List.concatMap
-                                                    (\( rowIdx, row ) ->
-                                                        colKeys
-                                                            |> List.filterMap
-                                                                (\key ->
-                                                                    Dict.get key row
-                                                                        |> Maybe.map
-                                                                            (\v ->
-                                                                                { action = "set"
-                                                                                , path = [ E.int (rowIdx + 1), E.string key ]
-                                                                                , value = v
-                                                                                }
-                                                                            )
-                                                                )
-                                                    )
-                                    in
-                                    ( colPatches ++ rowPatches, backColPatches ++ backRowPatches )
-
-                                SheetFillDown r ->
-                                    let
-                                        norm =
-                                            normalizeRect r
-
-                                        -- The seed is the top data row of the selection: a rect
-                                        -- that starts on the header or type row fills from row 1.
-                                        top =
-                                            max 1 norm.a.y
-
-                                        patchPairs =
-                                            List.range norm.a.x norm.b.x
-                                                |> List.concatMap
-                                                    (\x ->
-                                                        case Array.get x table.cols of
-                                                            Nothing ->
-                                                                []
-
-                                                            Just col ->
-                                                                let
-                                                                    seed =
-                                                                        getOldValue (toDoc top) col.key
-                                                                in
-                                                                List.range (top + 1) norm.b.y
-                                                                    |> List.map
-                                                                        (\y ->
-                                                                            let
-                                                                                docY =
-                                                                                    toDoc y
-                                                                            in
-                                                                            ( { action = "set"
-                                                                              , path = [ E.int docY, E.string col.key ]
-                                                                              , value = seed
-                                                                              }
-                                                                            , { action = "set"
-                                                                              , path = [ E.int docY, E.string col.key ]
-                                                                              , value = getOldValue docY col.key
-                                                                              }
-                                                                            )
-                                                                        )
-                                                    )
-
-                                        forward =
-                                            List.map Tuple.first patchPairs
-
-                                        backward =
-                                            List.map Tuple.second patchPairs
-                                    in
-                                    ( forward, backward )
-
-                                SheetClearCells indices ->
-                                    let
-                                        patchPairs =
-                                            indices
-                                                |> List.filterMap
-                                                    (\idx ->
-                                                        Array.get idx.x table.cols
-                                                            |> Maybe.map
-                                                                (\col ->
-                                                                    let
-                                                                        docY =
-                                                                            toDoc idx.y
-                                                                    in
-                                                                    ( { action = "set"
-                                                                      , path = [ E.int docY, E.string col.key ]
-                                                                      , value = E.string ""
-                                                                      }
-                                                                    , { action = "set"
-                                                                      , path = [ E.int docY, E.string col.key ]
-                                                                      , value = getOldValue docY col.key
-                                                                      }
-                                                                    )
-                                                                )
-                                                    )
-
-                                        forward =
-                                            List.map Tuple.first patchPairs
-
-                                        backward =
-                                            List.map Tuple.second patchPairs
-                                    in
-                                    ( forward, backward )
-
-                                CellCheck i c ->
-                                    case Array.get i.x table.cols of
-                                        Just col ->
-                                            let
-                                                docY =
-                                                    toDoc i.y
-
-                                                oldValue =
-                                                    getOldValue docY col.key
-
-                                                forward =
-                                                    [ { action = "set"
-                                                      , path = [ E.int docY, E.string col.key ]
-                                                      , value = E.bool c
-                                                      }
-                                                    ]
-
-                                                backward =
-                                                    [ { action = "set"
-                                                      , path = [ E.int docY, E.string col.key ]
-                                                      , value = oldValue
-                                                      }
-                                                    ]
-                                            in
-                                            ( forward, backward )
-
-                                        Nothing ->
-                                            ( [], [] )
-
-                        renameClash =
-                            case ( edit, sheet.write ) of
-                                -- y is 0 for a header rename and -1 for a type
-                                -- write, which is the same header cell and not
-                                -- a name at all.
-                                ( SheetWrite { x, y }, Just write ) ->
-                                    iif (y == 0) (nameClash table.cols x write) Nothing
-
-                                _ ->
-                                    Nothing
-
-                        -- Update undo stack if we have patches to track
-                        newUndoStack =
-                            if List.isEmpty forwardPatches || List.isEmpty backwardPatches then
-                                sheet.undoStack
-
-                            else
-                                { forward = forwardPatches, backward = backwardPatches } :: sheet.undoStack |> List.take 50
-
-                        -- Clear redo stack on new changes (unless no undo tracking)
-                        newRedoStack =
-                            if List.isEmpty backwardPatches then
-                                sheet.redoStack
-
-                            else
-                                []
-                    in
-                    case renameClash of
-                        Just name ->
-                            ( { model
-                                | sheet = { sheet | write = Nothing }
-                                , error = "This sheet already has a column called \"" ++ name ++ "\". Two columns of one name have no row a reader can key, so every export and every query over this sheet would refuse it."
-                              }
-                            , Cmd.none
-                            )
-
-                        Nothing ->
-                            if List.isEmpty forwardPatches then
-                                ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
-
-                            else
-                                advanceTutorial 1
-                                    ( { model
-                                        | sheet =
-                                            { sheet
-                                                | write = Nothing
-                                                , undoStack = newUndoStack
-                                                , redoStack = newRedoStack
-                                            }
-                                      }
-                                    , changeDoc { id = sheet.id, data = forwardPatches }
-                                    )
-
-                _ ->
-                    ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
+            updateDocMsg edit model
 
         DocDelete id ->
             -- Show confirmation instead of immediately deleting
@@ -2250,133 +1808,7 @@ update msg ({ sheet, auth } as model) =
             ( { model | deleteConfirm = Nothing }, Cmd.none )
 
         ShareLoad value ->
-            -- Every answer names the sheet it is about and the action that
-            -- asked. Without the id, a list for sheet A that resolved after the
-            -- user opened sheet B wrote A's members and public flag into B's
-            -- panel, silently. Without the action, a field the server renamed
-            -- away read exactly like a field this action never sends, so the
-            -- one failure this payload most needed to report was the one it
-            -- could not see.
-            case value |> D.decodeValue (D.map2 Tuple.pair (D.field "id" D.string) (D.field "action" D.string)) of
-                Err err ->
-                    ( { model
-                        | error =
-                            "A share answer arrived without saying which sheet and which action it is about: "
-                                ++ D.errorToString err
-                      }
-                    , Cmd.none
-                    )
-
-                Ok ( id, action ) ->
-                    if id /= model.id then
-                        -- A correct answer to a question about another sheet.
-                        -- Dropped rather than reported: navigating while a
-                        -- request is open is ordinary, and the bug was ever
-                        -- letting it land.
-                        ( model, Cmd.none )
-
-                    else
-                        let
-                            share =
-                                model.share
-
-                            -- Whether a field was sent at all, which separates a
-                            -- field this action does not carry from one that
-                            -- arrived and could not be read.
-                            sent field =
-                                value |> D.decodeValue (D.field field D.value) |> Result.toMaybe
-
-                            members =
-                                value
-                                    |> D.decodeValue
-                                        (D.field "members"
-                                            (D.list (D.map2 Member (D.field "email" D.string) (D.field "role" D.string)))
-                                        )
-
-                            public =
-                                value |> D.decodeValue (D.field "public" D.bool)
-
-                            link =
-                                value |> D.decodeValue (D.field "link" D.string)
-
-                            hook =
-                                value
-                                    |> D.decodeValue
-                                        (D.field "hook"
-                                            (D.map3 Hook
-                                                (D.field "url" D.string)
-                                                (D.field "secret" D.string)
-                                                (D.field "repro" D.string)
-                                            )
-                                        )
-
-                            -- What this action promises to carry. A promised
-                            -- field that is absent is an error, which is what
-                            -- makes a rename an error rather than a silence.
-                            promised =
-                                case action of
-                                    "hook" ->
-                                        [ "hook" ]
-
-                                    "link" ->
-                                        [ "members", "public", "link" ]
-
-                                    _ ->
-                                        [ "members", "public" ]
-
-                            checked what field decoded =
-                                if not (List.member field promised) then
-                                    Nothing
-
-                                else
-                                    case ( sent field, decoded ) of
-                                        ( Nothing, _ ) ->
-                                            Just
-                                                ("A "
-                                                    ++ action
-                                                    ++ " answer carries no "
-                                                    ++ what
-                                                    ++ ": the \""
-                                                    ++ field
-                                                    ++ "\" field is missing, not empty."
-                                                )
-
-                                        ( Just _, Err err ) ->
-                                            Just ("The " ++ what ++ " arrived in a shape I could not read: " ++ D.errorToString err)
-
-                                        _ ->
-                                            Nothing
-
-                            unreadable =
-                                List.filterMap identity
-                                    [ checked "member list" "members" (Result.map (always ()) members)
-                                    , checked "public flag" "public" (Result.map (always ()) public)
-                                    , checked "share link" "link" (Result.map (always ()) link)
-                                    , checked "signing secret" "hook" (Result.map (always ()) hook)
-                                    ]
-                        in
-                        ( { model
-                            | share =
-                                { share
-                                    | members = members |> Result.withDefault share.members
-                                    , public = public |> Result.withDefault share.public
-                                    , link = link |> Result.toMaybe |> orElse share.link
-                                    , hook = hook |> Result.toMaybe |> orElse share.hook
-                                }
-
-                            -- Every unreadable field, not the first: a banner
-                            -- about the member list while the public flag
-                            -- quietly shows the previous answer's value is worse
-                            -- than one that names both.
-                            , error =
-                                if List.isEmpty unreadable then
-                                    model.error
-
-                                else
-                                    String.join " " unreadable
-                          }
-                        , Cmd.none
-                        )
+            updateShareLoad value model
 
         ShareEmailChange email ->
             ( { model | share = (\s -> { s | email = email }) model.share }, Cmd.none )
@@ -2534,8 +1966,7 @@ update msg ({ sheet, auth } as model) =
                 [ Nav.replaceUrl model.nav ("?q=" ++ Url.percentEncode x)
                 , case sheet.doc of
                     Ok (Query query) ->
-                        -- TODO: Lang to string.
-                        queryDoc (Idd sheet.id { lang = "sql", code = query.code, cols = query.cols })
+                        queryDoc (Idd sheet.id { lang = query.lang, code = query.code, cols = query.cols })
 
                     _ ->
                         Cmd.none
@@ -2739,7 +2170,10 @@ update msg ({ sheet, auth } as model) =
                                             (sheet.table
                                                 |> Result.toMaybe
                                                 |> Maybe.andThen (\t -> t.cols |> Array.filter (\c -> c.key == key) |> Array.get 0)
-                                                |> Maybe.map (.typ >> typeWidthPx)
+                                                |> Maybe.andThen (.typ >> spec >> .width)
+                                                -- No such column, or one that
+                                                -- sizes itself: 140px is about
+                                                -- what one renders at.
                                                 |> Maybe.withDefault 140
                                             )
                                 }
@@ -3012,298 +2446,7 @@ update msg ({ sheet, auth } as model) =
             ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
 
         KeyDown event ->
-            -- Handle global shortcuts first (Ctrl+F, Ctrl+H, Escape for find/replace)
-            if (event.ctrl || event.meta) && event.key == "k" then
-                update (PaletteToggle (model.palette == Nothing)) model
-
-            else if (event.ctrl || event.meta) && event.key == "/" then
-                update (ShortcutsToggle (not model.showShortcuts)) model
-
-            else if
-                event.key
-                    == "?"
-                    && (case sheet.doc of
-                            Ok (Tab _) ->
-                                False
-
-                            _ ->
-                                True
-                       )
-            then
-                update (ShortcutsToggle True) model
-
-            else if (event.ctrl || event.meta) && event.key == "f" then
-                update (FindOpen False) model
-
-            else if (event.ctrl || event.meta) && event.key == "h" then
-                update (FindOpen True) model
-
-            else if (event.ctrl || event.meta) && event.key == "d" then
-                update (DocMsg (SheetFillDown sheet.select)) model
-
-            else if event.key == "Escape" && model.palette /= Nothing then
-                update (PaletteToggle False) model
-
-            else if event.key == "Escape" && model.showShortcuts then
-                update (ShortcutsToggle False) model
-
-            else if event.key == "Escape" && model.showSettings then
-                update SettingsClose model
-
-            else if event.key == "Escape" && model.deleteConfirm /= Nothing then
-                update DocDeleteCancel model
-
-            else if event.key == "Escape" && sheet.filterOpen /= Nothing then
-                ( { model | sheet = { sheet | filterOpen = Nothing } }, Cmd.none )
-
-            else if event.key == "Escape" && sheet.findReplace /= Nothing then
-                update FindClose model
-
-            else if event.key == "Enter" && sheet.findReplace /= Nothing then
-                update FindNext model
-
-            else if (event.ctrl || event.meta) && event.key == "z" && not event.shift then
-                update Undo model
-
-            else if (event.ctrl || event.meta) && event.key == "z" && event.shift then
-                update Redo model
-
-            else if (event.ctrl || event.meta) && event.key == "y" then
-                update Redo model
-
-            else
-                let
-                    sel =
-                        sheet.select.a
-
-                    bounds =
-                        tableBounds model
-
-                    -- Move selection, clamping to bounds and stepping over hidden columns
-                    move : Int -> Int -> ( Model, Cmd Msg )
-                    move dx dy =
-                        let
-                            newX =
-                                skipHidden sheet bounds dx (clamp 0 bounds.maxX (sel.x + dx))
-
-                            newY =
-                                clamp 1 bounds.maxY (sel.y + dy)
-
-                            newSel =
-                                xy newX newY
-                        in
-                        ( { model | sheet = { sheet | select = Rect newSel newSel } }
-                        , Cmd.none
-                        )
-
-                    -- Start editing the current cell
-                    startEdit =
-                        case sheet.doc of
-                            Ok (Tab tbl) ->
-                                let
-                                    col =
-                                        Array.get sel.x tbl.cols
-
-                                    row =
-                                        Array.get (displayYToDocY model.search sheet tbl.rows sel.y - 1) tbl.rows
-                                in
-                                case ( col, row ) of
-                                    ( Just c, Just r ) ->
-                                        let
-                                            val =
-                                                r
-                                                    |> Dict.get c.key
-                                                    |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
-                                                    |> Maybe.withDefault ""
-                                        in
-                                        ( { model | sheet = { sheet | write = Just val } }
-                                        , Task.attempt (always NoOp) (Dom.focus "new-cell")
-                                        )
-
-                                    _ ->
-                                        ( model, Cmd.none )
-
-                            Ok Library ->
-                                case libraryIdAtRow model sel.y of
-                                    "" ->
-                                        ( model, Cmd.none )
-
-                                    id ->
-                                        update (Goto id) model
-
-                            _ ->
-                                ( model, Cmd.none )
-                in
-                if sel.x < 0 || sel.y < 0 then
-                    -- No selection yet, ignore navigation
-                    ( model, Cmd.none )
-
-                else
-                    -- When not editing, navigate with keys
-                    let
-                        -- Expand selection instead of moving when shift is held
-                        expand dx dy =
-                            let
-                                newSelect =
-                                    expandSelection bounds dx dy sheet.select
-                            in
-                            ( { model | sheet = { sheet | select = newSelect } }, Cmd.none )
-
-                        -- Get selected row indices for deletion (never the header/type rows y <= 0)
-                        selectedRows =
-                            let
-                                norm =
-                                    normalizeRect sheet.select
-                            in
-                            List.range norm.a.y norm.b.y |> List.filter (\y -> y >= 1)
-
-                        -- Get selected column indices for deletion
-                        selectedCols =
-                            let
-                                norm =
-                                    normalizeRect sheet.select
-                            in
-                            List.range norm.a.x norm.b.x
-
-                        -- Get all selected cell indices for clearing (data rows only)
-                        selectedCells =
-                            rectToIndices sheet.select |> List.filter (\i -> i.y >= 1)
-                    in
-                    case event.key of
-                        "ArrowUp" ->
-                            if event.shift then
-                                expand 0 -1
-
-                            else
-                                move 0 -1
-
-                        "ArrowDown" ->
-                            if event.shift then
-                                expand 0 1
-
-                            else
-                                move 0 1
-
-                        "ArrowLeft" ->
-                            if event.shift then
-                                expand -1 0
-
-                            else
-                                move -1 0
-
-                        "ArrowRight" ->
-                            if event.shift then
-                                expand 1 0
-
-                            else
-                                move 1 0
-
-                        "Tab" ->
-                            move (iif event.shift -1 1) 0
-
-                        "Enter" ->
-                            -- Ctrl+Enter inserts blank rows above the selection, which is the
-                            -- only way to reach row 1; the footer click appends at the end.
-                            if event.ctrl || event.meta then
-                                update (DocMsg (iif event.shift (SheetRowDuplicate selectedRows) (SheetRowInsert selectedRows))) model
-
-                            else
-                                startEdit
-
-                        "Delete" ->
-                            -- Ctrl+Delete deletes the selected rows, plain Delete clears the cells
-                            if event.ctrl || event.meta then
-                                update (DocMsg (SheetRowDelete selectedRows)) model
-
-                            else
-                                update (DocMsg (SheetClearCells selectedCells)) model
-
-                        "Backspace" ->
-                            -- Ctrl+Backspace deletes the selected columns. Ctrl+Shift+Delete would be
-                            -- the symmetric key, but Chrome keeps it for "Clear browsing data".
-                            if event.ctrl || event.meta then
-                                update (DocMsg (SheetColumnDelete selectedCols)) model
-
-                            else
-                                update (DocMsg (SheetClearCells selectedCells)) model
-
-                        "a" ->
-                            -- Ctrl+A to select all
-                            if event.ctrl || event.meta then
-                                update SelectAll model
-
-                            else
-                                -- Start editing with 'a'
-                                case sheet.doc of
-                                    Ok (Tab tbl) ->
-                                        case Array.get sel.x tbl.cols of
-                                            Just _ ->
-                                                ( { model | sheet = { sheet | write = Just "a" } }
-                                                , Task.attempt (always NoOp) (Dom.focus "new-cell")
-                                                )
-
-                                            _ ->
-                                                ( model, Cmd.none )
-
-                                    _ ->
-                                        ( model, Cmd.none )
-
-                        "Home" ->
-                            -- Jump to beginning of row, or top-left with Ctrl
-                            if event.ctrl || event.meta then
-                                let
-                                    newSel =
-                                        xy 0 1
-                                in
-                                ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
-
-                            else
-                                let
-                                    newSel =
-                                        xy 0 sel.y
-                                in
-                                ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
-
-                        "End" ->
-                            -- Jump to end of row, or bottom-right with Ctrl
-                            if event.ctrl || event.meta then
-                                let
-                                    newSel =
-                                        xy bounds.maxX bounds.maxY
-                                in
-                                ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
-
-                            else
-                                let
-                                    newSel =
-                                        xy bounds.maxX sel.y
-                                in
-                                ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
-
-                        _ ->
-                            -- If it's a single printable character, start editing with it
-                            if String.length event.key == 1 && not event.ctrl && not event.meta then
-                                case sheet.doc of
-                                    Ok (Tab tbl) ->
-                                        let
-                                            col =
-                                                Array.get sel.x tbl.cols
-                                        in
-                                        case col of
-                                            Just _ ->
-                                                -- Start editing with the typed character
-                                                ( { model | sheet = { sheet | write = Just event.key } }
-                                                , Task.attempt (always NoOp) (Dom.focus "new-cell")
-                                                )
-
-                                            _ ->
-                                                ( model, Cmd.none )
-
-                                    _ ->
-                                        ( model, Cmd.none )
-
-                            else
-                                ( model, Cmd.none )
+            updateKeyDown event model
 
         QueryEditorUpdate { textBeforeCursor } ->
             -- Handle special keyboard navigation signals
@@ -3487,142 +2630,7 @@ update msg ({ sheet, auth } as model) =
                     ( model, Cmd.none )
 
         ClipboardPaste text ->
-            -- Parse pasted data and insert into table, expanding bounds as needed
-            case sheet.doc of
-                Ok (Tab tbl) ->
-                    let
-                        -- Clamp paste target to a data cell so an empty/header selection never overwrites column defs
-                        sel =
-                            { x = max 0 sheet.select.a.x, y = max 1 sheet.select.a.y }
-
-                        -- Detect format and parse
-                        data =
-                            case detectFormat text of
-                                Tsv ->
-                                    parseTsv text
-
-                                Csv ->
-                                    parseCsv text
-
-                                JsonArray ->
-                                    parseJson text
-                                        |> Result.withDefault [ [ text ] ]
-
-                                PlainText ->
-                                    [ [ text ] ]
-
-                        -- Calculate required dimensions
-                        pasteWidth =
-                            data |> List.map List.length |> List.maximum |> Maybe.withDefault 0
-
-                        pasteHeight =
-                            List.length data
-
-                        currentColCount =
-                            Array.length tbl.cols
-
-                        currentRowCount =
-                            Array.length tbl.rows
-
-                        -- Rows currently visible (after sort/filter/search); paste targets display positions
-                        visibleCount =
-                            Array.length (filterAndSortIndexed model.search sheet tbl.rows)
-
-                        -- Map a display row to its document row; positions past the visible set become appended rows
-                        docRowFor : Int -> Int
-                        docRowFor dispY =
-                            if dispY <= visibleCount then
-                                displayYToDocY model.search sheet tbl.rows dispY
-
-                            else
-                                currentRowCount + (dispY - visibleCount)
-
-                        -- How many new columns/rows needed?
-                        neededCols =
-                            max 0 (sel.x + pasteWidth - currentColCount)
-
-                        neededRows =
-                            max 0 (sel.y + pasteHeight - 1 - visibleCount)
-
-                        -- Generate patches to add new columns
-                        newColPatches =
-                            List.range 0 (neededCols - 1)
-                                |> List.map
-                                    (\i ->
-                                        let
-                                            newKey =
-                                                String.fromInt (currentColCount + i)
-                                        in
-                                        { action = "push"
-                                        , path = [ E.int 0 ]
-                                        , value =
-                                            E.list identity
-                                                [ E.object
-                                                    [ ( "name", E.string "" )
-                                                    , ( "type", E.string "text" )
-                                                    , ( "key", E.string newKey )
-                                                    ]
-                                                ]
-                                        }
-                                    )
-
-                        -- Generate patches to add new rows
-                        newRowPatches =
-                            List.range 0 (neededRows - 1)
-                                |> List.map
-                                    (\_ ->
-                                        { action = "push"
-                                        , path = []
-                                        , value = E.list identity [ E.object [] ]
-                                        }
-                                    )
-
-                        -- Build column key lookup (existing + new)
-                        colKey : Int -> String
-                        colKey x =
-                            if x < currentColCount then
-                                Array.get x tbl.cols
-                                    |> Maybe.map .key
-                                    |> Maybe.withDefault (String.fromInt x)
-
-                            else
-                                String.fromInt x
-
-                        -- Generate patches for each cell value
-                        cellPatches =
-                            data
-                                |> List.indexedMap
-                                    (\rowOffset row ->
-                                        row
-                                            |> List.indexedMap
-                                                (\colOffset value ->
-                                                    let
-                                                        x =
-                                                            sel.x + colOffset
-
-                                                        y =
-                                                            docRowFor (sel.y + rowOffset)
-                                                    in
-                                                    { action = "set"
-                                                    , path = [ E.int y, E.string (colKey x) ]
-                                                    , value = E.string value
-                                                    }
-                                                )
-                                    )
-                                |> List.concat
-
-                        -- Combine all patches: columns first, then rows, then values
-                        allPatches =
-                            newColPatches ++ newRowPatches ++ cellPatches
-                    in
-                    if List.isEmpty allPatches then
-                        ( model, Cmd.none )
-
-                    else
-                        ( model, changeDoc { id = sheet.id, data = allPatches } )
-
-                _ ->
-                    ( model, Cmd.none )
+            updatePaste text model
 
         SelectAll ->
             case sheet.doc of
@@ -3644,6 +2652,1012 @@ update msg ({ sheet, auth } as model) =
 
 
 ---- VIEW ---------------------------------------------------------------------
+
+
+updateDocMsg : DocMsg -> Model -> ( Model, Cmd Msg )
+updateDocMsg edit ({ sheet } as model) =
+    case sheet.doc of
+        Ok Library ->
+            ( { model | sheet = { sheet | write = Nothing } }
+            , case edit of
+                SheetWrite { x, y } ->
+                    let
+                        id : String
+                        id =
+                            libraryIdAtRow model y
+                    in
+                    case Maybe.map .name (Array.get x (libraryCols model)) of
+                        Just "name" ->
+                            updateLibrary (Idd id { name = sheet.write, tags = Nothing })
+
+                        Just "tags" ->
+                            updateLibrary (Idd id { name = Nothing, tags = sheet.write |> Maybe.map (String.split ", " >> List.map String.trim) })
+
+                        _ ->
+                            Cmd.none
+
+                _ ->
+                    Cmd.none
+            )
+
+        Ok (Tab table) ->
+            let
+                -- Map a display row coordinate to its document row coordinate (accounts for sort/filter/search)
+                toDoc : Int -> Int
+                toDoc y =
+                    displayYToDocY model.search sheet table.rows y
+
+                -- Helper to get old cell value as E.Value (rowIdx is a document coordinate)
+                getOldValue : Int -> String -> E.Value
+                getOldValue rowIdx key =
+                    table.rows
+                        |> Array.get (rowIdx - 1)
+                        |> Maybe.andThen (Dict.get key)
+                        |> Maybe.map (\v -> D.decodeValue D.value v |> Result.withDefault E.null)
+                        |> Maybe.withDefault E.null
+
+                -- Compute forward and backward patches based on edit type
+                ( forwardPatches, backwardPatches ) =
+                    case edit of
+                        SheetWrite { x, y } ->
+                            case ( max 0 y, Array.get x table.cols ) of
+                                ( 0, Just col ) ->
+                                    -- Editing column header (row 0)
+                                    let
+                                        forward =
+                                            sheet.write
+                                                |> Maybe.map
+                                                    (\write ->
+                                                        [ { action = "set"
+                                                          , path = [ E.int 0, E.string (String.fromInt x) ]
+                                                          , value =
+                                                                if y == -1 then
+                                                                    E.object [ ( "name", E.string col.name ), ( "type", E.string write ), ( "key", E.string col.key ) ]
+
+                                                                else
+                                                                    E.object [ ( "name", E.string write ), ( "type", E.string (typeName col.typ) ), ( "key", E.string col.key ) ]
+                                                          }
+                                                        ]
+                                                    )
+                                                |> Maybe.withDefault []
+
+                                        backward =
+                                            [ { action = "set"
+                                              , path = [ E.int 0, E.string (String.fromInt x) ]
+                                              , value = E.object [ ( "name", E.string col.name ), ( "type", E.string (typeName col.typ) ), ( "key", E.string col.key ) ]
+                                              }
+                                            ]
+                                    in
+                                    ( forward, backward )
+
+                                ( rowY, Just col ) ->
+                                    -- Editing data cell (translate display row to document row).
+                                    -- No write means a cancelled edit or a blur after cancel: leave the cell untouched.
+                                    case sheet.write of
+                                        Nothing ->
+                                            ( [], [] )
+
+                                        Just write ->
+                                            let
+                                                docY =
+                                                    toDoc rowY
+
+                                                forward =
+                                                    [ { action = "set"
+                                                      , path = [ E.int docY, E.string col.key ]
+                                                      , value = E.string write
+                                                      }
+                                                    ]
+
+                                                backward =
+                                                    [ { action = "set"
+                                                      , path = [ E.int docY, E.string col.key ]
+                                                      , value = getOldValue docY col.key
+                                                      }
+                                                    ]
+                                            in
+                                            ( forward, backward )
+
+                                _ ->
+                                    ( [], [] )
+
+                        SheetRowPush ->
+                            let
+                                rowCount =
+                                    Array.length table.rows + 1
+
+                                forward =
+                                    [ { action = "push"
+                                      , path = []
+                                      , value = E.list identity [ E.object [] ]
+                                      }
+                                    ]
+
+                                backward =
+                                    [ { action = "splice"
+                                      , path = []
+                                      , value = E.list E.int [ rowCount, 1 ]
+                                      }
+                                    ]
+                            in
+                            ( forward, backward )
+
+                        SheetColumnPush ->
+                            let
+                                colCount =
+                                    Array.length table.cols
+
+                                forward =
+                                    [ { action = "push"
+                                      , path = [ E.int 0 ]
+                                      , value = E.list identity [ E.object [ ( "name", E.string "" ), ( "type", E.string "text" ), ( "key", E.int colCount ) ] ]
+                                      }
+                                    ]
+
+                                backward =
+                                    [ { action = "splice"
+                                      , path = [ E.int 0 ]
+                                      , value = E.list E.int [ colCount, 1 ]
+                                      }
+                                    ]
+                            in
+                            ( forward, backward )
+
+                        SheetRowInsert indices ->
+                            rowSplices (\_ -> Just Dict.empty) 0 indices toDoc
+
+                        SheetRowDuplicate indices ->
+                            rowSplices (\i -> Array.get (i - 1) table.rows) 1 indices toDoc
+
+                        SheetRowDelete indices ->
+                            let
+                                docYs =
+                                    indices |> List.map toDoc |> List.sort
+
+                                forward =
+                                    docYs
+                                        |> List.reverse
+                                        |> List.map
+                                            (\i ->
+                                                { action = "splice"
+                                                , path = []
+                                                , value = E.list E.int [ i, 1 ]
+                                                }
+                                            )
+
+                                -- Re-insert lowest first, so each row lands back at
+                                -- its original index. Doc row i is rows[i - 1].
+                                backward =
+                                    docYs
+                                        |> List.filterMap
+                                            (\i ->
+                                                Array.get (i - 1) table.rows
+                                                    |> Maybe.map
+                                                        (\row ->
+                                                            { action = "splice"
+                                                            , path = []
+                                                            , value = E.list identity [ E.int i, E.int 0, E.dict identity identity row ]
+                                                            }
+                                                        )
+                                            )
+                            in
+                            ( forward, backward )
+
+                        SheetColumnDelete indices ->
+                            let
+                                colKeys =
+                                    indices
+                                        |> List.filterMap (\i -> Array.get i table.cols)
+                                        |> List.map .key
+
+                                colPatches =
+                                    indices
+                                        |> List.sort
+                                        |> List.reverse
+                                        |> List.map
+                                            (\i ->
+                                                { action = "splice"
+                                                , path = [ E.int 0 ]
+                                                , value = E.list E.int [ i, 1 ]
+                                                }
+                                            )
+
+                                rowPatches =
+                                    table.rows
+                                        |> Array.toIndexedList
+                                        |> List.concatMap
+                                            (\( rowIdx, _ ) ->
+                                                colKeys
+                                                    |> List.map
+                                                        (\key ->
+                                                            { action = "del"
+                                                            , path = [ E.int (rowIdx + 1), E.string key ]
+                                                            , value = E.null
+                                                            }
+                                                        )
+                                            )
+
+                                -- Put each column definition back at its own index
+                                -- (lowest first), then restore the cells it held.
+                                backColPatches =
+                                    indices
+                                        |> List.sort
+                                        |> List.filterMap
+                                            (\i ->
+                                                Array.get i table.cols
+                                                    |> Maybe.map
+                                                        (\col ->
+                                                            { action = "splice"
+                                                            , path = [ E.int 0 ]
+                                                            , value =
+                                                                E.list identity
+                                                                    [ E.int i
+                                                                    , E.int 0
+                                                                    , E.object
+                                                                        [ ( "name", E.string col.name )
+                                                                        , ( "type", E.string (typeName col.typ) )
+                                                                        , ( "key", E.string col.key )
+                                                                        ]
+                                                                    ]
+                                                            }
+                                                        )
+                                            )
+
+                                backRowPatches =
+                                    table.rows
+                                        |> Array.toIndexedList
+                                        |> List.concatMap
+                                            (\( rowIdx, row ) ->
+                                                colKeys
+                                                    |> List.filterMap
+                                                        (\key ->
+                                                            Dict.get key row
+                                                                |> Maybe.map
+                                                                    (\v ->
+                                                                        { action = "set"
+                                                                        , path = [ E.int (rowIdx + 1), E.string key ]
+                                                                        , value = v
+                                                                        }
+                                                                    )
+                                                        )
+                                            )
+                            in
+                            ( colPatches ++ rowPatches, backColPatches ++ backRowPatches )
+
+                        SheetFillDown r ->
+                            let
+                                norm =
+                                    normalizeRect r
+
+                                -- The seed is the top data row of the selection: a rect
+                                -- that starts on the header or type row fills from row 1.
+                                top =
+                                    max 1 norm.a.y
+
+                                patchPairs =
+                                    List.range norm.a.x norm.b.x
+                                        |> List.concatMap
+                                            (\x ->
+                                                case Array.get x table.cols of
+                                                    Nothing ->
+                                                        []
+
+                                                    Just col ->
+                                                        let
+                                                            seed =
+                                                                getOldValue (toDoc top) col.key
+                                                        in
+                                                        List.range (top + 1) norm.b.y
+                                                            |> List.map
+                                                                (\y ->
+                                                                    let
+                                                                        docY =
+                                                                            toDoc y
+                                                                    in
+                                                                    ( { action = "set"
+                                                                      , path = [ E.int docY, E.string col.key ]
+                                                                      , value = seed
+                                                                      }
+                                                                    , { action = "set"
+                                                                      , path = [ E.int docY, E.string col.key ]
+                                                                      , value = getOldValue docY col.key
+                                                                      }
+                                                                    )
+                                                                )
+                                            )
+
+                                forward =
+                                    List.map Tuple.first patchPairs
+
+                                backward =
+                                    List.map Tuple.second patchPairs
+                            in
+                            ( forward, backward )
+
+                        SheetClearCells indices ->
+                            let
+                                patchPairs =
+                                    indices
+                                        |> List.filterMap
+                                            (\idx ->
+                                                Array.get idx.x table.cols
+                                                    |> Maybe.map
+                                                        (\col ->
+                                                            let
+                                                                docY =
+                                                                    toDoc idx.y
+                                                            in
+                                                            ( { action = "set"
+                                                              , path = [ E.int docY, E.string col.key ]
+                                                              , value = E.string ""
+                                                              }
+                                                            , { action = "set"
+                                                              , path = [ E.int docY, E.string col.key ]
+                                                              , value = getOldValue docY col.key
+                                                              }
+                                                            )
+                                                        )
+                                            )
+
+                                forward =
+                                    List.map Tuple.first patchPairs
+
+                                backward =
+                                    List.map Tuple.second patchPairs
+                            in
+                            ( forward, backward )
+
+                        CellCheck i c ->
+                            case Array.get i.x table.cols of
+                                Just col ->
+                                    let
+                                        docY =
+                                            toDoc i.y
+
+                                        oldValue =
+                                            getOldValue docY col.key
+
+                                        forward =
+                                            [ { action = "set"
+                                              , path = [ E.int docY, E.string col.key ]
+                                              , value = E.bool c
+                                              }
+                                            ]
+
+                                        backward =
+                                            [ { action = "set"
+                                              , path = [ E.int docY, E.string col.key ]
+                                              , value = oldValue
+                                              }
+                                            ]
+                                    in
+                                    ( forward, backward )
+
+                                Nothing ->
+                                    ( [], [] )
+
+                renameClash =
+                    case ( edit, sheet.write ) of
+                        -- y is 0 for a header rename and -1 for a type
+                        -- write, which is the same header cell and not
+                        -- a name at all.
+                        ( SheetWrite { x, y }, Just write ) ->
+                            iif (y == 0) (nameClash table.cols x write) Nothing
+
+                        _ ->
+                            Nothing
+
+                -- Update undo stack if we have patches to track
+                newUndoStack =
+                    if List.isEmpty forwardPatches || List.isEmpty backwardPatches then
+                        sheet.undoStack
+
+                    else
+                        { forward = forwardPatches, backward = backwardPatches } :: sheet.undoStack |> List.take 50
+
+                -- Clear redo stack on new changes (unless no undo tracking)
+                newRedoStack =
+                    if List.isEmpty backwardPatches then
+                        sheet.redoStack
+
+                    else
+                        []
+            in
+            case renameClash of
+                Just name ->
+                    ( { model
+                        | sheet = { sheet | write = Nothing }
+                        , error = "This sheet already has a column called \"" ++ name ++ "\". Two columns of one name have no row a reader can key, so every export and every query over this sheet would refuse it."
+                      }
+                    , Cmd.none
+                    )
+
+                Nothing ->
+                    if List.isEmpty forwardPatches then
+                        ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
+
+                    else
+                        advanceTutorial 1
+                            ( { model
+                                | sheet =
+                                    { sheet
+                                        | write = Nothing
+                                        , undoStack = newUndoStack
+                                        , redoStack = newRedoStack
+                                    }
+                              }
+                            , changeDoc { id = sheet.id, data = forwardPatches }
+                            )
+
+        _ ->
+            ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
+
+
+updateKeyDown : KeyEvent -> Model -> ( Model, Cmd Msg )
+updateKeyDown event ({ sheet } as model) =
+    -- Handle global shortcuts first (Ctrl+F, Ctrl+H, Escape for find/replace)
+    if (event.ctrl || event.meta) && event.key == "k" then
+        update (PaletteToggle (model.palette == Nothing)) model
+
+    else if (event.ctrl || event.meta) && event.key == "/" then
+        update (ShortcutsToggle (not model.showShortcuts)) model
+
+    else if
+        event.key
+            == "?"
+            && (case sheet.doc of
+                    Ok (Tab _) ->
+                        False
+
+                    _ ->
+                        True
+               )
+    then
+        update (ShortcutsToggle True) model
+
+    else if (event.ctrl || event.meta) && event.key == "f" then
+        update (FindOpen False) model
+
+    else if (event.ctrl || event.meta) && event.key == "h" then
+        update (FindOpen True) model
+
+    else if (event.ctrl || event.meta) && event.key == "d" then
+        update (DocMsg (SheetFillDown sheet.select)) model
+
+    else if event.key == "Escape" && model.palette /= Nothing then
+        update (PaletteToggle False) model
+
+    else if event.key == "Escape" && model.showShortcuts then
+        update (ShortcutsToggle False) model
+
+    else if event.key == "Escape" && model.showSettings then
+        update SettingsClose model
+
+    else if event.key == "Escape" && model.deleteConfirm /= Nothing then
+        update DocDeleteCancel model
+
+    else if event.key == "Escape" && sheet.filterOpen /= Nothing then
+        ( { model | sheet = { sheet | filterOpen = Nothing } }, Cmd.none )
+
+    else if event.key == "Escape" && sheet.findReplace /= Nothing then
+        update FindClose model
+
+    else if event.key == "Enter" && sheet.findReplace /= Nothing then
+        update FindNext model
+
+    else if (event.ctrl || event.meta) && event.key == "z" && not event.shift then
+        update Undo model
+
+    else if (event.ctrl || event.meta) && event.key == "z" && event.shift then
+        update Redo model
+
+    else if (event.ctrl || event.meta) && event.key == "y" then
+        update Redo model
+
+    else
+        let
+            sel =
+                sheet.select.a
+
+            bounds =
+                tableBounds model
+
+            -- Move selection, clamping to bounds and stepping over hidden columns
+            move : Int -> Int -> ( Model, Cmd Msg )
+            move dx dy =
+                let
+                    newX =
+                        skipHidden sheet bounds dx (clamp 0 bounds.maxX (sel.x + dx))
+
+                    newY =
+                        clamp 1 bounds.maxY (sel.y + dy)
+
+                    newSel =
+                        xy newX newY
+                in
+                ( { model | sheet = { sheet | select = Rect newSel newSel } }
+                , Cmd.none
+                )
+
+            -- Start editing the current cell
+            startEdit =
+                case sheet.doc of
+                    Ok (Tab tbl) ->
+                        let
+                            col =
+                                Array.get sel.x tbl.cols
+
+                            row =
+                                Array.get (displayYToDocY model.search sheet tbl.rows sel.y - 1) tbl.rows
+                        in
+                        case ( col, row ) of
+                            ( Just c, Just r ) ->
+                                let
+                                    val =
+                                        r
+                                            |> Dict.get c.key
+                                            |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
+                                            |> Maybe.withDefault ""
+                                in
+                                ( { model | sheet = { sheet | write = Just val } }
+                                , Task.attempt (always NoOp) (Dom.focus "new-cell")
+                                )
+
+                            _ ->
+                                ( model, Cmd.none )
+
+                    Ok Library ->
+                        case libraryIdAtRow model sel.y of
+                            "" ->
+                                ( model, Cmd.none )
+
+                            id ->
+                                update (Goto id) model
+
+                    _ ->
+                        ( model, Cmd.none )
+        in
+        if sel.x < 0 || sel.y < 0 then
+            -- No selection yet, ignore navigation
+            ( model, Cmd.none )
+
+        else
+            -- When not editing, navigate with keys
+            let
+                -- Expand selection instead of moving when shift is held
+                expand dx dy =
+                    let
+                        newSelect =
+                            expandSelection bounds dx dy sheet.select
+                    in
+                    ( { model | sheet = { sheet | select = newSelect } }, Cmd.none )
+
+                -- Get selected row indices for deletion (never the header/type rows y <= 0)
+                selectedRows =
+                    let
+                        norm =
+                            normalizeRect sheet.select
+                    in
+                    List.range norm.a.y norm.b.y |> List.filter (\y -> y >= 1)
+
+                -- Get selected column indices for deletion
+                selectedCols =
+                    let
+                        norm =
+                            normalizeRect sheet.select
+                    in
+                    List.range norm.a.x norm.b.x
+
+                -- Get all selected cell indices for clearing (data rows only)
+                selectedCells =
+                    rectToIndices sheet.select |> List.filter (\i -> i.y >= 1)
+            in
+            case event.key of
+                "ArrowUp" ->
+                    if event.shift then
+                        expand 0 -1
+
+                    else
+                        move 0 -1
+
+                "ArrowDown" ->
+                    if event.shift then
+                        expand 0 1
+
+                    else
+                        move 0 1
+
+                "ArrowLeft" ->
+                    if event.shift then
+                        expand -1 0
+
+                    else
+                        move -1 0
+
+                "ArrowRight" ->
+                    if event.shift then
+                        expand 1 0
+
+                    else
+                        move 1 0
+
+                "Tab" ->
+                    move (iif event.shift -1 1) 0
+
+                "Enter" ->
+                    -- Ctrl+Enter inserts blank rows above the selection, which is the
+                    -- only way to reach row 1; the footer click appends at the end.
+                    if event.ctrl || event.meta then
+                        update (DocMsg (iif event.shift (SheetRowDuplicate selectedRows) (SheetRowInsert selectedRows))) model
+
+                    else
+                        startEdit
+
+                "Delete" ->
+                    -- Ctrl+Delete deletes the selected rows, plain Delete clears the cells
+                    if event.ctrl || event.meta then
+                        update (DocMsg (SheetRowDelete selectedRows)) model
+
+                    else
+                        update (DocMsg (SheetClearCells selectedCells)) model
+
+                "Backspace" ->
+                    -- Ctrl+Backspace deletes the selected columns. Ctrl+Shift+Delete would be
+                    -- the symmetric key, but Chrome keeps it for "Clear browsing data".
+                    if event.ctrl || event.meta then
+                        update (DocMsg (SheetColumnDelete selectedCols)) model
+
+                    else
+                        update (DocMsg (SheetClearCells selectedCells)) model
+
+                "a" ->
+                    -- Ctrl+A to select all
+                    if event.ctrl || event.meta then
+                        update SelectAll model
+
+                    else
+                        -- Start editing with 'a'
+                        case sheet.doc of
+                            Ok (Tab tbl) ->
+                                case Array.get sel.x tbl.cols of
+                                    Just _ ->
+                                        ( { model | sheet = { sheet | write = Just "a" } }
+                                        , Task.attempt (always NoOp) (Dom.focus "new-cell")
+                                        )
+
+                                    _ ->
+                                        ( model, Cmd.none )
+
+                            _ ->
+                                ( model, Cmd.none )
+
+                "Home" ->
+                    -- Jump to beginning of row, or top-left with Ctrl
+                    if event.ctrl || event.meta then
+                        let
+                            newSel =
+                                xy 0 1
+                        in
+                        ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
+
+                    else
+                        let
+                            newSel =
+                                xy 0 sel.y
+                        in
+                        ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
+
+                "End" ->
+                    -- Jump to end of row, or bottom-right with Ctrl
+                    if event.ctrl || event.meta then
+                        let
+                            newSel =
+                                xy bounds.maxX bounds.maxY
+                        in
+                        ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
+
+                    else
+                        let
+                            newSel =
+                                xy bounds.maxX sel.y
+                        in
+                        ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
+
+                _ ->
+                    -- If it's a single printable character, start editing with it
+                    if String.length event.key == 1 && not event.ctrl && not event.meta then
+                        case sheet.doc of
+                            Ok (Tab tbl) ->
+                                let
+                                    col =
+                                        Array.get sel.x tbl.cols
+                                in
+                                case col of
+                                    Just _ ->
+                                        -- Start editing with the typed character
+                                        ( { model | sheet = { sheet | write = Just event.key } }
+                                        , Task.attempt (always NoOp) (Dom.focus "new-cell")
+                                        )
+
+                                    _ ->
+                                        ( model, Cmd.none )
+
+                            _ ->
+                                ( model, Cmd.none )
+
+                    else
+                        ( model, Cmd.none )
+
+
+updatePaste : String -> Model -> ( Model, Cmd Msg )
+updatePaste text ({ sheet } as model) =
+    -- Parse pasted data and insert into table, expanding bounds as needed
+    case sheet.doc of
+        Ok (Tab tbl) ->
+            let
+                -- Clamp paste target to a data cell so an empty/header selection never overwrites column defs
+                sel =
+                    { x = max 0 sheet.select.a.x, y = max 1 sheet.select.a.y }
+
+                -- Detect format and parse
+                data =
+                    case detectFormat text of
+                        Tsv ->
+                            parseTsv text
+
+                        Csv ->
+                            parseCsv text
+
+                        JsonArray ->
+                            parseJson text
+                                |> Result.withDefault [ [ text ] ]
+
+                        PlainText ->
+                            [ [ text ] ]
+
+                -- Calculate required dimensions
+                pasteWidth =
+                    data |> List.map List.length |> List.maximum |> Maybe.withDefault 0
+
+                pasteHeight =
+                    List.length data
+
+                currentColCount =
+                    Array.length tbl.cols
+
+                currentRowCount =
+                    Array.length tbl.rows
+
+                -- Rows currently visible (after sort/filter/search); paste targets display positions
+                visibleCount =
+                    Array.length (filterAndSortIndexed model.search sheet tbl.rows)
+
+                -- Map a display row to its document row; positions past the visible set become appended rows
+                docRowFor : Int -> Int
+                docRowFor dispY =
+                    if dispY <= visibleCount then
+                        displayYToDocY model.search sheet tbl.rows dispY
+
+                    else
+                        currentRowCount + (dispY - visibleCount)
+
+                -- How many new columns/rows needed?
+                neededCols =
+                    max 0 (sel.x + pasteWidth - currentColCount)
+
+                neededRows =
+                    max 0 (sel.y + pasteHeight - 1 - visibleCount)
+
+                -- Generate patches to add new columns
+                newColPatches =
+                    List.range 0 (neededCols - 1)
+                        |> List.map
+                            (\i ->
+                                let
+                                    newKey =
+                                        String.fromInt (currentColCount + i)
+                                in
+                                { action = "push"
+                                , path = [ E.int 0 ]
+                                , value =
+                                    E.list identity
+                                        [ E.object
+                                            [ ( "name", E.string "" )
+                                            , ( "type", E.string "text" )
+                                            , ( "key", E.string newKey )
+                                            ]
+                                        ]
+                                }
+                            )
+
+                -- Generate patches to add new rows
+                newRowPatches =
+                    List.range 0 (neededRows - 1)
+                        |> List.map
+                            (\_ ->
+                                { action = "push"
+                                , path = []
+                                , value = E.list identity [ E.object [] ]
+                                }
+                            )
+
+                -- Build column key lookup (existing + new)
+                colKey : Int -> String
+                colKey x =
+                    if x < currentColCount then
+                        Array.get x tbl.cols
+                            |> Maybe.map .key
+                            |> Maybe.withDefault (String.fromInt x)
+
+                    else
+                        String.fromInt x
+
+                -- Generate patches for each cell value
+                cellPatches =
+                    data
+                        |> List.indexedMap
+                            (\rowOffset row ->
+                                row
+                                    |> List.indexedMap
+                                        (\colOffset value ->
+                                            let
+                                                x =
+                                                    sel.x + colOffset
+
+                                                y =
+                                                    docRowFor (sel.y + rowOffset)
+                                            in
+                                            { action = "set"
+                                            , path = [ E.int y, E.string (colKey x) ]
+                                            , value = E.string value
+                                            }
+                                        )
+                            )
+                        |> List.concat
+
+                -- Combine all patches: columns first, then rows, then values
+                allPatches =
+                    newColPatches ++ newRowPatches ++ cellPatches
+            in
+            if List.isEmpty allPatches then
+                ( model, Cmd.none )
+
+            else
+                ( model, changeDoc { id = sheet.id, data = allPatches } )
+
+        _ ->
+            ( model, Cmd.none )
+
+
+updateShareLoad : D.Value -> Model -> ( Model, Cmd Msg )
+updateShareLoad value model =
+    -- Every answer names the sheet it is about and the action that
+    -- asked. Without the id, a list for sheet A that resolved after the
+    -- user opened sheet B wrote A's members and public flag into B's
+    -- panel, silently. Without the action, a field the server renamed
+    -- away read exactly like a field this action never sends, so the
+    -- one failure this payload most needed to report was the one it
+    -- could not see.
+    case value |> D.decodeValue (D.map2 Tuple.pair (D.field "id" D.string) (D.field "action" D.string)) of
+        Err err ->
+            ( { model
+                | error =
+                    "A share answer arrived without saying which sheet and which action it is about: "
+                        ++ D.errorToString err
+              }
+            , Cmd.none
+            )
+
+        Ok ( id, action ) ->
+            if id /= model.id then
+                -- A correct answer to a question about another sheet.
+                -- Dropped rather than reported: navigating while a
+                -- request is open is ordinary, and the bug was ever
+                -- letting it land.
+                ( model, Cmd.none )
+
+            else
+                let
+                    share =
+                        model.share
+
+                    -- Whether a field was sent at all, which separates a
+                    -- field this action does not carry from one that
+                    -- arrived and could not be read.
+                    sent field =
+                        value |> D.decodeValue (D.field field D.value) |> Result.toMaybe
+
+                    members =
+                        value
+                            |> D.decodeValue
+                                (D.field "members"
+                                    (D.list (D.map2 Member (D.field "email" D.string) (D.field "role" D.string)))
+                                )
+
+                    public =
+                        value |> D.decodeValue (D.field "public" D.bool)
+
+                    link =
+                        value |> D.decodeValue (D.field "link" D.string)
+
+                    hook =
+                        value
+                            |> D.decodeValue
+                                (D.field "hook"
+                                    (D.map3 Hook
+                                        (D.field "url" D.string)
+                                        (D.field "secret" D.string)
+                                        (D.field "repro" D.string)
+                                    )
+                                )
+
+                    -- What this action promises to carry. A promised
+                    -- field that is absent is an error, which is what
+                    -- makes a rename an error rather than a silence.
+                    promised =
+                        case action of
+                            "hook" ->
+                                [ "hook" ]
+
+                            "link" ->
+                                [ "members", "public", "link" ]
+
+                            _ ->
+                                [ "members", "public" ]
+
+                    checked what field decoded =
+                        if not (List.member field promised) then
+                            Nothing
+
+                        else
+                            case ( sent field, decoded ) of
+                                ( Nothing, _ ) ->
+                                    Just
+                                        ("A "
+                                            ++ action
+                                            ++ " answer carries no "
+                                            ++ what
+                                            ++ ": the \""
+                                            ++ field
+                                            ++ "\" field is missing, not empty."
+                                        )
+
+                                ( Just _, Err err ) ->
+                                    Just ("The " ++ what ++ " arrived in a shape I could not read: " ++ D.errorToString err)
+
+                                _ ->
+                                    Nothing
+
+                    unreadable =
+                        List.filterMap identity
+                            [ checked "member list" "members" (Result.map (always ()) members)
+                            , checked "public flag" "public" (Result.map (always ()) public)
+                            , checked "share link" "link" (Result.map (always ()) link)
+                            , checked "signing secret" "hook" (Result.map (always ()) hook)
+                            ]
+                in
+                ( { model
+                    | share =
+                        { share
+                            | members = members |> Result.withDefault share.members
+                            , public = public |> Result.withDefault share.public
+                            , link = link |> Result.toMaybe |> orElse share.link
+                            , hook = hook |> Result.toMaybe |> orElse share.hook
+                        }
+
+                    -- Every unreadable field, not the first: a banner
+                    -- about the member list while the public flag
+                    -- quietly shows the previous answer's value is worse
+                    -- than one that names both.
+                    , error =
+                        if List.isEmpty unreadable then
+                            model.error
+
+                        else
+                            String.join " " unreadable
+                  }
+                , Cmd.none
+                )
 
 
 libraryCols : Model -> Array Col
@@ -4635,118 +4649,17 @@ displayYToDocY search sheet rows y =
             |> Maybe.withDefault y
 
 
-typeAlign : Type -> H.Attribute Msg
-typeAlign typ =
-    case typ of
-        Create ->
-            S.textAlignRight
-
-        SheetId ->
-            S.textAlignCenter
-
-        Boolean ->
-            S.textAlignCenter
-
-        Usd ->
-            S.textAlignRight
-
-        Number ->
-            S.textAlignRight
-
-        Percentage ->
-            S.textAlignRight
-
-        Delete ->
-            S.textAlignCenter
-
-        Form ->
-            S.textAlignCenter
-
-        _ ->
-            S.textAlignLeft
-
-
-{-| A dragged width wins over the per-type default; without one the column keeps
-whatever typeWidth says, including auto.
+{-| A dragged width wins over the type's own, and a type with no width of its
+own sizes itself. Both come out of `spec`, in px, so a width cannot be changed
+in one place and missed in another.
 -}
 colWidth : Sheet -> Col -> H.Attribute Msg
 colWidth sheet col =
-    case Dict.get col.key sheet.widths of
+    case Dict.get col.key sheet.widths |> orElse (spec col.typ).width of
         Just px ->
             S.width (String.fromInt px ++ "px")
 
         Nothing ->
-            typeWidth col.typ
-
-
-{-| Starting point for a drag, in px: the rem widths below times the 16px root,
-and a readable default for the columns that size themselves.
--}
-typeWidthPx : Type -> Int
-typeWidthPx typ =
-    case typ of
-        Create ->
-            160
-
-        SheetId ->
-            48
-
-        Boolean ->
-            32
-
-        Number ->
-            80
-
-        Usd ->
-            80
-
-        Date ->
-            112
-
-        Percentage ->
-            64
-
-        Delete ->
-            64
-
-        Thumb ->
-            64
-
-        _ ->
-            140
-
-
-typeWidth : Type -> H.Attribute Msg
-typeWidth typ =
-    case typ of
-        Create ->
-            S.widthRem 10
-
-        SheetId ->
-            S.widthRem 3
-
-        Boolean ->
-            S.widthRem 2
-
-        Number ->
-            S.widthRem 5
-
-        Usd ->
-            S.widthRem 5
-
-        Date ->
-            S.widthRem 7
-
-        Percentage ->
-            S.widthRem 4
-
-        Delete ->
-            S.widthRem 4
-
-        Thumb ->
-            S.widthRem 4
-
-        _ ->
             S.widthAuto
 
 
@@ -5022,7 +4935,7 @@ viewCell sheet stats i n col row =
         , A.onMouseEnter (CellHover (xy i n))
         , iif (n == 0 && sheet.filterOpen == Just col.key) (S.zIndex "2") (A.classList [])
         , cellClasses sheet i n
-        , typeAlign col.typ
+        , (spec col.typ).align
         , colWidth sheet col
         , iif (Set.member col.key sheet.hidden) S.displayNone (A.classList [])
         ]
@@ -5306,7 +5219,7 @@ viewToolbar model info =
             , [ H.button [ A.class "chip", A.onClick (ShortcutsToggle True), iif (sheet.id == "") S.marginLeftAuto (A.classList []) ] [ text "keys" ] ]
             , case sheet.doc of
                 Ok (Tab _) ->
-                    [ H.a [ A.class "chip", A.href ("https://api.sheets.scrap.land/export/" ++ sheet.id ++ ".csv"), A.download (sheet.id ++ ".csv") ] [ text "export csv" ] ]
+                    [ H.a [ A.class "chip", A.href (model.api ++ "/export/" ++ sheet.id ++ ".csv"), A.download (sheet.id ++ ".csv") ] [ text "export csv" ] ]
 
                 Ok (Chart _) ->
                     List.map
@@ -5375,7 +5288,7 @@ viewNetHook : Model -> Html Msg
 viewNetHook model =
     let
         url =
-            "https://api.sheets.scrap.land/net/" ++ model.sheet.id
+            model.api ++ "/net/" ++ model.sheet.id
     in
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ viewNetWarning model
