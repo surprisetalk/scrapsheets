@@ -56,11 +56,11 @@ it in with `--insert-statement`.
 
 Five files. Which one a failure belongs in is usually obvious.
 
-- `main_test.ts` — the server. One `Deno.test` of 35 named `t.step`s against in-process PGlite: auth, sync and roles,
-  shop and Stripe, `POST /query`, the `src/sql.mjs` UDFs, net-http polling, alerts and digests, MCP, export. Steps run
-  in order against one database, so a step still depends on what ran before it. What steps buy is a name in the failure
-  and every later step still running — **not** isolation, and not `--filter`, which matches test names and not step
-  names.
+- `main_test.ts` — the server. One `Deno.test` of named `t.step`s against in-process PGlite: auth, sync and roles, shop
+  and Stripe, `POST /query`, the `src/sql.mjs` UDFs, net-http polling, socket reports, alerts and digests, MCP, export.
+  Steps run in order against one database, so a step still depends on what ran before it. What steps buy is a name in
+  the failure and every later step still running — **not** isolation, and not `--filter`, which matches test names and
+  not step names.
 - `examples_test.ts` — every bundled sheet through **both** engines (`npm:alasql` and the vendored `src/alasql.mjs` the
   page loads), compared row for row.
 - `page_test.ts` — the page under jsdom: the compiled Elm in `dist/index.js` initializes, renders and answers clicks,
@@ -108,6 +108,16 @@ A change that breaks one of these is a bug even if the suite is green.
   `index.html` by import. `PORTALS` in `src/portals.mjs` is the only portal list. `Stored` in `index.html` is the only
   `localStorage` key prefix. `spec` in `Main.elm` is the only per-column-type table, and it has no wildcard, so a new
   type fails to compile.
+- **A column type is one word everywhere.** `COLUMN_TYPES` in `src/sql.mjs` is the list. Its entries are either a type
+  or an `as` alias of one; `CANONICAL_TYPES` is the half anything may write, `NUMERIC_TYPES` and `JSON_TYPES` derive
+  through `canonicalType()`, and `main.ts`'s `Type` union plus `columnTypes`/`typeAliases` in `Main.elm` are the copies
+  a language boundary forces — `browser_test.ts` reads all three as source text, in both directions, and fails when any
+  drifts. An alias is read and never written, so an old `pct` column still loads, still queries and is still checked,
+  and no new one is stored. A spelling outside the list is refused by `checkColumnTypes` rather than skipped: skipping
+  it is how a percent column stopped being checked at all.
+- **A column's declared type is never rewritten.** `col.raw` is the document's own spelling, the way `col.key` is, and
+  a header write patches one field (`[0, x, "name"]`) rather than replacing the column object. Replacing it made a
+  rename re-encode the type beside the name.
 - **No runtime CDN.** Everything the page loads is served by us; `deno task vendor` fails the build if a bundle would
   still fetch something. Automerge stays external in the repo bundles so all three share one WASM-initialized copy.
 
@@ -133,6 +143,10 @@ navigation, in file order:
 - **Webhook ingest**: `POST /net/:id`, always signed (`scrapsheets-signature: t=…,v2=…`, or a Stripe/GitHub/Shopify
   scheme chosen by the sheet's stored secret name). Replay is refused by the unique index `net_hook_signature_idx` on
   the digest that actually verified.
+- **Socket health**: nothing server-side opens a `net-socket` sheet's socket, so a browser with the tab open is the
+  only witness and `POST /library/:id/socket` is how it says so. Two states — `connected` and `error`, never a close,
+  because `changeId()` closes the socket on every navigation. `library:freshness` admits the sheet only once it has a
+  `SOCKET` run, so a socket nobody has watched is absent rather than "never run" forever.
 - **Polling**: `pollNetOnce` and `pollAlertOnce` on a 15-second tick; conditional requests, per-host `Retry-After`,
   bounded retries, and a `net` row per run — including quiet ones, because a healthy quiet alert and a dead timer
   otherwise write the same nothing.
@@ -153,8 +167,11 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
 - **Unpivot** is ours (AlaSQL drops the columns it is not unpivoting); **pivot** is AlaSQL's, guarded by `checkPivot()`.
 - **`describe @ref`** is intercepted before the engine in both engines, and is the one statement that still answers on a
   sheet whose cells fail the type check.
-- **Types**: `checkColumnTypes()` is the one place a cell becomes what its column says — a blank becomes `null`, a
-  numeric string becomes its number. `selectTypes()` types a result column off its select item, not off its name.
+- **Types**: `COLUMN_TYPES` is every type a column may declare and what each one is; `NUMERIC_TYPES` is derived from
+  it and `knownType()` matches the `enum:` family by prefix. `checkColumnTypes()` is the one place a cell becomes what
+  its column says — a blank becomes `null`, a numeric string becomes its number. `selectTypes()` types a result column
+  off its select item, not off its name, and `WINDOW_TYPES` says the same thing about a window: `sum` and `avg` follow
+  their argument in both, so one name cannot mean two types.
 - **Guards**: `checkQueryRows()` caps rows loaded across every `@sheet`; `checkResultColumns()` turns AlaSQL's silent
   undefined column into an error; `nearest()` backs every "did you mean".
 - **AlaSQL gotchas**: a `group by` expression is evaluated against an empty row, so a UDF named there gets nothing — bin
@@ -180,8 +197,15 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
 - **Table UX**: multi-column sort, column hide (keeps its x coordinate; `skipHidden` steps over it), drag-resize, row
   insert/duplicate/fill-down, find/replace, undo/redo, command palette (Ctrl/⌘+K), shortcut sheet (Ctrl/⌘+/).
   `shortcutGroups` carries the `Msg` each key runs and `paletteCommands` reads that list, so the two cannot drift.
+- **The arrangement is stored on the columns.** Sort, filter, hidden and width live in `data[0]` as `sort`/`rank`,
+  `filter`, `hidden`, `width`, so they survive a reload and travel with a share. `viewDecoder` reads them on
+  `DocSelect` and `arrange` writes them, diffed against `sheet.storedView` so closing an untouched filter panel writes
+  nothing. It goes around `updateDocMsg`: a resize is not data and does not belong on the undo stack. Only a `Tab`
+  sheet — a query's rows are computed, so there is no document for its view to live on.
 - **Known gaps**: `@library:freshness` resolves on the server but not in the page. `describe` results carry no type in
-  the page, and `WINDOW_TYPES` is server-only, so a window alias there falls back to the sheet's stored `cols`.
+  the page, and `WINDOW_TYPES` is server-only, so a window alias there falls back to the sheet's stored `cols`. A
+  viewer's arrangement is not stored: the sync socket refuses the write and nothing listens for the repo's errors, so
+  it works locally and is lost on reload.
 
 ## Schema (`schema/db.sql`)
 

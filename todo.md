@@ -12,36 +12,37 @@ items are deleted — what shipped is described in `claude.md`. Anything below t
 
 The next things to build, in this order.
 
-- [ ] **Feed health covers a live socket.** `library:freshness` now answers for `net-http`, `net-hook`, `alert` and
-      `codex-*` — every sheet whose runs the **server** writes down. A `net-socket` sheet is opened by the browser
-      against the user's own url, so the server never sees whether it is connected, and it is left out on purpose:
-      including it would report "never run" forever about a sheet that works.
-  1. Decide first, and write the answer here before touching code. A socket's health is reported by whoever has the tab
-     open, so a sheet nobody is looking at goes stale by definition. Either that is acceptable and the column means
-     "last seen", or it is not and this item is deleted rather than shipped as a column that lies. A codex sheet has the
-     same shape and was accepted, but the two are not the same: opening a codex sheet is an act somebody took, and
-     leaving a socket tab open is not.
-  2. The page already computes the three states it would send — `connected`, `disconnected`, `error connecting to <url>`
-     — beside the `docNotified` call in `src/index.html`. The work is a route that callback also POSTs to, writing one
-     `net` row per state change with `method = 'SOCKET'` and the `meta.status` shape `POLL_OK` already grades.
-  3. Write access is `syncRole`, not `assertSheetAccess`: a viewer holding a share link watches the same socket and must
-     not be able to write its health. Bound it per sheet the way `hookBucket()` bounds a delivery — a page stuck in a
-     reconnect loop is a sender that will not stop.
-  4. Then it is one `RUN_OF()`/`RUN_OK()` arm and one type in the where clause, and the column fills itself, since the
-     page marks a sheet by its own freshness rather than by its type.
+- [ ] **You reorder and pin columns.** Sort, filter, the hidden set and dragged widths are now stored on the column
+      itself and come back on reload, so the display-only hide set is no longer the obstacle. What is missing is an
+      order and a frozen count.
+  1. Reorder is a `splice` on `data[0]`, not a display permutation. Rows are keyed by `col.key`, so moving a column
+     moves no cell and the display index stays the document index — which is what keeps `Array.get x table.cols`,
+     `tableBounds` and every selection index in `src/Main.elm` correct without a display-to-document map.
+  2. Pin is a `pinned` boolean on the column plus a `left` summed from the widths of the pinned columns before it.
+     `.c0` in `src/style.css` already pins column 0 exactly that way; the sum needs concrete widths, which the stored
+     view now has.
+  3. Both ride `arrange` in `src/Main.elm`, so they are written and read back with the rest of the view for free.
+
+- [ ] **A query sheet remembers how you were looking at it.** A table sheet's arrangement is stored on its columns; a
+      query's rows are computed, so there is no document for its view to live on and sorting one still dies with the
+      tab.
+  1. A query sheet's document has a `data[0]` of its own — `cols`, the type overrides — so a view can live beside it.
+  2. `arrange` in `src/Main.elm` refuses anything but `Ok (Tab _)`, which is the one line to widen, plus the matching
+     read in `viewDecoder`.
+
+- [ ] **A viewer's arrangement is theirs, and it is kept.** Sorting a sheet you can only read works and is not saved:
+      the sync socket refuses the write silently, because nothing in `src/index.html` listens for the repo's errors.
+      Local-only is the right behaviour; losing it on reload is not.
+  1. Store a viewer's view under the sheet id in `localStorage`, beside the library, with the document's own view as
+     the default it starts from.
+  2. The page cannot tell a viewer from an editor — `GET /library` selects no `su.role`, and the page never calls that
+     route at all. That read is the same one the item above wants.
 
 ---
 
 ## Query engine
 
 The single biggest gap. Most of the Demo Gallery dies here first.
-
-- [ ] **Your money arithmetic is exact.** Every numeric column is a float today, so a cent disappears in any long sum
-      and no invoice total can be trusted.
-  1. A `Decimal` type carrying scale, stored as a string, compared and summed as scaled integers.
-  2. `usd` becomes a `Decimal` with scale 2 rather than a display hint over a float.
-  3. `checkColumnTypes()` rejects a value that does not parse at the declared scale, naming the row — the same shape it
-     already uses for a non-numeric value in a numeric column.
 
 - [ ] **A currency cannot be added to another currency by accident.** A `usd` column and an `eur` column sum today, and
       the answer is a number with no meaning.
@@ -86,10 +87,13 @@ The single biggest gap. Most of the Demo Gallery dies here first.
   2. Expansion is textual and bounded like `MAX_REF_DEPTH`, and a cycle is reported as the path that closes it.
   3. This is the seam Scrapscript eventually replaces.
 
-- [ ] **A top-N-per-group does not materialize every candidate.** `qualify` covers the as-of join, but the pairs are
-      still built before the filter, and AlaSQL cannot parse `lateral` at all.
-  1. A dedicated as-of join that walks two sorted inputs.
-  2. It is the same missing piece as nearest-neighbour in **Geospatial**, so build it once.
+- [ ] **A join over sorted inputs does not build every pair first.** `qualify` covers the as-of join and
+      `haversine_km(...) <= n` covers within-distance, but both build the pairs before the filter, and AlaSQL cannot
+      parse `lateral` at all. Three questions share one missing piece — top-N-per-group, as-of, and nearest-neighbour —
+      so it is written once.
+  1. A join that walks two inputs already in order, keyed on time for an as-of and on distance for a nearest.
+  2. It is what **Geospatial**'s nearest-neighbour item waits on, and the only reason that item is separate is the
+     geodesy around it.
 
 - [ ] **`min()` over text answers.** AlaSQL compiles `min`/`max` inline over numbers and dates and drops a text value,
       so `min(code)` returns nothing. `min_text()`/`max_text()` are the workaround and `checkResultColumns()` names the
@@ -135,16 +139,6 @@ The single biggest gap. Most of the Demo Gallery dies here first.
 ## Table UX
 
 The unglamorous spreadsheet niceties. Their absence is what makes people leave.
-
-- [ ] **Your sort, filter and hidden columns survive a reload.** They live in the model and die with the tab.
-  1. A named view per sheet, holding sort keys, filters and the hidden set.
-  2. Stored on the sheet, so it travels with a share rather than living in one browser.
-
-- [ ] **You reorder and pin columns.** Drag-resize and hide ship; both of these need a persisted column order rather
-      than the display-only hide set.
-  1. An explicit order array on the sheet; `skipHidden` already proves navigation can step over a display rule without
-     touching selection indices.
-  2. Pinning is that order plus a frozen count.
 
 - [ ] **You drag a row where it belongs, and drag a series down.** Insert, delete and duplicate ship; reorder needs drag
       state rather than a splice, and fill-down is plain today.
@@ -329,7 +323,8 @@ The missing other half: sheets that do something, not just show something.
 - [ ] **A failed action is retried and then kept.** Nothing survives a failure.
   1. An action queue with retries, backoff and idempotency keys, sharing the dead-letter sheet from **Types &
      validation**.
-  2. An audit log: who ran what, against which rows, with which payload.
+  2. Who ran what, against which rows, with which payload, goes in the one audit log under **Permissions &
+     governance** rather than a second one beside it.
 
 ---
 
@@ -386,9 +381,9 @@ The Excel add-in market lives here.
   1. Geocoding and reverse geocoding, with a match-confidence score.
   2. Address normalization and dedupe, which is the hard part of every property and customer dataset.
 
-- [ ] **A nearest-neighbour join does not materialize every pair.** `point_in_polygon()` works as a join predicate and
-      within-distance is `haversine_km(...) <= n`; nearest still builds every pair first.
-  1. The same sorted-input join as the as-of join under **Query engine**. Build it once.
+- [ ] **A nearest point is found without measuring every pair.** `point_in_polygon()` works as a join predicate and
+      within-distance is `haversine_km(...) <= n`.
+  1. The sorted-input join under **Query engine** is the machinery; this item is the geodesy on top of it.
   2. Drive-time distance, and something that reprojects — neither exists.
 
 ---
@@ -408,7 +403,7 @@ The Excel add-in market lives here.
 
 - [ ] **An agent can be trusted with write access.** MCP writes carry the caller's whole authority.
   1. Scoped tokens and per-tool permissions.
-  2. An audit trail for agent writes, sharing the action audit log.
+  2. Agent writes go in the one audit log under **Permissions & governance**.
   3. Sheets exposed as MCP resources and prompts, not only tools.
 
 ---
@@ -436,8 +431,11 @@ The Excel add-in market lives here.
 
 - [ ] **You can read who opened a sheet and what they changed.** A link now carries a chosen expiry and an optional
       password, and nothing records what it was used for.
-  1. An audit log of reads and writes, exportable and queryable as a sheet — which is the same log the agent writes and
-     the same one an action needs, so build it once.
+  1. One audit log of reads and writes, exportable and queryable as a sheet. It is the only one: an action's "who ran
+     what" and an agent's write trail are rows in it, which is why neither **Actions & write-back** nor **AI & MCP**
+     carries a log of its own.
+  2. Row-level provenance under **Lineage, tests & freshness** answers "which run produced this row" and is a
+     different question from "who did this"; they stay two things.
 
 - [ ] **You cannot publish a secret by accident.** Nothing is scanned.
   1. Refuse to publish a sheet containing an API key.
@@ -579,6 +577,32 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
 - [ ] **One account cannot exhaust the service.** `rateLimit()` bounds requests per IP and nothing bounds a user.
   1. Per-user quotas: fetches, rows, storage, outbound actions.
   2. Abuse detection on outbound actions: rate anomalies that look like a sheet being used as a spam cannon.
+
+- [ ] **A refusal is a refusal, not a 500.** Three ways an authenticated caller reaches an unexplained 500 today. Each
+      is one guard, and the error log and `GET /status`'s `no_5xx` condition are what they cost.
+  1. A percent-encoded NUL in any `:id` that reaches a SQL comparison — `POST /library/<id>%00/public`,
+     `GET /sheet/<id>%00`, and `syncRole` itself. Postgres text cannot hold a NUL and `POST /net/:id` already refuses
+     one by name; the same check belongs where an id is read, not on one route.
+  2. A body whose size the caller picks. `POST /net/:id` caps at `NET_BODY_CAP` and answers 413; every authenticated
+     JSON route parses whatever arrives. Cap them all, or none — capping one is theatre.
+  3. `bad()` covers the rest, so this is a hunt rather than a design: find every `await` whose failure is not already a
+     refusal.
+
+- [ ] **A remote cell edit does not re-read the whole sheet.** `applyCellPatches` is the fast path for a single cell,
+      and it never fires on a synced sheet: automerge emits `action: "put"` with `path[0] == "data"`, and the branch
+      matches `"set"` with an integer `path[0]`. Every remote edit re-decodes the document instead.
+  1. Match what automerge actually sends, which the shape above states.
+  2. It is correct today and only slow, so it ships with a test that asserts the fast path fires — a fast path nothing
+     proves is taken is a fast path that stops being taken.
+  3. `pruneView` currently relies on the full decode running, so it moves into the fast path or is proven unnecessary
+     there first.
+
+- [ ] **A budget cannot be spent twice at once.** `hookBucket()` is read, then a row is written, then it is charged, and
+      the two awaits between let concurrent senders through: 30 requests against a budget of 1 wrote 27 rows. Both
+      `POST /net/:id` and `POST /library/:id/socket` have the shape.
+  1. Charge before the write, and refund on a failure — or take the row count from `net` itself, which is the number
+     the budget is about.
+  2. Whichever it is, one of them: two routes with one bug is one fix.
 
 - [ ] **We are a polite scraper.** `safeFetch` guards our network and not theirs.
   1. Per-host limits and a documented user agent.
@@ -766,6 +790,15 @@ Each ends in an item above, or in a decision to drop it.
       Spreadsheet Radio, MyExcelOnline, Humans of Data.
 - [ ] **Read lexega.com/blog/how-lexega-turns-sql-into-signals**: the SQL-into-signals framing may map onto query
       sheets.
+
+- [ ] **Exact decimal money**, which was an item under **Query engine** and came back here. A `Decimal` carried as a
+      string cannot be summed by the engine at all: AlaSQL compiles `SUM` as a first-class `aggregatorid`
+      (`aggregatorid=="SUM"` in `src/alasql.mjs`), the same trap `min`/`max` hit, so `alasql.aggr.sum` is never
+      consulted and a UDF cannot replace it. Decide between patching the vendored bundle, rewriting `sum()` over a
+      decimal column in a pre-engine pass the way `rewriteWindows()` rewrites a window, and keeping floats with the
+      error bound written down. `round2` in `src/Main.elm` now rounds rather than truncating, which was the cent this
+      was losing on the way to the screen; the arithmetic under it is still a double. Comes back as an item under
+      **Query engine**, or does not come back.
 
 ---
 

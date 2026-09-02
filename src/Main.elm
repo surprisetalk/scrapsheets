@@ -3,15 +3,18 @@ port module Main exposing
     , ClipboardFormat(..)
     , Col
     , Doc(..)
+    , Filter(..)
     , Freshness
     , Index
     , Peers(..)
     , Rect
     , Sheet
+    , SheetView
     , SortOrder(..)
     , Stat(..)
     , Table
     , TableBounds
+    , canonicalTypeNames
     , chartPoints
     , civilDays
     , clampIndex
@@ -22,10 +25,12 @@ port module Main exposing
     , displayYToDocY
     , docDecoder
     , emptySheet
+    , emptyView
     , expandSelection
     , filterAndSortIndexed
     , freshnessCell
     , freshnessDecoder
+    , knownTypeName
     , main
     , moveSelection
     , nameClash
@@ -36,6 +41,7 @@ port module Main exposing
     , parseDay
     , parseJson
     , parseTsv
+    , pruneView
     , rect
     , rectToIndices
     , rowSplices
@@ -44,6 +50,9 @@ port module Main exposing
     , shortcutGroups
     , skipHidden
     , sortRankOf
+    , typeName
+    , usd
+    , viewDecoder
     , xy
     )
 
@@ -415,9 +424,14 @@ iif c a b =
         b
 
 
+{-| Two decimal places, rounded rather than truncated. It floored, so `usd`
+rendered $1.999 as $1.99 and every total read a cent light. Still a float, so
+$1.005 is whatever the double nearest it is -- exact decimal money is its own
+job and is blocked on the engine compiling `sum` inline.
+-}
 round2 : Float -> Float
 round2 =
-    (*) 100 >> floor >> toFloat >> flip (/) 100
+    (*) 100 >> round >> toFloat >> flip (/) 100
 
 
 commas : String -> String
@@ -769,6 +783,11 @@ type alias Sheet =
     , netStatus : Maybe String
     , widths : Dict String Int
     , resizing : Maybe { key : String, startX : Int, startWidth : Int }
+
+    -- The arrangement the document holds, as last read or last written. Every
+    -- write is diffed against it, so closing a filter panel that changed
+    -- nothing writes nothing, and moving one sort key rewrites one column.
+    , storedView : SheetView
     , lineage : Maybe String
     }
 
@@ -795,6 +814,7 @@ emptySheet =
     , lineage = Nothing
     , widths = Dict.empty
     , resizing = Nothing
+    , storedView = emptyView
     }
 
 
@@ -822,6 +842,259 @@ type alias FindReplace =
 
 type Filter
     = TextContains String
+
+
+{-| How a sheet was last being looked at: which columns are hidden, how it is
+sorted, what is filtered, and how wide each column was dragged.
+
+Stored on the columns themselves, in `data[0]`, for two reasons. `applyPatches`
+in `src/index.html` is rooted at `data`, so a key beside it cannot be written at
+all; and hidden, width, sort and filter are each a fact about one column anyway.
+It lives in the document rather than in this browser so that it travels with a
+share, which is the whole point of remembering it.
+
+One view per sheet, not a named set of them: a second view is a setting, and a
+setting earns its place after both values are wanted in real use.
+
+-}
+type alias SheetView =
+    { hidden : Set String
+    , sort : List ( String, SortOrder )
+    , filters : Dict String Filter
+    , widths : Dict String Int
+    }
+
+
+emptyView : SheetView
+emptyView =
+    { hidden = Set.empty, sort = [], filters = Dict.empty, widths = Dict.empty }
+
+
+{-| One column's share of the view. Every field is optional and every default is
+the absence of the thing, so a document written before any of this existed reads
+as a sheet nobody has arranged yet.
+-}
+type alias ColView =
+    { key : String
+    , hidden : Bool
+    , sort : Maybe SortOrder
+    , rank : Int
+    , filter : String
+    , width : Maybe Int
+    }
+
+
+{-| Narrower than this and a column cannot be grabbed to widen it again, which
+is why the drag clamps here too. A width the document carries has never been
+through that drag -- a collaborator, a share or an API write can put any integer
+there -- so an unusable one is read as no width at all, the way an unusable sort
+is read as no sort.
+-}
+minColWidth : Int
+minColWidth =
+    32
+
+
+colViewDecoder : D.Decoder ColView
+colViewDecoder =
+    D.map6 ColView
+        -- The key `colDecoder` will give this column, not the one written on it.
+        -- They differ: a column whose name is a JSON number falls back to a key
+        -- of "" there and read as "1" here, so the arrangement was stored under
+        -- a key the rendered table never used and `pruneView` then deleted it.
+        (D.map .key colDecoder)
+        (D.oneOf [ D.field "hidden" D.bool, D.succeed False ])
+        (D.oneOf
+            [ D.field "sort" D.string
+                |> D.map
+                    (\order ->
+                        case order of
+                            "asc" ->
+                                Just Ascending
+
+                            "desc" ->
+                                Just Descending
+
+                            _ ->
+                                Nothing
+                    )
+            , D.succeed Nothing
+            ]
+        )
+        (D.oneOf [ D.field "rank" D.int, D.succeed 0 ])
+        (D.oneOf [ D.field "filter" D.string, D.succeed "" ])
+        (D.oneOf [ D.field "width" (D.map (\w -> iif (w >= minColWidth) (Just w) Nothing) D.int), D.succeed Nothing ])
+
+
+{-| The view a document carries, or none. A sheet with no `data` -- the library,
+the shop -- has no columns to carry one, and a shape this cannot read is a sheet
+nobody arranged rather than an error: the view is how you were looking at the
+rows, and losing it must never cost you the rows.
+-}
+viewDecoder : D.Decoder SheetView
+viewDecoder =
+    D.oneOf
+        [ D.field "data" (D.index 0 (D.oneOf [ D.list colViewDecoder, D.dict colViewDecoder |> D.map Dict.values ]))
+            |> D.map viewOf
+        , D.succeed emptyView
+        ]
+
+
+viewOf : List ColView -> SheetView
+viewOf cols =
+    { hidden = cols |> List.filter .hidden |> List.map .key |> Set.fromList
+    , sort =
+        cols
+            |> List.filterMap (\c -> Maybe.map (\order -> ( c.rank, ( c.key, order ) )) c.sort)
+            |> List.sortBy Tuple.first
+            |> List.map Tuple.second
+    , filters =
+        cols
+            |> List.filterMap (\c -> iif (String.isEmpty c.filter) Nothing (Just ( c.key, TextContains c.filter )))
+            |> Dict.fromList
+    , widths = cols |> List.filterMap (\c -> Maybe.map (Tuple.pair c.key) c.width) |> Dict.fromList
+    }
+
+
+{-| Drop the arrangement of every column the document no longer has.
+
+An arrangement belongs to a column, so it goes when the column does. Kept, it
+came back wrong twice: an undo restored the sort rank the column had when it was
+deleted, colliding with a rank written since; and `SheetColumnPush` keys a new
+column by the column count, so deleting the last column and adding one inherited
+its hidden flag and its sort.
+
+Runs where the document is re-read rather than where a column is deleted, so a
+collaborator's delete is pruned too. It only ever removes, so it cannot overwrite
+a filter somebody is in the middle of typing -- which is why the arrangement is
+otherwise read on open and not on every change.
+
+-}
+pruneView : Result String Doc -> Sheet -> Sheet
+pruneView doc sheet =
+    case doc of
+        Ok (Tab tbl) ->
+            let
+                live =
+                    tbl.cols |> Array.toList |> List.map .key |> Set.fromList
+
+                keep arrangement =
+                    { hidden = Set.filter (\key -> Set.member key live) arrangement.hidden
+                    , sort = List.filter (\( key, _ ) -> Set.member key live) arrangement.sort
+                    , filters = Dict.filter (\key _ -> Set.member key live) arrangement.filters
+                    , widths = Dict.filter (\key _ -> Set.member key live) arrangement.widths
+                    }
+
+                onScreen =
+                    keep { hidden = sheet.hidden, sort = sheet.sort, filters = sheet.filters, widths = sheet.widths }
+            in
+            { sheet
+                | hidden = onScreen.hidden
+                , sort = onScreen.sort
+                , filters = onScreen.filters
+                , widths = onScreen.widths
+                , storedView = keep sheet.storedView
+            }
+
+        _ ->
+            sheet
+
+
+{-| What changed between the arrangement the document holds and the one on
+screen, and nothing else. A diff rather than a rewrite for two reasons: moving
+one sort key must not rewrite forty columns, and closing a filter panel that
+changed nothing must write nothing at all.
+
+Walks the columns by position, so a filter left over from a column that has
+since been deleted is written nowhere, and two columns sharing a key are written
+once each rather than once per pair.
+
+A field that goes back to its default is deleted rather than set: a `false`
+hidden and a `null` width are noise in a document somebody may read.
+
+-}
+viewPatches : Array Col -> SheetView -> SheetView -> List Patch
+viewPatches cols before after =
+    let
+        ranked arrangement =
+            arrangement.sort |> List.indexedMap (\i ( k, order ) -> ( k, ( i + 1, order ) )) |> Dict.fromList
+
+        ( wasSorted, nowSorted ) =
+            ( ranked before, ranked after )
+
+        text_ filters key =
+            case Dict.get key filters of
+                Just (TextContains t) ->
+                    Just t
+
+                Nothing ->
+                    Nothing
+
+        set x field value =
+            [ { action = iif (value == Nothing) "del" "set"
+              , path = [ E.int 0, E.string (String.fromInt x), E.string field ]
+              , value = Maybe.withDefault E.null value
+              }
+            ]
+
+        only was now patches =
+            iif (was == now) [] patches
+    in
+    cols
+        |> Array.toIndexedList
+        |> List.concatMap
+            (\( x, col ) ->
+                let
+                    key =
+                        col.key
+                in
+                List.concat
+                    [ only (Set.member key before.hidden) (Set.member key after.hidden) <|
+                        set x "hidden" (iif (Set.member key after.hidden) (Just (E.bool True)) Nothing)
+                    , only (Dict.get key before.widths) (Dict.get key after.widths) <|
+                        set x "width" (Maybe.map E.int (Dict.get key after.widths))
+                    , only (text_ before.filters key) (text_ after.filters key) <|
+                        set x "filter" (Maybe.map E.string (text_ after.filters key))
+                    , only (Dict.get key wasSorted) (Dict.get key nowSorted) <|
+                        case Dict.get key nowSorted of
+                            Just ( rank, order ) ->
+                                set x "sort" (Just (E.string (iif (order == Ascending) "asc" "desc")))
+                                    ++ set x "rank" (Just (E.int rank))
+
+                            Nothing ->
+                                set x "sort" Nothing ++ set x "rank" Nothing
+                    ]
+            )
+
+
+{-| Move to a sheet arranged this way, and store the arrangement on its columns.
+
+Only a table sheet. A query's rows are computed rather than stored, so there is
+no document for its view to live on, and sorting one still dies with the tab.
+
+Deliberately not routed through `updateDocMsg`: dragging a column wider is not
+an edit to the data, and does not belong on the undo stack beside one.
+
+-}
+arrange : Model -> Sheet -> ( Model, Cmd Msg )
+arrange model next =
+    let
+        after =
+            { hidden = next.hidden, sort = next.sort, filters = next.filters, widths = next.widths }
+    in
+    case next.doc of
+        Ok (Tab tbl) ->
+            ( { model | sheet = { next | storedView = after } }
+            , case viewPatches tbl.cols next.storedView after of
+                [] ->
+                    Cmd.none
+
+                patches ->
+                    changeDoc { id = next.id, data = patches }
+            )
+
+        _ ->
+            ( { model | sheet = next }, Cmd.none )
 
 
 type Stat
@@ -887,6 +1160,14 @@ type alias Col =
     { key : String
     , name : String
     , typ : Type
+
+    -- The document's own spelling of the type, the way `key` is the document's
+    -- own spelling of the column. Kept because the app must never rewrite it: a
+    -- rename used to re-encode the type beside the name, which turned `int`
+    -- into `num`, `percentage` into `pct` and `float` into a type the decoder
+    -- did not know. Nothing normalizes a spelling now -- it is displayed as
+    -- written, edited as written and written back as written.
+    , raw : String
     }
 
 
@@ -944,7 +1225,7 @@ spec typ =
             { name = "bool", align = S.textAlignCenter, width = Just 32 }
 
         Percentage ->
-            { name = "pct", align = S.textAlignRight, width = Just 64 }
+            { name = "percentage", align = S.textAlignRight, width = Just 64 }
 
         Date ->
             { name = "date", align = S.textAlignLeft, width = Just 112 }
@@ -986,6 +1267,15 @@ spec typ =
 typeName : Type -> String
 typeName typ =
     (spec typ).name
+
+
+{-| A column the page makes up rather than reads: the library's own columns, a
+net sheet's created\_at and body, a chart's x and y. There is no document to
+have spelled its type, so `spec` supplies the spelling.
+-}
+madeCol : String -> String -> Type -> Col
+madeCol key name typ =
+    Col key name typ (typeName typ)
 
 
 
@@ -1129,30 +1419,6 @@ rowDecoder =
 colDecoder : D.Decoder Col
 colDecoder =
     let
-        types : Dict String Type
-        types =
-            Dict.fromList
-                [ ( "bool", Boolean )
-                , ( "number", Number )
-                , ( "num", Number )
-                , ( "int", Number )
-                , ( "usd", Usd )
-                , ( "pct", Percentage )
-                , ( "percentage", Percentage )
-                , ( "percent", Percentage )
-                , ( "sheet_id", SheetId )
-                , ( "link", Link )
-                , ( "image", Image )
-                , ( "form", Form )
-                , ( "timestamp", Timestamp )
-                , ( "datetime", Timestamp )
-                , ( "date", Date )
-                , ( "json", Json )
-                , ( "text", Text )
-                , ( "string", Text )
-                , ( "create", Create )
-                ]
-
         parseType : String -> Type
         parseType typeStr =
             if String.startsWith "enum:" typeStr then
@@ -1165,15 +1431,79 @@ colDecoder =
                     |> Enum
 
             else
-                Dict.get typeStr types |> Maybe.withDefault Unknown
+                Dict.get typeStr typeSpellings |> Maybe.withDefault Unknown
     in
     D.oneOf
-        [ D.map3 Col
+        [ D.map3 (\key name raw -> Col key name (parseType raw) raw)
             (D.field "key" string)
             (D.field "name" D.string)
-            (D.field "type" (D.nullable D.string |> D.map (Maybe.map parseType >> Maybe.withDefault Unknown)))
-        , D.succeed (Col "" "" Text)
+            (D.field "type" (D.nullable D.string |> D.map (Maybe.withDefault "")))
+        , D.succeed (madeCol "" "" Text)
         ]
+
+
+{-| Every type a column may declare, in the one spelling the page writes.
+`COLUMN_TYPES` in `src/sql.mjs` is the same list on the other side of the wire
+and carries the reason; `browser_test.ts` fails in both directions when they
+stop agreeing.
+-}
+columnTypes : List ( String, Type )
+columnTypes =
+    [ ( "text", Text )
+    , ( "num", Number )
+    , ( "int", Number )
+    , ( "float", Number )
+    , ( "usd", Usd )
+    , ( "percentage", Percentage )
+    , ( "bool", Boolean )
+    , ( "date", Date )
+    , ( "timestamp", Timestamp )
+    , ( "json", Json )
+    , ( "link", Link )
+    , ( "image", Image )
+    , ( "sheet_id", SheetId )
+    , ( "form", Form )
+    , ( "create", Create )
+    ]
+
+
+{-| Spellings that are read and never written. Documents written before the list
+above settled hold them, and dropping them would read those columns as unknown;
+admitting them to a **write** is what let the editor store `pct`, which the
+engine does not know and so does not check.
+-}
+typeAliases : List ( String, Type )
+typeAliases =
+    [ ( "number", Number )
+    , ( "string", Text )
+    , ( "pct", Percentage )
+    , ( "percent", Percentage )
+    , ( "datetime", Timestamp )
+    ]
+
+
+typeSpellings : Dict String Type
+typeSpellings =
+    Dict.fromList (columnTypes ++ typeAliases)
+
+
+{-| Whether the page may **write** this type string. Aliases are readable and
+not writable, so nothing new lands in a spelling the engine skips. An enum
+carries its own options, so it is a family rather than a name and is matched by
+its prefix -- the same rule `knownType` applies in `src/sql.mjs`.
+-}
+knownTypeName : String -> Bool
+knownTypeName name =
+    List.any (Tuple.first >> (==) name) columnTypes || (String.startsWith "enum:" name && String.length name > 5)
+
+
+{-| What the refusal offers. The names themselves, not the types behind them:
+`int`, `float` and `num` are one `Type` here and three types to the engine, so
+offering the `Type` names told a user to write `num` where `int` was meant.
+-}
+canonicalTypeNames : List String
+canonicalTypeNames =
+    List.map Tuple.first columnTypes
 
 
 shopDecoder : D.Decoder Table
@@ -1662,6 +1992,14 @@ update msg ({ sheet, auth } as model) =
                     ( { model | error = "The library failed to sync: " ++ D.errorToString err }, Cmd.none )
 
         DocSelect data ->
+            let
+                -- How this sheet was last arranged, off the columns that carry
+                -- it. Read here and nowhere else: a collaborator's sort lands on
+                -- your next open of the sheet rather than under your cursor, and
+                -- re-reading on every change would overwrite a filter mid-word.
+                stored =
+                    data.data.doc |> D.decodeValue viewDecoder |> Result.withDefault emptyView
+            in
             ( { model
                 | error = ""
                 , sheet =
@@ -1673,9 +2011,9 @@ update msg ({ sheet, auth } as model) =
                     , doc = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString
                     , table = Err ""
                     , stats = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString |> Result.andThen computeStats
-                    , hidden = Set.empty
-                    , sort = []
-                    , filters = Dict.empty
+                    , hidden = stored.hidden
+                    , sort = stored.sort
+                    , filters = stored.filters
                     , filterOpen = Nothing
                     , findReplace = Nothing
                     , queryAutocomplete = Nothing
@@ -1683,8 +2021,9 @@ update msg ({ sheet, auth } as model) =
                     , redoStack = []
                     , netStatus = Nothing
                     , lineage = data.data.doc |> D.decodeValue (D.field "forked_from" D.string) |> Result.toMaybe
-                    , widths = Dict.empty
+                    , widths = stored.widths
                     , resizing = Nothing
+                    , storedView = stored
                     }
               }
             , case data.data.doc |> D.decodeValue docDecoder of
@@ -1714,14 +2053,15 @@ update msg ({ sheet, auth } as model) =
                         in
                         { model
                             | sheet =
-                                { sheet
-                                    | doc = parsedDoc
-                                    , stats = Result.andThen computeStats parsedDoc
-                                    , lineage =
-                                        data.data.doc
-                                            |> D.decodeValue (D.field "forked_from" D.string)
-                                            |> Result.toMaybe
-                                }
+                                pruneView parsedDoc
+                                    { sheet
+                                        | doc = parsedDoc
+                                        , stats = Result.andThen computeStats parsedDoc
+                                        , lineage =
+                                            data.data.doc
+                                                |> D.decodeValue (D.field "forked_from" D.string)
+                                                |> Result.toMaybe
+                                    }
                         }
             , Cmd.none
             )
@@ -2148,13 +2488,13 @@ update msg ({ sheet, auth } as model) =
             ( { model | sheet = { sheet | hover = hover, select = select_ } }, Cmd.none )
 
         ColumnHide key ->
-            ( { model | sheet = { sheet | hidden = Set.insert key sheet.hidden, filterOpen = Nothing } }, Cmd.none )
+            arrange model { sheet | hidden = Set.insert key sheet.hidden, filterOpen = Nothing }
 
         ColumnsShowAll ->
-            ( { model | sheet = { sheet | hidden = Set.empty } }, Cmd.none )
+            arrange model { sheet | hidden = Set.empty }
 
         ColumnSort shift key ->
-            ( { model | sheet = { sheet | sort = cycleSort shift key sheet.sort } }, Cmd.none )
+            arrange model { sheet | sort = cycleSort shift key sheet.sort }
 
         ColumnResizeStart key startX ->
             ( { model
@@ -2186,7 +2526,7 @@ update msg ({ sheet, auth } as model) =
             case sheet.resizing of
                 Just r ->
                     -- 32px floor: a column dragged to nothing cannot be grabbed again.
-                    ( { model | sheet = { sheet | widths = Dict.insert r.key (max 32 (r.startWidth + x - r.startX)) sheet.widths } }
+                    ( { model | sheet = { sheet | widths = Dict.insert r.key (max minColWidth (r.startWidth + x - r.startX)) sheet.widths } }
                     , Cmd.none
                     )
 
@@ -2194,7 +2534,9 @@ update msg ({ sheet, auth } as model) =
                     ( model, Cmd.none )
 
         ColumnResizeEnd ->
-            ( { model | sheet = { sheet | resizing = Nothing } }, Cmd.none )
+            -- Stored when the drag ends, not while it moves: one width per drag
+            -- rather than one per pixel.
+            arrange model { sheet | resizing = Nothing }
 
         FilterToggle key ->
             let
@@ -2205,23 +2547,17 @@ update msg ({ sheet, auth } as model) =
                     else
                         Just key
             in
-            ( { model | sheet = { sheet | filterOpen = newFilterOpen } }, Cmd.none )
+            -- Closing the panel is when the filter it holds reaches the
+            -- document. The input writes to the model on every keystroke, and a
+            -- patch per keystroke is a sync per keystroke for everyone watching.
+            arrange model { sheet | filterOpen = newFilterOpen }
 
         FilterClear key ->
-            ( { model
-                | sheet =
-                    { sheet
-                        | filters =
-                            if key == "" then
-                                Dict.empty
-
-                            else
-                                Dict.remove key sheet.filters
-                        , filterOpen = Nothing
-                    }
-              }
-            , Cmd.none
-            )
+            arrange model
+                { sheet
+                    | filters = iif (key == "") Dict.empty (Dict.remove key sheet.filters)
+                    , filterOpen = Nothing
+                }
 
         FilterInput key value ->
             -- Create a TextContains filter from the input value
@@ -2702,31 +3038,30 @@ updateDocMsg edit ({ sheet } as model) =
                         SheetWrite { x, y } ->
                             case ( max 0 y, Array.get x table.cols ) of
                                 ( 0, Just col ) ->
-                                    -- Editing column header (row 0)
+                                    -- The column's name (row 0) or its type (row -1).
+                                    --
+                                    -- One field, never a rebuilt column object. Replacing the
+                                    -- whole object made a rename rewrite the type beside it, so
+                                    -- editing a name turned `int` into `num` and `float` into a
+                                    -- spelling the decoder did not know. It also let two people
+                                    -- editing one column's name and type clobber each other,
+                                    -- where two field writes merge.
                                     let
-                                        forward =
-                                            sheet.write
-                                                |> Maybe.map
-                                                    (\write ->
-                                                        [ { action = "set"
-                                                          , path = [ E.int 0, E.string (String.fromInt x) ]
-                                                          , value =
-                                                                if y == -1 then
-                                                                    E.object [ ( "name", E.string col.name ), ( "type", E.string write ), ( "key", E.string col.key ) ]
+                                        fieldName =
+                                            iif (y == -1) "type" "name"
 
-                                                                else
-                                                                    E.object [ ( "name", E.string write ), ( "type", E.string (typeName col.typ) ), ( "key", E.string col.key ) ]
-                                                          }
-                                                        ]
-                                                    )
-                                                |> Maybe.withDefault []
-
-                                        backward =
+                                        setField value =
                                             [ { action = "set"
-                                              , path = [ E.int 0, E.string (String.fromInt x) ]
-                                              , value = E.object [ ( "name", E.string col.name ), ( "type", E.string (typeName col.typ) ), ( "key", E.string col.key ) ]
+                                              , path = [ E.int 0, E.string (String.fromInt x), E.string fieldName ]
+                                              , value = E.string value
                                               }
                                             ]
+
+                                        forward =
+                                            sheet.write |> Maybe.map setField |> Maybe.withDefault []
+
+                                        backward =
+                                            setField (iif (y == -1) col.raw col.name)
                                     in
                                     ( forward, backward )
 
@@ -2895,7 +3230,7 @@ updateDocMsg edit ({ sheet } as model) =
                                                                     , E.int 0
                                                                     , E.object
                                                                         [ ( "name", E.string col.name )
-                                                                        , ( "type", E.string (typeName col.typ) )
+                                                                        , ( "type", E.string col.raw )
                                                                         , ( "key", E.string col.key )
                                                                         ]
                                                                     ]
@@ -3036,13 +3371,37 @@ updateDocMsg edit ({ sheet } as model) =
                                 Nothing ->
                                     ( [], [] )
 
-                renameClash =
+                -- Why this write cannot be stored, if it cannot. Both refusals
+                -- are about the header cell: y is 0 for a rename and -1 for a
+                -- type, which is the same cell and not a name at all.
+                writeRefusal =
                     case ( edit, sheet.write ) of
-                        -- y is 0 for a header rename and -1 for a type
-                        -- write, which is the same header cell and not
-                        -- a name at all.
                         ( SheetWrite { x, y }, Just write ) ->
-                            iif (y == 0) (nameClash table.cols x write) Nothing
+                            if y == 0 then
+                                nameClash table.cols x write
+                                    |> Maybe.map
+                                        (\name ->
+                                            "This sheet already has a column called \"" ++ name ++ "\". Two columns of one name have no row a reader can key, so every export and every query over this sheet would refuse it."
+                                        )
+
+                            else if
+                                (y == -1)
+                                    && ((Array.get x table.cols |> Maybe.map .raw) /= Just write)
+                                    && not (knownTypeName write)
+                            then
+                                Just <|
+                                    -- Not a refusal when the value is what the
+                                    -- column already says: an alias is readable,
+                                    -- so opening the type row on a `pct` column
+                                    -- and clicking away must not be an error.
+                                    "I do not know a column type called \""
+                                        ++ write
+                                        ++ "\". A type nobody knows reads back as unknown, and a numeric column that reads back as unknown stops being checked -- its blanks start summing as zeros. Known types: "
+                                        ++ String.join ", " canonicalTypeNames
+                                        ++ ", or enum: followed by the options, e.g. enum:small,large."
+
+                            else
+                                Nothing
 
                         _ ->
                             Nothing
@@ -3063,14 +3422,9 @@ updateDocMsg edit ({ sheet } as model) =
                     else
                         []
             in
-            case renameClash of
-                Just name ->
-                    ( { model
-                        | sheet = { sheet | write = Nothing }
-                        , error = "This sheet already has a column called \"" ++ name ++ "\". Two columns of one name have no row a reader can key, so every export and every query over this sheet would refuse it."
-                      }
-                    , Cmd.none
-                    )
+            case writeRefusal of
+                Just message ->
+                    ( { model | sheet = { sheet | write = Nothing }, error = message }, Cmd.none )
 
                 Nothing ->
                     if List.isEmpty forwardPatches then
@@ -3137,7 +3491,10 @@ updateKeyDown event ({ sheet } as model) =
         update DocDeleteCancel model
 
     else if event.key == "Escape" && sheet.filterOpen /= Nothing then
-        ( { model | sheet = { sheet | filterOpen = Nothing } }, Cmd.none )
+        -- Escape closes the panel, which is one of the moments the filter it
+        -- holds is stored. It does not clear the filter -- that is what the
+        -- panel's own Clear is for -- so what is stored is what is on screen.
+        arrange model { sheet | filterOpen = Nothing }
 
     else if event.key == "Escape" && sheet.findReplace /= Nothing then
         update FindClose model
@@ -3664,18 +4021,18 @@ libraryCols : Model -> Array Col
 libraryCols model =
     Array.fromList <|
         List.concat
-            [ [ Col "sheet_id" "" SheetId
-              , Col "thumb" "" Thumb
-              , Col "name" "name" Text
-              , Col "tags" "tags" (Many Text)
+            [ [ madeCol "sheet_id" "" SheetId
+              , madeCol "thumb" "" Thumb
+              , madeCol "name" "name" Text
+              , madeCol "tags" "tags" (Many Text)
               ]
             , -- `library:freshness` answers for the sheets whose runs are
               -- written down, and for a caller it can identify, so an anonymous
               -- visitor gets no rows at all. No rows means no column: a blank
               -- one over every sheet reads as "nothing is wrong", which is the
               -- claim this column exists to stop the page making.
-              iif (Dict.isEmpty model.freshness) [] [ Col "freshness" "freshness" Text ]
-            , [ Col "delete" "" Delete ]
+              iif (Dict.isEmpty model.freshness) [] [ madeCol "freshness" "freshness" Text ]
+            , [ madeCol "delete" "" Delete ]
             ]
 
 
@@ -4381,7 +4738,7 @@ computeStats doc =
 
 emptyNetTable : Table
 emptyNetTable =
-    { cols = Array.fromList [ Col "created_at" "created_at" Timestamp, Col "body" "body" Json ]
+    { cols = Array.fromList [ madeCol "created_at" "created_at" Timestamp, madeCol "body" "body" Json ]
     , rows = Array.empty
     }
 
@@ -4437,11 +4794,11 @@ resolveTable model =
             Ok emptyNetTable
 
         ( Ok (Chart _), Err "" ) ->
-            Ok { cols = Array.fromList [ Col "x" "x" Text, Col "y" "y" Number ], rows = Array.empty }
+            Ok { cols = Array.fromList [ madeCol "x" "x" Text, madeCol "y" "y" Number ], rows = Array.empty }
 
         ( Ok (Dashboard tiles), _ ) ->
             Ok
-                { cols = Array.fromList [ Col "tile" "tile" SheetId ]
+                { cols = Array.fromList [ madeCol "tile" "tile" SheetId ]
                 , rows = tiles |> List.map (\t -> Dict.singleton "tile" (E.string (String.dropLeft 1 t))) |> Array.fromList
                 }
 
@@ -4923,10 +5280,10 @@ viewCell sheet stats i n col row =
                         col.name
 
                     "-1" ->
-                        typeName col.typ
+                        col.raw
 
                     "-2" ->
-                        typeName col.typ
+                        col.raw
 
                     _ ->
                         row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
@@ -4949,7 +5306,7 @@ viewCell sheet stats i n col row =
                     viewStatCell (Maybe.andThen (Array.get i) (Result.toMaybe stats))
 
                 "-1" ->
-                    [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontSizeRem 0.75 ] [ text (typeName col.typ) ] ]
+                    [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontSizeRem 0.75 ] [ text col.raw ] ]
 
                 "0" ->
                     viewHeaderCell sheet col
@@ -5147,7 +5504,7 @@ viewTableFooter sheet cols rows =
                         (Array.toList cols)
                         ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [] ]
                 , H.tr [ A.onClick (DocMsg SheetRowPush), A.title "add row" ] <|
-                    List.map (\col -> H.td [ iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) ] [ text (typeName col.typ) ]) (Array.toList cols)
+                    List.map (\col -> H.td [ iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) ] [ text col.raw ]) (Array.toList cols)
                         ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [ text "↴" ] ]
                 ]
 

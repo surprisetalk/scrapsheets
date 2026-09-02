@@ -32,6 +32,8 @@ import {
   checkColumnTypes,
   checkQueryRows,
   checkResultColumns,
+  canonicalType,
+  COLUMN_TYPES,
   DESCRIBE_COLUMNS,
   describeRef,
   describeRows,
@@ -40,6 +42,7 @@ import {
   loadRefs,
   MAX_QUERY_MS,
   nearest,
+  NUMERIC_TYPES,
   planQuery,
   register,
   scanRefs,
@@ -321,20 +324,32 @@ export type Tag<T extends string, X extends Row[]> = {
 
 // --- types
 
+// The compile-time half of COLUMN_TYPES in src/sql.mjs, which is the runtime
+// list. TypeScript cannot read a union out of an untyped .mjs, so the names are
+// written twice here and browser_test.ts fails when the two stop agreeing.
 export type Type =
-  // TODO: Consider using JSONSchema?
-  | "type"
   | "text"
-  | "create"
-  | "usd"
-  | "int"
   | "num"
-  | "bool"
+  | "int"
   | "float"
+  | "usd"
   | "percentage"
+  | "bool"
   | "date"
   | "timestamp"
   | "json"
+  | "link"
+  | "image"
+  | "sheet_id"
+  | "form"
+  | "create"
+  // The read-only aliases. They are here because a document holds them and this
+  // is the type a Col carries. Nothing writes one, which COLUMN_TYPES says.
+  | "number"
+  | "string"
+  | "pct"
+  | "percent"
+  | "datetime"
   | ["array", Type]
   | ["tuple", Type[]]
   | { [k: string]: Type };
@@ -729,7 +744,11 @@ const executeSql = async (
   }
   for (const w of plan.windows) {
     const declared = (WINDOW_TYPES as Record<string, Type | null>)[w.fn];
-    nameToType[w.alias] = declared ?? nameToType[w.args[0]] ?? "num";
+    const followed = nameToType[w.args[0]] ?? "num";
+    // An average of whole numbers is not a whole number. The one demotion
+    // itemType() makes for a select item, made here too, because a window and a
+    // select item spelling one name have to mean one type.
+    nameToType[w.alias] = declared ?? (w.fn === "avg" && followed === "int" ? "num" : followed);
   }
 
   let result: { columns: { columnid: string }[]; data: Record<string, unknown>[] };
@@ -1575,7 +1594,8 @@ const ALERT_OK = () =>
 // Which rows of `net` are one sheet's runs, and which of those went well --
 // per sheet type, because a run is a different event for each. A net-http
 // sheet's run is the poll it made; an alert's is the tick it fired; a codex
-// sheet's is the connection GET /codex/:id opened; a net-hook sheet's run is
+// sheet's is the connection GET /codex/:id opened; a net-socket sheet's is a
+// browser reporting what it saw of the socket; a net-hook sheet's run is
 // the delivery it was sent, and every delivery that reached the table landed,
 // since a refused one is never stored. Both name `s` and `n`, and RUN_OF is
 // spliced into freshness() three times -- the count subquery and both laterals
@@ -1591,10 +1611,11 @@ const RUN_OF = () =>
   sql`case when s.type = 'alert' then n.method = 'ALERT'
            when s.type = 'net-http' then n.method = 'GET'
            when s.type like 'codex-%' then n.method = 'CODEX'
+           when s.type = 'net-socket' then n.method = 'SOCKET'
            else true end`;
 const RUN_OK = () =>
   sql`case when s.type = 'alert' then (${ALERT_OK()})
-           when s.type = 'net-http' or s.type like 'codex-%' then (${POLL_OK()})
+           when s.type = 'net-http' or s.type = 'net-socket' or s.type like 'codex-%' then (${POLL_OK()})
            else true end`;
 
 const STATUS_AGO = [0, 3600, 86400];
@@ -3598,21 +3619,26 @@ const freshness = async (c: Context, { limit, offset }: Record<string, string>):
       -- net-hook sheet's deliveries, an alert's ticks, a codex sheet's
       -- connections. Deliberately not "sheets that have rows in net", because a
       -- webhook nobody has delivered to is the failure this read is for -- the
-      -- same argument the two left joins above carry. And deliberately not
-      -- every type net's own check constraint admits: a net-socket sheet is
-      -- opened by the browser against a url the user gave, so nothing
-      -- server-side ever writes a run for it, and it would read "never run"
-      -- forever. Saying nothing about a sheet it cannot answer for is what this
-      -- read does; a permanent "never run" on a working sheet is the same false
-      -- alarm as a blank cell on a rotten one, pointed the other way.
+      -- same argument the two left joins above carry.
       --
-      -- A codex sheet is in, and its "never run" is not that false alarm: a
+      -- A codex sheet is in, and its "never run" is not a false alarm: a
       -- connection has no poller, so the only moment anybody learns whether the
       -- far database still answers is when somebody opens the sheet, and a
       -- connection nobody has ever opened is a connection nobody has ever
       -- verified. That is the fact, and the read states it.
+      --
+      -- A net-socket sheet is in only once it has a run, which is the one
+      -- exception to the paragraph above, and POST /library/:id/socket says
+      -- why: only a browser can witness that socket, so the column means "last
+      -- seen open by a browser" and a sheet nobody has watched is absent rather
+      -- than "never run" forever.
       where su.usr_id = ${c.get("usr_id")}
-        and (s.type in ('net-http', 'net-hook', 'alert') or s.type like 'codex-%')
+        and (
+          s.type in ('net-http', 'net-hook', 'alert')
+          or s.type like 'codex-%'
+          or (s.type = 'net-socket'
+              and exists (select 1 from net n2 where n2.sheet_id = s.sheet_id and n2.method = 'SOCKET'))
+        )
     ) f`,
     where: [],
     // Stalest first, because that is the question. A sheet that has never run
@@ -3851,6 +3877,96 @@ app.post("/library/:id/public", async (c) => {
   await sql`update sheet set public = ${isPublic} where sheet_id = ${sheet_id}`;
   invalidateSync(sheet_id.split(":")[1]);
   return c.json({ data: { public: isPublic } });
+});
+
+// What a browser saw of a net-socket sheet's connection.
+//
+// Nothing server-side ever opens that socket, so a tab with the sheet open is
+// the only witness there is. `library:freshness` grades what lands here, which
+// is why the row carries `meta.status`: a poll, a codex connection and a socket
+// report are graded by one predicate rather than by three spellings of it.
+//
+// Two states, because only two can be told honestly. A close is not reported --
+// changeId() closes this socket on every navigation, so a close is a fact about
+// which sheet you are looking at rather than about the feed.
+//
+// Nothing rides along beside the status. The one thing a page could add -- which
+// url failed -- is already on the sheet, and it is unbounded text the page did
+// not choose, so a field for it is a field the page overflows by accident.
+const SOCKET_STATES: Record<string, number> = { connected: 200, error: 502 };
+
+app.post("/library/:id/socket", async (c) => {
+  const sheet_id = c.req.param("id");
+  // Owner or editor, read the way the sync socket reads it, and read before
+  // anything is written. A viewer holding a share link watches the same socket
+  // and must not write its health; and a stranger holding a doc_id must not
+  // write failures into somebody else's freshness, which is why GET /codex/:id
+  // checks access before its clock starts too.
+  const role = await syncRole({ usr_id: c.get("usr_id") ?? null, share: null }, sheet_id.split(":")[1] ?? "");
+  if (role !== "owner" && role !== "editor") {
+    bad(403, `You do not have write access to ${sheet_id}.`, {
+      Received: role ? `your role on this sheet is ${role}` : "you have no role on this sheet",
+      Expected: "role owner or editor",
+      Source: "sheet_usr.role, the same read the sync socket makes",
+      Fix: `ask an owner to run POST /library/${sheet_id}/share with your email and role editor`,
+    });
+  }
+  // syncRole answers on doc_id alone, so a role on table:abc passes the check
+  // above for net-socket:abc, and a second colon leaves the tail out of it
+  // entirely. The row this insert names has to exist or the foreign key refuses
+  // it as an unexplained 500 -- and the budget below would be keyed on an id the
+  // caller minted, which is how one editor evicts every other sheet's budget.
+  const [target] = await sql`select type from sheet where sheet_id = ${sheet_id}`;
+  if (!target || target.type !== "net-socket") {
+    bad(404, `No net-socket sheet answers to ${sheet_id}.`, {
+      Received: target ? `a ${target.type} sheet` : "no sheet with that id",
+      Expected: "an existing sheet of type net-socket",
+      Source: "the sheet table",
+      Fix: "post to /library/net-socket:<doc_id>/socket, with the id the sheet itself carries",
+    });
+  }
+  // Parsed, not destructured. `.catch` covers a body that is not JSON; a body
+  // that is JSON `null` parses fine and then throws on the destructuring, which
+  // is a 500 anyone can send.
+  const body = await c.req.json().catch(() => null);
+  const status = (body as { status?: unknown } | null)?.status;
+  // hasOwn, not `in`. `in` walks the prototype, so "__proto__", "toString" and
+  // every other Object.prototype key answered 200 and wrote a run whose
+  // meta.status was an object -- which POLL_OK grades as a failure forever, on a
+  // socket that never failed.
+  if (typeof status !== "string" || !Object.hasOwn(SOCKET_STATES, status)) {
+    bad(400, `That is not something a socket can be.`, {
+      Received: show(status),
+      Expected: Object.keys(SOCKET_STATES).join(" or "),
+      Source: "the status field of the request body",
+      Fix: 'post {"status": "connected"} when it opens and {"status": "error"} when it fails',
+    });
+  }
+  // The same budget a webhook sender spends, keyed on the same sheet: a page
+  // stuck in a reconnect ladder is a sender that will not stop, and one bucket
+  // with one refill and one broom is the whole answer to that. Taken after the
+  // 403 and the 404 for the reason POST /net/:id takes it there.
+  const budget = hookBucket(sheet_id);
+  if (budget.rows < 1) {
+    bad(429, `Sheet ${sheet_id} has reported on its socket too many times.`, {
+      Received: "a report with no budget left",
+      Limit: `${HOOK_ROWS_PER_WINDOW} reports per ${HOOK_WINDOW_S} seconds, for this sheet`,
+      Source: "this sheet's delivery budget, which refills continuously",
+      Fix: `report only when the connection changes state, or retry in ${
+        Math.ceil((1 - budget.rows) * HOOK_WINDOW_S / HOOK_ROWS_PER_WINDOW)
+      } seconds`,
+    });
+  }
+  await sql`
+    insert into net (sheet_id, method, body, meta)
+    values (${sheet_id}, 'SOCKET', ${status}, ${sql.json({ status: SOCKET_STATES[status] })})
+  `;
+  // Read again rather than charging the object above, for the reason
+  // POST /net/:id reads again: the await between them spans an eviction, and
+  // charging a bucket the map no longer holds charges nobody.
+  hookBucket(sheet_id).rows -= 1;
+  await trimNet(sheet_id);
+  return c.json({ data: { status } });
 });
 
 // A view-only link is a JWT scoped to one sheet. The sync socket already accepts
@@ -4652,23 +4768,20 @@ app.post("/sheet/:id", async (c) => {
   return c.json({ data: { appended: rows.length, rows: hand.doc().data.length - 1 } }, 201);
 });
 
-// A column type, as JSON Schema says it. A structured type (an array, a tuple,
-// an object) has no scalar spelling, so it is described as "anything" rather
-// than as a lie.
-const JSON_TYPES: Record<string, { type: string; format?: string }> = {
-  type: { type: "string" },
-  text: { type: "string" },
-  create: { type: "string" },
-  json: { type: "string" },
-  usd: { type: "number" },
-  num: { type: "number" },
-  float: { type: "number" },
-  percentage: { type: "number" },
-  int: { type: "integer" },
-  bool: { type: "boolean" },
-  date: { type: "string", format: "date" },
-  timestamp: { type: "string", format: "date-time" },
-};
+// A column type, as JSON Schema says it. Read off COLUMN_TYPES rather than
+// written again here, so a type the engine accepts cannot be missing from the
+// spec that documents it. A structured type (an array, a tuple, an object) has
+// no scalar spelling, so the lookup below falls back to "anything" rather than
+// to a lie.
+type JsonShape = { type: string; format?: string };
+// The cast is what src/sql.mjs checks when it loads: every entry is a type that
+// states a shape, or an alias of one that does. A second check here would be a
+// second place to be wrong about the same table.
+const JSON_TYPES: Record<string, JsonShape> = Object.fromEntries(
+  Object.keys(COLUMN_TYPES as Record<string, unknown>).map((
+    type,
+  ) => [type, (COLUMN_TYPES as Record<string, { json?: JsonShape }>)[canonicalType(type)].json as JsonShape]),
+);
 
 // The spec for one sheet, derived from its own columns at request time and
 // never stored, so it cannot drift from the schema it describes. It documents
@@ -5174,7 +5287,9 @@ const mcpTools: Record<string, McpTool> = {
               col: { type: "string", description: "column key or column name" },
               value: {
                 description:
-                  "must match the column type: number for num/int/float/usd, boolean for bool, string otherwise",
+                  `must match the column type: number for ${
+                    (NUMERIC_TYPES as string[]).join("/")
+                  }, boolean for bool, string otherwise`,
               },
             },
           },
@@ -5259,7 +5374,7 @@ const mcpTools: Record<string, McpTool> = {
           });
         }
         const t = target.type;
-        const mismatched = ["num", "int", "float", "usd", "percentage"].includes(t)
+        const mismatched = (NUMERIC_TYPES as string[]).includes(t)
           ? typeof value !== "number" || (t === "int" && !Number.isInteger(value))
           : t === "bool"
           ? typeof value !== "boolean"

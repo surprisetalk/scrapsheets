@@ -247,6 +247,45 @@ Deno.test("clicking a header sorts, and shift-clicking adds a second key", async
   );
 });
 
+// The bug this covers: a header rename emitted a whole rebuilt column object
+// with `type` re-encoded beside the name, so renaming a column silently turned
+// `int` into `num`, `percentage` into `pct` and `float` into a spelling the
+// decoder did not know. One field per patch is the fix, and this is the proof.
+Deno.test("renaming a column leaves its type exactly as the document spelled it", async () => {
+  const { dom, app, all, settle, type_ } = await boot("http://localhost/table:currencies");
+  const patches: { action: string; path: unknown[]; value: unknown }[] = [];
+  app.ports.changeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
+
+  // `minor` is table:currencies' int column -- the spelling that used to be
+  // flattened. Its header cell is the td the sort span sits in.
+  const span = all("span.sort").find((s) => s.textContent?.startsWith("minor"));
+  assert(span, "expected a `minor` column in table:currencies");
+  const cell = (span as unknown as { closest: (s: string) => El | null }).closest("td");
+  assert(cell, "the header span should sit in a td");
+
+  for (const type of ["mouseenter", "click", "dblclick"]) {
+    cell.dispatchEvent(new dom.window.MouseEvent(type, { bubbles: true }));
+    await settle();
+  }
+  const editor = all("#new-cell")[0];
+  assert(editor, "double-clicking a header should open its editor");
+  await type_(editor, "minor units");
+  editor.dispatchEvent(new dom.window.FocusEvent("blur", { bubbles: false }));
+  await settle();
+
+  assertEquals(patches.length, 1, `a rename is one patch, got ${JSON.stringify(patches)}`);
+  assertEquals(patches[0].value, "minor units");
+  assertEquals(
+    patches[0].path[2],
+    "name",
+    `a rename must write the name field alone, got ${JSON.stringify(patches[0].path)}`,
+  );
+  assert(
+    !JSON.stringify(patches).includes('"type"'),
+    `a rename must not mention the type at all, got ${JSON.stringify(patches)}`,
+  );
+});
+
 Deno.test("a share answer that cannot be read says which field failed", async () => {
   const here = { id: "table:countries", action: "list" };
   const { app, settle, text } = await boot("http://localhost/table:countries");
@@ -343,6 +382,74 @@ Deno.test("hiding a column stops it rendering, and show-all brings it back", asy
   await click(showAll);
   assertEquals(blanked(), 0, "show all should bring the column back");
   assert(!text().includes("columns hidden"), "and the filter bar should stop saying so");
+});
+
+// Sort, filter, hidden columns and dragged widths used to live in the model and
+// die with the tab. They live on the columns in data[0] now, which is both where
+// applyPatches can reach (it is rooted at `data`) and where a share carries them.
+Deno.test("arranging a sheet writes the arrangement onto its columns", async () => {
+  const { app, all, click } = await boot("http://localhost/table:countries");
+  const patches: { action: string; path: unknown[]; value: unknown }[] = [];
+  app.ports.changeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
+
+  await click(all("span.sort")[1]);
+  assertEquals(
+    patches.map((p) => [p.path[1], p.path[2], p.value]),
+    [["1", "sort", "asc"], ["1", "rank", 1]],
+    "a sort click stores which way and which key",
+  );
+
+  patches.length = 0;
+  await click(all("span.funnel")[0]);
+  await click(all("button").find((b) => b.textContent?.trim() === "Hide column"));
+  assertEquals(
+    patches.map((p) => [p.path[1], p.path[2], p.value]),
+    [["0", "hidden", true]],
+    "hiding stores only the hidden flag, and only for the column hidden",
+  );
+
+  // Closing a filter panel that changed nothing must write nothing: the write is
+  // a diff against what the document already holds, not a rewrite of it.
+  patches.length = 0;
+  await click(all("span.funnel")[1]);
+  await click(all("span.funnel")[1]);
+  assertEquals(patches, [], `closing an untouched panel should write nothing, got ${JSON.stringify(patches)}`);
+});
+
+Deno.test("a sheet opens arranged the way it was left", async () => {
+  const { app, all, text, settle } = await boot("http://localhost/table:countries");
+  app.ports.docSelected.send({
+    id: "table:arranged",
+    data: {
+      doc: {
+        type: "table",
+        data: [
+          [
+            { name: "n", type: "text", key: "0", sort: "asc", rank: 1 },
+            { name: "wide", type: "text", key: "1", hidden: true, width: 220 },
+            { name: "f", type: "text", key: "2", filter: "yes" },
+          ],
+          { "0": "b", "1": "x", "2": "yes" },
+          { "0": "a", "1": "y", "2": "yes" },
+          { "0": "c", "1": "z", "2": "no" },
+        ],
+      },
+    },
+  });
+  await settle();
+
+  assert(
+    all("span.sort").some((s) => s.textContent === "n ▲"),
+    `the stored sort should be on screen, got: ${all("span.sort").map((s) => s.textContent).join("|")}`,
+  );
+  const styles = all("tbody td").map((td) => td.getAttribute("style") ?? "");
+  assert(styles.some((style) => style.includes("display: none")), "the stored hidden column should not render");
+  assert(styles.some((style) => style.includes("220px")), "the stored width should be on the column");
+  assert(text().includes("Showing 2 of 3 rows"), `the stored filter should be applied, got: ${text().slice(0, 300)}`);
+
+  // Ascending on the first column, over the rows the filter left.
+  const first = all("tbody tr").map((tr) => tr.querySelector("td")?.textContent).filter((t) => t === "a" || t === "b");
+  assertEquals(first, ["a", "b"], "the rows should arrive in the stored order");
 });
 
 Deno.test("a chart sheet draws one bar per row and offers both ways to save it", async () => {

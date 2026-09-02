@@ -26,6 +26,11 @@ export const explain = (headline, fields) =>
 // JSON.stringify() renders Infinity and NaN as "null", so a message about a
 // number that is not finite used to read "received number null" -- which names
 // neither the value nor the problem.
+// A refusal quotes what arrived, and what arrived is whatever a caller sent. A
+// megabyte of it is a refusal nobody reads and a log line nothing survives, so
+// the quote is bounded and says how much it is not showing.
+const SHOWN_MAX = 200;
+const shorten = (text) => text.length <= SHOWN_MAX ? text : `${text.slice(0, SHOWN_MAX)}… (${text.length} characters)`;
 export const show = (v) =>
   v === null
     ? "null"
@@ -33,7 +38,7 @@ export const show = (v) =>
     ? "nothing"
     : typeof v === "number" && !Number.isFinite(v)
     ? `number ${v}`
-    : `${typeof v} ${JSON.stringify(v)}`;
+    : shorten(`${typeof v} ${JSON.stringify(v)}`);
 
 // A function that receives nothing at all has two causes and they look identical
 // from inside it: the row has no such column, or the call sits in a `group by`,
@@ -487,13 +492,98 @@ export const describeRows = (id, cols, rows) => {
 // string, and a blank that reaches a function anyway came from a text column or
 // a literal and is refused by name rather than read as a zero.
 
-// The column types a cell has to be a number to hold. Exported because the
-// tests assert what this pass promises, and a second copy of the list would
-// drift from the one the check reads.
-export const NUMERIC_TYPES = ["num", "int", "float", "usd", "percentage"];
+// Every type a column may declare, in the one spelling the stack writes, and
+// what each one is: `json` is the JSON Schema shape GET /openapi reports, and
+// `numeric` is whether a cell has to be a number to hold it.
+//
+// One table, because this was five hand-kept lists and they had already
+// drifted. The page spelled a percentage "pct" and nothing else in the stack
+// knew the word, so a percent column typed in the editor stopped being
+// type-checked at all -- blanks stayed blanks and avg() counted each one as a
+// reading of zero, which is the exact failure the pass below exists to stop.
+export const COLUMN_TYPES = {
+  text: { json: { type: "string" } },
+  num: { json: { type: "number" }, numeric: true },
+  int: { json: { type: "integer" }, numeric: true },
+  float: { json: { type: "number" }, numeric: true },
+  usd: { json: { type: "number" }, numeric: true },
+  percentage: { json: { type: "number" }, numeric: true },
+  bool: { json: { type: "boolean" } },
+  date: { json: { type: "string", format: "date" } },
+  timestamp: { json: { type: "string", format: "date-time" } },
+  json: { json: { type: "string" } },
+  link: { json: { type: "string", format: "uri" } },
+  image: { json: { type: "string", format: "uri" } },
+  sheet_id: { json: { type: "string" } },
+  form: { json: { type: "string" } },
+  create: { json: { type: "string" } },
+
+  // Spellings older documents hold, each read as the type it names and never
+  // written. They are in this table rather than beside it because everything
+  // that asks "is this a column type" has to say yes to them: a sheet spelling
+  // its column `pct` is a sheet somebody made, and refusing to query what the
+  // page still renders is the same drift as before, pointed the other way. It
+  // also puts them in NUMERIC_TYPES, so a legacy percent column is checked --
+  // which is the whole bug, fixed for the documents that actually have it.
+  number: { as: "num" },
+  string: { as: "text" },
+  pct: { as: "percentage" },
+  percent: { as: "percentage" },
+  datetime: { as: "timestamp" },
+};
+
+// Checked when this module loads, because every way this table can be wrong is
+// a column that quietly stops being checked -- the one failure it exists to
+// prevent. An alias names a type and never another alias, so `canonicalType`
+// resolves exactly one level and has no depth to bound.
+for (const [type, spec] of Object.entries(COLUMN_TYPES)) {
+  const named = spec.as === undefined ? undefined : COLUMN_TYPES[spec.as];
+  if (spec.as !== undefined && !named)
+    throw new Error(`COLUMN_TYPES: "${type}" is an alias of "${spec.as}", which is not in this table.`);
+  if (named?.as !== undefined)
+    throw new Error(`COLUMN_TYPES: "${type}" is an alias of "${spec.as}", which is itself an alias. An alias names a type.`);
+  if (spec.as === undefined && !spec.json)
+    throw new Error(`COLUMN_TYPES: "${type}" is a type and states no JSON shape.`);
+}
+
+/** What a spelling means: itself, or the type an alias names. */
+export const canonicalType = (type) => COLUMN_TYPES[type]?.as ?? type;
+
+// The spellings anything may write. An alias is read and never written, so a
+// second one never enters a document -- `columnTypes` in src/Main.elm is this
+// list on the other side of the wire.
+export const CANONICAL_TYPES = Object.keys(COLUMN_TYPES).filter((type) => !COLUMN_TYPES[type].as);
+
+// The column types a cell has to be a number to hold, aliases included. Derived
+// rather than written beside COLUMN_TYPES: two spellings of one fact is how
+// "pct" happened.
+export const NUMERIC_TYPES = Object.keys(COLUMN_TYPES).filter((type) => COLUMN_TYPES[canonicalType(type)].numeric);
+
+/** `enum:a,b` carries its own options, so it is a family rather than a name and
+ * is matched by its prefix. */
+export const knownType = (type) => Object.hasOwn(COLUMN_TYPES, type) || /^enum:.+/.test(type);
 
 export const checkColumnTypes = (id, cols, rows) => {
   for (const col of cols) {
+    // A type nobody knows used to take the `continue` below, which is a column
+    // that quietly stops being checked at all -- exactly how a percent column
+    // spelled "pct" came to sum its blanks as zeros. `describe @ref` skips this
+    // pass, so a sheet refused here is still the one statement that inspects it.
+    if (!knownType(col.type)) {
+      // Matched against every spelling and answered with what it means: the
+      // nearest thing to `PCT` is `pct`, and what a sheet should say is
+      // `percentage`. Searching the canonical half alone sent `PCT` to `int`.
+      const meant = nearest(String(col.type), Object.keys(COLUMN_TYPES));
+      throw new Error(explain(`Column "${col.name}" of @${id} declares a type nobody knows.`, {
+        Expected: `one of ${CANONICAL_TYPES.join(", ")}, or enum: followed by the options`,
+        Received: show(col.type),
+        Source: `data[0] of @${id}, column "${col.name}"`,
+        "Did you mean": meant && canonicalType(meant),
+        Fix: meant
+          ? `set that column's type to ${canonicalType(meant)}, or run describe @${id} to see the sheet as it stands`
+          : `set that column's type to one of those, or run describe @${id} to see the sheet as it stands`,
+      }));
+    }
     if (!NUMERIC_TYPES.includes(col.type)) continue;
     for (let i = 0; i < rows.length; i++) {
       const v = rows[i][col.name];
@@ -643,7 +733,11 @@ export const checkResultColumns = (cols, rows, known = [], code = "") => {
 // the plain columns the window reads; applyWindows() computes it over the rows
 // the engine returns and drops those columns again.
 
-// The type each window produces. null means "whatever its argument already was".
+// The type each window produces. null means "whatever its argument already was",
+// exactly as it does in SELECT_TYPES -- sum and avg follow their argument there,
+// so a window of one name and a select item of one name have to agree. They did
+// not: `sum(amount_usd) over (...)` read usd as a select item and num as a
+// window, which is the same fact spelled twice.
 export const WINDOW_TYPES = {
   row_number: "int",
   rank: "int",
@@ -652,8 +746,8 @@ export const WINDOW_TYPES = {
   count: "int",
   percent_rank: "num",
   cume_dist: "num",
-  sum: "num",
-  avg: "num",
+  sum: null,
+  avg: null,
   stddev: "num",
   lag: null,
   lead: null,

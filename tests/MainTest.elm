@@ -717,7 +717,145 @@ suite =
                         |> (\sheet -> skipHidden sheet { maxX = 3, maxY = 5 } 1 0)
                         |> Expect.equal 0
             ]
+        , describe "Column types"
+            [ test "a column keeps the spelling the document gave it" <|
+                \_ ->
+                    typedCols
+                        |> List.map .raw
+                        |> Expect.equal [ "int", "float", "percentage", "wat" ]
+            , test "an alias is read and never written" <|
+                \_ ->
+                    -- "pct" reads as a percentage so old documents still load, and
+                    -- is refused on a write: the engine does not know the word, so
+                    -- storing it is how a percent column stops being checked.
+                    ( typedCols |> List.map (.typ >> typeName)
+                    , List.map knownTypeName [ "pct", "percent", "number", "string", "datetime" ]
+                    )
+                        |> Expect.equal
+                            ( [ "num", "num", "percentage", "unknown" ]
+                            , [ False, False, False, False, False ]
+                            )
+            , test "a type the page cannot read back is not a type it will write" <|
+                \_ ->
+                    List.map knownTypeName [ "int", "float", "percentage", "enum:a,b", "wat", "enum:", "" ]
+                        |> Expect.equal [ True, True, True, True, False, False, False ]
+            , test "the refusal offers every type the engine tells apart" <|
+                \_ ->
+                    -- int, float and num are one Type in the page and three to the
+                    -- engine, so offering the Type names told a user to write num
+                    -- where int was meant.
+                    List.filter (\name -> not (List.member name canonicalTypeNames)) [ "int", "float", "num", "usd" ]
+                        |> Expect.equal []
+            , test "money rounds to the cent rather than dropping it" <|
+                \_ ->
+                    List.map usd [ 1.999, 1.994, -1.999, 0, 1234.5 ]
+                        |> Expect.equal [ "$2.00", "$1.99", "-$2.00", "$0.00", "$1,234.50" ]
+            ]
+        , describe "The stored view"
+            [ test "a sheet is read back arranged the way it was left" <|
+                \_ ->
+                    ( arranged.hidden, arranged.widths, Dict.toList arranged.filters )
+                        |> Expect.equal ( Set.singleton "1", Dict.fromList [ ( "1", 220 ) ], [ ( "2", TextContains "ill" ) ] )
+            , test "rank orders the sort keys, not the order the columns are in" <|
+                \_ ->
+                    arranged.sort
+                        |> Expect.equal [ ( "2", Ascending ), ( "0", Descending ) ]
+            , test "a sheet nobody arranged reads as nothing arranged" <|
+                \_ ->
+                    """{"type":"table","data":[[{"name":"a","type":"text","key":"0"}]]}"""
+                        |> D.decodeString viewDecoder
+                        |> Expect.equal (Ok emptyView)
+            , test "a sheet with no columns at all has no arrangement to lose" <|
+                \_ ->
+                    """{"type":"library"}"""
+                        |> D.decodeString viewDecoder
+                        |> Expect.equal (Ok emptyView)
+            , test "a sort spelled in a way nobody wrote is no sort, not an error" <|
+                \_ ->
+                    """{"type":"table","data":[[{"name":"a","type":"text","key":"0","sort":"sideways"}]]}"""
+                        |> D.decodeString viewDecoder
+                        |> Expect.equal (Ok emptyView)
+            , test "an arrangement goes when its column goes" <|
+                \_ ->
+                    -- An undo used to restore the sort rank a column had when it
+                    -- was deleted, colliding with a rank written since; and a
+                    -- pushed column reuses a deleted key and inherited the lot.
+                    let
+                        two =
+                            D.decodeString docDecoder
+                                """{"type":"table","data":[[{"name":"a","type":"text","key":"0"},{"name":"b","type":"text","key":"1"}]]}"""
+                                |> Result.mapError D.errorToString
+
+                        arrangedOnThree =
+                            { emptySheet
+                                | doc = two
+                                , hidden = Set.fromList [ "1", "9" ]
+                                , sort = [ ( "9", Ascending ), ( "0", Descending ) ]
+                                , widths = Dict.fromList [ ( "1", 220 ), ( "9", 90 ) ]
+                            }
+
+                        pruned =
+                            pruneView two arrangedOnThree
+                    in
+                    ( pruned.hidden, pruned.sort, pruned.widths )
+                        |> Expect.equal ( Set.singleton "1", [ ( "0", Descending ) ], Dict.singleton "1" 220 )
+            , test "the arrangement is keyed the way the table is keyed" <|
+                \_ ->
+                    -- A column whose name is a JSON number falls back to a key of
+                    -- "" when the table decodes it. Read as "1" here, the
+                    -- arrangement sat under a key nothing rendered and pruneView
+                    -- then deleted it.
+                    """{"type":"table","data":[[{"name":2024,"type":"text","key":"1","hidden":true}]]}"""
+                        |> D.decodeString viewDecoder
+                        |> Result.map .hidden
+                        |> Expect.equal (Ok (Set.singleton ""))
+            , test "a width too narrow to grab is no width" <|
+                \_ ->
+                    -- The drag clamps at the same floor. A document can carry any
+                    -- integer, and a 0px column cannot be grabbed to widen again.
+                    """{"type":"table","data":[[{"name":"a","type":"text","key":"0","width":0},
+                        {"name":"b","type":"text","key":"1","width":-40},
+                        {"name":"c","type":"text","key":"2","width":31},
+                        {"name":"d","type":"text","key":"3","width":32}]]}"""
+                        |> D.decodeString viewDecoder
+                        |> Result.map .widths
+                        |> Expect.equal (Ok (Dict.singleton "3" 32))
+            ]
         ]
+
+
+{-| A three-column sheet carrying every part of an arrangement: a secondary sort
+key written before the primary one, a hidden column that was also dragged wider,
+and a filter.
+-}
+arranged : SheetView
+arranged =
+    """{"type":"table","data":[[
+        {"name":"a","type":"text","key":"0","sort":"desc","rank":2},
+        {"name":"b","type":"text","key":"1","hidden":true,"width":220},
+        {"name":"c","type":"text","key":"2","sort":"asc","rank":1,"filter":"ill"}]]}"""
+        |> D.decodeString viewDecoder
+        |> Result.withDefault emptyView
+
+
+{-| Four columns whose declared types cover the cases that used to be rewritten:
+two numeric spellings the page normalizes to one type, one that was renamed to a
+word nothing else knew, and one nobody knows at all.
+-}
+typedCols : List Col
+typedCols =
+    D.decodeString docDecoder
+        """{"type":"table","data":[[{"name":"a","type":"int","key":"0"},{"name":"b","type":"float","key":"1"},{"name":"c","type":"percentage","key":"2"},{"name":"d","type":"wat","key":"3"}]]}"""
+        |> Result.map
+            (\doc ->
+                case doc of
+                    Tab tbl ->
+                        Array.toList tbl.cols
+
+                    _ ->
+                        []
+            )
+        |> Result.withDefault []
 
 
 {-| A library map from id, name and whether the sheet is scratch. `Library` and

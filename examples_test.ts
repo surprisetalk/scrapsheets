@@ -26,6 +26,7 @@ import {
   checkResultColumns,
   describeRef,
   describeRows,
+  knownType,
   NUMERIC_TYPES,
   register,
   rewriteUnpivot,
@@ -78,6 +79,14 @@ const replay = (engine: Engine) => {
     loaded[id] = rows.map((row) =>
       Object.fromEntries((Object.values(cols_) as { name: string; key: string }[]).map((c) => [c.name, row[c.key]]))
     );
+    // Every bundled column declares a type the engine knows, checked before the
+    // pass below refuses one for the same reason.
+    for (const c of Object.values(cols_) as { name: string; type: string }[]) {
+      assert(
+        knownType(c.type),
+        `${id}.${c.name} declares the type "${c.type}", which COLUMN_TYPES in src/sql.mjs does not list`,
+      );
+    }
     checkColumnTypes(id, Object.values(cols_), loaded[id]);
     // checkColumnTypes is the one coercion there is, so this is what it
     // promises: a numeric column holds numbers and nulls, never a blank that

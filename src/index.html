@@ -800,11 +800,40 @@
                     id,
                     data: { type: "net-status", message },
                   });
+                // What the server is told, as distinct from what the page
+                // shows. Only on a change of state; the route's own comment says
+                // why a close is not one of the states.
+                let reported = null;
+                const report = catchy(async (status) => {
+                  const token = getAuthToken();
+                  if (!token || status === reported) return;
+                  reported = status;
+                  const res = await fetch(`${API_BASE}/library/${id}/socket`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                    body: JSON.stringify({ status }),
+                  });
+                  // A 403 is somebody watching a sheet they only have read
+                  // access to. They may watch the socket and may not write its
+                  // health, and that is not a failure of anything.
+                  if (!res.ok && res.status !== 403)
+                    throw new Error(
+                      `Could not report the socket (${res.status}): ${
+                        httpErrorDetail(await res.text(), res.headers.get("Content-Type") ?? "")
+                      }`,
+                    );
+                }, 'reportSocket');
                 if (/^wss?:\/\//.test(url)) {
                   ws = new WebSocket(url);
-                  ws.onopen = () => notify("connected");
+                  ws.onopen = () => {
+                    notify("connected");
+                    report("connected");
+                  };
                   ws.onclose = () => notify("disconnected");
-                  ws.onerror = () => notify(`error connecting to ${url}`);
+                  ws.onerror = () => {
+                    notify(`error connecting to ${url}`);
+                    report("error");
+                  };
                 } else if (url) {
                   notify("url must start with ws:// or wss://");
                 }

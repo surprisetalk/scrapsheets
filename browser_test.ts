@@ -10,6 +10,7 @@
 // typed into -- and that is a real hole, not an oversight.
 import { assert, assertEquals } from "@std/assert";
 import { serveDir } from "@std/http/file-server";
+import { CANONICAL_TYPES, COLUMN_TYPES } from "./src/sql.mjs";
 
 const dir = new URL(".", import.meta.url).pathname;
 
@@ -294,4 +295,56 @@ Deno.test("WASM file is served with correct headers", async () => {
 
   controller.abort();
   await server.finished;
+});
+
+// COLUMN_TYPES in src/sql.mjs is the one list, and its own comment says what a
+// second one costs. Neither an Elm Dict nor a TypeScript union can be imported
+// and asked at runtime, so these read the other two copies as source text.
+//
+// Both directions, because a one-way check let the page keep writing spellings
+// the server did not know -- the bug wearing the guard as a disguise. Names come
+// out by regex rather than line by line, so reformatting cannot quietly turn the
+// comparison into a no-op.
+const quoted = (block: string, pattern: RegExp) => new Set([...block.matchAll(pattern)].map((m) => m[1]));
+const elmList = (elm: string, name: string) => {
+  const block = elm.split(`${name} =`)[1]?.split("]")[0] ?? "";
+  assert(block.includes('( "'), `${name} should still be a list of spellings in src/Main.elm`);
+  return quoted(block, /"([^"]+)"/g);
+};
+const same = (a: Set<string>, b: Set<string>, aName: string, bName: string) => {
+  assertEquals([...a].filter((x) => !b.has(x)).sort(), [], `${aName} has a column type ${bName} does not`);
+  assertEquals([...b].filter((x) => !a.has(x)).sort(), [], `${bName} has a column type ${aName} does not`);
+};
+
+Deno.test("the page and the engine accept exactly the same column types", async () => {
+  const elm = await Deno.readTextFile(dir + "src/Main.elm");
+  same(
+    elmList(elm, "columnTypes"),
+    new Set(CANONICAL_TYPES as string[]),
+    "src/Main.elm's columnTypes",
+    "src/sql.mjs's CANONICAL_TYPES",
+  );
+  same(
+    elmList(elm, "typeAliases"),
+    new Set(Object.keys(COLUMN_TYPES).filter((type) => !(CANONICAL_TYPES as string[]).includes(type))),
+    "src/Main.elm's typeAliases",
+    "src/sql.mjs's aliases",
+  );
+});
+
+Deno.test("the server's union admits exactly the column types the engine knows", async () => {
+  const ts = await Deno.readTextFile(dir + "main.ts");
+  const union = ts.split("export type Type =")[1]?.split(";")[0] ?? "";
+  // Pinned to the union's own last arm. A stray semicolon anywhere above it --
+  // in a comment, say -- cuts this read short, and a short read is a guard that
+  // passes because it looked at less.
+  assert(union.includes("[k: string]: Type"), "the Type union should end at its structured arm in main.ts");
+  // `\| "x"` and not every quoted word: the structured arms carry "array" and
+  // "tuple", which are shapes rather than column types.
+  same(
+    quoted(union, /\|\s*"([^"]+)"/g),
+    new Set(Object.keys(COLUMN_TYPES)),
+    "main.ts's Type union",
+    "src/sql.mjs's COLUMN_TYPES",
+  );
 });

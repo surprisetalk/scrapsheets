@@ -1982,6 +1982,75 @@ Deno.test(async function allTests(t) {
   // than as a reading nobody took: AlaSQL skips a null and counts a "", and its avg() over ["1","2","3"] answers 41
   // because "+" concatenated them first. checkColumnTypes() is now the one place a cell becomes what its column says
   // it is, and it is the only coercion there is.
+  await t.step("A column spelled the old way is read, queried and still checked", async () => {
+    // The bug this whole list exists because of: the page wrote "pct" for a
+    // percentage, nothing else knew the word, and NUMERIC_TYPES therefore
+    // skipped the column -- its blanks stayed blanks and avg() counted each as a
+    // reading of zero. An alias is a type the engine knows now, so the documents
+    // that actually hold one are checked rather than condemned.
+    const { jwt } = await usr("nadia@example.com");
+    const hand = automerge.create<{ data: Sheet["data"] }>({
+      data: [
+        arrayify([{ name: "site", type: "string", key: 0 }, { name: "share", type: "pct", key: 1 }]),
+        { 0: "a", 1: 0.5 },
+        { 0: "b", 1: "" },
+        { 0: "c", 1: "0.25" },
+      ],
+    });
+    const id = `table:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+    const { data: [, row] }: { data: Table } = await post(jwt, `/query`, {
+      lang: "sql",
+      code: `select avg(share) as mean, count(share) as n from @${id}`,
+      args: [],
+    });
+    assertEquals([row.mean, Number(row.n)], [0.375, 2], "the blank is absent, not a zero, and the string is a number");
+
+    // And a spelling nobody knows is refused by name rather than skipped, which
+    // is the same failure wearing a typo.
+    const typo = automerge.create<{ data: Sheet["data"] }>({
+      // Cast, because the Type union refuses this spelling at compile time --
+      // which is the guard working. A document written by an older page is how
+      // one reaches the engine at runtime.
+      data: [arrayify([{ name: "share", type: "percentag", key: 0 } as unknown as Col]), { 0: "" }],
+    });
+    await put(jwt, `/library/table:${typo.documentId}`, {});
+    const refused = await app.request("/query", {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+      body: JSON.stringify({ lang: "sql", code: `select * from @table:${typo.documentId}`, args: [] }),
+    });
+    assertEquals(refused.status, 400);
+    const said = await refused.text();
+    assert(said.includes("percentage"), `the refusal should name the nearest type it knows: ${said}`);
+
+    // Matched against every spelling and answered with what it means. Searching
+    // only the writable half sent PCT to `int` -- a suggestion that turns a
+    // percentage column into a whole number.
+    const shouted = automerge.create<{ data: Sheet["data"] }>({
+      data: [arrayify([{ name: "share", type: "PCT", key: 0 } as unknown as Col]), { 0: "" }],
+    });
+    await put(jwt, `/library/table:${shouted.documentId}`, {});
+    const yelled = await app.request("/query", {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+      body: JSON.stringify({ lang: "sql", code: `select * from @table:${shouted.documentId}`, args: [] }),
+    });
+    const about = await yelled.text();
+    assert(
+      about.includes("set that column's type to percentage"),
+      `PCT should be pointed at percentage, not at whatever is nearest among the writable names: ${about}`,
+    );
+    // describe is the way back in: a sheet this refuses is the one it exists to
+    // let somebody look at.
+    const seen = await app.request("/query", {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+      body: JSON.stringify({ lang: "sql", code: `describe @table:${typo.documentId}`, args: [] }),
+    });
+    assertEquals(seen.status, 200, "describe still answers on a sheet whose types are wrong");
+  });
+
   await t.step("Null, empty and zero stay different", async () => {
     const { jwt } = await usr("nils@example.com");
     const hand = automerge.create<{ data: Sheet["data"] }>({
@@ -3984,6 +4053,113 @@ Deno.test(async function allTests(t) {
     // The rotten feed, the tied one, and the codex connection with no DSN. The
     // never-run feed and the never-opened connection have failed nothing.
     assertEquals(Number((answer as Table)[1].n), 3, "a query sheet can select from it");
+  });
+
+  await t.step("A live socket is only as fresh as the last browser that watched it", async () => {
+    const { jwt } = await usr("sasha@example.com");
+    const hand = automerge.create<Sheet>({ type: "net-socket", data: [{ url: "wss://example.com/feed" }] });
+    const sheet_id = `net-socket:${hand.documentId}`;
+    await put(jwt, `/library/${sheet_id}`, { name: "a live feed" });
+
+    const fresh = async () =>
+      Object.fromEntries(
+        (await get<Table>(jwt, "/sheet/library:freshness")).slice(1).map((r) => [String(r.sheet_id), r]),
+      );
+
+    // Before a browser has said anything, the read says nothing about it.
+    assert(!(await fresh())[sheet_id], "a socket nobody has watched is absent, not never-run");
+
+    await post(jwt, `/library/${sheet_id}/socket`, { status: "connected" });
+    const seen = (await fresh())[sheet_id];
+    assert(seen, "a socket a browser has seen open has a freshness");
+    assertEquals(seen.last_ok, seen.last_run, "seeing it open is a good run");
+    assertEquals(Number(seen.failures_since_ok), 0);
+
+    await post(jwt, `/library/${sheet_id}/socket`, { status: "error" });
+    const broken = (await fresh())[sheet_id];
+    assertEquals(Number(broken.failures_since_ok), 1, "a failed connection is a failure since the last good one");
+    assertEquals(
+      JSON.parse(String(broken.last_meta)).status,
+      502,
+      "graded by POLL_OK off the same meta.status a poll writes, not a second spelling of it",
+    );
+
+    // Two states and no more, and `__proto__` is not one of them: `in` walked the
+    // prototype, so every Object.prototype key answered 200 and wrote a run
+    // POLL_OK grades as a failure forever, on a socket that never failed.
+    for (const status of ["disconnected", "__proto__", "toString", "constructor", 7, null, ["connected"], undefined]) {
+      await reject(jwt, `/library/${sheet_id}/socket`, { method: "POST", body: JSON.stringify({ status }) });
+    }
+    // A body that is not an object at all. JSON `null` parses, so the `.catch`
+    // does not see it and destructuring it used to be a 500 anyone could send.
+    for (const body of ["null", "[]", "7", '"connected"', "{", ""]) {
+      await reject(jwt, `/library/${sheet_id}/socket`, { method: "POST", body });
+    }
+    assertEquals(
+      Number((await fresh())[sheet_id].failures_since_ok),
+      1,
+      "a refused status is not a socket that failed",
+    );
+
+    // syncRole answers on doc_id alone, so owning any sheet gets you past the
+    // access check for that doc_id under another type prefix, and a second colon
+    // leaves the tail out of the check entirely. The row this writes has to
+    // exist, or the insert violates net's foreign key and answers an unexplained
+    // 500 -- and the budget below it gets keyed on an id the caller minted.
+    const other = automerge.create<Sheet>({
+      type: "table",
+      data: [arrayify([{ name: "a", type: "text", key: "0" }])],
+    });
+    await put(jwt, `/library/table:${other.documentId}`, { name: "not a socket" });
+    const minted = [
+      `net-socket:${other.documentId}`,
+      `table:${other.documentId}`,
+      `net-socket:${hand.documentId}:x`,
+      "net-socket:",
+      "net-socket",
+    ];
+    for (const id of minted) {
+      await reject(jwt, `/library/${id}/socket`, { method: "POST", body: JSON.stringify({ status: "connected" }) });
+    }
+    assertEquals(
+      minted.filter((id) => hookBuckets.has(id)),
+      [],
+      "a minted id must not mint a rate-limit key, which evicts the budgets of sheets that exist",
+    );
+
+    // A viewer watches the same socket and must not be able to write its
+    // health, and a stranger holding the doc_id must not be able to write
+    // failures into somebody else's freshness.
+    await usr("sam@example.com");
+    const { jwt: viewerJwt } = await usr("sonia@example.com");
+    await post(jwt, `/library/${sheet_id}/share`, { email: "sonia@example.com", role: "viewer" });
+    const { jwt: strangerJwt } = await usr("sven@example.com");
+    for (const token of [viewerJwt, strangerJwt]) {
+      await reject(token, `/library/${sheet_id}/socket`, {
+        method: "POST",
+        body: JSON.stringify({ status: "error" }),
+      });
+    }
+    assertEquals(
+      Number((await fresh())[sheet_id].failures_since_ok),
+      1,
+      "a refused reporter is not a socket that failed",
+    );
+
+    // A page stuck in a reconnect ladder is a sender that will not stop, and it
+    // spends the same budget a webhook sender does.
+    hookBuckets.delete(sheet_id);
+    let refused = 0;
+    for (let i = 0; i < HOOK_ROWS_PER_WINDOW + 5; i++) {
+      const res = await app.request(`/library/${sheet_id}/socket`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        body: JSON.stringify({ status: "connected" }),
+      });
+      if (res.status === 429) refused++;
+    }
+    assert(refused > 0, "a flood of reports must run out of budget and say so");
+    hookBuckets.delete(sheet_id);
   });
 
   await t.step("The bucket a flood is counted against must be one the flood cannot choose", async () => {
