@@ -20,6 +20,16 @@ The next things to build, in this order.
   2. `SelectAll` computes the same bounds inline instead of calling `tableBounds`. That second copy goes with it.
   3. Navigation only. A cell in a query result is computed, so a write to one must still be refused by name.
 
+- [ ] **A view held for a sheet you could not write stops winning once you can.** `Views.shown` in `src/index.html`
+      prefers this browser's held arrangement on every open, forever. An owner who grants you editor access makes the
+      document's own arrangement the truth again, and nothing notices.
+  1. Drop the held entry once a write to the document is known to have landed.
+  2. `refused` is per-session and never clears, so a grant taken mid-session still routes every arrangement into
+     `localStorage` until a reload.
+  3. Nothing ever deletes from `scrapsheets-views`, and it shares a browser-store quota with `scrapsheets-library`,
+     which holds whole documents. A full store is a refusal with a message now, but there is still no way to clear one
+     held view without clearing the site.
+
 - [ ] **A remote cell edit does not re-read the whole sheet.** `applyCellPatches` is the fast path for a single cell,
       and it never fires on a synced sheet: automerge emits `action: "put"` with `path[0] == "data"`, and the branch
       matches `"set"` with an integer `path[0]`. Every remote edit re-decodes the document instead.

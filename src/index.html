@@ -81,7 +81,17 @@
             return fallback;
           }
         },
-        set: (name, value) => localStorage.setItem(`scrapsheets-${name}`, JSON.stringify(value)),
+        set: (name, value) => {
+          try {
+            localStorage.setItem(`scrapsheets-${name}`, JSON.stringify(value));
+          } catch (error) {
+            throw new Error(
+              `Expected to save scrapsheets-${name} in this browser, received ${error?.name ?? "a refusal"} ` +
+                `from localStorage. Source: whatever last wrote ${name}. This site's browser store is full or ` +
+                `turned off; clear this site's data, or turn storage back on, and reload.`,
+            );
+          }
+        },
         clear: (name) => localStorage.removeItem(`scrapsheets-${name}`),
       };
 
@@ -97,9 +107,7 @@
           },
         });
 
-        app.ports.saveTutorial.subscribe((n) =>
-          Stored.set("tutorial", n),
-        );
+        app.ports.saveTutorial.subscribe(catchy((n) => Stored.set("tutorial", n), 'saveTutorial'));
 
         // Debug logging - set localStorage.debug = 'scrapsheets' to enable verbose logging
         const VERBOSE = localStorage.getItem('debug')?.includes('scrapsheets');
@@ -155,13 +163,26 @@
         // shape the arrangement patches address, so it merges back the way it
         // was written. A cell edit never lands here -- `arrangeDoc` is the one
         // port that reaches it, and only view fields go out on it.
+        //
+        // Held in memory as well as in the store, and the store written last. A
+        // browser store that refuses a write must not also lose what it was
+        // given: the next fold would land on a blob missing a batch, and Elm
+        // has already moved `storedView` past that batch, so nothing would ever
+        // write it again. In memory it survives the refusal and the next
+        // successful write carries it.
         const Views = {
-          keep: (id, patches) =>
-            Stored.set("views", { ...Stored.get("views"), [id]: foldView(Stored.get("views")[id], patches) }),
+          all: null,
+          map: () => (Views.all ??= Stored.get("views")),
+          held: (id) => Views.map()[id],
+          hold: (id, held) => {
+            Views.all = { ...Views.map(), [id]: held };
+            Stored.set("views", Views.all);
+          },
+          keep: (id, patches, data0) => Views.hold(id, foldView(Views.held(id), patches, data0)),
           // Only on the way in. What is stored is never written back into a
           // document that is not ours.
           shown: (id, doc) => {
-            const held = Stored.get("views")[id];
+            const held = Views.held(id);
             if (!held || !Array.isArray(doc?.data) || !doc.data.length) return doc;
             return { ...doc, data: [mergeView(doc.data[0], held), ...doc.data.slice(1)] };
           },
@@ -169,14 +190,19 @@
         // Documents the sync server has refused a write on. It answers on
         // doc_id, so this is keyed the same way.
         const refused = new Set();
-        // The arrangement last sent for a synced sheet. A refusal arrives after
-        // the write, so without this the first one after a page load is the one
-        // that gets lost.
-        let lastArranged = null;
+        // Every arrangement sent to a synced document since the page loaded,
+        // folded onto whatever this browser already held for it. A refusal
+        // arrives a round trip after the write, so without this the arrangements
+        // made before it are the ones that get lost -- and folded rather than
+        // queued so that an editor, who is never refused, cannot grow it.
+        let pending = null;
 
         app.ports.deleteDoc.subscribe(async (id) => Library.delete(id));
 
-        app.ports.updateLibrary.subscribe(({ id, data }) => Library.set(id, data));
+        // Through `catchy` so that `Stored.set`'s refusal reaches the page: a
+        // full browser store threw into an unhandled port subscriber, and the
+        // library stopped saving without a word.
+        app.ports.updateLibrary.subscribe(catchy(({ id, data }) => Library.set(id, data), 'updateLibrary'));
 
         // Query editor autocomplete
         const setupQueryEditorTracking = () => {
@@ -455,10 +481,16 @@
           // arrangement that was refused is kept in this browser instead.
           // Through `catchy` so that a full localStorage cannot take the sync
           // socket down with it: this runs inside the adapter's message handler.
+          // The server's message goes first: `model.error` is one slot, and a
+          // browser store that is full must not answer in place of the sentence
+          // that says how to fix the refusal.
           const onRefused = catchy((frame) => {
             refused.add(frame.documentId);
-            if (lastArranged?.doc_id === frame.documentId) Views.keep(lastArranged.id, lastArranged.patches);
             app.ports.docErrored.send(frame.message ?? "That edit was not saved.");
+            if (pending?.doc_id === frame.documentId) {
+              Views.hold(pending.id, pending.held);
+              pending = null;
+            }
           }, 'sync refusal');
           const receiveMessage = networkAdapter.receiveMessage.bind(networkAdapter);
           networkAdapter.receiveMessage = (data) => {
@@ -466,8 +498,10 @@
             try {
               frame = cbor.decode(new Uint8Array(data));
             } catch {
-              // The adapter reports its own decode failure. Two reports of one
-              // fault is one report too many.
+              // Nothing to report that is not already lost: the adapter runs the
+              // same decoder on the same bytes a moment later and drops the
+              // frame, and this wrapper must not change what it delivers. Every
+              // inbound frame is decoded twice, which is what reading one costs.
             }
             if (frame?.type === "error" && frame.documentId) onRefused(frame);
             return receiveMessage(data);
@@ -1260,17 +1294,33 @@
           app.ports.arrangeDoc.subscribe(
             catchy(async ({ id, data: patches }) => {
               const [, doc_id] = id.split(":");
-              const doc = Library.get()[id]?.doc;
-              if (refused.has(doc_id) || doc) Views.keep(id, patches);
-              if (doc) {
-                const d = { ...doc };
+              const bundled = Library.get()[id]?.doc;
+              const held = refused.has(doc_id) || !!bundled;
+              // What the patches were addressed against, which is how a table's
+              // position becomes the column key the held view is stored under.
+              const data0 = (bundled ?? sheet?.doc?.())?.data?.[0];
+              // The document first and the store last. `arrange` has already
+              // moved `storedView` on to what it just sent, so a batch dropped
+              // here is a batch nothing ever writes again -- and a store that is
+              // full must not be the reason the document missed one.
+              if (bundled) {
+                const d = { ...bundled };
                 applyPatches(d.data, patches);
                 app.ports.docChanged.send({ id, data: { doc: d, handle: null, patchInfo: null, patches } });
-                return;
+              } else if (!held) {
+                if (!sheet)
+                  throw new Error(
+                    `Expected the open sheet's automerge handle to write an arrangement to, received none for ${id}. ` +
+                      `Source: arrangeDoc. The document is not loaded; reload the page and try again.`,
+                  );
+                pending = {
+                  id,
+                  doc_id,
+                  held: foldView(pending?.doc_id === doc_id ? pending.held : Views.held(id), patches, data0),
+                };
+                sheet.change((d) => applyPatches(d.data, patches));
               }
-              if (refused.has(doc_id)) return;
-              lastArranged = { id, doc_id, patches };
-              sheet?.change((d) => applyPatches(d.data, patches));
+              if (held) Views.keep(id, patches, data0);
             }, 'arrangeDoc'),
           );
         }

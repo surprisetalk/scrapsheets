@@ -198,6 +198,10 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   drag-reorder, pin, row insert/duplicate/fill-down, find/replace, undo/redo, command palette (Ctrl/⌘+K), shortcut
   sheet (Ctrl/⌘+/). `shortcutGroups` carries the `Msg` each key runs and `paletteCommands` reads that list, so the two
   cannot drift.
+- **The arrangement is offered where it is kept.** `arrangeControls` is the one predicate `viewHeaderCell` asks: a
+  table and a query, because the arrangement is kept; the library and the shop, because their order is how you read a
+  listing this app builds and there is no document under it. Everything else is a feed — its rows are a run log, and a
+  sort that worked and then forgot read as a bug in saving.
 - **The arrangement is stored on the columns, in two homes.** Sort, filter, hidden, pinned and width live in `data[0]`
   as `sort`/`rank`, `filter`, `hidden`, `pinned`, `width`, so they survive a reload and travel with a share.
   `viewDecoder` reads them on `DocSelect` and `arrange` writes them, diffed against `sheet.storedView` so closing an
@@ -210,14 +214,23 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   index stays the document index. It is a `DocMsg` and not an arrangement: everyone looking at the sheet sees the new
   order, so it rides `changeDoc`, `movePatch to from` is its own undo entry, and a viewer's is refused like any edit.
   `pinLeft` sums the widths of the sticky columns before each pinned one and hands the answer to `.pin` inline; column
-  0 is in the sum whether or not anybody pinned it, because `.c0` sticks it regardless. Pinning a column that sizes
-  itself writes `autoColWidth` for it, because an inexact sum overlaps columns.
+  0 is in the sum whether or not anybody pinned it, because `.c0` sticks it regardless. Pinning writes `autoColWidth`
+  for any sticky column that sizes itself — the one pinned and column 0 both — because a guessed sum either leaves a
+  gap the rows scroll through or slides the pinned column underneath column 0.
+- **`arrange` moves `storedView` before the page has done anything, so the page must never drop a batch.** There is
+  nothing to roll back to: `storedView` is what *this browser wrote*, not what the document holds, and re-reading the
+  document to recover it is exactly what would write a deletion over a collaborator's sort. So `arrangeDoc` in
+  `index.html` writes the document first and the browser store last, `Views` keeps what it was given in memory so a
+  full store loses nothing, and a missing automerge handle is a named refusal rather than a no-op.
 - **A sheet whose document cannot hold the arrangement keeps it in this browser.** `arrangeDoc` is a port of its own so
-  that the page knows a batch is only view fields without inspecting a path. `Views` in `index.html` folds those
-  patches into a partial of `data[0]` under `scrapsheets-views` and merges it back in `selectDoc`; `foldView` and
-  `mergeView` in `src/page.mjs` are the two halves a test can reach. Two sheets need it: one that ships bundled, and
-  one the sync server has refused a write on — which is heard by wrapping the ws adapter's `receiveMessage`, since the
-  vendored adapter logs the server's `type: "error"` frame and emits nothing.
+  that the page knows a batch is only view fields without inspecting a path. `Views` in `index.html` holds those
+  patches under `scrapsheets-views` and merges them back in `selectDoc`; `foldView` and `mergeView` in `src/page.mjs`
+  are the two halves a test can reach. **Held by `col.key`, never by position** — a table's patch addresses `data[0][x]`
+  and `foldView` resolves x against the document's own `data[0]`, because the whole reason a view is held is that
+  somebody else owns the document and can reorder it. A held key the document no longer carries is dropped, not
+  created. Two sheets need this: one that ships bundled, and one the sync server has refused a write on — which is
+  heard by wrapping the ws adapter's `receiveMessage`, since the vendored adapter logs the server's `type: "error"`
+  frame at a debug namespace and emits nothing.
 - **Known gaps**: `@library:freshness` resolves on the server but not in the page. `describe` results carry no type in
   the page, and `WINDOW_TYPES` is server-only, so a window alias there falls back to the sheet's stored `cols`.
   `tableBounds` answers `0, 0` for a query sheet, so the keyboard does not move over one.

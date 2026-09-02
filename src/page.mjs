@@ -86,52 +86,72 @@ export const docThumb = (doc) => {
 
 // --- a view this browser holds
 //
-// The sync server refuses a viewer's write and says so, so a sheet you can only
-// read is arranged locally or not at all. What is kept is not the document --
-// that one is not ours -- but the arrangement patches Elm sent for it, folded
-// into a partial of `data[0]` and merged back over the document on the way in.
-// Both halves are here rather than in src/index.html because both are functions
-// of their input, and because a merge nothing checks is a merge that loses a
-// filter.
+// The sync server refuses a viewer's write and says so, and a bundled sheet has
+// no document of this browser's at all, so those two are arranged locally or not
+// at all. What is kept is not the document -- that one is not ours -- but the
+// arrangement patches Elm sent for it, merged back over the document on the way
+// in. Both halves are here rather than in src/index.html because both are
+// functions of their input, and because a merge nothing checks is a merge that
+// loses a filter.
+//
+// Held by column key, never by position. A table's patch addresses `data[0][x]`,
+// and the document's own copy of that field can afford to: it lives on the
+// column object, so a splice carries it. A copy held out here cannot -- the
+// whole reason it is held is that somebody else owns the document and can
+// reorder it, and then position 5 is a different column than the one you hid.
 
-/** The arrangement patches folded into a partial of `data[0]`, in the shape
- * their own paths describe. `path[0]` is always 0 — `data[0]` — so the walk
- * starts after it.
+/** The arrangement patches folded into what this browser holds for a sheet:
+ * `{ [column key]: { field: value } }`, whichever home the patch addressed.
+ * `data0` is the document's own `data[0]`, which is how a table's position
+ * becomes the key the column carries.
  *
  * A cleared field is held as `null` rather than dropped: a viewer who clears a
  * sort must not get the owner's back on the next reload.
  */
-export const foldView = (held, patches) => {
-  const out = structuredClone(held ?? {});
+export const foldView = (held, patches, data0) => {
+  const out = { ...(held ?? {}) };
   for (const { path, action, value } of patches) {
-    // Every arrangement patch names a field on a column. A path that names
-    // something else is a patch on the wrong port, and folding it away quietly
-    // would lose an edit somebody made.
-    if (!Array.isArray(path) || path.length < 3 || path[0] !== 0)
+    // A query addresses `data[0].view.<name>.<field>` and already names the
+    // column; a table addresses `data[0][x].<field>`, and x is resolved here.
+    const [root, at, ...rest] = Array.isArray(path) ? path : [];
+    const query = at === "view";
+    const [key, field] = query ? rest : [data0?.[at]?.key, ...rest];
+    if (root !== 0 || rest.length !== (query ? 2 : 1) || typeof key !== "string" || typeof field !== "string") {
       throw new Error(
-        `Expected an arrangement patch addressing data[0], received ${JSON.stringify(path)} from arrangeDoc. ` +
+        `Expected an arrangement patch naming one field of one column, received ` +
+          `${JSON.stringify(path)} from arrangeDoc against ${JSON.stringify(data0)?.slice(0, 120)}. ` +
           `Only view fields go out on that port; a row or column edit belongs on changeDoc.`,
       );
-    let at = out;
-    for (const seg of path.slice(1, -1)) at = at[seg] ??= {};
-    at[path[path.length - 1]] = action === "del" ? null : value;
+    }
+    out[key] = { ...out[key], [field]: action === "del" ? null : value };
   }
   return out;
 };
 
-/** That partial merged back over a document's `data[0]`, copying as it descends
- * — an automerge snapshot is frozen, and a held view must never be written into
- * the document it is standing in for. A null clears the field.
+/** What this browser holds, put back on the columns that carry those keys. A
+ * held key the document no longer has is dropped rather than created: the
+ * arrangement of a column that is gone is nothing, and a column invented to hold
+ * one reads back as a blank column the sheet never had.
+ *
+ * Copies as it goes — an automerge snapshot is frozen, and a held view must
+ * never be written into the document it is standing in for.
  */
 export const mergeView = (data0, held) => {
   if (!held || typeof data0 !== "object" || data0 === null) return data0;
-  const out = Array.isArray(data0) ? [...data0] : { ...data0 };
-  for (const [key, value] of Object.entries(held)) {
-    if (value === null) delete out[key];
-    else if (value && typeof value === "object" && !Array.isArray(value)) out[key] = mergeView(out[key] ?? {}, value);
-    else out[key] = value;
-  }
-  return out;
+  const onto = (col, fields) => {
+    const out = { ...col };
+    for (const [field, value] of Object.entries(fields)) {
+      if (value === null) delete out[field];
+      else out[field] = value;
+    }
+    return out;
+  };
+  // A table's `data[0]` is the column list, and each column carries its share.
+  if (Array.isArray(data0)) return data0.map((col) => (held[col?.key] ? onto(col, held[col.key]) : col));
+  // A query's is one object, and the view lives in a map beside `cols`.
+  const view = { ...data0.view };
+  for (const [key, fields] of Object.entries(held)) view[key] = onto(view[key], fields);
+  return { ...data0, view };
 };
 
 // --- http

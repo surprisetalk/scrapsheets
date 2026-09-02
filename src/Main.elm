@@ -801,9 +801,15 @@ type alias Sheet =
     -- column under the pointer is `hover.x`, which every cell already reports.
     , moving : Maybe String
 
-    -- The arrangement the document holds, as last read or last written. Every
-    -- write is diffed against it, so closing a filter panel that changed
-    -- nothing writes nothing, and moving one sort key rewrites one column.
+    -- What this browser has written to the document, plus what the document
+    -- held when it was opened. Every write is diffed against it, so closing a
+    -- filter panel that changed nothing writes nothing, and moving one sort key
+    -- rewrites one column.
+    --
+    -- Not re-read from the document as it changes, on purpose. A collaborator's
+    -- sort would land in here, the next diff would see it go from theirs to the
+    -- nothing on my screen, and I would write a deletion over their sort. What
+    -- I did not touch, I do not write.
     , storedView : SheetView
     , lineage : Maybe String
     }
@@ -1193,6 +1199,36 @@ arrangeable sheet =
             Nothing
 
 
+{-| Whether the column controls -- sort, filter, hide, pin, resize -- are offered
+on this sheet at all.
+
+Anything `arrangeable` answers for, because there the arrangement is kept. Plus
+the library and the shop, which are listings this app builds rather than sheets:
+their order is a way of reading the list rather than a fact about it, there is no
+document under them to keep it in, and nobody expects a reload to hold it.
+
+Everything else is a feed. Its rows are the log of what happened to the sheet,
+`arrange` has nowhere to put an arrangement, and a control that works and then
+forgets on reload reads as a bug in saving rather than as a sheet with no columns
+of its own. A control that is absent explains itself.
+
+-}
+arrangeControls : Sheet -> Bool
+arrangeControls sheet =
+    case ( arrangeable sheet, sheet.doc ) of
+        ( Just _, _ ) ->
+            True
+
+        ( Nothing, Ok Library ) ->
+            True
+
+        ( Nothing, Ok Shop ) ->
+            True
+
+        _ ->
+            False
+
+
 {-| Move to a sheet arranged this way, and store the arrangement on its columns.
 
 Deliberately not routed through `updateDocMsg`: dragging a column wider is not
@@ -1200,6 +1236,15 @@ an edit to the data, and does not belong on the undo stack beside one. It goes
 out through `arrangeDoc` rather than `changeDoc` for the same reason from the
 other side -- the page then knows a batch is only ever view fields, without
 having to keep a second copy of what those are.
+
+`storedView` moves to `after` here, before the page has done anything with the
+patches, and **the page must never drop a batch** -- it is written to hold that
+up: the document first and the browser store last, a store that refuses keeps
+what it was given in memory, and a missing automerge handle is a named refusal
+rather than a no-op. There is no acknowledgement to wait for and no correct
+value to roll back to: this is what _I_ wrote, not what the document holds, and
+re-reading the document to recover it is what would write a deletion over a
+collaborator's sort.
 
 -}
 arrange : Model -> Sheet -> ( Model, Cmd Msg )
@@ -2635,22 +2680,31 @@ update msg ({ sheet, auth } as model) =
             arrange model { sheet | sort = cycleSort shift key sheet.sort }
 
         ColumnPin key ->
+            let
+                pinning =
+                    not (Set.member key sheet.pinned)
+
+                -- A pinned column's left edge is the sum of the widths of the
+                -- sticky columns before it, and a column that sizes itself has
+                -- no width to add. Both get one written: the column being
+                -- pinned, and column 0, which is sticky whether or not anybody
+                -- pinned it. Guessing column 0's either leaves a gap that
+                -- unpinned content scrolls through or slides the pinned column
+                -- underneath it. Unpinning leaves every width alone, because by
+                -- then it is a width somebody has been looking at.
+                sized col widths =
+                    iif (colPx sheet col == Nothing) (Dict.insert col.key autoColWidth widths) widths
+
+                sticky =
+                    List.filterMap identity
+                        [ colOf sheet key
+                        , arrangeable sheet |> Maybe.andThen (\target -> Array.get 0 target.cols)
+                        ]
+            in
             arrange model
                 { sheet
-                    | pinned = iif (Set.member key sheet.pinned) (Set.remove key sheet.pinned) (Set.insert key sheet.pinned)
-
-                    -- A pinned column's left edge is the sum of the widths
-                    -- before it, and a column that sizes itself has no width to
-                    -- add. Pinning one fixes its width so the sum is exact;
-                    -- unpinning leaves the width alone, because by then it is a
-                    -- width somebody has been looking at.
-                    , widths =
-                        case ( Set.member key sheet.pinned, colOf sheet key |> Maybe.andThen (colPx sheet) ) of
-                            ( False, Nothing ) ->
-                                Dict.insert key autoColWidth sheet.widths
-
-                            _ ->
-                                sheet.widths
+                    | pinned = iif pinning (Set.insert key sheet.pinned) (Set.remove key sheet.pinned)
+                    , widths = iif pinning (List.foldl sized sheet.widths sticky) sheet.widths
                     , filterOpen = Nothing
                 }
 
@@ -5459,6 +5513,9 @@ viewHeaderCell sheet col =
                 isPinned =
                     Set.member col.key sheet.pinned
 
+                controls =
+                    arrangeControls sheet
+
                 -- A table's columns are the document's own order, so only they
                 -- can be moved. A query's are its select list's.
                 movable =
@@ -5492,16 +5549,25 @@ viewHeaderCell sheet col =
                         )
                         (text "")
                     , iif isPinned (H.span [ A.class "pinned", A.title "pinned" ] [ text "📌" ]) (text "")
-                    , H.span [ A.class "sort", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600", S.cursorPointer, A.on "click" (D.map (\shift -> ColumnSort shift col.key) (D.field "shiftKey" D.bool)), A.title "shift-click to add a sort key" ]
-                        [ text (col.name ++ sortIndicator) ]
-                    , H.span [ A.classList [ ( "funnel", True ), ( "on", hasFilter ) ], S.cursorPointer, S.fontSizeRem 0.75, A.onClick (FilterToggle col.key), A.title "filter" ]
-                        [ text (iif hasFilter "⧩" "▽") ]
-                    , H.span
-                        [ A.class "grip"
-                        , A.title "drag to resize"
-                        , A.on "mousedown" (D.map (ColumnResizeStart col.key) (D.field "clientX" (D.map round D.float)))
-                        ]
-                        []
+                    , iif controls
+                        (H.span [ A.class "sort", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600", S.cursorPointer, A.on "click" (D.map (\shift -> ColumnSort shift col.key) (D.field "shiftKey" D.bool)), A.title "shift-click to add a sort key" ]
+                            [ text (col.name ++ sortIndicator) ]
+                        )
+                        (H.span [ S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600" ] [ text col.name ])
+                    , iif controls
+                        (H.span [ A.classList [ ( "funnel", True ), ( "on", hasFilter ) ], S.cursorPointer, S.fontSizeRem 0.75, A.onClick (FilterToggle col.key), A.title "filter" ]
+                            [ text (iif hasFilter "⧩" "▽") ]
+                        )
+                        (text "")
+                    , iif controls
+                        (H.span
+                            [ A.class "grip"
+                            , A.title "drag to resize"
+                            , A.on "mousedown" (D.map (ColumnResizeStart col.key) (D.field "clientX" (D.map round D.float)))
+                            ]
+                            []
+                        )
+                        (text "")
                     ]
                 , if isFilterOpen then
                     H.div [ A.class "panel", S.positionAbsolute, S.top "100%", S.left "0", S.padding "0.5rem", S.zIndex "100", S.minWidth "150px", S.fontSizeRem 0.875 ]
