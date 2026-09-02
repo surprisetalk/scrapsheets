@@ -32,6 +32,7 @@ port module Main exposing
     , freshnessDecoder
     , knownTypeName
     , main
+    , movePatch
     , moveSelection
     , nameClash
     , nextSortOrder
@@ -41,7 +42,9 @@ port module Main exposing
     , parseDay
     , parseJson
     , parseTsv
+    , pinLeft
     , pruneView
+    , queryHome
     , rect
     , rectToIndices
     , rowSplices
@@ -50,9 +53,11 @@ port module Main exposing
     , shortcutGroups
     , skipHidden
     , sortRankOf
+    , tableHome
     , typeName
     , usd
     , viewDecoder
+    , viewPatches
     , xy
     )
 
@@ -517,6 +522,13 @@ port deleteDoc : String -> Cmd msg
 port changeDoc : Idd (List Patch) -> Cmd msg
 
 
+{-| The arrangement, on its own wire. Every patch that leaves here is a view
+field and nothing else, which is what lets the page keep a viewer's arrangement
+in this browser without a second copy of the list of what a view field is.
+-}
+port arrangeDoc : Idd (List Patch) -> Cmd msg
+
+
 port queryDoc : Idd { lang : String, code : String, cols : D.Value } -> Cmd msg
 
 
@@ -773,6 +785,7 @@ type alias Sheet =
     , table : Result String Table
     , stats : Result String (Array Stat)
     , hidden : Set String
+    , pinned : Set String
     , sort : List ( String, SortOrder )
     , filters : Dict String Filter
     , filterOpen : Maybe String
@@ -783,6 +796,10 @@ type alias Sheet =
     , netStatus : Maybe String
     , widths : Dict String Int
     , resizing : Maybe { key : String, startX : Int, startWidth : Int }
+
+    -- The column being dragged to a new position, while the drag lasts. The
+    -- column under the pointer is `hover.x`, which every cell already reports.
+    , moving : Maybe String
 
     -- The arrangement the document holds, as last read or last written. Every
     -- write is diffed against it, so closing a filter panel that changed
@@ -803,6 +820,7 @@ emptySheet =
     , table = Err ""
     , stats = Err ""
     , hidden = Set.empty
+    , pinned = Set.empty
     , sort = []
     , filters = Dict.empty
     , filterOpen = Nothing
@@ -814,6 +832,7 @@ emptySheet =
     , lineage = Nothing
     , widths = Dict.empty
     , resizing = Nothing
+    , moving = Nothing
     , storedView = emptyView
     }
 
@@ -859,6 +878,7 @@ setting earns its place after both values are wanted in real use.
 -}
 type alias SheetView =
     { hidden : Set String
+    , pinned : Set String
     , sort : List ( String, SortOrder )
     , filters : Dict String Filter
     , widths : Dict String Int
@@ -867,7 +887,7 @@ type alias SheetView =
 
 emptyView : SheetView
 emptyView =
-    { hidden = Set.empty, sort = [], filters = Dict.empty, widths = Dict.empty }
+    { hidden = Set.empty, pinned = Set.empty, sort = [], filters = Dict.empty, widths = Dict.empty }
 
 
 {-| One column's share of the view. Every field is optional and every default is
@@ -877,6 +897,7 @@ as a sheet nobody has arranged yet.
 type alias ColView =
     { key : String
     , hidden : Bool
+    , pinned : Bool
     , sort : Maybe SortOrder
     , rank : Int
     , filter : String
@@ -895,15 +916,24 @@ minColWidth =
     32
 
 
-colViewDecoder : D.Decoder ColView
-colViewDecoder =
-    D.map6 ColView
-        -- The key `colDecoder` will give this column, not the one written on it.
-        -- They differ: a column whose name is a JSON number falls back to a key
-        -- of "" there and read as "1" here, so the arrangement was stored under
-        -- a key the rendered table never used and `pruneView` then deleted it.
-        (D.map .key colDecoder)
+{-| What a column that sizes itself renders at, near enough. A resize drag has
+to start somewhere, and a pinned column's left edge is a sum of widths that has
+to be exact -- so pinning a self-sizing column fixes its width at this.
+-}
+autoColWidth : Int
+autoColWidth =
+    140
+
+
+{-| One column's view fields, under a key its home decides rather than one
+written beside them. A table's columns carry their own key; a query has no
+stored columns at all, so the map key is the only key there is.
+-}
+colViewFields : String -> D.Decoder ColView
+colViewFields key =
+    D.map6 (ColView key)
         (D.oneOf [ D.field "hidden" D.bool, D.succeed False ])
+        (D.oneOf [ D.field "pinned" D.bool, D.succeed False ])
         (D.oneOf
             [ D.field "sort" D.string
                 |> D.map
@@ -926,15 +956,39 @@ colViewDecoder =
         (D.oneOf [ D.field "width" (D.map (\w -> iif (w >= minColWidth) (Just w) Nothing) D.int), D.succeed Nothing ])
 
 
+colViewDecoder : D.Decoder ColView
+colViewDecoder =
+    -- The key `colDecoder` will give this column, not the one written on it.
+    -- They differ: a column whose name is a JSON number falls back to a key
+    -- of "" there and read as "1" here, so the arrangement was stored under
+    -- a key the rendered table never used and `pruneView` then deleted it.
+    D.map .key colDecoder |> D.andThen colViewFields
+
+
+colViewAt : ( String, D.Value ) -> Maybe ColView
+colViewAt ( key, value ) =
+    D.decodeValue (colViewFields key) value |> Result.toMaybe
+
+
 {-| The view a document carries, or none. A sheet with no `data` -- the library,
 the shop -- has no columns to carry one, and a shape this cannot read is a sheet
 nobody arranged rather than an error: the view is how you were looking at the
 rows, and losing it must never cost you the rows.
+
+Two homes, because `data[0]` has two shapes. A table's is the column list, and
+each column carries its own share. A query's is one object -- `lang`, `code`,
+`cols` -- because its rows and its headers are both computed, so the view lives
+in a `view` map beside `cols`, keyed the way `cols` is: by the column's name.
+The `view` branch goes first; a table's `data[0]` is a list, so `D.field "view"`
+fails there and falls through.
+
 -}
 viewDecoder : D.Decoder SheetView
 viewDecoder =
     D.oneOf
-        [ D.field "data" (D.index 0 (D.oneOf [ D.list colViewDecoder, D.dict colViewDecoder |> D.map Dict.values ]))
+        [ D.field "data" (D.index 0 (D.field "view" (D.keyValuePairs D.value)))
+            |> D.map (List.filterMap colViewAt >> viewOf)
+        , D.field "data" (D.index 0 (D.oneOf [ D.list colViewDecoder, D.dict colViewDecoder |> D.map Dict.values ]))
             |> D.map viewOf
         , D.succeed emptyView
         ]
@@ -943,6 +997,7 @@ viewDecoder =
 viewOf : List ColView -> SheetView
 viewOf cols =
     { hidden = cols |> List.filter .hidden |> List.map .key |> Set.fromList
+    , pinned = cols |> List.filter .pinned |> List.map .key |> Set.fromList
     , sort =
         cols
             |> List.filterMap (\c -> Maybe.map (\order -> ( c.rank, ( c.key, order ) )) c.sort)
@@ -969,6 +1024,13 @@ collaborator's delete is pruned too. It only ever removes, so it cannot overwrit
 a filter somebody is in the middle of typing -- which is why the arrangement is
 otherwise read on open and not on every change.
 
+A table only. A query's columns are whatever its last run returned, and they
+come and go on every keystroke while its SQL is being edited -- pruning there
+would drop your sort the moment a column momentarily stopped existing. Nothing
+is written for a column the query no longer returns anyway, because
+`viewPatches` walks the columns it does, and the entry comes back if the column
+does.
+
 -}
 pruneView : Result String Doc -> Sheet -> Sheet
 pruneView doc sheet =
@@ -980,16 +1042,18 @@ pruneView doc sheet =
 
                 keep arrangement =
                     { hidden = Set.filter (\key -> Set.member key live) arrangement.hidden
+                    , pinned = Set.filter (\key -> Set.member key live) arrangement.pinned
                     , sort = List.filter (\( key, _ ) -> Set.member key live) arrangement.sort
                     , filters = Dict.filter (\key _ -> Set.member key live) arrangement.filters
                     , widths = Dict.filter (\key _ -> Set.member key live) arrangement.widths
                     }
 
                 onScreen =
-                    keep { hidden = sheet.hidden, sort = sheet.sort, filters = sheet.filters, widths = sheet.widths }
+                    keep (onScreenView sheet)
             in
             { sheet
                 | hidden = onScreen.hidden
+                , pinned = onScreen.pinned
                 , sort = onScreen.sort
                 , filters = onScreen.filters
                 , widths = onScreen.widths
@@ -1013,8 +1077,8 @@ A field that goes back to its default is deleted rather than set: a `false`
 hidden and a `null` width are noise in a document somebody may read.
 
 -}
-viewPatches : Array Col -> SheetView -> SheetView -> List Patch
-viewPatches cols before after =
+viewPatches : (Int -> String -> List D.Value) -> Array Col -> SheetView -> SheetView -> List Patch
+viewPatches at cols before after =
     let
         ranked arrangement =
             arrangement.sort |> List.indexedMap (\i ( k, order ) -> ( k, ( i + 1, order ) )) |> Dict.fromList
@@ -1030,9 +1094,9 @@ viewPatches cols before after =
                 Nothing ->
                     Nothing
 
-        set x field value =
+        set x key field value =
             [ { action = iif (value == Nothing) "del" "set"
-              , path = [ E.int 0, E.string (String.fromInt x), E.string field ]
+              , path = at x key ++ [ E.string field ]
               , value = Maybe.withDefault E.null value
               }
             ]
@@ -1050,50 +1114,112 @@ viewPatches cols before after =
                 in
                 List.concat
                     [ only (Set.member key before.hidden) (Set.member key after.hidden) <|
-                        set x "hidden" (iif (Set.member key after.hidden) (Just (E.bool True)) Nothing)
+                        set x key "hidden" (iif (Set.member key after.hidden) (Just (E.bool True)) Nothing)
+                    , only (Set.member key before.pinned) (Set.member key after.pinned) <|
+                        set x key "pinned" (iif (Set.member key after.pinned) (Just (E.bool True)) Nothing)
                     , only (Dict.get key before.widths) (Dict.get key after.widths) <|
-                        set x "width" (Maybe.map E.int (Dict.get key after.widths))
+                        set x key "width" (Maybe.map E.int (Dict.get key after.widths))
                     , only (text_ before.filters key) (text_ after.filters key) <|
-                        set x "filter" (Maybe.map E.string (text_ after.filters key))
+                        set x key "filter" (Maybe.map E.string (text_ after.filters key))
                     , only (Dict.get key wasSorted) (Dict.get key nowSorted) <|
                         case Dict.get key nowSorted of
                             Just ( rank, order ) ->
-                                set x "sort" (Just (E.string (iif (order == Ascending) "asc" "desc")))
-                                    ++ set x "rank" (Just (E.int rank))
+                                set x key "sort" (Just (E.string (iif (order == Ascending) "asc" "desc")))
+                                    ++ set x key "rank" (Just (E.int rank))
 
                             Nothing ->
-                                set x "sort" Nothing ++ set x "rank" Nothing
+                                set x key "sort" Nothing ++ set x key "rank" Nothing
                     ]
             )
 
 
+{-| A column moved from one position in `data[0]` to another.
+
+One patch, not a splice out and a splice back in: the value re-inserted has to
+be the column object the document already holds. `Col` carries only key, name
+and type, so a column rebuilt here would arrive stripped of its own arrangement.
+`applyPatches` in src/index.html moves the value in place.
+
+-}
+movePatch : Int -> Int -> Patch
+movePatch from to =
+    { action = "move", path = [ E.int 0 ], value = E.list E.int [ from, to ] }
+
+
+{-| The arrangement as it stands on screen: the half of a `Sheet` that is a
+`SheetView`.
+-}
+onScreenView : Sheet -> SheetView
+onScreenView sheet =
+    { hidden = sheet.hidden
+    , pinned = sheet.pinned
+    , sort = sheet.sort
+    , filters = sheet.filters
+    , widths = sheet.widths
+    }
+
+
+{-| Where one column's view fields live in `data[0]`. A table's columns are the
+list itself, so the address is the position. A query has no stored columns to
+write on -- its rows and its headers are both computed -- so they live under
+`view`, keyed by the column's name the way its `cols` overrides are.
+-}
+tableHome : Int -> String -> List D.Value
+tableHome x _ =
+    [ E.int 0, E.string (String.fromInt x) ]
+
+
+queryHome : Int -> String -> List D.Value
+queryHome _ key =
+    [ E.int 0, E.string "view", E.string key ]
+
+
+{-| The columns an arrangement may name, and where each one's fields go. One
+`case` rather than two, so a sheet type cannot be arrangeable in one direction
+and not the other. A query's columns are whatever its last run returned -- the
+same `Col` record through the same decoder, just held beside the document
+instead of inside it.
+-}
+arrangeable : Sheet -> Maybe { cols : Array Col, home : Int -> String -> List D.Value }
+arrangeable sheet =
+    case sheet.doc of
+        Ok (Tab tbl) ->
+            Just { cols = tbl.cols, home = tableHome }
+
+        Ok (Query _) ->
+            sheet.table |> Result.toMaybe |> Maybe.map (\tbl -> { cols = tbl.cols, home = queryHome })
+
+        _ ->
+            Nothing
+
+
 {-| Move to a sheet arranged this way, and store the arrangement on its columns.
 
-Only a table sheet. A query's rows are computed rather than stored, so there is
-no document for its view to live on, and sorting one still dies with the tab.
-
 Deliberately not routed through `updateDocMsg`: dragging a column wider is not
-an edit to the data, and does not belong on the undo stack beside one.
+an edit to the data, and does not belong on the undo stack beside one. It goes
+out through `arrangeDoc` rather than `changeDoc` for the same reason from the
+other side -- the page then knows a batch is only ever view fields, without
+having to keep a second copy of what those are.
 
 -}
 arrange : Model -> Sheet -> ( Model, Cmd Msg )
 arrange model next =
     let
         after =
-            { hidden = next.hidden, sort = next.sort, filters = next.filters, widths = next.widths }
+            onScreenView next
     in
-    case next.doc of
-        Ok (Tab tbl) ->
+    case arrangeable next of
+        Just target ->
             ( { model | sheet = { next | storedView = after } }
-            , case viewPatches tbl.cols next.storedView after of
+            , case viewPatches target.home target.cols next.storedView after of
                 [] ->
                     Cmd.none
 
                 patches ->
-                    changeDoc { id = next.id, data = patches }
+                    arrangeDoc { id = next.id, data = patches }
             )
 
-        _ ->
+        Nothing ->
             ( { model | sheet = next }, Cmd.none )
 
 
@@ -1682,6 +1808,9 @@ type Msg
     | ColumnSort Bool String
     | ColumnHide String
     | ColumnsShowAll
+    | ColumnPin String
+    | ColumnMoveStart String
+    | ColumnMoveEnd
     | ColumnResizeStart String Int
     | ColumnResizeMove Int
     | ColumnResizeEnd
@@ -1736,6 +1865,7 @@ type DocMsg
     | SheetRowDuplicate (List Int)
     | SheetRowDelete (List Int)
     | SheetColumnDelete (List Int)
+    | SheetColumnMove Int Int
     | SheetClearCells (List Index)
     | SheetFillDown Rect
     | CellCheck Index Bool
@@ -1787,6 +1917,12 @@ subs model =
                     [ Browser.onMouseMove (D.map ColumnResizeMove (D.field "clientX" (D.map round D.float)))
                     , Browser.onMouseUp (D.succeed ColumnResizeEnd)
                     ]
+
+            Nothing ->
+                Sub.none
+        , case model.sheet.moving of
+            Just _ ->
+                Browser.onMouseUp (D.succeed ColumnMoveEnd)
 
             Nothing ->
                 Sub.none
@@ -2012,6 +2148,7 @@ update msg ({ sheet, auth } as model) =
                     , table = Err ""
                     , stats = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString |> Result.andThen computeStats
                     , hidden = stored.hidden
+                    , pinned = stored.pinned
                     , sort = stored.sort
                     , filters = stored.filters
                     , filterOpen = Nothing
@@ -2023,6 +2160,7 @@ update msg ({ sheet, auth } as model) =
                     , lineage = data.data.doc |> D.decodeValue (D.field "forked_from" D.string) |> Result.toMaybe
                     , widths = stored.widths
                     , resizing = Nothing
+                    , moving = Nothing
                     , storedView = stored
                     }
               }
@@ -2496,6 +2634,75 @@ update msg ({ sheet, auth } as model) =
         ColumnSort shift key ->
             arrange model { sheet | sort = cycleSort shift key sheet.sort }
 
+        ColumnPin key ->
+            arrange model
+                { sheet
+                    | pinned = iif (Set.member key sheet.pinned) (Set.remove key sheet.pinned) (Set.insert key sheet.pinned)
+
+                    -- A pinned column's left edge is the sum of the widths
+                    -- before it, and a column that sizes itself has no width to
+                    -- add. Pinning one fixes its width so the sum is exact;
+                    -- unpinning leaves the width alone, because by then it is a
+                    -- width somebody has been looking at.
+                    , widths =
+                        case ( Set.member key sheet.pinned, colOf sheet key |> Maybe.andThen (colPx sheet) ) of
+                            ( False, Nothing ) ->
+                                Dict.insert key autoColWidth sheet.widths
+
+                            _ ->
+                                sheet.widths
+                    , filterOpen = Nothing
+                }
+
+        ColumnMoveStart key ->
+            ( { model | sheet = { sheet | moving = Just key, filterOpen = Nothing } }, Cmd.none )
+
+        ColumnMoveEnd ->
+            -- The column under the pointer is `hover.x`: every cell reports it
+            -- already, so a drag needs no tracking of its own. A move is a
+            -- splice on `data[0]` rather than a display permutation -- rows are
+            -- keyed by `col.key`, so no cell moves and the display index stays
+            -- the document index, which is what keeps every selection index in
+            -- this file right without a display-to-document map. It travels
+            -- alone in its batch: every other view write is addressed by a
+            -- position this one changes. It is a document edit rather than an
+            -- arrangement -- everyone looking at the sheet sees the new order --
+            -- so it goes out on `changeDoc` with an undo entry beside it, and a
+            -- viewer's is refused the way any other edit of theirs is.
+            --
+            -- A table only. A query's columns are its result's, in the order its
+            -- select list put them, and moving one means editing the query.
+            case ( sheet.moving, sheet.doc ) of
+                ( Just key, Ok (Tab tbl) ) ->
+                    let
+                        from =
+                            tbl.cols
+                                |> Array.toIndexedList
+                                |> List.filter (\( _, c ) -> c.key == key)
+                                |> List.head
+                                |> Maybe.map Tuple.first
+
+                        -- Let go anywhere but over a column and the column goes
+                        -- nowhere. `hover` is -1 off the table, and a drop that
+                        -- guessed 0 from that moved a column somebody was only
+                        -- putting down.
+                        to =
+                            iif (sheet.hover.x < 0) Nothing (Just (min sheet.hover.x (Array.length tbl.cols - 1)))
+                    in
+                    case ( from, to ) of
+                        ( Just at, Just onto ) ->
+                            if at == onto then
+                                ( { model | sheet = { sheet | moving = Nothing } }, Cmd.none )
+
+                            else
+                                updateDocMsg (SheetColumnMove at onto) { model | sheet = { sheet | moving = Nothing } }
+
+                        _ ->
+                            ( { model | sheet = { sheet | moving = Nothing } }, Cmd.none )
+
+                _ ->
+                    ( { model | sheet = { sheet | moving = Nothing } }, Cmd.none )
+
         ColumnResizeStart key startX ->
             ( { model
                 | sheet =
@@ -2504,18 +2711,7 @@ update msg ({ sheet, auth } as model) =
                             Just
                                 { key = key
                                 , startX = startX
-                                , startWidth =
-                                    Dict.get key sheet.widths
-                                        |> Maybe.withDefault
-                                            (sheet.table
-                                                |> Result.toMaybe
-                                                |> Maybe.andThen (\t -> t.cols |> Array.filter (\c -> c.key == key) |> Array.get 0)
-                                                |> Maybe.andThen (.typ >> spec >> .width)
-                                                -- No such column, or one that
-                                                -- sizes itself: 140px is about
-                                                -- what one renders at.
-                                                |> Maybe.withDefault 140
-                                            )
+                                , startWidth = colOf sheet key |> Maybe.andThen (colPx sheet) |> Maybe.withDefault autoColWidth
                                 }
                     }
               }
@@ -3177,6 +3373,13 @@ updateDocMsg edit ({ sheet } as model) =
                                             )
                             in
                             ( forward, backward )
+
+                        SheetColumnMove from to ->
+                            -- Its own inverse, which is the whole reason a move
+                            -- is one patch: a splice out and a splice back in
+                            -- would have to rebuild the column to undo it, and
+                            -- `Col` does not carry all of one.
+                            ( [ movePatch from to ], [ movePatch to from ] )
 
                         SheetColumnDelete indices ->
                             let
@@ -4986,12 +5189,10 @@ skipHidden sheet bounds dx x =
 
 columnHiddenAt : Sheet -> Int -> Bool
 columnHiddenAt sheet x =
-    case sheet.doc of
-        Ok (Tab tbl) ->
-            Array.get x tbl.cols |> Maybe.map (\col -> Set.member col.key sheet.hidden) |> Maybe.withDefault False
-
-        _ ->
-            False
+    arrangeable sheet
+        |> Maybe.andThen (\target -> Array.get x target.cols)
+        |> Maybe.map (\col -> Set.member col.key sheet.hidden)
+        |> Maybe.withDefault False
 
 
 displayYToDocY : String -> Sheet -> Array Row -> Int -> Int
@@ -5010,14 +5211,56 @@ displayYToDocY search sheet rows y =
 own sizes itself. Both come out of `spec`, in px, so a width cannot be changed
 in one place and missed in another.
 -}
+colPx : Sheet -> Col -> Maybe Int
+colPx sheet col =
+    Dict.get col.key sheet.widths |> orElse (spec col.typ).width
+
+
 colWidth : Sheet -> Col -> H.Attribute Msg
 colWidth sheet col =
-    case Dict.get col.key sheet.widths |> orElse (spec col.typ).width of
+    case colPx sheet col of
         Just px ->
             S.width (String.fromInt px ++ "px")
 
         Nothing ->
             S.widthAuto
+
+
+colOf : Sheet -> String -> Maybe Col
+colOf sheet key =
+    arrangeable sheet |> Maybe.andThen (\target -> target.cols |> Array.filter (\c -> c.key == key) |> Array.get 0)
+
+
+{-| The left edge of every column that stays put while the table scrolls
+sideways, in px: the widths of the sticky columns before it.
+
+Column 0 is in the sum whether or not anybody pinned it -- `.c0` in
+src/style.css keeps the row label in view regardless -- because a pinned column
+that did not count it would land underneath it. A hidden column renders
+`display: none` and so adds nothing.
+
+-}
+pinLeft : Sheet -> Array Col -> Dict String Int
+pinLeft sheet cols =
+    cols
+        |> Array.toIndexedList
+        |> List.filter (\( x, col ) -> (x == 0 || Set.member col.key sheet.pinned) && not (Set.member col.key sheet.hidden))
+        |> List.foldl
+            (\( _, col ) ( left, acc ) ->
+                ( left + Maybe.withDefault autoColWidth (colPx sheet col), Dict.insert col.key left acc )
+            )
+            ( 0, Dict.empty )
+        |> Tuple.second
+
+
+pinAttrs : Dict String Int -> Col -> List (H.Attribute Msg)
+pinAttrs pins col =
+    case Dict.get col.key pins of
+        Just left ->
+            [ A.class "pin", S.left (String.fromInt left ++ "px") ]
+
+        Nothing ->
+            []
 
 
 cellClasses : Sheet -> Int -> Int -> H.Attribute Msg
@@ -5213,6 +5456,19 @@ viewHeaderCell sheet col =
                 hasFilter =
                     Dict.member col.key sheet.filters
 
+                isPinned =
+                    Set.member col.key sheet.pinned
+
+                -- A table's columns are the document's own order, so only they
+                -- can be moved. A query's are its select list's.
+                movable =
+                    case sheet.doc of
+                        Ok (Tab _) ->
+                            True
+
+                        _ ->
+                            False
+
                 isFilterOpen =
                     sheet.filterOpen == Just col.key
 
@@ -5226,7 +5482,17 @@ viewHeaderCell sheet col =
             in
             [ H.div [ S.displayFlex, S.flexDirectionColumn, S.positionRelative ]
                 [ H.div [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ]
-                    [ H.span [ A.class "sort", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600", S.cursorPointer, A.on "click" (D.map (\shift -> ColumnSort shift col.key) (D.field "shiftKey" D.bool)), A.title "shift-click to add a sort key" ]
+                    [ iif movable
+                        (H.span
+                            [ A.class "grab"
+                            , A.title "drag onto the column it should sit at"
+                            , A.stopPropagationOn "mousedown" (D.succeed ( ColumnMoveStart col.key, True ))
+                            ]
+                            [ text "⠿" ]
+                        )
+                        (text "")
+                    , iif isPinned (H.span [ A.class "pinned", A.title "pinned" ] [ text "📌" ]) (text "")
+                    , H.span [ A.class "sort", S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontWeight "600", S.cursorPointer, A.on "click" (D.map (\shift -> ColumnSort shift col.key) (D.field "shiftKey" D.bool)), A.title "shift-click to add a sort key" ]
                         [ text (col.name ++ sortIndicator) ]
                     , H.span [ A.classList [ ( "funnel", True ), ( "on", hasFilter ) ], S.cursorPointer, S.fontSizeRem 0.75, A.onClick (FilterToggle col.key), A.title "filter" ]
                         [ text (iif hasFilter "⧩" "▽") ]
@@ -5241,6 +5507,7 @@ viewHeaderCell sheet col =
                     H.div [ A.class "panel", S.positionAbsolute, S.top "100%", S.left "0", S.padding "0.5rem", S.zIndex "100", S.minWidth "150px", S.fontSizeRem 0.875 ]
                         [ H.input [ A.placeholder "contains...", A.value currentFilterValue, A.onInput (FilterInput col.key), S.width "100%" ] []
                         , H.button [ A.onClick (ColumnHide col.key), S.marginTop "0.25rem" ] [ text "Hide column" ]
+                        , H.button [ A.onClick (ColumnPin col.key), S.marginTop "0.25rem" ] [ text (iif isPinned "Unpin column" "Pin column") ]
                         , if hasFilter then
                             H.button [ A.onClick (FilterClear col.key), S.marginTop "0.25rem" ] [ text "Clear" ]
 
@@ -5269,11 +5536,11 @@ viewEditCell sheet col =
             [ H.input [ A.id "new-cell", onEditorKeydown, A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.minWidthRem 8, S.border "none", S.borderRadius "0", S.padding "0" ] [] ]
 
 
-viewCell : Sheet -> Result String (Array Stat) -> Int -> Int -> Col -> Row -> Html Msg
-viewCell sheet stats i n col row =
+viewCell : Sheet -> Result String (Array Stat) -> Dict String Int -> Int -> Int -> Col -> Row -> Html Msg
+viewCell sheet stats pins i n col row =
     H.td
-        [ A.onClick CellMouseClick
-        , A.onDoubleClick <|
+        ([ A.onClick CellMouseClick
+         , A.onDoubleClick <|
             CellMouseDoubleClick <|
                 case String.fromInt n of
                     "0" ->
@@ -5287,15 +5554,17 @@ viewCell sheet stats i n col row =
 
                     _ ->
                         row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
-        , A.onMouseDown CellMouseDown
-        , A.onMouseUp CellMouseUp
-        , A.onMouseEnter (CellHover (xy i n))
-        , iif (n == 0 && sheet.filterOpen == Just col.key) (S.zIndex "2") (A.classList [])
-        , cellClasses sheet i n
-        , (spec col.typ).align
-        , colWidth sheet col
-        , iif (Set.member col.key sheet.hidden) S.displayNone (A.classList [])
-        ]
+         , A.onMouseDown CellMouseDown
+         , A.onMouseUp CellMouseUp
+         , A.onMouseEnter (CellHover (xy i n))
+         , iif (n == 0 && sheet.filterOpen == Just col.key) (S.zIndex "2") (A.classList [])
+         , cellClasses sheet i n
+         , (spec col.typ).align
+         , colWidth sheet col
+         , iif (Set.member col.key sheet.hidden) S.displayNone (A.classList [])
+         ]
+            ++ pinAttrs pins col
+        )
     <|
         if sheet.write /= Nothing && sheet.select == rect i n i n then
             viewEditCell sheet col
@@ -5329,8 +5598,8 @@ viewCell sheet stats i n col row =
                     ]
 
 
-viewTableRow : Sheet -> Doc -> Result String (Array Stat) -> Array Col -> Int -> Row -> Html Msg
-viewTableRow sheet doc stats cols n row =
+viewTableRow : Sheet -> Doc -> Result String (Array Stat) -> Dict String Int -> Array Col -> Int -> Row -> Html Msg
+viewTableRow sheet doc stats pins cols n row =
     H.tr
         [ A.classList [ ( "meta", n < 0 ) ]
         , case ( String.fromInt n, stats ) of
@@ -5341,7 +5610,7 @@ viewTableRow sheet doc stats cols n row =
                 S.displayTableRow
         ]
     <|
-        List.indexedMap (\i col -> viewCell sheet stats i n col row) (Array.toList cols)
+        List.indexedMap (\i col -> viewCell sheet stats pins i n col row) (Array.toList cols)
             ++ [ case doc of
                     Tab _ ->
                         H.th [ A.onClick (DocMsg SheetColumnPush), A.title "add column", S.widthRem 0.001, S.whiteSpaceNowrap ] [ text (iif (n == 0) "→" "") ]
@@ -5464,8 +5733,8 @@ viewGallery model =
         )
 
 
-viewTableFooter : Sheet -> Array Col -> Array Row -> Html Msg
-viewTableFooter sheet cols rows =
+viewTableFooter : Sheet -> Dict String Int -> Array Col -> Array Row -> Html Msg
+viewTableFooter sheet pins cols rows =
     H.tfoot [] <|
         case sheet.doc of
             Ok Library ->
@@ -5498,13 +5767,13 @@ viewTableFooter sheet cols rows =
                 [ H.tr [ A.class "totals", A.title "totals for the rows shown" ] <|
                     List.map
                         (\col ->
-                            H.td [ S.textAlignRight, S.fontWeight "600", iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) ]
+                            H.td ([ S.textAlignRight, S.fontWeight "600", iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) ] ++ pinAttrs pins col)
                                 [ text (Maybe.withDefault "" (Maybe.map (round2 >> String.fromFloat) (columnTotal rows col))) ]
                         )
                         (Array.toList cols)
                         ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [] ]
                 , H.tr [ A.onClick (DocMsg SheetRowPush), A.title "add row" ] <|
-                    List.map (\col -> H.td [ iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) ] [ text col.raw ]) (Array.toList cols)
+                    List.map (\col -> H.td (iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) :: pinAttrs pins col) [ text col.raw ]) (Array.toList cols)
                         ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [ text "↴" ] ]
                 ]
 
@@ -6026,6 +6295,9 @@ view ({ sheet } as model) =
 
                             doc =
                                 sheet.doc |> Result.withDefault Library
+
+                            pins =
+                                pinLeft sheet cols
                         in
                         case doc of
                             Chart cfg ->
@@ -6041,9 +6313,9 @@ view ({ sheet } as model) =
                                     , H.table [ A.onMouseLeave (CellHover (xy -1 -1)) ]
                                         [ H.tbody [] <|
                                             Array.toList <|
-                                                Array.indexedMap (\n_ row -> viewTableRow sheet doc stats cols (n_ - 2) row) <|
+                                                Array.indexedMap (\n_ row -> viewTableRow sheet doc stats pins cols (n_ - 2) row) <|
                                                     Array.append (Array.repeat 3 Dict.empty) sortedRows
-                                        , viewTableFooter sheet cols sortedRows
+                                        , viewTableFooter sheet pins cols sortedRows
                                         ]
                                     ]
                 ]

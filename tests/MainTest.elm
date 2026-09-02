@@ -809,6 +809,61 @@ suite =
                         |> D.decodeString viewDecoder
                         |> Result.map .hidden
                         |> Expect.equal (Ok (Set.singleton ""))
+            , test "a query's arrangement lives beside its code, keyed by column name" <|
+                \_ ->
+                    -- A query's rows are computed, so it has no stored columns to
+                    -- write on. The view goes in a map beside the type overrides,
+                    -- keyed the way those are, and `rank` is what orders the sort
+                    -- keys -- a map has no order of its own to borrow.
+                    let
+                        arrangedQuery =
+                            """{"type":"query","data":[{"lang":"sql","code":"select 1","cols":{},
+                                "view":{"b":{"sort":"desc","rank":2},
+                                        "a":{"sort":"asc","rank":1,"pinned":true,"width":220}}}]}"""
+                                |> D.decodeString viewDecoder
+                                |> Result.withDefault emptyView
+                    in
+                    ( arrangedQuery.sort, ( arrangedQuery.pinned, arrangedQuery.widths ) )
+                        |> Expect.equal
+                            ( [ ( "a", Ascending ), ( "b", Descending ) ]
+                            , ( Set.singleton "a", Dict.singleton "a" 220 )
+                            )
+            , test "a table's view is addressed by position and a query's by name" <|
+                \_ ->
+                    let
+                        paths at =
+                            viewPatches at (namedCols [ "a", "b" ]) emptyView { emptyView | hidden = Set.singleton "1" }
+                                |> List.map (\p -> E.encode 0 (E.list identity p.path))
+                    in
+                    ( paths tableHome, paths queryHome )
+                        |> Expect.equal
+                            ( [ """[0,"1","hidden"]""" ], [ """[0,"view","1","hidden"]""" ] )
+            , test "a pinned column reads back pinned" <|
+                \_ ->
+                    """{"type":"table","data":[[{"name":"a","type":"text","key":"0","pinned":true}]]}"""
+                        |> D.decodeString viewDecoder
+                        |> Result.map .pinned
+                        |> Expect.equal (Ok (Set.singleton "0"))
+            , test "a pinned column sits past every sticky column before it" <|
+                \_ ->
+                    -- Column 0 is sticky whether or not anybody pinned it, so its
+                    -- width counts or a pinned column lands underneath it. A
+                    -- column nobody pinned does not count, and one that sizes
+                    -- itself counts as the width pinning writes for it.
+                    pinLeft
+                        { emptySheet | pinned = Set.singleton "2", widths = Dict.fromList [ ( "0", 100 ), ( "1", 60 ) ] }
+                        (namedCols [ "a", "b", "c" ])
+                        |> Dict.toList
+                        |> Expect.equal [ ( "0", 0 ), ( "2", 100 ) ]
+            , test "a column move is one patch saying where from and where to" <|
+                \_ ->
+                    -- Not a splice out and a splice back in: what goes back has to
+                    -- be the column object the document holds, and `Col` carries
+                    -- key, name and type only.
+                    ( movePatch 3 0 |> .action
+                    , ( E.encode 0 (E.list identity (movePatch 3 0).path), E.encode 0 (movePatch 3 0).value )
+                    )
+                        |> Expect.equal ( "move", ( "[0]", "[3,0]" ) )
             , test "a width too narrow to grab is no width" <|
                 \_ ->
                     -- The drag clamps at the same floor. A document can carry any

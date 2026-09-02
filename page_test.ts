@@ -12,19 +12,21 @@
 // What this still does not cover is the module script in src/index.html — the
 // automerge repo, the websocket sync, the real ports. Everything below feeds
 // Elm through those ports by hand, mirroring what that file sends.
-import { assert, assertEquals } from "@std/assert";
+import { assert, assertEquals, assertThrows } from "@std/assert";
 import { JSDOM } from "jsdom";
 import { EXAMPLES } from "./src/examples.mjs";
 import {
   API_BASE,
   atomToJson,
   docThumb,
+  foldView,
   httpErrorDetail,
   httpFailure,
   httpTarget,
   httpUnparsed,
   httpUnreachable,
   library,
+  mergeView,
   PORTALS,
   sheets,
 } from "./src/page.mjs";
@@ -171,7 +173,14 @@ const boot = async (url: string, { tutorial = -1 } = {}) => {
   };
 
   await settle();
-  return { dom, doc, app, settle, click, text, all, type_, asks };
+  // A drag is three events on three targets, and no helper covered any of them.
+  // `mouseenter` does not bubble, which is what makes the cell under the pointer
+  // the thing to dispatch it on.
+  const fire = async (el: { dispatchEvent: (event: unknown) => boolean }, type: string, init: Record<string, unknown> = {}) => {
+    el.dispatchEvent(new dom.window.MouseEvent(type, { bubbles: type !== "mouseenter", ...init }));
+    await settle();
+  };
+  return { dom, doc, app, settle, click, fire, text, all, type_, asks };
 };
 
 Deno.test("the page boots: Elm initializes and renders the library", async () => {
@@ -390,7 +399,7 @@ Deno.test("hiding a column stops it rendering, and show-all brings it back", asy
 Deno.test("arranging a sheet writes the arrangement onto its columns", async () => {
   const { app, all, click } = await boot("http://localhost/table:countries");
   const patches: { action: string; path: unknown[]; value: unknown }[] = [];
-  app.ports.changeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
+  app.ports.arrangeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
 
   await click(all("span.sort")[1]);
   assertEquals(
@@ -450,6 +459,185 @@ Deno.test("a sheet opens arranged the way it was left", async () => {
   // Ascending on the first column, over the rows the filter left.
   const first = all("tbody tr").map((tr) => tr.querySelector("td")?.textContent).filter((t) => t === "a" || t === "b");
   assertEquals(first, ["a", "b"], "the rows should arrive in the stored order");
+});
+
+// A query's rows are computed, so there are no stored columns to write an
+// arrangement on and sorting one used to die with the tab. It lives in a `view`
+// map beside the type overrides, keyed by column name the way those are.
+Deno.test("a query sheet remembers how you were looking at it", async () => {
+  const { app, all, click, settle } = await boot("http://localhost/query:budget-burn");
+  const patches: { action: string; path: unknown[]; value: unknown }[] = [];
+  app.ports.arrangeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
+
+  // Nothing answers queryDoc under jsdom, so the result arrives the way
+  // src/index.html sends it: a synthesized header row, then the rows.
+  app.ports.docQueried.send({
+    id: "query:budget-burn",
+    data: [
+      [{ key: "department", name: "department", type: "text" }, { key: "burn_ratio", name: "burn_ratio", type: "num" }],
+      { department: "Police", burn_ratio: 1.05 },
+      { department: "Parks", burn_ratio: 0.62 },
+    ],
+  });
+  await settle();
+
+  await click(all("span.sort").find((s) => s.textContent?.startsWith("burn_ratio")));
+  assertEquals(
+    patches.map((p) => p.path.concat([p.value])),
+    [[0, "view", "burn_ratio", "sort", "asc"], [0, "view", "burn_ratio", "rank", 1]],
+    "a query's arrangement is addressed by column name, under view",
+  );
+});
+
+Deno.test("a query sheet opens arranged the way it was left", async () => {
+  const { app, all, text, settle } = await boot("http://localhost/query:budget-burn");
+  app.ports.docSelected.send({
+    id: "query:arranged",
+    data: {
+      doc: {
+        type: "query",
+        data: [{
+          lang: "sql",
+          code: "select 1",
+          view: { b: { sort: "asc", rank: 1 }, c: { hidden: true, width: 220 } },
+        }],
+      },
+    },
+  });
+  app.ports.docQueried.send({
+    id: "query:arranged",
+    data: [
+      [{ key: "b", name: "b", type: "text" }, { key: "c", name: "c", type: "text" }],
+      { b: "z", c: "1" },
+      { b: "a", c: "2" },
+    ],
+  });
+  await settle();
+
+  assert(
+    all("span.sort").some((s) => s.textContent === "b ▲"),
+    `the stored sort should be on screen, got: ${all("span.sort").map((s) => s.textContent).join("|")}`,
+  );
+  const styles = all("tbody td").map((td) => td.getAttribute("style") ?? "");
+  assert(styles.some((style) => style.includes("display: none")), "the stored hidden column should not render");
+  assert(styles.some((style) => style.includes("220px")), "the stored width should be on the column");
+  assert(text().includes("1 columns hidden"), `the filter bar should say so, got: ${text().slice(0, 300)}`);
+});
+
+// A pinned column stays put while the table scrolls sideways. Its left edge is
+// the widths of the sticky columns before it, so a column that sizes itself gets
+// one written when it is pinned -- an inexact sum overlaps the columns.
+Deno.test("pinning a column sticks it at the sum of the widths before it", async () => {
+  const { app, all, click, settle } = await boot("http://localhost/table:countries");
+  const patches: { action: string; path: unknown[]; value: unknown }[] = [];
+  app.ports.arrangeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
+
+  app.ports.docSelected.send({
+    id: "table:pinnable",
+    data: {
+      doc: {
+        type: "table",
+        data: [
+          [
+            { name: "a", type: "text", key: "0", width: 100 },
+            { name: "b", type: "text", key: "1", width: 60 },
+            { name: "c", type: "text", key: "2" },
+          ],
+          { "0": "x", "1": "y", "2": "z" },
+        ],
+      },
+    },
+  });
+  await settle();
+
+  await click(all("span.funnel")[2]);
+  await click(all("button").find((b) => b.textContent?.trim() === "Pin column"));
+  assertEquals(
+    patches.map((p) => [p.path[1], p.path[2], p.value]),
+    [["2", "pinned", true], ["2", "width", 140]],
+    "pinning a column that sizes itself fixes its width too",
+  );
+
+  // Column 0 is sticky whether or not anybody pinned it, so its width counts and
+  // column 1's, which nobody pinned, does not.
+  const pinned = all("td.pin").map((td) => td.getAttribute("style") ?? "");
+  assert(
+    pinned.some((style) => style.includes("left: 100px")),
+    `the pinned column should sit past column 0, got: ${JSON.stringify(pinned)}`,
+  );
+});
+
+// Reorder is a splice on data[0], not a display permutation: rows are keyed by
+// col.key, so moving a column moves no cell and the display index stays the
+// document index -- which is what keeps every selection index in Main.elm right
+// without a display-to-document map. It rides changeDoc rather than arrangeDoc
+// because everyone looking at the sheet sees the new order, which makes it an
+// edit and not an arrangement -- so it undoes, and a viewer's is refused.
+Deno.test("dragging a column onto another moves it there, and off the table moves nothing", async () => {
+  const { app, all, dom, doc, fire, settle } = await boot("http://localhost/table:countries");
+  const patches: { action: string; path: unknown[]; value: unknown }[] = [];
+  app.ports.changeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
+  await settle();
+
+  // Grab column 2's handle, hover column 0, let go.
+  const firstCell = () => [...all("tbody tr")[0].querySelectorAll("td")][0];
+  await fire(all("span.grab")[2], "mousedown");
+  await fire(firstCell(), "mouseenter");
+  await fire(doc, "mouseup");
+  assertEquals(
+    patches.map((p) => [p.action, p.path, p.value]),
+    [["move", [0], [2, 0]]],
+    "a drop on a column moves the dragged one to it",
+  );
+
+  // Let go with the pointer off the table and nothing moves.
+  patches.length = 0;
+  await fire(all("span.grab")[2], "mousedown");
+  await fire(all("table")[0], "mouseleave");
+  await fire(doc, "mouseup");
+  assertEquals(patches, [], `a drop off the table should move nothing, got ${JSON.stringify(patches)}`);
+
+  // A move has an exact inverse, so it undoes rather than leaving Ctrl+Z to
+  // reach past it for whatever was edited before.
+  patches.length = 0;
+  await fire(all("span.grab")[2], "mousedown");
+  await fire(firstCell(), "mouseenter");
+  await fire(doc, "mouseup");
+  patches.length = 0;
+  doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true }));
+  await settle();
+  assertEquals(
+    patches.map((p) => [p.action, p.value]),
+    [["move", [0, 2]]],
+    "undoing a move puts the column back where it was",
+  );
+});
+
+// The two halves composed, which is what src/index.html does on the way in and
+// what neither half proves on its own.
+Deno.test("a sheet you cannot write opens with the arrangement this browser kept", async () => {
+  const { app, all, text, settle } = await boot("http://localhost/table:countries");
+  const cols = [{ name: "n", type: "text", key: "0" }, { name: "w", type: "text", key: "1" }];
+  const rows = [{ "0": "b", "1": "x" }, { "0": "a", "1": "y" }];
+  const held = foldView(undefined, [
+    { action: "set", path: [0, "0", "sort"], value: "asc" },
+    { action: "set", path: [0, "0", "rank"], value: 1 },
+    { action: "set", path: [0, "1", "hidden"], value: true },
+  ]);
+
+  app.ports.docSelected.send({
+    id: "table:held",
+    data: { doc: { type: "table", data: [mergeView(cols, held), ...rows] } },
+  });
+  await settle();
+
+  assert(
+    all("span.sort").some((s) => s.textContent === "n ▲"),
+    `the kept sort should be on screen, got: ${all("span.sort").map((s) => s.textContent).join("|")}`,
+  );
+  assert(text().includes("1 columns hidden"), `the kept hidden column should be hidden, got: ${text().slice(0, 300)}`);
+  const first = all("tbody tr").map((tr) => tr.querySelector("td")?.textContent).filter((t) => t === "a" || t === "b");
+  assertEquals(first, ["a", "b"], "and the kept sort should order the rows");
 });
 
 Deno.test("a chart sheet draws one bar per row and offers both ways to save it", async () => {
@@ -661,6 +849,42 @@ Deno.test("the library merges what is stored under what is bundled", () => {
   assert(shelf["table:tutorial"], "the tutorial is part of the library");
   // Every entry with a doc gets a thumbnail, which is what the library rows draw.
   for (const [id, entry] of Object.entries(shelf)) assert(entry.thumb, `${id} should carry a thumb`);
+});
+
+// The sync server refuses a viewer's write, and a bundled sheet has no document
+// of this browser's to write to at all. Both keep their arrangement here: the
+// patches folded into a partial of data[0], merged back over the document on the
+// way in.
+Deno.test("an arrangement this browser has to keep folds up and merges back", () => {
+  const held = foldView(undefined, [
+    { action: "set", path: [0, "1", "hidden"], value: true },
+    { action: "set", path: [0, "view", "b", "sort"], value: "asc" },
+  ]);
+  assertEquals(held, { "1": { hidden: true }, view: { b: { sort: "asc" } } }, "each path is kept as it was written");
+
+  // Only view fields go out on arrangeDoc. Anything else arriving here is a
+  // patch on the wrong port, and folding it away quietly would lose an edit.
+  assertThrows(
+    () => foldView(held, [{ action: "move", path: [0], value: [2, 0] }]),
+    Error,
+    "arrangeDoc",
+  );
+
+  // A cleared field is held as null rather than dropped: a viewer who clears a
+  // sort must not get the owner's back on the next reload.
+  const cleared = foldView(held, [{ action: "del", path: [0, "view", "b", "sort"], value: null }]);
+  assertEquals(cleared.view, { b: { sort: null } }, "a cleared field is held, not forgotten");
+
+  type Column = Record<string, unknown>;
+  const cols: Column[] = [{ key: "0", name: "a", type: "text" }, { key: "1", name: "b", type: "text", sort: "desc" }];
+  const merged = mergeView(cols, { "1": { hidden: true } }) as Column[];
+  assertEquals(merged[1], { key: "1", name: "b", type: "text", sort: "desc", hidden: true }, "the merge adds a field");
+  assertEquals(cols[1].hidden, undefined, "and copies rather than writing into a document that is not ours");
+  assertEquals(
+    (mergeView(cols, { "1": { sort: null } }) as Column[])[1].sort,
+    undefined,
+    "a null clears the field the document carries",
+  );
 });
 
 Deno.test("a thumbnail is the first numeric column, scaled, or nothing to draw", () => {

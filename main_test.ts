@@ -1424,13 +1424,18 @@ Deno.test(async function allTests(t) {
       assert(body.includes("populaton"), `expected the bad column named, got: ${body}`);
       assert(body.includes("population"), `expected a nearest-match suggestion, got: ${body}`);
 
-      // A mistyped @sheet ref used to read as a bare access denial.
+      // A mistyped @sheet ref used to read as a bare access denial. The last
+      // character is swapped for one it is not: an id that already ended in the
+      // one hard-coded here made the typo the real id, and that run asserted
+      // nothing while still passing.
+      const mistyped = hand.documentId.slice(0, -1) + (hand.documentId.endsWith("x") ? "y" : "x");
+      assert(mistyped !== hand.documentId, "the typo must not be the id it is a typo of");
       const typo = await app.request(`/query`, {
         method: "POST",
         headers: new Headers({ Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" }),
         body: JSON.stringify({
           lang: "sql",
-          code: `select * from @table:${hand.documentId.slice(0, -1)}x`,
+          code: `select * from @table:${mistyped}`,
           args: [],
         }),
       });

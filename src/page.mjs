@@ -84,6 +84,56 @@ export const docThumb = (doc) => {
   return { kind: "table", cols: cols.length, rows: doc.data.length - 1, spark };
 };
 
+// --- a view this browser holds
+//
+// The sync server refuses a viewer's write and says so, so a sheet you can only
+// read is arranged locally or not at all. What is kept is not the document --
+// that one is not ours -- but the arrangement patches Elm sent for it, folded
+// into a partial of `data[0]` and merged back over the document on the way in.
+// Both halves are here rather than in src/index.html because both are functions
+// of their input, and because a merge nothing checks is a merge that loses a
+// filter.
+
+/** The arrangement patches folded into a partial of `data[0]`, in the shape
+ * their own paths describe. `path[0]` is always 0 — `data[0]` — so the walk
+ * starts after it.
+ *
+ * A cleared field is held as `null` rather than dropped: a viewer who clears a
+ * sort must not get the owner's back on the next reload.
+ */
+export const foldView = (held, patches) => {
+  const out = structuredClone(held ?? {});
+  for (const { path, action, value } of patches) {
+    // Every arrangement patch names a field on a column. A path that names
+    // something else is a patch on the wrong port, and folding it away quietly
+    // would lose an edit somebody made.
+    if (!Array.isArray(path) || path.length < 3 || path[0] !== 0)
+      throw new Error(
+        `Expected an arrangement patch addressing data[0], received ${JSON.stringify(path)} from arrangeDoc. ` +
+          `Only view fields go out on that port; a row or column edit belongs on changeDoc.`,
+      );
+    let at = out;
+    for (const seg of path.slice(1, -1)) at = at[seg] ??= {};
+    at[path[path.length - 1]] = action === "del" ? null : value;
+  }
+  return out;
+};
+
+/** That partial merged back over a document's `data[0]`, copying as it descends
+ * — an automerge snapshot is frozen, and a held view must never be written into
+ * the document it is standing in for. A null clears the field.
+ */
+export const mergeView = (data0, held) => {
+  if (!held || typeof data0 !== "object" || data0 === null) return data0;
+  const out = Array.isArray(data0) ? [...data0] : { ...data0 };
+  for (const [key, value] of Object.entries(held)) {
+    if (value === null) delete out[key];
+    else if (value && typeof value === "object" && !Array.isArray(value)) out[key] = mergeView(out[key] ?? {}, value);
+    else out[key] = value;
+  }
+  return out;
+};
+
 // --- http
 //
 // The page cannot fetch a third-party URL directly: the browser will not allow

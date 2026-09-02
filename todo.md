@@ -12,31 +12,29 @@ items are deleted — what shipped is described in `claude.md`. Anything below t
 
 The next things to build, in this order.
 
-- [ ] **You reorder and pin columns.** Sort, filter, the hidden set and dragged widths are now stored on the column
-      itself and come back on reload, so the display-only hide set is no longer the obstacle. What is missing is an
-      order and a frozen count.
-  1. Reorder is a `splice` on `data[0]`, not a display permutation. Rows are keyed by `col.key`, so moving a column
-     moves no cell and the display index stays the document index — which is what keeps `Array.get x table.cols`,
-     `tableBounds` and every selection index in `src/Main.elm` correct without a display-to-document map.
-  2. Pin is a `pinned` boolean on the column plus a `left` summed from the widths of the pinned columns before it.
-     `.c0` in `src/style.css` already pins column 0 exactly that way; the sum needs concrete widths, which the stored
-     view now has.
-  3. Both ride `arrange` in `src/Main.elm`, so they are written and read back with the rest of the view for free.
+- [ ] **The keyboard moves over a query's result the way it moves over a table.** A query sheet's columns now sort,
+      filter, hide, resize and remember it, but the arrow keys still do nothing: `tableBounds` in `src/Main.elm`
+      answers `{ maxX = 0, maxY = 0 }` for anything that is not a `Tab` or the library.
+  1. `tableBounds` reads what `arrangeable` reads, so a query's bounds come off `sheet.table` the way its arrangement
+     does.
+  2. `SelectAll` computes the same bounds inline instead of calling `tableBounds`. That second copy goes with it.
+  3. Navigation only. A cell in a query result is computed, so a write to one must still be refused by name.
 
-- [ ] **A query sheet remembers how you were looking at it.** A table sheet's arrangement is stored on its columns; a
-      query's rows are computed, so there is no document for its view to live on and sorting one still dies with the
-      tab.
-  1. A query sheet's document has a `data[0]` of its own — `cols`, the type overrides — so a view can live beside it.
-  2. `arrange` in `src/Main.elm` refuses anything but `Ok (Tab _)`, which is the one line to widen, plus the matching
-     read in `viewDecoder`.
+- [ ] **A remote cell edit does not re-read the whole sheet.** `applyCellPatches` is the fast path for a single cell,
+      and it never fires on a synced sheet: automerge emits `action: "put"` with `path[0] == "data"`, and the branch
+      matches `"set"` with an integer `path[0]`. Every remote edit re-decodes the document instead.
+  1. Match what automerge actually sends, which the shape above states.
+  2. It is correct today and only slow, so it ships with a test that asserts the fast path fires — a fast path nothing
+     proves is taken is a fast path that stops being taken.
+  3. `pruneView` currently relies on the full decode running, so it moves into the fast path or is proven unnecessary
+     there first.
 
-- [ ] **A viewer's arrangement is theirs, and it is kept.** Sorting a sheet you can only read works and is not saved:
-      the sync socket refuses the write silently, because nothing in `src/index.html` listens for the repo's errors.
-      Local-only is the right behaviour; losing it on reload is not.
-  1. Store a viewer's view under the sheet id in `localStorage`, beside the library, with the document's own view as
-     the default it starts from.
-  2. The page cannot tell a viewer from an editor — `GET /library` selects no `su.role`, and the page never calls that
-     route at all. That read is the same one the item above wants.
+- [ ] **A budget cannot be spent twice at once.** `hookBucket()` is read, then a row is written, then it is charged, and
+      the two awaits between let concurrent senders through: 30 requests against a budget of 1 wrote 27 rows. Both
+      `POST /net/:id` and `POST /library/:id/socket` have the shape.
+  1. Charge before the write, and refund on a failure — or take the row count from `net` itself, which is the number
+     the budget is about.
+  2. Whichever it is, one of them: two routes with one bug is one fix.
 
 ---
 
@@ -140,9 +138,9 @@ The single biggest gap. Most of the Demo Gallery dies here first.
 
 The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
-- [ ] **You drag a row where it belongs, and drag a series down.** Insert, delete and duplicate ship; reorder needs drag
-      state rather than a splice, and fill-down is plain today.
-  1. Row drag-reorder.
+- [ ] **You drag a row where it belongs, and drag a series down.** Insert, delete and duplicate ship, and a column
+      drags to a new position; a row does not, and fill-down is plain today.
+  1. Row drag-reorder, on the drag state `ColumnMoveStart`/`ColumnMoveEnd` already established for a column.
   2. Drag-fill that continues dates, numbers and simple patterns rather than repeating the cell.
 
 - [ ] **A number looks like the number it is.** There is no formatting layer at all.
@@ -587,22 +585,6 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
      JSON route parses whatever arrives. Cap them all, or none — capping one is theatre.
   3. `bad()` covers the rest, so this is a hunt rather than a design: find every `await` whose failure is not already a
      refusal.
-
-- [ ] **A remote cell edit does not re-read the whole sheet.** `applyCellPatches` is the fast path for a single cell,
-      and it never fires on a synced sheet: automerge emits `action: "put"` with `path[0] == "data"`, and the branch
-      matches `"set"` with an integer `path[0]`. Every remote edit re-decodes the document instead.
-  1. Match what automerge actually sends, which the shape above states.
-  2. It is correct today and only slow, so it ships with a test that asserts the fast path fires — a fast path nothing
-     proves is taken is a fast path that stops being taken.
-  3. `pruneView` currently relies on the full decode running, so it moves into the fast path or is proven unnecessary
-     there first.
-
-- [ ] **A budget cannot be spent twice at once.** `hookBucket()` is read, then a row is written, then it is charged, and
-      the two awaits between let concurrent senders through: 30 requests against a budget of 1 wrote 27 rows. Both
-      `POST /net/:id` and `POST /library/:id/socket` have the shape.
-  1. Charge before the write, and refund on a failure — or take the row count from `net` itself, which is the number
-     the budget is about.
-  2. Whichever it is, one of them: two routes with one bug is one fix.
 
 - [ ] **We are a polite scraper.** `safeFetch` guards our network and not theirs.
   1. Per-host limits and a documented user agent.

@@ -194,18 +194,33 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
 - **Feed health**: `library:freshness` is read by `index.html` and handed to Elm through `freshnessLoaded`. The
   `freshness` column appears only when the answer is non-empty — a blank column over a logged-out library would read as
   "nothing is wrong".
-- **Table UX**: multi-column sort, column hide (keeps its x coordinate; `skipHidden` steps over it), drag-resize, row
-  insert/duplicate/fill-down, find/replace, undo/redo, command palette (Ctrl/⌘+K), shortcut sheet (Ctrl/⌘+/).
-  `shortcutGroups` carries the `Msg` each key runs and `paletteCommands` reads that list, so the two cannot drift.
-- **The arrangement is stored on the columns.** Sort, filter, hidden and width live in `data[0]` as `sort`/`rank`,
-  `filter`, `hidden`, `width`, so they survive a reload and travel with a share. `viewDecoder` reads them on
-  `DocSelect` and `arrange` writes them, diffed against `sheet.storedView` so closing an untouched filter panel writes
-  nothing. It goes around `updateDocMsg`: a resize is not data and does not belong on the undo stack. Only a `Tab`
-  sheet — a query's rows are computed, so there is no document for its view to live on.
+- **Table UX**: multi-column sort, column hide (keeps its x coordinate; `skipHidden` steps over it), drag-resize,
+  drag-reorder, pin, row insert/duplicate/fill-down, find/replace, undo/redo, command palette (Ctrl/⌘+K), shortcut
+  sheet (Ctrl/⌘+/). `shortcutGroups` carries the `Msg` each key runs and `paletteCommands` reads that list, so the two
+  cannot drift.
+- **The arrangement is stored on the columns, in two homes.** Sort, filter, hidden, pinned and width live in `data[0]`
+  as `sort`/`rank`, `filter`, `hidden`, `pinned`, `width`, so they survive a reload and travel with a share.
+  `viewDecoder` reads them on `DocSelect` and `arrange` writes them, diffed against `sheet.storedView` so closing an
+  untouched filter panel writes nothing. It goes around `updateDocMsg`: a resize is not data and does not belong on the
+  undo stack. `tableHome` and `queryHome` are the two addresses — a table's `data[0]` is the column list, so the
+  address is the position; a query's is one object, so the fields live under `view`, keyed by column name the way its
+  `cols` overrides are. `arrangeable` is the one `case` that picks, and `pruneView` is a table only, deliberately.
+- **Reorder is a splice, pin is a sum.** A move is one `move` patch on `data[0]`, applied by `applyPatches` in
+  `index.html` to the value the document already holds — rows are keyed by `col.key`, so no cell moves and the display
+  index stays the document index. It is a `DocMsg` and not an arrangement: everyone looking at the sheet sees the new
+  order, so it rides `changeDoc`, `movePatch to from` is its own undo entry, and a viewer's is refused like any edit.
+  `pinLeft` sums the widths of the sticky columns before each pinned one and hands the answer to `.pin` inline; column
+  0 is in the sum whether or not anybody pinned it, because `.c0` sticks it regardless. Pinning a column that sizes
+  itself writes `autoColWidth` for it, because an inexact sum overlaps columns.
+- **A sheet whose document cannot hold the arrangement keeps it in this browser.** `arrangeDoc` is a port of its own so
+  that the page knows a batch is only view fields without inspecting a path. `Views` in `index.html` folds those
+  patches into a partial of `data[0]` under `scrapsheets-views` and merges it back in `selectDoc`; `foldView` and
+  `mergeView` in `src/page.mjs` are the two halves a test can reach. Two sheets need it: one that ships bundled, and
+  one the sync server has refused a write on — which is heard by wrapping the ws adapter's `receiveMessage`, since the
+  vendored adapter logs the server's `type: "error"` frame and emits nothing.
 - **Known gaps**: `@library:freshness` resolves on the server but not in the page. `describe` results carry no type in
-  the page, and `WINDOW_TYPES` is server-only, so a window alias there falls back to the sheet's stored `cols`. A
-  viewer's arrangement is not stored: the sync socket refuses the write and nothing listens for the repo's errors, so
-  it works locally and is lost on reload.
+  the page, and `WINDOW_TYPES` is server-only, so a window alias there falls back to the sheet's stored `cols`.
+  `tableBounds` answers `0, 0` for a query sheet, so the keyboard does not move over one.
 
 ## Schema (`schema/db.sql`)
 

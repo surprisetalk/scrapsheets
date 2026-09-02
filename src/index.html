@@ -27,18 +27,20 @@
       await initializeWasm(fetch("/automerge.wasm"));
 
       // Import Automerge packages
-      import { Repo } from "@automerge/automerge-repo";
+      import { cbor, Repo } from "@automerge/automerge-repo";
       import { IndexedDBStorageAdapter } from "/automerge-repo-idb.mjs";
       import { BrowserWebSocketClientAdapter } from "/automerge-repo-ws.mjs";
       import {
         API_BASE,
         docThumb,
+        foldView,
         httpErrorDetail,
         httpFailure,
         httpTarget,
         httpUnparsed,
         httpUnreachable,
         library,
+        mergeView,
         PARSERS,
         sheets,
       } from "/page.mjs";
@@ -146,6 +148,31 @@
           },
         };
         app.ports.librarySynced.send(Library.get());
+
+        // The arrangement this browser holds for sheets whose document cannot
+        // hold it: one that ships bundled, and one the sync server has refused a
+        // write on. Each value is a partial of that sheet's `data[0]`, in the
+        // shape the arrangement patches address, so it merges back the way it
+        // was written. A cell edit never lands here -- `arrangeDoc` is the one
+        // port that reaches it, and only view fields go out on it.
+        const Views = {
+          keep: (id, patches) =>
+            Stored.set("views", { ...Stored.get("views"), [id]: foldView(Stored.get("views")[id], patches) }),
+          // Only on the way in. What is stored is never written back into a
+          // document that is not ours.
+          shown: (id, doc) => {
+            const held = Stored.get("views")[id];
+            if (!held || !Array.isArray(doc?.data) || !doc.data.length) return doc;
+            return { ...doc, data: [mergeView(doc.data[0], held), ...doc.data.slice(1)] };
+          },
+        };
+        // Documents the sync server has refused a write on. It answers on
+        // doc_id, so this is keyed the same way.
+        const refused = new Set();
+        // The arrangement last sent for a synced sheet. A refusal arrives after
+        // the write, so without this the first one after a page load is the one
+        // that gets lost.
+        let lastArranged = null;
 
         app.ports.deleteDoc.subscribe(async (id) => Library.delete(id));
 
@@ -420,6 +447,32 @@
           debug.log('Initializing repo with sync URL:', syncUrl);
           const networkAdapter = new BrowserWebSocketClientAdapter(syncUrl);
 
+          // The sync server refuses a viewer's write with a `type: "error"`
+          // frame naming the document. The vendored adapter logs that frame to a
+          // debug namespace and emits nothing, so the one method that sees it is
+          // the only place it can be read. Two things hang off it: the writer is
+          // told the edit was not saved, which nothing did before, and the
+          // arrangement that was refused is kept in this browser instead.
+          // Through `catchy` so that a full localStorage cannot take the sync
+          // socket down with it: this runs inside the adapter's message handler.
+          const onRefused = catchy((frame) => {
+            refused.add(frame.documentId);
+            if (lastArranged?.doc_id === frame.documentId) Views.keep(lastArranged.id, lastArranged.patches);
+            app.ports.docErrored.send(frame.message ?? "That edit was not saved.");
+          }, 'sync refusal');
+          const receiveMessage = networkAdapter.receiveMessage.bind(networkAdapter);
+          networkAdapter.receiveMessage = (data) => {
+            let frame;
+            try {
+              frame = cbor.decode(new Uint8Array(data));
+            } catch {
+              // The adapter reports its own decode failure. Two reports of one
+              // fault is one report too many.
+            }
+            if (frame?.type === "error" && frame.documentId) onRefused(frame);
+            return receiveMessage(data);
+          };
+
           const repo = new Repo({
             storage: new IndexedDBStorageAdapter(),
             network: [networkAdapter],
@@ -667,6 +720,19 @@
           );
           app.ports.queryDoc.subscribe(({ id, data }) => queryDoc(id, data));
 
+          // A sort, a filter or a dragged width lands on the same document as
+          // the query, and every change to that document used to start the SQL
+          // again. Only these three decide what a run answers. One slot is
+          // enough: one sheet is open at a time, and selectDoc clears it so
+          // coming back to a sheet still runs its query.
+          let lastRun = { id: null, key: null };
+          const runQuery = (id, data) => {
+            const key = JSON.stringify([data?.lang, data?.code, data?.cols]);
+            if (lastRun.id === id && lastRun.key === key) return;
+            lastRun = { id, key };
+            queryDoc(id, data);
+          };
+
           let ws;
           let netInterval;
           const storedThumb = (id, doc) => {
@@ -677,6 +743,7 @@
           const selectDoc = catchy(async (id, sheetHandle) => {
             const [type, doc_id] = id.split(":");
             debug.log('selectDoc:', id);
+            lastRun = { id: null, key: null };
 
             const libraryEntry = Library.get()[id];
             const doc = libraryEntry?.doc ?? sheetHandle?.doc?.();
@@ -702,7 +769,7 @@
             debug.log('Loaded:', id);
             app.ports.docSelected.send({
               id,
-              data: { doc: doc && { ...doc } },
+              data: { doc: doc && Views.shown(id, { ...doc }) },
             });
             storedThumb(id, doc);
             if (!type || !doc_id) return;
@@ -710,15 +777,15 @@
             // same chartSql the server uses, so the picture matches the export.
             const chartQuery = (cfg) =>
               cfg?.source ? { lang: "sql", code: chartSql(cfg), cols: { y: "num" } } : null;
-            if (type === "query") queryDoc(id, doc.data[0]);
-            if (type === "chart" && chartQuery(doc.data?.[0])) queryDoc(id, chartQuery(doc.data[0]));
+            if (type === "query") runQuery(id, doc.data[0]);
+            if (type === "chart" && chartQuery(doc.data?.[0])) runQuery(id, chartQuery(doc.data[0]));
             sheetHandle?.on?.("change", (data) => {
               app.ports.docChanged.send({
                 id: type + ":" + data.handle.documentId,
                 data,
               });
-              if (type === "query") queryDoc(id, data.doc.data[0]);
-              if (type === "chart" && chartQuery(data.doc.data?.[0])) queryDoc(id, chartQuery(data.doc.data[0]));
+              if (type === "query") runQuery(id, data.doc.data[0]);
+              if (type === "chart" && chartQuery(data.doc.data?.[0])) runQuery(id, chartQuery(data.doc.data[0]));
               storedThumbDebounced(id, data.doc);
             });
             if (type === "portal") {
@@ -1126,6 +1193,18 @@
                 case 1: {
                   const [y] = path;
                   if (action === "set") data[y] = value;
+                  // A column moved to another position. The value put back is
+                  // the one the document already held, read out before the
+                  // delete: Elm's `Col` carries key, name and type only, so a
+                  // column rebuilt there would arrive stripped of its own
+                  // arrangement. Copied rather than re-inserted because what
+                  // comes out of an automerge list is not a value to hand back.
+                  else if (action === "move") {
+                    const [from, to] = value;
+                    const held = JSON.parse(JSON.stringify(data[y][from]));
+                    data[y].splice(from, 1);
+                    data[y].splice(to, 0, held);
+                  }
                   else data[y][action](...value);
                   break;
                 }
@@ -1161,11 +1240,38 @@
                 const d = { ...doc };
                 applyPatches(d.data, patches);
                 app.ports.docChanged.send({ id, data: { doc: d, handle: null, patchInfo: null, patches } });
-                if (type === "query") queryDoc(id, d.data[0]);
+                if (type === "query") runQuery(id, d.data[0]);
                 return;
               }
               sheet?.change((d) => applyPatches(d.data, patches));
             }, 'changeDoc'),
+          );
+
+          // The same write, for a batch that is only ever view fields. Its own
+          // port because that is the fact worth having: a sheet whose document
+          // cannot hold the arrangement keeps it in this browser, and knowing
+          // which patches are an arrangement without inspecting a path is what
+          // keeps the list of what a view field is in one language.
+          //
+          // A sheet ships bundled, or the server has refused a write on it, or
+          // it is ours: the first two are kept here, and the first and third are
+          // still applied so the session shows them. No query is re-run --
+          // sorting a query's result is not a new question.
+          app.ports.arrangeDoc.subscribe(
+            catchy(async ({ id, data: patches }) => {
+              const [, doc_id] = id.split(":");
+              const doc = Library.get()[id]?.doc;
+              if (refused.has(doc_id) || doc) Views.keep(id, patches);
+              if (doc) {
+                const d = { ...doc };
+                applyPatches(d.data, patches);
+                app.ports.docChanged.send({ id, data: { doc: d, handle: null, patchInfo: null, patches } });
+                return;
+              }
+              if (refused.has(doc_id)) return;
+              lastArranged = { id, doc_id, patches };
+              sheet?.change((d) => applyPatches(d.data, patches));
+            }, 'arrangeDoc'),
           );
         }
       } catch (error) {

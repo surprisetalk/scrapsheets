@@ -284,6 +284,50 @@ tr.meta .c0 {
   border-right: 1px solid var(--chrome);
 }
 
+/* A column pinned by hand stays put the way the first one does. Its left edge is
+   the sum of the widths before it, which only the table knows, so it arrives as
+   an inline style rather than living here. */
+.pin {
+  position: sticky;
+  z-index: 1;
+  background: #fff;
+}
+
+tr.meta .pin {
+  background: #f6f6f6;
+}
+
+.r0.pin {
+  z-index: 2;
+}
+
+.pin::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: -1px;
+  display: block;
+  height: 100%;
+  border-right: 1px solid var(--chrome);
+}
+
+/* Grab a column, drop it on the one it should sit at. */
+.grab {
+  cursor: grab;
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1;
+}
+
+.grab:active {
+  cursor: grabbing;
+}
+
+.pinned {
+  font-size: 0.625rem;
+  line-height: 1;
+}
+
 /* Sits at the right edge of the header cell; widened hit area, hairline look. */
 .grip {
   margin-left: auto;
