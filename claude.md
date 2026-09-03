@@ -63,9 +63,14 @@ Five files. Which one a failure belongs in is usually obvious.
   not step names.
 - `examples_test.ts` — every bundled sheet through **both** engines (`npm:alasql` and the vendored `src/alasql.mjs` the
   page loads), compared row for row.
-- `page_test.ts` — the page under jsdom: the compiled Elm in `dist/index.js` initializes, renders and answers clicks,
-  with the library fed in through `library()` from `src/page.mjs`. Always runs `deno task build` first. deno-dom is not
-  enough — it has no `replaceData` on a text node.
+- `page_test.ts` — the page under jsdom, through two harnesses. `boot` runs the compiled Elm in `dist/index.js` with
+  every port answered by hand and the library fed in through `library()`; reach for it for anything about what the page
+  renders. `glue` runs `src/index.html`'s own `<script type="module">` over the same jsdom — its imports rewritten to a
+  destructure, `initializeWasm`, `Repo` and its storage stubbed, the websocket adapter genuine, `fetch` recorded and
+  answered by the test — so `changeDoc`, `arrangeDoc`, `applyPatches`, `Views`, the query re-run guard, the share
+  requests and the sync-refusal hook are the real ones; reach for it for anything about what the glue does. `docs`
+  hands it a synced document, which is where a write is watched: the handle holds the test's own object. Always runs `deno task build` first. deno-dom is not enough — it has no
+  `replaceData` on a text node.
 - `browser_test.ts` — no browser: dist builds, `index.html` wires the WASM and the import map, every root-absolute asset
   is in `_redirects`, every imported name is exported, nothing reaches a CDN. `index.html`'s `<script type="module">`
   body is piped to `deno lint` for real scope analysis. `BROWSER_GLOBALS` is the whole allowlist of names Deno's global

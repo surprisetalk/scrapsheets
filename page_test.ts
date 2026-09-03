@@ -9,12 +9,18 @@
 // enough here: it has no `replaceData` on a text node, which is the call Elm's
 // virtual-dom makes to patch text in place, so the first re-render throws.
 //
-// What this still does not cover is the module script in src/index.html — the
-// automerge repo, the websocket sync, the real ports. Everything below feeds
-// Elm through those ports by hand, mirroring what that file sends.
+// Two harnesses, and the difference matters. `boot` feeds Elm through the ports
+// by hand, mirroring what src/index.html sends; `glue` runs that file's own
+// module script over the same jsdom, so the ports, the browser store and the
+// sync-refusal hook are the real ones. Reach for `boot` for anything about what
+// the page renders, and for `glue` for anything about what the glue does.
 import { assert, assertEquals, assertThrows } from "@std/assert";
+import { cbor } from "@automerge/automerge-repo";
 import { JSDOM } from "jsdom";
+import { BrowserWebSocketClientAdapter } from "./src/automerge-repo-ws.mjs";
 import { EXAMPLES } from "./src/examples.mjs";
+import * as pageExports from "./src/page.mjs";
+import * as sqlExports from "./src/sql.mjs";
 import {
   API_BASE,
   atomToJson,
@@ -70,13 +76,12 @@ type El = {
   querySelectorAll: (sel: string) => Iterable<El>;
 };
 
-const boot = async (url: string, { tutorial = -1 } = {}) => {
-  await ensureDist();
-  const dom = new JSDOM(`<!doctype html><html><body><div id="elm"></div></body></html>`, {
-    url,
-    pretendToBeVisual: true, // supplies requestAnimationFrame, which is when Elm paints
-  });
-  const w = dom.window as unknown as Record<string, unknown>;
+/** jsdom's window, installed as the globals the compiled Elm and src/index.html
+ * both read. `defineProperty` rather than assignment: Deno's own `localStorage`
+ * is an accessor that a plain assignment does not replace, and Deno's is backed
+ * by a file in the user's cache — a test must never end up writing there.
+ */
+const globalize = (w: Record<string, unknown>) => {
   for (
     const name of [
       "window",
@@ -96,11 +101,23 @@ const boot = async (url: string, { tutorial = -1 } = {}) => {
       "MutationObserver",
       "DOMParser",
       "XMLHttpRequest",
+      "XMLSerializer",
+      "Image",
       "localStorage",
       "FileReader",
       "Blob",
     ]
-  ) { (globalThis as Record<string, unknown>)[name] = w[name]; }
+  ) { Object.defineProperty(globalThis, name, { value: w[name], configurable: true, writable: true }); }
+};
+
+const boot = async (url: string, { tutorial = -1 } = {}) => {
+  await ensureDist();
+  const dom = new JSDOM(`<!doctype html><html><body><div id="elm"></div></body></html>`, {
+    url,
+    pretendToBeVisual: true, // supplies requestAnimationFrame, which is when Elm paints
+  });
+  const w = dom.window as unknown as Record<string, unknown>;
+  globalize(w);
 
   // Elm's compiled output is an IIFE that hangs `Elm` off its `this`. A module's
   // `this` is undefined, and a second boot onto the same object crashes with
@@ -1335,4 +1352,441 @@ Deno.test("a share link is minted with the expiry and password that were typed",
     text().includes("password is not in it"),
     `expected the panel to say the password travels separately, got: ${text().slice(0, 400)}`,
   );
+});
+
+// --- the glue, actually executed
+//
+// `boot` above answers every port by hand. src/index.html is what does that for
+// real, and none of it had ever run in a test: the ports, `applyPatches`, the
+// browser store behind a held arrangement, the query re-run guard, and the hook
+// that reads the sync server's refusal off the wire. This runs that file's own
+// `<script type="module">` over the same jsdom.
+//
+// Three things are stubbed and only three: `initializeWasm`, the `Repo`, and its
+// storage — everything that would need a network or a WASM document. The
+// websocket adapter is the genuine vendored class, because what the refusal hook
+// does is override one of its methods, and a stub would prove nothing about
+// that.
+
+/** src/index.html's module script, with its imports turned into a destructure of
+ * what the harness supplies. jsdom does not run `type="module"`, and Deno cannot
+ * resolve `/page.mjs`, so the imports are the one thing rewritten — a name the
+ * harness does not supply fails the test rather than arriving undefined.
+ */
+const glueSource = async (deps: Record<string, unknown>) => {
+  const html = await Deno.readTextFile(dir + "src/index.html");
+  const open = html.indexOf('<script type="module">');
+  const from = html.indexOf(">", open) + 1;
+  const names: string[] = [];
+  const body = html.slice(from, html.indexOf("</script>", open)).replace(
+    /import\s+([^;]*?)\s+from\s+"[^"]+";/g,
+    (_m, clause: string) => {
+      for (const name of clause.replace(/[{}]/g, "").split(",").map((x) => x.trim()).filter(Boolean)) {
+        assert(!name.includes(" as "), `the glue harness does not rewrite a renamed import: ${name}`);
+        names.push(name);
+      }
+      return "";
+    },
+  );
+  assertEquals(
+    names.filter((name) => !(name in deps)),
+    [],
+    "src/index.html imports a name the glue harness does not supply; add it to `deps` in page_test.ts",
+  );
+  return `const { ${names.join(", ")} } = deps;\n${body}`;
+};
+
+/** An automerge handle, as much of one as src/index.html asks for. No
+ * `whenReady`: the real one is raced against a ten-second timeout that
+ * `Promise.race` cannot cancel, and a test does not need to leave that behind.
+ */
+const fakeHandle = (documentId: string, doc: Record<string, unknown>) => {
+  const listeners: ((d: unknown) => void)[] = [];
+  return {
+    documentId,
+    doc: () => doc,
+    change: (fn: (d: Record<string, unknown>) => void) => {
+      fn(doc);
+      // The shape automerge sends and `DocDelta` in src/Main.elm decodes. A field
+      // short of it and the port refuses the whole value.
+      for (const listener of listeners) listener({ doc, handle: { documentId }, patchInfo: null, patches: [] });
+    },
+    on: (_event: string, cb: (d: unknown) => void) => listeners.push(cb),
+  };
+};
+
+const glue = async (
+  url: string,
+  {
+    stored = {},
+    docs = {} as Record<string, Record<string, unknown>>,
+    // What a test wants to watch rather than replace: whatever is named here
+    // wins over the real export of the same name.
+    watching = {} as Record<string, unknown>,
+    // What the API answers. `{ data: [] }` is the shape the freshness poll
+    // reads, which every page makes whether a test cares or not.
+    respond = (_url: string, _init?: RequestInit): unknown => ({ data: [] }),
+  } = {},
+) => {
+  await ensureDist();
+  const dom = new JSDOM(`<!doctype html><html><body><div id="elm"></div></body></html>`, {
+    url,
+    pretendToBeVisual: true,
+  });
+  const w = dom.window as unknown as Record<string, unknown>;
+  globalize(w);
+  for (const [key, value] of Object.entries(stored))
+    (w.localStorage as Storage).setItem(`scrapsheets-${key}`, JSON.stringify(value));
+
+  // Nothing here talks to the API. Every request is recorded so a test can say
+  // what the page asked for, and `respond` says what it hears back.
+  const asked: { url: string; method: string; body: unknown }[] = [];
+  const define = (name: string, value: unknown) =>
+    Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+  define("fetch", (input: unknown, init?: RequestInit) => {
+    const url = String(input);
+    asked.push({
+      url,
+      method: init?.method ?? "GET",
+      body: typeof init?.body === "string" ? JSON.parse(init.body) : null,
+    });
+    return Promise.resolve(
+      new Response(JSON.stringify(respond(url, init) ?? { data: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+  });
+  // The page sets a one-minute freshness poll going. Recorded so the harness can
+  // stop it, or it outlives the test.
+  const timers: unknown[] = [];
+  const realInterval = globalThis.setInterval;
+  define("setInterval", (...args: Parameters<typeof setInterval>) => {
+    const id = realInterval(...args);
+    timers.push(id);
+    return id;
+  });
+
+  const scope: { Elm?: { Main: { init: (o: unknown) => { ports: Ports } } } } = {};
+  (await compiled()).call(scope);
+  let app!: { ports: Ports };
+  define("Elm", { Main: { init: (o: unknown) => (app = scope.Elm!.Main.init(o)) } });
+
+  // The one thing the harness has to reach afterwards: the refusal hook lives on
+  // this instance, and `Repo` is where src/index.html hands it over.
+  let adapter!: { socket?: unknown; receiveMessage: (data: unknown) => void };
+  const deps: Record<string, unknown> = {
+    ...pageExports,
+    ...sqlExports,
+    ...watching,
+    alasql,
+    initializeWasm: () => Promise.resolve(),
+    cbor,
+    BrowserWebSocketClientAdapter,
+    IndexedDBStorageAdapter: class {},
+    Repo: class {
+      constructor(options: { network: (typeof adapter)[] }) {
+        adapter = options.network[0];
+      }
+      on() {}
+      find(doc_id: string) {
+        return Promise.resolve(docs[doc_id] ? fakeHandle(doc_id, docs[doc_id]) : null);
+      }
+    },
+  };
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  await new AsyncFunction("deps", await glueSource(deps))(deps);
+
+  const doc = dom.window.document;
+  // Elm paints on an animation frame; `ms` is for the parts of the page that
+  // wait on a real clock, which is only the query debounce.
+  const settle = async (ms = 0) => {
+    for (let i = 0; i < 30; i++) await new Promise((r) => dom.window.requestAnimationFrame(() => r(null)));
+    if (ms) await new Promise((r) => setTimeout(r, ms));
+  };
+  await settle();
+  return {
+    app,
+    settle,
+    asked,
+    all: (sel: string): El[] => [...doc.querySelectorAll(sel)],
+    fire: async (el: El, type: string) => {
+      el.dispatchEvent(new dom.window.MouseEvent(type, { bubbles: type !== "mouseenter" }));
+      await settle();
+    },
+    keyUp: async () => {
+      doc.dispatchEvent(new dom.window.MouseEvent("mouseup", { bubbles: true }));
+      await settle();
+    },
+    type_: async (el: El | undefined | null, value: string) => {
+      assert(el, "nothing to type into");
+      (el as unknown as { value: string }).value = value;
+      el.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+      el.dispatchEvent(new dom.window.FocusEvent("blur", { bubbles: false }));
+      await settle();
+    },
+    text: () => doc.body.textContent?.replace(/\s+/g, " ") ?? "",
+    click: async (el: El | undefined | null) => {
+      assert(el, "nothing to click");
+      el.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
+      await settle();
+    },
+    held: () => JSON.parse((w.localStorage as Storage).getItem("scrapsheets-views") ?? "null"),
+    // The sync server refuses a viewer's write with this frame. The adapter
+    // asserts it has a socket before reading one, and connecting for real would
+    // open one to the API, so it is given something to find.
+    refuse: async (documentId: string, message: string) => {
+      adapter.socket = { readyState: 1 };
+      adapter.receiveMessage(cbor.encode({ type: "error", senderId: "s", targetId: "t", documentId, message }));
+      await settle();
+    },
+    close: () => {
+      for (const id of timers) clearInterval(id as number);
+      define("setInterval", realInterval);
+      dom.window.close();
+    },
+  };
+};
+
+// The whole of it, for the first time: a click in Elm, out through the real
+// `arrangeDoc`, into the real browser store, and back into the document Elm is
+// handed on the next load. A bundled sheet has no document of this browser's to
+// write to, so the arrangement is kept here or nowhere.
+Deno.test({
+  name: "a sheet this browser cannot write keeps its arrangement, and opens with it again",
+  // The page runs timers by design -- a freshness poll, a query debounce -- and
+  // `close` stops the ones it owns.
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const first = await glue("http://localhost/table:countries");
+    const name = first.all("span.sort").find((s) => s.textContent?.startsWith("name"));
+    await first.click(name);
+
+    const kept = first.held();
+    assertEquals(
+      kept,
+      { "table:countries": { "1": { sort: "asc", rank: 1 } } },
+      "the arrangement is held under the column's own key, not its position",
+    );
+    // The document first and the store last: the bundled doc got the patch too,
+    // which is what the session is rendering from.
+    const bundled = (EXAMPLES as unknown as Record<string, { doc: { data: Record<string, string>[][] } }>)[
+      "table:countries"
+    ];
+    assertEquals(bundled.doc.data[0][1].sort, "asc", "the document the session reads is patched as well");
+    first.close();
+
+    // A bundled document is a module object, and the page patched it in place. A
+    // reload re-reads the file, so this has to put it back -- or the sort would
+    // come back from memory and the store would be proving nothing.
+    delete bundled.doc.data[0][1].sort;
+    delete bundled.doc.data[0][1].rank;
+
+    // A reload: a new page over the same browser store.
+    const again = await glue("http://localhost/table:countries", { stored: { views: kept } });
+    assert(
+      again.all("span.sort").some((s) => s.textContent === "name ▲"),
+      `the kept arrangement should come back, got: ${again.all("span.sort").map((s) => s.textContent).join("|")}`,
+    );
+    again.close();
+  },
+});
+
+// main.ts refuses a viewer's write with a `type: "error"` frame naming the
+// document. The vendored adapter logs that frame at a debug namespace and emits
+// nothing, so the edit used to vanish with no word to anybody.
+Deno.test({
+  name: "a refused write reaches the writer, and the arrangement it carried is kept here",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const doc = {
+      type: "table",
+      data: [
+        [{ name: "a", type: "text", key: "0" }, { name: "b", type: "text", key: "1" }],
+        { "0": "x", "1": "y" },
+      ],
+    };
+    const page = await glue("http://localhost/table:shared1", { docs: { shared1: doc } });
+    assert(page.text().includes("a"), "the shared sheet should render");
+
+    // Sorted before the refusal arrives, which is the case that used to lose it:
+    // the write goes to the document, and only a round trip later does the
+    // server say it was not saved.
+    await page.click(page.all("span.sort").find((s) => s.textContent?.startsWith("b")));
+    assertEquals(page.held(), null, "nothing is held until the server refuses");
+
+    await page.refuse("shared1", "You have viewer access to this sheet, so your edit was not saved.");
+    assert(
+      page.text().includes("your edit was not saved"),
+      `the server's own words should reach the writer, got: ${page.text().slice(-300)}`,
+    );
+    assertEquals(
+      page.held(),
+      { "table:shared1": { "1": { sort: "asc", rank: 1 } } },
+      "and the arrangement that was refused is kept in this browser instead",
+    );
+    page.close();
+  },
+});
+
+// A sort, a filter and a dragged width land on the same document as the query,
+// and every change to that document used to start the SQL again. A synced sheet
+// is where that shows: the write goes to the handle, the handle reports a
+// change, and the change is what used to re-run the query.
+Deno.test({
+  name: "sorting a query result does not run its SQL again",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    let runs = 0;
+    const asked = { type: "query", data: [{ lang: "sql", code: "select 1 as n", cols: {} }] } as {
+      data: Record<string, unknown>[];
+    };
+    const page = await glue("http://localhost/query:asked1", {
+      docs: { asked1: asked },
+      watching: {
+        sheets: (...args: Parameters<typeof sheets>) => {
+          const made = sheets(...args);
+          const run = made.runSql as (...a: unknown[]) => unknown;
+          return { ...made, runSql: (...q: unknown[]) => (runs++, run(...q)) };
+        },
+      },
+    });
+    await page.settle(400); // the query editor debounce
+    assertEquals(runs, 1, "opening a query sheet runs it once");
+
+    await page.click(page.all("span.sort").find((s) => s.textContent?.startsWith("n")));
+    await page.settle(400);
+    assertEquals(runs, 1, "sorting the result is not a new question to ask the engine");
+    assertEquals(
+      (asked.data[0] as { view?: unknown }).view,
+      { n: { sort: "asc", rank: 1 } },
+      "the arrangement went to the document, under the name its select list gave the column",
+    );
+    assertEquals(page.held(), null, "and this browser has no reason to hold a copy");
+    page.close();
+  },
+});
+
+// `changeDoc` is the other write port, and `applyPatches` behind it is what puts
+// a patch into a document. A synced sheet is where to watch: the write goes to
+// the handle, and the object the handle holds is the test's own.
+Deno.test({
+  name: "a column dragged to a new place moves in the document, carrying what is written on it",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    // `width` is the point: Elm's `Col` carries key, name and type and nothing
+    // else, so a column rebuilt on the way back would arrive stripped of it.
+    // `applyPatches` moves the value the document already holds instead.
+    const doc = {
+      type: "table",
+      data: [
+        [
+          { name: "a", type: "text", key: "0" },
+          { name: "b", type: "text", key: "1" },
+          { name: "c", type: "text", key: "2", width: 220 },
+        ],
+        { "0": "x", "1": "y", "2": "z" },
+      ],
+    } as { data: [Record<string, unknown>[], Record<string, string>] };
+    const page = await glue("http://localhost/table:moved1", { docs: { moved1: doc } });
+
+    // Grab the third column's handle, hover the first, let go.
+    await page.fire(page.all("span.grab")[2], "mousedown");
+    await page.fire([...page.all("tbody tr")[0].querySelectorAll("td")][0], "mouseenter");
+    await page.keyUp();
+
+    assertEquals(
+      doc.data[0].map((col) => col.name),
+      ["c", "a", "b"],
+      "the column moves in the document, not just on screen",
+    );
+    assertEquals(doc.data[0][0].width, 220, "and arrives with everything that was written on it");
+    assertEquals(doc.data[1], { "0": "x", "1": "y", "2": "z" }, "rows are keyed by column, so no cell moves");
+    page.close();
+  },
+});
+
+Deno.test({
+  name: "a cell edit reaches the document and comes back to the screen",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const doc = {
+      type: "table",
+      data: [[{ name: "a", type: "text", key: "0" }], { "0": "before" }],
+    } as { data: [Record<string, unknown>[], Record<string, string>] };
+    const page = await glue("http://localhost/table:edited1", { docs: { edited1: doc } });
+
+    const cell = [...page.all("tbody tr")[3].querySelectorAll("td")][0];
+    for (const type of ["mouseenter", "click", "dblclick"]) await page.fire(cell, type);
+    await page.type_(page.all("#new-cell")[0], "after");
+
+    assertEquals(doc.data[1], { "0": "after" }, "the write lands in the document the handle holds");
+    assert(
+      page.text().includes("after"),
+      `and the document's answer is what renders, got: ${page.text().slice(0, 200)}`,
+    );
+    page.close();
+  },
+});
+
+// The share panel: what Elm asks for is covered above through `boot`. This is
+// the middle -- the requests src/index.html actually makes, and the answer
+// finding its way back onto the screen.
+Deno.test({
+  name: "minting a share link asks the server for one and shows what comes back",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const page = await glue("http://localhost/table:countries#settings", {
+      stored: { user: { usr_id: "u1", jwt: "a-token" } },
+      respond: (url) => {
+        if (url.includes("/link")) return { data: { token: "minted-token" } };
+        if (url.includes("/share"))
+          return { data: { members: [{ email: "her@example.com", role: "viewer" }], public: false } };
+        return { data: [] };
+      },
+    });
+
+    await page.click(page.all("button").find((b) => b.textContent?.includes("view-only link")));
+
+    const link = page.asked.find((r) => r.url.endsWith("/library/table:countries/link"));
+    assert(link, `expected a link request, got: ${JSON.stringify(page.asked.map((r) => r.url))}`);
+    assertEquals(link.method, "POST");
+    assertEquals(link.body, {}, "an untouched panel asks for the default link, which is an empty body");
+    assert(
+      page.asked.some((r) => r.method === "GET" && r.url.endsWith("/library/table:countries/share")),
+      "and the member list is read back after, so the panel is not left stale",
+    );
+
+    const shown = page.all("input[readonly]").map((el) => (el as unknown as { value: string }).value);
+    assert(
+      shown.some((v) => v.includes("?share=minted-token")),
+      `the server's token should be in the link on screen, got: ${JSON.stringify(shown)}`,
+    );
+    assert(page.text().includes("her@example.com"), "and the members it answered with are listed");
+    page.close();
+  },
+});
+
+Deno.test({
+  name: "a share action with nobody logged in says so instead of failing quietly",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const page = await glue("http://localhost/table:countries#settings");
+    await page.click(page.all("button").find((b) => b.textContent?.includes("view-only link")));
+
+    assert(page.text().includes("Log in to share"), `expected the reason, got: ${page.text().slice(-300)}`);
+    assertEquals(
+      page.asked.filter((r) => r.url.includes("/share") || r.url.includes("/link")),
+      [],
+      "and nothing was asked of the server",
+    );
+    page.close();
+  },
 });
