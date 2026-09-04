@@ -615,7 +615,7 @@ export const checkColumnTypes = (id, cols, rows) => {
 // the rows loaded, not the time spent. MAX_QUERY_MS bounds how long a caller
 // waits for an answer; the work itself still finishes in the background.
 
-const MAX_QUERY_ROWS = 200_000;
+export const MAX_QUERY_ROWS = 200_000;
 export const MAX_QUERY_MS = 15_000;
 
 export const checkQueryRows = (total, id) => {

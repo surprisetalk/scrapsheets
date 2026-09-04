@@ -22,7 +22,15 @@ import {
   hookBuckets,
   hookSecret,
   hookSign,
+  flushWebhooks,
   HOST_GAP_MS,
+  WEBHOOK_FAILS_MAX,
+  webhookTimer,
+  WEBHOOKS_PER_SHEET_MAX,
+  accountBuckets,
+  APPEND_ROWS_MAX,
+  USER_EMAILS_PER_DAY,
+  USER_SHEETS_MAX,
   LICENSES,
   safeFetch,
   USER_AGENT,
@@ -43,6 +51,7 @@ import {
 } from "./main.ts";
 import type { Col, Query, Sheet, Table, Template } from "./main.ts";
 import { DATASETS } from "./src/examples.mjs";
+import { MAX_QUERY_ROWS } from "./src/sql.mjs";
 import ala from "alasql";
 import dbSql from "./schema/db.sql" with { type: "text" };
 import examplesSql from "./examples.sql" with { type: "text" };
@@ -4012,7 +4021,7 @@ Deno.test(async function allTests(t) {
       values (${ids[0]}, 'GET', 'x', ${sql.json({ status: "99999999999999999999" })})
     `;
     assertEquals((await rows(jwt)).body.length > 0, true, "one unreadable status must not empty the answer");
-    assertEquals(Object.keys(await status()).length, 14, "nor take the alarm down with it");
+    assertEquals(Object.keys(await status()).length, 16, "nor take the alarm down with it");
     await sql`delete from net where sheet_id = ${ids[0]} and body = 'x'`;
 
     // A poll is not the only kind of run. A net-hook sheet's run is the
@@ -4581,6 +4590,302 @@ Deno.test(async function allTests(t) {
     assert(queried.some((r) => r.action === "GET /sheet/:id"), `the log is a query source: ${JSON.stringify(queried)}`);
   });
 
+  // A sheet's own API spends the budget a net sheet's deliveries spend, keyed
+  // on the sheet: a read is one row of it, an append is the rows it carries.
+  // The refusal names the limit and the window, and it is a 429, which is the
+  // one status app.onError does not log.
+  await t.step("A public sheet API has its own limit", async () => {
+    const { jwt } = await usr("limited@example.com");
+    const { jwt: stranger } = await usr("unlimited@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "table",
+      data: [arrayify([{ name: "a", type: "text", key: "0" }]), { 0: "x" }],
+    });
+    const sheet_id = `table:${hand.documentId}`;
+    await put(jwt, `/library/${sheet_id}`, {});
+    const read = (who = jwt) =>
+      app.request(`/sheet/${sheet_id}`, { headers: new Headers({ Authorization: `Bearer ${who}` }) });
+    const append = (n: number) =>
+      app.request(`/sheet/${sheet_id}`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        body: JSON.stringify({ rows: Array.from({ length: n }, (_, i) => ({ a: `r${i}` })) }),
+      });
+
+    // Reads, one row of budget each.
+    hookBuckets.delete(sheet_id);
+    hookBucket(sheet_id).rows = 2;
+    assert((await read()).ok);
+    assert((await read()).ok);
+    const third = await read();
+    assertEquals(third.status, 429, "the third read on a budget of two is refused");
+    const said = await third.text();
+    assert(said.includes(`${HOOK_ROWS_PER_WINDOW} reads`), `it names the limit in reads: ${said}`);
+    assert(said.includes(`${HOOK_WINDOW_S} seconds`), `and the window: ${said}`);
+    const [{ n: logged }] = await sql`
+      select count(*)::int as n from net where sheet_id = 'net-hook:errors'
+        and meta->>'path' = ${`/sheet/${sheet_id}`} and meta->>'status' = '429'
+    `;
+    assertEquals(logged, 0, "a 429 is shed, not logged");
+
+    // Writes: one append is one unit whatever it carries, so a full batch
+    // lands on a fresh budget, and the second append on a budget of one does not.
+    hookBuckets.delete(sheet_id);
+    assertEquals((await append(APPEND_ROWS_MAX)).status, 201, "a full batch lands on a fresh budget");
+    hookBucket(sheet_id).rows = 1;
+    assertEquals((await append(2)).status, 201, "an append of two lands");
+    const spent = await append(1);
+    assertEquals(spent.status, 429, "and the next append is refused");
+    assert((await spent.text()).includes("appends"), "counting in appends");
+
+    // A refused read spends nothing of the owner's budget, and an export is a read.
+    hookBucket(sheet_id).rows = 1;
+    assertEquals((await read(stranger)).status, 403);
+    assert((await read()).ok, "a stranger's 403 did not spend the row");
+    hookBucket(sheet_id).rows = 1;
+    const csv = await app.request(`/export/${sheet_id}.csv`, { headers: new Headers({ Authorization: `Bearer ${jwt}` }) });
+    assert(csv.ok, `an export is a read: ${csv.status}`);
+    assertEquals((await read()).status, 429, "and it spent the row");
+
+    // Thirty readers at once against a budget of one.
+    hookBucket(sheet_id).rows = 1;
+    const raced = await Promise.all(Array.from({ length: 30 }, () => read()));
+    assertEquals(raced.filter((res) => res.ok).length, 1, "one read lands on a budget of one");
+    assertEquals(raced.filter((res) => res.status === 429).length, 29);
+    hookBuckets.delete(sheet_id);
+  });
+
+  // rateLimit() bounded an address and the sheet budget bounds one sheet;
+  // nothing bounded an account across its addresses and its sheets. Each
+  // quota is a count the refusal names beside the limit, and every refusal
+  // says "quota", which is the word the status check counts.
+  await t.step("One account cannot exhaust the service", async () => {
+    const { jwt, usr_id } = await usr("greedy@example.com");
+    const raw = (route: string, init: { method?: string; body?: string; headers?: Record<string, string> } = {}) =>
+      app.request(route, {
+        method: init.method ?? "GET",
+        body: init.body,
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}`, ...init.headers }),
+      });
+
+    // Requests, whatever address they come from.
+    accountBuckets.set(usr_id, { tokens: 1, lastRefill: Date.now() });
+    assert((await raw(`/library`)).ok);
+    const flooded = await raw(`/library`, { headers: { "x-forwarded-for": "203.0.113.9" } });
+    assertEquals(flooded.status, 429, "the account's bucket, not the address's, refuses");
+    assert((await flooded.text()).includes("account"), "and says so");
+    accountBuckets.delete(usr_id);
+
+    // Sheets an account may own.
+    await sql`
+      insert into sheet (created_by, type, doc_id)
+      select ${usr_id}, 'table', 'quota-' || g from generate_series(1, ${USER_SHEETS_MAX}) g
+    `;
+    const hand = automerge.create<Sheet>({ type: "table", data: [arrayify([{ name: "a", type: "text", key: 0 }])] });
+    const capped = await raw(`/library/table:${hand.documentId}`, { method: "PUT", body: "{}" });
+    assertEquals(capped.status, 413, "a sheet past the account's cap is refused");
+    assert((await capped.text()).includes(`${USER_SHEETS_MAX} sheets`), "naming the limit");
+    await sql`delete from sheet where created_by = ${usr_id} and doc_id like 'quota-%'`;
+    await put(jwt, `/library/table:${hand.documentId}`, {});
+
+    // Rows one sheet may hold: the engine's own cap, so a sheet past it could
+    // not be queried anyway.
+    const big = await raw(`/import/csv`, {
+      method: "POST",
+      headers: { "Content-Type": "text/csv" },
+      body: "a\n" + "1\n".repeat(MAX_QUERY_ROWS + 1),
+    });
+    assertEquals(big.status, 413, "a file past the row cap is refused before a document is made");
+    assert((await big.text()).includes(`${MAX_QUERY_ROWS} rows`), "naming the cap");
+
+    // Fetches need no quota of their own: a feed polls at most once a minute,
+    // so an account's fetches are bounded by the sheets it may own, and there
+    // is nothing to test.
+    const later = Date.now() + 90_000_000;
+
+    // Alert emails a day, across every alert the account owns: a sheet used
+    // as a cannon stops at the quota and says so in its own run log.
+    const watched = automerge.create<Sheet>({
+      type: "table",
+      data: [arrayify([{ name: "n", type: "num", key: "0" }]), { 0: 1 }],
+    });
+    await put(jwt, `/library/table:${watched.documentId}`, {});
+    const alert = automerge.create<{ data: [{ code: string; to: string; interval: number }] }>({
+      data: [{ code: `select n from @table:${watched.documentId}`, to: "victim@example.com", interval: 60 }],
+    });
+    const alertId = `alert:${alert.documentId}`;
+    await put(jwt, `/library/${alertId}`, { name: "cannon" });
+    await sql`
+      insert into net (sheet_id, method, body, meta)
+      select ${alertId}, 'ALERT', ${JSON.stringify({ status: "firing", delivery: "sent" })}, '{}'
+      from generate_series(1, ${USER_EMAILS_PER_DAY}) g
+    `;
+    let sent = 0;
+    await pollAlertOnce(() => {
+      sent++;
+      return Promise.resolve("sent");
+    }, later);
+    assertEquals(sent, 0, "nothing is sent past the account's daily quota");
+    const [run] = (await get<Table>(jwt, `/sheet/${alertId}`)).slice(1);
+    const delivery = String(JSON.parse(String(run.body)).delivery);
+    assert(delivery.includes("quota") && delivery.includes(`${USER_EMAILS_PER_DAY}`), `the run names it: ${delivery}`);
+
+    // The operator hears about it.
+    assert((await status())["No account hit a quota in the past day."]["0"] < 1, "a quota hit is a failing grade");
+  });
+
+  // Change flowed in and never out. A sheet's owner names a url, and every
+  // change to the sheet -- a cell over the socket, an append, a delivery on a
+  // net sheet -- is posted there, signed with the same secret an inbound
+  // delivery to the sheet is verified with, so one secret serves both ways.
+  await t.step("Something is told when a sheet changes", async () => {
+    // The production flush timer would race the flushes below; this step
+    // drives every flush itself.
+    clearInterval(webhookTimer);
+    const { jwt } = await usr("teller@example.com");
+    const { jwt: viewer } = await usr("listener@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "table",
+      data: [arrayify([{ name: "a", type: "text", key: "0" }]), { 0: "x" }],
+    });
+    const sheet_id = `table:${hand.documentId}`;
+    await put(jwt, `/library/${sheet_id}`, {});
+    await post(jwt, `/library/${sheet_id}/share`, { email: "listener@example.com", role: "viewer" });
+    const hooks = () => get<Table>(jwt, `/library/${sheet_id}/webhook`).then((rows) => rows.slice(1));
+
+    // Every receiver in this step is this stub. A literal address, because
+    // safeFetch resolves a hostname before it posts and a made-up name can
+    // stall this machine's resolver for the length of a test.
+    const heard: { url: string; headers: Record<string, string>; body: string }[] = [];
+    let answer = 200;
+    let inboxDoc = hand;
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      heard.push({ url, headers: Object.fromEntries(new Headers(init?.headers).entries()), body: String(init?.body) });
+      return new Response("", { status: answer });
+    }) as typeof fetch;
+    try {
+      // Registering: owner or editor, an http(s) url, a receiver that answers
+      // a signed ping, and a bounded number.
+      const register = (url: string, who = jwt) =>
+        app.request(`/library/${sheet_id}/webhook`, {
+          method: "POST",
+          headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${who}` }),
+          body: JSON.stringify({ url }),
+        });
+      assertEquals((await register("http://93.184.216.34/", viewer)).status, 403, "a viewer may not name a receiver");
+      assertEquals((await register("ftp://x.test/")).status, 400, "a receiver is http or https");
+      const inside = await register("http://127.0.0.1:9/hook");
+      assertEquals(inside.status, 400, "a url inside our own network is refused at registration");
+      assert((await inside.text()).includes("own network"), "by name");
+      answer = 404;
+      const unwilling = await register("http://93.184.216.34/nope");
+      assertEquals(unwilling.status, 400, "a receiver that does not take the ping is not registered");
+      assert((await unwilling.text()).includes("ping"), "and the refusal says so");
+      answer = 200;
+      assertEquals((await register("http://93.184.216.34/hook?via=sheets")).status, 201);
+      assertEquals(JSON.parse(heard.at(-1)!.body).event, "ping", "registration is a signed ping");
+      assertEquals((await register("http://93.184.216.34/hook?via=sheets")).status, 201);
+      assertEquals((await hooks()).map((h) => h.url), ["http://93.184.216.34/hook?via=sheets"], "one row per url");
+      assertEquals(
+        (await app.request(`/library/${sheet_id}/webhook`, { headers: new Headers({ Authorization: `Bearer ${viewer}` }) }))
+          .status,
+        403,
+        "a receiver's url is a credential, so a viewer may not read it",
+      );
+      for (let i = 1; i < WEBHOOKS_PER_SHEET_MAX; i++) assertEquals((await register(`http://93.184.216.34/${i}`)).status, 201);
+      const past = await register("http://93.184.216.34/one-too-many");
+      assertEquals(past.status, 413);
+      assert((await past.text()).includes(`${WEBHOOKS_PER_SHEET_MAX} per sheet`), "naming the cap");
+      for (let i = 1; i < WEBHOOKS_PER_SHEET_MAX; i++) {
+        await request(jwt, `/library/${sheet_id}/webhook`, {
+          method: "DELETE",
+          body: JSON.stringify({ url: `http://93.184.216.34/${i}` }),
+        });
+      }
+      assertEquals((await hooks()).length, 1);
+      heard.length = 0;
+
+      // Delivery: the receiver hears one signed POST per flush however many
+      // changes landed, verifiable with the secret GET /library/:id/hook answers.
+      // A change is heard as the save the repo makes of it, which is debounced,
+      // so a flush waits for the save first. The creation save is drained
+      // before anything is counted.
+      const flushed = async () => {
+        await new Promise((r) => setTimeout(r, 250));
+        await flushWebhooks();
+      };
+      await flushed();
+      heard.length = 0;
+      await flushed();
+      assertEquals(heard.length, 0, "nothing changed, nothing is sent");
+      await post(jwt, `/sheet/${sheet_id}`, { rows: [{ a: "y" }] });
+      await post(jwt, `/sheet/${sheet_id}`, { rows: [{ a: "z" }] });
+      await flushed();
+      assertEquals(heard.length, 1, "two changes before a flush are one delivery");
+      assertEquals(heard[0].url, "http://93.184.216.34/hook?via=sheets");
+      const body = JSON.parse(heard[0].body);
+      assertEquals(body.sheet_id, sheet_id, "the delivery names the sheet");
+      const { secret }: { secret: string } = await get(jwt, `/library/${sheet_id}/hook`);
+      const t = heard[0].headers["scrapsheets-signature"].match(/^t=(\d+),v2=/)?.[1];
+      assert(t, `the signature is the inbound scheme: ${heard[0].headers["scrapsheets-signature"]}`);
+      assertEquals(
+        heard[0].headers["scrapsheets-signature"],
+        await hookSign(secret, "/hook?via=sheets", heard[0].body, Number(t)),
+        "and verifies with the sheet's own secret over the receiver's path and the body",
+      );
+      const [{ status: outcome, failures }] = await hooks();
+      assertEquals([Number(outcome), Number(failures)], [200, 0], "the outcome lands on the hook");
+
+      // A change over the sync socket is a change too.
+      (await automerge.find<Sheet>(hand.documentId)).change((d) => {
+        (d.data as unknown as Record<string, unknown>[])[1] = { 0: "synced" };
+      });
+      await flushed();
+      assertEquals(heard.length, 2, "a document change over sync is delivered");
+
+      // A receiver that keeps failing is left alone after WEBHOOK_FAILS_MAX,
+      // and the row says so.
+      answer = 500;
+      for (let i = 0; i < WEBHOOK_FAILS_MAX; i++) {
+        await post(jwt, `/sheet/${sheet_id}`, { rows: [{ a: `fail ${i}` }] });
+        await flushed();
+      }
+      assertEquals(heard.length, 2 + WEBHOOK_FAILS_MAX, "each failure was tried");
+      const [dead] = await hooks();
+      assertEquals([Number(dead.status), Number(dead.failures)], [500, WEBHOOK_FAILS_MAX]);
+      await post(jwt, `/sheet/${sheet_id}`, { rows: [{ a: "after" }] });
+      await flushed();
+      assertEquals(heard.length, 2 + WEBHOOK_FAILS_MAX, "and a dead hook is not tried again");
+      assert((await status())["Every webhook's last delivery in the past day was accepted."]["0"] < 1);
+
+      // Setting it again is the owner saying try again.
+      answer = 200;
+      await post(jwt, `/library/${sheet_id}/webhook`, { url: "http://93.184.216.34/hook?via=sheets" });
+      assertEquals(JSON.parse(heard.at(-1)!.body).event, "ping", "and setting it again pinged it again");
+      await post(jwt, `/sheet/${sheet_id}`, { rows: [{ a: "again" }] });
+      await flushed();
+      assertEquals(heard.length, 4 + WEBHOOK_FAILS_MAX, "a re-set hook is tried again");
+      assertEquals(JSON.parse(heard.at(-1)!.body).event, "change");
+
+      // A delivery to a net sheet is a change to it.
+      inboxDoc = automerge.create<Sheet>({ type: "net-hook", data: [] });
+      const inboxId = `net-hook:${inboxDoc.documentId}`;
+      await put(jwt, `/library/${inboxId}`, {});
+      await post(jwt, `/library/${inboxId}/webhook`, { url: "http://93.184.216.34/inbox" });
+      const pinged = heard.length;
+      assert((await deliver(inboxId, JSON.stringify({ event: "in" }))).ok);
+      await flushed();
+      assertEquals(heard.length, pinged + 1, "a delivery in is a delivery out");
+      assertEquals(heard.at(-1)?.url, "http://93.184.216.34/inbox");
+      assertEquals(JSON.parse(heard.at(-1)!.body).event, "change");
+    } finally {
+      globalThis.fetch = origFetch;
+      // Nothing after this step may post to the address above for real.
+      await sql`delete from webhook where sheet_id in (${sheet_id}, ${`net-hook:${inboxDoc.documentId}`})`;
+    }
+  });
+
   await t.step("The bucket a flood is counted against must be one the flood cannot choose", async () => {
     const ip = (xff: string | undefined, remote?: string) =>
       callerIp(
@@ -4694,7 +4999,7 @@ Deno.test(async function allTests(t) {
   await t.step("Every status condition is graded so that 1.0 is the minimum pass", async () => {
     const grades = await status();
     const conditions = Object.keys(grades);
-    assertEquals(conditions.length, 14);
+    assertEquals(conditions.length, 16);
     for (const [condition, series] of Object.entries(grades)) {
       assert(condition.endsWith("."), `a condition is a sentence: ${condition}`);
       assert("0" in series, `${condition} must be graded now`);
@@ -4716,7 +5021,7 @@ Deno.test(async function allTests(t) {
     const survived = await app.request("/status");
     assertEquals(
       Object.keys(await survived.json()).length,
-      14,
+      16,
       "a malformed row must degrade a grade, not replace the whole answer with an error",
     );
 

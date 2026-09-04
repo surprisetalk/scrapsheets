@@ -55,12 +55,27 @@ thing: a sheet with two columns of the same name has no name-keyed row to give, 
 one. A script carries a key for one sheet rather than your login: `POST /library/<sheet_id>/secret` with
 `{"name":"api"}` and no value mints one, answers it once, and it opens that sheet and nothing else.
 `GET /openapi/<sheet_id>` describes the read and the write, generated from the sheet's own columns, so it cannot drift
-from them.
+from them. A sheet's API spends the same per-sheet budget a webhook sender spends: a read is one row of it and an
+append is the rows it carries, and past the limit the answer is a 429 that names the limit and the window. An account
+is bounded too: requests per second across every address it sends from, sheets it may own, rows one sheet may hold,
+and alert emails a day across every alert it owns. Each refusal names the count and the limit, and `deno task status`
+fails while any account has hit the sheets, rows or emails cap in the past day; a request past its rate is shed with
+a 429 and not counted.
 
 ```sh
 curl -X POST "https://api.sheets.scrap.land/sheet/$sheet_id" -H "scrapsheets-key: $key" \
   -H 'Content-Type: application/json' -d '{"rows":[{"city":"Oslo","population":709037}]}'
 ```
+
+A sheet tells somebody when it changes. `POST /library/<sheet_id>/webhook` with `{"url": "https://..."}` names where.
+The receiver is sent a signed POST carrying `"event": "ping"` first and is registered only if it answers 2xx, so
+nothing is ever posted to a url that did not ask. From then on every change to the sheet is posted there a few
+seconds later, whoever made it and however: one delivery per flush, a JSON body naming the sheet, and a
+`scrapsheets-signature` header signed exactly the way an inbound delivery to that sheet is verified, with the secret
+`GET /library/<sheet_id>/hook` answers, over the receiver's path and the body. Each delivery spends the sheet's own
+budget. `GET` lists each url with its last outcome, for owners and editors, since a receiver's url is often a
+credential; a receiver that fails ten times in a row is left alone until you set it again with the same `POST`, and
+`DELETE` with the url stops it.
 
 `GET /sheet/library:audit` is who did what to which sheet: every read and write of a sheet over HTTP, every sheet a
 query selects from, every open and first edit over the sync socket, and every MCP tool call, with `via` saying which

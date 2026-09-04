@@ -50,6 +50,7 @@ import {
   selectTypes,
   show,
   WINDOW_TYPES,
+  MAX_QUERY_ROWS,
 } from "./src/sql.mjs";
 import Stripe from "stripe";
 
@@ -258,19 +259,23 @@ const bound = <V>(map: Map<string, V>, max: number): void => {
 };
 
 // Simple in-memory rate limiter (token bucket algorithm)
-const rateLimitBuckets = new Map<string, { tokens: number; lastRefill: number }>();
-const RATE_LIMIT_MAX_TOKENS = 1000; // Max burst per IP (debounced queries fire per keystroke)
+export const rateLimitBuckets = new Map<string, { tokens: number; lastRefill: number }>();
+// Accounts apart from addresses: a map evicts its oldest key when it fills,
+// and an account's key is older than every address that has sent since, so a
+// flood from ten thousand addresses would evict the one key meant to bound it.
+export const accountBuckets = new Map<string, { tokens: number; lastRefill: number }>();
+const RATE_LIMIT_MAX_TOKENS = 1000; // Max burst per address, and per account (debounced queries fire per keystroke)
 const RATE_LIMIT_REFILL_RATE = 100; // Tokens per second
 const RATE_LIMIT_WINDOW_MS = 60_000; // Cleanup old entries after 1 minute of inactivity
 
-const rateLimit = (identifier: string): boolean => {
+const rateLimit = (identifier: string, buckets = rateLimitBuckets): boolean => {
   const now = Date.now();
-  let bucket = rateLimitBuckets.get(identifier);
+  let bucket = buckets.get(identifier);
 
   if (!bucket) {
     bucket = { tokens: RATE_LIMIT_MAX_TOKENS, lastRefill: now };
-    rateLimitBuckets.set(identifier, bucket);
-    bound(rateLimitBuckets, RATE_LIMIT_KEYS_MAX);
+    buckets.set(identifier, bucket);
+    bound(buckets, RATE_LIMIT_KEYS_MAX);
   }
 
   // Refill tokens based on time elapsed
@@ -541,6 +546,11 @@ const sheet = async (
     });
   }
   await assertSheetAccess(c, sheet_id);
+  // A whole read of the sheet -- GET /sheet, an export, an MCP read -- spends
+  // one row of its budget, after the access check so a stranger's 403 spends
+  // nothing. A sheet a query resolves on the way is not charged again: the
+  // query's own sheet was.
+  if (!path_.length) spend(sheet_id, "reads", 1, 0, "read it less often, or read it over the sync socket");
   const hand = await automerge
     .find<{ data: Sheet["data"] }>(doc_id as AnyDocumentId)
     .catch(() => ({
@@ -1759,9 +1769,10 @@ export const flushFolds = async (now = Date.now()): Promise<void> => {
 // budget is a full one, so dropping it loses nothing.
 setInterval(() => {
   const now = Date.now();
-  for (const [key, bucket] of rateLimitBuckets) {
-    if (now - bucket.lastRefill > RATE_LIMIT_WINDOW_MS)
-      rateLimitBuckets.delete(key);
+  for (const buckets of [rateLimitBuckets, accountBuckets]) {
+    for (const [key, bucket] of buckets) {
+      if (now - bucket.lastRefill > RATE_LIMIT_WINDOW_MS) buckets.delete(key);
+    }
   }
   for (const [key, bucket] of hookBuckets) {
     if (now - bucket.lastRefill > HOOK_WINDOW_S * 1000)
@@ -1870,6 +1881,8 @@ const LATENCY_MS = 250;
 const REFUSALS_MAX = 20;
 // One open report fails the grade; this many is total failure.
 const REPORTS_OPEN_MAX = 10;
+// One account at a quota fails the grade; this many hits is total failure.
+const QUOTAS_HIT_MAX = 10;
 const POLL_STALE_S = 7200;
 const DB_BYTES_CAP = 4_000_000_000;
 const HEAP_BYTES_CAP = 512_000_000;
@@ -1988,7 +2001,23 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
       ${DB_BYTES_CAP}::numeric / greatest(1, pg_database_size(current_database())) as db_size,
       (select count(*) from sheet where doc_id like 'dataset-%')::numeric / ${SEEDED.length} as datasets_present,
       1 - least(${REPORTS_OPEN_MAX}, (select count(*) from net n
-        where n.sheet_id = ${REPORT_SHEET} and n.meta->>'status' = 'open'))::numeric / ${REPORTS_OPEN_MAX} as reports_reviewed
+        where n.sheet_id = ${REPORT_SHEET} and n.meta->>'status' = 'open'))::numeric / ${REPORTS_OPEN_MAX} as reports_reviewed,
+      -- The quotas that change what an account keeps or sends: a sheet or a
+      -- row past the cap is a 413 on the error log, and an email past the day's
+      -- is the alert run's own delivery line. A 429 is shed and never logged,
+      -- so the request and sheet budgets are not here, by design.
+      1 - least(${QUOTAS_HIT_MAX}, (
+        select count(*) from net n
+        where n.sheet_id = ${ERROR_SHEET} and n.created_at > now() - interval '1 day'
+          and n.meta->>'status' = '413' and n.body like '%quota%'
+      ) + (
+        select count(*) from net n inner join sheet s using (sheet_id)
+        where s.type = 'alert' and n.method = 'ALERT' and n.created_at > now() - interval '1 day'
+          and (case when n.body is json then n.body::jsonb end)->>'delivery' like '%quota%'
+      ))::numeric / ${QUOTAS_HIT_MAX} as quotas_hit,
+      (select case when count(*) = 0 then 1
+                   else count(*) filter (where status between 200 and 299)::numeric / count(*) end
+       from webhook where delivered_at > now() - interval '1 day' or failures >= ${WEBHOOK_FAILS_MAX}) as webhooks_ok
   `;
 
   const byAgo = (
@@ -2026,6 +2055,8 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
     byAgo("Somebody created a sheet in the past 24 hours.", (r) => r.sheets_created),
     now("Every seeded dataset is still in the shop.", live.datasets_present),
     now("No shop report is waiting for review.", live.reports_reviewed),
+    now("No account hit a quota in the past day.", live.quotas_hit),
+    now("Every webhook's last delivery in the past day was accepted.", live.webhooks_ok),
   ]);
 };
 
@@ -2166,6 +2197,9 @@ const fulfillPurchase = async (
       Fix: "only templates and live sheets can be sold; the seller must re-list it",
     });
   }
+  // On the transaction's own connection: the test database has one, and a
+  // query on the pool while the transaction holds it waits forever.
+  await assertSheetsQuota(usr_id, tx);
   const row_0 = sheet.type === "template" ? sheet.row_0.data : [];
   const doc_id = sheet.sell_type.startsWith("codex-")
     ? Math.random().toString().slice(2)
@@ -2622,6 +2656,81 @@ export const hookBucket = (sheet_id: string): { rows: number; bytes: number; las
   return bucket;
 };
 
+// --- quotas
+//
+// What one account may have of the service, so that one account cannot
+// exhaust it for the rest. The sheet budget bounds one sheet; these bound the
+// account across every sheet it owns, and each is a count the refusal names
+// beside the limit. Requests ride rateLimit() keyed on the account beside the
+// address; the rest are counted where they are made. Fetches need no count of
+// their own: a feed polls at most once a minute, so an account's fetches are
+// bounded by its sheets, which are. A refusal that changed what an account
+// keeps or sends carries the word "quota" where GET /status reads it: the
+// sheet and row caps on the error log, the email cap on the alert's own run.
+// A 429 is shed and never logged, so the request and sheet budgets are not.
+export const USER_SHEETS_MAX = 500;
+export const USER_EMAILS_PER_DAY = 200;
+
+/** Refuses a sheet past the account's cap. Nothing deletes a sheet through the
+ * API yet, so the fix is the operator's number and not the caller's. */
+const assertSheetsQuota = async (usr_id: string, db = sql): Promise<void> => {
+  const [{ n }] = await db`select count(*)::int as n from sheet where created_by = ${usr_id}`;
+  if (n >= USER_SHEETS_MAX) {
+    bad(413, `This account holds its quota of sheets.`, {
+      Received: `${n} sheets on this account`,
+      Limit: `${USER_SHEETS_MAX} sheets per account`,
+      Source: "sheet.created_by, counted for this account",
+      Fix: "the cap is the operator's to raise; a sheet cannot be deleted through the API yet",
+    });
+  }
+};
+
+/** Refuses rows past what one sheet may hold: the engine's own MAX_QUERY_ROWS,
+ * because a sheet past it could not be queried, and a sheet that cannot be
+ * queried is storage and nothing else. */
+const assertRoom = (sheet_id: string, have: number, adding: number): void => {
+  if (have + adding > MAX_QUERY_ROWS) {
+    bad(413, `That would push ${sheet_id} past its quota of rows.`, {
+      Received: `${have} rows held plus ${adding} arriving`,
+      Limit: `${MAX_QUERY_ROWS} rows per sheet, which is also the most a query reads`,
+      Source: "MAX_QUERY_ROWS in src/sql.mjs",
+      Fix: "start a new sheet for the rows that follow, and select from both",
+    });
+  }
+};
+
+/** Checks and charges a sheet's budget in one step, or refuses by name. One
+ * step because the check and the charge are what a budget is, and an await
+ * between them is a window every concurrent sender walks through: thirty
+ * deliveries against a budget of one landed twenty-seven. `what` is the noun
+ * the refusal counts in -- deliveries, reports, reads, rows -- and every door
+ * into a sheet spends the one budget, so a busy API and a busy feed on one
+ * sheet slow each other down rather than either running away. A 429 is the
+ * one status app.onError does not log. */
+const spend = (sheet_id: string, what: string, rows: number, bytes: number, fix: string): void => {
+  const budget = hookBucket(sheet_id);
+  if (budget.rows < rows) {
+    bad(429, `Sheet ${sheet_id} has taken too many ${what}.`, {
+      Received: `${what}: ${rows} asked, ${Math.floor(budget.rows)} left in this window`,
+      Limit: `${HOOK_ROWS_PER_WINDOW} ${what} per ${HOOK_WINDOW_S} seconds, for this sheet`,
+      Source: "this sheet's budget, which refills continuously and is shared by every door into the sheet",
+      Fix: `${fix}, or retry in ${Math.ceil((rows - budget.rows) * HOOK_WINDOW_S / HOOK_ROWS_PER_WINDOW)} seconds`,
+    });
+  }
+  if (budget.bytes < bytes) {
+    bad(429, `Sheet ${sheet_id} has taken too many bytes.`, {
+      Received: `${bytes} bytes against ${Math.floor(budget.bytes)} left in this window`,
+      Limit: `${HOOK_BYTES_PER_WINDOW} bytes per ${HOOK_WINDOW_S} seconds, for this sheet`,
+      Source: "this sheet's byte budget, which refills continuously",
+      Fix: `send a smaller body, or retry in ${
+        Math.ceil((bytes - budget.bytes) * HOOK_WINDOW_S / HOOK_BYTES_PER_WINDOW)
+      } seconds`,
+    });
+  }
+  budget.rows -= rows;
+  budget.bytes -= bytes;
+};
+
 app.post("/net/:id", async (c) => {
   const sheet_id = c.req.param("id");
   const heard = [...c.req.raw.headers.keys()].sort().join(", ") || "(none)";
@@ -2674,10 +2783,7 @@ app.post("/net/:id", async (c) => {
   // checked comes off the sheet's stored secrets, never off the request.
   const { scheme, secret_at, sig } = await verifyDelivery(c, sheet_id, raw, size, heard);
   // Checked and charged here, in one step, after the signature and before the
-  // write. One step because the check and the charge are what a budget is,
-  // and an await between them is a window every concurrent sender walks
-  // through: thirty deliveries against a budget of one landed twenty-seven.
-  // After verifyDelivery so that a 401 spends nothing -- charging every
+  // write. After verifyDelivery so that a 401 spends nothing -- charging every
   // attempt would let one attacker posting junk at an id it guessed exhaust
   // the budget of the sender that sheet belongs to, the opposite of what the
   // budget protects. Charging first and refunding a 401 would keep the secret
@@ -2686,31 +2792,8 @@ app.post("/net/:id", async (c) => {
   // miniature. So a spent budget pays the secret lookup before it refuses,
   // and callerIp()'s limiter is what bounds a flood per source. Not before the
   // body is read: the byte bound must spend the bytes actually sent rather
-  // than the content-length a flooder declares. A 429 is the one status
-  // app.onError does not log.
-  const budget = hookBucket(sheet_id);
-  if (budget.rows < 1) {
-    bad(429, `Sheet ${sheet_id} has taken too many deliveries.`, {
-      Received: `a delivery of ${size} bytes with no delivery budget left`,
-      Limit: `${HOOK_ROWS_PER_WINDOW} deliveries per ${HOOK_WINDOW_S} seconds, for this sheet`,
-      Source: "this sheet's delivery budget, which refills continuously",
-      Fix: `batch the events into fewer deliveries, or retry in ${
-        Math.ceil((1 - budget.rows) * HOOK_WINDOW_S / HOOK_ROWS_PER_WINDOW)
-      } seconds`,
-    });
-  }
-  if (budget.bytes < size) {
-    bad(429, `Sheet ${sheet_id} has taken too many bytes.`, {
-      Received: `${size} bytes against ${Math.floor(budget.bytes)} left in this window`,
-      Limit: `${HOOK_BYTES_PER_WINDOW} bytes per ${HOOK_WINDOW_S} seconds, for this sheet`,
-      Source: "this sheet's byte budget, which refills continuously",
-      Fix: `send a smaller body, or retry in ${
-        Math.ceil((size - budget.bytes) * HOOK_WINDOW_S / HOOK_BYTES_PER_WINDOW)
-      } seconds`,
-    });
-  }
-  budget.rows -= 1;
-  budget.bytes -= size;
+  // than the content-length a flooder declares.
+  spend(sheet_id, "deliveries", 1, size, "batch the events into fewer deliveries");
   // The skew window bounds a replay to HOOK_SKEW seconds, which is not the same
   // as never: a delivery captured off the wire can be sent again, unchanged,
   // until its t goes stale. The unique index on (sheet_id, signature) is what
@@ -2754,6 +2837,7 @@ app.post("/net/:id", async (c) => {
     refund();
     throw err;
   }
+  if (stored) touch(sheet_id.split(":")[1]);
   if (!stored) {
     refund();
     bad(409, `This delivery to ${sheet_id} has already been stored.`, {
@@ -2801,7 +2885,11 @@ const REDIRECT_MAX = 5;
 export const USER_AGENT = "Scrapsheets/1.0 (+https://github.com/surprisetalk/scrapsheets#polite-scraper)";
 
 // SSRF guard: block internal hosts by literal IP and by resolved DNS; follow redirects manually re-validating each hop.
-export const safeFetch = async (start: string, headers: Record<string, string> = {}): Promise<Response> => {
+export const safeFetch = async (
+  start: string,
+  headers: Record<string, string> = {},
+  body?: string,
+): Promise<Response> => {
   let url = start;
   for (let hop = 0; hop < REDIRECT_MAX; hop++) {
     const u = new URL(url);
@@ -2835,6 +2923,8 @@ export const safeFetch = async (start: string, headers: Record<string, string> =
       });
     }
     const res = await fetch(url, {
+      method: body === undefined ? "GET" : "POST",
+      body,
       redirect: "manual",
       // Ten seconds, not thirty: the poller runs on a 15s tick, and a request
       // that can outlive two of them is a cycle that overlaps the next. The
@@ -2848,7 +2938,9 @@ export const safeFetch = async (start: string, headers: Record<string, string> =
         ...(u.origin === new URL(start).origin ? headers : {}),
       },
     });
-    const location = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+    // A POST is not followed anywhere: a webhook that redirects is a webhook
+    // set wrong, and a redirect that turns a POST into a GET drops the body.
+    const location = body === undefined && res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
     if (!location) return res;
     url = new URL(location, url).href;
   }
@@ -3041,6 +3133,11 @@ const readBody = async (res: Response): Promise<Uint8Array> => {
 const netRow = async (sheet_id: string, body: string, meta: Record<string, unknown>): Promise<void> => {
   await sql`insert into net (sheet_id, method, body, meta) values (${sheet_id}, 'GET', ${body}, ${sql.json(meta)})`;
   await trimNet(sheet_id);
+  // A body that landed is a change to the feed. A failure row is the log's
+  // and not the feed's: a receiver told about every failed poll would hear
+  // one a minute about nothing arriving.
+  const status = Number(meta.status);
+  if (status >= 200 && status < 300) touch(sheet_id.split(":")[1]);
 };
 
 export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promise<void> => {
@@ -3258,6 +3355,134 @@ setInterval(() => {
     .finally(() => polling = false);
 }, 15_000);
 
+// --- outbound webhooks
+//
+// Change flowed in and never out. A sheet's owner names a url, and a change to
+// the sheet is posted there: a document change, heard as the save the repo's
+// storage makes of it, whoever made it and by whichever door; and a row
+// landing on a net sheet, which is that sheet's change. Signed the way an
+// inbound delivery is verified, with the same secret GET /library/:id/hook
+// answers, so a receiver that can verify one direction can verify the other.
+// Changes are gathered and flushed on a timer, one delivery per hook per flush,
+// because a keystroke over the socket is a change and a receiver wants the
+// sheet, not the keystrokes. A hook that fails WEBHOOK_FAILS_MAX times in a row
+// is left out until its owner sets it again: the outcome is on the row.
+//
+// Nothing is posted anywhere that did not ask for it: a url is registered by
+// answering a signed ping 2xx, which is also where a url inside our own network
+// is refused by name rather than at delivery time as a bare status. Every
+// delivery spends the sheet's own budget, so a sheet cannot be a cannon.
+export const WEBHOOKS_PER_SHEET_MAX = 10;
+export const WEBHOOK_FAILS_MAX = 10;
+const WEBHOOK_FLUSH_MS = 5_000;
+// Deliveries in flight at once during a flush, so one flush is bounded by
+// (hooks / this) times safeFetch's own timeout rather than by their sum.
+const WEBHOOK_PARALLEL = 20;
+// Hooks one flush delivers to. Past it the documents are announced again and
+// the next flush takes the rest, so a burst is late rather than a flush that
+// runs for hours while every later one waits behind it.
+const WEBHOOK_FLUSH_MAX = 1_000;
+
+// Documents changed since the last flush. Bounded like every map that grows
+// with traffic; a change dropped here is one the next change re-announces.
+const touched = new Set<string>();
+const touch = (doc_id: string): void => {
+  touched.add(doc_id);
+  while (touched.size > RATE_LIMIT_KEYS_MAX) touched.delete(touched.values().next().value!);
+};
+// Documents the repo is loading from disk. The first save after a load is the
+// load itself: the handle goes from empty to the stored document, the storage
+// has no heads on record for it since the process started, and so it saves --
+// which would announce every sheet on the service as changed after a restart.
+const loading = new Set<string>();
+// Heard through the storage's metrics rather than the repo's own document and
+// change events, because the save is what the repo debounces per document:
+// one touch per burst, where the change event is one per keystroke. A small
+// document saves as a compaction and a large one incrementally.
+automerge.on("doc-metrics", (event) => {
+  if (event.type === "doc-loaded") loading.add(event.documentId);
+  else if (event.type === "doc-saved" || event.type === "doc-compacted") {
+    if (!loading.delete(event.documentId)) touch(event.documentId);
+  }
+});
+
+/** One signed POST to a hook: its status, 0 for a receiver that did not answer,
+ * the way the poller records one. A refusal of the url itself -- inside our
+ * own network, not http -- is thrown, so registration can say it by name. */
+const deliverWebhook = async (
+  hook: { webhook_id: string; sheet_id: string; url: string; failures: number },
+  event: "change" | "ping",
+  fetcher: typeof safeFetch,
+  now: number,
+): Promise<number> => {
+  const body = JSON.stringify({ sheet_id: hook.sheet_id, event, at: new Date(now).toISOString() });
+  const target = new URL(hook.url);
+  // Scrapsheets' own key, and never a provider's: a sheet verified by Stripe
+  // holds Stripe's secret, which is nobody's to sign with. Registration
+  // refuses such a sheet, so this is the belt to that brace.
+  const { name, keys } = await hookKeys(hook.sheet_id);
+  if (name !== "hook") return 0;
+  const headers = {
+    "Content-Type": "application/json",
+    "scrapsheets-signature": await hookSign(keys[0].value, target.pathname + target.search, body),
+  };
+  return await fetcher(hook.url, headers, body).then((res) => res.status).catch((err) => {
+    if (err instanceof HTTPException) throw err;
+    console.error(`webhook ${hook.sheet_id} -> ${hook.url}:`, reason(err));
+    return 0;
+  });
+};
+
+export const flushWebhooks = async (fetcher = safeFetch, now = Date.now()): Promise<void> => {
+  if (!touched.size) return;
+  const doc_ids = [...touched];
+  const hooks: { webhook_id: string; sheet_id: string; url: string; failures: number }[] = await sql`
+    select w.webhook_id, w.sheet_id, w.url, w.failures from webhook w inner join sheet s using (sheet_id)
+    where s.doc_id = any(${doc_ids}) and w.failures < ${WEBHOOK_FAILS_MAX}
+    order by w.webhook_id
+    limit ${WEBHOOK_FLUSH_MAX}
+  `;
+  // Cleared only once the query answered, so a database that blinked loses
+  // nothing; and announced again when the flush could not take them all.
+  for (const doc_id of doc_ids) touched.delete(doc_id);
+  if (hooks.length === WEBHOOK_FLUSH_MAX) {
+    console.error(`webhooks: a flush took ${WEBHOOK_FLUSH_MAX} hooks, its bound; the rest wait for the next`);
+    for (const doc_id of doc_ids) touch(doc_id);
+  }
+  for (let i = 0; i < hooks.length; i += WEBHOOK_PARALLEL) {
+    // Each hook on its own: one sheet whose keys cannot be read, or one row
+    // the database refuses, must not silence every hook after it.
+    await Promise.all(hooks.slice(i, i + WEBHOOK_PARALLEL).map(async (hook) => {
+      try {
+        spend(hook.sheet_id, "webhooks", 1, 0, "change the sheet less often");
+      } catch (err) {
+        if (err instanceof HTTPException && err.status === 429) return;
+        throw err;
+      }
+      // A refusal of the url at delivery time -- a host that now resolves
+      // inside our network -- is a failure on the row like any other.
+      const status = await deliverWebhook(hook, "change", fetcher, now).catch((err) => {
+        console.error(`webhook ${hook.sheet_id} -> ${hook.url}:`, reason(err));
+        return 0;
+      });
+      const ok = status >= 200 && status < 300;
+      await sql`
+        update webhook set delivered_at = now(), status = ${status}, failures = ${ok ? 0 : hook.failures + 1}
+        where webhook_id = ${hook.webhook_id}
+      `.catch((err: unknown) => console.error(`webhook ${hook.sheet_id}: could not record the outcome:`, reason(err)));
+    }));
+  }
+};
+
+let flushing = false;
+export const webhookTimer = setInterval(() => {
+  if (flushing) return;
+  flushing = true;
+  flushWebhooks()
+    .catch((err) => console.error("webhooks:", err))
+    .finally(() => flushing = false);
+}, WEBHOOK_FLUSH_MS);
+
 // --- alerts
 //
 // An alert sheet is a query plus a destination. It fires when the query returns
@@ -3325,6 +3550,31 @@ export const sendAlertEmail = async (
   const detail = await res.text();
   console.error(`alert ${sheet_id}: resend refused the message:`, res.status, detail);
   return `resend refused it with ${res.status}: ${detail.slice(0, 200)}`;
+};
+
+/** Sends unless the account has sent its day's worth already. Counted off
+ * the run log rather than kept in memory, so a restart forgets nothing, and
+ * across every alert the account owns, so splitting a cannon into many sheets
+ * buys it nothing. The refusal is the run's own delivery line. */
+const sendWithinQuota = async (
+  created_by: string,
+  to: string,
+  sheet_id: string,
+  name: string,
+  rows: Record<string, unknown>[],
+  diff: { added: Record<string, unknown>[]; removed: number } | null,
+  send: typeof sendAlertEmail,
+): Promise<string> => {
+  const [{ n }] = await sql`
+    select count(*)::int as n from net n inner join sheet s using (sheet_id)
+    where s.type = 'alert' and s.created_by = ${created_by}
+      and n.method = 'ALERT' and n.created_at > now() - interval '1 day'
+      and (case when n.body is json then n.body::jsonb end)->>'delivery' = 'sent'
+  `;
+  if (n >= USER_EMAILS_PER_DAY) {
+    return `this account's quota of ${USER_EMAILS_PER_DAY} emails a day is spent (${n} sent), so nothing was sent`;
+  }
+  return await send(to, sheet_id, name, rows, diff);
 };
 
 export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Promise<void> => {
@@ -3444,7 +3694,7 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
           : config.digest
           ? HELD
           : config.to
-          ? await send(config.to, sheet_id, name, rows, diff)
+          ? await sendWithinQuota(created_by, config.to, sheet_id, name, rows, diff, send)
           : "no destination, so nothing was sent",
       };
     } catch (err) {
@@ -3667,6 +3917,16 @@ app.use("*", async (c, next) => {
     });
   }
   c.set("usr_id", usr_id);
+  // The same bucket the address has, keyed on the account: a flood from many
+  // addresses is one account's, and it is the account that pays.
+  if (!rateLimit(usr_id, accountBuckets)) {
+    bad(429, `This account has spent its quota of requests for now.`, {
+      Expected: `a burst of at most ${RATE_LIMIT_MAX_TOKENS}, refilling at ${RATE_LIMIT_REFILL_RATE} per second`,
+      Received: "one request past that, counted across every address this account sends from",
+      Source: "the account this token names",
+      Fix: "wait a second and send it again",
+    });
+  }
   await next();
 });
 
@@ -3688,6 +3948,7 @@ const AUDITED = new Set([
   "/library/:id/link",
   "/library/:id/secret",
   "/library/:id/hook",
+  "/library/:id/webhook",
   "/codex/:id",
   "/codex-db/:id",
 ]);
@@ -4212,6 +4473,7 @@ app.put("/library/:id", async (c) => {
       });
     });
 
+  await assertSheetsQuota(usr_id);
   const sheet = {
     name,
     tags,
@@ -4419,21 +4681,7 @@ app.post("/library/:id/socket", async (c) => {
   // stuck in a reconnect ladder is a sender that will not stop, and one bucket
   // with one refill and one broom is the whole answer to that. Taken after the
   // 403 and the 404, so a budget is keyed on a sheet that exists.
-  const budget = hookBucket(sheet_id);
-  if (budget.rows < 1) {
-    bad(429, `Sheet ${sheet_id} has reported on its socket too many times.`, {
-      Received: "a report with no budget left",
-      Limit: `${HOOK_ROWS_PER_WINDOW} reports per ${HOOK_WINDOW_S} seconds, for this sheet`,
-      Source: "this sheet's delivery budget, which refills continuously",
-      Fix: `report only when the connection changes state, or retry in ${
-        Math.ceil((1 - budget.rows) * HOOK_WINDOW_S / HOOK_ROWS_PER_WINDOW)
-      } seconds`,
-    });
-  }
-  // Charged before the write and in the same step as the check, for the
-  // reason POST /net/:id charges there: an await between them lets every
-  // concurrent reporter through.
-  budget.rows -= 1;
+  spend(sheet_id, "reports", 1, 0, "report only when the connection changes state");
   try {
     await sql`
       insert into net (sheet_id, method, body, meta)
@@ -4501,16 +4749,127 @@ app.post("/library/:id/link", async (c) => {
 // delivery. Owner-only: the secret is what stands between the sheet and anyone
 // who learns its id, so it may not travel with the document the way a share
 // link does.
+/** The role this account holds on a sheet, or a 403 naming what it needs. */
+const assertSheetEditor = async (c: Context, sheet_id: string, verb: string): Promise<void> => {
+  const role = await syncRole({ usr_id: c.get("usr_id") ?? null, share: null }, sheet_id.split(":")[1] ?? "");
+  if (role !== "owner" && role !== "editor") {
+    bad(403, `You cannot ${verb} ${sheet_id}.`, {
+      Received: role ? `${role} access` : "no access",
+      Expected: "owner or editor access",
+      Source: "sheet_usr, for this account and this sheet",
+      Fix: `ask an owner to run POST /library/${sheet_id}/share with your email and role editor`,
+    });
+  }
+};
+
+app.post("/library/:id/webhook", async (c) => {
+  const sheet_id = c.req.param("id");
+  await assertSheetEditor(c, sheet_id, "send changes from");
+  const { name } = await hookKeys(sheet_id);
+  if (name !== "hook") {
+    bad(400, `Sheet ${sheet_id} is signed by ${name.slice("hook:".length)}, so it cannot sign what it sends.`, {
+      Received: `a sheet holding a ${name} secret`,
+      Expected: "a sheet on scrapsheets' own signing scheme",
+      Source: "the secret table",
+      Fix: `delete the ${name} secret with DELETE /library/${sheet_id}/secret, or send changes from another sheet`,
+    });
+  }
+  const { url } = await jsonBody(c);
+  const target = typeof url === "string" ? URL.parse(url) : null;
+  if (!target || !["http:", "https:"].includes(target.protocol)) {
+    bad(400, `A webhook is an http or https url.`, {
+      Expected: '{"url": "https://example.com/hook"}',
+      Received: show(url),
+      Source: `the "url" field of the request body`,
+      Fix: "send the url the changes should be posted to",
+    });
+  }
+  const [{ n }] = await sql`select count(*)::int as n from webhook where sheet_id = ${sheet_id}`;
+  const [existing] = await sql`select true from webhook where sheet_id = ${sheet_id} and url = ${target.href}`;
+  if (!existing && n >= WEBHOOKS_PER_SHEET_MAX) {
+    bad(413, `Sheet ${sheet_id} sends its changes to as many urls as it may.`, {
+      Received: `${n} webhooks on this sheet`,
+      Limit: `${WEBHOOKS_PER_SHEET_MAX} per sheet`,
+      Source: "the webhook table, for this sheet",
+      Fix: `remove one with DELETE /library/${sheet_id}/webhook and {"url": "..."}`,
+    });
+  }
+  // The receiver answers a signed ping before anything is sent to it: a url
+  // that did not ask is not posted to, and a url inside our own network is
+  // refused here by name. Setting a url again is the owner saying try again,
+  // and it answers the ping again.
+  const answered = await deliverWebhook(
+    { webhook_id: "", sheet_id, url: target.href, failures: 0 },
+    "ping",
+    safeFetch,
+    Date.now(),
+  );
+  if (answered < 200 || answered >= 300) {
+    bad(400, `${target.host} did not take the ping.`, {
+      Received: answered ? `a ${answered}` : "no answer",
+      Expected: "a 2xx to a signed POST carrying event: ping",
+      Source: "the url in the request body, asked once before it is registered",
+      Fix: "make the receiver answer 2xx to a POST it can verify, then set the url again",
+    });
+  }
+  await sql`
+    insert into webhook (sheet_id, url) values (${sheet_id}, ${target.href})
+    on conflict (sheet_id, url) do update set failures = 0
+  `;
+  return c.json(null, 201);
+});
+
+app.get("/library/:id/webhook", async (c) => {
+  const sheet_id = c.req.param("id");
+  // A hook url is often a credential -- a Slack or Zapier url is the whole
+  // key -- so who may set them is who may read them.
+  await assertSheetEditor(c, sheet_id, "read where the changes from");
+  return page(c)(
+    await cselect({
+      cols: null,
+      select: sql`select url, created_at, delivered_at, status, failures`,
+      from: sql`from webhook`,
+      where: [sql`sheet_id = ${sheet_id}`],
+      order: sql`order by webhook_id`,
+      limit: String(WEBHOOKS_PER_SHEET_MAX),
+      offset: "0",
+    }),
+  );
+});
+
+app.delete("/library/:id/webhook", async (c) => {
+  const sheet_id = c.req.param("id");
+  await assertSheetEditor(c, sheet_id, "stop the changes from");
+  const { url } = await jsonBody(c);
+  const gone = await sql`delete from webhook where sheet_id = ${sheet_id} and url = ${String(url)} returning url`;
+  if (!gone.length) {
+    bad(404, `Sheet ${sheet_id} does not send its changes to that url.`, {
+      Received: show(url),
+      Expected: `a url GET /library/${sheet_id}/webhook lists`,
+      Source: "the webhook table, for this sheet",
+      Fix: "read the list and send one of its urls, exactly as listed",
+    });
+  }
+  return c.json(null, 200);
+});
+
 app.get("/library/:id/hook", async (c) => {
   const sheet_id = c.req.param("id");
   await assertSheetOwner(c, sheet_id);
-  const [target] = await sql`select type from sheet where sheet_id = ${sheet_id}`;
-  if (!target || !String(target.type).startsWith("net-")) {
-    bad(400, `Sheet ${sheet_id} has no delivery endpoint.`, {
-      Received: target ? `a ${target.type} sheet` : "no sheet row",
-      Expected: "a net-hook, net-http, or net-socket sheet",
-      Source: "sheet.type",
-      Fix: "ask for the hook of a net-hook sheet",
+  // One secret, both directions: a net sheet's deliveries are verified with
+  // it, and any sheet's outbound webhooks are signed with it, so a sheet that
+  // sends its changes somewhere hands it out too.
+  const [target] = await sql`
+    select type, exists (select true from webhook w where w.sheet_id = s.sheet_id) as sends
+    from sheet s where sheet_id = ${sheet_id}
+  `;
+  const net = !!target && String(target.type).startsWith("net-");
+  if (!target || (!net && !target.sends)) {
+    bad(400, `Sheet ${sheet_id} has nothing to sign.`, {
+      Received: target ? `a ${target.type} sheet that sends its changes nowhere` : "no sheet row",
+      Expected: "a net-hook, net-http or net-socket sheet, or a sheet with a webhook",
+      Source: "sheet.type, and the webhook table",
+      Fix: `ask for the hook of a net sheet, or name a url with POST /library/${sheet_id}/webhook first`,
     });
   }
   // The current key, which is the newest stored one if this sheet has any and
@@ -4535,21 +4894,27 @@ app.get("/library/:id/hook", async (c) => {
   const url = `${new URL(c.req.url).origin}${path}`;
   // A long-lived secret may not sit in a shared cache.
   c.header("Cache-Control", "no-store");
+  // The delivery line is a net sheet's; a table sheet's secret verifies what
+  // it sends, which the readme's polite-scraper section describes.
   return c.json({
     data: {
-      url,
       secret,
-      // The path is signed alongside the body, so a query string makes a second
-      // delivery instead of a replay. That is why $path is a variable here: a
-      // sender that varies it has to sign what it varied.
-      repro: [
-        `body='{"hello":"world"}'`,
-        `path='${path}'`,
-        `t=$(date +%s)`,
-        `sig=$(printf '%s\\n%s\\n%s' "$t" "$path" "$body" | openssl dgst -sha256 -hmac '${quoted}' -r | cut -d' ' -f1)`,
-        `curl -X POST '${new URL(c.req.url).origin}'"$path" -H 'Content-Type: application/json' \\`,
-        `  -H "scrapsheets-signature: t=$t,v2=$sig" -d "$body"`,
-      ].join("\n"),
+      ...(net
+        ? {
+          url,
+          // The path is signed alongside the body, so a query string makes a
+          // second delivery instead of a replay. That is why $path is a
+          // variable here: a sender that varies it has to sign what it varied.
+          repro: [
+            `body='{"hello":"world"}'`,
+            `path='${path}'`,
+            `t=$(date +%s)`,
+            `sig=$(printf '%s\\n%s\\n%s' "$t" "$path" "$body" | openssl dgst -sha256 -hmac '${quoted}' -r | cut -d' ' -f1)`,
+            `curl -X POST '${new URL(c.req.url).origin}'"$path" -H 'Content-Type: application/json' \\`,
+            `  -H "scrapsheets-signature: t=$t,v2=$sig" -d "$body"`,
+          ].join("\n"),
+        }
+        : {}),
     },
   });
 });
@@ -4855,6 +5220,7 @@ app.post("/import/csv", async (c) => {
   }
 
   const [headerRow, ...dataRows] = parsed;
+  assertRoom("the imported sheet", 0, dataRows.length);
 
   // A short or long row is the single most common broken CSV, and coercing it
   // loses data silently. Name the line, the counts, and the column it stops at.
@@ -4936,6 +5302,7 @@ app.post("/import/csv", async (c) => {
   });
 
   const tableData: Table = [colsRow, ...rows];
+  await assertSheetsQuota(usr_id);
   const handle = automerge.create<{ type: string; data: Table }>();
   handle.change((doc) => {
     doc.type = "table";
@@ -5129,7 +5496,7 @@ app.get("/sheet/:id", async (c) => page(c)(await sheet(c, c.req.param("id"), c.r
 
 // At most one batch, because the whole batch is checked before the document is
 // touched and the check holds every row in memory.
-const APPEND_ROWS_MAX = 1000;
+export const APPEND_ROWS_MAX = 1000;
 
 // The write half of that read. Rows arrive keyed by column **name** -- the
 // header a CSV would carry, and the shape checkColumnTypes reads -- and are
@@ -5248,6 +5615,14 @@ app.post("/sheet/:id", async (c) => {
   // All or nothing. Every row is checked above and the append is one change,
   // because automerge cannot roll a change back: a batch half-written under a
   // 201 is the silent failure this endpoint exists without.
+  // After every check and before the write: a refused batch spends nothing,
+  // and the batch is all-or-nothing, so what it spends is what lands. One
+  // append is one unit whatever it carries, the way one delivery is: a budget
+  // of sixty rows a minute against batches of a thousand refused every batch
+  // and promised a retry the bucket could never keep. The bytes bound the
+  // volume.
+  assertRoom(sheet_id, hand.doc().data.length - 1, rows.length);
+  spend(sheet_id, "appends", 1, new TextEncoder().encode(JSON.stringify(rows)).byteLength, "send fewer, larger batches");
   hand.change((doc) => {
     for (const row of rows as Row[])
       doc.data.push(Object.fromEntries(cols.map((col) => [col.key, row[col.name]])) as Row);
@@ -5274,6 +5649,16 @@ const JSON_TYPES: Record<string, JsonShape> = Object.fromEntries(
 // never stored, so it cannot drift from the schema it describes. It documents
 // the two routes a key opens and the header the key is presented in -- which is
 // the whole point: a key with nothing to point at is a key nobody can use.
+// What both halves of a sheet's API answer past its budget. Generated beside
+// the schema so a client that reads the document learns the limit from it.
+const TOO_MANY = {
+  "429": {
+    description: `Past this sheet's budget of ${HOOK_ROWS_PER_WINDOW} reads or appends per ${HOOK_WINDOW_S} ` +
+      `seconds, or ${HOOK_BYTES_PER_WINDOW} bytes appended, shared with its webhook deliveries. The body names ` +
+      "the limit, the window and when to retry.",
+  },
+};
+
 app.get("/openapi/:id", async (c) => {
   const sheet_id = c.req.param("id");
   // sheet() is the access check and the column row in one read. One row,
@@ -5302,6 +5687,7 @@ app.get("/openapi/:id", async (c) => {
           summary: `Read ${sheet_id}`,
           parameters: ["limit", "offset"].map((name) => ({ name, in: "query", schema: { type: "integer" } })),
           responses: {
+            ...TOO_MANY,
             "200": {
               // The same Row the write takes. One schema for both halves is the
               // whole point: the read used to key a table sheet's rows by
@@ -5348,6 +5734,7 @@ app.get("/openapi/:id", async (c) => {
                 },
               },
               responses: {
+                ...TOO_MANY,
                 "201": {
                   description: "Every row was appended, or none was.",
                   content: {

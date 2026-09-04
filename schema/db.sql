@@ -119,6 +119,21 @@ create table audit
 create index audit_sheet_id_idx on audit (sheet_id, audit_id desc);
 create index audit_usr_id_idx on audit (usr_id, audit_id desc);
 
+-- Where a sheet's changes are sent. One row per url per sheet, and the last
+-- delivery's outcome lives on the row, because a table sheet has no net log
+-- to put it on. A hook that failed WEBHOOK_FAILS_MAX times in a row is left
+-- out of deliveries until its owner sets it again.
+create table webhook
+( webhook_id bigint not null generated always as identity primary key
+, sheet_id text not null references sheet(sheet_id)
+, url text not null
+, created_at timestamp not null default now()
+, delivered_at timestamp
+, status int
+, failures int not null default 0
+, unique (sheet_id, url)
+);
+
 create table payment
 ( payment_id bigint not null generated always as identity primary key
 , created_at timestamp default now()

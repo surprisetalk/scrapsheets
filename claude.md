@@ -115,6 +115,19 @@ A change that breaks one of these is a bug even if the suite is green.
   not promise to evaluate `and` left to right.
 - **Every bounded map goes through `bound(map, max)`**, and every loop, retry and recursion has a bound whose message
   carries the counter.
+- **One budget per sheet, spent through `spend()`.** `hookBucket()` is the bucket and `spend(sheet_id, what, rows,
+  bytes, fix)` is the one check-and-charge, synchronous so concurrent callers cannot all pass it. Every door into a
+  document sheet spends one unit: a webhook delivery, a socket report, a whole read through `sheet()` (`GET /sheet`,
+  an export, an MCP read; the computed sheets are free), and an append whatever it carries, with its bytes as the
+  volume. It is taken after the access or signature check, so a refused request spends nothing, and its refusal is a
+  429, which `app.onError` does not log.
+- **One account is bounded across its sheets.** `rateLimit()` runs once more on the account, in `accountBuckets`
+  rather than the address map so address churn cannot evict it; `assertSheetsQuota()` caps the sheets an account owns
+  at claim, import and purchase; `assertRoom()` caps a sheet's rows at the engine's own `MAX_QUERY_ROWS` at import
+  and append; `sendWithinQuota()` caps an account's alert emails a day, counted off the run log. Fetches need no
+  count: a feed polls at most once a minute, so the sheets cap bounds them. A refusal that changed what an account
+  keeps or sends says "quota" where `GET /status` reads it, the error log's 413s and the alert run's delivery line; a
+  429 is shed unlogged and is not counted, by design.
 - **`POLL_OK` / `ALERT_OK` / `RUN_OF` / `RUN_OK` have one definition each.** `GET /status` and `library:freshness` both
   read them from there. Two hand-copied copies had already drifted.
 - **The status check grades, never maximizes.** 1.0 is the minimum pass, `grade()` floors, and a condition that cannot
@@ -178,7 +191,18 @@ navigation, in file order:
   `LICENSES` or does not go live (the schema checks it). `POST /shop/:sell_id/report` is one row per account per
   listing on `net-hook:reports`, `POST /shop/:sell_id/review` is the operator's `keep` or `takedown`, and `GET /status`
   fails while a report is open.
-- **Outbound fetches**: `safeFetch` is the one door out and sends `USER_AGENT`. The per-host gap is the poller's
+- **Outbound webhooks**: `POST /library/:id/webhook` names a url, which must answer a signed `ping` 2xx before it is
+  registered, and that ping is where a url inside our network is refused by name. `flushWebhooks()` posts one
+  signed `change` per hook per flush for every document `touched` since the last, heard as the storage's
+  `doc-saved` and `doc-compacted` metrics rather than the handle's change event, because the save is what the repo
+  debounces per document; the first save after a `doc-loaded` is the load itself and is not a change. A row landing
+  on a net sheet touches it too. Signed with the sheet's own `hook` key, the one `GET /library/:id/hook` answers,
+  over the receiver's path and the body, so one secret serves both directions; a sheet on a provider scheme cannot
+  register one. Every delivery spends the sheet's budget as `webhooks`. The outcome lives on the `webhook` row;
+  `WEBHOOK_FAILS_MAX` failures in a row take a hook out until its owner sets it again, a dead hook fails
+  `GET /status` until then, the flush is bounded by `WEBHOOK_FLUSH_MAX`, and the url list is owner or editor only.
+- **Outbound fetches**: `safeFetch` is the one door out and sends `USER_AGENT`. Given a body it posts and follows no
+  redirect. The per-host gap is the poller's
   alone: `holdHost()` in `pollNetOnce` writes `hostDue` after each request and on every `Retry-After`, taking the
   later of the two, so two sheets on one host take turns across cycles and the proxy can neither hold a host nor
   evict a hold.
@@ -289,6 +313,8 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   identity PK, an index on `(sheet_id, created_at desc)`, and the unique `net_hook_signature_idx`. `trimNet()` keeps the
   newest `NET_KEEP` per sheet behind every write — a sheet that must keep everything writes to a table, which is never
   trimmed
+- **webhook** — where a sheet's changes are posted: `url` per sheet, and the last delivery's `delivered_at`,
+  `status` and `failures`, because a table sheet has no net log to record it on
 - **audit** — who did what to which sheet: `sheet_id` (no foreign key, a deleted sheet's trail stays), nullable
   `usr_id`, `action`, `via`, `detail`. Never trimmed
 - **payment** — marketplace transactions

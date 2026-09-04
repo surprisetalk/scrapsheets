@@ -453,15 +453,6 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
 
 ## Sheet as an API
 
-- [ ] **A public sheet API has its own limit.** `POST /sheet/:id`, per-sheet keys and the generated OpenAPI document
-      ship. `hookBucket()` bounds a net sheet's deliveries and nothing bounds a sheet's API.
-  1. Per-sheet rate limits for the read and the write, keyed on the sheet the way `hookBucket()` is.
-  2. The refusal names the limit and the window, and stays a 429 so it is not logged.
-
-- [ ] **Something is told when a sheet changes.** Change flows in and never out.
-  1. Outbound change webhooks, signed the way inbound deliveries are verified.
-  2. They are the "on upstream change" trigger under **Scheduling & runs**, seen from the other side.
-
 ---
 
 ## Collaboration
@@ -539,10 +530,6 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
 ---
 
 ## Trust, safety & abuse
-
-- [ ] **One account cannot exhaust the service.** `rateLimit()` bounds requests per IP and nothing bounds a user.
-  1. Per-user quotas: fetches, rows, storage, outbound actions.
-  2. Abuse detection on outbound actions: rate anomalies that look like a sheet being used as a spam cannon.
 
 ---
 
