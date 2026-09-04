@@ -3,12 +3,14 @@ import { PGlite } from "@electric-sql/pglite";
 import { PostgresConnection } from "pg-gateway";
 import { citext } from "@electric-sql/pglite/contrib/citext";
 import * as AM from "@automerge/automerge-repo";
+import { decodeSyncMessage } from "@automerge/automerge";
 import { WebSocketClientAdapter } from "@automerge/automerge-repo-network-websocket";
 import Stripe from "stripe";
 import {
   app,
   arrayify,
   automerge,
+  BODY_CAP,
   callerIp,
   createJwt,
   createToken,
@@ -20,6 +22,10 @@ import {
   hookBuckets,
   hookSecret,
   hookSign,
+  HOST_GAP_MS,
+  LICENSES,
+  safeFetch,
+  USER_AGENT,
   hostDue,
   LOG_EVERY_MS,
   NET_KEEP,
@@ -268,7 +274,7 @@ Deno.test(async function allTests(t) {
         const sheet_id = type + ":" + doc_id;
         const meta = { name: `Example ${type}`, tags: ["tag1", "tag2"] };
         await put(jwt, `/library/${sheet_id}`, meta);
-        await post(jwt, `/sell/${sheet_id}`, { price: 0 });
+        await post(jwt, `/sell/${sheet_id}`, { price: 0, license: "own" });
         const [, { name, tags, sell_price }] = await get<Table>(
           jwt,
           `/library`,
@@ -299,26 +305,49 @@ Deno.test(async function allTests(t) {
     {
       const ws = new WebSocket(wsUrl(jwt));
       ws.binaryType = "arraybuffer";
-      const reply = await new Promise<Record<string, unknown>>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("No peer reply within 2s.")), 2000);
-        ws.onopen = () =>
-          ws.send(AM.cbor.encode({
-            type: "join",
-            senderId: "raw-test-peer",
-            peerMetadata: {},
-            supportedProtocolVersions: ["1"],
-          }));
-        ws.onmessage = (e) => {
-          clearTimeout(timer);
-          resolve(AM.cbor.decode(new Uint8Array(e.data as ArrayBuffer)) as Record<string, unknown>);
-        };
-        ws.onerror = () => {
-          clearTimeout(timer);
-          reject(new Error("WebSocket errored before the peer reply."));
-        };
+      // The first frame `pick` takes. The server announces every document
+      // this account may read as soon as the peer is in, so the answer to a
+      // question is not the next frame, only the next one about it.
+      const next = (what: string, pick: (frame: Record<string, unknown>) => boolean = () => true) =>
+        new Promise<Record<string, unknown>>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error(`No ${what} within 2s.`)), 2000);
+          ws.onmessage = (e) => {
+            const frame = AM.cbor.decode(new Uint8Array(e.data as ArrayBuffer)) as Record<string, unknown>;
+            if (!pick(frame)) return;
+            clearTimeout(timer);
+            resolve(frame);
+          };
+          ws.onerror = () => {
+            clearTimeout(timer);
+            reject(new Error(`WebSocket errored before the ${what}.`));
+          };
+        });
+      const peer = next("peer reply");
+      await new Promise<void>((resolve) => {
+        ws.onopen = () => resolve();
       });
+      ws.send(AM.cbor.encode({
+        type: "join",
+        senderId: "raw-test-peer",
+        peerMetadata: {},
+        supportedProtocolVersions: ["1"],
+      }));
+      const reply = await peer;
       assertEquals(reply.type, "peer");
       assertEquals(reply.selectedProtocolVersion, "1");
+
+      // A document id no document can have. Postgres text cannot hold a NUL,
+      // so the role lookup used to throw and the socket closed on an
+      // unexplained error; a document that cannot exist is unavailable.
+      const unavailable = next("doc-unavailable reply", (frame) => frame.documentId === "no\u0000such");
+      ws.send(AM.cbor.encode({
+        type: "request",
+        senderId: "raw-test-peer",
+        targetId: reply.senderId,
+        documentId: "no\u0000such",
+        data: new Uint8Array(),
+      }));
+      assertEquals((await unavailable).type, "doc-unavailable", "a NUL in a document id is a document nobody has");
       ws.close();
     }
 
@@ -426,21 +455,37 @@ Deno.test(async function allTests(t) {
       assertEquals(stillReadable, "shared", "a viewer should still read after a refused write");
       vAdapter.disconnect();
 
-      // An editor's write does land.
+      // An editor's write does land, and the server says so: its next sync
+      // frame for the document carries the editor's new head. That frame is
+      // how src/index.html learns a write it once held in this browser has
+      // landed, so the protocol is pinned here, where the server's own repo
+      // is in the loop. The handle's heads are base58 and the wire's are hex,
+      // which is why the page decodes them before comparing.
       const eAdapter = new WebSocketClientAdapter(wsUrl(editor.jwt), 100);
       const eRepo = new AM.Repo({ network: [eAdapter], peerId: "client-editor" as AM.PeerId });
       const eHandle = await eRepo.find<Sheet>(hand.documentId);
+      const heard: string[][] = [];
+      const receive = eAdapter.receiveMessage.bind(eAdapter);
+      eAdapter.receiveMessage = (bytes: Uint8Array) => {
+        const frame = AM.cbor.decode(new Uint8Array(bytes)) as { type: string; documentId?: string; data?: Uint8Array };
+        if (frame.type === "sync" && frame.documentId === hand.documentId) heard.push(decodeSyncMessage(frame.data!).heads);
+        return receive(bytes);
+      };
       eHandle.change((d: Sheet) => {
         (d.data as unknown as Record<string, unknown>[])[1] = { 0: 4242 };
       });
+      const written = AM.decodeHeads(eHandle.heads()!);
       for (let i = 0; i < 50; i++) {
-        const doc = (await automerge.find<Sheet>(hand.documentId)).doc();
-        if (JSON.stringify(doc).includes("4242")) break;
+        if (heard.some((heads) => written.every((h) => heads.includes(h)))) break;
         await new Promise((r) => setTimeout(r, 100));
       }
       assert(
         JSON.stringify((await automerge.find<Sheet>(hand.documentId)).doc()).includes("4242"),
         "an editor's write should reach the server copy",
+      );
+      assert(
+        heard.some((heads) => written.every((h) => heads.includes(h))),
+        `the server's sync reply must carry the editor's head ${written}, heard: ${JSON.stringify(heard)}`,
       );
       eAdapter.disconnect();
 
@@ -503,7 +548,7 @@ Deno.test(async function allTests(t) {
       const [cols_, ...rows] = await get<Table>(jwt, `/shop`);
       const cols = Object.values(cols_);
       assert(cols.length);
-      assertEquals(cols.map((col) => col.name).join(), "name,price,");
+      assertEquals(cols.map((col) => col.name).join(), "name,price,license,");
       assert(rows.length);
 
       // Buy the first 3 items
@@ -521,7 +566,7 @@ Deno.test(async function allTests(t) {
       const [{ type, doc_id }] = bobRows;
       await reject(jwt, `/sell/${type}:${doc_id}`, {
         method: "POST",
-        body: JSON.stringify({ price: 5 }),
+        body: JSON.stringify({ price: 5, license: "own" }),
       });
     }
 
@@ -720,7 +765,7 @@ Deno.test(async function allTests(t) {
 
       // An alert mails its author on a timer, so a copy of one would mail a
       // stranger's address: it cannot be listed.
-      await reject(jwt, `/sell/${alert_id}`, { method: "POST", body: JSON.stringify({ price: 0 }) });
+      await reject(jwt, `/sell/${alert_id}`, { method: "POST", body: JSON.stringify({ price: 0, license: "own" }) });
 
       // A digest alert records its run but holds the email, and one summary a day
       // goes to the account address with every held run since the last one.
@@ -851,7 +896,7 @@ Deno.test(async function allTests(t) {
         data: [arrayify([{ name: "a", type: "text", key: 0 }])],
       });
       await put(aliceJwt, `/library/table:${hand.documentId}`, { name: "Paid table" });
-      await post(aliceJwt, `/sell/table:${hand.documentId}`, { price: 5 });
+      await post(aliceJwt, `/sell/table:${hand.documentId}`, { price: 5, license: "own" });
       const [, listing] = await get<Table>(bobJwt, `/shop`, { name: "Paid table" });
       assert(listing?.sell_id, "expected Paid table in the shop");
 
@@ -1792,9 +1837,9 @@ Deno.test(async function allTests(t) {
 
     const hook = automerge.create<Sheet>({ type: "net-hook", data: [] });
     await put(jwt, `/library/net-hook:${hook.documentId}`, {});
-    const big = await deliver(`net-hook:${hook.documentId}`, "x".repeat(1_048_577));
+    const big = await deliver(`net-hook:${hook.documentId}`, "x".repeat(BODY_CAP + 1));
     assertEquals(big.status, 413);
-    assert((await big.text()).includes("1048577 bytes"), "it must name the size it received");
+    assert((await big.text()).includes(`${BODY_CAP} bytes`), "it must name the limit");
     assert((await deliver(`net-hook:${hook.documentId}`, "{}")).ok, "a valid delivery still lands");
   });
 
@@ -2247,7 +2292,7 @@ Deno.test(async function allTests(t) {
       const keyed = automerge.create<Sheet>({
         type: "net-http",
         data: [{
-          url: "https://feeds.test/keyed",
+          url: "https://keyed.test/keyed",
           interval: 120,
           headers: "X-Api-Key: {{secret:weather}}\nAuthorization: Bearer {{secret:weather}}",
         }],
@@ -2258,7 +2303,7 @@ Deno.test(async function allTests(t) {
       // Every due net-http sheet is polled, so only this one's calls count.
       const seen: Record<string, string>[] = [];
       const fetcher = (url: string, headers: Record<string, string> = {}) => {
-        if (url === "https://feeds.test/keyed") seen.push(headers);
+        if (url === "https://keyed.test/keyed") seen.push(headers);
         return Promise.resolve(new Response(`{"ok":true}`));
       };
       const rowsOf = async () => (await get<Table>(jwt, `/net/${keyedId}`)).slice(1);
@@ -2344,13 +2389,13 @@ Deno.test(async function allTests(t) {
     // question nobody asked. Folding it onto a row would be inventing one.
     const odd = automerge.create<Sheet>({
       type: "net-http",
-      data: [{ url: "https://etag.test/odd", interval: 120 }],
+      data: [{ url: "https://odd.test/odd", interval: 120 }],
     });
     const oddId = `net-http:${odd.documentId}`;
     await put(jwt, `/library/${oddId}`, {});
     await pollNetOnce(
       (url: string) =>
-        Promise.resolve(url === "https://etag.test/odd" ? new Response(null, { status: 304 }) : new Response(`{}`)),
+        Promise.resolve(url === "https://odd.test/odd" ? new Response(null, { status: 304 }) : new Response(`{}`)),
       t + 300_000,
     );
     const [oddRow] = (await get<Table>(jwt, `/net/${oddId}`)).slice(1);
@@ -2451,7 +2496,9 @@ Deno.test(async function allTests(t) {
     assertEquals((await get<Table>(jwt, `/net/${twoId}`)).slice(1).length, 0, "and logs nothing: it never ran");
     busy = false;
     await pollNetOnce(fetcher, t + 121_000);
-    assertEquals(hits.length, 3, "and both go once the host's own wait is over");
+    assertEquals(hits.length, 2, "and one goes once the host's own wait is over");
+    await pollNetOnce(fetcher, t + 121_000 + HOST_GAP_MS);
+    assertEquals(hits.length, 3, "and the other a gap later: one host, one request per cycle");
 
     // A Retry-After neither side can read is this sheet's failure row naming
     // what it received. The poller keeps every other sheet.
@@ -2533,7 +2580,7 @@ Deno.test(async function allTests(t) {
 
     const bad = automerge.create<Sheet>({
       type: "net-http",
-      data: [{ url: "https://cursor.test/bad", interval: 600, cursor: "since=1&sneaky" }],
+      data: [{ url: "https://badcursor.test/bad", interval: 600, cursor: "since=1&sneaky" }],
     });
     const badId = `net-http:${bad.documentId}`;
     await put(jwt, `/library/${badId}`, {});
@@ -3047,7 +3094,7 @@ Deno.test(async function allTests(t) {
         data: [arrayify([{ name: "a", type: "text", key: 0 }])],
       });
       await put(sellerJwt, `/library/table:${hand.documentId}`, { name });
-      await post(sellerJwt, `/sell/table:${hand.documentId}`, { price: 5 });
+      await post(sellerJwt, `/sell/table:${hand.documentId}`, { price: 5, license: "own" });
       const [, listing] = await get<Table>(buyerJwt, `/shop`, { name });
       assert(listing?.sell_id, `expected ${name} in the shop`);
       return listing as { sell_id: string };
@@ -3327,14 +3374,18 @@ Deno.test(async function allTests(t) {
       return JSON.parse(atob(b64 + "=".repeat((4 - b64.length % 4) % 4))) as { exp: number; lock?: string };
     };
     const now = Math.floor(Date.now() / 1000);
-    for (const options of [{ method: "POST" }, { method: "POST", body: "not json" }]) {
-      const res = await raw(`/library/${sheet_id}/link`, options);
+    {
+      const res = await raw(`/library/${sheet_id}/link`, { method: "POST" });
       const body = await res.text();
       assert(res.ok, `an empty body still mints a link: ${res.status} ${body}`);
       const { data: { token } } = JSON.parse(body);
       assert(Math.abs(expOf(token).exp - (now + 30 * day)) < 120, "and it still lives thirty days");
       assert(!expOf(token).lock, "and it is still openable by anyone holding it");
     }
+    // A body that is not JSON is not "no options": it is a request the caller
+    // meant to send and got wrong, and defaulting it minted a link nobody asked
+    // for in that shape.
+    await reject(jwt, `/library/${sheet_id}/link`, { method: "POST", body: "not json" });
 
     const { data: { token: plain } }: { data: { token: string } } = await post(jwt, `/library/${sheet_id}/link`, {});
     const { data: { token: short } }: { data: { token: string } } = await post(
@@ -3942,7 +3993,7 @@ Deno.test(async function allTests(t) {
       values (${ids[0]}, 'GET', 'x', ${sql.json({ status: "99999999999999999999" })})
     `;
     assertEquals((await rows(jwt)).body.length > 0, true, "one unreadable status must not empty the answer");
-    assertEquals(Object.keys(await status()).length, 13, "nor take the alarm down with it");
+    assertEquals(Object.keys(await status()).length, 14, "nor take the alarm down with it");
     await sql`delete from net where sheet_id = ${ids[0]} and body = 'x'`;
 
     // A poll is not the only kind of run. A net-hook sheet's run is the
@@ -4164,7 +4215,261 @@ Deno.test(async function allTests(t) {
       if (res.status === 429) refused++;
     }
     assert(refused > 0, "a flood of reports must run out of budget and say so");
+
+    // Thirty reports at once against a budget of one, for the reason
+    // POST /net/:id is raced the same way: the check and the charge are one
+    // step, or every report passes.
     hookBuckets.delete(sheet_id);
+    hookBucket(sheet_id).rows = 1;
+    const [{ n: before }] = await sql`select count(*)::int as n from net where sheet_id = ${sheet_id}`;
+    const raced = await Promise.all(
+      Array.from({ length: 30 }, () =>
+        app.request(`/library/${sheet_id}/socket`, {
+          method: "POST",
+          headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+          body: JSON.stringify({ status: "connected" }),
+        })),
+    );
+    assertEquals(raced.filter((res) => res.ok).length, 1, "one report may land on a budget of one");
+    assertEquals(raced.filter((res) => res.status === 429).length, 29, "and the rest are refused");
+    const [{ n: after }] = await sql`select count(*)::int as n from net where sheet_id = ${sheet_id}`;
+    assertEquals(after - before, 1, "concurrent reports must not outrun the budget");
+    hookBuckets.delete(sheet_id);
+  });
+
+  // Three ways a caller holding a real credential reached an unexplained 500.
+  // Each is one guard at the boundary the input crosses, so no handler has to
+  // remember it.
+  await t.step("A refusal is a refusal, not a 500", async () => {
+    const { jwt } = await usr("nul@example.com");
+    const hand = automerge.create<Sheet>({ type: "table", data: [arrayify([{ name: "a", type: "text", key: 0 }])] });
+    const sheet_id = `table:${hand.documentId}`;
+    await put(jwt, `/library/${sheet_id}`, {});
+
+    // A percent-encoded NUL in an id. Postgres text cannot hold one, so every
+    // :id that reached a SQL comparison threw -- and a query-string id is the
+    // same id by another door.
+    for (
+      const [method, route] of [
+        ["POST", `/library/${sheet_id}%00/public`],
+        ["GET", `/sheet/${sheet_id}%00`],
+        ["GET", `/library?doc_id=${hand.documentId}%00`],
+      ] as const
+    ) {
+      const res = await app.request(route, {
+        method,
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        body: method === "POST" ? JSON.stringify({ public: true }) : undefined,
+      });
+      assertEquals(res.status, 400, `${method} ${route} must be refused, not fail`);
+      const text = await res.text();
+      assert(text.includes("NUL"), `${method} ${route} must name the byte, got: ${text}`);
+    }
+
+    // A body whose size the caller picks, on a route that parses JSON. One cap
+    // for every body, or the one on POST /net/:id was theatre.
+    const big = await app.request(`/library/${sheet_id}`, {
+      method: "PUT",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+      body: JSON.stringify({ name: "x".repeat(BODY_CAP) }),
+    });
+    assertEquals(big.status, 413, "a body over the cap is refused by size");
+    const text = await big.text();
+    assert(text.includes(`${BODY_CAP} bytes`), `it must name the limit, got: ${text}`);
+    await put(jwt, `/library/${sheet_id}`, { name: "small" });
+
+    // The rest of the hunt: every await whose failure was not already a
+    // refusal. Each row is the request that reached a SyntaxError, a
+    // TypeError or a PostgresError, and the word its refusal now carries.
+    const bare = automerge.create({ type: "table" } as unknown as Sheet);
+    await put(jwt, `/library/table:${bare.documentId}`, {});
+    const conn = automerge.create<Sheet>({ type: "codex-db", data: [] });
+    await put(jwt, `/library/codex-db:${conn.documentId}`, {});
+    const form = new FormData();
+    form.set("file", "a,b\n1,2");
+    const json = (body: unknown) => ({ body: JSON.stringify(body), type: "application/json" });
+    for (
+      const [method, route, init, status, needle] of [
+        ["POST", "/login", { body: "x", type: "application/json" }, 400, "not JSON"],
+        ["POST", "/login", { body: "null", type: "application/json" }, 400, "not a JSON object"],
+        ["POST", "/login", json({ email: true, password: "x" }), 400, "email"],
+        ["GET", "/library?limit=abc", {}, 400, "limit"],
+        ["GET", "/library?offset=-1", {}, 400, "offset"],
+        ["GET", "/shop?sell_price=5", {}, 400, "sell_price"],
+        ["POST", `/sell/${sheet_id}`, json({ price: "abc" }), 400, "price"],
+        ["PUT", `/library/${sheet_id}`, json({ tags: "abc" }), 400, "tags"],
+        ["POST", "/query", json({ lang: "sql" }), 400, "needs SQL"],
+        ["POST", `/library/${sheet_id}/share`, { body: "null", type: "application/json" }, 400, "not a JSON object"],
+        ["POST", "/import/csv", { body: "x", type: "multipart/form-data" }, 400, "multipart"],
+        ["POST", "/import/csv", { body: form }, 400, "text field"],
+        ["GET", `/sheet/table:${bare.documentId}`, {}, 400, "no rows in it"],
+        ["POST", `/codex-db/${conn.documentId}`, json({ a: 1 }), 400, "dsn"],
+        ["POST", `/codex-db/${conn.documentId}`, json({ dsn: "postgresql://u:p@nope.invalid:5432/db" }), 200, ""],
+        ["GET", `/codex/codex-db:${conn.documentId}`, {}, 502, "did not answer"],
+      ] as const
+    ) {
+      const headers = new Headers({ Authorization: `Bearer ${jwt}` });
+      if ("type" in init) headers.set("Content-Type", init.type);
+      const res = await app.request(route, { method, headers, body: "body" in init ? init.body : undefined });
+      const answer = await res.text();
+      assertEquals(res.status, status, `${method} ${route} must answer ${status}, got ${res.status}: ${answer}`);
+      assert(answer.includes(needle), `${method} ${route} must name ${JSON.stringify(needle)}, got: ${answer}`);
+    }
+  });
+
+  // safeFetch guarded our network and not theirs. Three things a polite
+  // scraper does: it says who it is, it does not stampede one host, and the
+  // shop it feeds records whether what it sells may be sold, and can be told
+  // when it should not have been.
+  await t.step("We are a polite scraper", async () => {
+    const { jwt } = await usr("polite@example.com");
+
+    // Who we are, on every outbound request, with the address that explains it.
+    {
+      const seen: Record<string, string>[] = [];
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = ((_url: string, init?: RequestInit) => {
+        seen.push(Object.fromEntries(new Headers(init?.headers).entries()));
+        return Promise.resolve(new Response("ok"));
+      }) as typeof fetch;
+      try {
+        await safeFetch("http://93.184.216.34/feed");
+        assertEquals(seen[0]["user-agent"], USER_AGENT, "every fetch says who it is");
+        assert(USER_AGENT.includes("https://"), `the user agent points at where it is explained: ${USER_AGENT}`);
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    }
+
+    // The real door, not a stub: the poller through safeFetch. Every other poll
+    // test hands in a fetcher, which is how a poller that refused its own
+    // fetch passed the suite.
+    {
+      const hand = automerge.create<Sheet>({
+        type: "net-http",
+        data: [{ url: "http://93.184.216.34/poll", interval: 3600 }],
+      });
+      const id = `net-http:${hand.documentId}`;
+      await put(jwt, `/library/${id}`, {});
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = (() => Promise.resolve(new Response(`{"polled":true}`))) as typeof fetch;
+      try {
+        await pollNetOnce(undefined, Date.now() + 70_000_000);
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+      const [{ meta }]: { meta: { status: number } }[] = await sql`select meta from net where sheet_id = ${id}`;
+      assertEquals(meta.status, 200, `a poll through safeFetch itself lands: ${JSON.stringify(meta)}`);
+    }
+
+    // Two sheets on one host take turns across cycles rather than one cycle.
+    {
+      const feeds = ["https://polite.test/a", "https://polite.test/b", "https://elsewhere.test/c"];
+      for (const url of feeds) {
+        const hand = automerge.create<Sheet>({ type: "net-http", data: [{ url, interval: 3600 }] });
+        await put(jwt, `/library/net-http:${hand.documentId}`, {});
+      }
+      const calls: string[] = [];
+      const fetcher = (url: string) => {
+        calls.push(url);
+        return Promise.resolve(new Response(`{"ok":true}`));
+      };
+      hostDue.delete("polite.test");
+      hostDue.delete("elsewhere.test");
+      const t0 = Date.now() + 10_000_000;
+      await pollNetOnce(fetcher, t0);
+      assertEquals(calls.filter((u) => u.includes("polite.test")).length, 1, "one request to one host per cycle");
+      assertEquals(calls.filter((u) => u.includes("elsewhere.test")).length, 1, "and another host is not held for it");
+      await pollNetOnce(fetcher, t0 + HOST_GAP_MS / 2);
+      assertEquals(calls.filter((u) => u.includes("polite.test")).length, 1, "inside the gap the other sheet waits");
+      await pollNetOnce(fetcher, t0 + HOST_GAP_MS + 1);
+      assertEquals(calls.filter((u) => u.includes("polite.test")).length, 2, "and past it the other sheet is fetched");
+      assertEquals(new Set(calls.filter((u) => u.includes("polite.test"))).size, 2, "each sheet once");
+      hostDue.delete("polite.test");
+      hostDue.delete("elsewhere.test");
+    }
+
+    // A listing records whether what it sells may be sold. Without a license a
+    // listing does not go live; with one, the shop shows it beside the price.
+    const hand = automerge.create<Sheet>({ type: "table", data: [arrayify([{ name: "a", type: "text", key: 0 }])] });
+    const sheet_id = `table:${hand.documentId}`;
+    await put(jwt, `/library/${sheet_id}`, { name: "polite listing" });
+    const unlicensed = await app.request(`/sell/${sheet_id}`, {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+      body: JSON.stringify({ price: 1 }),
+    });
+    assertEquals(unlicensed.status, 400, "a listing without a license does not go live");
+    const said = await unlicensed.text();
+    assert(said.includes("license"), `and the refusal names the field: ${said}`);
+    await reject(jwt, `/sell/${sheet_id}`, { method: "POST", body: JSON.stringify({ price: 1, license: "mine" }) });
+    await post(jwt, `/sell/${sheet_id}`, { price: 1, license: LICENSES[0] });
+    const [, ...listed] = await get<Table>(jwt, `/shop`, { name: "polite listing" });
+    assertEquals(listed.length, 1);
+    assertEquals(listed[0].license, LICENSES[0], "the shop shows the license beside the price");
+    const sell_id = String(listed[0].sell_id);
+
+    // Anyone signed in may report a listing, once, with a reason. The reports
+    // are a sheet: the reporter reads their own, the operator reads them all.
+    const { jwt: buyer, usr_id: buyerId } = await usr("reporter@example.com");
+    const report = (body: unknown, who = buyer) =>
+      app.request(`/shop/${sell_id}/report`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${who}` }),
+        body: JSON.stringify(body),
+      });
+    assertEquals((await report({})).status, 400, "a report needs a reason");
+    assertEquals((await report({ reason: "this is the census bureau's table, resold" })).status, 200);
+    assertEquals((await report({ reason: "again" })).status, 409, "one report per account per listing");
+    assertEquals((await report({ reason: "x" }, jwt)).status, 400, "a seller cannot report their own listing");
+    const missing = await app.request(`/shop/${"0".repeat(32)}/report`, {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${buyer}` }),
+      body: JSON.stringify({ reason: "x" }),
+    });
+    assertEquals(missing.status, 404, "a report on nothing is refused by name");
+
+    const [, ...mine] = await get<Table>(buyer, `/sheet/net-hook:reports`);
+    assertEquals(mine.length, 1, "a reporter reads their own reports");
+    assert(String(mine[0].body).includes("census"), `and the reason is the row: ${JSON.stringify(mine[0])}`);
+    assertEquals(String(mine[0].sell_id), sell_id);
+    const [, ...others] = await get<Table>(jwt, `/sheet/net-hook:reports`);
+    assertEquals(others.length, 0, "and nobody else's");
+
+    // The operator is whoever reads the error log. Review closes the reports;
+    // a takedown pulls the listing too, and the status check grades the queue.
+    const { jwt: operator, usr_id: operatorId } = await usr("moderator@example.com");
+    const review = (action: unknown, who = operator) =>
+      app.request(`/shop/${sell_id}/review`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${who}` }),
+        body: JSON.stringify({ action }),
+      });
+    assertEquals((await review("takedown", buyer)).status, 403, "a review is the operator's");
+    const waiting = "No shop report is waiting for review.";
+    assert((await status())[waiting]["0"] < 1, "an open report is a failing grade");
+    await sql`insert into sheet_usr (sheet_id, usr_id, role) values ('net-hook:errors', ${operatorId}, 'viewer')`;
+    const [, ...queue] = await get<Table>(operator, `/sheet/net-hook:reports`);
+    assert(queue.some((r) => String(r.sell_id) === sell_id), "the operator reads every report");
+    assertEquals((await review("shrug")).status, 400, "a review is keep or takedown");
+    assertEquals((await review("takedown")).status, 200);
+    const [, ...gone] = await get<Table>(jwt, `/shop`, { name: "polite listing" });
+    assertEquals(gone.length, 0, "a takedown pulls the listing");
+    assertEquals((await status())[waiting]["0"], 1, "and clears the queue");
+    assertEquals((await review("takedown")).status, 404, "a listing that is down has nothing left to pull");
+
+    // A seller who pulls a reported listing does not take the report with it:
+    // the operator still closes it, or the alarm would ring until somebody
+    // muted it.
+    await post(jwt, `/sell/${sheet_id}`, { price: 2, license: "own" });
+    assertEquals((await report({ reason: "relisted, still theirs" }, buyer)).status, 409, "one report per account, still");
+    const { jwt: second } = await usr("second-reporter@example.com");
+    assertEquals((await report({ reason: "still not theirs" }, second)).status, 200);
+    await post(jwt, `/sell/${sheet_id}`, { price: null });
+    assert((await status())[waiting]["0"] < 1, "a report on a pulled listing is still open");
+    assertEquals((await review("keep")).status, 200, "and the operator closes it");
+    assertEquals((await status())[waiting]["0"], 1);
+    void buyerId;
   });
 
   await t.step("The bucket a flood is counted against must be one the flood cannot choose", async () => {
@@ -4184,7 +4489,7 @@ Deno.test(async function allTests(t) {
     assertEquals(ip(undefined), "127.0.0.1");
   });
 
-  // NET_BODY_CAP bounds a delivery and trimNet bounds the log, so a sender posting flat out loses nothing of its own
+  // BODY_CAP bounds a delivery and trimNet bounds the log, so a sender posting flat out loses nothing of its own
   // -- it evicts everything the sheet held before it. The budget is keyed on the sheet, not on callerIp(), because a
   // webhook sender is one machine that will not rotate its address. So the ways this breaks are: a bound that leaks
   // across sheets, a bound a refused delivery pays for, and a count bound alone, which one 1 MB body a second walks
@@ -4231,6 +4536,37 @@ Deno.test(async function allTests(t) {
     assert(big.text.includes(`${HOOK_BYTES_PER_WINDOW} bytes`), `it must name the byte limit, got: ${big.text}`);
     assert(big.text.includes(`${HOOK_WINDOW_S} seconds`), `it must name the window, got: ${big.text}`);
 
+    // Thirty senders at once against a budget of one. The check and the charge
+    // are one step with no await between them, or every sender reads the same
+    // budget, every one passes, and thirty rows land on a budget of one.
+    const race = await netSheet();
+    hookBucket(race).rows = 1;
+    const raced = await Promise.all(
+      Array.from({ length: 30 }, (_, n) => deliver(race, JSON.stringify({ n, race: true }))),
+    );
+    assertEquals(raced.filter((res) => res.ok).length, 1, "one delivery may land on a budget of one");
+    assertEquals(raced.filter((res) => res.status === 429).length, 29, "and the rest are refused, not lost");
+    const [{ n: landed }] = await sql`select count(*)::int as n from net where sheet_id = ${race}`;
+    assertEquals(landed, 1, "concurrent senders must not outrun the budget");
+
+    // A replay is charged nothing: the budget protects the sender, and one
+    // captured delivery must not be able to spend it. Signed once, sent twice,
+    // then a fresh delivery on the one row of budget the replay must have
+    // given back.
+    hookBucket(race).rows = 2;
+    const once = JSON.stringify({ event: "once" });
+    const signature = await hookSign(await hookSecret(race), `/net/${race}`, once);
+    const replay = (body: string, sig: string) =>
+      app.request(`/net/${race}`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", "scrapsheets-signature": sig }),
+        body,
+      });
+    assert((await replay(once, signature)).ok, "the first copy lands");
+    assertEquals((await replay(once, signature)).status, 409, "the second is a replay");
+    const after = await deliver(race, JSON.stringify({ event: "after the replay" }));
+    assert(after.ok, `a replay must refund what it charged, got: ${after.status} ${await after.text()}`);
+
     // The bound belongs to the sheet, so two sheets over budget refuse nothing
     // on a third.
     const quiet = await netSheet();
@@ -4249,7 +4585,7 @@ Deno.test(async function allTests(t) {
   await t.step("Every status condition is graded so that 1.0 is the minimum pass", async () => {
     const grades = await status();
     const conditions = Object.keys(grades);
-    assertEquals(conditions.length, 13);
+    assertEquals(conditions.length, 14);
     for (const [condition, series] of Object.entries(grades)) {
       assert(condition.endsWith("."), `a condition is a sentence: ${condition}`);
       assert("0" in series, `${condition} must be graded now`);
@@ -4271,7 +4607,7 @@ Deno.test(async function allTests(t) {
     const survived = await app.request("/status");
     assertEquals(
       Object.keys(await survived.json()).length,
-      13,
+      14,
       "a malformed row must degrade a grade, not replace the whole answer with an error",
     );
 

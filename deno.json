@@ -49,6 +49,7 @@
     "@hono/hono/logger": "jsr:@hono/hono@^4.13.1/logger",
     "@hono/hono/cors": "jsr:@hono/hono@^4.13.1/cors",
     "@hono/hono/jwt": "jsr:@hono/hono@^4.13.1/jwt",
+    "@hono/hono/body-limit": "jsr:@hono/hono@^4.13.1/body-limit",
     "@hono/hono/deno": "jsr:@hono/hono@^4.13.1/deno",
     "postgresjs": "https://deno.land/x/postgresjs@v3.4.9/mod.js",
     "@std/path": "jsr:@std/path@^1.1.6",

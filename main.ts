@@ -8,6 +8,7 @@
 // are the navigation; keep them accurate and keep new code inside one of them.
 
 import { HTTPException } from "@hono/hono/http-exception";
+import { bodyLimit } from "@hono/hono/body-limit";
 import { Context, Hono } from "@hono/hono";
 import { logger } from "@hono/hono/logger";
 import { cors } from "@hono/hono/cors";
@@ -483,9 +484,7 @@ const sheet = async (
     // A string, always: the auth middleware refuses a token that names no
     // account, so no route reaching this line has an anonymous caller.
     const usr_id = c.get("usr_id");
-    const [operator] = await sql`
-      select true from sheet_usr where sheet_id = ${ERROR_SHEET} and usr_id = ${usr_id}
-    `;
+    const operator = await isOperator(usr_id);
     return await cselect({
       cols: null,
       // A 5xx body is the stack `onError` recorded: file paths, line numbers,
@@ -510,6 +509,22 @@ const sheet = async (
       offset,
     });
   }
+  if (sheet_id === REPORT_SHEET) {
+    const usr_id = c.get("usr_id");
+    const operator = await isOperator(usr_id);
+    return await cselect({
+      cols: null,
+      select: sql`select n.created_at, n.meta->>'sell_id' as sell_id, n.meta->>'status' as status,
+                         n.meta->>'review' as review, n.body`,
+      from: sql`from net n`,
+      where: operator
+        ? [sql`n.sheet_id = ${REPORT_SHEET}`]
+        : [sql`n.sheet_id = ${REPORT_SHEET}`, sql`n.meta->>'usr_id' = ${usr_id}`],
+      order: sql`order by n.created_at desc, n.net_id desc`,
+      limit,
+      offset,
+    });
+  }
   await assertSheetAccess(c, sheet_id);
   const hand = await automerge
     .find<{ data: Sheet["data"] }>(doc_id as AnyDocumentId)
@@ -526,7 +541,7 @@ const sheet = async (
     }));
   switch (type) {
     case "table": {
-      const [colsRow, ...rows] = hand.doc().data as Table;
+      const [colsRow, ...rows] = docData(hand, sheet_id) as Table;
       const cols = Object.values(colsRow ?? {}) as Col[];
       // Values with no names left to key them by. Every read is name-keyed, so
       // this sheet's rows would come back as one empty object each -- N rows of
@@ -585,7 +600,7 @@ const sheet = async (
         offset,
       });
     case "dashboard": {
-      const { tiles } = hand.doc().data[0] as unknown as Dashboard;
+      const { tiles } = (docData(hand, sheet_id)[0] ?? {}) as Dashboard;
       const rows = (Array.isArray(tiles) ? tiles : []).map((tile) => ({ tile: String(tile).replace(/^@/, "") }));
       return {
         data: [arrayify([{ name: "tile", type: "text" as Type, key: "tile" }]), ...rows],
@@ -605,7 +620,7 @@ const sheet = async (
       return await executeSql(c, code, path_);
     }
     case "query":
-      return await querify(c, hand.doc().data[0] as Query, {
+      return await querify(c, (docData(hand, sheet_id)[0] ?? {}) as Query, {
         limit,
         offset,
         ...qs,
@@ -831,6 +846,14 @@ const querify = async (
       Fix: `set lang to "sql"; it is the only language this engine runs`,
     });
   }
+  if (typeof code !== "string" || !code.trim()) {
+    bad(400, `A query sheet needs SQL to run.`, {
+      Expected: `a "code" string holding a select statement`,
+      Received: show(code ?? null),
+      Source: `the "code" field of this query sheet`,
+      Fix: `set code to a statement, such as select * from @table:countries`,
+    });
+  }
   return await executeSql(c, code, path_);
 };
 
@@ -933,10 +956,27 @@ const cselect = async ({
   limit: string;
   offset: string;
 }): Promise<Page> => {
+  // Straight off the query string, so a limit of "abc" or an offset of -1
+  // reached Postgres as bigint text and came back as an unexplained 500 from
+  // every paged route at once.
+  const count_ = (name: string, value: string): number => {
+    const n = value.trim() === "" ? NaN : Number(value);
+    if (!Number.isSafeInteger(n) || n < 0) {
+      bad(400, `That ${name} is not a page.`, {
+        Received: show(value),
+        Expected: "a whole number, zero or more",
+        Source: `the ${name} query parameter`,
+        Fix: `send ?${name}=${name === "limit" ? "50" : "0"}`,
+      });
+    }
+    return n;
+  };
+  const limit_ = count_("limit", limit);
+  const offset_ = count_("offset", offset);
   const where_ = where.filter((x) => x).length
     ? sql`where true ${where.filter((x) => x).map((x: SqlFragment) => sql`and ${x}`)}`
     : sql``;
-  const rows = await sql`${select} ${from} ${where_} ${order ?? sql``} limit ${limit} offset ${offset}`;
+  const rows = await sql`${select} ${from} ${where_} ${order ?? sql``} limit ${limit_} offset ${offset_}`;
   const cols_: Row<Col> = arrayify(
     rows.columns.map((col: { name: string; type: number }) => ({
       name: col.name,
@@ -948,7 +988,7 @@ const cselect = async ({
   return {
     data: [(cols as unknown as Row<Col>) ?? cols_, ...rows],
     count,
-    offset: parseInt(offset),
+    offset: offset_,
   };
 };
 
@@ -990,6 +1030,117 @@ app.use("*", async (c, next) => {
   await next();
 });
 
+/** The path as sent, percent-decoded. One that cannot be decoded is left as it
+ * is: it is not any sheet's path either, and the refusal that follows says so
+ * rather than a URIError and a 500. */
+const decodePath = (path: string): string => {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return path;
+  }
+};
+
+// Postgres text cannot hold a NUL, so a percent-encoded one in a path or a
+// query string reached a SQL comparison through every :id there is and came
+// back as an unexplained 500 -- and, through pg-gateway, took the connection
+// behind it down with it. Refused before routing, so no handler has to
+// remember: POST /net/:id refuses one in a body the same way, and syncRole one
+// in a document id.
+app.use("*", async (c, next) => {
+  const line = [decodePath(c.req.path), ...Object.values(c.req.query())];
+  const at = line.findIndex((part) => part.includes("\0"));
+  if (at >= 0) {
+    bad(400, "That request names something no id can hold.", {
+      Received: `a NUL byte in ${at === 0 ? "the path" : "the query string"}, ${show(line[at])}`,
+      Expected: "a path and a query string with no NUL bytes",
+      Source: at === 0 ? "the request path" : "the query string",
+      Fix: "check the id; every id this server mints is base58",
+    });
+  }
+  await next();
+});
+
+// One delivery may not be larger than this. The net table has no retention policy
+// yet, so an unbounded body is an unbounded table.
+export const BODY_CAP = 1_048_576;
+
+// One cap for every body, whatever route reads it. POST /net/:id had one and
+// every JSON route parsed whatever arrived, which made the one theatre.
+// Checked against content-length when there is one and counted off the wire
+// when there is not, so a sender that lies about the size is refused mid-read.
+app.use(
+  "*",
+  bodyLimit({
+    maxSize: BODY_CAP,
+    onError: (c) =>
+      bad(413, "That request body is too large to take.", {
+        Received: c.req.header("content-length")
+          ? `${c.req.header("content-length")} bytes declared`
+          : `more than ${BODY_CAP} bytes`,
+        Limit: `${BODY_CAP} bytes per request`,
+        Source: "the request body",
+        Fix: "send the payload in pages, or post a URL the sheet can fetch instead",
+      }),
+  }),
+);
+
+/** The request body as the one JSON object every route past the middleware
+ * takes. A body that was not JSON threw a SyntaxError out of the handler, and
+ * a JSON null threw a TypeError out of the destructuring on the next line;
+ * both answered 500 to a caller holding a real credential. */
+const jsonBody = async (c: Context): Promise<Record<string, unknown>> => {
+  const text = await c.req.text();
+  // No body is no fields, which every route here takes: a link minted with
+  // nothing but its defaults is the common case, not a malformed one.
+  if (text.trim() === "") return {};
+  // Postgres text cannot hold a NUL, and most of these fields are stored as
+  // text; one that got through answered 500 to a caller who could have fixed it.
+  if (text.includes("\0")) {
+    bad(400, "That request body carries a byte no field can hold.", {
+      Received: `a NUL byte at offset ${text.indexOf("\0")} of ${text.length}`,
+      Expected: "a JSON object with no NUL bytes",
+      Source: "the request body",
+      Fix: "remove the \\u0000 from the field that carries it",
+    });
+  }
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch (err) {
+    bad(400, "That request body is not JSON.", {
+      Received: show(text.slice(0, 80)) + (text.length > 80 ? "…" : ""),
+      Expected: "a JSON object",
+      Source: "the request body",
+      Fix: `send Content-Type: application/json and a JSON object; the parser said: ${reason(err)}`,
+    });
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    bad(400, "That request body is not a JSON object.", {
+      Received: show(body),
+      Expected: "a JSON object",
+      Source: "the request body",
+      Fix: "put the fields in an object: {...}",
+    });
+  }
+  return body as Record<string, unknown>;
+};
+
+/** A document's rows, or a refusal. A claimed document is the caller's own, so
+ * `data` may be anything, and one without it threw out of a destructure. */
+const docData = (hand: { doc: () => { data?: unknown } | undefined }, sheet_id: string): unknown[] => {
+  const data = hand.doc()?.data;
+  if (!Array.isArray(data)) {
+    bad(400, `Sheet ${sheet_id} has a document with no rows in it.`, {
+      Expected: "a document whose data is a list: a header row, then rows",
+      Received: show(data),
+      Source: `the automerge document behind ${sheet_id}`,
+      Fix: `re-create the sheet, or claim it again with PUT /library/${sheet_id}`,
+    });
+  }
+  return data;
+};
+
 // --- seeding
 
 // Every sheet seed() puts in the shop. Named rather than inlined because the
@@ -1007,10 +1158,11 @@ export const seed = async () => {
   await sql.unsafe(examplesSql);
   for (const { doc_id, name, tags, doc } of SEEDED) {
     await sql`
-      insert into sheet (sell_price, created_by, type, name, tags, doc_id, row_0)
-      values (0, (select usr_id from usr where email = ''), 'template', ${name}, ${tags},
+      insert into sheet (sell_price, license, created_by, type, name, tags, doc_id, row_0)
+      values (0, 'public-domain', (select usr_id from usr where email = ''), 'template', ${name}, ${tags},
               ${"dataset-" + doc_id}, ${sql.json({ name, ...doc })})
-      on conflict (doc_id) do update set name = excluded.name, tags = excluded.tags, row_0 = excluded.row_0
+      on conflict (doc_id) do update set name = excluded.name, tags = excluded.tags, row_0 = excluded.row_0,
+                                         license = excluded.license
     `;
   }
   // The operator's failure log. It is a net-hook sheet because that is already
@@ -1018,11 +1170,13 @@ export const seed = async () => {
   // and trims with no new code, and `select * from @net-hook:errors` works the
   // day it lands. The sentinel owns it and has no password, so reading it in
   // the app means sharing it to a real account once.
-  await sql`
-    insert into sheet (created_by, type, doc_id, name, tags)
-    values ((select usr_id from usr where email = ''), 'net-hook', ${ERROR_DOC}, 'errors', '{"system"}')
-    on conflict (doc_id) do nothing
-  `;
+  for (const [doc_id, name] of [[ERROR_DOC, "errors"], [REPORT_DOC, "reports"]]) {
+    await sql`
+      insert into sheet (created_by, type, doc_id, name, tags)
+      values ((select usr_id from usr where email = ''), 'net-hook', ${doc_id}, ${name}, '{"system"}')
+      on conflict (doc_id) do nothing
+    `;
+  }
   // The sentinel cannot be logged into, so the log needs a reader who can. The
   // account row is created here rather than waited for: an operator who has not
   // signed up yet would otherwise get nothing, and signing up later adopts this
@@ -1126,6 +1280,9 @@ const grantSync = (usr_id: string, documentId: string): void => {
 // stop disagreeing about who may read what.
 const syncRole = async (auth: WsAuth, documentId: string): Promise<Role | null> => {
   const { usr_id, share } = auth;
+  // Postgres text cannot hold a NUL, so a document id carrying one has no row
+  // to look up and no role -- asking threw, and closed the socket asking.
+  if (documentId.includes("\0")) return null;
   if (usr_id && (pendingSync.get(`${usr_id}/${documentId}`) ?? 0) > Date.now()) return "owner";
   const key = `${usr_id ?? "-"}:${share ?? "-"}/${documentId}`;
   const hit = syncAccessCache.get(key);
@@ -1372,6 +1529,17 @@ app.notFound((c) => {
 // Authorization must not sit in a log forever. trimNet bounds it at NET_KEEP.
 const ERROR_DOC = "errors";
 const ERROR_SHEET = `net-hook:${ERROR_DOC}`;
+
+// Every report on a listing lands here as a row, the way every failure lands on
+// the error log: a net-hook sheet so it reads, pages and exports with no new
+// code. The reporter reads their own rows and the operator reads them all.
+const REPORT_DOC = "reports";
+const REPORT_SHEET = `net-hook:${REPORT_DOC}`;
+
+/** Whoever reads the error log. OPERATOR_EMAIL is granted that at seed time,
+ * and it is the one authority this server has above a sheet's own owner. */
+const isOperator = async (usr_id: string): Promise<boolean> =>
+  (await sql`select true from sheet_usr where sheet_id = ${ERROR_SHEET} and usr_id = ${usr_id}`).length > 0;
 
 // How many log writes have failed in a row. It resets on the next success, so
 // it reads as "the log is broken right now" rather than "it was once". Without
@@ -1633,6 +1801,8 @@ const STATUS_AGO = [0, 3600, 86400];
 // a saturated pool, a cold start, a query queue -- rather than a slow packet.
 const LATENCY_MS = 250;
 const REFUSALS_MAX = 20;
+// One open report fails the grade; this many is total failure.
+const REPORTS_OPEN_MAX = 10;
 const POLL_STALE_S = 7200;
 const DB_BYTES_CAP = 4_000_000_000;
 const HEAP_BYTES_CAP = 512_000_000;
@@ -1749,7 +1919,9 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
       ${NET_KEEP}::numeric / greatest(1, coalesce(
         (select max(c) from (select count(*) as c from net group by sheet_id) logs), 0)) as log_capped,
       ${DB_BYTES_CAP}::numeric / greatest(1, pg_database_size(current_database())) as db_size,
-      (select count(*) from sheet where doc_id like 'dataset-%')::numeric / ${SEEDED.length} as datasets_present
+      (select count(*) from sheet where doc_id like 'dataset-%')::numeric / ${SEEDED.length} as datasets_present,
+      1 - least(${REPORTS_OPEN_MAX}, (select count(*) from net n
+        where n.sheet_id = ${REPORT_SHEET} and n.meta->>'status' = 'open'))::numeric / ${REPORTS_OPEN_MAX} as reports_reviewed
   `;
 
   const byAgo = (
@@ -1786,6 +1958,7 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
     now(`The server heap is under ${HEAP_BYTES_CAP / 1e6} MB.`, HEAP_BYTES_CAP / Deno.memoryUsage().heapUsed),
     byAgo("Somebody created a sheet in the past 24 hours.", (r) => r.sheets_created),
     now("Every seeded dataset is still in the shop.", live.datasets_present),
+    now("No shop report is waiting for review.", live.reports_reviewed),
   ]);
 };
 
@@ -1826,8 +1999,7 @@ app.post("/signup", async (c) => {
 
 app.post("/signup/:token{.+}", async (c) => {
   const token = c.req.param("token");
-  const { email, password } = await c.req.json();
-  if (!token || !email || !password) return c.json(null, 400);
+  const { email, password } = await credentials(c);
   const [ts, _hash] = token.split(":");
   const epoch = parseInt(ts);
   if (Date.now() / 1000 - epoch > 86400) return c.json(null, 401);
@@ -1840,8 +2012,24 @@ app.post("/signup/:token{.+}", async (c) => {
   return c.json(null, 200);
 });
 
+/** The one body POST /login and POST /signup/:token take. A boolean where
+ * the email goes reached Postgres declared boolean and answered 500, from a
+ * caller with no account at all. */
+const credentials = async (c: Context): Promise<{ email: string; password: string }> => {
+  const { email, password } = await jsonBody(c);
+  if (typeof email !== "string" || !email || typeof password !== "string" || !password) {
+    bad(400, "Signing in takes an email and a password.", {
+      Received: `email ${show(email)}, password ${typeof password === "string" ? "a string" : show(password)}`,
+      Expected: '{"email": "you@example.com", "password": "..."}',
+      Source: "the request body",
+      Fix: "send both as strings",
+    });
+  }
+  return { email, password };
+};
+
 app.post("/login", async (c) => {
-  const { email, password } = await c.req.json();
+  const { email, password } = await credentials(c);
   const [usr] = await sql`select usr_id, password from usr where email = ${email}`;
   if (!usr || !(await verifyPassword(password, usr.password))) return c.json(null, 401);
   return c.json(
@@ -2035,22 +2223,33 @@ app.post("/stripe", async (c) => {
 
 app.get("/shop", async (c) => {
   const { limit, offset, ...qs } = c.req.query();
+  // Two numbers with a dash between. Anything else reached Postgres as a cast
+  // of "undefined" or of a word, and answered 500.
+  const range = qs.sell_price === undefined ? null : qs.sell_price.match(/^(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)$/);
+  if (qs.sell_price !== undefined && !range) {
+    bad(400, "A price range is two numbers with a dash between.", {
+      Received: show(qs.sell_price),
+      Expected: "min-max, such as 0-20",
+      Source: "the sell_price query parameter",
+      Fix: "send ?sell_price=0-20",
+    });
+  }
   return page(c)(
     await cselect({
       cols: [
         { name: "name", type: "text", key: "name" },
         { name: "price", type: "usd", key: "sell_price" },
+        { name: "license", type: "text", key: "license" },
         { name: "", type: "create", key: "row_0" },
       ],
-      select: sql`select created_at, sell_id, sell_type, sell_price, name, row_0`,
+      select: sql`select created_at, sell_id, sell_type, sell_price, license, name, row_0`,
       from: sql`from sheet s`,
       where: [
         sql`sell_price >= 0`,
         sql`sell_type is not null`,
         qs.name && sql`name ilike ${qs.name + "%"}`,
         qs.sell_type && sql`sell_type = ${qs.sell_type}`,
-        qs.sell_price &&
-        sql`sell_price between ${qs.sell_price.split("-")[0]}::numeric and ${qs.sell_price.split("-")[1]}::numeric`,
+        range && sql`sell_price between ${range[1]}::numeric and ${range[2]}::numeric`,
       ],
       // name is not unique, so it cannot decide the order on its own.
       order: sql`order by name, sell_id`,
@@ -2060,9 +2259,6 @@ app.get("/shop", async (c) => {
   );
 });
 
-// One delivery may not be larger than this. The net table has no retention policy
-// yet, so an unbounded body is an unbounded table.
-const NET_BODY_CAP = 1_048_576;
 
 // How far a delivery's signed timestamp may sit from ours. It is replay
 // protection only in the crude sense -- a delivery id dedupe is a separate item
@@ -2322,7 +2518,7 @@ const verifyDelivery = async (
 
 // --- delivery budgets
 //
-// NET_BODY_CAP bounds one delivery and trimNet bounds one sheet, but nothing
+// BODY_CAP bounds one delivery and trimNet bounds one sheet, but nothing
 // bounded the sender: inside the global limiter's 100 requests a second, one
 // machine churns all NET_KEEP rows in ten seconds and every delivery the sheet
 // held before it is gone. The key is the **sheet**, not callerIp(): a webhook
@@ -2337,7 +2533,7 @@ const verifyDelivery = async (
 export const hookBuckets = new Map<string, { rows: number; bytes: number; lastRefill: number }>();
 export const HOOK_WINDOW_S = 60;
 export const HOOK_ROWS_PER_WINDOW = 60;
-export const HOOK_BYTES_PER_WINDOW = 4 * NET_BODY_CAP;
+export const HOOK_BYTES_PER_WINDOW = 4 * BODY_CAP;
 
 /** This sheet's budget, refilled for the time since it was last read. Exported
  * because the test drives the key cap through the same function the handler
@@ -2386,14 +2582,12 @@ app.post("/net/:id", async (c) => {
       Fix: "post to a net-hook sheet, or change this sheet's type prefix",
     });
   }
-  const declared = Number(c.req.header("content-length") ?? NaN);
   // Bytes, not text: the signature covers what was sent, and decoding a
   // non-UTF-8 payload first would replace characters and make a correctly
   // signed delivery unverifiable. The column is text, so it is decoded after.
-  const raw = declared > NET_BODY_CAP
-    ? new Uint8Array(new ArrayBuffer(0))
-    : new Uint8Array<ArrayBuffer>(await c.req.arrayBuffer());
-  const size = declared > NET_BODY_CAP ? declared : raw.byteLength;
+  // Bounded by the body cap every route gets, before routing.
+  const raw = new Uint8Array<ArrayBuffer>(await c.req.arrayBuffer());
+  const size = raw.byteLength;
   const body = new TextDecoder().decode(raw);
   // Postgres text cannot hold a NUL, and the column is text because a body is
   // a body. Verified bytes that cannot be stored used to reach the insert and
@@ -2408,25 +2602,25 @@ app.post("/net/:id", async (c) => {
       Fix: "send text or JSON; base64 the payload if it is binary",
     });
   }
-  if (size > NET_BODY_CAP) {
-    bad(413, `This delivery to ${sheet_id} is too large to store.`, {
-      Received: `${size} bytes`,
-      Limit: `${NET_BODY_CAP} bytes per delivery`,
-      Source: "the request body",
-      Fix: "send the payload in pages, or post a URL the sheet can fetch instead",
-    });
-  }
-  // Placed here on purpose, between the checks that cost nothing and the four
-  // round trips that follow. After the 404 and the 400, because a budget must
-  // be keyed on a sheet that exists -- keyed before them, a caller minting ids
-  // mints map keys -- and because those two already answer before the signature
-  // is checked, so a 429 here tells a caller holding a doc_id nothing the 404
-  // did not. Before verifyDelivery, the insert and the trim, which is what a
-  // refusal is worth shedding. Not before the body is read: the byte bound must
-  // spend the bytes actually sent rather than the content-length a flooder
-  // declares, and the body is on the wire either way, so refusing sooner saves
-  // nothing. A 429 is the one status app.onError does not log, so shedding load
-  // stays the cheap path.
+  // Every delivery is signed. There is no per-sheet opt-out: without this,
+  // anyone who learns a net sheet's id can append rows to it. Which scheme is
+  // checked comes off the sheet's stored secrets, never off the request.
+  const { scheme, secret_at, sig } = await verifyDelivery(c, sheet_id, raw, size, heard);
+  // Checked and charged here, in one step, after the signature and before the
+  // write. One step because the check and the charge are what a budget is,
+  // and an await between them is a window every concurrent sender walks
+  // through: thirty deliveries against a budget of one landed twenty-seven.
+  // After verifyDelivery so that a 401 spends nothing -- charging every
+  // attempt would let one attacker posting junk at an id it guessed exhaust
+  // the budget of the sender that sheet belongs to, the opposite of what the
+  // budget protects. Charging first and refunding a 401 would keep the secret
+  // lookup behind the budget, but every junk request in flight would hold the
+  // sender's budget down until its refund, which is that same attack in
+  // miniature. So a spent budget pays the secret lookup before it refuses,
+  // and callerIp()'s limiter is what bounds a flood per source. Not before the
+  // body is read: the byte bound must spend the bytes actually sent rather
+  // than the content-length a flooder declares. A 429 is the one status
+  // app.onError does not log.
   const budget = hookBucket(sheet_id);
   if (budget.rows < 1) {
     bad(429, `Sheet ${sheet_id} has taken too many deliveries.`, {
@@ -2448,10 +2642,8 @@ app.post("/net/:id", async (c) => {
       } seconds`,
     });
   }
-  // Every delivery is signed. There is no per-sheet opt-out: without this,
-  // anyone who learns a net sheet's id can append rows to it. Which scheme is
-  // checked comes off the sheet's stored secrets, never off the request.
-  const { scheme, secret_at, sig } = await verifyDelivery(c, sheet_id, raw, size, heard);
+  budget.rows -= 1;
+  budget.bytes -= size;
   // The skew window bounds a replay to HOOK_SKEW seconds, which is not the same
   // as never: a delivery captured off the wire can be sent again, unchanged,
   // until its t goes stale. The unique index on (sheet_id, signature) is what
@@ -2462,7 +2654,20 @@ app.post("/net/:id", async (c) => {
   // The one hole is the log's own retention: trimNet keeps NET_KEEP rows per
   // sheet, so a sheet taking more than that can evict the record and free the
   // signature -- at which point the skew check has long since refused it anyway.
-  const [stored] = await sql`insert into net ${
+  // Given back on the two exits after the charge that store nothing: a replay,
+  // or one captured delivery sent over and over could exhaust the budget of
+  // the sender it was captured from; and an insert that fails, or our outage
+  // would answer the sender's next delivery with a 429 blaming the sender.
+  // Read again rather than refunding the object above: the insert spans an
+  // eviction, and a bucket the map no longer holds refills full on its own.
+  const refund = () => {
+    const bucket = hookBucket(sheet_id);
+    bucket.rows = Math.min(HOOK_ROWS_PER_WINDOW, bucket.rows + 1);
+    bucket.bytes = Math.min(HOOK_BYTES_PER_WINDOW, bucket.bytes + size);
+  };
+  let stored;
+  try {
+    [stored] = await sql`insert into net ${
     sql({
       sheet_id,
       body,
@@ -2478,7 +2683,12 @@ app.post("/net/:id", async (c) => {
       meta: sql.json({ bytes: size, scheme, secret_at, sig }),
     })
   } on conflict (sheet_id, (meta->>'sig')) do nothing returning net_id`;
+  } catch (err) {
+    refund();
+    throw err;
+  }
   if (!stored) {
+    refund();
     bad(409, `This delivery to ${sheet_id} has already been stored.`, {
       Received: "a signature this sheet has already accepted",
       // Under v2 a signature covers the second, the request target and the
@@ -2498,18 +2708,6 @@ app.post("/net/:id", async (c) => {
         : `${scheme} sends each delivery one signature; this one has already landed`,
     });
   }
-  // Charged only by a delivery that landed. A 401 or a 409 spends nothing:
-  // charging every attempt would let one attacker replaying one captured
-  // delivery, or posting junk at an id it guessed, exhaust the budget of the
-  // sender that sheet belongs to -- the opposite of what the budget protects.
-  // The cost is that an unsigned flood is shed by callerIp()'s global limiter
-  // alone, and each of its requests still pays the secret lookup a spent budget
-  // would have refused before. Read again rather than reusing the bucket
-  // checked above, because the awaits between them span an eviction, and
-  // charging a bucket the map no longer holds charges nobody.
-  const spent = hookBucket(sheet_id);
-  spent.rows -= 1;
-  spent.bytes -= size;
   await trimNet(sheet_id);
   return c.json(null, 200);
 });
@@ -2531,8 +2729,12 @@ const ipBlocked = (ipRaw: string): boolean => {
 // refusal at the end of the loop quotes the same number the loop counts to.
 const REDIRECT_MAX = 5;
 
+// Who we are, to every host we fetch, and where that is explained. A host that
+// wants us gone blocks this string; the readme says what we do and how often.
+export const USER_AGENT = "Scrapsheets/1.0 (+https://github.com/surprisetalk/scrapsheets#polite-scraper)";
+
 // SSRF guard: block internal hosts by literal IP and by resolved DNS; follow redirects manually re-validating each hop.
-const safeFetch = async (start: string, headers: Record<string, string> = {}): Promise<Response> => {
+export const safeFetch = async (start: string, headers: Record<string, string> = {}): Promise<Response> => {
   let url = start;
   for (let hop = 0; hop < REDIRECT_MAX; hop++) {
     const u = new URL(url);
@@ -2572,7 +2774,7 @@ const safeFetch = async (start: string, headers: Record<string, string> = {}): P
       // page waiting on /proxy has less patience than that anyway.
       signal: AbortSignal.timeout(10_000),
       headers: {
-        "User-Agent": "Scrapsheets/1.0",
+        "User-Agent": USER_AGENT,
         "Accept": "application/json, application/xml, text/xml, application/atom+xml, */*",
         // Caller headers may carry credentials: never replay them to a host an
         // origin redirected to.
@@ -2678,6 +2880,20 @@ export const netDue = new Map<string, number>();
 // only the one that heard it. Two sheets on one API otherwise take turns
 // stampeding the host that just said stop.
 export const hostDue = new Map<string, number>();
+// The least time between two of the poller's requests to one host, however
+// many sheets point there: the next sheet on a host waits for the next cycle.
+// The poller's alone, and not the proxy's: a proxy call is one person asking
+// once, and letting it write here would let an anonymous caller hold a feed's
+// host in the future forever, or mint hosts until the broom evicts a real
+// Retry-After.
+export const HOST_GAP_MS = 1_000;
+
+/** A host was just asked, or asked to wait: the later of the two holds. A plain
+ * set let a Retry-After of 0 erase the gap on the one host that had said stop. */
+const holdHost = (host: string, until: number): void => {
+  hostDue.set(host, Math.max(hostDue.get(host) ?? 0, until));
+  bound(hostDue, RATE_LIMIT_KEYS_MAX);
+};
 
 // The most failures in a row one feed retries before it stops and waits for its
 // own interval again. The row that gives up names this number and the count.
@@ -2727,7 +2943,7 @@ const readBody = async (res: Response): Promise<Uint8Array> => {
   if (!reader) return new Uint8Array();
   const chunks: Uint8Array[] = [];
   let size = 0;
-  for (let chunk = 0; size <= NET_BODY_CAP; chunk++) {
+  for (let chunk = 0; size <= BODY_CAP; chunk++) {
     if (chunk >= BODY_CHUNKS_MAX) {
       throw new Error(
         explain("This response arrived in more pieces than a body may take.", {
@@ -2842,6 +3058,8 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
         if (err instanceof HTTPException) throw err;
         return reason(err);
       });
+      // Asked once; the next sheet on this host in the same cycle steps over it.
+      holdHost(host, now + HOST_GAP_MS);
       // A 5xx and a 429 are the host saying "later". A 404, a 401, an SSRF
       // refusal are a "no", and retrying a "no" is noise on top of the failure
       // row that already answered it.
@@ -2852,10 +3070,7 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
         // The wait is the host's and not this sheet's, so it holds every sheet
         // pointed there. It is a floor and not a schedule: this sheet takes the
         // later of it and its own backoff, which is what the host asked for.
-        if (after !== null) {
-          hostDue.set(host, now + retryAfterMs(after, now));
-          bound(hostDue, RATE_LIMIT_KEYS_MAX);
-        }
+        if (after !== null) holdHost(host, now + retryAfterMs(after, now));
         const attempt = Number(was.attempt ?? 0) + 1;
         // Read back out of jsonb, so it is guarded like every other read out of
         // jsonb: a count that is not a whole number lands as NaN in the next
@@ -2929,11 +3144,11 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       const raw = await readBody(res);
       // A body over the cap is a failure row naming both numbers. A truncated
       // success is a parse error further downstream, blamed on the data.
-      if (res.ok && raw.byteLength > NET_BODY_CAP) {
+      if (res.ok && raw.byteLength > BODY_CAP) {
         throw new Error(
           explain("This feed's response is too large to store.", {
             Received: `${res.headers.get("content-length") ?? `at least ${raw.byteLength}`} bytes`,
-            Limit: `${NET_BODY_CAP} bytes per response`,
+            Limit: `${BODY_CAP} bytes per response`,
             Source: url,
             Fix: "point the sheet at a paged or filtered endpoint, or give it a cursor",
           }),
@@ -3341,16 +3556,8 @@ app.use("*", async (c, next) => {
   // No key header and the request takes exactly the path it always did.
   if (!presented) return await jwtAuth(c, next);
   const { usr_id, sheet_id } = await apiKeyScope(presented);
-  // A colon may arrive percent-encoded. One that cannot be decoded at all is
-  // not this key's sheet either, so it falls to the refusal below rather than
-  // to a URIError and a 500.
-  const path = (() => {
-    try {
-      return decodeURIComponent(c.req.path);
-    } catch {
-      return c.req.path;
-    }
-  })();
+  // A colon may arrive percent-encoded.
+  const path = decodePath(c.req.path);
   // The scope is checked on the path, before routing, so no handler has to
   // remember to ask -- and a key that reached POST /library/:id/secret could
   // mint itself a key for a sheet it was never given.
@@ -3515,15 +3722,37 @@ app.post("/buy/:id", async (c) => {
   return c.json({ data: { checkout_url: session.url } }, 200);
 });
 
+// What lets a listing be sold. Recorded on the listing and shown in the shop,
+// so a buyer knows what they may do with it and a report has something to be
+// about. "own" is work the seller made; the rest are the licenses public data
+// arrives under.
+export const LICENSES = ["own", "public-domain", "cc0", "cc-by", "cc-by-sa", "odbl"] as const;
+
 app.post("/sell/:id", async (c) => {
-  const body = await c.req.json();
-  const { price } = body;
+  const body = await jsonBody(c);
+  const { price, license } = body;
   if (price === undefined) {
     bad(400, `A listing needs a price.`, {
       Expected: `a "price" field in the body`,
       Received: show(body),
       Source: "the request body",
       Fix: `post {"price": 0} to list it for free`,
+    });
+  }
+  if (price !== null && (typeof price !== "number" || !Number.isFinite(price) || price < 0)) {
+    bad(400, `A listing's price is a number of dollars, zero or more.`, {
+      Expected: "a number, such as 0 or 19.99, or null to take the listing down",
+      Received: show(price),
+      Source: `the "price" field of the request body`,
+      Fix: `post {"price": 0} to list it for free`,
+    });
+  }
+  if (price !== null && !LICENSES.includes(license as typeof LICENSES[number])) {
+    bad(400, `A listing says what lets it be sold.`, {
+      Expected: `a "license" of ${LICENSES.join(", ")}`,
+      Received: show(license),
+      Source: `the "license" field of the request body`,
+      Fix: `post {"price": 0, "license": "own"} for work that is yours; name the source's license otherwise`,
     });
   }
   // An alert holds someone's email address and sends mail on a timer. Selling
@@ -3536,7 +3765,7 @@ app.post("/sell/:id", async (c) => {
     });
   }
   const updated = await sql`
-    update sheet set sell_price = ${price}
+    update sheet set sell_price = ${price}${price === null ? sql`` : sql`, license = ${license as string}`}
     where true
       and sheet_id = ${c.req.param("id")}
       and created_by = ${c.get("usr_id")}
@@ -3551,6 +3780,123 @@ app.post("/sell/:id", async (c) => {
       Fix: "sell a sheet of your own, or fork this one and sell the fork",
     });
   }
+  return c.json(null, 200);
+});
+
+// --- shop moderation
+//
+// A report is a row on the reports sheet, one per account per listing -- the
+// unique index on (sheet_id, meta->>'sig') that refuses a replayed delivery
+// refuses a second report the same way. A review closes the reports on a
+// listing; a takedown pulls the listing too. The seller pulls their own with
+// POST /sell/:id {"price": null}, so nothing here is for them.
+
+const REPORT_REASON_CAP = 1_000;
+const REVIEWS = ["keep", "takedown"] as const;
+
+/** The sheet behind a sell_id and whether it is in the shop now, or a 404. A
+ * review reaches a listing the seller has already pulled: the reports on it
+ * are still open, and the operator is the only one who closes them. */
+const listing = async (sell_id: string): Promise<{ sheet_id: string; created_by: string; live: boolean }> => {
+  const [row] = await sql`
+    select sheet_id, created_by::text, sell_price is not null as live from sheet where sell_id = ${sell_id}
+  `;
+  if (!row) {
+    bad(404, `No sheet has the listing id ${sell_id}.`, {
+      Expected: "the sell_id of a listing GET /shop shows",
+      Received: sell_id,
+      Source: "the sheet table, for a row with that sell_id",
+      Fix: "read the sell_id off GET /shop",
+    });
+  }
+  return row;
+};
+
+app.post("/shop/:sell_id/report", async (c) => {
+  const sell_id = c.req.param("sell_id");
+  const usr_id = c.get("usr_id");
+  const { reason: complaint } = await jsonBody(c);
+  if (typeof complaint !== "string" || !complaint.trim() || complaint.length > REPORT_REASON_CAP) {
+    bad(400, `A report says what is wrong.`, {
+      Expected: `a "reason" of 1 to ${REPORT_REASON_CAP} characters`,
+      Received: typeof complaint === "string" ? `${complaint.length} characters` : show(complaint),
+      Source: `the "reason" field of the request body`,
+      Fix: `post {"reason": "this is the census bureau's table, resold"}`,
+    });
+  }
+  const listed = await listing(sell_id);
+  if (!listed.live) {
+    bad(404, `No listing ${sell_id} is in the shop.`, {
+      Expected: "a listing GET /shop shows",
+      Received: `${listed.sheet_id}, which is not for sale`,
+      Source: "sheet.sell_price, which is null",
+      Fix: "a listing that was taken down has nothing left to report",
+    });
+  }
+  if (listed.created_by === String(usr_id)) {
+    bad(400, `That listing is yours.`, {
+      Received: `a report on ${listed.sheet_id}, which you listed`,
+      Expected: "a report on somebody else's listing",
+      Source: "sheet.created_by, against your account",
+      Fix: `take it down yourself with POST /sell/${listed.sheet_id} and {"price": null}`,
+    });
+  }
+  const [stored] = await sql`
+    insert into net ${
+    sql({
+      sheet_id: REPORT_SHEET,
+      method: "REPORT",
+      body: complaint,
+      meta: sql.json({ sell_id, usr_id, sig: `${sell_id}:${usr_id}`, status: "open" }),
+    })
+  } on conflict (sheet_id, (meta->>'sig')) do nothing returning net_id`;
+  if (!stored) {
+    bad(409, `You have already reported ${sell_id}.`, {
+      Received: "a second report from this account on this listing",
+      Expected: "one report per account per listing",
+      Source: `the reports sheet, ${REPORT_SHEET}`,
+      Fix: `read your report with GET /sheet/${REPORT_SHEET}; the operator reviews it from there`,
+    });
+  }
+  // Not trimmed: a moderation record is a sheet that must keep everything, and
+  // a queue that forgets its oldest open report grades better for overflowing.
+  return c.json(null, 200);
+});
+
+app.post("/shop/:sell_id/review", async (c) => {
+  const sell_id = c.req.param("sell_id");
+  const usr_id = c.get("usr_id");
+  if (!(await isOperator(usr_id))) {
+    bad(403, `A review is the operator's to make.`, {
+      Received: "an account that does not read the error log",
+      Expected: "the account OPERATOR_EMAIL names",
+      Source: `membership of ${ERROR_SHEET}`,
+      Fix: `report the listing instead, with POST /shop/${sell_id}/report`,
+    });
+  }
+  const { action } = await jsonBody(c);
+  if (!REVIEWS.includes(action as typeof REVIEWS[number])) {
+    bad(400, `A review keeps a listing or takes it down.`, {
+      Expected: `an "action" of ${REVIEWS.join(" or ")}`,
+      Received: show(action),
+      Source: `the "action" field of the request body`,
+      Fix: `post {"action": "takedown"} to pull the listing, or {"action": "keep"} to close the reports on it`,
+    });
+  }
+  const listed = await listing(sell_id);
+  if (action === "takedown" && !listed.live) {
+    bad(404, `Listing ${sell_id} is already down.`, {
+      Expected: "a listing GET /shop shows",
+      Received: `${listed.sheet_id}, which is not for sale`,
+      Source: "sheet.sell_price, which is null",
+      Fix: `close the reports on it with {"action": "keep"}; there is nothing left to pull`,
+    });
+  }
+  if (action === "takedown") await sql`update sheet set sell_price = null where sell_id = ${sell_id}`;
+  await sql`
+    update net set meta = meta || ${sql.json({ status: "closed", review: action, reviewed_by: usr_id })}
+    where sheet_id = ${REPORT_SHEET} and meta->>'sell_id' = ${sell_id} and meta->>'status' = 'open'
+  `;
   return c.json(null, 200);
 });
 
@@ -3678,7 +4024,24 @@ app.get("/library", async (c) => {
 app.put("/library/:id", async (c) => {
   const sheet_id = c.req.param("id");
   const usr_id = c.get("usr_id");
-  const body = await c.req.json();
+  const body = await jsonBody(c);
+  const { name = "", tags = [] } = body;
+  if (typeof name !== "string") {
+    bad(400, `A sheet's name is text.`, {
+      Expected: "a string",
+      Received: show(name),
+      Source: `the "name" field of the request body`,
+      Fix: 'send {"name": "weekly p&l"}',
+    });
+  }
+  if (!Array.isArray(tags) || tags.some((tag) => typeof tag !== "string")) {
+    bad(400, `A sheet's tags are a list of words.`, {
+      Expected: "a list of strings",
+      Received: show(tags),
+      Source: `the "tags" field of the request body`,
+      Fix: 'send {"tags": ["finance", "weekly"]}',
+    });
+  }
 
   // Check if the user already has access to this sheet
   const [existingAccess] = await sql`
@@ -3740,8 +4103,8 @@ app.put("/library/:id", async (c) => {
     });
 
   const sheet = {
-    name: body.name ?? "",
-    tags: body.tags ?? [],
+    name,
+    tags,
     type,
     doc_id,
     row_0,
@@ -3791,7 +4154,7 @@ app.post("/library/:id/share", async (c) => {
   // A missing or malformed body is a 400 naming what arrived. Unguarded, the
   // json() throw became an unexplained 500, and cost a row in the error log
   // for a request the caller could have fixed from the message.
-  const { email, role } = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  const { email, role } = await jsonBody(c);
   if (typeof email !== "string" || !email.includes("@")) {
     bad(400, `A share needs somebody to share with.`, {
       Expected: "an email address",
@@ -3800,7 +4163,7 @@ app.post("/library/:id/share", async (c) => {
       Fix: `post {"email": "them@example.com", "role": "viewer"}`,
     });
   }
-  if (!ROLES.includes(role)) {
+  if (!ROLES.includes(role as Role)) {
     bad(400, `That is not a role a share can grant.`, {
       Expected: ROLES.join(", "),
       Received: show(role),
@@ -3830,7 +4193,7 @@ app.post("/library/:id/share", async (c) => {
 app.delete("/library/:id/share", async (c) => {
   const sheet_id = c.req.param("id");
   await assertSheetOwner(c, sheet_id);
-  const { email } = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  const { email } = await jsonBody(c);
   // Unvalidated, a missing email reached the delete and came back as the 404
   // "undefined is not a non-owner member of this sheet" -- a sentence about the
   // sheet for a mistake in the request.
@@ -3865,7 +4228,7 @@ app.delete("/library/:id/share", async (c) => {
 app.post("/library/:id/public", async (c) => {
   const sheet_id = c.req.param("id");
   await assertSheetOwner(c, sheet_id);
-  const { public: isPublic } = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  const { public: isPublic } = await jsonBody(c);
   if (typeof isPublic !== "boolean") {
     bad(400, `A sheet is either public or it is not.`, {
       Expected: "true or false",
@@ -3928,7 +4291,7 @@ app.post("/library/:id/socket", async (c) => {
   // Parsed, not destructured. `.catch` covers a body that is not JSON; a body
   // that is JSON `null` parses fine and then throws on the destructuring, which
   // is a 500 anyone can send.
-  const body = await c.req.json().catch(() => null);
+  const body = await jsonBody(c);
   const status = (body as { status?: unknown } | null)?.status;
   // hasOwn, not `in`. `in` walks the prototype, so "__proto__", "toString" and
   // every other Object.prototype key answered 200 and wrote a run whose
@@ -3945,7 +4308,7 @@ app.post("/library/:id/socket", async (c) => {
   // The same budget a webhook sender spends, keyed on the same sheet: a page
   // stuck in a reconnect ladder is a sender that will not stop, and one bucket
   // with one refill and one broom is the whole answer to that. Taken after the
-  // 403 and the 404 for the reason POST /net/:id takes it there.
+  // 403 and the 404, so a budget is keyed on a sheet that exists.
   const budget = hookBucket(sheet_id);
   if (budget.rows < 1) {
     bad(429, `Sheet ${sheet_id} has reported on its socket too many times.`, {
@@ -3957,14 +4320,21 @@ app.post("/library/:id/socket", async (c) => {
       } seconds`,
     });
   }
-  await sql`
-    insert into net (sheet_id, method, body, meta)
-    values (${sheet_id}, 'SOCKET', ${status}, ${sql.json({ status: SOCKET_STATES[status] })})
-  `;
-  // Read again rather than charging the object above, for the reason
-  // POST /net/:id reads again: the await between them spans an eviction, and
-  // charging a bucket the map no longer holds charges nobody.
-  hookBucket(sheet_id).rows -= 1;
+  // Charged before the write and in the same step as the check, for the
+  // reason POST /net/:id charges there: an await between them lets every
+  // concurrent reporter through.
+  budget.rows -= 1;
+  try {
+    await sql`
+      insert into net (sheet_id, method, body, meta)
+      values (${sheet_id}, 'SOCKET', ${status}, ${sql.json({ status: SOCKET_STATES[status] })})
+    `;
+  } catch (err) {
+    // Our failure, not the reporter's, so it is not the reporter's to pay.
+    const bucket = hookBucket(sheet_id);
+    bucket.rows = Math.min(HOOK_ROWS_PER_WINDOW, bucket.rows + 1);
+    throw err;
+  }
   await trimNet(sheet_id);
   return c.json({ data: { status } });
 });
@@ -3982,7 +4352,7 @@ const LINK_PASSWORD_MAX = 128;
 app.post("/library/:id/link", async (c) => {
   const sheet_id = c.req.param("id");
   await assertSheetOwner(c, sheet_id);
-  const { days, password } = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  const { days, password } = await jsonBody(c);
   if (days !== undefined && (typeof days !== "number" || !(days > 0) || days > LINK_DAYS_MAX)) {
     bad(400, `That is not a usable lifetime for a link to ${sheet_id}.`, {
       Received: show(days),
@@ -4093,7 +4463,7 @@ app.post("/library/:id/secret", async (c) => {
   // A missing or malformed body is a 400 naming what arrived. Unguarded, the
   // json() throw became an unexplained 500, and cost a row in the error log
   // for a request the caller could have fixed from the message.
-  const { name, value } = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  const { name, value } = await jsonBody(c);
   if (typeof name !== "string" || !SECRET_NAME.test(name)) {
     bad(400, `That is not a usable secret name on ${sheet_id}.`, {
       Received: show(name),
@@ -4166,7 +4536,7 @@ app.post("/library/:id/secret", async (c) => {
   //
   // The name cap above is a plain check because losing that race costs one name
   // over the limit; losing this one costs the sheet.
-  const value_encrypted = await encrypt(minted ?? value);
+  const value_encrypted = await encrypt(minted ?? (value as string));
   // The check and the insert are one transaction behind a lock on the sheet
   // row, because `insert ... where not exists` is only atomic against another
   // statement on the same connection. Two isolates each hold their own, so
@@ -4250,7 +4620,7 @@ app.get("/library/:id/secret", async (c) => {
 app.delete("/library/:id/secret", async (c) => {
   const sheet_id = c.req.param("id");
   await assertSheetOwner(c, sheet_id);
-  const { name } = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  const { name } = await jsonBody(c);
   const removed = typeof name === "string"
     ? await sql`delete from secret where sheet_id = ${sheet_id} and name = ${name} returning secret_id`
     : [];
@@ -4276,12 +4646,19 @@ app.post("/import/csv", async (c) => {
   let sheetName = "Imported CSV";
 
   if (contentType.includes("multipart/form-data")) {
-    const formData = await c.req.formData();
-    const file = formData.get("file") as File | null;
-    if (!file) {
+    const formData = await c.req.formData().catch((err) =>
+      bad(400, `That upload is not a multipart body.`, {
+        Expected: "multipart/form-data with a boundary, carrying a field named \"file\"",
+        Received: reason(err),
+        Source: "the request body, against its Content-Type",
+        Fix: "send the CSV as -F file=@data.csv, or post the raw text with Content-Type: text/csv",
+      })
+    );
+    const file = formData.get("file");
+    if (!(file instanceof File)) {
       bad(400, `That upload carries no file.`, {
-        Expected: `a multipart field named "file"`,
-        Received: `fields: ${[...formData.keys()].join(", ") || "(none)"}`,
+        Expected: `a multipart field named "file" holding a file`,
+        Received: file === null ? `fields: ${[...formData.keys()].join(", ") || "(none)"}` : `a text field ${show(file)}`,
         Source: "the multipart request body",
         Fix: "send the CSV as -F file=@data.csv, or post the raw text with Content-Type: text/csv",
       });
@@ -4675,7 +5052,7 @@ app.post("/sheet/:id", async (c) => {
       Fix: `ask an owner to run POST /library/${sheet_id}/share with your email and role editor`,
     });
   }
-  const { rows } = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  const { rows } = await jsonBody(c);
   if (!Array.isArray(rows) || !rows.length) {
     bad(400, `That is not a batch of rows to append to ${sheet_id}.`, {
       Received: Array.isArray(rows) ? "an empty rows array" : `a ${typeof rows} rows field`,
@@ -4701,7 +5078,7 @@ app.post("/sheet/:id", async (c) => {
         `the document is missing or unreadable; re-create the sheet, or claim it again with PUT /library/${sheet_id}`,
     });
   });
-  const [colsRow] = hand.doc().data;
+  const [colsRow] = docData(hand, sheet_id);
   const cols = Object.values(colsRow ?? {}) as Col[];
   if (!cols.length) {
     bad(400, `Sheet ${sheet_id} has no columns to append under.`, {
@@ -4903,7 +5280,7 @@ app.get("/net/:id", async (c) => {
 });
 
 app.post("/query", async (c) => {
-  return page(c)(await querify(c, await c.req.json(), c.req.query()));
+  return page(c)(await querify(c, await jsonBody(c) as unknown as Query, c.req.query()));
 });
 
 // --- codex (external databases)
@@ -5076,25 +5453,49 @@ app.get("/codex/:id", async (c) => {
       await codexRun(
         sheet_id,
         started,
-        err instanceof HTTPException ? err.status : 500,
+        err instanceof HTTPException ? err.status : 502,
         reason(err),
       );
     }
-    throw err;
+    if (err instanceof HTTPException) throw err;
+    // The far database did not answer: no such host, refused, wrong password,
+    // no such database, or a DSN postgres.js decodes and refuses where new URL
+    // did not. Ours to name and not ours to fix, which is a 502 and not a 500.
+    // codexRun's own comment establishes the message names the host or the
+    // parse and never the password.
+    bad(502, `The database behind ${sheet_id} did not answer.`, {
+      Received: reason(err),
+      Expected: "a reachable postgres server that takes the stored credentials",
+      Source: `the dsn stored for ${sheet_id}`,
+      Fix: `check the host, the credentials and the network, then save the dsn again with POST /codex-db/${
+        sheet_id.split(":")[1]
+      }`,
+    });
   }
 });
 
 app.post("/codex-db/:id", async (c) => {
   const sheet_id = `codex-db:${c.req.param("id")}`;
-  const dsn = await c.req.json();
+  const role = await syncRole({ usr_id: c.get("usr_id") ?? null, share: null }, c.req.param("id"));
+  if (role !== "owner" && role !== "editor") {
+    bad(403, `You cannot set the connection behind ${sheet_id}.`, {
+      Received: role ? `${role} access` : "no access",
+      Expected: "owner or editor access",
+      Source: "sheet_usr, for this account and this sheet",
+      Fix: `ask an owner to run POST /library/${sheet_id}/share with your email and role editor`,
+    });
+  }
+  const { dsn } = await jsonBody(c);
+  if (typeof dsn !== "string" || !dsn) {
+    bad(400, `A connection is a DSN string.`, {
+      Expected: '{"dsn": "postgresql://user:password@host:5432/database"}',
+      Received: show(dsn),
+      Source: `the "dsn" field of the request body`,
+      Fix: "send the connection string under dsn",
+    });
+  }
   await sql`
-    insert into db (sheet_id, dsn)
-    select ${sheet_id}, ${await encrypt(dsn)}
-    where exists (select true from sheet_usr su where (su.sheet_id,su.usr_id) = (${sheet_id},${
-    c.get(
-      "usr_id",
-    )
-  }))
+    insert into db (sheet_id, dsn) values (${sheet_id}, ${await encrypt(dsn)})
     on conflict (sheet_id) do update set dsn = excluded.dsn
   `;
   return c.json(null, 200);

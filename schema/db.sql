@@ -21,11 +21,13 @@ create table sheet
 , sell_id text not null unique generated always as (md5(doc_id||created_by::text)) stored
 , sell_type text generated always as (case when type = 'template' then row_0->>'type' when type in ('table','net-hook','net-http','net-socket','query') then 'portal' end) stored
 , sell_price numeric check (sell_price >= 0)
+, license text
 , buy_id text references sheet(sell_id)
 , buy_price numeric check (buy_price >= 0)
 , row_0 jsonb not null default '[]'::jsonb check (jsonb_typeof(row_0) in ('array','object'))
 , public boolean not null default false
 , check (not (sell_price is not null and buy_price is not null))
+, check (sell_price is null or license is not null)
 );
 
 create table db

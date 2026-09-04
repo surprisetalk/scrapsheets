@@ -1,6 +1,7 @@
-insert into sheet (sell_price, created_by, type, name, doc_id, row_0)
+insert into sheet (sell_price, license, created_by, type, name, doc_id, row_0)
 select
   0,
+  'own',
   (select usr_id from usr where email = ''),
   'template',
   name,
@@ -351,4 +352,4 @@ from jsonb_to_recordset(replace($$[
 ]$$,$$
   \n  $$,'\n')::jsonb) as s(name text, code text, cols jsonb)
 on conflict (doc_id) 
-do update set name = excluded.name, row_0 = excluded.row_0;
+do update set name = excluded.name, row_0 = excluded.row_0, license = excluded.license;

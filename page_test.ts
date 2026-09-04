@@ -15,7 +15,8 @@
 // sync-refusal hook are the real ones. Reach for `boot` for anything about what
 // the page renders, and for `glue` for anything about what the glue does.
 import { assert, assertEquals, assertThrows } from "@std/assert";
-import { cbor, Repo as AutomergeRepo } from "@automerge/automerge-repo";
+import { cbor, decodeHeads, encodeHeads, Repo as AutomergeRepo } from "@automerge/automerge-repo";
+import { decodeSyncMessage, encodeSyncMessage } from "@automerge/automerge";
 import { JSDOM } from "jsdom";
 import { BrowserWebSocketClientAdapter } from "./src/automerge-repo-ws.mjs";
 import { EXAMPLES } from "./src/examples.mjs";
@@ -517,6 +518,54 @@ Deno.test("a query sheet remembers how you were looking at it", async () => {
     [[0, "view", "burn_ratio", "sort", "asc"], [0, "view", "burn_ratio", "rank", 1]],
     "a query's arrangement is addressed by column name, under view",
   );
+});
+
+// A query's columns sort, filter and hide, and its rows are a table the view
+// already draws, so the keyboard walks it the way it walks a table. A cell in
+// it is computed, so a keystroke that would open an editor is refused by name.
+Deno.test("the keyboard moves over a query's result, and a write to it is refused by name", async () => {
+  const { dom, doc, app, all, text, fire, settle } = await boot("http://localhost/query:budget-burn");
+  app.ports.docQueried.send({
+    id: "query:budget-burn",
+    data: [
+      [{ key: "department", name: "department", type: "text" }, { key: "burn_ratio", name: "burn_ratio", type: "num" }],
+      { department: "Police", burn_ratio: 1.05 },
+      { department: "Parks", burn_ratio: 0.62 },
+      { department: "Fire", burn_ratio: 0.3 },
+    ],
+  });
+  await settle();
+  const key = async (init: Record<string, unknown>) => {
+    doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, ...init }));
+    await settle();
+  };
+  const selected = () => all("td.selected:not(.r0)").map((td) => td.textContent?.trim());
+
+  const police = all("td").find((td) => td.textContent?.trim() === "Police");
+  assert(police, "the result is drawn");
+  await fire(police, "mouseenter");
+  await fire(police, "mousedown");
+  await fire(police, "mouseup");
+  assertEquals(selected(), ["Police"], "a click selects the cell it lands on");
+
+  await key({ key: "ArrowDown" });
+  await key({ key: "ArrowDown" });
+  assertEquals(selected(), ["Fire"], "ArrowDown walks the result's rows");
+  await key({ key: "ArrowRight" });
+  assertEquals(selected(), ["0.3"], "ArrowRight walks its columns");
+  await key({ key: "ArrowDown" });
+  await key({ key: "ArrowRight" });
+  assertEquals(selected(), ["0.3"], "and the edge of the result is the edge");
+  await key({ key: "Home", ctrlKey: true });
+  assertEquals(selected(), ["Police"], "Ctrl+Home is the first cell");
+  await key({ key: "End", ctrlKey: true });
+  assertEquals(selected(), ["0.3"], "Ctrl+End is the last");
+  await key({ key: "a", ctrlKey: true });
+  assertEquals(selected().length, 6, "Ctrl+A selects the whole result");
+
+  await key({ key: "x" });
+  assertEquals(all("#new-cell").length, 0, "a computed cell opens no editor");
+  assert(text().includes("computed, not typed"), `the refusal names the reason, got: ${text().slice(0, 300)}`);
 });
 
 Deno.test("a query sheet opens arranged the way it was left", async () => {
@@ -1410,18 +1459,27 @@ const glueSource = async (deps: Record<string, unknown>) => {
  * `Promise.race` cannot cancel, and a test does not need to leave that behind.
  */
 const fakeHandle = (documentId: string, doc: Record<string, unknown>) => {
-  const listeners: ((d: unknown) => void)[] = [];
-  return {
+  let listeners: ((d: unknown) => void)[] = [];
+  // Every change moves the heads on, the way a real document's do.
+  let changes = 0;
+  const handle = {
     documentId,
     doc: () => doc,
+    // What the real handle answers: its heads, base58 the way a URL carries them.
+    heads: () => encodeHeads([changes.toString(16).padStart(64, "0")]),
     change: (fn: (d: Record<string, unknown>) => void) => {
       fn(doc);
+      changes++;
       // The shape automerge sends and `DocDelta` in src/Main.elm decodes. A field
       // short of it and the port refuses the whole value.
-      for (const listener of listeners) listener({ doc, handle: { documentId }, patchInfo: null, patches: [] });
+      for (const listener of listeners) listener({ doc, handle, patchInfo: null, patches: [] });
     },
     on: (_event: string, cb: (d: unknown) => void) => listeners.push(cb),
+    off: (_event: string, cb: (d: unknown) => void) => {
+      listeners = listeners.filter((l) => l !== cb);
+    },
   };
+  return handle;
 };
 
 const glue = async (
@@ -1518,6 +1576,9 @@ const glue = async (
   let repo!: { find: (id: string) => Promise<{ doc: () => unknown } | null> };
   // Documents the page made for itself, in the order it made them.
   const created: Record<string, unknown>[] = [];
+  // The handle the page was last given for each document, so a test can ask
+  // what a real handle would answer.
+  const handles: Record<string, ReturnType<typeof fakeHandle>> = {};
   const deps: Record<string, unknown> = {
     ...pageExports,
     ...sqlExports,
@@ -1525,6 +1586,8 @@ const glue = async (
     alasql,
     initializeWasm: () => Promise.resolve(),
     cbor,
+    decodeHeads,
+    decodeSyncMessage,
     BrowserWebSocketClientAdapter,
     IndexedDBStorageAdapter: class {},
     Repo: realRepo
@@ -1544,13 +1607,16 @@ const glue = async (
         }
         on() {}
         find(doc_id: string) {
-          return Promise.resolve(docs[doc_id] ? fakeHandle(doc_id, docs[doc_id]) : null);
+          if (!docs[doc_id]) return Promise.resolve(null);
+          handles[doc_id] ??= fakeHandle(doc_id, docs[doc_id]);
+          return Promise.resolve(handles[doc_id]);
         }
         create(doc: Record<string, unknown>) {
           const doc_id = `made${created.length + 1}`;
           created.push(doc);
           docs[doc_id] = doc;
-          return fakeHandle(doc_id, doc);
+          handles[doc_id] = fakeHandle(doc_id, doc);
+          return handles[doc_id];
         }
       },
   };
@@ -1595,6 +1661,13 @@ const glue = async (
     /** The document the repo holds, read back the way the page would. */
     document: async (id: string) => (await repo.find(id.split(":")[1]))?.doc(),
     path: () => dom.window.location.pathname.slice(1),
+    handles,
+    // The address bar: a new path, then the popstate Elm's navigation listens to.
+    go: async (path: string) => {
+      dom.window.history.pushState({}, "", path);
+      dom.window.dispatchEvent(new dom.window.PopStateEvent("popstate"));
+      await settle();
+    },
     /** A file chosen through the footer's file input, which is what Elm listens
      * for. `files` is read-only on the element, and Elm's decoder takes a plain
      * array as readily as a FileList.
@@ -1653,6 +1726,14 @@ const glue = async (
     refuse: async (documentId: string, message: string) => {
       adapter.socket = { readyState: 1 };
       adapter.receiveMessage(cbor.encode({ type: "error", senderId: "s", targetId: "t", documentId, message }));
+      await settle();
+    },
+    // The sync server's reply once it has taken a write: a sync frame whose
+    // heads are the document's, which include the head this browser wrote.
+    land: async (documentId: string, heads: string[]) => {
+      adapter.socket = { readyState: 1 };
+      const data = encodeSyncMessage({ heads, need: [], have: [], changes: [] });
+      adapter.receiveMessage(cbor.encode({ type: "sync", senderId: "s", targetId: "t", documentId, data }));
       await settle();
     },
     // The intervals the page started, and nothing else. `dom.window.close()`
@@ -1741,11 +1822,91 @@ Deno.test({
       page.text().includes("your edit was not saved"),
       `the server's own words should reach the writer, got: ${page.text().slice(-300)}`,
     );
+    assert(
+      page.text().includes("arranged is kept in this browser"),
+      `and the writer is told the arrangement is not lost, got: ${page.text().slice(-300)}`,
+    );
     assertEquals(
       page.held(),
       { "table:shared1": { "1": { sort: "asc", rank: 1 } } },
       "and the arrangement that was refused is kept in this browser instead",
     );
+    page.close();
+  },
+});
+
+// A held arrangement exists because the document would not take it. Once the
+// document does -- an owner granted this browser editor access -- the document
+// is the truth again, and the server says so the only way it can: its next
+// sync frame carries the head this browser wrote. Refusals are remembered for
+// one open of the sheet, not the whole session, or the grant is never tried.
+Deno.test({
+  name: "a held arrangement is dropped once the document takes one",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const doc = {
+      type: "table",
+      data: [
+        [{ name: "a", type: "text", key: "0" }, { name: "b", type: "text", key: "1" }],
+        { "0": "x", "1": "y" },
+      ],
+    };
+    const page = await glue("http://localhost/table:shared1", { docs: { shared1: doc } });
+    const sortOn = async (name: string) =>
+      await page.click(page.all("span.sort").find((s) => s.textContent?.startsWith(name)));
+    await sortOn("b");
+    await page.refuse("shared1", "You have viewer access to this sheet, so your edit was not saved.");
+    assertEquals(page.held(), { "table:shared1": { "1": { sort: "asc", rank: 1 } } }, "refused, so held");
+    await sortOn("a");
+    assertEquals(
+      (doc.data[0] as { sort?: string }[])[0].sort,
+      undefined,
+      "a second arrangement in the same open goes to the store, not the document",
+    );
+
+    // Granted editor access in the meantime. The next open tries the document
+    // again, and this time nothing refuses it.
+    await page.go("/");
+    assertEquals(page.path(), "", "on the library");
+    await page.go("/table:shared1");
+    assertEquals(page.path(), "table:shared1", "back on the sheet");
+    // The held view opened the sheet sorted on a already, so this click is the
+    // toggle -- and it goes to the document.
+    await sortOn("a");
+    assertEquals(
+      (doc.data[0] as { sort?: string }[])[0].sort,
+      "desc",
+      "on a new open the arrangement is written to the document again",
+    );
+    assert(page.held()?.["table:shared1"], "and still held until the server says it landed");
+
+    await page.land("shared1", ["cd".repeat(32)]);
+    assert(page.held()?.["table:shared1"], "a reply that does not cover the write drops nothing");
+    await page.land("shared1", decodeHeads(page.handles.shared1.heads()));
+    assertEquals(page.held(), {}, "a reply that covers the write is the document holding it, so nothing is held");
+    page.close();
+  },
+});
+
+// A sheet this browser no longer has is a sheet with nothing to hold a view for.
+Deno.test({
+  name: "deleting a sheet drops what this browser held for it",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const page = await glue("http://localhost/", {
+      stored: {
+        library: { "table:shared1": { name: "shared", tags: [] } },
+        views: { "table:shared1": { "1": { sort: "asc", rank: 1 } }, "table:other": { "0": { width: 80 } } },
+      },
+    });
+    const row = page.all("tbody tr").find((tr) => tr.textContent?.includes("shared"));
+    assert(row, "the stored sheet is listed");
+    await page.click([...row.querySelectorAll("button")].find((b) => b.textContent === "delete"));
+    await page.click(page.all("button").find((b) => b.textContent === "Delete"));
+    assertEquals(page.stored("library"), {}, "the sheet is gone from the library");
+    assertEquals(page.held(), { "table:other": { "0": { width: 80 } } }, "and its held view went with it");
     page.close();
   },
 });
@@ -2158,6 +2319,79 @@ Deno.test({
       ["1", "2", "a"],
       "a move means the same thing to automerge as it does to a plain object",
     );
+    page.close();
+  },
+});
+
+// A cell edit on a synced sheet is one patch, and `applyCellPatches` in
+// src/Main.elm is the path that applies just that one rather than decoding
+// the document again. Nothing about the page says which path ran, so the proof
+// is a decoy: the document handed over with the patches holds a different
+// value, and only the fast path shows the patched one. The patches are what a
+// real automerge handle emitted a moment earlier, not a literal, so the shape
+// this matches is the shape automerge sends.
+Deno.test({
+  name: "a cell edit on a synced sheet is applied as one patch, not a re-read",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const page = await glue("http://localhost/", { realRepo: true });
+    await page.click(page.all("tr").find((tr) => tr.getAttribute("title") === "new table:..."));
+    await page.click(page.all("tr").find((tr) => tr.getAttribute("title") === "add row"));
+    const sent: { patches: unknown[] }[] = [];
+    const send = page.app.ports.docChanged.send;
+    page.app.ports.docChanged.send = (data: unknown) => {
+      sent.push((data as { data: { patches: unknown[] } }).data);
+      return send(data);
+    };
+    const cell = [...page.all("tbody tr")[3].querySelectorAll("td")][0];
+    for (const type of ["mouseenter", "click", "dblclick"]) await page.fire(cell, type);
+    await page.type_(page.all("#new-cell")[0], "typed");
+    page.close();
+    const patches = sent.flatMap((d) => d.patches);
+    assert(patches.length > 0, "a cell edit reaches docChanged with the patches automerge emitted");
+
+    const { app, all, settle } = await boot("http://localhost/");
+    const decoy = { type: "table", data: [[{ key: "a", name: "a", type: "text" }], { a: "decoy" }] };
+    app.ports.docSelected.send({ id: "table:decoy", data: { doc: decoy } });
+    await settle();
+    app.ports.docChanged.send({ id: "table:decoy", data: { doc: decoy, handle: null, patchInfo: null, patches } });
+    await settle();
+    const cells = all("td").map((td) => td.textContent?.trim());
+    assert(
+      cells.includes("typed") && !cells.includes("decoy"),
+      `the fast path must apply ${JSON.stringify(patches)} without re-reading the document, got: ${cells.join(", ")}`,
+    );
+  },
+});
+
+// `repo.find` hands back the same handle every time, so a change listener per
+// open delivered every later change once per open. Harmless while every
+// delivery was a full decode; with cell patches applied as they arrive, a
+// second delivery of one splice is a doubled cell.
+Deno.test({
+  name: "opening a sheet again does not listen to it twice",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const page = await glue("http://localhost/", { realRepo: true });
+    await page.click(page.all("tr").find((tr) => tr.getAttribute("title") === "new table:..."));
+    const id = page.path();
+    await page.click(page.all("tr").find((tr) => tr.getAttribute("title") === "add row"));
+    await page.go("/");
+    await page.go(`/${id}`);
+    await page.go("/");
+    await page.go(`/${id}`);
+    let sent = 0;
+    const send = page.app.ports.docChanged.send;
+    page.app.ports.docChanged.send = (data: unknown) => {
+      sent++;
+      return send(data);
+    };
+    const cell = [...page.all("tbody tr")[3].querySelectorAll("td")][0];
+    for (const type of ["mouseenter", "click", "dblclick"]) await page.fire(cell, type);
+    await page.type_(page.all("#new-cell")[0], "once");
+    assertEquals(sent, 1, "one change is delivered to the page once");
     page.close();
   },
 });

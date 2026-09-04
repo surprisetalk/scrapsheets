@@ -12,40 +12,6 @@ items are deleted — what shipped is described in `claude.md`. Anything below t
 
 The next things to build, in this order.
 
-- [ ] **The keyboard moves over a query's result the way it moves over a table.** A query sheet's columns now sort,
-      filter, hide, resize and remember it, but the arrow keys still do nothing: `tableBounds` in `src/Main.elm`
-      answers `{ maxX = 0, maxY = 0 }` for anything that is not a `Tab` or the library.
-  1. `tableBounds` reads what `arrangeable` reads, so a query's bounds come off `sheet.table` the way its arrangement
-     does.
-  2. `SelectAll` computes the same bounds inline instead of calling `tableBounds`. That second copy goes with it.
-  3. Navigation only. A cell in a query result is computed, so a write to one must still be refused by name.
-
-- [ ] **A view held for a sheet you could not write stops winning once you can.** `Views.shown` in `src/index.html`
-      prefers this browser's held arrangement on every open, forever. An owner who grants you editor access makes the
-      document's own arrangement the truth again, and nothing notices.
-  1. Drop the held entry once a write to the document is known to have landed.
-  2. `refused` is per-session and never clears, so a grant taken mid-session still routes every arrangement into
-     `localStorage` until a reload.
-  3. Nothing ever deletes from `scrapsheets-views`, and it shares a browser-store quota with `scrapsheets-library`,
-     which holds whole documents. A full store is a refusal with a message now, but there is still no way to clear one
-     held view without clearing the site.
-
-- [ ] **A remote cell edit does not re-read the whole sheet.** `applyCellPatches` is the fast path for a single cell,
-      and it never fires on a synced sheet: automerge emits `action: "put"` with `path[0] == "data"`, and the branch
-      matches `"set"` with an integer `path[0]`. Every remote edit re-decodes the document instead.
-  1. Match what automerge actually sends, which the shape above states.
-  2. It is correct today and only slow, so it ships with a test that asserts the fast path fires — a fast path nothing
-     proves is taken is a fast path that stops being taken.
-  3. `pruneView` currently relies on the full decode running, so it moves into the fast path or is proven unnecessary
-     there first.
-
-- [ ] **A budget cannot be spent twice at once.** `hookBucket()` is read, then a row is written, then it is charged, and
-      the two awaits between let concurrent senders through: 30 requests against a budget of 1 wrote 27 rows. Both
-      `POST /net/:id` and `POST /library/:id/socket` have the shape.
-  1. Charge before the write, and refund on a failure — or take the row count from `net` itself, which is the number
-     the budget is about.
-  2. Whichever it is, one of them: two routes with one bug is one fix.
-
 ---
 
 ## Query engine
@@ -585,21 +551,6 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
 - [ ] **One account cannot exhaust the service.** `rateLimit()` bounds requests per IP and nothing bounds a user.
   1. Per-user quotas: fetches, rows, storage, outbound actions.
   2. Abuse detection on outbound actions: rate anomalies that look like a sheet being used as a spam cannon.
-
-- [ ] **A refusal is a refusal, not a 500.** Three ways an authenticated caller reaches an unexplained 500 today. Each
-      is one guard, and the error log and `GET /status`'s `no_5xx` condition are what they cost.
-  1. A percent-encoded NUL in any `:id` that reaches a SQL comparison — `POST /library/<id>%00/public`,
-     `GET /sheet/<id>%00`, and `syncRole` itself. Postgres text cannot hold a NUL and `POST /net/:id` already refuses
-     one by name; the same check belongs where an id is read, not on one route.
-  2. A body whose size the caller picks. `POST /net/:id` caps at `NET_BODY_CAP` and answers 413; every authenticated
-     JSON route parses whatever arrives. Cap them all, or none — capping one is theatre.
-  3. `bad()` covers the rest, so this is a hunt rather than a design: find every `await` whose failure is not already a
-     refusal.
-
-- [ ] **We are a polite scraper.** `safeFetch` guards our network and not theirs.
-  1. Per-host limits and a documented user agent.
-  2. Record whether a source may legally be redistributed, checked before a listing goes live.
-  3. Shop moderation: report a listing, review queue, takedown path.
 
 ---
 

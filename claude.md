@@ -91,7 +91,10 @@ A change that breaks one of these is a bug even if the suite is green.
   share-link token carries no `sub` and is refused with 403 before any route runs, so no handler ever sees an anonymous
   caller.
 - **One refusal shape.** Every 4xx/5xx this server raises is one `bad(status, headline, fields)` call carrying expected
-  / received / source / fix. The few surviving `throw new HTTPException` are passthroughs of an `explain()` block
+  / received / source / fix. Three guards sit at the boundary so no handler has to remember: a NUL in a path or query
+  string is refused before routing, every body is capped by `bodyLimit` at `BODY_CAP`, and every JSON body is read
+  through `jsonBody()`, which refuses what is not one object. `cselect()` refuses a `limit` or `offset` that is not a
+  count, and `docData()` refuses a claimed document with no rows. The few surviving `throw new HTTPException` are passthroughs of an `explain()` block
   `src/sql.mjs` already built. `Received` goes through `show()`, never `JSON.stringify` — `explain()` drops an undefined
   field, so a stringified `undefined` silently loses the line.
 - **No refusal is an oracle.** A signature rejection never prints the secret, the expected digest, or how close a guess
@@ -143,8 +146,9 @@ navigation, in file order:
 
 - **Sheet types** (the check constraint in `schema/db.sql` is the list): `template`, `table`, `net-hook`, `net-http`,
   `net-socket`, `query`, `portal`, `alert`, `chart`, `dashboard`, and `codex-*`. A sheet id is `type:doc_id`.
-- **Computed sheets**: `library:freshness` and `net-hook:errors` answer through `sheet()` without an automerge document,
-  so they page, export and can be selected from a query like any other sheet.
+- **Computed sheets**: `library:freshness`, `net-hook:errors` and `net-hook:reports` answer through `sheet()` without
+  an automerge document, so they page, export and can be selected from a query like any other sheet. The operator is
+  `isOperator()`: whoever reads `net-hook:errors`, which `OPERATOR_EMAIL` is granted at seed time.
 - **Auth**: JWT middleware; a per-sheet API key (`scrapsheets-key`) is scoped by a path check _before_ routing, so no
   handler has to remember to ask. Email through Resend.
 - **Sync**: official automerge `NodeWSServerAdapter` behind a ws-shim over Hono's `upgradeWebSocket`. Per-document
@@ -160,7 +164,14 @@ navigation, in file order:
 - **Polling**: `pollNetOnce` and `pollAlertOnce` on a 15-second tick; conditional requests, per-host `Retry-After`,
   bounded retries, and a `net` row per run — including quiet ones, because a healthy quiet alert and a dead timer
   otherwise write the same nothing.
-- **Marketplace**: Stripe Checkout, platform-side. Connect payouts are not wired.
+- **Marketplace**: Stripe Checkout, platform-side. Connect payouts are not wired. A listing carries a `license` from
+  `LICENSES` or does not go live (the schema checks it). `POST /shop/:sell_id/report` is one row per account per
+  listing on `net-hook:reports`, `POST /shop/:sell_id/review` is the operator's `keep` or `takedown`, and `GET /status`
+  fails while a report is open.
+- **Outbound fetches**: `safeFetch` is the one door out and sends `USER_AGENT`. The per-host gap is the poller's
+  alone: `holdHost()` in `pollNetOnce` writes `hostDue` after each request and on every `Retry-After`, taking the
+  later of the two, so two sheets on one host take turns across cycles and the proxy can neither hold a host nor
+  evict a hold.
 - **MCP**: hand-rolled JSON-RPC 2.0 at `POST /mcp/:id` — `initialize`, `tools/list`, `tools/call` with `read_sheet`,
   `write_cells`, `query_sheet`, `list_sheets`.
 
@@ -245,16 +256,20 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   somebody else owns the document and can reorder it. A held key the document no longer carries is dropped, not
   created. Two sheets need this: one that ships bundled, and one the sync server has refused a write on — which is
   heard by wrapping the ws adapter's `receiveMessage`, since the vendored adapter logs the server's `type: "error"`
-  frame at a debug namespace and emits nothing.
+  frame at a debug namespace and emits nothing. The same wrapper hears the opposite answer: while an arrangement
+  write is `pending`, a `sync` frame whose heads cover the head this browser wrote means the document took it, and
+  `Views.drop` forgets the held view. A refusal is remembered per open (`selectDoc` clears it), so a grant taken
+  mid-session is tried on the next open. `DocHandle.heads()` is base58 and the wire is hex; `decodeHeads` bridges
+  them, and `main_test.ts` pins that the server's reply carries the head at all.
 - **Known gaps**: `@library:freshness` resolves on the server but not in the page. `describe` results carry no type in
   the page, and `WINDOW_TYPES` is server-only, so a window alias there falls back to the sheet's stored `cols`.
-  `tableBounds` answers `0, 0` for a query sheet, so the keyboard does not move over one.
 
 ## Schema (`schema/db.sql`)
 
 - **usr** — identity, name, email (citext), password, `stripe_customer_id`
 - **sheet** — the central polymorphic row. `sheet_id` is generated as `type || ':' || doc_id`. Marketplace fields
-  (`sell_id` generated from `md5(doc_id||created_by)`, `sell_type`, `sell_price`, `buy_id`, `buy_price`), document data
+  (`sell_id` generated from `md5(doc_id||created_by)`, `sell_type`, `sell_price`, `license`, `buy_id`, `buy_price`),
+  document data
   (`row_0`, `name`, `tags`), and `public boolean` for anonymous read through `syncRole`
 - **sheet_usr** — membership, with `role` in owner/editor/viewer
 - **db** — external database connections (DSNs for codex sheets, encrypted under `DSN_ENCRYPTION_KEY`)

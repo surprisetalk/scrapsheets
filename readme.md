@@ -79,6 +79,21 @@ the sheet loads: the token says it is locked, and the refusal would otherwise la
 browser can read it. `POST /library/<sheet_id>/link` is the same thing over HTTP, taking `{"days": 7}` and
 `{"password": "..."}`.
 
+# polite scraper
+
+Every request this server makes to somebody else's host carries the user agent `Scrapsheets/1.0 (+this page)`. It is
+the poller behind net-http sheets and the page's `/proxy`, and nothing else. The poller asks one host at most once per
+`HOST_GAP_MS` (`main.ts` names the number) however many sheets point there, it honours `Retry-After` for every sheet on
+that host, it follows at most five redirects, and it stops retrying a feed after three failures in a row. To keep it
+off a host, block that user agent; to ask about it, open an issue here.
+
+A listing in the shop says what lets it be sold: `POST /sell/<sheet_id>` takes `{"price": 0, "license": "own"}`, where
+`license` is one of the values `LICENSES` in `main.ts` lists, and the shop shows it beside the price. Anyone signed in
+may report a listing, once, with `POST /shop/<sell_id>/report` and `{"reason": "..."}`; the reports are the sheet
+`net-hook:reports`, where a reporter reads their own and the operator reads them all. The operator closes them with
+`POST /shop/<sell_id>/review` and `{"action": "keep"}` or `{"action": "takedown"}`, and `deno task status` fails while
+a report is waiting.
+
 ```nu
 # watch mode
 watch src { try { cp -vu src/* dist ; elm make src/Main.elm --debug --output=dist/index.js } }

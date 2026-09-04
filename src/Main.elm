@@ -2078,17 +2078,26 @@ libraryIdAtRow model y =
         |> Maybe.withDefault ""
 
 
+{-| The keyboard walks whatever the view draws -- a table, the library as
+searched, a query's last result, a feed's run log -- and the one that draws
+it is the one that bounds it, so the two cannot disagree.
+-}
 tableBounds : Model -> TableBounds
 tableBounds model =
-    case model.sheet.doc of
-        Ok (Tab tbl) ->
+    case resolveTable model of
+        Ok tbl ->
             { maxX = Array.length tbl.cols - 1, maxY = Array.length tbl.rows }
 
-        Ok Library ->
-            { maxX = Array.length (libraryCols model) - 1, maxY = Dict.size model.library }
-
-        _ ->
+        Err _ ->
             { maxX = 0, maxY = 0 }
+
+
+{-| The refusal a keystroke or a double-click earns on a cell the keyboard can
+reach but nobody types into: a query's result, a feed's log, a chart, the shop.
+-}
+computedCell : String
+computedCell =
+    "Expected an edit to a table cell, received one on a sheet whose rows are computed, not typed. Edit what computes them: a query's SQL, a feed's source, a chart's settings."
 
 
 advanceTutorial : Int -> ( Model, Cmd Msg ) -> ( Model, Cmd Msg )
@@ -2648,7 +2657,10 @@ update msg ({ sheet, auth } as model) =
                         _ ->
                             openEditor
 
-                _ ->
+                Ok _ ->
+                    ( { model | error = computedCell }, Cmd.none )
+
+                Err _ ->
                     ( model, Cmd.none )
 
         CellMouseClick ->
@@ -3219,21 +3231,7 @@ update msg ({ sheet, auth } as model) =
             updatePaste text model
 
         SelectAll ->
-            case sheet.doc of
-                Ok (Tab tbl) ->
-                    let
-                        bounds =
-                            { maxX = Array.length tbl.cols - 1
-                            , maxY = Array.length tbl.rows
-                            }
-
-                        newSelect =
-                            selectAll bounds
-                    in
-                    ( { model | sheet = { sheet | select = newSelect } }, Cmd.none )
-
-                _ ->
-                    ( model, Cmd.none )
+            ( { model | sheet = { sheet | select = selectAll (tableBounds model) } }, Cmd.none )
 
 
 
@@ -3700,7 +3698,11 @@ updateDocMsg edit ({ sheet } as model) =
                             , changeDoc { id = sheet.id, data = forwardPatches }
                             )
 
-        _ ->
+        Ok _ ->
+            -- Every edit the keyboard offers, on a sheet nobody types into.
+            ( { model | error = computedCell, sheet = { sheet | write = Nothing } }, Cmd.none )
+
+        Err _ ->
             ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
 
 
@@ -3828,7 +3830,10 @@ updateKeyDown event ({ sheet } as model) =
                             id ->
                                 update (Goto id) model
 
-                    _ ->
+                    Ok _ ->
+                        ( { model | error = computedCell }, Cmd.none )
+
+                    Err _ ->
                         ( model, Cmd.none )
         in
         if sel.x < 0 || sel.y < 0 then
@@ -3924,27 +3929,6 @@ updateKeyDown event ({ sheet } as model) =
                     else
                         update (DocMsg (SheetClearCells selectedCells)) model
 
-                "a" ->
-                    -- Ctrl+A to select all
-                    if event.ctrl || event.meta then
-                        update SelectAll model
-
-                    else
-                        -- Start editing with 'a'
-                        case sheet.doc of
-                            Ok (Tab tbl) ->
-                                case Array.get sel.x tbl.cols of
-                                    Just _ ->
-                                        ( { model | sheet = { sheet | write = Just "a" } }
-                                        , Task.attempt (always NoOp) (Dom.focus "new-cell")
-                                        )
-
-                                    _ ->
-                                        ( model, Cmd.none )
-
-                            _ ->
-                                ( model, Cmd.none )
-
                 "Home" ->
                     -- Jump to beginning of row, or top-left with Ctrl
                     if event.ctrl || event.meta then
@@ -3978,17 +3962,15 @@ updateKeyDown event ({ sheet } as model) =
                         ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
 
                 _ ->
-                    -- If it's a single printable character, start editing with it
-                    if String.length event.key == 1 && not event.ctrl && not event.meta then
+                    if event.key == "a" && (event.ctrl || event.meta) then
+                        update SelectAll model
+
+                    else if String.length event.key == 1 && not event.ctrl && not event.meta then
+                        -- A printable character starts editing with it
                         case sheet.doc of
                             Ok (Tab tbl) ->
-                                let
-                                    col =
-                                        Array.get sel.x tbl.cols
-                                in
-                                case col of
+                                case Array.get sel.x tbl.cols of
                                     Just _ ->
-                                        -- Start editing with the typed character
                                         ( { model | sheet = { sheet | write = Just event.key } }
                                         , Task.attempt (always NoOp) (Dom.focus "new-cell")
                                         )
@@ -3996,7 +3978,10 @@ updateKeyDown event ({ sheet } as model) =
                                     _ ->
                                         ( model, Cmd.none )
 
-                            _ ->
+                            Ok _ ->
+                                ( { model | error = computedCell }, Cmd.none )
+
+                            Err _ ->
                                 ( model, Cmd.none )
 
                     else
@@ -4139,7 +4124,10 @@ updatePaste text ({ sheet } as model) =
             else
                 ( model, changeDoc { id = sheet.id, data = allPatches } )
 
-        _ ->
+        Ok _ ->
+            ( { model | error = computedCell }, Cmd.none )
+
+        Err _ ->
             ( model, Cmd.none )
 
 
@@ -5067,6 +5055,15 @@ resolveTable model =
             Err err
 
 
+{-| A cell edit on a synced sheet, applied as the patches automerge emitted
+rather than by decoding the whole document again: a `put` at
+`["data", row, key]`, and for text the `put` of `""` that automerge follows
+with a `splice` of the characters at `["data", row, key, offset]`. Anything
+else -- a column, a row inserted, a view field, a patch this browser made up
+-- answers `Nothing`, and the caller decodes the document. Columns live in
+`data[0]`, which no patch admitted here addresses, so the column set is what
+it was and `pruneView` has nothing to prune on this path.
+-}
 applyCellPatches : List D.Value -> Result String Doc -> Maybe (Result String Doc)
 applyCellPatches patches doc =
     case ( patches, doc ) of
@@ -5074,51 +5071,63 @@ applyCellPatches patches doc =
             Nothing
 
         ( _, Ok (Tab table) ) ->
-            List.foldl
-                (\patch acc ->
-                    acc
-                        |> Maybe.andThen
-                            (\t ->
-                                let
-                                    rowIdx =
-                                        D.decodeValue (D.field "path" (D.index 0 D.int)) patch |> Result.toMaybe
-
-                                    colKey =
-                                        D.decodeValue (D.field "path" (D.index 1 D.string)) patch |> Result.toMaybe
-
-                                    action =
-                                        D.decodeValue (D.field "action" D.string) patch |> Result.toMaybe
-
-                                    value =
-                                        D.decodeValue (D.field "value" D.value) patch |> Result.toMaybe
-                                in
-                                case ( action, rowIdx ) of
-                                    ( Just "set", Just ri ) ->
-                                        case ( colKey, value ) of
-                                            ( Just ck, Just val ) ->
-                                                if ri >= 1 then
-                                                    Array.get (ri - 1) t.rows
-                                                        |> Maybe.map
-                                                            (\row ->
-                                                                { t | rows = Array.set (ri - 1) (Dict.insert ck val row) t.rows }
-                                                            )
-
-                                                else
-                                                    Nothing
-
-                                            _ ->
-                                                Nothing
-
-                                    _ ->
-                                        Nothing
-                            )
-                )
-                (Just table)
-                patches
-                |> Maybe.map (\t -> Ok (Tab t))
+            List.foldl (\patch acc -> Maybe.andThen (applyCellPatch patch) acc) (Just table) patches
+                |> Maybe.map (Tab >> Ok)
 
         _ ->
             Nothing
+
+
+applyCellPatch : D.Value -> Table -> Maybe Table
+applyCellPatch patch table =
+    let
+        cell : Int -> (Row -> Maybe Row) -> Maybe Table
+        cell ri edit =
+            if ri >= 1 then
+                Array.get (ri - 1) table.rows
+                    |> Maybe.andThen edit
+                    |> Maybe.map (\row -> { table | rows = Array.set (ri - 1) row table.rows })
+
+            else
+                Nothing
+
+        at : Int -> D.Decoder a -> D.Decoder a
+        at i decoder =
+            D.field "path" (D.index i decoder)
+
+        put =
+            D.map3 (\ri ck val -> cell ri (Dict.insert ck val >> Just))
+                (at 1 D.int)
+                (at 2 D.string)
+                (D.field "value" D.value)
+
+        splice =
+            D.map4
+                (\ri ck offset chars ->
+                    cell ri
+                        (\row ->
+                            Dict.get ck row
+                                |> Maybe.andThen (D.decodeValue D.string >> Result.toMaybe)
+                                |> Maybe.map (\was -> Dict.insert ck (E.string (String.left offset was ++ chars ++ String.dropLeft offset was)) row)
+                        )
+                )
+                (at 1 D.int)
+                (at 2 D.string)
+                (at 3 D.int)
+                (D.field "value" D.string)
+
+        -- The action and the exact depth under "data", so a column's field at
+        -- depth 4 is not read as a cell at depth 3 with something after it.
+        shape action depth decoder =
+            D.map3 (\a root path -> a == action && root == "data" && List.length path == depth)
+                (D.field "action" D.string)
+                (at 0 D.string)
+                (D.field "path" (D.list D.value))
+                |> D.andThen (\matches -> iif matches decoder (D.fail "not this patch"))
+    in
+    D.decodeValue (D.oneOf [ shape "put" 3 put, shape "splice" 4 splice ]) patch
+        |> Result.toMaybe
+        |> Maybe.andThen identity
 
 
 applyFilter : Filter -> String -> Row -> Bool

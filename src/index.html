@@ -23,11 +23,11 @@
     </script>
     <script type="module">
       // Initialize Automerge WASM first
-      import { initializeWasm } from "@automerge/automerge";
+      import { decodeSyncMessage, initializeWasm } from "@automerge/automerge";
       await initializeWasm(fetch("/automerge.wasm"));
 
       // Import Automerge packages
-      import { cbor, Repo } from "@automerge/automerge-repo";
+      import { cbor, decodeHeads, Repo } from "@automerge/automerge-repo";
       import { IndexedDBStorageAdapter } from "/automerge-repo-idb.mjs";
       import { BrowserWebSocketClientAdapter } from "/automerge-repo-ws.mjs";
       import {
@@ -152,6 +152,7 @@
           delete: (id) => {
             Stored.set("library", { ...Stored.get("library"), [id]: undefined });
             Library.cache = null;
+            Views.drop(id);
             app.ports.librarySynced.send(Library.get());
           },
         };
@@ -170,6 +171,12 @@
         // has already moved `storedView` past that batch, so nothing would ever
         // write it again. In memory it survives the refusal and the next
         // successful write carries it.
+        //
+        // Held only as long as the document will not take it. Two things drop
+        // an entry: the sheet leaving this library, and the document taking an
+        // arrangement from this browser -- which `onLanded` hears -- because
+        // from then on the document's own arrangement is the truth, and a held
+        // width the landed write did not carry is meant to give way to it.
         const Views = {
           all: null,
           map: () => (Views.all ??= Stored.get("views")),
@@ -179,6 +186,12 @@
             Stored.set("views", Views.all);
           },
           keep: (id, patches, data0) => Views.hold(id, foldView(Views.held(id), patches, data0)),
+          drop: (id) => {
+            if (!(id in Views.map())) return;
+            const { [id]: _dropped, ...rest } = Views.map();
+            Views.all = rest;
+            Stored.set("views", Views.all);
+          },
           // Only on the way in. What is stored is never written back into a
           // document that is not ours.
           shown: (id, doc) => {
@@ -187,17 +200,22 @@
             return { ...doc, data: [mergeView(doc.data[0], held), ...doc.data.slice(1)] };
           },
         };
-        // Documents the sync server has refused a write on. It answers on
-        // doc_id, so this is keyed the same way.
+        // Documents the sync server has refused a write on, for the current
+        // open of each: `selectDoc` forgets the refusal, so a grant taken
+        // mid-session is noticed the next time the sheet is opened and
+        // arranged. When there was no grant that costs one refused round trip,
+        // and `pending` puts the arrangement back. It answers on doc_id, so this
+        // is keyed the same way.
         const refused = new Set();
         // Every arrangement sent to a synced document since the page loaded,
-        // folded onto whatever this browser already held for it. A refusal
-        // arrives a round trip after the write, so without this the arrangements
-        // made before it are the ones that get lost -- and folded rather than
-        // queued so that an editor, who is never refused, cannot grow it.
+        // folded onto whatever this browser already held for it, and the heads
+        // the document sat at once the last one was written. A refusal arrives
+        // a round trip after the write, so without this the arrangements made
+        // before it are the ones that get lost -- and folded rather than queued
+        // so that an editor, who is never refused, cannot grow it.
         let pending = null;
 
-        app.ports.deleteDoc.subscribe(async (id) => Library.delete(id));
+        app.ports.deleteDoc.subscribe(catchy((id) => Library.delete(id), 'deleteDoc'));
 
         // Through `catchy` so that `Stored.set`'s refusal reaches the page: a
         // full browser store threw into an unhandled port subscriber, and the
@@ -486,12 +504,37 @@
           // that says how to fix the refusal.
           const onRefused = catchy((frame) => {
             refused.add(frame.documentId);
-            app.ports.docErrored.send(frame.message ?? "That edit was not saved.");
-            if (pending?.doc_id === frame.documentId) {
+            // An arrangement is not lost the way a cell is, and the sentence
+            // says so, or a viewer sorting a shared sheet reads an alarm.
+            const kept = pending?.doc_id === frame.documentId;
+            app.ports.docErrored.send(
+              (frame.message ?? "That edit was not saved.") +
+                (kept ? " How you have this sheet arranged is kept in this browser." : ""),
+            );
+            if (kept) {
               Views.hold(pending.id, pending.held);
               pending = null;
             }
           }, 'sync refusal');
+          // The other answer. A write the server took comes back as its next
+          // sync frame for the document, whose heads are the document's and so
+          // cover the head this browser wrote. The document holds the
+          // arrangement now, and what this browser held for it is stale. A
+          // refused change that lands later on a reconnect, after a grant,
+          // does not pass through here: there is no pending write for it, and
+          // the first new arrangement is what drops the held view. Nor does a
+          // write a collaborator has already built on by the time the server
+          // answers -- its head is an ancestor then, not a head -- so on a busy
+          // sheet the landing is heard on the next arrangement, which starts a
+          // new `pending` of its own.
+          // What this session knows first, the store last: a full store must
+          // not leave `pending` waiting on an answer that has already come.
+          const onLanded = catchy(() => {
+            const { id, doc_id } = pending;
+            pending = null;
+            refused.delete(doc_id);
+            Views.drop(id);
+          }, 'sync landed');
           const receiveMessage = networkAdapter.receiveMessage.bind(networkAdapter);
           networkAdapter.receiveMessage = (data) => {
             let frame;
@@ -504,6 +547,20 @@
               // inbound frame is decoded twice, which is what reading one costs.
             }
             if (frame?.type === "error" && frame.documentId) onRefused(frame);
+            // Only while a write is out, so the sync payload is decoded in the
+            // window between a write and its answer and at no other time.
+            if (frame?.type === "sync" && pending && frame.documentId === pending.doc_id) {
+              let heads;
+              try {
+                heads = decodeSyncMessage(frame.data).heads;
+              } catch (error) {
+                // The repo reads the same payload by another path and may well
+                // take it, so this is a landing that cannot be heard, not a
+                // frame that is lost. Said where it can be seen.
+                debug.warn("sync landed: could not read the heads of a sync frame for", frame.documentId, error);
+              }
+              if (heads && pending.heads.every((head) => heads.includes(head))) onLanded();
+            }
             return receiveMessage(data);
           };
 
@@ -539,6 +596,10 @@
           };
 
           let sheet;
+          // The change listener on the open sheet's handle, so the next open
+          // takes it off: `repo.find` hands back the same handle every time,
+          // and a listener per open delivered every change once per open.
+          let watched = null;
 
           const setupDragDrop = () => {
             document.body.addEventListener("dragover", (e) => {
@@ -714,6 +775,7 @@
           const storedThumbDebounced = debounce(storedThumb, 500);
           const selectDoc = catchy(async (id, sheetHandle) => {
             const [type, doc_id] = id.split(":");
+            refused.delete(doc_id);
             debug.log('selectDoc:', id);
             lastRun = { id: null, key: null };
 
@@ -751,15 +813,26 @@
               cfg?.source ? { lang: "sql", code: chartSql(cfg), cols: { y: "num" } } : null;
             if (type === "query") runQuery(id, doc.data[0]);
             if (type === "chart" && chartQuery(doc.data?.[0])) runQuery(id, chartQuery(doc.data[0]));
-            sheetHandle?.on?.("change", (data) => {
-              app.ports.docChanged.send({
-                id: type + ":" + data.handle.documentId,
-                data,
-              });
-              if (type === "query") runQuery(id, data.doc.data[0]);
-              if (type === "chart" && chartQuery(data.doc.data?.[0])) runQuery(id, chartQuery(data.doc.data[0]));
-              storedThumbDebounced(id, data.doc);
-            });
+            watched?.handle.off("change", watched.onChange);
+            watched = null;
+            if (sheetHandle?.on) {
+              const onChange = (data) => {
+                app.ports.docChanged.send({
+                  id: type + ":" + data.handle.documentId,
+                  data,
+                });
+                // A change after an arrangement moves the heads on, and the
+                // server's answer carries the heads it has -- so what is waited
+                // for is the newest, or a cell typed before the answer came
+                // would hide the landing.
+                if (pending?.doc_id === data.handle.documentId) pending.heads = decodeHeads(data.handle.heads());
+                if (type === "query") runQuery(id, data.doc.data[0]);
+                if (type === "chart" && chartQuery(data.doc.data?.[0])) runQuery(id, chartQuery(data.doc.data[0]));
+                storedThumbDebounced(id, data.doc);
+              };
+              sheetHandle.on("change", onChange);
+              watched = { handle: sheetHandle, onChange };
+            }
             if (type === "portal") {
               const portalUrl = `${WS_BASE}/${type}/${doc_id}/sync`;
               let retries = 0;
@@ -1226,7 +1299,9 @@
               if (doc) {
                 const d = { ...doc };
                 applyPatches(d.data, patches);
-                app.ports.docChanged.send({ id, data: { doc: d, handle: null, patchInfo: null, patches } });
+                // No patches: the port speaks automerge's, and these are ours.
+                // A bundled sheet is small enough to decode again.
+                app.ports.docChanged.send({ id, data: { doc: d, handle: null, patchInfo: null, patches: [] } });
                 if (type === "query") runQuery(id, d.data[0]);
                 return;
               }
@@ -1259,19 +1334,23 @@
               if (bundled) {
                 const d = { ...bundled };
                 applyPatches(d.data, patches);
-                app.ports.docChanged.send({ id, data: { doc: d, handle: null, patchInfo: null, patches } });
+                app.ports.docChanged.send({ id, data: { doc: d, handle: null, patchInfo: null, patches: [] } });
               } else if (!held) {
                 if (!sheet)
                   throw new Error(
                     `Expected the open sheet's automerge handle to write an arrangement to, received none for ${id}. ` +
                       `Source: arrangeDoc. The document is not loaded; reload the page and try again.`,
                   );
-                pending = {
-                  id,
-                  doc_id,
-                  held: foldView(pending?.doc_id === doc_id ? pending.held : Views.held(id), patches, data0),
-                };
+                const folded = foldView(pending?.doc_id === doc_id ? pending.held : Views.held(id), patches, data0);
+                const before = sheet.heads().join();
                 sheet.change((d) => applyPatches(d.data, patches));
+                const heads = sheet.heads();
+                // A value the document already held is no write: nothing went
+                // out and nothing will answer, and the heads it left are ones
+                // the server has, which the next frame would read as a landing.
+                // The handle's heads are base58, the wire's are hex; compared
+                // in hex, because that is the alphabet the answer arrives in.
+                if (heads.join() !== before) pending = { id, doc_id, held: folded, heads: decodeHeads(heads) };
               }
               if (held) Views.keep(id, patches, data0);
             }, 'arrangeDoc'),
