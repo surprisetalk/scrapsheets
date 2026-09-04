@@ -102,6 +102,23 @@ create index net_sheet_id_created_at_idx on net (sheet_id, created_at desc);
 -- which point the skew check has refused it for HOOK_SKEW seconds anyway.
 create unique index net_hook_signature_idx on net (sheet_id, (meta->>'sig'));
 
+-- One log of who did what to which sheet. A table and not `net`, because a log
+-- that trims itself is not an audit log; read as the sheet library:audit.
+-- No foreign key to sheet on purpose: a deleted sheet's trail is still a trail.
+-- usr_id is null for a share-link holder, who has no account.
+create table audit
+( audit_id bigint not null generated always as identity primary key
+, created_at timestamp not null default now()
+, sheet_id text not null
+, usr_id bigint references usr(usr_id)
+, action text not null
+, via text not null check (via in ('jwt','key','mcp','sync','link','public'))
+, detail jsonb not null default '{}'::jsonb
+);
+
+create index audit_sheet_id_idx on audit (sheet_id, audit_id desc);
+create index audit_usr_id_idx on audit (usr_id, audit_id desc);
+
 create table payment
 ( payment_id bigint not null generated always as identity primary key
 , created_at timestamp default now()

@@ -473,6 +473,21 @@ const sheet = async (
   // lookup: they have no automerge document and no sheet row, and their own
   // where clause is the access rule.
   if (sheet_id === FRESHNESS_SHEET) return await freshness(c, { limit, offset });
+  if (sheet_id === AUDIT_SHEET) {
+    const usr_id = c.get("usr_id");
+    return await cselect({
+      cols: null,
+      select: sql`select a.created_at, a.sheet_id,
+                         coalesce(u.email, case a.via when 'link' then 'share link' else 'anonymous' end) as who,
+                         a.action, a.via, a.detail::text as detail`,
+      from: sql`from audit a left join usr u using (usr_id)`,
+      where: [sql`(a.usr_id = ${usr_id} or a.sheet_id in (
+        select su.sheet_id from sheet_usr su where su.usr_id = ${usr_id} and su.role in ('owner', 'editor')))`],
+      order: sql`order by a.audit_id desc`,
+      limit,
+      offset,
+    });
+  }
   // The failure log answers before the membership check, because a caller with
   // no share on it still owns the failures their own requests caused. The where
   // clause is the access rule: the operator reads every row through their
@@ -682,8 +697,15 @@ const executeSql = async (
     // Where a sheet comes from is the only real difference between the engines:
     // here it is sheet(), which enforces access and recurses into a query sheet
     // on its own; in the page it is a library entry or an automerge document.
+    // A query is a read of every sheet it selects from, and the log says so
+    // per sheet: the route alone would say "POST /query" about nothing.
     fetch: (sheet_id: string) =>
-      sheet(c, sheet_id, {}, [...path_, sheet_id]).then((r) => r.data).catch(async (err) => {
+      sheet(c, sheet_id, {}, [...path_, sheet_id])
+        .then(async (r) => {
+          await record(sheet_id, c.get("usr_id"), "query", c.get("via") ?? "jwt");
+          return r.data;
+        })
+        .catch(async (err) => {
         // A mistyped @ref reads as "no access". Name the sheet the author meant.
         const mine: { sheet_id: string }[] = await sql`
           select sheet_id from sheet_usr where usr_id = ${c.get("usr_id")}
@@ -1000,7 +1022,7 @@ const page = (c: Context) => ({ data, offset, count }: Page) => {
 // --- app & middleware
 
 export const app = new Hono<{
-  Variables: JwtVariables & { usr_id: string };
+  Variables: JwtVariables & { usr_id: string; via: Via };
 }>();
 
 app.use("*", logger());
@@ -1344,6 +1366,8 @@ app.get(
     let shim: WsSocketShim | undefined;
     let joined: AM.PeerId | undefined;
     let queue = Promise.resolve();
+    // Documents this connection has been audited on, as doc_id and doc_id:edit.
+    const audited = new Set<string>();
     const cleanup = () => {
       if (!shim) return;
       wss.clients.delete(shim);
@@ -1387,6 +1411,17 @@ app.get(
           if (msg?.documentId) {
             const role = await syncRole(auth, msg.documentId);
             if (!shim) return;
+            // Once per document per connection: the open on the first frame
+            // about it, the edit on the first frame carrying a change the
+            // server will take. A refused change is not an edit.
+            if (role !== null && !audited.has(msg.documentId)) {
+              audited.add(msg.documentId);
+              await recordDoc(auth, msg.documentId, "open");
+            }
+            if (role !== null && role !== "viewer" && !audited.has(`${msg.documentId}:edit`) && carriesChanges(msg)) {
+              audited.add(`${msg.documentId}:edit`);
+              await recordDoc(auth, msg.documentId, "edit");
+            }
             if (role === null) {
               shim.send(AM.cbor.encode({
                 type: "doc-unavailable",
@@ -1535,6 +1570,38 @@ const ERROR_SHEET = `net-hook:${ERROR_DOC}`;
 // code. The reporter reads their own rows and the operator reads them all.
 const REPORT_DOC = "reports";
 const REPORT_SHEET = `net-hook:${REPORT_DOC}`;
+
+// --- audit
+//
+// One log of who did what to which sheet, and the only one: an agent's write
+// and a key's read are rows in it beside a person's. Every read and write over
+// HTTP lands here by route, through the middleware below the auth middlewares;
+// the sync socket records an open and a first edit per peer per document; MCP
+// records the tool it ran. A refused request did nothing and writes nothing.
+// It is read as the sheet library:audit, where an owner or editor reads every
+// row about their sheet and everybody reads the rows they made themselves.
+const AUDIT_SHEET = "library:audit";
+type Via = "jwt" | "key" | "mcp" | "sync" | "link" | "public";
+
+const record = async (
+  sheet_id: string,
+  usr_id: string | null,
+  action: string,
+  via: Via,
+  detail: Record<string, unknown> = {},
+): Promise<void> => {
+  await sql`insert into audit ${sql({ sheet_id, usr_id, action, via, detail: sql.json(detail) })}`;
+};
+
+/** The sync socket knows a document and not a sheet. A document with no row is
+ * one being claimed, and the claim that makes the row is itself audited. No
+ * account is a share-link holder when the token named a sheet, and an
+ * anonymous reader of a public sheet otherwise: an owner told "a link was
+ * used" when the sheet was simply public would be told wrong. */
+const recordDoc = async (auth: WsAuth, doc_id: string, action: "open" | "edit"): Promise<void> => {
+  const [row] = await sql`select sheet_id from sheet where doc_id = ${doc_id}`;
+  if (row) await record(row.sheet_id, auth.usr_id, action, auth.usr_id ? "sync" : auth.share ? "link" : "public");
+};
 
 /** Whoever reads the error log. OPERATOR_EMAIL is granted that at seed time,
  * and it is the one authority this server has above a sheet's own owner. */
@@ -3571,6 +3638,7 @@ app.use("*", async (c, next) => {
     });
   }
   c.set("usr_id", usr_id);
+  c.set("via", "key");
   await next();
 });
 
@@ -3600,6 +3668,48 @@ app.use("*", async (c, next) => {
   }
   c.set("usr_id", usr_id);
   await next();
+});
+
+// The routes whose :id names a sheet and whose success is worth a row. Matched
+// on the route pattern after routing, so a new route is audited by adding its
+// pattern here and nowhere else. A refusal is kept out by its status: the
+// throw is caught and answered before this middleware sees it, so the status
+// check below is what refuses a refusal, not the throw. POST /net/:id is not
+// here and cannot be: it is registered before the auth middlewares, so this
+// runs for GET /net/:id alone, and a delivery is its own row on net anyway.
+const AUDITED = new Set([
+  "/sheet/:id",
+  "/export/:id",
+  "/net/:id",
+  "/sell/:id",
+  "/library/:id",
+  "/library/:id/share",
+  "/library/:id/public",
+  "/library/:id/link",
+  "/library/:id/secret",
+  "/library/:id/hook",
+  "/codex/:id",
+  "/codex-db/:id",
+]);
+app.use("*", async (c, next) => {
+  await next();
+  const route = c.req.routePath.replace(/\{.*\}$/, "");
+  if (!AUDITED.has(route) || c.res.status >= 300) return;
+  // The row is keyed by the sheet, the way sheet_usr is, or its owner never
+  // sees it. Three routes spell their :id another way: the export's carries the
+  // format, the codex route's is the bare doc_id, and /net/:id takes either.
+  const raw = c.req.param("id") ?? "";
+  const sheet_id = route === "/export/:id"
+    ? raw.slice(0, raw.lastIndexOf("."))
+    : route === "/codex-db/:id"
+    ? `codex-db:${raw}`
+    : route === "/net/:id" && !raw.includes(":")
+    ? String((await sql`select sheet_id from sheet where doc_id = ${raw}`)[0]?.sheet_id ?? raw)
+    : raw;
+  // Not caught: an audit log that drops a row on a database hiccup is not an
+  // audit log, so the request it was about fails with it, the way the sync
+  // socket closes and the MCP call answers 500 for the same reason.
+  await record(sheet_id, c.get("usr_id"), `${c.req.method} ${route}`, c.get("via") ?? "jwt", { status: c.res.status });
 });
 
 app.post("/buy/:id", async (c) => {
@@ -5850,9 +5960,10 @@ app.post("/mcp/:id", async (c) => {
       const tool = mcpTools[msg.params?.name ?? ""];
       if (!tool)
         return rpcErr(-32602, `Unknown tool: ${msg.params?.name}. Available: ${Object.keys(mcpTools).join(", ")}`);
+      c.set("via", "mcp");
+      let out: unknown;
       try {
-        const out = await tool.handler(c, msg.params?.arguments ?? {});
-        return rpc({ content: [{ type: "text", text: JSON.stringify(out) }], structuredContent: out, isError: false });
+        out = await tool.handler(c, msg.params?.arguments ?? {});
       } catch (err) {
         if (!(err instanceof HTTPException)) console.error(`mcp tools/call ${msg.params?.name}:`, err);
         return rpc({
@@ -5860,6 +5971,10 @@ app.post("/mcp/:id", async (c) => {
           isError: true,
         });
       }
+      // Outside the try: a tool that ran is not an error because its row did
+      // not land, and a row that cannot land is a 500 like everywhere else.
+      await record(c.req.param("id"), c.get("usr_id"), `mcp ${msg.params?.name}`, "mcp");
+      return rpc({ content: [{ type: "text", text: JSON.stringify(out) }], structuredContent: out, isError: false });
     }
     default:
       return rpcErr(-32601, `Method not found: ${msg.method}`);

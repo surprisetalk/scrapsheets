@@ -62,6 +62,12 @@ curl -X POST "https://api.sheets.scrap.land/sheet/$sheet_id" -H "scrapsheets-key
   -H 'Content-Type: application/json' -d '{"rows":[{"city":"Oslo","population":709037}]}'
 ```
 
+`GET /sheet/library:audit` is who did what to which sheet: every read and write of a sheet over HTTP, every sheet a
+query selects from, every open and first edit over the sync socket, and every MCP tool call, with `via` saying which
+door. A webhook delivery is not in it, because it is already its own row on that sheet's log. An owner or editor reads every row about
+their sheet; everybody reads the rows they made. It is a sheet, so `select * from @library:audit` and
+`/export/library:audit.csv` both work, and a refused request is not in it because it did nothing.
+
 `GET /library/freshness` names the feeds that stopped. One row per sheet whose runs are recorded — every polled feed,
 every webhook and every alert you can read: when it last ran, when it last succeeded, and how many runs since. A webhook
 nobody has delivered to in three days says so beside a poll that has been failing. It is a sheet, so

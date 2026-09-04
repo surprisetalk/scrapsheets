@@ -50,7 +50,11 @@ is a shareable table, every sheet is an API.
 
 Local Postgres default is `postgresql://postgres@127.0.0.1:5434/postgres`. Tests need no real Postgres: they run against
 in-process PGlite behind a pg-gateway on that port. Schema changes go in `schema/db.sql`; DML is never generated, splice
-it in with `--insert-statement`.
+it in with `--insert-statement`. **Deploy the code before a check constraint on a column `seed()` writes.** Postgres
+checks an `insert ... on conflict do update`'s proposed row before it looks for the conflict, so the running seed must
+already propose the column or every request fails on the constraint until the deploy lands. `license` on `sheet` took
+production down this way: backfill the rows, deploy, then `db:apply`. The opposite order for a new table the code
+writes on every request: `audit` had to exist before the code that inserts into it was deployed.
 
 ## Tests
 
@@ -146,8 +150,8 @@ navigation, in file order:
 
 - **Sheet types** (the check constraint in `schema/db.sql` is the list): `template`, `table`, `net-hook`, `net-http`,
   `net-socket`, `query`, `portal`, `alert`, `chart`, `dashboard`, and `codex-*`. A sheet id is `type:doc_id`.
-- **Computed sheets**: `library:freshness`, `net-hook:errors` and `net-hook:reports` answer through `sheet()` without
-  an automerge document, so they page, export and can be selected from a query like any other sheet. The operator is
+- **Computed sheets**: `library:freshness`, `library:audit`, `net-hook:errors` and `net-hook:reports` answer through
+  `sheet()` without an automerge document, so they page, export and can be selected from a query like any other sheet. The operator is
   `isOperator()`: whoever reads `net-hook:errors`, which `OPERATOR_EMAIL` is granted at seed time.
 - **Auth**: JWT middleware; a per-sheet API key (`scrapsheets-key`) is scoped by a path check _before_ routing, so no
   handler has to remember to ask. Email through Resend.
@@ -164,6 +168,12 @@ navigation, in file order:
 - **Polling**: `pollNetOnce` and `pollAlertOnce` on a 15-second tick; conditional requests, per-host `Retry-After`,
   bounded retries, and a `net` row per run — including quiet ones, because a healthy quiet alert and a dead timer
   otherwise write the same nothing.
+- **Audit**: one log, the `audit` table, read as `library:audit`. `record()` is the one writer. HTTP reads and writes
+  land through one middleware keyed on the route patterns in `AUDITED`, after the route succeeded; the sync socket
+  records `open` and a first `edit` per peer per document; MCP records `mcp <tool>`; a query records `query` on every
+  sheet it resolves. `via` says which door, `public` being an anonymous reader of a public sheet. An owner or editor
+  reads every row about their sheet, everybody reads their own rows, and a row with no account is `who = share link`
+  or `anonymous`. A row that cannot be written fails the request it was about.
 - **Marketplace**: Stripe Checkout, platform-side. Connect payouts are not wired. A listing carries a `license` from
   `LICENSES` or does not go live (the schema checks it). `POST /shop/:sell_id/report` is one row per account per
   listing on `net-hook:reports`, `POST /shop/:sell_id/review` is the operator's `keep` or `takedown`, and `GET /status`
@@ -279,4 +289,6 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   identity PK, an index on `(sheet_id, created_at desc)`, and the unique `net_hook_signature_idx`. `trimNet()` keeps the
   newest `NET_KEEP` per sheet behind every write — a sheet that must keep everything writes to a table, which is never
   trimmed
+- **audit** — who did what to which sheet: `sheet_id` (no foreign key, a deleted sheet's trail stays), nullable
+  `usr_id`, `action`, `via`, `detail`. Never trimmed
 - **payment** — marketplace transactions

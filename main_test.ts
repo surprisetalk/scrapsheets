@@ -489,6 +489,21 @@ Deno.test(async function allTests(t) {
       );
       eAdapter.disconnect();
 
+      // The socket is where a sheet is opened and edited in the app, so it is
+      // where the audit log hears it: one open per peer per document, one edit
+      // the first time a peer's frame carries a change, and nothing for a
+      // change the server refused.
+      const trail: { email: string; action: string }[] = await sql`
+        select u.email, a.action from audit a left join usr u using (usr_id)
+        where a.sheet_id = ${sheet_id} order by a.audit_id
+      `;
+      const seen: string[] = trail.map((r) => `${r.email}:${r.action}`);
+      assert(seen.includes("viewer@example.com:open"), `a viewer's open is audited: ${seen}`);
+      assert(seen.includes("editor@example.com:open"), `an editor's open is audited: ${seen}`);
+      assert(seen.includes("editor@example.com:edit"), `an editor's edit is audited: ${seen}`);
+      assert(!seen.includes("viewer@example.com:edit"), `a refused edit is not an edit: ${seen}`);
+      assertEquals(seen.filter((x) => x === "editor@example.com:edit").length, 1, "once per connection, not per frame");
+
       // Removing a member revokes sync.
       await request(jwt, `/library/${sheet_id}/share`, {
         method: "DELETE",
@@ -527,6 +542,10 @@ Deno.test(async function allTests(t) {
       ]);
       assertEquals(outcome, "shared", "a public sheet should be readable anonymously");
       adapter.disconnect();
+      const [anonymous]: { via: string }[] = await sql`
+        select via from audit where sheet_id = ${sheet_id} and usr_id is null order by audit_id desc limit 1
+      `;
+      assertEquals(anonymous?.via, "public", "an anonymous reader of a public sheet is not a share link");
       await post(jwt, `/library/${sheet_id}/public`, { public: false });
     }
 
@@ -4470,6 +4489,96 @@ Deno.test(async function allTests(t) {
     assertEquals((await review("keep")).status, 200, "and the operator closes it");
     assertEquals((await status())[waiting]["0"], 1);
     void buyerId;
+  });
+
+  // Every read and write of a sheet is a row in one log, and the log is a
+  // sheet: an owner reads who touched what they own, everybody reads what they
+  // did themselves, and a refused request did nothing and so is not in it.
+  await t.step("You can read who opened a sheet and what they changed", async () => {
+    const { jwt: owner } = await usr("audit-owner@example.com");
+    const { jwt: editor } = await usr("audit-editor@example.com");
+    const { jwt: viewer } = await usr("audit-viewer@example.com");
+    const { jwt: stranger } = await usr("audit-stranger@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "table",
+      data: [arrayify([{ name: "a", type: "text", key: "0" }]), { 0: "x" }],
+    });
+    const sheet_id = `table:${hand.documentId}`;
+    await put(owner, `/library/${sheet_id}`, { name: "audited" });
+    await post(owner, `/library/${sheet_id}/share`, { email: "audit-editor@example.com", role: "editor" });
+    await post(owner, `/library/${sheet_id}/share`, { email: "audit-viewer@example.com", role: "viewer" });
+
+    await get(viewer, `/sheet/${sheet_id}`);
+    await post(editor, `/sheet/${sheet_id}`, { rows: [{ a: "y" }] });
+    await reject(viewer, `/sheet/${sheet_id}`, { method: "POST", body: JSON.stringify({ rows: [{ a: "z" }] }) });
+    await reject(stranger, `/sheet/${sheet_id}`);
+    const raw = (jwt: string, route: string) =>
+      app.request(route, { headers: new Headers({ Authorization: `Bearer ${jwt}` }) });
+    assert((await raw(owner, `/export/${sheet_id}.csv`)).ok);
+
+    // The owner reads everything that happened to their sheet, by who and how.
+    const trail = async (jwt: string) =>
+      (await get<Table>(jwt, `/sheet/library:audit`)).slice(1)
+        .filter((r) => r.sheet_id === sheet_id)
+        .map((r) => `${r.who} ${r.action} ${r.via}`);
+    const owned = await trail(owner);
+    assert(owned.includes("audit-viewer@example.com GET /sheet/:id jwt"), `a read is a row: ${owned}`);
+    assert(owned.includes("audit-editor@example.com POST /sheet/:id jwt"), `a write is a row: ${owned}`);
+    assert(owned.includes("audit-owner@example.com GET /export/:id jwt"), `an export is a row: ${owned}`);
+    assert(owned.includes("audit-owner@example.com POST /library/:id/share jwt"), `a share is a row: ${owned}`);
+    assert(!owned.some((x) => x.startsWith("audit-viewer@example.com POST")), `a refused write is not: ${owned}`);
+    assert(!owned.some((x) => x.startsWith("audit-stranger")), `a refused read is not: ${owned}`);
+
+    // Everybody else reads what they did themselves and nothing more.
+    const viewed = await trail(viewer);
+    assertEquals(viewed, ["audit-viewer@example.com GET /sheet/:id jwt"], "a viewer sees their own read only");
+    assertEquals(await trail(stranger), [], "and a stranger sees nothing about a sheet they never reached");
+
+    // An agent's write and a key's read are rows in the same log, marked so.
+    const rpc = await app.request(`/mcp/${sheet_id}`, {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${editor}` }),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "write_cells", arguments: { cells: [{ row: 0, col: "a", value: "agent" }] } },
+      }),
+    });
+    assert(rpc.ok, `mcp answered ${rpc.status}`);
+    const { data: { key } }: { data: { key: string } } = await post(owner, `/library/${sheet_id}/secret`, {
+      name: "api",
+    });
+    assert((await app.request(`/sheet/${sheet_id}`, { headers: new Headers({ "scrapsheets-key": key }) })).ok);
+    const again = await trail(owner);
+    assert(again.includes("audit-editor@example.com mcp write_cells mcp"), `an agent's write is a row: ${again}`);
+    assert(again.includes("audit-owner@example.com GET /sheet/:id key"), `a key's read is a row: ${again}`);
+
+    // A query is a read of every sheet it selects from, whoever spelled the
+    // request, and a route whose :id is not a sheet id is still keyed by the
+    // sheet, or its owner would never see the row.
+    await post(viewer, `/query`, { lang: "sql", code: `select * from @${sheet_id}`, args: [] });
+    const conn = automerge.create<Sheet>({ type: "codex-db", data: [] });
+    await put(owner, `/library/codex-db:${conn.documentId}`, {});
+    await post(owner, `/codex-db/${conn.documentId}`, { dsn: "postgresql://u:p@nope.invalid:5432/db" });
+    const hook = automerge.create<Sheet>({ type: "net-hook", data: [] });
+    await put(owner, `/library/net-hook:${hook.documentId}`, {});
+    await get(owner, `/net/${hook.documentId}`);
+    const spelled = (await get<Table>(owner, `/sheet/library:audit`)).slice(1).map((r) => `${r.sheet_id} ${r.action}`);
+    assert(spelled.includes(`${sheet_id} query`), `a query's read of a sheet is a row on that sheet: ${spelled}`);
+    assert(spelled.includes(`codex-db:${conn.documentId} POST /codex-db/:id`), `a codex write is keyed by its sheet: ${spelled}`);
+    assert(spelled.includes(`net-hook:${hook.documentId} GET /net/:id`), `a bare doc id is keyed by its sheet: ${spelled}`);
+
+    // A sheet, so it exports and queries like one.
+    const csv = await raw(owner, `/export/library:audit.csv`);
+    assert(csv.ok, `export answered ${csv.status}`);
+    assertEquals((await csv.text()).split("\n")[0], "created_at,sheet_id,who,action,via,detail");
+    const { data: [, ...queried] }: { data: Table } = await post(owner, `/query`, {
+      lang: "sql",
+      code: `select action, count(*) as n from @library:audit where sheet_id = '${sheet_id}' group by action order by action`,
+      args: [],
+    });
+    assert(queried.some((r) => r.action === "GET /sheet/:id"), `the log is a query source: ${JSON.stringify(queried)}`);
   });
 
   await t.step("The bucket a flood is counted against must be one the flood cannot choose", async () => {

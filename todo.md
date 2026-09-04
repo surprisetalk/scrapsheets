@@ -403,14 +403,6 @@ The Excel add-in market lives here.
   2. SSO, SAML and SCIM, which is table stakes for any org-sized customer.
   3. Ownership transfer and offboarding: what happens to sheets when someone leaves.
 
-- [ ] **You can read who opened a sheet and what they changed.** A link now carries a chosen expiry and an optional
-      password, and nothing records what it was used for.
-  1. One audit log of reads and writes, exportable and queryable as a sheet. It is the only one: an action's "who ran
-     what" and an agent's write trail are rows in it, which is why neither **Actions & write-back** nor **AI & MCP**
-     carries a log of its own.
-  2. Row-level provenance under **Lineage, tests & freshness** answers "which run produced this row" and is a
-     different question from "who did this"; they stay two things.
-
 - [ ] **You cannot publish a secret by accident.** Nothing is scanned.
   1. Refuse to publish a sheet containing an API key.
   2. Warn before a dataset with personal data goes public.
