@@ -66,11 +66,16 @@ Five files. Which one a failure belongs in is usually obvious.
 - `page_test.ts` — the page under jsdom, through two harnesses. `boot` runs the compiled Elm in `dist/index.js` with
   every port answered by hand and the library fed in through `library()`; reach for it for anything about what the page
   renders. `glue` runs `src/index.html`'s own `<script type="module">` over the same jsdom — its imports rewritten to a
-  destructure, `initializeWasm`, `Repo` and its storage stubbed, the websocket adapter genuine, `fetch` recorded and
-  answered by the test — so `changeDoc`, `arrangeDoc`, `applyPatches`, `Views`, the query re-run guard, the share
-  requests and the sync-refusal hook are the real ones; reach for it for anything about what the glue does. `docs`
-  hands it a synced document, which is where a write is watched: the handle holds the test's own object. Always runs `deno task build` first. deno-dom is not enough — it has no
-  `replaceData` on a text node.
+  destructure, `initializeWasm` and the storage stubbed, the websocket adapter genuine, `fetch` and `WebSocket`
+  recorded and answered by the test — so `changeDoc`, `arrangeDoc`, `applyPatches`, `Views`, the query re-run guard,
+  the share requests, CSV import, `newDoc`, fork and the socket-health report are the real ones; reach for it for
+  anything about what the glue does. `docs` hands it a synced document, which is where a write is watched: the handle
+  holds the test's own object. `realRepo` swaps the stub repo for automerge itself — slower, and the only way to find
+  out whether a patch means the same thing to a real document as it does to a plain object. Both harnesses drive
+  animation frames off the event loop rather than jsdom's ~16ms clock: a settle waits for the page to go quiet, not
+  for real time, and that clock was most of this file's wall time. Anything that does wait on a real timer — the query
+  debounce, a file being read — asks `settle(ms)` for it by name. Always runs `deno task build` first. deno-dom is not
+  enough — it has no `replaceData` on a text node.
 - `browser_test.ts` — no browser: dist builds, `index.html` wires the WASM and the import map, every root-absolute asset
   is in `_redirects`, every imported name is exported, nothing reaches a CDN. `index.html`'s `<script type="module">`
   body is piped to `deno lint` for real scope analysis. `BROWSER_GLOBALS` is the whole allowlist of names Deno's global
@@ -196,6 +201,11 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   `repo.find`. `viewGallery` reads `model.library`, so a new demo needs no code change.
 - **Cross-sheet queries in the browser**: `sheets(alasql, shelf, find)` in `src/page.mjs`. Only two things come from the
   browser and both are arguments: the library map and `repo.find`.
+- **One CSV import, whichever way the file arrives.** The footer's file input goes through Elm's `CsvImportFile` and
+  the `importCsv` port; a file dropped on the page is read by `setupDragDrop` and handed to the same `uploadCsv`. The
+  server parses it, because it is the one that registers the sheet, syncs it and infers the column types from the
+  values — and its answer carries the new `sheet_id`, which `Library.set` needs or the sheet lands where this browser
+  cannot see it. `parseCsv` in `Main.elm` is a different job: the clipboard.
 - **Feed health**: `library:freshness` is read by `index.html` and handed to Elm through `freshnessLoaded`. The
   `freshness` column appears only when the answer is non-empty — a blank column over a logged-out library would read as
   "nothing is wrong".

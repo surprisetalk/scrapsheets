@@ -552,85 +552,23 @@
               e.stopPropagation();
               document.body.classList.remove("drag-over");
             });
-            document.body.addEventListener("drop", async (e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              document.body.classList.remove("drag-over");
-              const files = Array.from(e.dataTransfer.files).filter(
-                (file) =>
-                  file.type === "text/csv" ||
-                  file.name.endsWith(".csv"),
-              );
-              for (const file of files) {
-                try {
-                  const lines = (await file.text())
-                    .split("\n")
-                    .filter((line) => line.trim());
-                  if (!lines.length) return null;
-                  const [headers, ...data] = lines.map((row) => {
-                    const result = [];
-                    let current = "";
-                    let inQuotes = false;
-                    for (let i = 0; i < row.length; i++) {
-                      const char = row[i];
-                      if (char === '"') {
-                        if (inQuotes && row[i + 1] === '"') {
-                          current += '"';
-                          i++;
-                        } else {
-                          inQuotes = !inQuotes;
-                        }
-                      } else if (char === "," && !inQuotes) {
-                        result.push(current.trim());
-                        current = "";
-                      } else {
-                        current += char;
-                      }
-                    }
-                    result.push(current.trim());
-                    return result;
-                  });
-                  if (!headers.length) return;
-                  const newSheet = repo.create({
-                    type: "table",
-                    data: [
-                      headers.map((name, key) => ({
-                        name,
-                        type: "text",
-                        key,
-                      })),
-                      ...data.map((row) => {
-                        const rowObj = {};
-                        headers.forEach((_, index) => {
-                          rowObj[index] = row[index] || "";
-                        });
-                        return rowObj;
-                      }),
-                    ],
-                  });
-                  const id = `table:${newSheet.documentId}`;
-                  const csvName = file.name.replace(/\.csv$/i, "");
-                  Library.set(id, { name: csvName, tags: [] });
-
-                  // Register document in database with retry for sync timing
-                  const registered = await registerDocWithRetry(id, csvName);
-                  if (!registered) {
-                    console.error("Failed to register CSV document after retries");
-                    app.ports.docErrored.send("Failed to save imported file. Please try again.");
-                    return;
-                  }
-
-                  requestAnimationFrame(() => {
-                    window.location = `/${id}`;
-                  });
-                } catch (error) {
-                  console.error("Error processing CSV file:", error);
-                  app.ports.docErrored.send(
-                    `Error processing ${file.name}: ${error.message}`,
-                  );
-                }
-              }
-            });
+            document.body.addEventListener(
+              "drop",
+              catchy(async (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                document.body.classList.remove("drag-over");
+                const files = Array.from(e.dataTransfer.files).filter(
+                  (file) => file.type === "text/csv" || file.name.endsWith(".csv"),
+                );
+                // The same import the file input asks for. This used to parse the
+                // CSV here and make the sheet with `repo.create`, which meant a
+                // dropped file and a chosen one produced two different sheets --
+                // one this browser owned and one the server did -- off two
+                // different parsers.
+                for (const file of files) await uploadCsv(file.name, await file.text());
+              }, "drop"),
+            );
           };
           if (document.readyState === "loading") {
             document.addEventListener(
@@ -1138,35 +1076,50 @@
             }, "downloadChart"),
           );
 
+          // One import, whichever way the file arrived: the footer's file input
+          // sends it here through Elm, and a file dropped on the page is read and
+          // sent here too. The server is the one that parses it, because it is
+          // the one that registers the sheet, syncs it and infers the column
+          // types from the values.
+          async function uploadCsv(filename, content) {
+            debug.log('importCsv:', filename);
+            const token = getAuthToken();
+            if (!token) {
+              app.ports.docErrored.send('Please log in to import CSV files.');
+              return;
+            }
+            const formData = new FormData();
+            formData.append('file', new File([content], filename, { type: 'text/csv' }));
+            const res = await fetch(`${API_BASE}/import/csv`, {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${token}` },
+              body: formData,
+            });
+            if (!res.ok) {
+              app.ports.docErrored.send(
+                `CSV import failed: ${
+                  httpErrorDetail(await res.text(), res.headers.get("Content-Type") ?? "") || res.statusText
+                }`,
+              );
+              return;
+            }
+            // The sheet is the server's, so this browser has to be told it exists
+            // before it can show it: the library is what localStorage holds plus
+            // what ships bundled, and nothing here reads the server's list.
+            const { sheet_id } = await res.json();
+            if (!sheet_id) {
+              throw new Error(
+                `Expected the imported sheet's id, received an answer without one from POST /import/csv. ` +
+                  `Source: importing ${filename}. The sheet may exist on the server; reload to look for it.`,
+              );
+            }
+            Library.set(sheet_id, { name: filename.replace(/\.csv$/i, ""), tags: [] });
+            window.history.pushState({}, "", `/${sheet_id}`);
+            await changeId(sheet_id);
+          }
+
           app.ports.importCsv.subscribe(
-            catchy(async ({ filename, content }) => {
-              debug.log('importCsv:', filename);
-              const token = getAuthToken();
-              if (!token) {
-                app.ports.docErrored.send('Please log in to import CSV files.');
-                return;
-              }
-              try {
-                const formData = new FormData();
-                formData.append('file', new File([content], filename, { type: 'text/csv' }));
-                const res = await fetch(`${API_BASE}/import/csv`, {
-                  method: 'POST',
-                  headers: {
-                    'Authorization': `Bearer ${token}`,
-                  },
-                  body: formData,
-                });
-                if (!res.ok) {
-                  const text = await res.text();
-                  app.ports.docErrored.send(`CSV import failed: ${text || res.statusText}`);
-                  return;
-                }
-                // Refresh library to show the new sheet
-                await changeId('');
-              } catch (err) {
-                app.ports.docErrored.send(`CSV import failed: ${err?.message ?? 'Unknown error'}`);
-              }
-            }, 'importCsv'),
+            catchy(({ filename, content }) => uploadCsv(filename, content), 'importCsv'),
           );
 
           // Restore a logged-in session from a previous visit so the UI shows LoggedIn on load.

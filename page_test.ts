@@ -15,7 +15,7 @@
 // sync-refusal hook are the real ones. Reach for `boot` for anything about what
 // the page renders, and for `glue` for anything about what the glue does.
 import { assert, assertEquals, assertThrows } from "@std/assert";
-import { cbor } from "@automerge/automerge-repo";
+import { cbor, Repo as AutomergeRepo } from "@automerge/automerge-repo";
 import { JSDOM } from "jsdom";
 import { BrowserWebSocketClientAdapter } from "./src/automerge-repo-ws.mjs";
 import { EXAMPLES } from "./src/examples.mjs";
@@ -82,6 +82,13 @@ type El = {
  * by a file in the user's cache — a test must never end up writing there.
  */
 const globalize = (w: Record<string, unknown>) => {
+  // jsdom paints on a ~16ms clock, and a settle waits several frames for the
+  // page to go quiet. Nothing here depends on real frame timing — only on Elm
+  // having had its turn — and that clock was most of this file's wall time, so
+  // the frames run as fast as the event loop will carry them. Anything that
+  // waits on a real timer instead, like the query debounce, asks for it by name.
+  w.requestAnimationFrame = (cb: (t: number) => void) => setTimeout(() => cb(Date.now()), 0);
+  w.cancelAnimationFrame = (id: number) => clearTimeout(id);
   for (
     const name of [
       "window",
@@ -105,6 +112,8 @@ const globalize = (w: Record<string, unknown>) => {
       "Image",
       "localStorage",
       "FileReader",
+      "File",
+      "FormData",
       "Blob",
     ]
   ) { Object.defineProperty(globalThis, name, { value: w[name], configurable: true, writable: true }); }
@@ -1423,9 +1432,14 @@ const glue = async (
     // What a test wants to watch rather than replace: whatever is named here
     // wins over the real export of the same name.
     watching = {} as Record<string, unknown>,
-    // What the API answers. `{ data: [] }` is the shape the freshness poll
-    // reads, which every page makes whether a test cares or not.
+    // What the API answers: a `Response` is used as it is, anything else is sent
+    // back as a JSON 200. `{ data: [] }` is the shape the freshness poll reads,
+    // which every page makes whether a test cares or not.
     respond = (_url: string, _init?: RequestInit): unknown => ({ data: [] }),
+    // Automerge itself, rather than a stub of it. Slower, and the only way to
+    // find out whether a patch means the same thing to a real document as it
+    // does to a plain object.
+    realRepo = false,
   } = {},
 ) => {
   await ensureDist();
@@ -1448,15 +1462,41 @@ const glue = async (
     asked.push({
       url,
       method: init?.method ?? "GET",
-      body: typeof init?.body === "string" ? JSON.parse(init.body) : null,
+      // A string body is the JSON these routes send; anything else -- a
+      // FormData carrying a file -- is handed over as it is, for the test to read.
+      body: typeof init?.body === "string" ? JSON.parse(init.body) : (init?.body ?? null),
     });
+    const answer = respond(url, init);
+    if (answer instanceof Response) return Promise.resolve(answer);
     return Promise.resolve(
-      new Response(JSON.stringify(respond(url, init) ?? { data: [] }), {
+      new Response(JSON.stringify(answer ?? { data: [] }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       }),
     );
   });
+  // A net-socket sheet opens one of these to watch a feed. Recorded so a test
+  // can say what was opened and then say what happened to it.
+  const sockets: { url: string; onopen?: () => void; onclose?: () => void; onerror?: () => void; closed: boolean }[] =
+    [];
+  define(
+    "WebSocket",
+    class {
+      url: string;
+      readyState = 0;
+      closed = false;
+      onopen?: () => void;
+      onclose?: () => void;
+      onerror?: () => void;
+      constructor(url: string) {
+        this.url = url;
+        sockets.push(this);
+      }
+      close() {
+        this.closed = true;
+      }
+    },
+  );
   // The page sets a one-minute freshness poll going. Recorded so the harness can
   // stop it, or it outlives the test.
   const timers: unknown[] = [];
@@ -1475,6 +1515,9 @@ const glue = async (
   // The one thing the harness has to reach afterwards: the refusal hook lives on
   // this instance, and `Repo` is where src/index.html hands it over.
   let adapter!: { socket?: unknown; receiveMessage: (data: unknown) => void };
+  let repo!: { find: (id: string) => Promise<{ doc: () => unknown } | null> };
+  // Documents the page made for itself, in the order it made them.
+  const created: Record<string, unknown>[] = [];
   const deps: Record<string, unknown> = {
     ...pageExports,
     ...sqlExports,
@@ -1484,24 +1527,62 @@ const glue = async (
     cbor,
     BrowserWebSocketClientAdapter,
     IndexedDBStorageAdapter: class {},
-    Repo: class {
-      constructor(options: { network: (typeof adapter)[] }) {
-        adapter = options.network[0];
+    Repo: realRepo
+      // No storage and no network: a document made here lives and dies in this
+      // test, and nothing it does reaches a socket.
+      ? class extends AutomergeRepo {
+        constructor(options: { network: (typeof adapter)[] }) {
+          adapter = options.network[0];
+          super({ network: [] });
+          repo = this as unknown as typeof repo;
+        }
       }
-      on() {}
-      find(doc_id: string) {
-        return Promise.resolve(docs[doc_id] ? fakeHandle(doc_id, docs[doc_id]) : null);
-      }
-    },
+      : class {
+        constructor(options: { network: (typeof adapter)[] }) {
+          adapter = options.network[0];
+          repo = this as unknown as typeof repo;
+        }
+        on() {}
+        find(doc_id: string) {
+          return Promise.resolve(docs[doc_id] ? fakeHandle(doc_id, docs[doc_id]) : null);
+        }
+        create(doc: Record<string, unknown>) {
+          const doc_id = `made${created.length + 1}`;
+          created.push(doc);
+          docs[doc_id] = doc;
+          return fakeHandle(doc_id, doc);
+        }
+      },
   };
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   await new AsyncFunction("deps", await glueSource(deps))(deps);
 
   const doc = dom.window.document;
-  // Elm paints on an animation frame; `ms` is for the parts of the page that
-  // wait on a real clock, which is only the query debounce.
+  // jsdom's File implements no `text()`, and src/index.html's drop handler reads
+  // one. Everything else about the file is jsdom's, because Elm reads it with
+  // jsdom's FileReader and that will not take a foreign Blob.
+  const csvFile = (name: string, content: string) => {
+    const file = new dom.window.File([content], name, { type: "text/csv" });
+    if (typeof (file as unknown as { text?: unknown }).text !== "function")
+      Object.defineProperty(file, "text", { value: () => Promise.resolve(content) });
+    return file;
+  };
+  // The same quiet-frames wait `boot` uses, and for the same reason: a fixed
+  // count long enough for a click to go out through a port and back was half a
+  // second on every assertion. `ms` is for the parts of the page that wait on a
+  // real clock instead -- the query debounce, and a file being read.
   const settle = async (ms = 0) => {
-    for (let i = 0; i < 30; i++) await new Promise((r) => dom.window.requestAnimationFrame(() => r(null)));
+    await new Promise<void>((resolve) => {
+      let frames = 0, quiet = 0, last = "";
+      const tick = () => {
+        const now = doc.body.innerHTML;
+        quiet = now === last ? quiet + 1 : 0;
+        last = now;
+        if (quiet >= 3 || ++frames >= 24) return resolve();
+        dom.window.requestAnimationFrame(tick);
+      };
+      dom.window.requestAnimationFrame(tick);
+    });
     if (ms) await new Promise((r) => setTimeout(r, ms));
   };
   await settle();
@@ -1509,6 +1590,31 @@ const glue = async (
     app,
     settle,
     asked,
+    created,
+    sockets,
+    /** The document the repo holds, read back the way the page would. */
+    document: async (id: string) => (await repo.find(id.split(":")[1]))?.doc(),
+    path: () => dom.window.location.pathname.slice(1),
+    /** A file chosen through the footer's file input, which is what Elm listens
+     * for. `files` is read-only on the element, and Elm's decoder takes a plain
+     * array as readily as a FileList.
+     */
+    pickFile: async (name: string, content: string) => {
+      const input = [...doc.querySelectorAll('input[type="file"]')][0];
+      assert(input, "expected a file input on the library sheet");
+      Object.defineProperty(input, "files", { value: [csvFile(name, content)], configurable: true });
+      input.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+      await settle(50);
+    },
+    /** A file dropped on the page, which src/index.html handles itself. jsdom
+     * builds no `dataTransfer`, so the handler is given the one it reads.
+     */
+    dropFile: async (name: string, content: string) => {
+      const event = new dom.window.Event("drop", { bubbles: true });
+      Object.defineProperty(event, "dataTransfer", { value: { files: [csvFile(name, content)] } });
+      dom.window.document.body.dispatchEvent(event);
+      await settle(50);
+    },
     all: (sel: string): El[] => [...doc.querySelectorAll(sel)],
     fire: async (el: El, type: string) => {
       el.dispatchEvent(new dom.window.MouseEvent(type, { bubbles: type !== "mouseenter" }));
@@ -1532,6 +1638,15 @@ const glue = async (
       await settle();
     },
     held: () => JSON.parse((w.localStorage as Storage).getItem("scrapsheets-views") ?? "null"),
+    stored: (key: string) => JSON.parse((w.localStorage as Storage).getItem(`scrapsheets-${key}`) ?? "null"),
+    /** A file the page built, read the way the page's own reader reads one. */
+    readFile: (file: unknown) =>
+      new Promise<string>((resolve, reject) => {
+        const reader = new dom.window.FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsText(file as Blob);
+      }),
     // The sync server refuses a viewer's write with this frame. The adapter
     // asserts it has a socket before reading one, and connecting for real would
     // open one to the API, so it is given something to find.
@@ -1540,10 +1655,14 @@ const glue = async (
       adapter.receiveMessage(cbor.encode({ type: "error", senderId: "s", targetId: "t", documentId, message }));
       await settle();
     },
+    // The intervals the page started, and nothing else. `dom.window.close()`
+    // does not stop jsdom's animation frames, so a frame the page has already
+    // asked for fires against a closed window and throws reading `location` off
+    // it -- uncatchably, from a timer. `boot` leaves its window open for the
+    // same reason, and an idle jsdom costs a timer nobody is watching.
     close: () => {
       for (const id of timers) clearInterval(id as number);
       define("setInterval", realInterval);
-      dom.window.close();
     },
   };
 };
@@ -1786,6 +1905,258 @@ Deno.test({
       page.asked.filter((r) => r.url.includes("/share") || r.url.includes("/link")),
       [],
       "and nothing was asked of the server",
+    );
+    page.close();
+  },
+});
+
+// CSV import, whichever way the file arrives. Both go to the server: it is the
+// one that registers the sheet, syncs it and infers the column types. A dropped
+// file used to be parsed in the browser and made into a sheet this browser
+// owned, so the same gesture produced two different sheets off two parsers.
+const imported = {
+  stored: { user: { usr_id: "u1", jwt: "a-token" } },
+  docs: {
+    imported1: { type: "table", data: [[{ name: "name", type: "text", key: "0" }], { "0": "Chile" }] },
+  },
+  respond: (url: string) => url.endsWith("/import/csv") ? { sheet_id: "table:imported1" } : { data: [] },
+};
+
+Deno.test({
+  name: "a chosen CSV is posted to the server, and the sheet it makes is opened",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const page = await glue("http://localhost/", imported);
+    await page.pickFile("countries of the world.csv", "name,code\nChile,CL\n");
+
+    const post = page.asked.find((r) => r.url.endsWith("/import/csv"));
+    assert(post, `expected the import request, got: ${JSON.stringify(page.asked.map((r) => r.url))}`);
+    assertEquals(post.method, "POST");
+    const sent = (post.body as FormData).get("file") as File;
+    assertEquals(sent.name, "countries of the world.csv", "the file goes over with the name it had");
+    assertEquals(await page.readFile(sent), "name,code\nChile,CL\n", "and the bytes Elm read out of it");
+
+    // The sheet is the server's, and the library is what this browser holds plus
+    // what ships bundled — so it has to be told the sheet exists, or the import
+    // lands somewhere it cannot be seen.
+    // A thumbnail joins it on the way in, which is every library entry's story.
+    const entry = page.stored("library")["table:imported1"] as { name: string; tags: string[] };
+    assertEquals(
+      [entry.name, entry.tags],
+      ["countries of the world", []],
+      "the imported sheet joins this browser's library, under the file's name",
+    );
+    assertEquals(page.path(), "table:imported1", "and the page goes to it");
+    assert(
+      page.text().includes("Chile"),
+      `the sheet the server made is what renders, got: ${page.text().slice(0, 200)}`,
+    );
+    page.close();
+  },
+});
+
+Deno.test({
+  name: "a dropped CSV takes the same path as a chosen one",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const page = await glue("http://localhost/", imported);
+    await page.dropFile("prices.csv", 'item,cost\n"widget, large",4.50\n');
+
+    const post = page.asked.find((r) => r.url.endsWith("/import/csv"));
+    assert(
+      post,
+      `a dropped file should be imported the same way, got: ${JSON.stringify(page.asked.map((r) => r.url))}`,
+    );
+    assertEquals(await page.readFile((post.body as FormData).get("file")), 'item,cost\n"widget, large",4.50\n');
+    assertEquals(page.created, [], "and nothing is parsed and made here any more");
+    assertEquals(page.path(), "table:imported1", "the page goes to the sheet the server made");
+    page.close();
+  },
+});
+
+Deno.test({
+  name: "a CSV import the server refuses says what the server said",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const page = await glue("http://localhost/", {
+      stored: { user: { usr_id: "u1", jwt: "a-token" } },
+      respond: (url) =>
+        url.endsWith("/import/csv")
+          ? new Response("Expected a header row, received an empty file.", { status: 400 })
+          : { data: [] },
+    });
+    await page.pickFile("empty.csv", "");
+
+    assert(
+      page.text().includes("Expected a header row"),
+      `the server's own words should reach the page, got: ${page.text().slice(-300)}`,
+    );
+    assertEquals(
+      Object.keys(page.stored("library") ?? {}),
+      [],
+      "and nothing is added to the library for a sheet that was not made",
+    );
+    page.close();
+  },
+});
+
+Deno.test({
+  name: "a CSV import with nobody logged in says so instead of failing quietly",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const page = await glue("http://localhost/");
+    await page.pickFile("x.csv", "a,b\n1,2\n");
+
+    assert(page.text().includes("log in to import"), `expected the reason, got: ${page.text().slice(-300)}`);
+    assertEquals(page.asked.filter((r) => r.url.includes("/import/")), [], "and nothing was asked of the server");
+    page.close();
+  },
+});
+
+// A net-socket sheet's socket is opened by the browser watching it, and nothing
+// server-side ever opens one — so this report is the only witness the server has
+// that the feed is alive.
+Deno.test({
+  name: "a socket that opens is reported, and only when its state changes",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const page = await glue("http://localhost/net-socket:feed1", {
+      stored: { user: { usr_id: "u1", jwt: "a-token" } },
+      docs: { feed1: { type: "net-socket", data: [{ url: "wss://feed.example/ticks" }] } },
+    });
+    const reports = () => page.asked.filter((r) => r.url.endsWith("/library/net-socket:feed1/socket"));
+
+    assertEquals(page.sockets.map((s) => s.url), ["wss://feed.example/ticks"], "the sheet's own url is opened");
+    assertEquals(reports(), [], "and nothing is reported until something happens to it");
+
+    page.sockets[0].onopen?.();
+    await page.settle();
+    assertEquals(reports().map((r) => r.body), [{ status: "connected" }], "an open is reported");
+    assert(page.text().includes("connected"), `and shown, got: ${page.text().slice(-200)}`);
+
+    page.sockets[0].onopen?.();
+    await page.settle();
+    assertEquals(reports().length, 1, "a second open is the same state, and the same state is not news");
+
+    page.sockets[0].onerror?.();
+    await page.settle();
+    assertEquals(reports().map((r) => r.body).at(-1), { status: "error" }, "a change of state is");
+    page.close();
+  },
+});
+
+Deno.test({
+  name: "a socket report nobody may write is not a failure, and logged out is not a report",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    // 403 is somebody watching a sheet they can only read. They may watch the
+    // socket and may not write its health, which is not a failure of anything.
+    const viewer = await glue("http://localhost/net-socket:feed2", {
+      stored: { user: { usr_id: "u1", jwt: "a-token" } },
+      docs: { feed2: { type: "net-socket", data: [{ url: "wss://feed.example/x" }] } },
+      respond: (url) => url.endsWith("/socket") ? new Response("no", { status: 403 }) : { data: [] },
+    });
+    viewer.sockets[0].onopen?.();
+    await viewer.settle();
+    assert(!viewer.text().includes("Could not report"), `a 403 must pass quietly, got: ${viewer.text().slice(-200)}`);
+    viewer.close();
+
+    const anon = await glue("http://localhost/net-socket:feed2", {
+      docs: { feed2: { type: "net-socket", data: [{ url: "wss://feed.example/x" }] } },
+    });
+    anon.sockets[0].onopen?.();
+    await anon.settle();
+    assertEquals(anon.asked.filter((r) => r.url.endsWith("/socket")), [], "nobody logged in reports nothing");
+    assert(anon.text().includes("connected"), "but the page still says what it can see");
+    anon.close();
+  },
+});
+
+// Forking is what makes "start from a demo" mean anything: the source is a
+// bundled example with no document of this browser's behind it.
+Deno.test({
+  name: "forking a bundled demo copies it into this browser, without its demo tags",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const page = await glue("http://localhost/query:budget-burn");
+    await page.click(page.all("button").find((b) => b.textContent?.trim() === "fork"));
+
+    assertEquals(page.created.length, 1, "a fork is a document this browser makes");
+    const copy = page.created[0] as { forked_from: string; name: string; data: unknown[] };
+    assertEquals(copy.forked_from, "query:budget-burn", "and it says where it came from");
+    assert(copy.name.endsWith("(fork)"), `named after its source, got: ${copy.name}`);
+    const entry = page.stored("library")["query:made1"] as { name: string; tags: string[] };
+    assertEquals(entry.name, copy.name, "the fork is in this browser's library");
+    assertEquals(
+      entry.tags.filter((t) => t === "demo" || t === "example"),
+      [],
+      "and does not inherit the tags that would put it in the gallery pretending to be an original",
+    );
+    page.close();
+  },
+});
+
+// Everything above stubs the repo, so every patch has only ever been applied to
+// a plain object. Automerge is not a plain object: a list is a CRDT the library
+// owns, and `applyPatches` splices one.
+Deno.test({
+  name: "a new sheet is a real automerge document, and every patch shape lands on it",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const page = await glue("http://localhost/", { realRepo: true });
+    await page.click(page.all("tr").find((tr) => tr.getAttribute("title") === "new table:..."));
+    const id = page.path();
+    assert(id.startsWith("table:"), `the page should be on the new sheet, got: ${id}`);
+
+    // "→" adds a column: a `push` on data[0], against a real automerge list. A
+    // pushed column is nameless until somebody names it, and keyed by the count.
+    const add = () => page.all("th").find((th) => th.getAttribute("title") === "add column");
+    await page.click(add());
+    await page.click(add());
+    const made = await page.document(id) as { data: [Record<string, unknown>[], ...Record<string, string>[]] };
+    assertEquals(
+      made.data[0].map((col) => String(col.key)),
+      ["a", "1", "2"],
+      "a pushed column lands in the document",
+    );
+
+    // A new table has columns and no rows. "↴" pushes one: a `push` at the root
+    // of `data`, which is the third patch shape and the last one untried.
+    await page.click(page.all("tr").find((tr) => tr.getAttribute("title") === "add row"));
+    assertEquals(
+      ((await page.document(id)) as { data: unknown[] }).data.length,
+      2,
+      "a pushed row lands at the root of the document",
+    );
+
+    // A cell edit: a set at [row, column key].
+    const cell = [...page.all("tbody tr")[3].querySelectorAll("td")][0];
+    for (const type of ["mouseenter", "click", "dblclick"]) await page.fire(cell, type);
+    await page.type_(page.all("#new-cell")[0], "typed");
+    assertEquals(
+      ((await page.document(id)) as { data: Record<string, string>[] }).data[1]["a"],
+      "typed",
+      "and a cell write lands under the column's key",
+    );
+
+    // A move: the one patch that takes a value out of an automerge list and puts
+    // it back somewhere else. `a` is the only column with a handle to grab — a
+    // pushed column is nameless, and a nameless header draws nothing.
+    await page.fire(page.all("span.grab")[0], "mousedown");
+    await page.fire([...page.all("tbody tr")[3].querySelectorAll("td")][2], "mouseenter");
+    await page.keyUp();
+    assertEquals(
+      ((await page.document(id)) as { data: Record<string, unknown>[][] }).data[0].map((col) => String(col.key)),
+      ["1", "2", "a"],
+      "a move means the same thing to automerge as it does to a plain object",
     );
     page.close();
   },
