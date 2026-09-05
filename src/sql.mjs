@@ -443,7 +443,7 @@ const checkRefPath = (path, id) => {
 // `describe @table:abc` is not SQL AlaSQL can parse, so both engines intercept it
 // before the engine sees the text. One statement, one ref, nothing else: the
 // point is to answer "what columns does this sheet have" without writing a query
-// that guesses.
+// that guesses. `explain <query>` below is the other intercepted statement.
 
 export const describeRef = (code) =>
   code.trim().replace(/;+$/, "").match(/^describe\s+@([a-z-]+:[A-Za-z0-9._-]+)\s*$/i)?.[1];
@@ -469,6 +469,58 @@ export const describeRows = (id, cols, rows) => {
       sample: filled.length ? String(filled[0]).slice(0, 60) : null,
     };
   });
+};
+
+// --- profiling
+//
+// `explain <query>` runs the query and answers with where the time went, one
+// row per stage. Both engines wrap the calls they already make in `timed`, which
+// does nothing without a stage list, so a profiled run and a plain run are one
+// code path. One `plan` row rather than one per pass: the passes are regex over
+// the text and their split is nothing an author can act on. A `load` of a
+// @query ref includes the nested run on both hosts, which is the point -- it
+// names the ref that is slow. `total` is wall clock rather than a sum, so
+// anything a host does between stages still shows up.
+
+export const profileRef = (code) => {
+  // A bare `explain` is claimed too: AlaSQL has an EXPLAIN of its own, and
+  // what it says about one is a TypeError naming an internal property.
+  const match = code.trim().match(/^explain(?:\s+([\s\S]+?))?\s*;*\s*$/i);
+  if (!match) return undefined;
+  const inner = match[1] ?? "";
+  if (!inner || describeRef(inner) || /^explain\s/i.test(inner)) {
+    throw new Error(explain(`explain profiles a query, and this is not one.`, {
+      Expected: "explain select …",
+      Received: inner ? shorten(inner) : "nothing after explain",
+      Source: "the statement after explain",
+      Fix: "explain a select; describe already answers without running anything",
+    }));
+  }
+  return inner;
+};
+
+export const PROFILE_COLUMNS = ["stage", "rows_in", "rows_out", "ms"];
+
+const tenths = (ms) => Math.round(ms * 10) / 10;
+
+export const timed = async (stages, stage, rows_in, fn, count) => {
+  if (!stages) return await fn();
+  const t0 = performance.now();
+  const out = await fn();
+  stages.push({ stage, rows_in, rows_out: count(out), ms: tenths(performance.now() - t0) });
+  return out;
+};
+
+/** Rows loaded across every sheet a run named: what the stages after the loads
+ * take in. Counted off the docs rather than parsed back out of a stage name. */
+export const loadedOf = (docs) => Object.values(docs).reduce((n, rows) => n + rows.length, 0);
+
+export const profileRows = (stages, docs, started) => {
+  if (!stages.length) throw new Error("profileRows: a profile with no stages; the plan and engine stages always run");
+  return [
+    ...stages,
+    { stage: "total", rows_in: loadedOf(docs), rows_out: stages.at(-1).rows_out, ms: tenths(performance.now() - started) },
+  ];
 };
 
 // --- type mismatch, and the one coercion table
@@ -1604,20 +1656,24 @@ export const toRecords = ([cols, ...rows]) =>
  * `fetch(id)` returns one as `[cols, ...rows]`. `onLoad(id, rows)` runs after
  * each, which is where the server spends its row budget; the page has no budget.
  * `describing` skips the column-type check, because a sheet whose cells are wrong
- * is exactly the sheet `describe` exists to inspect.
+ * is exactly the sheet `describe` exists to inspect. `stages`, when given,
+ * collects one timed row per load; a plain run passes none.
  */
-export const loadRefs = async (ids, { path, describing, fetch, onLoad }) => {
+export const loadRefs = async (ids, { path, describing, fetch, onLoad, stages }) => {
   const docs = {}, colsOf = {};
   for (const id of ids) {
     if (docs[id]) continue;
     checkRefPath(path, id);
-    const sheet = await fetch(id);
-    colsOf[id] = Object.values(sheet[0]);
-    docs[id] = toRecords(sheet);
-    await onLoad(id, docs[id]);
-    // Only table sheets: a query column keeps its source column's declared type,
-    // so `cast(price as string) as price` would trip a check meant for a bad cell.
-    if (!describing && id.startsWith("table:")) checkColumnTypes(id, colsOf[id], docs[id]);
+    await timed(stages, `load @${id}`, null, async () => {
+      const sheet = await fetch(id);
+      colsOf[id] = Object.values(sheet[0]);
+      docs[id] = toRecords(sheet);
+      await onLoad(id, docs[id]);
+      // Only table sheets: a query column keeps its source column's declared type,
+      // so `cast(price as string) as price` would trip a check meant for a bad cell.
+      if (!describing && id.startsWith("table:")) checkColumnTypes(id, colsOf[id], docs[id]);
+      return docs[id];
+    }, (rows) => rows.length);
   }
   return { docs, colsOf };
 };

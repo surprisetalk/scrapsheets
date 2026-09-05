@@ -719,6 +719,59 @@ Deno.test("dragging a column onto another moves it there, and off the table move
   );
 });
 
+// A row moves the same way: one `move` patch, at the root of `data` rather than
+// on `data[0]`. Only while the table is in document order -- a sorted view has
+// no honest target for the drop, so the handle is not there to grab.
+Deno.test("dragging a row onto another moves it there, and a sorted table offers no handle", async () => {
+  const { app, all, dom, doc, fire, settle, click, type_ } = await boot("http://localhost/table:countries");
+  const patches: { action: string; path: unknown[]; value: unknown }[] = [];
+  app.ports.changeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
+  await settle();
+
+  // Data rows start after the three meta rows; row 3 of the document is the
+  // fourth data row. Grab its handle, hover row 1, let go.
+  const rowHandle = (y: number) => [...all("tbody tr")[2 + y].querySelectorAll(`span.grab[title^="drag onto the row"]`)][0];
+  const rowCell = (y: number) => [...all("tbody tr")[2 + y].querySelectorAll("td")][0];
+  assert(rowHandle(3), "a table in document order offers a handle on every row");
+  await fire(rowHandle(3), "mousedown");
+  await fire(rowCell(1), "mouseenter");
+  await fire(doc, "mouseup");
+  assertEquals(patches.map((p) => [p.action, p.path, p.value]), [["move", [], [3, 1]]]);
+
+  patches.length = 0;
+  await fire(rowHandle(3), "mousedown");
+  await fire(all("table")[0], "mouseleave");
+  await fire(doc, "mouseup");
+  assertEquals(patches, [], `a drop off the table should move nothing, got ${JSON.stringify(patches)}`);
+
+  patches.length = 0;
+  await fire(rowHandle(3), "mousedown");
+  await fire(rowCell(1), "mouseenter");
+  await fire(doc, "mouseup");
+  patches.length = 0;
+  doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true }));
+  await settle();
+  assertEquals(patches.map((p) => [p.action, p.path, p.value]), [["move", [], [1, 3]]], "undo puts the row back");
+
+  // A sort taken with the button still down: the row under the pointer is a
+  // display row again, and the drop is refused rather than spliced blind.
+  patches.length = 0;
+  await fire(rowHandle(3), "mousedown");
+  await click(all("span.sort")[0]);
+  await fire(rowCell(1), "mouseenter");
+  await fire(doc, "mouseup");
+  assertEquals(patches, [], `a drop after a mid-drag sort should move nothing, got ${JSON.stringify(patches)}`);
+  assertEquals(all(`span.grab[title^="drag onto the row"]`).length, 0, "a sorted table offers no row handle");
+  assertEquals(all("span.grab").length, all("span.sort").length, "the column handles are still there");
+
+  // A search is the other way a display row stops being a document row.
+  await click(all("span.sort")[0]);
+  await click(all("span.sort")[0]);
+  assert(all(`span.grab[title^="drag onto the row"]`).length > 0, "unsorted again, the handles are back");
+  await type_(all('input[placeholder="search"]')[0], "Fr");
+  assertEquals(all(`span.grab[title^="drag onto the row"]`).length, 0, "a searched table offers no row handle");
+});
+
 // The two halves composed, which is what src/index.html does on the way in and
 // what neither half proves on its own.
 Deno.test("a sheet you cannot write opens with the arrangement this browser kept", async () => {
@@ -1003,19 +1056,68 @@ Deno.test("?embed=1 renders the sheet with no chrome around it", async () => {
 
 Deno.test("the library merges what is stored under what is bundled", () => {
   const stored = {
-    "table:mine": { name: "mine", doc: { type: "table", data: [{}] } },
+    "table:mine": { name: "mine", seen: "2026-09-03T10:00:00.000Z", doc: { type: "table", data: [{}] } },
     // A stale copy of a bundled example must not shadow the real one.
-    "table:countries": { name: "an old countries", doc: { type: "table", data: [{}] } },
+    "table:countries": { name: "an old countries", seen: "2026-09-04T10:00:00.000Z", doc: { type: "table", data: [{}] } },
   };
-  const shelf = library(stored) as Record<string, { name: string; system?: boolean; thumb?: unknown }>;
+  const shelf = library(stored) as Record<string, { name: string; system?: boolean; thumb?: unknown; seen?: string }>;
 
   assertEquals(shelf["table:mine"].name, "mine", "a stored sheet survives the merge");
+  assertEquals(shelf["table:mine"].seen, "2026-09-03T10:00:00.000Z", "and so does when it was opened");
   assertEquals(shelf["table:countries"].name, "countries", "the bundled countries wins over a stored copy");
+  // `seen` is this browser's fact whoever owns the entry, so it is the one
+  // stored field a bundled sheet keeps.
+  assertEquals(shelf["table:countries"].seen, "2026-09-04T10:00:00.000Z", "but when this browser opened it is kept");
+  assertEquals(shelf["table:tutorial"].seen, undefined, "a sheet never opened carries no seen");
   assertEquals(shelf[""].name, "library", "the empty id is the library itself");
   for (const p of PORTALS) assert(shelf[`portal:${p}`], `portal:${p} should be listed`);
   assert(shelf["table:tutorial"], "the tutorial is part of the library");
   // Every entry with a doc gets a thumbnail, which is what the library rows draw.
   for (const [id, entry] of Object.entries(shelf)) assert(entry.thumb, `${id} should carry a thumb`);
+});
+
+// The library's `opened` column is when this browser last opened the sheet,
+// sortable like any other, so the sheet you were just in is one click away.
+Deno.test("the library shows when each sheet was opened, and sorts by it", async () => {
+  const { app, all, click, settle, text } = await boot("http://localhost/");
+  app.ports.librarySynced.send({
+    ...shelf,
+    "table:mine": { name: "mine", tags: [], seen: "2026-09-04T10:00:00.000Z", doc: { type: "table", data: [[]] } },
+  });
+  await settle();
+  const header = () => all("span.sort").find((s) => s.textContent?.startsWith("opened"));
+  assert(header(), "the library has an opened column");
+  assert(text().includes("2026-09-04T10:00:00.000Z"), "and the row shows when it was opened");
+  await click(header());
+  await click(header());
+  const firstName = [...all("tbody tr")[3].querySelectorAll("td")][2].textContent;
+  assertEquals(firstName, "mine", "descending puts the last opened first, and the never-opened last");
+});
+
+// A rename in the library lands on the sheet whose row was edited, which is the
+// row as drawn -- sorted, filtered and searched -- and not the same position in
+// the unsorted dictionary. It used to be the latter, so a rename in a sorted
+// library renamed a stranger.
+Deno.test("renaming a row in a sorted library renames the sheet on that row", async () => {
+  const { app, all, fire, type_, click, settle, dom } = await boot("http://localhost/");
+  const renamed: { id: string; data: { name: string | null } }[] = [];
+  app.ports.updateLibrary.subscribe((sent: (typeof renamed)[number]) => renamed.push(sent));
+  await settle();
+
+  const nameHeader = () => all("span.sort").find((s) => s.textContent?.startsWith("name"));
+  await click(nameHeader());
+  await click(nameHeader());
+  assert(nameHeader()?.textContent?.endsWith("▼"), "two clicks sort the library by name, descending");
+  const first = all("tbody tr")[3];
+  const firstId = [...first.querySelectorAll("a")][0]?.getAttribute("href")?.slice(1);
+  assert(firstId, "the first row links to its sheet");
+  const nameCell = [...first.querySelectorAll("td")][2];
+  for (const type of ["mouseenter", "mousedown", "mouseup", "click", "dblclick"]) await fire(nameCell, type);
+  await type_(all("#new-cell")[0], "renamed");
+  // The write lands on blur, which `type_` here does not send.
+  all("#new-cell")[0].dispatchEvent(new dom.window.FocusEvent("blur"));
+  await settle();
+  assertEquals(renamed.map((r) => [r.id, r.data.name]), [[firstId, "renamed"]], "the rename names the row's own sheet");
 });
 
 // The sync server refuses a viewer's write, and a bundled sheet has no document
@@ -1310,6 +1412,26 @@ Deno.test("describe answers for a query sheet too, through the chain under it", 
     (data as Record<string, unknown>[]).map((r) => r.column),
     ["department", "spent_ytd", "adopted_ytd", "burn_ratio", "projected_year", "projected_variance"],
   );
+});
+
+Deno.test("explain answers the query's profile in the page, one row per stage", async () => {
+  const { columns, data } = await resolver().runSql("explain select * from @table:countries", { "": null });
+  assertEquals(columns.map((c: { columnid: string }) => c.columnid), ["stage", "rows_in", "rows_out", "ms"]);
+  const rows = data as Record<string, unknown>[];
+  assertEquals(rows.map((r) => r.stage), ["load @table:countries", "plan", "engine", "total"]);
+  assertEquals(rows[0].rows_in, null, "nothing precedes a load");
+  assertEquals(rows.at(-1)!.rows_out, rows[2].rows_out, "total answers what the last stage kept");
+  for (const r of rows) assert(typeof r.ms === "number" && (r.ms as number) >= 0, JSON.stringify(r));
+  assert((await refused("explain describe @table:countries")).includes("profiles a query"));
+  assert((await refused("explain")).includes("nothing after explain"), "a bare explain is ours, not AlaSQL's");
+  assert((await refused("explain select nope from @table:countries")).includes("nope"), "the query's own checks still stand");
+
+  // A @query ref's load is the nested run, which is what names the slow ref.
+  const nested = (await resolver().runSql("explain select * from @query:budget-burn", { "": null }))
+    .data as Record<string, unknown>[];
+  assertEquals(nested[0].stage, "load @query:budget-burn");
+  assert((nested[0].rows_out as number) > 0, "the nested query's rows are what the load stage answered");
+  assertEquals(nested[1].rows_in, nested[0].rows_out, "and they are what the plan takes in");
 });
 
 Deno.test("a table whose cells contradict their column type is refused as it loads", async () => {
@@ -1896,6 +2018,38 @@ Deno.test({
 // is the truth again, and the server says so the only way it can: its next
 // sync frame carries the head this browser wrote. Refusals are remembered for
 // one open of the sheet, not the whole session, or the grant is never tried.
+// Opening a sheet stamps when, on the stored library entry, and only for a
+// sheet the library already lists: a sheet opened from somebody's link is not
+// thereby yours. A bundled sheet gets a stored entry of this one field.
+Deno.test({
+  name: "opening a sheet records when, for the library's opened column",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const doc = { type: "table", data: [[{ name: "a", type: "text", key: "0" }], { "0": "x" }] };
+    const page = await glue("http://localhost/", {
+      docs: { shared1: doc, nowhere1: doc },
+      stored: { library: { "table:shared1": { name: "shared", tags: [] } } },
+    });
+    await page.go("/table:shared1");
+    const seen = page.stored("library")["table:shared1"].seen;
+    assert(Date.now() - Date.parse(seen) < 60_000, `seen should be now, got ${seen}`);
+
+    await page.go("/table:countries");
+    const bundled = page.stored("library")["table:countries"];
+    assert(bundled.seen, "a bundled sheet gets a stored entry for when it was opened");
+    assertEquals(bundled.name, undefined, "and nothing else: the bundled entry stays the bundled one");
+
+    await page.go("/table:nowhere1");
+    assertEquals(page.stored("library")["table:nowhere1"], undefined, "a sheet the library does not list is not added to it");
+
+    await page.go("/");
+    const row = page.all("tbody tr").find((tr) => tr.textContent?.includes("shared"));
+    assert(row?.textContent?.includes(seen), "the library row shows when the sheet was opened");
+    page.close();
+  },
+});
+
 Deno.test({
   name: "a held arrangement is dropped once the document takes one",
   sanitizeOps: false,
@@ -2002,6 +2156,25 @@ Deno.test({
       "the arrangement went to the document, under the name its select list gave the column",
     );
     assertEquals(page.held(), null, "and this browser has no reason to hold a copy");
+    page.close();
+  },
+});
+
+// explain answers a table whose columns are not the query's own, so the page's
+// column check has to know to leave it alone -- or every profile would be
+// refused for having no column the sheets hold.
+Deno.test({
+  name: "explain renders its profile in a query sheet without tripping the column check",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const profiled = { type: "query", data: [{ lang: "sql", code: "explain select 1 as n", cols: {} }] };
+    const page = await glue("http://localhost/query:profiled1", { docs: { profiled1: profiled } });
+    await page.settle(400); // the query editor debounce
+    const headers = page.all("span.sort").map((s) => s.textContent?.replace(/ [▲▼]$/, ""));
+    assertEquals(headers.slice(0, 4), ["stage", "rows_in", "rows_out", "ms"]);
+    assert(page.text().includes("total"), "the last stage is the whole statement");
+    assert(!page.text().includes("No column named"), page.text().slice(0, 300));
     page.close();
   },
 });
@@ -2423,6 +2596,19 @@ Deno.test({
       ["1", "2", "a"],
       "a move means the same thing to automerge as it does to a plain object",
     );
+
+    // A row move: the same patch at the root of `data`. A second row, typed
+    // into, then dragged above the first; every cell survives the trip.
+    await page.click(page.all("tr").find((tr) => tr.getAttribute("title") === "add row"));
+    const second = [...page.all("tbody tr")[4].querySelectorAll("td")][2];
+    for (const type of ["mouseenter", "click", "dblclick"]) await page.fire(second, type);
+    await page.type_(page.all("#new-cell")[0], "two");
+    await page.fire([...page.all("tbody tr")[4].querySelectorAll(`span.grab[title^="drag onto the row"]`)][0], "mousedown");
+    await page.fire([...page.all("tbody tr")[3].querySelectorAll("td")][0], "mouseenter");
+    await page.keyUp();
+    const moved = (await page.document(id)) as { data: Record<string, string>[] };
+    assertEquals(moved.data.slice(1).map((row) => row.a), ["two", "typed"], "a row move reorders the document");
+    assertEquals(moved.data.length, 3, "and keeps every row");
     page.close();
   },
 });

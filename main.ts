@@ -46,10 +46,14 @@ import {
   nearest,
   NUMERIC_TYPES,
   planQuery,
+  PROFILE_COLUMNS,
+  profileRef,
+  profileRows,
   register,
   scanRefs,
   selectTypes,
   show,
+  timed,
   WINDOW_TYPES,
   MAX_QUERY_ROWS,
 } from "./src/sql.mjs";
@@ -379,7 +383,7 @@ export type NetHttp = { url: string; interval: number; headers?: string; cursor?
 // An alert is a query plus somewhere to send it. The condition is the query's
 // own where clause: it fires when the query returns a row, which is the only
 // definition that needs no second language.
-export type Alert = { code: string; to: string; interval: number; digest?: boolean };
+export type Alert = { code: string; to: string; interval: number; digest?: boolean; when?: When };
 // A chart is a sheet: where the numbers come from, and which two columns to draw.
 export type Chart = { source: string; kind: string; x: string; y: string };
 // A dashboard owns no data: it names the sheets to show, and each tile is that
@@ -685,14 +689,6 @@ const executeSql = async (
   sqlCode: string,
   path_: string[] = [],
 ): Promise<Page> => {
-  // `describe @table:abc` never reaches the engine: it loads the one sheet it
-  // names and reports its shape. describeRef is shared with the page.
-  const described = describeRef(sqlCode);
-  // scanRefs is shared with the page, so @type:doc_id resolves identically here.
-  const { sql: scanned, ids: sheet_ids, cells } = described
-    ? { sql: "", ids: [described], cells: [] }
-    : scanRefs(sqlCode);
-
   // A check that fires on the query itself is the author's problem: 400. One
   // that came out of loading a sheet already carries its own status -- 403 for a
   // sheet that is not theirs, 404 for one that is not there -- and re-wrapping
@@ -702,6 +698,24 @@ const executeSql = async (
     throw new HTTPException(400, { message: reason(err) });
   };
 
+  // `describe @table:abc` never reaches the engine: it loads the one sheet it
+  // names and reports its shape. `explain <query>` runs the query and answers
+  // with its profile. Both are shared with the page.
+  const described = describeRef(sqlCode);
+  const started = performance.now();
+  let profiled: string | undefined;
+  try {
+    profiled = profileRef(sqlCode);
+  } catch (err) {
+    asBadRequest(err);
+  }
+  const query = profiled ?? sqlCode;
+  const stages = profiled === undefined ? undefined : [] as Record<string, unknown>[];
+  // scanRefs is shared with the page, so @type:doc_id resolves identically here.
+  const { sql: scanned, ids: sheet_ids, cells } = described
+    ? { sql: "", ids: [described], cells: [] }
+    : scanRefs(query);
+
   // Source column types by name, and then what each select item makes of them.
   // Two sheets with a column of one name and two types still collide here; the
   // select list is read last, so a query's own alias wins over both.
@@ -710,6 +724,7 @@ const executeSql = async (
   const { docs, colsOf } = await loadRefs(sheet_ids, {
     path: path_,
     describing: !!described,
+    stages,
     // Where a sheet comes from is the only real difference between the engines:
     // here it is sheet(), which enforces access and recurses into a query sheet
     // on its own; in the page it is a library entry or an automerge document.
@@ -754,7 +769,7 @@ const executeSql = async (
   // The author's own text, not the scanned rewrite, so the page infers from the
   // same characters. An item selectTypes cannot type is left out, which leaves
   // the source column of that name below -- what typing did before this existed.
-  Object.assign(nameToType, selectTypes(sqlCode, nameToType) as Record<string, Type>);
+  Object.assign(nameToType, selectTypes(query, nameToType) as Record<string, Type>);
 
   if (described) {
     const rows = ((): Record<string, unknown>[] => {
@@ -791,7 +806,7 @@ const executeSql = async (
     offset: number;
   };
   try {
-    plan = planQuery(scanned, cells, docs, colsOf);
+    plan = await timed(stages, "plan", loaded, () => planQuery(scanned, cells, docs, colsOf), () => loaded);
   } catch (err) {
     return asBadRequest(err);
   }
@@ -811,44 +826,71 @@ const executeSql = async (
     // how long the caller waits, not how long the CPU burns. checkQueryRows above
     // is the guard that actually keeps a runaway from starting. The page has no
     // equivalent: there is no other request waiting on it.
-    result = await Promise.race<typeof result>([
-      ala(plan.sql, [docs]),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () =>
-            reject(
-              new HTTPException(504, {
-                message: explain(`This query ran longer than one request is allowed.`, {
-                  Received: `still running after ${MAX_QUERY_MS / 1000}s over ${loaded} loaded rows`,
-                  Limit: `${MAX_QUERY_MS / 1000}s per query`,
-                  Source: "the SQL in this query sheet",
-                  Fix: "narrow the joins, or filter each @sheet in its own query sheet first",
-                }),
-              }),
-            ),
-          MAX_QUERY_MS,
-        );
-      }),
-    ]);
+    result = await timed(
+      stages,
+      "engine",
+      loaded,
+      () =>
+        Promise.race<typeof result>([
+          ala(plan.sql, [docs]),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () =>
+                reject(
+                  new HTTPException(504, {
+                    message: explain(`This query ran longer than one request is allowed.`, {
+                      Received: `still running after ${MAX_QUERY_MS / 1000}s over ${loaded} loaded rows`,
+                      Limit: `${MAX_QUERY_MS / 1000}s per query`,
+                      Source: "the SQL in this query sheet",
+                      Fix: "narrow the joins, or filter each @sheet in its own query sheet first",
+                    }),
+                  }),
+                ),
+              MAX_QUERY_MS,
+            );
+          }),
+        ]),
+      (r: typeof result) => r.data.length,
+    );
   } catch (err) {
     // An AlaSQL parse error used to surface as a generic 500. Say where it is.
     if (err instanceof HTTPException) throw err;
-    throw new HTTPException(400, { message: formatQueryError(err, sqlCode) });
+    throw new HTTPException(400, { message: formatQueryError(err, query) });
   } finally {
     clearTimeout(timer);
   }
   let { columns: cols, data: rows } = result;
   try {
     if (plan.windows.length) {
-      ({ columns: cols, data: rows } = applyWindows(
-        result,
-        plan,
-        (q: string, params: unknown[]) => (ala(q, params) as { data: Record<string, unknown>[] }).data,
+      ({ columns: cols, data: rows } = await timed(
+        stages,
+        "windows",
+        rows.length,
+        () =>
+          applyWindows(
+            result,
+            plan,
+            (q: string, params: unknown[]) => (ala(q, params) as { data: Record<string, unknown>[] }).data,
+          ),
+        (r: typeof result) => r.data.length,
       ));
     }
-    checkResultColumns(cols, rows, known, sqlCode);
+    checkResultColumns(cols, rows, known, query);
   } catch (err) {
     return asBadRequest(err);
+  }
+
+  if (stages) {
+    const profile = profileRows(stages, docs, started);
+    const profileTypes: Record<string, Type> = { stage: "text", rows_in: "int", rows_out: "int", ms: "num" };
+    return {
+      data: [
+        arrayify(PROFILE_COLUMNS.map((name) => ({ name, type: profileTypes[name], key: name }))),
+        ...profile,
+      ],
+      count: profile.length,
+      offset: 0,
+    };
   }
 
   return {
@@ -3569,7 +3611,8 @@ export const webhookTimer = setInterval(() => {
 //
 // An alert sheet is a query plus a destination. It fires when the query returns
 // a row, which means the condition is the query's own where clause and there is
-// no second expression language to learn. Every evaluation lands in `net`, so
+// no second expression language to learn -- or, by `when`, when that answer
+// gained or lost a row since the run before. Every evaluation lands in `net`, so
 // the alert's own history is a sheet you can query -- and a quiet alert is
 // distinguishable from a dead one, which it is not when only changes are kept.
 
@@ -3579,6 +3622,12 @@ const alertDue = new Map<string, number>();
 // run before. Past this the rows are still counted and still sent, but the run
 // says it could not tell you which of them are new.
 const ALERT_ROWS = 200;
+
+// What a run is asked. `rows` is what an alert asked before there was a `when`,
+// so a document without one still means what it did. `added` and `removed` are
+// the two halves of the diff below, judged against the run before.
+const ALERT_WHEN = ["rows", "added", "removed"] as const;
+type When = typeof ALERT_WHEN[number];
 
 // What a run says when the alert asked to be folded into the daily summary
 // instead of mailed on its own. The summary is a convenience over runs that are
@@ -3692,7 +3741,27 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
       }
       interval = Math.max(60, Math.round(Number(config.interval) || 3600));
       alertDue.set(sheet_id, now + interval * 1000);
+      const when: When = config.when ?? "rows";
+      if (!(ALERT_WHEN as readonly string[]).includes(when)) {
+        throw new Error(explain(`The when on ${sheet_id} is not a condition an alert knows.`, {
+          Received: show(config.when),
+          Expected: `one of ${ALERT_WHEN.join(", ")}, or no when at all for rows`,
+          Source: "data[0].when on the alert document",
+          Fix: "pick one in the alert's settings",
+        }));
+      }
       const code = config.code?.trim() ?? "";
+      // A profile's rows carry the milliseconds each stage took, which is a
+      // different answer every run, so an alert watching one never settles
+      // and mails every interval. Refused by name rather than fingerprinted.
+      if (profileRef(code) !== undefined) {
+        throw new Error(explain(`The alert on ${sheet_id} watches a profile, and a profile is never the same twice.`, {
+          Received: show(code),
+          Expected: "a select, whose rows the alert can compare run to run",
+          Source: "data[0].code on the alert document",
+          Fix: "drop the explain and watch the query itself",
+        }));
+      }
       let rows: Row[] = [];
       if (code) {
         // Run it as the owner would, through the same authenticated path, so an
@@ -3742,7 +3811,16 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
       // The diff is over the rows the last run kept, so it is only honest when
       // neither run had more rows than it keeps. Say so rather than guess.
       const truncated = rows.length > ALERT_ROWS;
-      const comparable = !truncated && before !== null && !before.truncated;
+      if (truncated && when !== "rows") {
+        throw new Error(explain(`This run matched more than the ${ALERT_ROWS} rows an alert keeps, so it cannot tell which are ${when}.`, {
+          Received: `${rows.length} rows`,
+          Expected: `at most ${ALERT_ROWS} rows on this run and the run before`,
+          Source: `when = ${when} on ${sheet_id}`,
+          Fix: "narrow the query, or fire on rows",
+        }));
+      }
+      // An error run kept no rows, so a diff against it would call every row new.
+      const comparable = !truncated && before !== null && before.status !== "error" && !before.truncated;
       const gone = new Set((before?.matched ?? []).map((row) => JSON.stringify(row)));
       const here = new Set(rows.map((row) => JSON.stringify(row)));
       const diff = comparable
@@ -3751,8 +3829,28 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
           removed: [...gone].filter((row) => !here.has(row)).length,
         }
         : null;
+      // The verdict, per condition. `status` is the verdict and `delivery` is
+      // what was done about it, so no reader of either has to know `when`.
+      // The change conditions re-fire on `stuck`: the run they would diff
+      // against is the failed firing, which already holds the rows it never
+      // delivered, so the diff alone would lose the retry. `rows` does not:
+      // a firing that failed and has since gone empty has nothing to resend.
+      const hit = {
+        rows: rows.length > 0,
+        added: stuck || !!diff?.added.length,
+        removed: stuck || !!diff?.removed,
+      }[when];
+      // Why a miss missed, for the delivery line below: `rows` misses by being
+      // empty, and the other two conditions miss either against a real diff or
+      // against nothing to diff against at all.
+      const missed = when === "rows"
+        ? "cleared"
+        : diff
+        ? `no rows ${when} since the run before`
+        : "nothing to compare with";
       record = {
-        status: !code ? "idle" : unchanged ? "unchanged" : rows.length ? "firing" : "clear",
+        status: !code ? "idle" : unchanged ? "unchanged" : hit ? "firing" : "clear",
+        when,
         rows: rows.length,
         fingerprint,
         to: config.to ?? "",
@@ -3765,14 +3863,16 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
             ? `this run matched more than ${ALERT_ROWS} rows`
             : before === null
             ? "this is the first run, so there is nothing to compare it with"
+            : before.status === "error"
+            ? "the run before failed, so there is nothing to compare it with"
             : `the run before matched more than ${ALERT_ROWS} rows`,
         }),
         delivery: !code
           ? "no query to run, so nothing was sent"
           : unchanged
           ? "the same answer as the run before, so nothing was sent"
-          : !rows.length
-          ? "cleared, so nothing was sent"
+          : !hit
+          ? `${missed}, so nothing was sent`
           : config.digest
           ? HELD
           : config.to

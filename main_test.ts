@@ -826,6 +826,183 @@ Deno.test(async function allTests(t) {
         assertEquals(digests.length, 1, "an empty day should not send an empty digest");
       }
 
+      // `when` asks a different question of the same answer: not "is there a
+      // row" but "is there a row that was not there the run before", or one
+      // that has left. The verdict stays `status`, so nothing downstream learns
+      // a new word.
+      const setWhen = (when: string, digest = false) =>
+        alert.change((d: { data: [{ code: string; when?: string; digest?: boolean }] }) => {
+          d.data[0].when = when;
+          d.data[0].digest = digest;
+        });
+      const burn = (row: number, value: number) =>
+        watched.change((d: { data: Record<number, unknown>[] }) => {
+          d.data[row][1] = value;
+        });
+      const to = (address: string) => sent.filter((mail) => mail.to === address);
+
+      // Switching to `added` over the same answer is still the same answer.
+      {
+        setWhen("added");
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        assertEquals((await history())[0].status, "unchanged");
+        assertEquals(sent.length, 2);
+      }
+
+      // A row leaving is not news to an `added` alert, and the run says why.
+      {
+        burn(2, 0);
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        const left = (await history())[0];
+        assertEquals([left.status, left.rows, left.added, left.removed, left.when], ["clear", 1, 0, 1, "added"]);
+        assertEquals(left.delivery, "no rows added since the run before, so nothing was sent");
+        assertEquals(sent.length, 2, "a row leaving is not a row added");
+      }
+
+      // A row arriving is.
+      {
+        burn(2, 1.1);
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        assertEquals((await history())[0].status, "firing");
+        assertEquals(sent.length, 3, "a new row is what an added alert exists for");
+        assertEquals(sent[2].added, 1);
+      }
+
+      // A change condition folds into the digest like any other: the verdict
+      // is the diff's, and holding the email is the delivery's.
+      {
+        setWhen("added", true);
+        burn(2, 1.3);
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        const held_ = (await history())[0];
+        assertEquals([held_.status, held_.added, held_.delivery], ["firing", 1, "held for the daily digest"]);
+        assertEquals(sent.length, 3, "held, not mailed");
+      }
+
+      // A `removed` alert fires when a row leaves -- and when the last one
+      // leaves, which is the transition `rows` can never say.
+      {
+        setWhen("removed");
+        burn(2, 0);
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        assertEquals((await history())[0].status, "firing");
+        assertEquals(sent.length, 4);
+        assertEquals(sent[3].removed, 1);
+
+        burn(1, 0);
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        const emptied = (await history())[0];
+        assertEquals([emptied.status, emptied.rows, emptied.removed], ["firing", 0, 1]);
+        assertEquals(sent.length, 5, "the last row leaving is a change worth sending");
+        assertEquals(sent[4].rows.length, 0);
+      }
+
+      // A failed send under a change condition is retried, although the run it
+      // diffs against already holds the rows it never delivered.
+      {
+        setWhen("added");
+        burn(1, 1.2);
+        const refusals: number[] = [];
+        const refuse = () => {
+          refusals.push(1);
+          return Promise.resolve("resend refused it with 500: down");
+        };
+        clock += 120_000;
+        await pollAlertOnce(refuse, clock);
+        assertEquals(refusals.length, 1);
+        clock += 120_000;
+        await pollAlertOnce(refuse, clock);
+        assertEquals(refusals.length, 2, "the rows that never arrived are sent again");
+        assertEquals((await history())[0].status, "firing");
+      }
+
+      // An unknown `when` is an error run that names the choices, not a quiet
+      // fall back to rows.
+      {
+        setWhen("bogus");
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        const unknown = (await history())[0];
+        assertEquals(unknown.status, "error");
+        assert(String(unknown.error).includes("bogus"), String(unknown.error));
+        assert(String(unknown.error).includes("rows, added, removed"), String(unknown.error));
+        setWhen("rows");
+      }
+
+      // A profile is a different answer every run, so an alert watching one
+      // would mail every interval. Refused by name.
+      {
+        const watching = `select region, burn from @table:${watched.documentId} where burn > 0`;
+        alert.change((d: { data: [{ code: string }] }) => {
+          d.data[0].code = `explain ${watching}`;
+        });
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        const profiled = (await history())[0];
+        assertEquals(profiled.status, "error");
+        assert(String(profiled.error).includes("watches a profile"), String(profiled.error));
+        alert.change((d: { data: [{ code: string }] }) => {
+          d.data[0].code = watching;
+        });
+      }
+
+      // A change condition's first run is its baseline, a run past ALERT_ROWS is
+      // a refusal rather than a silent "nothing new", and the run after an error
+      // is not a diff against nothing -- which is what used to call every row new.
+      {
+        const big = automerge.create<{ data: Sheet["data"] }>({
+          data: [
+            arrayify([{ name: "n", type: "num", key: 0 }]),
+            { 0: 1 },
+            { 0: 2 },
+            { 0: 3 },
+          ],
+        });
+        await put(jwt, `/library/table:${big.documentId}`, {});
+        const alert2 = automerge.create<{ data: [{ code: string; to: string; interval: number; when: string }] }>({
+          data: [{ code: `select n from @table:${big.documentId}`, to: "two@example.com", interval: 60, when: "added" }],
+        });
+        await put(jwt, `/library/alert:${alert2.documentId}`, { name: "big watch" });
+        const history2 = async () => {
+          const [, ...rows] = await get<Table>(jwt, `/sheet/alert:${alert2.documentId}`, {});
+          return rows.map((row) => JSON.parse(String(row.body)) as Record<string, unknown>);
+        };
+
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        const first = (await history2())[0];
+        assertEquals(first.status, "clear");
+        assert(String(first.diff_skipped).includes("first run"), String(first.diff_skipped));
+        assertEquals(first.delivery, "nothing to compare with, so nothing was sent");
+        assertEquals(to("two@example.com").length, 0, "a baseline is not a backlog to mail");
+
+        big.change((d: { data: Record<number, unknown>[] }) => {
+          for (let i = 0; i < 198; i++) d.data.push({ 0: 10 + i });
+        });
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        const over = (await history2())[0];
+        assertEquals(over.status, "error");
+        assert(String(over.error).includes("more than the 200 rows"), String(over.error));
+        assert(String(over.error).includes("narrow the query"), String(over.error));
+
+        big.change((d: { data: Record<number, unknown>[] }) => {
+          d.data.splice(4, 198);
+        });
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        const after = (await history2())[0];
+        assertEquals([after.status, after.added], ["clear", null]);
+        assert(String(after.diff_skipped).includes("the run before failed"), String(after.diff_skipped));
+        assertEquals(to("two@example.com").length, 0, "the run after an error must not call every row new");
+      }
+
       // An alert reads as a sheet, so its history is queryable like any log.
       const { data: [, row] }: { data: Table } = await post(jwt, `/query`, {
         lang: "sql",
@@ -1897,6 +2074,37 @@ Deno.test(async function allTests(t) {
       ]);
       // Trailing semicolon and case are the two things a SQL author types by habit.
       assertEquals(((await runs(`DESCRIBE @${id};`)).data as Table).length, 3);
+    }
+
+    // explain runs the query and answers with its profile: one row per stage,
+    // and the query's own checks still stand under it.
+    {
+      const [cols_, ...rows] = (await runs(`explain select city from @${id} where pop > 0`)).data as Table;
+      assertEquals(
+        Object.values(cols_).map((col) => `${col.name}:${col.type}`).join(),
+        "stage:text,rows_in:int,rows_out:int,ms:num",
+      );
+      assertEquals(
+        rows.map((r) => [r.stage, r.rows_in, r.rows_out]),
+        [[`load @${id}`, null, 2], ["plan", 2, 2], ["engine", 2, 1], ["total", 2, 1]],
+      );
+      for (const r of rows) assert(typeof r.ms === "number" && r.ms >= 0, JSON.stringify(r));
+      const [, ...win] = (await runs(
+        `explain select city, row_number() over (order by pop) as rn from @${id} limit 1`,
+      )).data as Table;
+      assertEquals(win.map((r) => r.stage), [`load @${id}`, "plan", "engine", "windows", "total"]);
+      assertEquals(win.at(-1)!.rows_out, 1, "the profile counts what the windows pass kept");
+      const refusal = async (code: string) => {
+        const res = await app.request(`/query`, {
+          method: "POST",
+          headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+          body: JSON.stringify({ lang: "sql", code, args: [] }),
+        });
+        assertEquals(res.status, 400, code);
+        return await res.text();
+      };
+      assert((await refusal(`explain describe @${id}`)).includes("profiles a query"));
+      assert((await refusal(`explain select nope from @${id}`)).includes("nope"), "a profile of a refused query is refused");
     }
 
     // min()/max() over text used to drop the column out of the result: a silent

@@ -456,6 +456,39 @@ suite =
                             |> Expect.equal ""
                 ]
             ]
+        , describe "dropOf"
+            (let
+                tbl =
+                    { cols = namedCols [ "a", "b", "c" ]
+                    , rows = Array.repeat 4 Dict.empty
+                    }
+             in
+             [ test "a row let go over another row moves there, in document indices" <|
+                \_ ->
+                    dropOf (MovingRow 3) (xy 0 1) tbl
+                        |> Expect.equal (Just (SheetRowMove 3 1))
+             , test "a row let go on the header, or off the table, goes nowhere" <|
+                \_ ->
+                    [ dropOf (MovingRow 3) (xy 0 0) tbl, dropOf (MovingRow 3) (xy -1 -1) tbl ]
+                        |> Expect.equal [ Nothing, Nothing ]
+             , test "a row let go where it was is not a move" <|
+                \_ ->
+                    dropOf (MovingRow 2) (xy 1 2) tbl
+                        |> Expect.equal Nothing
+             , test "a row that is no longer there goes nowhere" <|
+                \_ ->
+                    dropOf (MovingRow 9) (xy 0 1) tbl
+                        |> Expect.equal Nothing
+             , test "a row let go past the last row lands on the last row" <|
+                \_ ->
+                    dropOf (MovingRow 1) (xy 0 9) tbl
+                        |> Expect.equal (Just (SheetRowMove 1 4))
+             , test "a column is found by key and dropped by position" <|
+                \_ ->
+                    dropOf (MovingCol "2") (xy 0 0) tbl
+                        |> Expect.equal (Just (SheetColumnMove 2 0))
+             ]
+            )
         , describe "docDecoder"
             [ test "net-http decodes url and interval, headers default to empty" <|
                 \_ ->
@@ -468,6 +501,24 @@ suite =
             , test "net-http without interval is still rejected" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test"}]}"""
+                        |> Result.toMaybe
+                        |> Expect.equal Nothing
+            , test "alert without a when fires on rows, the way it did before there was one" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60}]}"""
+                        |> Expect.equal (Ok (Alert { code = "", to = "", interval = 60, digest = False, when = OnRows }))
+            , test "alert decodes its when" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60,"when":"added"}]}"""
+                        |> Expect.equal (Ok (Alert { code = "", to = "", interval = 60, digest = False, when = OnAdded }))
+            , test "alert with an unknown when is refused rather than shown as rows" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60,"when":"bogus"}]}"""
+                        |> Result.toMaybe
+                        |> Expect.equal Nothing
+            , test "alert with a when that is not a string is refused too, as the server refuses it" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60,"when":5}]}"""
                         |> Result.toMaybe
                         |> Expect.equal Nothing
             , test "net-socket decodes its url" <|
@@ -860,10 +911,16 @@ suite =
                     -- Not a splice out and a splice back in: what goes back has to
                     -- be the column object the document holds, and `Col` carries
                     -- key, name and type only.
-                    ( movePatch 3 0 |> .action
-                    , ( E.encode 0 (E.list identity (movePatch 3 0).path), E.encode 0 (movePatch 3 0).value )
+                    ( movePatch [ 0 ] 3 0 |> .action
+                    , ( E.encode 0 (E.list identity (movePatch [ 0 ] 3 0).path), E.encode 0 (movePatch [ 0 ] 3 0).value )
                     )
                         |> Expect.equal ( "move", ( "[0]", "[3,0]" ) )
+            , test "a row move is the same patch at the root, and its inverse is the undo" <|
+                \_ ->
+                    ( ( E.encode 0 (E.list identity (movePatch [] 3 1).path), E.encode 0 (movePatch [] 3 1).value )
+                    , E.encode 0 (movePatch [] 1 3).value
+                    )
+                        |> Expect.equal ( ( "[]", "[3,1]" ), "[1,3]" )
             , test "a width too narrow to grab is no width" <|
                 \_ ->
                     -- The drag clamps at the same floor. A document can carry any
@@ -920,7 +977,7 @@ libraryOf entries =
     entries
         |> List.map
             (\( id, name, scratch ) ->
-                ( id, { name = name, tags = [], scratch = scratch, system = False, thumb = E.null, peers = Private } )
+                ( id, { name = name, tags = [], scratch = scratch, system = False, thumb = E.null, peers = Private, seen = "" } )
             )
         |> Dict.fromList
 

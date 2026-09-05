@@ -178,6 +178,10 @@ navigation, in file order:
   only witness and `POST /library/:id/socket` is how it says so. Two states — `connected` and `error`, never a close,
   because `changeId()` closes the socket on every navigation. `library:freshness` admits the sheet only once it has a
   `SOCKET` run, so a socket nobody has watched is absent rather than "never run" forever.
+- **Alerts**: an alert's `when` is `rows` (the query returned a row; the default), `added` or `removed` (the answer
+  gained or lost a row since the run before). `status` is the verdict and `delivery` what was done, so no reader
+  learns a new word; a change condition's first run is a silent baseline and a run past `ALERT_ROWS` under one is an
+  `error` row. `ALERT_WHEN` in `main.ts` and `whenSpec` in `Main.elm` are the two copies a language boundary forces.
 - **Polling**: `pollNetOnce` and `pollAlertOnce` on a 15-second tick; conditional requests, per-host `Retry-After`,
   bounded retries, and a `net` row per run — including quiet ones, because a healthy quiet alert and a dead timer
   otherwise write the same nothing. A run's row carries `meta.shape`, the columns the body answered with and the JSON
@@ -228,7 +232,9 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   makes an as-of join one statement. A window that is not a select item of its own is refused by name.
 - **Unpivot** is ours (AlaSQL drops the columns it is not unpivoting); **pivot** is AlaSQL's, guarded by `checkPivot()`.
 - **`describe @ref`** is intercepted before the engine in both engines, and is the one statement that still answers on a
-  sheet whose cells fail the type check.
+  sheet whose cells fail the type check. **`explain <query>`** is the other intercepted statement: it runs the query
+  with every guard and answers one row per stage (`load @ref`, `plan`, `engine`, `windows`, `total`) with rows in,
+  rows out and milliseconds. `timed()` wraps the calls both hosts already make and does nothing on a plain run.
 - **Types**: `COLUMN_TYPES` is every type a column may declare and what each one is; `NUMERIC_TYPES` is derived from
   it and `knownType()` matches the `enum:` family by prefix. `checkColumnTypes()` is the one place a cell becomes what
   its column says — a blank becomes `null`, a numeric string becomes its number. `selectTypes()` types a result column
@@ -250,7 +256,10 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   remaining server type decodes to `Unviewable typ`; give one a real view by replacing its branch in `docDecoder`.
 - **Flags**: `{ api, tutorial }`. A missing `api` lands in `model.error` rather than defaulting.
 - **Library**: `library()` in `src/page.mjs` merges what this browser stored under everything bundled. System ids skip
-  `repo.find`. `viewGallery` reads `model.library`, so a new demo needs no code change.
+  `repo.find`. `viewGallery` reads `model.library`, so a new demo needs no code change. `seen` is stamped by
+  `selectDoc` for a sheet the library lists, is the one stored field that survives a system entry in the merge, and
+  is the library's `opened` column. `libraryIdAtRow` reads a row's sheet off the rows as drawn — sorted, filtered,
+  searched — never off the dictionary's order.
 - **Cross-sheet queries in the browser**: `sheets(alasql, shelf, find)` in `src/page.mjs`. Only two things come from the
   browser and both are arguments: the library map and `repo.find`.
 - **One CSV import, whichever way the file arrives, in two steps.** The footer's file input goes through Elm's
@@ -274,7 +283,7 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   `freshness` column appears only when the answer is non-empty — a blank column over a logged-out library would read as
   "nothing is wrong".
 - **Table UX**: multi-column sort, column hide (keeps its x coordinate; `skipHidden` steps over it), drag-resize,
-  drag-reorder, pin, row insert/duplicate/fill-down, find/replace, undo/redo, command palette (Ctrl/⌘+K), shortcut
+  drag-reorder (columns, and rows while the table is in document order), pin, row insert/duplicate/fill-down, find/replace, undo/redo, command palette (Ctrl/⌘+K), shortcut
   sheet (Ctrl/⌘+/). `shortcutGroups` carries the `Msg` each key runs and `paletteCommands` reads that list, so the two
   cannot drift.
 - **The arrangement is offered where it is kept.** `arrangeControls` is the one predicate `viewHeaderCell` asks: a
@@ -288,10 +297,14 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   undo stack. `tableHome` and `queryHome` are the two addresses — a table's `data[0]` is the column list, so the
   address is the position; a query's is one object, so the fields live under `view`, keyed by column name the way its
   `cols` overrides are. `arrangeable` is the one `case` that picks, and `pruneView` is a table only, deliberately.
-- **Reorder is a splice, pin is a sum.** A move is one `move` patch on `data[0]`, applied by `applyPatches` in
-  `index.html` to the value the document already holds — rows are keyed by `col.key`, so no cell moves and the display
-  index stays the document index. It is a `DocMsg` and not an arrangement: everyone looking at the sheet sees the new
-  order, so it rides `changeDoc`, `movePatch to from` is its own undo entry, and a viewer's is refused like any edit.
+- **Reorder is a splice, pin is a sum.** A move is one `move` patch — on `data[0]` for a column, on `data` for a
+  row — applied by `applyPatches` in `index.html` to the value the document already holds — rows are keyed by
+  `col.key`, so no cell moves and the display index stays the document index. It is a `DocMsg` and not an
+  arrangement: everyone looking at the sheet sees the new order, so it rides `changeDoc`, `movePatch` the other way is
+  its own undo entry, and a viewer's is refused like any edit. `dropOf` is the one place a drop becomes a `DocMsg`. A
+  row's handle is drawn in the first data cell only while `inDocumentOrder` holds — nothing sorted, filtered or
+  searched — because a display row then *is* the document row, and `MoveEnd` asks it again so a sort taken mid-drag
+  is refused; the `.grab` glyph is CSS so a cell's text stays its value.
   `pinLeft` sums the widths of the sticky columns before each pinned one and hands the answer to `.pin` inline; column
   0 is in the sum whether or not anybody pinned it, because `.c0` sticks it regardless. Pinning writes `autoColWidth`
   for any sticky column that sizes itself — the one pinned and column 0 both — because a guessed sum either leaves a

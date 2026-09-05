@@ -332,6 +332,18 @@ Deno.test("the page and the engine accept exactly the same column types", async 
   );
 });
 
+// An alert's `when` is spelled on the document, read by the poller in main.ts
+// and offered by the select in Main.elm. Same reason, same guard.
+Deno.test("the page offers exactly the alert conditions the poller knows", async () => {
+  const ts = await Deno.readTextFile(dir + "main.ts");
+  const elm = await Deno.readTextFile(dir + "src/Main.elm");
+  const poller = ts.split("const ALERT_WHEN = [")[1]?.split("]")[0] ?? "";
+  assert(poller.includes('"'), "ALERT_WHEN should still be a list of spellings in main.ts");
+  const page = elm.split("whenSpec when =")[1]?.split("\n\n\n")[0] ?? "";
+  assert(page.includes('name = "'), "whenSpec should still name each condition in src/Main.elm");
+  same(quoted(poller, /"([^"]+)"/g), quoted(page, /name = "([^"]+)"/g), "main.ts's ALERT_WHEN", "src/Main.elm's whenSpec");
+});
+
 Deno.test("the server's union admits exactly the column types the engine knows", async () => {
   const ts = await Deno.readTextFile(dir + "main.ts");
   const union = ts.split("export type Type =")[1]?.split(";")[0] ?? "";

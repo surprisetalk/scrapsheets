@@ -12,6 +12,33 @@ items are deleted — what shipped is described in `claude.md`. Anything below t
 
 The next things to build, in this order.
 
+- [ ] **A join that would not fit in memory is refused, not run.** `checkQueryRows()` caps the rows *loaded* across
+      every `@sheet`, and the engine then materializes the cross product: a five-way self-join of `@table:countries`
+      kills the Deno process with a native out-of-memory, with or without `explain`, before `MAX_QUERY_MS` or anything
+      else can speak. On the server that is every request in flight.
+  1. Reproduce first: `select count(*) from @table:countries a, @table:countries b, @table:countries c,
+     @table:countries d, @table:countries e` through `POST /query`, and watch the process die rather than answer.
+  2. Guard in `planQuery()`, so both engines share it: the product of the row counts of the sheets in the from clause
+     against one bound beside `MAX_QUERY_ROWS`. Refuse with the product, each sheet's count, and the fix: filter each
+     `@sheet` in its own query sheet first, or join on a key the engine can index — say in the message that AlaSQL
+     builds every pair before a `where` runs, which is why a keyed join pays the same refusal.
+  3. Trade-off, decided here: the guard is by from-clause row counts, not by estimating what the join keeps, because
+     the engine cannot be preempted and an estimate that is wrong once is an outage. A bundled demo that trips it is a
+     demo to rewrite as two sheets. `examples_test.ts` proves none does.
+  4. `main_test.ts`: the five-way join is a 400 naming the product, and the server answers the next request.
+
+- [ ] **The suite finishes in seconds.** `deno task test` prints its wall time on the last line; it is past the ten
+      seconds after which the rule is to fix the suite before adding a feature. `main_test.ts` and `page_test.ts`
+      are the two that cost anything (`time deno test --allow-all <file>` per file says how much).
+  1. `main_test.ts`: the steps that wait on real time — the retry bound, `Retry-After`, the polite scraper, the sync
+     socket — take the clock they already take for alerts (`pollAlertOnce(send, now)`) or a zero backoff under test,
+     so a wait is an assertion about a timestamp rather than a sleep.
+  2. `page_test.ts`: every glue test that opens a query sheet pays `settle(400)` for the editor debounce; drive that
+     debounce off the same injectable frame clock the harness already uses for animation frames, so the wait is a
+     tick rather than 400ms of real time. The `realRepo` tests are the next cost, and there should be as few of them
+     as prove the patch shapes.
+  3. Then make the rule a check: `deno task test` fails past ten seconds, so the suite cannot drift back.
+
 ---
 
 ## Query engine
@@ -47,14 +74,13 @@ The single biggest gap. Most of the Demo Gallery dies here first.
   1. Push the where clause into the DSN query for `codex-db`, and only what is provably safe to push.
   2. `describe` already reads the remote schema; the pushdown uses the same read.
 
-- [ ] **You can see which step of a query is slow.** There is no profile, so a slow sheet is a guess.
-  1. `explain <query>` beside the existing `describe <ref>`, intercepted the same way in both engines.
-  2. Rows in and out per stage, and the milliseconds each took.
-
-- [ ] **The editor suggests the sheets and columns you actually have.** `nearest()` names a typo after the fact; there
-      is nothing before it.
-  1. Autocomplete `@type:doc_id` from the library, and columns from the sheet once the ref resolves.
-  2. Same source as `describe`, so a suggestion cannot disagree with the schema.
+- [ ] **The editor suggests the columns you actually have.** `@type:doc_id` completes from the library today; a column
+      name does not, and `nearest()` names the typo only after the fact.
+  1. Complete columns from the sheet once the ref resolves, off the same read `describe` uses, so a suggestion cannot
+     disagree with the schema. The page has no column source Elm can reach: the map lives in the `sheets()` closure
+     in `src/page.mjs`, so this needs a port.
+  2. The dropdown's keyboard path finds itself with `[style*="z-index: 100"]`, which also matches the filter panel;
+     give it an id first.
 
 - [ ] **You name an expression once and use it in five sheets.** Every demo repeats the same case statement.
   1. A `snippet` sheet holding named expressions; `planQuery()` expands them before the engine runs.
@@ -105,10 +131,9 @@ The single biggest gap. Most of the Demo Gallery dies here first.
 
 The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
-- [ ] **You drag a row where it belongs, and drag a series down.** Insert, delete and duplicate ship, and a column
-      drags to a new position; a row does not, and fill-down is plain today.
-  1. Row drag-reorder, on the drag state `ColumnMoveStart`/`ColumnMoveEnd` already established for a column.
-  2. Drag-fill that continues dates, numbers and simple patterns rather than repeating the cell.
+- [ ] **You drag a series down.** Insert, delete, duplicate and drag-reorder ship for rows and columns; fill-down is
+      plain today.
+  1. Drag-fill that continues dates, numbers and simple patterns rather than repeating the cell.
 
 - [ ] **A number looks like the number it is.** There is no formatting layer at all.
   1. Decimals, thousands separators, currency symbol, percent, scientific, custom mask — per column.
@@ -249,10 +274,9 @@ The runner is in **Now**. These are what the Demo Gallery needs on top of it.
 
 ## Alerts & notifications
 
-- [ ] **An alert can fire on a change, not only on a row.** The condition is the query's where clause, which covers
-      threshold and change but not "outside its usual band".
-  1. Change conditions read the previous run out of the log the alert already writes.
-  2. An anomaly band needs the forecasting work under **Stats & modeling**, and waits for it.
+- [ ] **An alert can fire on "outside its usual band".** The condition is the query's where clause, or a row added
+      or removed since the run before; a band is neither.
+  1. An anomaly band needs the forecasting work under **Stats & modeling**, and waits for it.
 
 - [ ] **An alert reaches you where you are.** Email ships, through the Resend key signup already uses.
   1. SMS, Slack, Discord, Teams, webhook, push.
@@ -485,10 +509,9 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
 
 ## Navigation & workspace UX
 
-- [ ] **A library of hundreds of sheets is navigable.** It is one flat list.
+- [ ] **A library of hundreds of sheets is navigable.** It is one flat list with an `opened` column.
   1. Folders, workspaces and favourites.
   2. Bulk operations: multi-select, move, tag, delete, share.
-  3. Recently viewed, and back/forward.
 
 - [ ] **Everything is reachable without a mouse or a screen.** Ctrl/⌘+K opens a palette over every sheet and every
       runnable shortcut; nothing below it is done.

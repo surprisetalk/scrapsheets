@@ -13,14 +13,21 @@ import { Col, EXAMPLES, Table } from "./examples.mjs";
 import { PORTALS as FEEDS } from "./portals.mjs";
 import {
   applyWindows,
+  checkResultColumns,
   DESCRIBE_COLUMNS,
   describeRef,
   describeRows,
+  explain,
+  loadedOf,
   loadRefs,
   nearest,
   planQuery,
+  PROFILE_COLUMNS,
+  profileRef,
+  profileRows,
   scanRefs,
   selectTypes,
+  timed,
   toRecords,
 } from "./sql.mjs";
 
@@ -45,6 +52,9 @@ const tutorial = Table(
  * bundled. The order matters — a system entry wins over a stored one of the same
  * id, so a stale copy of a bundled example cannot shadow the real one. The empty
  * id is the library itself, which is what an unrecognised route falls back to.
+ * `seen` — when this browser last opened the sheet — is this browser's fact
+ * whoever owns the entry, so it is the one stored field that survives a system
+ * entry.
  */
 export const library = (stored = {}) => {
   const merged = {
@@ -58,9 +68,10 @@ export const library = (stored = {}) => {
     "table:tutorial": { name: "tutorial", system: true, doc: tutorial },
   };
   return Object.fromEntries(
-    Object.entries(merged).map((
-      [id, entry],
-    ) => [id, entry.doc && !entry.thumb ? { ...entry, thumb: docThumb(entry.doc) } : entry]),
+    Object.entries(merged).map(([id, entry]) => {
+      const e = stored[id]?.seen ? { ...entry, seen: stored[id].seen } : entry;
+      return [id, e.doc && !e.thumb ? { ...e, thumb: docThumb(e.doc) } : e];
+    }),
   );
 };
 
@@ -310,15 +321,25 @@ export const sheets = (alasql, shelf, find) => {
       [...rows].map(([id, rs]) => [id, types.get(id) ?? Object.keys(rs?.[0] ?? {}).map((name) => ({ name }))]),
     );
 
+  /** Every column the referenced sheets actually have: what a typo'd column
+   * name gets matched against. */
+  const columns = () => [...new Set([...rows.values()].flatMap((rs) => Object.keys(rs?.[0] ?? {})))];
+
   const runSql = async (code, params, path = []) => {
     // `describe @table:abc` never reaches the engine: it loads the one sheet it
     // names and reports its shape. Same statement, same answer, on the server.
+    // `explain <query>` runs the query and answers with its profile instead.
     const describing = describeRef(code);
-    const { sql: out, ids, cells } = describing ? { sql: "", ids: [describing], cells: [] } : scanRefs(code);
+    const profiling = profileRef(code);
+    const query = profiling ?? code;
+    const started = performance.now();
+    const stages = profiling === undefined ? undefined : [];
+    const { sql: out, ids, cells } = describing ? { sql: "", ids: [describing], cells: [] } : scanRefs(query);
 
-    const { colsOf } = await loadRefs(ids, {
+    const { docs, colsOf } = await loadRefs(ids, {
       path,
       describing: !!describing,
+      stages,
       fetch: async (id) => {
         const [type, ref_id] = id.split(":");
         if (!["table", "query"].includes(type))
@@ -367,9 +388,44 @@ export const sheets = (alasql, shelf, find) => {
         data: describeRows(describing, colsOf[describing], rows.get(describing)),
       };
     }
-    const plan = planQuery(out, cells, Object.fromEntries(rows), columnsOf());
-    const [, result = {}] = await alasql([[`set @params = ?`, [params]], plan.sql]);
-    const answer = plan.windows.length ? applyWindows(result, plan, (q, p) => alasql(q, p).data) : result;
+    const loaded = loadedOf(docs);
+    const plan = await timed(
+      stages,
+      "plan",
+      loaded,
+      () => planQuery(out, cells, Object.fromEntries(rows), columnsOf()),
+      () => loaded,
+    );
+    const result = await timed(stages, "engine", loaded, async () => {
+      const [, answered] = await alasql([[`set @params = ?`, [params]], plan.sql]);
+      // Two statements in, two results out, and the second is a recordset.
+      // Anything else is the engine's, not the author's, and used to surface
+      // as a TypeError about `.data` two lines later.
+      if (!answered?.data) {
+        throw new Error(explain(`The engine returned no rows for this query.`, {
+          Expected: "a recordset for the select",
+          Received: answered === undefined ? "nothing" : typeof answered,
+          Source: "the SQL after the pre-engine passes",
+          Fix: "this is an engine bug: report it with the query text",
+        }));
+      }
+      return answered;
+    }, (r) => r.data.length);
+    const answer = plan.windows.length
+      ? await timed(
+        stages,
+        "windows",
+        result.data.length,
+        () => applyWindows(result, plan, (q, p) => alasql(q, p).data),
+        (r) => r.data.length,
+      )
+      : result;
+    if (profiling !== undefined) {
+      // The query's own answer is still checked: a profile of a refused query
+      // is a profile of nothing, and both hosts must refuse the same thing.
+      checkResultColumns(answer.columns, answer.data, columns(), query);
+      return { columns: PROFILE_COLUMNS.map((name) => ({ columnid: name })), data: profileRows(stages, docs, started) };
+    }
     // Every column carries the type its select item produced, which is the map
     // the server stamps its own answer with -- off the author's own text, not
     // the scanned rewrite, so both engines infer from the same characters. A
@@ -386,9 +442,7 @@ export const sheets = (alasql, shelf, find) => {
 
   return {
     runSql,
-    /** Every column the referenced sheets actually have: what a typo'd column
-     * name gets matched against. */
-    columns: () => [...new Set([...rows.values()].flatMap((rs) => Object.keys(rs?.[0] ?? {})))],
+    columns,
     rows: (id) => rows.get(id),
     types: (id) => types.get(id),
   };

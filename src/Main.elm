@@ -3,9 +3,11 @@ port module Main exposing
     , ClipboardFormat(..)
     , Col
     , Doc(..)
+    , DocMsg(..)
     , Filter(..)
     , Freshness
     , Index
+    , Moving(..)
     , Peers(..)
     , Rect
     , Sheet
@@ -14,6 +16,7 @@ port module Main exposing
     , Stat(..)
     , Table
     , TableBounds
+    , When(..)
     , canonicalTypeNames
     , chartPoints
     , civilDays
@@ -24,6 +27,7 @@ port module Main exposing
     , detectFormat
     , displayYToDocY
     , docDecoder
+    , dropOf
     , emptySheet
     , emptyView
     , expandSelection
@@ -748,6 +752,7 @@ type alias SheetInfo =
     , system : Bool
     , thumb : D.Value
     , peers : Peers
+    , seen : String -- ISO 8601, when this browser last opened it; "" if never
     }
 
 
@@ -823,9 +828,9 @@ type alias Sheet =
     , widths : Dict String Int
     , resizing : Maybe { key : String, startX : Int, startWidth : Int }
 
-    -- The column being dragged to a new position, while the drag lasts. The
-    -- column under the pointer is `hover.x`, which every cell already reports.
-    , moving : Maybe String
+    -- The column or row being dragged to a new position, while the drag lasts.
+    -- What is under the pointer is `hover`, which every cell already reports.
+    , moving : Maybe Moving
 
     -- What this browser has written to the document, plus what the document
     -- held when it was opened. Every write is diffed against it, so closing a
@@ -940,6 +945,15 @@ type alias UndoEntry =
     { forward : List Patch -- Patches to redo
     , backward : List Patch -- Patches to undo (inverse)
     }
+
+
+{-| What a drag carries: a column by key, or a row by its document index. A row
+is only ever picked up while the table is in document order, which is what lets
+the index be the document's rather than the display's.
+-}
+type Moving
+    = MovingCol String
+    | MovingRow Int
 
 
 type alias QueryAutocomplete =
@@ -1232,17 +1246,72 @@ viewPatches at cols before after =
             )
 
 
-{-| A column moved from one position in `data[0]` to another.
+{-| A value moved within a list: a column within `data[0]` at `[ 0 ]`, a row
+within `data` at `[]`.
 
 One patch, not a splice out and a splice back in: the value re-inserted has to
-be the column object the document already holds. `Col` carries only key, name
-and type, so a column rebuilt here would arrive stripped of its own arrangement.
-`applyPatches` in src/index.html moves the value in place.
+be the object the document already holds. `Col` carries only key, name and
+type, so a column rebuilt here would arrive stripped of its own arrangement, and
+`Row` carries only the cells. `applyPatches` in src/index.html moves the value
+in place.
 
 -}
-movePatch : Int -> Int -> Patch
-movePatch from to =
-    { action = "move", path = [ E.int 0 ], value = E.list E.int [ from, to ] }
+movePatch : List Int -> Int -> Int -> Patch
+movePatch path from to =
+    { action = "move", path = List.map E.int path, value = E.list E.int [ from, to ] }
+
+
+{-| Whether the rows on screen are the document's rows in the document's order:
+nothing sorted, and nothing filtered or searched away. Only then is a display
+row a document row, which is what a row drag needs at both ends -- the handle
+is withheld without it, and a drop after a sort taken mid-drag is refused.
+-}
+inDocumentOrder : String -> Sheet -> Array Row -> Bool
+inDocumentOrder search sheet rows =
+    List.isEmpty sheet.sort && Array.length (filterAndSort search sheet rows) == Array.length rows
+
+
+{-| Where a drag lands when the pointer lets go, or nowhere.
+
+The column under the pointer is `hover.x`: every cell reports it already, so a
+drag needs no tracking of its own. A move is a splice on `data[0]` rather than
+a display permutation -- rows are keyed by `col.key`, so no cell moves and the
+display index stays the document index, which is what keeps every selection
+index in this file right without a display-to-document map. It travels alone
+in its batch: every other view write is addressed by a position this one
+changes. It is a document edit rather than an arrangement -- everyone looking
+at the sheet sees the new order -- so it goes out on `changeDoc` with an undo
+entry beside it, and a viewer's is refused the way any other edit of theirs is.
+
+A row, likewise, in document indices: the handle is drawn only while the rows
+on screen are the document's rows in the document's order, so `hover.y` is the
+document row. Let go on a header row or off the table and nothing moves.
+
+Let go anywhere but over a target and the thing goes nowhere. `hover` is -1 off
+the table, and a drop that guessed 0 from that moved a column somebody was only
+putting down.
+
+A table only. A query's columns are its result's, in the order its select list
+put them, and moving one means editing the query; its rows are computed.
+
+-}
+dropOf : Moving -> Index -> Table -> Maybe DocMsg
+dropOf moving hover tbl =
+    let
+        onto edit from to =
+            iif (from == to) Nothing (Just (edit from to))
+    in
+    case moving of
+        MovingCol key ->
+            Maybe.map2 (onto SheetColumnMove)
+                (tbl.cols |> Array.toIndexedList |> List.filter (\( _, c ) -> c.key == key) |> List.head |> Maybe.map Tuple.first)
+                (iif (hover.x < 0) Nothing (Just (min hover.x (Array.length tbl.cols - 1))))
+                |> Maybe.andThen identity
+
+        MovingRow from ->
+            -- A row picked up before a collaborator deleted it is no row at all.
+            iif (hover.y < 1 || from < 1 || from > Array.length tbl.rows) Nothing (Just (min hover.y (Array.length tbl.rows)))
+                |> Maybe.andThen (onto SheetRowMove from)
 
 
 {-| The arrangement as it stands on screen: the half of a `Sheet` that is a
@@ -1398,7 +1467,7 @@ type Doc
     | Query Query_
     | NetHook
     | NetHttp { url : String, interval : Int, headers : String }
-    | Alert { code : String, to : String, interval : Int, digest : Bool }
+    | Alert { code : String, to : String, interval : Int, digest : Bool, when : When }
     | Chart { source : String, kind : String, x : String, y : String }
     | Dashboard (List String)
     | NetSocket { url : String }
@@ -1462,6 +1531,44 @@ type Type
     | Form
     | Enum (List String)
     | Thumb
+
+
+{-| What an alert asks of its query's answer. One table with no wildcard, so a
+new constructor fails to compile here; `main.ts` keeps the same list as
+`ALERT_WHEN`, and the name is the one both spell on the document.
+-}
+type When
+    = OnRows
+    | OnAdded
+    | OnRemoved
+
+
+whenSpec : When -> { name : String, label : String }
+whenSpec when =
+    case when of
+        OnRows ->
+            { name = "rows", label = "the query returns a row" }
+
+        OnAdded ->
+            { name = "added", label = "a row is new since the run before" }
+
+        OnRemoved ->
+            { name = "removed", label = "a row has left since the run before" }
+
+
+whens : List When
+whens =
+    [ OnRows, OnAdded, OnRemoved ]
+
+
+whenDecoder : String -> D.Decoder When
+whenDecoder name =
+    case List.filter (\w -> (whenSpec w).name == name) whens of
+        [ w ] ->
+            D.succeed w
+
+        _ ->
+            D.fail ("not a condition an alert knows: " ++ name ++ "; expected one of " ++ String.join ", " (List.map (whenSpec >> .name) whens))
 
 
 {-| Everything the table knows about a column type: what it is called, which
@@ -1619,11 +1726,27 @@ docDecoder =
                     "alert" ->
                         D.field "data" <|
                             D.index 0 <|
-                                D.map4 (\code to interval digest -> Alert { code = code, to = to, interval = interval, digest = digest })
+                                D.map5 (\code to interval digest when -> Alert { code = code, to = to, interval = interval, digest = digest, when = when })
                                     (D.oneOf [ D.field "code" D.string, D.succeed "" ])
                                     (D.oneOf [ D.field "to" D.string, D.succeed "" ])
                                     (D.oneOf [ D.field "interval" D.int, D.succeed 3600 ])
                                     (D.oneOf [ D.field "digest" D.bool, D.succeed False ])
+                                    -- Absent is rows, the way a document written before there was a
+                                    -- `when` means it. Present and unknown, or present and not a
+                                    -- string, is refused by name rather than shown as rows: a select
+                                    -- saying "rows" over a document that says otherwise is a lie the
+                                    -- server would not tell.
+                                    (D.maybe (D.field "when" D.value)
+                                        |> D.andThen
+                                            (\present ->
+                                                case present of
+                                                    Nothing ->
+                                                        D.succeed OnRows
+
+                                                    Just _ ->
+                                                        D.field "when" (D.string |> D.andThen whenDecoder)
+                                            )
+                                    )
 
                     "chart" ->
                         D.field "data" <|
@@ -1951,7 +2074,8 @@ type Msg
     | ColumnsShowAll
     | ColumnPin String
     | ColumnMoveStart String
-    | ColumnMoveEnd
+    | RowMoveStart Int
+    | MoveEnd
     | ColumnResizeStart String Int
     | ColumnResizeMove Int
     | ColumnResizeEnd
@@ -2011,6 +2135,7 @@ type DocMsg
     | SheetRowDelete (List Int)
     | SheetColumnDelete (List Int)
     | SheetColumnMove Int Int
+    | SheetRowMove Int Int -- document rows: data[from] to data[to]
     | SheetClearCells (List Index)
     | SheetFillDown Rect
     | CellCheck Index Bool
@@ -2028,6 +2153,7 @@ type Input
     | AlertCode
     | AlertTo
     | AlertDigest
+    | AlertWhen
     | ChartSource
     | ChartKind
     | ChartX
@@ -2069,7 +2195,7 @@ subs model =
                 Sub.none
         , case model.sheet.moving of
             Just _ ->
-                Browser.onMouseUp (D.succeed ColumnMoveEnd)
+                Browser.onMouseUp (D.succeed MoveEnd)
 
             Nothing ->
                 Sub.none
@@ -2170,14 +2296,19 @@ onFindKeydown =
 ---- UPDATE -------------------------------------------------------------------
 
 
-libraryIdAtRow : Model -> Int -> String
+{-| The sheet on a library row, read off the rows as the view draws them --
+sorted, filtered and searched -- rather than the same position in the unsorted
+dictionary, which renamed a stranger whenever the library was sorted. `Nothing`
+is a row the library does not draw, a header row say; it is never the empty id,
+which is the library's own.
+-}
+libraryIdAtRow : Model -> Int -> Maybe String
 libraryIdAtRow model y =
-    model.library
-        |> Dict.filter (\k v -> k /= "" && not v.scratch && List.any (String.contains model.search) (k :: v.name :: v.tags))
-        |> Dict.keys
-        |> List.drop (y - 1)
-        |> List.head
-        |> Maybe.withDefault ""
+    resolveTable model
+        |> Result.toMaybe
+        |> Maybe.andThen (\tbl -> Array.get (y - 1) (filterAndSort model.search model.sheet tbl.rows))
+        |> Maybe.andThen (Dict.get "sheet_id")
+        |> Maybe.andThen (D.decodeValue D.string >> Result.toMaybe)
 
 
 {-| The keyboard walks whatever the view draws -- a table, the library as
@@ -2266,13 +2397,14 @@ update msg ({ sheet, auth } as model) =
             case
                 D.decodeValue
                     (D.dict
-                        (D.map6 SheetInfo
+                        (D.map7 SheetInfo
                             (D.oneOf [ D.field "name" D.string, D.succeed "" ])
                             (D.oneOf [ D.field "tags" (D.list D.string), D.succeed [] ])
                             (D.oneOf [ D.field "scratch" D.bool, D.succeed False ])
                             (D.oneOf [ D.field "system" D.bool, D.succeed False ])
                             (D.oneOf [ D.field "thumb" D.value, D.succeed E.null ])
                             (D.oneOf [ D.field "public" D.bool |> D.map (\p -> iif p Public Private), D.succeed Private ])
+                            (D.oneOf [ D.field "seen" D.string, D.succeed "" ])
                         )
                     )
                     data
@@ -2758,6 +2890,14 @@ update msg ({ sheet, auth } as model) =
                 }
             )
 
+        InputChange AlertWhen x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "when" ], value = E.string x } ]
+                }
+            )
+
         InputChange ChartSource x ->
             ( model, chartSet sheet.id "source" x )
 
@@ -2885,53 +3025,36 @@ update msg ({ sheet, auth } as model) =
                 }
 
         ColumnMoveStart key ->
-            ( { model | sheet = { sheet | moving = Just key, filterOpen = Nothing } }, Cmd.none )
+            ( { model | sheet = { sheet | moving = Just (MovingCol key), filterOpen = Nothing } }, Cmd.none )
 
-        ColumnMoveEnd ->
-            -- The column under the pointer is `hover.x`: every cell reports it
-            -- already, so a drag needs no tracking of its own. A move is a
-            -- splice on `data[0]` rather than a display permutation -- rows are
-            -- keyed by `col.key`, so no cell moves and the display index stays
-            -- the document index, which is what keeps every selection index in
-            -- this file right without a display-to-document map. It travels
-            -- alone in its batch: every other view write is addressed by a
-            -- position this one changes. It is a document edit rather than an
-            -- arrangement -- everyone looking at the sheet sees the new order --
-            -- so it goes out on `changeDoc` with an undo entry beside it, and a
-            -- viewer's is refused the way any other edit of theirs is.
-            --
-            -- A table only. A query's columns are its result's, in the order its
-            -- select list put them, and moving one means editing the query.
+        RowMoveStart y ->
+            ( { model | sheet = { sheet | moving = Just (MovingRow y), filterOpen = Nothing } }, Cmd.none )
+
+        MoveEnd ->
+            -- `dropOf` is the one place a drop becomes an edit; see it for why.
+            let
+                dropped =
+                    { model | sheet = { sheet | moving = Nothing } }
+            in
             case ( sheet.moving, sheet.doc ) of
-                ( Just key, Ok (Tab tbl) ) ->
+                ( Just moving, Ok (Tab tbl) ) ->
                     let
-                        from =
-                            tbl.cols
-                                |> Array.toIndexedList
-                                |> List.filter (\( _, c ) -> c.key == key)
-                                |> List.head
-                                |> Maybe.map Tuple.first
+                        -- A sort taken while the button was down: the row under
+                        -- the pointer is a display row again, not a document row.
+                        ordered =
+                            case moving of
+                                MovingRow _ ->
+                                    inDocumentOrder model.search sheet tbl.rows
 
-                        -- Let go anywhere but over a column and the column goes
-                        -- nowhere. `hover` is -1 off the table, and a drop that
-                        -- guessed 0 from that moved a column somebody was only
-                        -- putting down.
-                        to =
-                            iif (sheet.hover.x < 0) Nothing (Just (min sheet.hover.x (Array.length tbl.cols - 1)))
+                                MovingCol _ ->
+                                    True
                     in
-                    case ( from, to ) of
-                        ( Just at, Just onto ) ->
-                            if at == onto then
-                                ( { model | sheet = { sheet | moving = Nothing } }, Cmd.none )
-
-                            else
-                                updateDocMsg (SheetColumnMove at onto) { model | sheet = { sheet | moving = Nothing } }
-
-                        _ ->
-                            ( { model | sheet = { sheet | moving = Nothing } }, Cmd.none )
+                    iif ordered (dropOf moving sheet.hover tbl) Nothing
+                        |> Maybe.map (\edit -> updateDocMsg edit dropped)
+                        |> Maybe.withDefault ( dropped, Cmd.none )
 
                 _ ->
-                    ( { model | sheet = { sheet | moving = Nothing } }, Cmd.none )
+                    ( dropped, Cmd.none )
 
         ColumnResizeStart key startX ->
             ( { model
@@ -3406,27 +3529,29 @@ updateDocMsg : DocMsg -> Model -> ( Model, Cmd Msg )
 updateDocMsg edit ({ sheet } as model) =
     case sheet.doc of
         Ok Library ->
-            ( { model | sheet = { sheet | write = Nothing } }
-            , case edit of
+            let
+                closed =
+                    { model | sheet = { sheet | write = Nothing } }
+            in
+            case edit of
                 SheetWrite { x, y } ->
-                    let
-                        id : String
-                        id =
-                            libraryIdAtRow model y
-                    in
-                    case Maybe.map .name (Array.get x (libraryCols model)) of
-                        Just "name" ->
-                            updateLibrary (Idd id { name = sheet.write, tags = Nothing })
+                    case ( libraryIdAtRow model y, Maybe.map .name (Array.get x (libraryCols model)) ) of
+                        ( Just id, Just "name" ) ->
+                            ( closed, updateLibrary (Idd id { name = sheet.write, tags = Nothing }) )
 
-                        Just "tags" ->
-                            updateLibrary (Idd id { name = Nothing, tags = sheet.write |> Maybe.map (String.split ", " >> List.map String.trim) })
+                        ( Just id, Just "tags" ) ->
+                            ( closed, updateLibrary (Idd id { name = Nothing, tags = sheet.write |> Maybe.map (String.split ", " >> List.map String.trim) }) )
+
+                        ( Nothing, _ ) ->
+                            -- Written to a row the library does not draw. The empty
+                            -- id is the library's own entry, so it must not stand in.
+                            ( { closed | error = "Library row " ++ String.fromInt y ++ " is not a sheet. Reload the page and try again." }, Cmd.none )
 
                         _ ->
-                            Cmd.none
+                            ( closed, Cmd.none )
 
                 _ ->
-                    Cmd.none
-            )
+                    ( closed, Cmd.none )
 
         Ok (Tab table) ->
             let
@@ -3595,7 +3720,13 @@ updateDocMsg edit ({ sheet } as model) =
                             -- is one patch: a splice out and a splice back in
                             -- would have to rebuild the column to undo it, and
                             -- `Col` does not carry all of one.
-                            ( [ movePatch from to ], [ movePatch to from ] )
+                            ( [ movePatch [ 0 ] from to ], [ movePatch [ 0 ] to from ] )
+
+                        -- Like the column move, a delete and an insert to
+                        -- automerge: a collaborator's concurrent edit to that
+                        -- row's cells lands on the object that was deleted.
+                        SheetRowMove from to ->
+                            ( [ movePatch [] from to ], [ movePatch [] to from ] )
 
                         SheetColumnDelete indices ->
                             let
@@ -3987,12 +4118,9 @@ updateKeyDown event ({ sheet } as model) =
                                 ( model, Cmd.none )
 
                     Ok Library ->
-                        case libraryIdAtRow model sel.y of
-                            "" ->
-                                ( model, Cmd.none )
-
-                            id ->
-                                update (Goto id) model
+                        libraryIdAtRow model sel.y
+                            |> Maybe.map (\id -> update (Goto id) model)
+                            |> Maybe.withDefault ( model, Cmd.none )
 
                     Ok _ ->
                         ( { model | error = computedCell }, Cmd.none )
@@ -4434,6 +4562,10 @@ libraryCols model =
               , madeCol "thumb" "" Thumb
               , madeCol "name" "name" Text
               , madeCol "tags" "tags" (Many Text)
+
+              -- When this browser last opened the sheet. Sortable by the header
+              -- click; "" for never-opened sorts to the far end either way.
+              , madeCol "opened" "opened" Timestamp
               ]
             , -- `library:freshness` answers for the sheets whose runs are
               -- written down, and for a caller it can identify, so an anonymous
@@ -5229,6 +5361,7 @@ resolveTable model =
                                     , ( "type", E.string (Maybe.withDefault "" <| List.head <| String.split ":" k) )
                                     , ( "name", E.string (iif (String.isEmpty (String.trim v.name)) "(untitled)" v.name) )
                                     , ( "tags", E.list E.string v.tags )
+                                    , ( "opened", E.string v.seen )
                                     , ( "freshness", E.string (freshnessCell (Dict.get k model.freshness)) )
                                     , ( "delete", iif v.system E.null (E.string k) )
                                     ]
@@ -5767,7 +5900,7 @@ viewHeaderCell sheet col =
                             , A.title "drag onto the column it should sit at"
                             , A.stopPropagationOn "mousedown" (D.succeed ( ColumnMoveStart col.key, True ))
                             ]
-                            [ text "⠿" ]
+                            []
                         )
                         (text "")
                     , iif isPinned (H.span [ A.class "pinned", A.title "pinned" ] [ text "📌" ]) (text "")
@@ -5824,8 +5957,8 @@ viewEditCell sheet col =
             [ H.input [ A.id "new-cell", onEditorKeydown, A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.minWidthRem 8, S.border "none", S.borderRadius "0", S.padding "0" ] [] ]
 
 
-viewCell : Sheet -> Result String (Array Stat) -> Dict String Int -> Int -> Int -> Col -> Row -> Html Msg
-viewCell sheet stats pins i n col row =
+viewCell : Sheet -> Result String (Array Stat) -> Dict String Int -> Bool -> Int -> Int -> Col -> Row -> Html Msg
+viewCell sheet stats pins grab i n col row =
     H.td
         ([ A.onClick CellMouseClick
          , A.onDoubleClick <|
@@ -5869,7 +6002,19 @@ viewCell sheet stats pins i n col row =
                     viewHeaderCell sheet col
 
                 _ ->
-                    [ row
+                    [ -- There is no row-number cell, so the first data cell carries
+                      -- the row's handle. Only while the table is in document order:
+                      -- `grab` is decided where the rows on screen are known.
+                      iif (i == 0 && grab)
+                        (H.span
+                            [ A.class "grab"
+                            , A.title "drag onto the row it should sit at"
+                            , A.stopPropagationOn "mousedown" (D.succeed ( RowMoveStart n, True ))
+                            ]
+                            []
+                        )
+                        (text "")
+                    , row
                         |> Dict.get col.key
                         |> Maybe.withDefault (E.string "")
                         |> D.decodeValue (cellDecoder col.typ i n)
@@ -5886,8 +6031,8 @@ viewCell sheet stats pins i n col row =
                     ]
 
 
-viewTableRow : Sheet -> Doc -> Result String (Array Stat) -> Dict String Int -> Array Col -> Int -> Row -> Html Msg
-viewTableRow sheet doc stats pins cols n row =
+viewTableRow : Sheet -> Doc -> Result String (Array Stat) -> Dict String Int -> Bool -> Array Col -> Int -> Row -> Html Msg
+viewTableRow sheet doc stats pins grab cols n row =
     H.tr
         [ A.classList [ ( "meta", n < 0 ) ]
         , case ( String.fromInt n, stats ) of
@@ -5898,7 +6043,7 @@ viewTableRow sheet doc stats pins cols n row =
                 S.displayTableRow
         ]
     <|
-        List.indexedMap (\i col -> viewCell sheet stats pins i n col row) (Array.toList cols)
+        List.indexedMap (\i col -> viewCell sheet stats pins grab i n col row) (Array.toList cols)
             ++ [ case doc of
                     Tab _ ->
                         H.th [ A.onClick (DocMsg SheetColumnPush), A.title "add column", S.widthRem 0.001, S.whiteSpaceNowrap ] [ text (iif (n == 0) "→" "") ]
@@ -6290,11 +6435,11 @@ viewPreflight tested =
                 ]
 
 
-viewAlert : Model -> { code : String, to : String, interval : Int, digest : Bool } -> Html Msg
+viewAlert : Model -> { code : String, to : String, interval : Int, digest : Bool, when : When } -> Html Msg
 viewAlert model cfg =
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
-            [ text "fires when this query returns a row"
+            [ text "watches this query"
             , H.textarea [ A.id "code", A.class "mono", A.rows 8, A.value cfg.code, A.placeholder "select * from @query:budget-burn where burn_ratio > 1.1", A.spellcheck False, A.onInput (InputChange AlertCode) ] []
             ]
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
@@ -6304,6 +6449,11 @@ viewAlert model cfg =
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "check every (seconds)"
             , H.input [ A.type_ "number", A.value (String.fromInt cfg.interval), A.onInput (InputChange NetInterval) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "fires when"
+            , H.select [ A.value (whenSpec cfg.when).name, A.onInput (InputChange AlertWhen) ] <|
+                List.map (\w -> H.option [ A.value (whenSpec w).name, A.selected (w == cfg.when) ] [ text (whenSpec w).label ]) whens
             ]
         , H.label [ S.displayFlex, S.gapRem 0.5, S.alignItemsCenter, S.fontSizeRem 0.875 ]
             [ H.input [ A.type_ "checkbox", A.checked cfg.digest, A.onCheck (\on -> InputChange AlertDigest (iif on "1" "")) ] []
@@ -6590,7 +6740,7 @@ view : Model -> Browser.Document Msg
 view ({ sheet } as model) =
     let
         info =
-            model.library |> Dict.get sheet.id |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = E.null, peers = Private }
+            model.library |> Dict.get sheet.id |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = E.null, peers = Private, seen = "" }
 
         stats =
             sheet.stats
@@ -6618,6 +6768,17 @@ view ({ sheet } as model) =
 
                             pins =
                                 pinLeft sheet cols
+
+                            -- The row handle, only where a drop has an honest target.
+                            grab =
+                                (case doc of
+                                    Tab _ ->
+                                        True
+
+                                    _ ->
+                                        False
+                                )
+                                    && inDocumentOrder model.search sheet rows
                         in
                         case doc of
                             Chart cfg ->
@@ -6633,7 +6794,7 @@ view ({ sheet } as model) =
                                     , H.table [ A.onMouseLeave (CellHover (xy -1 -1)) ]
                                         [ H.tbody [] <|
                                             Array.toList <|
-                                                Array.indexedMap (\n_ row -> viewTableRow sheet doc stats pins cols (n_ - 2) row) <|
+                                                Array.indexedMap (\n_ row -> viewTableRow sheet doc stats pins grab cols (n_ - 2) row) <|
                                                     Array.append (Array.repeat 3 Dict.empty) sortedRows
                                         , viewTableFooter sheet pins cols sortedRows
                                         ]

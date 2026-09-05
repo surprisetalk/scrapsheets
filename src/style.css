@@ -311,12 +311,17 @@ tr.meta .pin {
   border-right: 1px solid var(--chrome);
 }
 
-/* Grab a column, drop it on the one it should sit at. */
+/* Grab a column or a row, drop it on the one it should sit at. The glyph is
+   drawn here rather than as text so a cell's textContent is still its value. */
 .grab {
   cursor: grab;
   color: var(--muted);
   font-size: 0.75rem;
   line-height: 1;
+}
+
+.grab::before {
+  content: "⠿";
 }
 
 .grab:active {

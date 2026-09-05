@@ -51,6 +51,7 @@
         checkResultColumns,
         describeRef,
         formatQueryError,
+        profileRef,
         register,
       } from "/sql.mjs";
       import alasql from "/alasql.mjs";
@@ -741,12 +742,14 @@
                         },
                         { "": [].join(" ") },
                       ) ?? { "": null };
-                    // describe is answered by runSql itself, the same way the
-                    // server answers it, and is the one statement whose columns
-                    // are not the query's own -- so it skips the column check.
-                    const describing = describeRef(code);
+                    // describe and explain are answered by runSql itself, the
+                    // same way the server answers them, and are the two
+                    // statements whose columns are not the query's own -- so
+                    // they skip the column check. explain has already run it
+                    // over the query's own answer.
+                    const answered = describeRef(code) || profileRef(code);
                     const { columns: cols, data: rows } = await runSql(code, params);
-                    if (!describing) checkResultColumns(cols, rows, sheetColumns(), code);
+                    if (!answered) checkResultColumns(cols, rows, sheetColumns(), code);
                     app.ports.docQueried.send({
                       id,
                       data: [
@@ -829,6 +832,11 @@
             });
             storedThumb(id, doc);
             if (!type || !doc_id) return;
+            // When this browser last opened it, for the library's `opened`
+            // column. Only a sheet the library already lists: a sheet opened
+            // from somebody's link is not thereby yours. A bundled sheet gets a
+            // stored entry of this one field, which `library()` carries over.
+            if (libraryEntry) Library.set(id, { seen: new Date().toISOString() });
             // A chart is a query whose SQL its settings describe, built by the
             // same chartSql the server uses, so the picture matches the export.
             const chartQuery = (cfg) =>
@@ -1312,25 +1320,38 @@
             location.reload();
           });
 
+          // A value moved within an automerge list: a column within data[0],
+          // a row within data. The value put back is the one the document
+          // already held, read out before the delete: Elm's `Col` carries key,
+          // name and type only, so a column rebuilt there would arrive
+          // stripped of its own arrangement. Copied rather than re-inserted
+          // because what comes out of an automerge list is not a value to
+          // hand back.
+          const moveIn = (list, [from, to]) => {
+            // A drag started on a row a collaborator has since deleted. Left
+            // unchecked this reads undefined and dies inside JSON.parse with a
+            // message that names neither the sheet nor the move.
+            if (from < 0 || from >= list.length || to < 0 || to > list.length) {
+              throw new Error(
+                `Expected a move within the list, received from=${from} to=${to} over ${list.length} entries. ` +
+                  `Source: a move patch built before the document changed. Fix: drop it again.`,
+              );
+            }
+            const held = JSON.parse(JSON.stringify(list[from]));
+            list.splice(from, 1);
+            list.splice(to, 0, held);
+          };
           const applyPatches = (data, patches) => {
             for (const { path, action, value } of patches) {
               switch (path.length) {
-                case 0: data[action](...value); break;
+                case 0:
+                  if (action === "move") moveIn(data, value);
+                  else data[action](...value);
+                  break;
                 case 1: {
                   const [y] = path;
                   if (action === "set") data[y] = value;
-                  // A column moved to another position. The value put back is
-                  // the one the document already held, read out before the
-                  // delete: Elm's `Col` carries key, name and type only, so a
-                  // column rebuilt there would arrive stripped of its own
-                  // arrangement. Copied rather than re-inserted because what
-                  // comes out of an automerge list is not a value to hand back.
-                  else if (action === "move") {
-                    const [from, to] = value;
-                    const held = JSON.parse(JSON.stringify(data[y][from]));
-                    data[y].splice(from, 1);
-                    data[y].splice(to, 0, held);
-                  }
+                  else if (action === "move") moveIn(data[y], value);
                   else data[y][action](...value);
                   break;
                 }
