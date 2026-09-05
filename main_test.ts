@@ -1084,12 +1084,15 @@ Deno.test(async function allTests(t) {
       assert((await csv.text()).includes("2026-02-01"), "a chart should export the rows it draws");
 
       // A column name is the only thing that goes into the SQL, so anything else
-      // is refused by name rather than concatenated in.
+      // is refused by name rather than concatenated in. A kind is refused for a
+      // different reason: it changes no query, but one nobody draws used to
+      // render as a line and say nothing about the typo that made it.
       for (
         const [cfg, said] of [
           [{ source: "budget", kind: "line", x: "month", y: "spent" }, "one table or query sheet"],
           [{ source: "@chart:abc", kind: "line", x: "month", y: "spent" }, "one table or query sheet"],
           [{ source: `@table:${source.documentId}`, kind: "line", x: "month", y: "spent; drop table" }, "column name"],
+          [{ source: `@table:${source.documentId}`, kind: "scater", x: "month", y: "spent" }, "not a kind of chart"],
         ] as const
       ) {
         const bad = automerge.create<{ data: [typeof cfg] }>({ data: [cfg] });
@@ -2148,7 +2151,9 @@ Deno.test(async function allTests(t) {
     }
 
     // min()/max() over text used to drop the column out of the result: a silent
-    // wrong answer, which is the worst kind. Now it says so, and says what to use.
+    // wrong answer, which is the worst kind. rewriteExtremes() now aims the call
+    // at min_text()/max_text() when the argument is a text column, and what it
+    // cannot resolve still says so and says what to use.
     {
       const codes = automerge.create<{ data: Sheet["data"] }>({
         data: [
@@ -2168,16 +2173,24 @@ Deno.test(async function allTests(t) {
         assertEquals(res.status, 400, code);
         return await res.text();
       };
-      // Aliased and bare, since the alias exemption used to hide this one.
-      for (const code of [`select min(code) as lowest from @${codesId}`, `select max(code) from @${codesId}`]) {
-        const said = await fails(code);
-        assert(said.includes("min_text"), `${code} -> ${said}`);
-      }
-      // The replacements compare as text, and min() over numbers still works.
-      const [, row] = (await runs(
-        `select min_text(code) as lo, max_text(code) as hi, min(n) as least from @${codesId}`,
+      // Aliased and bare, and a number beside them, all in one statement: the
+      // rewrite has to leave min(n) alone or it answers "5" as text.
+      const [, answered] = (await runs(
+        `select min(code) as lowest, max(code) as highest, min(n) as least from @${codesId}`,
       )).data as Table;
-      assertEquals([row.lo, row.hi, row.least], ["01", "10", 5]);
+      assertEquals([answered.lowest, answered.highest, answered.least], ["01", "10", 5]);
+
+      // An expression is not a column, so nothing can say what type it produces
+      // and the call reaches the engine as the author wrote it. That is the case
+      // the message is still for.
+      const said = await fails(`select min(upper(code)) from @${codesId}`);
+      assert(said.includes("min_text"), said);
+
+      // And the replacements are still there to be written by hand.
+      const [, row] = (await runs(
+        `select min_text(code) as lo, max_text(code) as hi from @${codesId}`,
+      )).data as Table;
+      assertEquals([row.lo, row.hi], ["01", "10"]);
     }
 
     // A numeric column holding text is a mismatch the sum would have hidden.

@@ -82,9 +82,11 @@ Five files. Which one a failure belongs in is usually obvious.
   out whether a patch means the same thing to a real document as it does to a plain object. Both harnesses drive
   animation frames off the event loop rather than jsdom's ~16ms clock: a settle waits for the page to go quiet, not
   for real time, and that clock was most of this file's wall time. Anything that does wait on a real timer — the query
-  debounce, a file being read — asks `settle(ms)` for it by name. Refuses a `dist` older than `src` rather than
-  building one: `deno task test` builds once before any file runs, so the files can run in parallel without a compiler
-  racing a reader of its output. deno-dom is not enough — it has no `replaceData` on a text node.
+  debounce, a file being read — asks `settle(ms)` for it by name, and `until()` is the bounded poll for the ones where
+  the wait is for something to happen; a flat `settle(ms)` is only for proving that something did **not**. Refuses a
+  `dist` older than `src` rather than building one: `deno task test` builds once before any file runs, so the files
+  can run in parallel without a compiler racing a reader of its output. deno-dom is not enough — it has no
+  `replaceData` on a text node.
 - `browser_test.ts` — no browser: dist is fresh, `index.html` wires the WASM and the import map, every root-absolute asset
   is in `_redirects`, every imported name is exported, nothing reaches a CDN. `index.html`'s `<script type="module">`
   body is piped to `deno lint` for real scope analysis. `BROWSER_GLOBALS` is the whole allowlist of names Deno's global
@@ -143,7 +145,9 @@ A change that breaks one of these is a bug even if the suite is green.
 - **One spelling per fact.** `API_BASE` in `src/page.mjs` is the only API host, handed to Elm through flags and to
   `index.html` by import. `PORTALS` in `src/portals.mjs` is the only portal list. `Stored` in `index.html` is the only
   `localStorage` key prefix. `spec` in `Main.elm` is the only per-column-type table, and it has no wildcard, so a new
-  type fails to compile.
+  type fails to compile. `CHART_KINDS` in `src/sql.mjs` is the only list of ways a chart is drawn: `chartSql` refuses
+  one that is not on it, `kindSpec` in `Main.elm` is the copy the language boundary forces, and `browser_test.ts`
+  fails when the two disagree.
 - **A column type is one word everywhere.** `COLUMN_TYPES` in `src/sql.mjs` is the list. Its entries are either a type
   or an `as` alias of one; `CANONICAL_TYPES` is the half anything may write, `NUMERIC_TYPES` and `JSON_TYPES` derive
   through `canonicalType()`, and `main.ts`'s `Type` union plus `columnTypes`/`typeAliases` in `Main.elm` are the copies
@@ -237,6 +241,16 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   select list and `applyWindows()` computes it over the returned rows. `qualify` rides the same pass, which is what
   makes an as-of join one statement. A window that is not a select item of its own is refused by name.
 - **Unpivot** is ours (AlaSQL drops the columns it is not unpivoting); **pivot** is AlaSQL's, guarded by `checkPivot()`.
+- **Extremes**: `rewriteExtremes()` runs first, before either other rewrite, and aims `min(x)`/`max(x)` at
+  `min_text`/`max_text` when `x` is a bare column every loaded sheet types as text — `TEXT_TYPES`, which is every type
+  whose cells reach the engine as a string, `date` and `timestamp` among them: nothing coerces a date column, so
+  AlaSQL is handed ISO text and drops it like any other. It always writes the lowercase name, because `register()`
+  defines `min_text` and `MIN_TEXT` and nothing between. Four things it leaves alone: a call followed by `over`, which
+  is a window `applyWindows` computes itself and `rewriteWindows` finds by name; an expression; a name typed two ways;
+  and **a name the query aliases into being** (`select min(a) from (select n as a …)`), because scope is not something
+  a regex can see and that one answered `"10"` for a minimum of 9. All of them land on `checkResultColumns()`. It stops
+  at the first unbalanced bracket rather than scanning to the end for every call after it, and `MAX_EXTREMES` bounds
+  the calls in one statement — without both, a body of nothing but `min(` was quadratic.
 - **`describe @ref`** is intercepted before the engine in both engines, and is the one statement that still answers on a
   sheet whose cells fail the type check. **`explain <query>`** is the other intercepted statement: it runs the query
   with every guard and answers one row per stage (`load @ref`, `plan`, `engine`, `windows`, `total`) with rows in,
@@ -253,8 +267,10 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   into an error; `nearest()` backs every "did you mean".
 - **AlaSQL gotchas**: a `group by` expression is evaluated against an empty row, so a UDF named there gets nothing — bin
   in a subquery first. An exception thrown from a function inside a from-clause subquery is discarded;
-  `formatQueryError()` replaces the message that destroys. `min()`/`max()` drop text — use `min_text()`/`max_text()`.
-  `total`, `store` and `class` will not parse as identifiers.
+  `formatQueryError()` replaces the message that destroys. `min()`/`max()` drop text and the compiler never consults
+  `alasql.aggr` for those two names, so `rewriteExtremes()` renames the call rather than replacing the function —
+  patching `src/alasql.mjs` is not an option, `deno task vendor` rebuilds it. `min_text()`/`max_text()` stay the escape
+  hatch for an argument the pass cannot resolve. `total`, `store` and `class` will not parse as identifiers.
 
 ## Frontend map (`src/Main.elm`, `src/index.html`)
 
@@ -266,9 +282,16 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
 - **Flags**: `{ api, tutorial }`. A missing `api` lands in `model.error` rather than defaulting.
 - **Library**: `library()` in `src/page.mjs` merges what this browser stored under everything bundled. System ids skip
   `repo.find`. `viewGallery` reads `model.library`, so a new demo needs no code change. `seen` is stamped by
-  `selectDoc` for a sheet the library lists, is the one stored field that survives a system entry in the merge, and
-  is the library's `opened` column. `libraryIdAtRow` reads a row's sheet off the rows as drawn — sorted, filtered,
-  searched — never off the dictionary's order.
+  `selectDoc` for a sheet the library lists and is the library's `opened` column; it and `trashed` are the two stored
+  fields that survive a system entry in the merge, because both are this browser's fact about somebody else's sheet.
+  `libraryIdAtRow` reads a row's sheet off the rows as drawn — sorted, filtered, searched — never off the dictionary's
+  order.
+- **Trash and restore** ride `updateLibrary`, which is the one port that writes this browser's facts about a sheet.
+  `Library.set` in `index.html` drops a **null** field out of the patch rather than out of the entry, so restoring
+  writes `trashed = False` and never `Nothing`. Trashing asks nothing first — being undoable is the point — and
+  `deleteDoc` stays the purge, which is the one that also calls `Views.drop`, so a restored sheet keeps the
+  arrangement it had. A trashed sheet is out of the library table, the demo strip and `paletteCommands`; `model.trash`
+  swaps the last library column between `Trash` and `Restore` + `Delete`, and hides the footer's new-sheet rows.
 - **Cross-sheet queries in the browser**: `sheets(alasql, shelf, find)` in `src/page.mjs`. Only two things come from the
   browser and both are arguments: the library map and `repo.find`.
 - **One CSV import, whichever way the file arrives, in two steps.** The footer's file input goes through Elm's
@@ -295,6 +318,15 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   drag-reorder (columns, and rows while the table is in document order), pin, row insert/duplicate/fill-down, find/replace, undo/redo, command palette (Ctrl/⌘+K), shortcut
   sheet (Ctrl/⌘+/). `shortcutGroups` carries the `Msg` each key runs and `paletteCommands` reads that list, so the two
   cannot drift.
+- **The column's panel is where its cells are cleaned.** Trim, UPPER, lower and drop-blank-rows sit under Hide and Pin,
+  each one `DocMsg`, so undo, the viewer refusal and the sync path are the ones already written. `cellRewrites()` emits
+  nothing for a cell the change does not move and skips one that is not text; `blankRows()` says what blank means;
+  `rowDeletions()` is the splice pair, shared with `SheetRowDelete`. They read every row the document holds, not the
+  rows on screen, and are offered only where `movable` holds — a table, never a query's computed columns.
+- **`formatNumber` is the one place a number becomes text.** The cell, the stats row and the totals row all go through
+  it; they used to format independently and a `usd` column's total came out without its `$`. A value that is not
+  finite skips the currency and the digit grouping — `commas` runs over the string form, so an overflowed total read
+  `$In,fin,ity.00`.
 - **The arrangement is offered where it is kept.** `arrangeControls` is the one predicate `viewHeaderCell` asks: a
   table and a query, because the arrangement is kept; the library and the shop, because their order is how you read a
   listing this app builds and there is no document under it. Everything else is a feed — its rows are a run log, and a

@@ -113,6 +113,23 @@ The library table shows the same answer per row — last run, and failures since
 feed is failing, so a dead feed is visible where you open it rather than only in the 15-minute alarm email. Ctrl/⌘+K
 opens a palette over every sheet and every shortcut; Ctrl/⌘+/ still lists the keys.
 
+A sheet you are done with goes in the trash, and asks nothing first, because the trash is undoable: the 🗑 chip beside
+the demo strip counts what is in it, and each row there offers restore, with the sort and the column widths you had
+still on it. Delete is still there, inside the trash, and now it means what its warning says.
+
+A column is cleaned from its own panel, beside hide and pin: trim, UPPER, lower, and drop every row this column has
+nothing in. Each one is an ordinary edit, so Ctrl/⌘+Z takes it back and everyone else looking at the sheet sees it.
+
+A chart is drawn as a line, bars, an area, a scatter, or one big number — `kpi` reads the last point, how far it moved
+since the one before, and draws the whole series small beside it. A kind that is not one of those is refused by name
+rather than quietly drawn as a line, which is what a typo used to get you.
+
+`select min(code) from @table:countries` answers, and so does the earliest date in a column. The engine under the page
+compares numbers and real dates, and a cell is neither — it is the text the document holds — so it used to drop the
+column out of the answer without a word. The query is now rewritten to the two functions that can compare text before
+the engine sees it. Where it cannot tell what a name means — an expression like `min(upper(code))`, or a name a
+subquery invented — it says so and names `min_text()` rather than guess.
+
 The share panel mints a view-only link, with a box for how many days it lives and a box for a password. Both are
 optional and blank means the link it always minted: thirty days, openable by anyone holding the url. The password is
 never stored and never put in the link — what rides the token is an HMAC of it under `TOKEN_SECRET`, so holding the link

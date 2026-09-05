@@ -1078,6 +1078,23 @@ Deno.test("the library merges what is stored under what is bundled", () => {
   // stored field a bundled sheet keeps.
   assertEquals(shelf["table:countries"].seen, "2026-09-04T10:00:00.000Z", "but when this browser opened it is kept");
   assertEquals(shelf["table:tutorial"].seen, undefined, "a sheet never opened carries no seen");
+  // The same argument, for the same reason: whether this browser threw a sheet
+  // away is this browser's fact, so a bundled demo can be put in the trash too.
+  const trashed = library({ "table:countries": { trashed: true }, "table:mine": { name: "mine" } }) as Record<
+    string,
+    { name: string; trashed?: boolean }
+  >;
+  assertEquals(trashed["table:countries"].trashed, true, "a bundled sheet keeps this browser's trash flag");
+  assertEquals(trashed["table:countries"].name, "countries", "and still loses its name to the bundled one");
+  assertEquals(trashed["table:mine"].trashed, undefined, "a sheet nobody trashed carries no flag");
+  // Restoring writes false rather than null, because Library.set drops a null
+  // out of the patch instead of out of the entry.
+  assertEquals(
+    (library({ "table:countries": { trashed: false } }) as Record<string, { trashed?: boolean }>)["table:countries"]
+      .trashed,
+    undefined,
+    "and a restored sheet carries none either",
+  );
   assertEquals(shelf[""].name, "library", "the empty id is the library itself");
   for (const p of PORTALS) assert(shelf[`portal:${p}`], `portal:${p} should be listed`);
   assert(shelf["table:tutorial"], "the tutorial is part of the library");
@@ -1101,6 +1118,49 @@ Deno.test("the library shows when each sheet was opened, and sorts by it", async
   await click(header());
   const firstName = [...all("tbody tr")[3].querySelectorAll("td")][2].textContent;
   assertEquals(firstName, "mine", "descending puts the last opened first, and the never-opened last");
+});
+
+// Deleting a sheet used to be one irreversible click on a browser-local shelf,
+// under a modal that said so. Trashing is the reversible half, so it asks
+// nothing; the modal is kept for the purge, where the warning is true.
+Deno.test("a sheet is trashed without a dialog, hidden from the library, and restored from the trash", async () => {
+  const { app, all, click, settle, text } = await boot("http://localhost/");
+  const sent: { id: string; data: { trashed: boolean | null } }[] = [];
+  app.ports.updateLibrary.subscribe((s: (typeof sent)[number]) => sent.push(s));
+  app.ports.librarySynced.send({
+    ...shelf,
+    "table:mine": { name: "mine", tags: [], doc: { type: "table", data: [[]] } },
+  });
+  await settle();
+  assert(text().includes("mine"), "the sheet is in the library to begin with");
+
+  const rowFor = (name: string) =>
+    all("tbody tr").find((tr) => [...tr.querySelectorAll("td")].some((td) => td.textContent?.trim() === name));
+  const button = (row: El | undefined, label: string) =>
+    [...(row?.querySelectorAll("button") ?? [])].find((b) => b.textContent?.trim() === label);
+
+  await click(button(rowFor("mine"), "trash"));
+  assertEquals(sent.map((s) => [s.id, s.data.trashed]), [["table:mine", true]], "trashing writes the flag, and only it");
+  assertEquals(all(".scrim").length, 0, "and asks nothing first, because it is undoable");
+
+  // The page is told what the browser stored, the way index.html tells it.
+  app.ports.librarySynced.send({
+    ...shelf,
+    "table:mine": { name: "mine", tags: [], trashed: true, doc: { type: "table", data: [[]] } },
+  });
+  await settle();
+  assert(!text().includes("mine"), "a trashed sheet leaves the library");
+
+  const chip = all("button.chip").find((b) => b.textContent?.startsWith("🗑"));
+  assert(chip, "the trash says how much is in it");
+  assertEquals(chip.textContent?.trim(), "🗑 1");
+  await click(chip);
+  assert(text().includes("mine"), "and opening it shows what was thrown away");
+  assert(!text().includes("table:..."), "with nothing offered to create in there");
+
+  sent.length = 0;
+  await click(button(rowFor("mine"), "restore"));
+  assertEquals(sent.map((s) => [s.id, s.data.trashed]), [["table:mine", false]], "restoring writes false, never null");
 });
 
 // A rename in the library lands on the sheet whose row was edited, which is the
@@ -1128,6 +1188,25 @@ Deno.test("renaming a row in a sorted library renames the sheet on that row", as
   await settle();
   assertEquals(renamed.map((r) => [r.id, r.data.name]), [[firstId, "renamed"]], "the rename names the row's own sheet");
 });
+
+/** Waits for something the page does on a real timer, without waiting the whole
+ * timer out: polls until it has happened, and says so by name if it never does.
+ * The query editor's debounce is 300ms and three tests slept 400 for it, which
+ * was more than a second of this suite's ten spent watching a clock. A wait for
+ * something *not* to happen still has to be the flat sleep -- there is no
+ * earlier moment that proves it.
+ */
+const UNTIL_TRIES = 40;
+const until = async (settle: (ms?: number) => Promise<void>, what: string, done: () => boolean) => {
+  for (let tries = 0; tries < UNTIL_TRIES; tries++) {
+    if (done()) return;
+    await settle(25);
+  }
+  throw new Error(
+    `Expected ${what}, received nothing after ${UNTIL_TRIES} polls 25ms apart. ` +
+      `Source: a real timer in src/index.html. Fix: check the timer still fires, or raise UNTIL_TRIES.`,
+  );
+};
 
 // The sync server refuses a viewer's write, and a bundled sheet has no document
 // of this browser's to write to at all. Both keep their arrangement here: the
@@ -2123,24 +2202,85 @@ Deno.test({
   },
 });
 
-// A sheet this browser no longer has is a sheet with nothing to hold a view for.
+// The column's own panel is where a column is hidden and pinned, so it is where
+// it is cleaned too. Each verb is one DocMsg, which is what buys undo, the
+// viewer refusal and the sync path without any of them being written again.
 Deno.test({
-  name: "deleting a sheet drops what this browser held for it",
+  name: "cleaning a column from its panel lands on the document",
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
+    const doc = {
+      type: "table",
+      data: [
+        [{ name: "city", type: "text", key: "0" }, { name: "note", type: "text", key: "1" }],
+        { "0": " Oslo ", "1": "a" },
+        { "0": "bergen", "1": "b" },
+        { "0": "  ", "1": "c" },
+      ],
+    } as { type: string; data: unknown[] };
+    const page = await glue("http://localhost/table:clean1", { docs: { clean1: doc } });
+    // The panel is a toggle, and a verb may leave it open or closed depending on
+    // whether the row it acted on is still there to re-render under it.
+    const verb = async (label: string) => {
+      if (!page.all("button").some((b) => b.textContent === label)) await page.click(page.all("span.funnel")[0]);
+      await page.click(page.all("button").find((b) => b.textContent === label));
+    };
+
+    await verb("Trim");
+    assertEquals(doc.data.slice(1), [{ "0": "Oslo", "1": "a" }, { "0": "bergen", "1": "b" }, { "0": "", "1": "c" }]);
+
+    await verb("UPPER");
+    assertEquals(
+      doc.data.slice(1).map((r) => (r as Record<string, string>)["0"]),
+      ["OSLO", "BERGEN", ""],
+      "and only the column whose panel was open",
+    );
+    assertEquals((doc.data[1] as Record<string, string>)["1"], "a", "the other column is untouched");
+
+    await verb("Drop blank rows");
+    assertEquals(doc.data.slice(1), [{ "0": "OSLO", "1": "a" }, { "0": "BERGEN", "1": "b" }], "the blank row goes");
+    page.close();
+  },
+});
+
+// A sheet this browser no longer has is a sheet with nothing to hold a view for.
+Deno.test({
+  name: "trashing a sheet keeps what this browser held for it, and purging it does not",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const held = { "table:shared1": { "1": { sort: "asc", rank: 1 } }, "table:other": { "0": { width: 80 } } };
     const page = await glue("http://localhost/", {
       stored: {
         library: { "table:shared1": { name: "shared", tags: [] } },
-        views: { "table:shared1": { "1": { sort: "asc", rank: 1 } }, "table:other": { "0": { width: 80 } } },
+        views: { ...held },
       },
     });
-    const row = page.all("tbody tr").find((tr) => tr.textContent?.includes("shared"));
-    assert(row, "the stored sheet is listed");
-    await page.click([...row.querySelectorAll("button")].find((b) => b.textContent === "delete"));
+    const button = (label: string) =>
+      [...(page.all("tbody tr").find((tr) => tr.textContent?.includes("shared"))?.querySelectorAll("button") ?? [])]
+        .find((b) => b.textContent === label);
+
+    await page.click(button("trash"));
+    // The flag and the name, not the whole entry: the page also stores a
+    // thumbnail for a sheet it has drawn, and whether it has by now is not what
+    // this test is about.
+    const entry = () =>
+      (page.stored("library") as Record<string, { name?: string; trashed?: boolean }>)["table:shared1"];
+    assertEquals(
+      [entry()?.name, entry()?.trashed],
+      ["shared", true],
+      "trashing flags the entry rather than removing it",
+    );
+    // The arrangement has to survive the trash, or restoring gives you back a
+    // sheet with somebody else's sort on it.
+    assertEquals(page.held(), held, "and leaves the held view alone");
+
+    await page.click(page.all("button.chip").find((b) => b.textContent?.startsWith("🗑")));
+    await page.click(button("delete"));
     await page.click(page.all("button").find((b) => b.textContent === "Delete"));
-    assertEquals(page.stored("library"), {}, "the sheet is gone from the library");
-    assertEquals(page.held(), { "table:other": { "0": { width: 80 } } }, "and its held view went with it");
+    assertEquals(page.stored("library"), {}, "purging from the trash is what takes the sheet out of the library");
+    assertEquals(page.held(), { "table:other": { "0": { width: 80 } } }, "and its held view goes with it");
     page.close();
   },
 });
@@ -2168,11 +2308,15 @@ Deno.test({
         },
       },
     });
-    await page.settle(400); // the query editor debounce
+    await until(page.settle, "the debounce to run the query once", () => runs === 1);
     assertEquals(runs, 1, "opening a query sheet runs it once");
 
     await page.click(page.all("span.sort").find((s) => s.textContent?.startsWith("n")));
-    await page.settle(400);
+    // Proving nothing ran has no earlier moment than the debounce itself, so
+    // this one stays a flat wait -- 320 for src/index.html's 300, and not a
+    // rounder number, because every millisecond over is one the suite spends
+    // watching a clock.
+    await page.settle(320);
     assertEquals(runs, 1, "sorting the result is not a new question to ask the engine");
     assertEquals(
       (asked.data[0] as { view?: unknown }).view,
@@ -2194,7 +2338,7 @@ Deno.test({
   fn: async () => {
     const profiled = { type: "query", data: [{ lang: "sql", code: "explain select 1 as n", cols: {} }] };
     const page = await glue("http://localhost/query:profiled1", { docs: { profiled1: profiled } });
-    await page.settle(400); // the query editor debounce
+    await until(page.settle, "the profile to render its stages", () => page.all("span.sort").length >= 4);
     const headers = page.all("span.sort").map((s) => s.textContent?.replace(/ [▲▼]$/, ""));
     assertEquals(headers.slice(0, 4), ["stage", "rows_in", "rows_out", "ms"]);
     assert(page.text().includes("total"), "the last stage is the whole statement");

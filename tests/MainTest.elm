@@ -549,11 +549,25 @@ suite =
             , test "chart decodes its source, kind and both axes" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:budget-burn","kind":"bar","x":"department","y":"burn_ratio"}]}"""
-                        |> Expect.equal (Ok (Chart { source = "@query:budget-burn", kind = "bar", x = "department", y = "burn_ratio" }))
+                        |> Expect.equal (Ok (Chart { source = "@query:budget-burn", kind = Bar, x = "department", y = "burn_ratio" }))
             , test "a chart with no kind is a line, and its axes default to empty" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:x"}]}"""
-                        |> Expect.equal (Ok (Chart { source = "@query:x", kind = "line", x = "", y = "" }))
+                        |> Expect.equal (Ok (Chart { source = "@query:x", kind = Line, x = "", y = "" }))
+            , test "every kind the engine admits decodes to one of its own" <|
+                \_ ->
+                    chartKinds
+                        |> List.map
+                            (\k ->
+                                D.decodeString docDecoder
+                                    ("""{"type":"chart","data":[{"source":"@query:x","kind":\"""" ++ (kindSpec k).name ++ "\"}]}")
+                            )
+                        |> Expect.equal (List.map (\k -> Ok (Chart { source = "@query:x", kind = k, x = "", y = "" })) chartKinds)
+            , test "a kind nobody draws is refused rather than drawn as a line" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:x","kind":"scater"}]}"""
+                        |> Result.mapError (always "refused")
+                        |> Expect.equal (Err "refused")
             , test "dashboard decodes its tiles in order" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"dashboard","data":[{"tiles":["@chart:a","@query:b"]}]}"""
@@ -708,6 +722,73 @@ suite =
                     freshnessCell (Just (Freshness (Just "2026-08-23T14:02:11.000Z") 4))
                         |> Expect.equal "2026-08-23 14:02 · 4 failed"
             ]
+        , describe "Cleaning a column"
+            [ test "trim writes only the cells it moves, and its own undo" <|
+                \_ ->
+                    rewritten String.trim [ " a ", "b", "  " ]
+                        |> Expect.equal ( [ ( 1, "a" ), ( 3, "" ) ], [ ( 1, " a " ), ( 3, "  " ) ] )
+            , test "a cell the change does not move contributes no patch at all" <|
+                \_ -> rewritten String.toUpper [ "A", "B" ] |> Tuple.first |> Expect.equal []
+            , test "a cell that is not text is left to the type that owns it" <|
+                \_ ->
+                    withCleanCol
+                        (\col ->
+                            cellRewrites col
+                                String.trim
+                                (Array.fromList [ Dict.fromList [ ( "0", E.int 5 ) ], Dict.fromList [ ( "0", E.string " x " ) ] ])
+                                |> Tuple.first
+                                |> List.map patchOf
+                        )
+                        []
+                        |> Expect.equal [ ( 2, "x" ) ]
+            , test "blank is missing, null or whitespace -- and a zero is not blank" <|
+                \_ ->
+                    withCleanCol
+                        (\col ->
+                            blankRows col
+                                (Array.fromList
+                                    [ Dict.fromList [ ( "0", E.string "x" ) ]
+                                    , Dict.fromList [ ( "0", E.string "  " ) ]
+                                    , Dict.fromList [ ( "0", E.null ) ]
+                                    , Dict.fromList [ ( "1", E.string "elsewhere" ) ]
+                                    , Dict.fromList [ ( "0", E.int 0 ) ]
+                                    ]
+                                )
+                        )
+                        []
+                        |> Expect.equal [ 2, 3, 4 ]
+            , test "rows come out highest first and go back lowest first, so each lands where it left" <|
+                \_ ->
+                    rowDeletions (cleanRows [ "a", "b", "c" ]) [ 1, 3 ]
+                        |> Tuple.mapBoth (List.map spliceOf) (List.map spliceOf)
+                        |> Expect.equal ( [ "[3,1]", "[1,1]" ], [ "[1,0,{\"0\":\"a\"}]", "[3,0,{\"0\":\"c\"}]" ] )
+            , test "a row named twice is removed once" <|
+                \_ ->
+                    rowDeletions (cleanRows [ "a", "b" ]) [ 2, 2 ]
+                        |> Tuple.first
+                        |> List.map spliceOf
+                        |> Expect.equal [ "[2,1]" ]
+            , test "an index with no row behind it deletes nothing, rather than something it cannot put back" <|
+                \_ ->
+                    -- 0 is the column list and 9 is past the end. Both used to
+                    -- splice a row out and hand back an empty undo.
+                    rowDeletions (cleanRows [ "a", "b" ]) [ 0, 9, -1, 2 ]
+                        |> Tuple.mapBoth (List.map spliceOf) (List.map spliceOf)
+                        |> Expect.equal ( [ "[2,1]" ], [ "[2,0,{\"0\":\"b\"}]" ] )
+            ]
+        , describe "formatNumber"
+            [ test "a total that overflowed is not dressed up as money" <|
+                \_ ->
+                    -- `usd` groups the digits of the string form, so Infinity
+                    -- came out "$In,fin,ity.00". Two 1e308 cells in a usd column
+                    -- is all the totals row needs.
+                    [ reads "usd" (1.0e308 + 1.0e308), reads "usd" -(1.0e308 + 1.0e308) ]
+                        |> Expect.equal [ "Infinity", "-Infinity" ]
+            , test "a usd column reads as money everywhere it is summed" <|
+                \_ ->
+                    [ reads "usd" 1234.5, reads "num" 1234.5, reads "percentage" 0.25 ]
+                        |> Expect.equal [ "$1,234.50", "1234.5", "25%" ]
+            ]
         , describe "paletteCommands"
             [ test "an empty query offers every runnable shortcut, in the order the sheet lists them" <|
                 \_ ->
@@ -727,6 +808,8 @@ suite =
                     paletteCommands (libraryOf [ ( "table:draft", "draft", True ) ]) "draft"
                         |> List.map .label
                         |> Expect.equal []
+            , test "a trashed sheet is not a destination, or the palette still opens what you threw away" <|
+                \_ -> paletteCommands trashedShelf "gone" |> List.map .label |> Expect.equal []
             , test "the library itself is not a destination" <|
                 \_ ->
                     paletteCommands (libraryOf [ ( "", "library-root", False ) ]) "library-root"
@@ -977,9 +1060,66 @@ libraryOf entries =
     entries
         |> List.map
             (\( id, name, scratch ) ->
-                ( id, { name = name, tags = [], scratch = scratch, system = False, thumb = E.null, peers = Private, seen = "" } )
+                ( id, { name = name, tags = [], scratch = scratch, system = False, thumb = E.null, seen = "", trashed = False } )
             )
         |> Dict.fromList
+
+
+{-| A number as the column named by that type spelling reads it. The type comes
+back through `docDecoder`, the way every other fixture here is built, so this
+needs no `Type` constructor exposed for one test.
+-}
+reads spelling v =
+    D.decodeString docDecoder
+        ("""{"type":"table","data":[[{"name":"a","type":\"""" ++ spelling ++ """\","key":"0"}]]}""")
+        |> Result.toMaybe
+        |> Maybe.andThen
+            (\doc ->
+                case doc of
+                    Tab tbl ->
+                        Array.get 0 tbl.cols
+
+                    _ ->
+                        Nothing
+            )
+        |> Maybe.map (\col -> formatNumber col.typ v)
+        |> Maybe.withDefault "no such column"
+
+
+{-| Every cleaning test runs against one text column keyed "0", which is the key
+`cleanRows` writes under. Built through the decoder by `namedCols`, the way the
+other fixtures here are, so no test needs a `Col` of its own.
+-}
+withCleanCol use fallback =
+    namedCols [ "c" ] |> Array.get 0 |> Maybe.map use |> Maybe.withDefault fallback
+
+
+rewritten change values =
+    withCleanCol
+        (\col -> cellRewrites col change (cleanRows values) |> Tuple.mapBoth (List.map patchOf) (List.map patchOf))
+        ( [], [] )
+
+
+cleanRows values =
+    values |> List.map (\v -> Dict.fromList [ ( "0", E.string v ) ]) |> Array.fromList
+
+
+{-| A cell patch as the row it addresses and the value it writes, which is all
+these tests are about. No annotation: `Patch` is not exposed.
+-}
+patchOf patch =
+    ( patch.path |> List.head |> Maybe.andThen (D.decodeValue D.int >> Result.toMaybe) |> Maybe.withDefault -1
+    , patch.value |> D.decodeValue D.string |> Result.withDefault "?"
+    )
+
+
+spliceOf patch =
+    E.encode 0 patch.value
+
+
+trashedShelf =
+    libraryOf [ ( "table:gone", "gone", False ) ]
+        |> Dict.map (\_ v -> { v | trashed = True })
 
 
 paletteShelf =

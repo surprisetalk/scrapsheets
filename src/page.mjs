@@ -52,9 +52,14 @@ const tutorial = Table(
  * bundled. The order matters — a system entry wins over a stored one of the same
  * id, so a stale copy of a bundled example cannot shadow the real one. The empty
  * id is the library itself, which is what an unrecognised route falls back to.
- * `seen` — when this browser last opened the sheet — is this browser's fact
- * whoever owns the entry, so it is the one stored field that survives a system
- * entry.
+ * `seen` — when this browser last opened the sheet — and `trashed` — whether it
+ * threw the sheet away — are this browser's facts whoever owns the entry, so
+ * they are the two stored fields that survive a system entry. A bundled demo has
+ * to be trashable for the same reason it has to be openable.
+ *
+ * Restoring writes `trashed` back as `false` rather than null, because
+ * Library.set drops a null field out of the patch rather than out of the entry —
+ * a null would leave the sheet in the trash.
  */
 export const library = (stored = {}) => {
   const merged = {
@@ -69,7 +74,8 @@ export const library = (stored = {}) => {
   };
   return Object.fromEntries(
     Object.entries(merged).map(([id, entry]) => {
-      const e = stored[id]?.seen ? { ...entry, seen: stored[id].seen } : entry;
+      const opened = stored[id]?.seen ? { ...entry, seen: stored[id].seen } : entry;
+      const e = stored[id]?.trashed ? { ...opened, trashed: stored[id].trashed } : opened;
       return [id, e.doc && !e.thumb ? { ...e, thumb: docThumb(e.doc) } : e];
     }),
   );

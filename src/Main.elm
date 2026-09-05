@@ -1,5 +1,6 @@
 port module Main exposing
-    ( ClipboardData
+    ( ChartKind(..)
+    , ClipboardData
     , ClipboardFormat(..)
     , Col
     , Doc(..)
@@ -8,7 +9,6 @@ port module Main exposing
     , Freshness
     , Index
     , Moving(..)
-    , Peers(..)
     , Rect
     , Sheet
     , SheetView
@@ -17,7 +17,10 @@ port module Main exposing
     , Table
     , TableBounds
     , When(..)
+    , blankRows
     , canonicalTypeNames
+    , cellRewrites
+    , chartKinds
     , chartPoints
     , civilDays
     , clampIndex
@@ -32,8 +35,10 @@ port module Main exposing
     , emptyView
     , expandSelection
     , filterAndSortIndexed
+    , formatNumber
     , freshnessCell
     , freshnessDecoder
+    , kindSpec
     , knownTypeName
     , main
     , movePatch
@@ -51,6 +56,7 @@ port module Main exposing
     , queryHome
     , rect
     , rectToIndices
+    , rowDeletions
     , rowSplices
     , selectAll
     , serializeToTsv
@@ -477,6 +483,37 @@ usd amount =
     iif (amount < 0) "-" "" ++ "$" ++ commas intPart ++ "." ++ decPart
 
 
+{-| How a number reads in the column it is in. Three places used to answer this
+independently -- the cell, the stats row and the totals row -- and they
+disagreed: a usd column's cells carried a $ and its total did not, which is a
+number that looks like a different number.
+
+A wildcard rather than a table, because the question is only ever asked of a
+column that holds a number, and a type that does not hold one has no reading of
+its own to state.
+
+-}
+formatNumber : Type -> Float -> String
+formatNumber typ v =
+    if isNaN v || isInfinite v then
+        -- Neither a currency symbol nor digit grouping belongs on a value that
+        -- is not a number: `commas` runs over the string form, so a usd total
+        -- that overflowed to Infinity read "$In,fin,ity.00". Two cells of 1e308
+        -- in a usd column is all it takes, and the totals row sums them.
+        String.fromFloat v
+
+    else
+        case typ of
+            Usd ->
+                usd v
+
+            Percentage ->
+                formatPercentage v
+
+            _ ->
+                String.fromFloat (round2 v)
+
+
 formatPercentage : Float -> String
 formatPercentage value =
     -- Assumes value is a decimal (e.g., 0.25 = 25%)
@@ -501,7 +538,11 @@ formatPercentage value =
 port librarySynced : (D.Value -> msg) -> Sub msg
 
 
-port updateLibrary : Idd { name : Maybe String, tags : Maybe (List String) } -> Cmd msg
+{-| This browser's own facts about a sheet in its library. A `Nothing` field is
+left as it was — src/index.html drops a null out of the patch rather than out of
+the entry — so restoring writes `Just False` and never `Nothing`.
+-}
+port updateLibrary : Idd { name : Maybe String, tags : Maybe (List String), trashed : Maybe Bool } -> Cmd msg
 
 
 port changeId : Id -> Cmd msg
@@ -704,6 +745,9 @@ type alias Model =
     , auth : Auth
     , deleteConfirm : Maybe String
 
+    -- Whether the library is showing what was thrown away instead of what was kept.
+    , trash : Bool
+
     -- The file being imported, once the server has said how it reads it.
     , importing : Maybe Importing
     , showSettings : Bool
@@ -751,14 +795,9 @@ type alias SheetInfo =
     , scratch : Bool
     , system : Bool
     , thumb : D.Value
-    , peers : Peers
     , seen : String -- ISO 8601, when this browser last opened it; "" if never
+    , trashed : Bool -- whether this browser put it in the trash
     }
-
-
-type Peers
-    = Private
-    | Public
 
 
 {-| Who a sheet is shared with, as last loaded from the server. `link` holds a
@@ -1468,7 +1507,7 @@ type Doc
     | NetHook
     | NetHttp { url : String, interval : Int, headers : String }
     | Alert { code : String, to : String, interval : Int, digest : Bool, when : When }
-    | Chart { source : String, kind : String, x : String, y : String }
+    | Chart { source : String, kind : ChartKind, x : String, y : String }
     | Dashboard (List String)
     | NetSocket { url : String }
     | Unviewable String
@@ -1527,6 +1566,8 @@ type Type
     | Timestamp
     | Image
     | Delete
+    | Trash
+    | Restore
     | Create
     | Form
     | Enum (List String)
@@ -1569,6 +1610,57 @@ whenDecoder name =
 
         _ ->
             D.fail ("not a condition an alert knows: " ++ name ++ "; expected one of " ++ String.join ", " (List.map (whenSpec >> .name) whens))
+
+
+{-| How a chart is drawn. One table with no wildcard, so a new constructor fails
+to compile in `viewChart` rather than falling through to a line; `CHART_KINDS` in
+`src/sql.mjs` is the same list on the other side of the wire, `chartSql` refuses
+a kind that is not on it, and `browser_test.ts` fails when the two disagree.
+
+`kind` used to be a plain string that nothing checked, so a typo drew a line and
+said nothing about it.
+
+-}
+type ChartKind
+    = Line
+    | Bar
+    | Area
+    | Scatter
+    | Kpi
+
+
+kindSpec : ChartKind -> { name : String, label : String }
+kindSpec kind =
+    case kind of
+        Line ->
+            { name = "line", label = "a line through every point" }
+
+        Bar ->
+            { name = "bar", label = "one bar per point, from zero" }
+
+        Area ->
+            { name = "area", label = "the line, filled to the baseline" }
+
+        Scatter ->
+            { name = "scatter", label = "one dot per point" }
+
+        Kpi ->
+            { name = "kpi", label = "the last value, its change, and a sparkline" }
+
+
+chartKinds : List ChartKind
+chartKinds =
+    [ Line, Bar, Area, Scatter, Kpi ]
+
+
+kindDecoder : String -> D.Decoder ChartKind
+kindDecoder name =
+    case List.filter (\k -> (kindSpec k).name == name) chartKinds of
+        [ k ] ->
+            D.succeed k
+
+        _ ->
+            D.fail ("not a kind of chart: " ++ name ++ "; expected one of " ++ String.join ", " (List.map (kindSpec >> .name) chartKinds))
 
 
 {-| Everything the table knows about a column type: what it is called, which
@@ -1621,6 +1713,12 @@ spec typ =
 
         Delete ->
             { name = "delete", align = S.textAlignCenter, width = Just 64 }
+
+        Trash ->
+            { name = "trash", align = S.textAlignCenter, width = Just 64 }
+
+        Restore ->
+            { name = "restore", align = S.textAlignCenter, width = Just 72 }
 
         Create ->
             { name = "create", align = S.textAlignRight, width = Just 160 }
@@ -1753,7 +1851,7 @@ docDecoder =
                             D.index 0 <|
                                 D.map4 (\source kind x y -> Chart { source = source, kind = kind, x = x, y = y })
                                     (D.oneOf [ D.field "source" D.string, D.succeed "" ])
-                                    (D.oneOf [ D.field "kind" D.string, D.succeed "line" ])
+                                    (D.oneOf [ D.field "kind" D.string, D.succeed "line" ] |> D.andThen kindDecoder)
                                     (D.oneOf [ D.field "x" D.string, D.succeed "" ])
                                     (D.oneOf [ D.field "y" D.string, D.succeed "" ])
 
@@ -1977,6 +2075,7 @@ init flags url nav =
                     , password = ""
                     }
                 , deleteConfirm = Nothing
+                , trash = False
                 , importing = Nothing
                 , showSettings = False
                 , embed = False
@@ -2037,6 +2136,9 @@ type Msg
     | ChartDownload String
     | DocNewQuery
     | DocNewTable
+    | DocTrash Id
+    | DocRestore Id
+    | TrashToggle
     | DocDelete Id
     | DocDeleteConfirm Id
     | DocDeleteCancel
@@ -2138,7 +2240,15 @@ type DocMsg
     | SheetRowMove Int Int -- document rows: data[from] to data[to]
     | SheetClearCells (List Index)
     | SheetFillDown Rect
+    | SheetColumnTrim String
+    | SheetColumnCase String Casing
+    | SheetRowsDropBlank String
     | CellCheck Index Bool
+
+
+type Casing
+    = Upper
+    | Lower
 
 
 type Input
@@ -2403,8 +2513,8 @@ update msg ({ sheet, auth } as model) =
                             (D.oneOf [ D.field "scratch" D.bool, D.succeed False ])
                             (D.oneOf [ D.field "system" D.bool, D.succeed False ])
                             (D.oneOf [ D.field "thumb" D.value, D.succeed E.null ])
-                            (D.oneOf [ D.field "public" D.bool |> D.map (\p -> iif p Public Private), D.succeed Private ])
                             (D.oneOf [ D.field "seen" D.string, D.succeed "" ])
+                            (D.oneOf [ D.field "trashed" D.bool, D.succeed False ])
                         )
                     )
                     data
@@ -2563,6 +2673,18 @@ update msg ({ sheet, auth } as model) =
         DocMsg edit ->
             updateDocMsg edit model
 
+        DocTrash id ->
+            -- No confirmation: being undoable is the whole point of the trash,
+            -- and a dialog in front of a reversible act only teaches people to
+            -- click through the one in front of an irreversible one.
+            ( model, updateLibrary (Idd id { name = Nothing, tags = Nothing, trashed = Just True }) )
+
+        DocRestore id ->
+            ( model, updateLibrary (Idd id { name = Nothing, tags = Nothing, trashed = Just False }) )
+
+        TrashToggle ->
+            ( { model | trash = not model.trash }, Cmd.none )
+
         DocDelete id ->
             -- Show confirmation instead of immediately deleting
             ( { model | deleteConfirm = Just id }, Cmd.none )
@@ -2714,7 +2836,7 @@ update msg ({ sheet, auth } as model) =
                     ( model, Cmd.none )
 
         SettingsNameChange newName ->
-            ( model, updateLibrary (Idd sheet.id { name = Just newName, tags = Nothing }) )
+            ( model, updateLibrary (Idd sheet.id { name = Just newName, tags = Nothing, trashed = Nothing }) )
 
         SettingsTagsChange newTags ->
             let
@@ -2724,7 +2846,7 @@ update msg ({ sheet, auth } as model) =
                         |> List.map String.trim
                         |> List.filter (not << String.isEmpty)
             in
-            ( model, updateLibrary (Idd sheet.id { name = Nothing, tags = Just tags }) )
+            ( model, updateLibrary (Idd sheet.id { name = Nothing, tags = Just tags, trashed = Nothing }) )
 
         DocNew x ->
             ( model, newDoc x )
@@ -3537,10 +3659,10 @@ updateDocMsg edit ({ sheet } as model) =
                 SheetWrite { x, y } ->
                     case ( libraryIdAtRow model y, Maybe.map .name (Array.get x (libraryCols model)) ) of
                         ( Just id, Just "name" ) ->
-                            ( closed, updateLibrary (Idd id { name = sheet.write, tags = Nothing }) )
+                            ( closed, updateLibrary (Idd id { name = sheet.write, tags = Nothing, trashed = Nothing }) )
 
                         ( Just id, Just "tags" ) ->
-                            ( closed, updateLibrary (Idd id { name = Nothing, tags = sheet.write |> Maybe.map (String.split ", " >> List.map String.trim) }) )
+                            ( closed, updateLibrary (Idd id { name = Nothing, tags = sheet.write |> Maybe.map (String.split ", " >> List.map String.trim), trashed = Nothing }) )
 
                         ( Nothing, _ ) ->
                             -- Written to a row the library does not draw. The empty
@@ -3568,6 +3690,17 @@ updateDocMsg edit ({ sheet } as model) =
                         |> Maybe.andThen (Dict.get key)
                         |> Maybe.map (\v -> D.decodeValue D.value v |> Result.withDefault E.null)
                         |> Maybe.withDefault E.null
+
+                -- A column addressed by its own key rather than by a position,
+                -- the way every other control in its panel addresses it. A key
+                -- the sheet no longer carries writes nothing.
+                withColumn key make =
+                    table.cols
+                        |> Array.toList
+                        |> List.filter (\c -> c.key == key)
+                        |> List.head
+                        |> Maybe.map make
+                        |> Maybe.withDefault ( [], [] )
 
                 -- Compute forward and backward patches based on edit type
                 ( forwardPatches, backwardPatches ) =
@@ -3682,38 +3815,16 @@ updateDocMsg edit ({ sheet } as model) =
                             rowSplices (\i -> Array.get (i - 1) table.rows) 1 indices toDoc
 
                         SheetRowDelete indices ->
-                            let
-                                docYs =
-                                    indices |> List.map toDoc |> List.sort
+                            rowDeletions table.rows (List.map toDoc indices)
 
-                                forward =
-                                    docYs
-                                        |> List.reverse
-                                        |> List.map
-                                            (\i ->
-                                                { action = "splice"
-                                                , path = []
-                                                , value = E.list E.int [ i, 1 ]
-                                                }
-                                            )
+                        SheetColumnTrim key ->
+                            withColumn key (\col -> cellRewrites col String.trim table.rows)
 
-                                -- Re-insert lowest first, so each row lands back at
-                                -- its original index. Doc row i is rows[i - 1].
-                                backward =
-                                    docYs
-                                        |> List.filterMap
-                                            (\i ->
-                                                Array.get (i - 1) table.rows
-                                                    |> Maybe.map
-                                                        (\row ->
-                                                            { action = "splice"
-                                                            , path = []
-                                                            , value = E.list identity [ E.int i, E.int 0, E.dict identity identity row ]
-                                                            }
-                                                        )
-                                            )
-                            in
-                            ( forward, backward )
+                        SheetColumnCase key casing ->
+                            withColumn key (\col -> cellRewrites col (iif (casing == Upper) String.toUpper String.toLower) table.rows)
+
+                        SheetRowsDropBlank key ->
+                            withColumn key (\col -> rowDeletions table.rows (blankRows col table.rows))
 
                         SheetColumnMove from to ->
                             -- Its own inverse, which is the whole reason a move
@@ -4573,7 +4684,11 @@ libraryCols model =
               -- one over every sheet reads as "nothing is wrong", which is the
               -- claim this column exists to stop the page making.
               iif (Dict.isEmpty model.freshness) [] [ madeCol "freshness" "freshness" Text ]
-            , [ madeCol "delete" "" Delete ]
+            , -- Trash is offered on every row, a bundled one included: the flag is
+              -- this browser's, so a demo it does not want is a demo it can put
+              -- away. Purging is not, because a system entry has nothing of its
+              -- own to purge -- dropping it would only un-trash it.
+              iif model.trash [ madeCol "restore" "" Restore, madeCol "delete" "" Delete ] [ madeCol "trash" "" Trash ]
             ]
 
 
@@ -4786,7 +4901,7 @@ viewDeleteConfirm maybeId =
         Just id ->
             viewModal DocDeleteCancel
                 [ H.p [ S.marginBottom "1rem" ]
-                    [ text "Are you sure you want to delete this sheet? This cannot be undone." ]
+                    [ text "Delete this sheet from this browser's library for good? Trashing it instead is undoable; this is not." ]
                 , H.div [ S.displayFlex, S.gapRem 0.5, S.justifyContentFlexEnd ]
                     [ H.button [ A.onClick DocDeleteCancel, S.padding "0.5rem 1rem" ] [ text "Cancel" ]
                     , H.button
@@ -4897,7 +5012,7 @@ paletteCommands shelf query =
 
         sheets =
             shelf
-                |> Dict.filter (\k v -> k /= "" && not v.scratch && matches [ k, v.name ])
+                |> Dict.filter (\k v -> k /= "" && not v.scratch && not v.trashed && matches [ k, v.name ])
                 |> Dict.toList
                 |> List.map
                     (\( k, v ) -> Command (iif (String.isEmpty (String.trim v.name)) k v.name) k (Goto k))
@@ -5351,7 +5466,7 @@ resolveTable model =
                 { cols = libraryCols model
                 , rows =
                     model.library
-                        |> Dict.filter (\k v -> k /= "" && not v.scratch && List.any (String.contains model.search) (k :: v.name :: v.tags))
+                        |> Dict.filter (\k v -> k /= "" && not v.scratch && v.trashed == model.trash && List.any (String.contains model.search) (k :: v.name :: v.tags))
                         |> Dict.toList
                         |> List.map
                             (\( k, v ) ->
@@ -5363,6 +5478,8 @@ resolveTable model =
                                     , ( "tags", E.list E.string v.tags )
                                     , ( "opened", E.string v.seen )
                                     , ( "freshness", E.string (freshnessCell (Dict.get k model.freshness)) )
+                                    , ( "trash", E.string k )
+                                    , ( "restore", E.string k )
                                     , ( "delete", iif v.system E.null (E.string k) )
                                     ]
                             )
@@ -5539,6 +5656,98 @@ filterAndSortIndexed search sheet rows =
 
 -- Insert rows by splice, the inverse of the splice SheetRowDelete already undoes with.
 -- `offset` 0 puts the new row above its source, 1 below. Doc row i is rows[i - 1].
+
+
+{-| The patches that take a set of document rows out, and the ones that put them
+back. Out highest first, so an earlier splice never shifts a later target; back
+lowest first, so each row lands at the index it left. Document row i is
+`rows[i - 1]`, because row 0 is the column list.
+
+Written once because the off-by-one is the whole difficulty and two verbs want
+it: deleting the selected rows, and dropping the rows a column has nothing in.
+
+-}
+rowDeletions : Array Row -> List Int -> ( List Patch, List Patch )
+rowDeletions rows indices =
+    let
+        -- Both sides come off one list, so a delete cannot outlive its undo. An
+        -- index with no row behind it -- 0, which is the column list, or one past
+        -- the end -- used to splice something out and put nothing back.
+        targets =
+            indices
+                |> Set.fromList
+                |> Set.toList
+                |> List.filterMap (\i -> Array.get (i - 1) rows |> Maybe.map (Tuple.pair i))
+    in
+    ( targets
+        |> List.reverse
+        |> List.map (\( i, _ ) -> { action = "splice", path = [], value = E.list E.int [ i, 1 ] })
+    , targets
+        |> List.map
+            (\( i, row ) ->
+                { action = "splice"
+                , path = []
+                , value = E.list identity [ E.int i, E.int 0, E.dict identity identity row ]
+                }
+            )
+    )
+
+
+{-| One column's cells, rewritten. A cell that is not text is left alone -- trim
+and case have nothing to say about a number -- and so is one the change does not
+move: a patch that writes back what was already there is a step on the undo
+stack that undoes nothing, and a change event every other viewer has to answer.
+
+Every row the document holds, not the rows on screen: this is the column's own
+verb, offered in the column's own panel, and a filter left on would otherwise
+clean half a column and leave no sign of which half.
+
+-}
+cellRewrites : Col -> (String -> String) -> Array Row -> ( List Patch, List Patch )
+cellRewrites col change rows =
+    let
+        pairs =
+            rows
+                |> Array.toIndexedList
+                |> List.filterMap
+                    (\( i, row ) ->
+                        Dict.get col.key row
+                            |> Maybe.andThen (D.decodeValue D.string >> Result.toMaybe)
+                            |> Maybe.andThen
+                                (\was ->
+                                    let
+                                        now =
+                                            change was
+
+                                        at value =
+                                            { action = "set", path = [ E.int (i + 1), E.string col.key ], value = E.string value }
+                                    in
+                                    iif (now == was) Nothing (Just ( at now, at was ))
+                                )
+                    )
+    in
+    ( List.map Tuple.first pairs, List.map Tuple.second pairs )
+
+
+{-| The document rows whose cell in this column holds nothing: missing, null, or
+text that is only whitespace. A zero is not blank.
+-}
+blankRows : Col -> Array Row -> List Int
+blankRows col rows =
+    rows
+        |> Array.toIndexedList
+        |> List.filterMap
+            (\( i, row ) ->
+                case Dict.get col.key row of
+                    Nothing ->
+                        Just (i + 1)
+
+                    Just value ->
+                        iif (D.decodeValue (D.nullable D.string) value == Ok Nothing) (Just (i + 1)) <|
+                            iif (D.decodeValue D.string value |> Result.map (String.trim >> String.isEmpty) |> Result.withDefault False)
+                                (Just (i + 1))
+                                Nothing
+            )
 
 
 rowSplices : (Int -> Maybe Row) -> Int -> List Int -> (Int -> Int) -> ( List Patch, List Patch )
@@ -5735,13 +5944,13 @@ cellDecoder typ i n =
                 boolean |> D.map (\c -> H.input [ A.type_ "checkbox", A.checked c, A.onCheck (DocMsg << CellCheck { x = i, y = n }) ] [])
 
             Number ->
-                D.oneOf [ D.map (text << String.fromFloat << round2) number, D.map text string ]
+                D.oneOf [ D.map (text << formatNumber Number) number, D.map text string ]
 
             Usd ->
-                D.oneOf [ D.map (text << usd) number, D.map text string ]
+                D.oneOf [ D.map (text << formatNumber Usd) number, D.map text string ]
 
             Percentage ->
-                D.oneOf [ D.map (text << formatPercentage) number, D.map text string ]
+                D.oneOf [ D.map (text << formatNumber Percentage) number, D.map text string ]
 
             Date ->
                 D.map text string
@@ -5751,6 +5960,12 @@ cellDecoder typ i n =
 
             Delete ->
                 D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])
+
+            Trash ->
+                D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocTrash sheet_id), A.title "move to the trash" ] [ text "trash" ])
+
+            Restore ->
+                D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocRestore sheet_id) ] [ text "restore" ])
 
             Thumb ->
                 D.map3 viewThumb
@@ -5790,8 +6005,8 @@ viewThumb cols rows spark =
         text ""
 
 
-viewStatCell : Maybe Stat -> List (Html Msg)
-viewStatCell maybeStat =
+viewStatCell : Type -> Maybe Stat -> List (Html Msg)
+viewStatCell typ maybeStat =
     let
         grid =
             H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gap "0 0.5rem", S.justifyContentFlexStart, S.fontSizeRem 0.75 ]
@@ -5802,8 +6017,8 @@ viewStatCell maybeStat =
     case maybeStat of
         Just (Numeric stat) ->
             [ grid <|
-                kv "min" (Maybe.withDefault "" (Maybe.map (String.fromFloat << round2) stat.min))
-                    ++ kv "max" (Maybe.withDefault "" (Maybe.map (String.fromFloat << round2) stat.max))
+                kv "min" (Maybe.withDefault "" (Maybe.map (formatNumber typ) stat.min))
+                    ++ kv "max" (Maybe.withDefault "" (Maybe.map (formatNumber typ) stat.max))
                     ++ kv "mean" (iif (stat.count == 0) "" (String.fromInt (round (stat.sum / toFloat stat.count))))
                     ++ kv "count" (String.fromInt stat.count)
             ]
@@ -5872,7 +6087,10 @@ viewHeaderCell sheet col =
                     arrangeControls sheet
 
                 -- A table's columns are the document's own order, so only they
-                -- can be moved. A query's are its select list's.
+                -- can be moved, and only their cells are this document's to
+                -- rewrite. A query's are its select list's, computed from
+                -- somewhere else -- which is why the cleaning verbs in the panel
+                -- below ask the same question the drag handle does.
                 movable =
                     case sheet.doc of
                         Ok (Tab _) ->
@@ -5929,6 +6147,16 @@ viewHeaderCell sheet col =
                         [ H.input [ A.placeholder "contains...", A.value currentFilterValue, A.onInput (FilterInput col.key), S.width "100%" ] []
                         , H.button [ A.onClick (ColumnHide col.key), S.marginTop "0.25rem" ] [ text "Hide column" ]
                         , H.button [ A.onClick (ColumnPin col.key), S.marginTop "0.25rem" ] [ text (iif isPinned "Unpin column" "Pin column") ]
+                        , if movable then
+                            H.div [ S.displayFlex, S.flexWrapWrap, S.gapRem 0.25, S.marginTop "0.25rem" ]
+                                [ H.button [ A.onClick (DocMsg (SheetColumnTrim col.key)), A.title "drop the spaces around every value in this column" ] [ text "Trim" ]
+                                , H.button [ A.onClick (DocMsg (SheetColumnCase col.key Upper)) ] [ text "UPPER" ]
+                                , H.button [ A.onClick (DocMsg (SheetColumnCase col.key Lower)) ] [ text "lower" ]
+                                , H.button [ A.onClick (DocMsg (SheetRowsDropBlank col.key)), A.title "delete every row with nothing in this column" ] [ text "Drop blank rows" ]
+                                ]
+
+                          else
+                            text ""
                         , if hasFilter then
                             H.button [ A.onClick (FilterClear col.key), S.marginTop "0.25rem" ] [ text "Clear" ]
 
@@ -5993,7 +6221,7 @@ viewCell sheet stats pins grab i n col row =
         else
             case String.fromInt n of
                 "-2" ->
-                    viewStatCell (Maybe.andThen (Array.get i) (Result.toMaybe stats))
+                    viewStatCell col.typ (Maybe.andThen (Array.get i) (Result.toMaybe stats))
 
                 "-1" ->
                     [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontSizeRem 0.75 ] [ text col.raw ] ]
@@ -6128,7 +6356,7 @@ viewGallery model =
     let
         demos =
             model.library
-                |> Dict.filter (\k v -> String.startsWith "query:" k && List.member "demo" v.tags)
+                |> Dict.filter (\k v -> String.startsWith "query:" k && List.member "demo" v.tags && not v.trashed)
                 |> Dict.toList
                 |> List.sortBy (\( _, v ) -> v.name)
 
@@ -6147,6 +6375,9 @@ viewGallery model =
         -- headed, and this rule needs no edit when it arrives.
         rotten id =
             model.freshness |> Dict.get id |> Maybe.map (\f -> f.failures > 0) |> Maybe.withDefault False
+
+        trashed =
+            model.library |> Dict.filter (\k v -> k /= "" && not v.scratch && v.trashed) |> Dict.size
     in
     H.div [ S.paddingRem 0.5, S.backgroundColor "#f6f6f6", S.borderBottom "1px solid #aaa", S.displayFlex, S.flexWrapWrap, S.gapRem 0.375, S.alignItemsCenter, S.fontSizeRem 0.8125 ]
         (H.strong [] [ text "start from a demo" ]
@@ -6163,45 +6394,61 @@ viewGallery model =
                 demos
             ++ H.span [ S.color "#666", S.marginLeftRem 0.5 ] [ text "filter" ]
             :: List.map (\t -> H.button [ A.class "chip", A.onClick (InputChange SheetSearch t) ] [ text t ]) tags
+            -- Shown while the trash is open even when it has just been emptied,
+            -- because it is the only way back to the library from in there.
+            ++ iif (trashed == 0 && not model.trash)
+                []
+                [ H.button
+                    [ A.class "chip"
+                    , A.onClick TrashToggle
+                    , A.title (iif model.trash "back to the library" "what this browser threw away")
+                    , iif model.trash (S.background "#fff8e0") (A.classList [])
+                    ]
+                    [ text ("🗑 " ++ String.fromInt trashed) ]
+                ]
         )
 
 
-viewTableFooter : Sheet -> Dict String Int -> Array Col -> Array Row -> Html Msg
-viewTableFooter sheet pins cols rows =
+viewTableFooter : Bool -> Sheet -> Dict String Int -> Array Col -> Array Row -> Html Msg
+viewTableFooter trash sheet pins cols rows =
     H.tfoot [] <|
         case sheet.doc of
+            -- Nothing is offered to make while the trash is open: a sheet made
+            -- there would land in the library and disappear from the view that
+            -- made it.
             Ok Library ->
-                List.map
-                    (\( label, msg ) ->
-                        H.tr [ A.onClick msg, A.title ("new " ++ label) ] <|
-                            H.td [] [ text label ]
-                                :: List.map (\typ -> H.td [] [ text typ ]) [ "text", "list text", "" ]
-                    )
-                    [ ( "table:...", DocNewTable )
-                    , ( "query:...", DocNewQuery )
-                    , ( "net-hook:...", DocNew <| E.object [ ( "type", E.string "net-hook" ), ( "data", E.list identity [] ) ] )
-                    , ( "net-http:...", DocNew <| E.object [ ( "type", E.string "net-http" ), ( "data", E.list identity [ E.object [ ( "url", E.string "" ), ( "interval", E.int 3600 ) ] ] ) ] )
-                    , ( "net-socket:...", DocNew <| E.object [ ( "type", E.string "net-socket" ), ( "data", E.list identity [ E.object [ ( "url", E.string "" ) ] ] ) ] )
-                    , ( "alert:...", DocNew <| E.object [ ( "type", E.string "alert" ), ( "data", E.list identity [ E.object [ ( "code", E.string "" ), ( "to", E.string "" ), ( "interval", E.int 3600 ), ( "digest", E.bool False ) ] ] ) ] )
-                    , ( "chart:...", DocNew <| E.object [ ( "type", E.string "chart" ), ( "data", E.list identity [ E.object [ ( "source", E.string "" ), ( "kind", E.string "line" ), ( "x", E.string "" ), ( "y", E.string "" ) ] ] ) ] )
-                    , ( "dashboard:...", DocNew <| E.object [ ( "type", E.string "dashboard" ), ( "data", E.list identity [ E.object [ ( "tiles", E.list E.string [] ) ] ] ) ] )
-                    ]
-                    ++ [ H.tr [] <|
-                            H.td []
-                                [ H.label []
-                                    [ text "import csv..."
-                                    , H.input [ A.type_ "file", A.accept ".csv,text/csv", A.on "change" (D.at [ "target", "files" ] (D.index 0 File.decoder) |> D.map CsvImportFile), S.display "none" ] []
+                iif trash [] <|
+                    List.map
+                        (\( label, msg ) ->
+                            H.tr [ A.onClick msg, A.title ("new " ++ label) ] <|
+                                H.td [] [ text label ]
+                                    :: List.map (\typ -> H.td [] [ text typ ]) [ "text", "list text", "" ]
+                        )
+                        [ ( "table:...", DocNewTable )
+                        , ( "query:...", DocNewQuery )
+                        , ( "net-hook:...", DocNew <| E.object [ ( "type", E.string "net-hook" ), ( "data", E.list identity [] ) ] )
+                        , ( "net-http:...", DocNew <| E.object [ ( "type", E.string "net-http" ), ( "data", E.list identity [ E.object [ ( "url", E.string "" ), ( "interval", E.int 3600 ) ] ] ) ] )
+                        , ( "net-socket:...", DocNew <| E.object [ ( "type", E.string "net-socket" ), ( "data", E.list identity [ E.object [ ( "url", E.string "" ) ] ] ) ] )
+                        , ( "alert:...", DocNew <| E.object [ ( "type", E.string "alert" ), ( "data", E.list identity [ E.object [ ( "code", E.string "" ), ( "to", E.string "" ), ( "interval", E.int 3600 ), ( "digest", E.bool False ) ] ] ) ] )
+                        , ( "chart:...", DocNew <| E.object [ ( "type", E.string "chart" ), ( "data", E.list identity [ E.object [ ( "source", E.string "" ), ( "kind", E.string "line" ), ( "x", E.string "" ), ( "y", E.string "" ) ] ] ) ] )
+                        , ( "dashboard:...", DocNew <| E.object [ ( "type", E.string "dashboard" ), ( "data", E.list identity [ E.object [ ( "tiles", E.list E.string [] ) ] ] ) ] )
+                        ]
+                        ++ [ H.tr [] <|
+                                H.td []
+                                    [ H.label []
+                                        [ text "import csv..."
+                                        , H.input [ A.type_ "file", A.accept ".csv,text/csv", A.on "change" (D.at [ "target", "files" ] (D.index 0 File.decoder) |> D.map CsvImportFile), S.display "none" ] []
+                                        ]
                                     ]
-                                ]
-                                :: List.map (\typ -> H.td [] [ text typ ]) [ "text", "list text", "" ]
-                       ]
+                                    :: List.map (\typ -> H.td [] [ text typ ]) [ "text", "list text", "" ]
+                           ]
 
             Ok (Tab _) ->
                 [ H.tr [ A.class "totals", A.title "totals for the rows shown" ] <|
                     List.map
                         (\col ->
                             H.td ([ S.textAlignRight, S.fontWeight "600", iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) ] ++ pinAttrs pins col)
-                                [ text (Maybe.withDefault "" (Maybe.map (round2 >> String.fromFloat) (columnTotal rows col))) ]
+                                [ text (Maybe.withDefault "" (Maybe.map (formatNumber col.typ) (columnTotal rows col))) ]
                         )
                         (Array.toList cols)
                         ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [] ]
@@ -6525,7 +6772,7 @@ chartSet id field value =
     changeDoc { id = id, data = [ { action = "set", path = [ E.int 0, E.string field ], value = E.string value } ] }
 
 
-viewChartSettings : Model -> { source : String, kind : String, x : String, y : String } -> Html Msg
+viewChartSettings : Model -> { source : String, kind : ChartKind, x : String, y : String } -> Html Msg
 viewChartSettings model cfg =
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
@@ -6534,8 +6781,13 @@ viewChartSettings model cfg =
             ]
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "kind"
-            , H.select [ A.value cfg.kind, A.onInput (InputChange ChartKind) ] <|
-                List.map (\k -> H.option [ A.value k, A.selected (k == cfg.kind) ] [ text k ]) [ "line", "bar" ]
+            , H.select [ A.value (kindSpec cfg.kind).name, A.onInput (InputChange ChartKind) ] <|
+                List.map
+                    (\k ->
+                        H.option [ A.value (kindSpec k).name, A.selected (k == cfg.kind), A.title (kindSpec k).label ]
+                            [ text (kindSpec k).name ]
+                    )
+                    chartKinds
             ]
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "across"
@@ -6573,7 +6825,7 @@ chartPoints tbl =
             )
 
 
-viewChart : { source : String, kind : String, x : String, y : String } -> Table -> Html Msg
+viewChart : { source : String, kind : ChartKind, x : String, y : String } -> Table -> Html Msg
 viewChart cfg tbl =
     let
         points =
@@ -6604,6 +6856,123 @@ viewChart cfg tbl =
 
         num v =
             String.fromFloat (round2 v)
+
+        at i v =
+            String.fromFloat (plotX i) ++ "," ++ String.fromFloat (plotY v)
+
+        path =
+            points |> List.indexedMap (\i ( _, v ) -> at i v) |> String.join " "
+
+        line =
+            [ Svg.polyline [ SvgA.fill "none", SvgA.stroke "#468", SvgA.strokeWidth "2", SvgA.points path ] [] ]
+
+        -- The fill is drawn first and the line over it, so a value at the
+        -- baseline still shows its stroke instead of being covered by its own
+        -- shading.
+        area =
+            Svg.polygon
+                [ SvgA.fill "#468"
+                , SvgA.fillOpacity "0.25"
+                , SvgA.stroke "none"
+                , SvgA.points (String.join " " [ at 0 bottom, path, at (n - 1) bottom ])
+                ]
+                []
+                :: line
+
+        bars =
+            List.indexedMap
+                (\i ( _, v ) ->
+                    let
+                        w =
+                            iif (n == 0) 10 (720 / toFloat n * 0.7)
+                    in
+                    Svg.rect
+                        [ SvgA.x (String.fromFloat (60 + (toFloat i / toFloat (max 1 n)) * 720))
+                        , SvgA.y (String.fromFloat (min (plotY v) (plotY 0)))
+                        , SvgA.width (String.fromFloat w)
+                        , SvgA.height (String.fromFloat (abs (plotY v - plotY 0)))
+                        , SvgA.fill "#468"
+                        ]
+                        []
+                )
+                points
+
+        dots =
+            List.indexedMap
+                (\i ( _, v ) ->
+                    Svg.circle
+                        [ SvgA.cx (String.fromFloat (plotX i))
+                        , SvgA.cy (String.fromFloat (plotY v))
+                        , SvgA.r "4"
+                        , SvgA.fill "#468"
+                        ]
+                        []
+                )
+                points
+
+        -- Every kind but the tile shares an axis and the two end labels, so the
+        -- series is the only thing each one of them decides.
+        plotted series =
+            List.concat
+                [ [ Svg.line [ SvgA.x1 "60", SvgA.y1 (String.fromFloat (plotY bottom)), SvgA.x2 "790", SvgA.y2 (String.fromFloat (plotY bottom)), SvgA.stroke "#aaa" ] []
+                  , Svg.text_ [ SvgA.x "4", SvgA.y "24", SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (num top) ]
+                  , Svg.text_ [ SvgA.x "4", SvgA.y (String.fromFloat (plotY bottom)), SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (num bottom) ]
+                  ]
+                , series
+                , -- Only the ends are labelled: every tick would collide, and the
+                  -- rows underneath are one click away in the source sheet.
+                  [ Svg.text_ [ SvgA.x "60", SvgA.y "290", SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (points |> List.head |> Maybe.map Tuple.first |> Maybe.withDefault "") ]
+                  , Svg.text_ [ SvgA.x "790", SvgA.y "290", SvgA.fontSize "12", SvgA.fill "#666", SvgA.textAnchor "end" ] [ Svg.text (points |> List.reverse |> List.head |> Maybe.map Tuple.first |> Maybe.withDefault "") ]
+                  ]
+                ]
+
+        -- The last point is the number, the one before it is what it is compared
+        -- against, and the whole series is the sparkline beside them. A tile
+        -- reads the same two columns every other kind does, so no chart document
+        -- gains a field to hold one.
+        latest =
+            points |> List.reverse |> List.head
+
+        previous =
+            points |> List.reverse |> List.drop 1 |> List.head
+
+        -- Its own scale rather than plotX/plotY: the sparkline lives in the
+        -- right third of the same viewBox, and the value has the rest.
+        sparkAt i v =
+            String.fromFloat (iif (n < 2) 600 (430 + (toFloat i / toFloat (n - 1)) * 350))
+                ++ ","
+                ++ String.fromFloat (230 - ((v - bottom) / span) * 160)
+
+        tile =
+            case latest of
+                Nothing ->
+                    []
+
+                Just ( label, v ) ->
+                    List.concat
+                        [ [ Svg.text_ [ SvgA.x "40", SvgA.y "150", SvgA.fontSize "92", SvgA.fill "#1a1a1a" ] [ Svg.text (num v) ]
+                          , Svg.text_ [ SvgA.x "40", SvgA.y "230", SvgA.fontSize "20", SvgA.fill "#666" ] [ Svg.text label ]
+                          ]
+                        , -- No arrow colour: whether a rise is good is the
+                          -- reader's question, not this chart's, and a green
+                          -- number would answer it for them.
+                          case previous of
+                            Just ( was, before ) ->
+                                [ Svg.text_ [ SvgA.x "40", SvgA.y "200", SvgA.fontSize "26", SvgA.fill "#468" ]
+                                    [ Svg.text (iif (v < before) "▼ " "▲ " ++ num (abs (v - before)) ++ " since " ++ was) ]
+                                ]
+
+                            Nothing ->
+                                []
+                        , [ Svg.polyline
+                                [ SvgA.fill "none"
+                                , SvgA.stroke "#468"
+                                , SvgA.strokeWidth "2"
+                                , SvgA.points (points |> List.indexedMap (\i ( _, v_ ) -> sparkAt i v_) |> String.join " ")
+                                ]
+                                []
+                          ]
+                        ]
     in
     if List.isEmpty points then
         H.p [ S.paddingRem 2, S.color "#666" ]
@@ -6611,46 +6980,25 @@ viewChart cfg tbl =
 
     else
         H.div [ S.paddingRem 1, S.backgroundColor "#fff" ]
-            [ Svg.svg [ SvgA.viewBox "0 0 800 300", SvgA.width "100%", SvgA.height "300" ] <|
-                List.concat
-                    [ [ Svg.line [ SvgA.x1 "60", SvgA.y1 (String.fromFloat (plotY bottom)), SvgA.x2 "790", SvgA.y2 (String.fromFloat (plotY bottom)), SvgA.stroke "#aaa" ] []
-                      , Svg.text_ [ SvgA.x "4", SvgA.y "24", SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (num top) ]
-                      , Svg.text_ [ SvgA.x "4", SvgA.y (String.fromFloat (plotY bottom)), SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (num bottom) ]
-                      ]
-                    , case cfg.kind of
-                        "bar" ->
-                            List.indexedMap
-                                (\i ( _, v ) ->
-                                    let
-                                        w =
-                                            iif (n == 0) 10 (720 / toFloat n * 0.7)
-                                    in
-                                    Svg.rect
-                                        [ SvgA.x (String.fromFloat (60 + (toFloat i / toFloat (max 1 n)) * 720))
-                                        , SvgA.y (String.fromFloat (min (plotY v) (plotY 0)))
-                                        , SvgA.width (String.fromFloat w)
-                                        , SvgA.height (String.fromFloat (abs (plotY v - plotY 0)))
-                                        , SvgA.fill "#468"
-                                        ]
-                                        []
-                                )
-                                points
+            [ -- One svg for every kind, the tile included: downloadChart in
+              -- src/index.html clones `main svg` to make the PNG, so a kind that
+              -- drew itself in HTML would be the one that cannot be exported.
+              Svg.svg [ SvgA.viewBox "0 0 800 300", SvgA.width "100%", SvgA.height "300" ] <|
+                case cfg.kind of
+                    Line ->
+                        plotted line
 
-                        _ ->
-                            [ Svg.polyline
-                                [ SvgA.fill "none"
-                                , SvgA.stroke "#468"
-                                , SvgA.strokeWidth "2"
-                                , SvgA.points (points |> List.indexedMap (\i ( _, v ) -> String.fromFloat (plotX i) ++ "," ++ String.fromFloat (plotY v)) |> String.join " ")
-                                ]
-                                []
-                            ]
-                    , -- Only the ends are labelled: every tick would collide, and the
-                      -- rows underneath are one click away in the source sheet.
-                      [ Svg.text_ [ SvgA.x "60", SvgA.y "290", SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (points |> List.head |> Maybe.map Tuple.first |> Maybe.withDefault "") ]
-                      , Svg.text_ [ SvgA.x "790", SvgA.y "290", SvgA.fontSize "12", SvgA.fill "#666", SvgA.textAnchor "end" ] [ Svg.text (points |> List.reverse |> List.head |> Maybe.map Tuple.first |> Maybe.withDefault "") ]
-                      ]
-                    ]
+                    Bar ->
+                        plotted bars
+
+                    Area ->
+                        plotted area
+
+                    Scatter ->
+                        plotted dots
+
+                    Kpi ->
+                        tile
             ]
 
 
@@ -6740,7 +7088,7 @@ view : Model -> Browser.Document Msg
 view ({ sheet } as model) =
     let
         info =
-            model.library |> Dict.get sheet.id |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = E.null, peers = Private, seen = "" }
+            model.library |> Dict.get sheet.id |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = E.null, seen = "", trashed = False }
 
         stats =
             sheet.stats
@@ -6796,7 +7144,7 @@ view ({ sheet } as model) =
                                             Array.toList <|
                                                 Array.indexedMap (\n_ row -> viewTableRow sheet doc stats pins grab cols (n_ - 2) row) <|
                                                     Array.append (Array.repeat 3 Dict.empty) sortedRows
-                                        , viewTableFooter sheet pins cols sortedRows
+                                        , viewTableFooter model.trash sheet pins cols sortedRows
                                         ]
                                     ]
                 ]

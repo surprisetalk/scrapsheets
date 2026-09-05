@@ -12,7 +12,7 @@
 // all of them in a second. What it does not cover is the glue in
 // `src/index.html` — `runSql`, the ports, the render — which is why the pass
 // order below is kept deliberately identical to the one that file documents.
-import { assert, assertEquals } from "@std/assert";
+import { assert, assertEquals, assertThrows } from "@std/assert";
 import server from "alasql";
 import page from "./src/alasql.mjs";
 import { DATASETS, EXAMPLES } from "./src/examples.mjs";
@@ -26,8 +26,10 @@ import {
   describeRows,
   knownType,
   NUMERIC_TYPES,
+  MAX_EXTREMES,
   planQuery,
   register,
+  rewriteExtremes,
   scanRefs,
   selectTypes,
 } from "./src/sql.mjs";
@@ -261,6 +263,89 @@ Deno.test("the page engine still needs min_text(), and still has the UDFs", () =
       lo: "a",
       hi: "c",
     }, `${name}: src/sql.mjs should be registered on this engine`);
+  }
+});
+
+Deno.test("min() and max() over a text column answer, in both engines", () => {
+  const t = [
+    { key: "0", name: "code", type: "text" },
+    { key: "1", name: "population", type: "num" },
+    { key: "2", name: "region", type: "enum:north,south" },
+    { key: "3", name: "due", type: "date" },
+  ];
+  const one = { "table:t": t };
+  // `code` is text here and a number there, so nothing can say which min() the
+  // author meant. A name typed two ways is left alone.
+  const two = { "table:t": t, "table:u": [{ key: "0", name: "code", type: "num" }] };
+
+  const cases: [string, string, Record<string, { name: string; type: string }[]>][] = [
+    ["select min(code) as lo from SHEET('table:t')", "select min_text(code) as lo from SHEET('table:t')", one],
+    ["select max(c.code) from SHEET('table:t') c", "select max_text(c.code) from SHEET('table:t') c", one],
+    ["select min([code]) from SHEET('table:t')", "select min_text([code]) from SHEET('table:t')", one],
+    ["select min(region) from SHEET('table:t')", "select min_text(region) from SHEET('table:t')", one],
+    // Untouched, each for its own reason: a number the engine already compares,
+    // an expression the pass cannot resolve to a column, a window applyWindows
+    // computes itself and rewriteWindows finds by name, text inside a literal
+    // that is not a call at all, and the ambiguous name above.
+    ["select min(population) from SHEET('table:t')", "select min(population) from SHEET('table:t')", one],
+    ["select min(upper(code)) from SHEET('table:t')", "select min(upper(code)) from SHEET('table:t')", one],
+    [
+      "select min(code) over (partition by region) from SHEET('table:t')",
+      "select min(code) over (partition by region) from SHEET('table:t')",
+      one,
+    ],
+    ["select 'min(code)' as note from SHEET('table:t')", "select 'min(code)' as note from SHEET('table:t')", one],
+    ["select min(code) from SHEET('table:t')", "select min(code) from SHEET('table:t')", two],
+    // register() defines min_text and MIN_TEXT and nothing between, so the
+    // author's casing cannot ride along: `MIN(` rewritten to `MIN_text` died as
+    // a raw TypeError, which is a worse answer than the empty column was.
+    ["SELECT MIN(code) FROM SHEET('table:t')", "SELECT min_text(code) FROM SHEET('table:t')", one],
+    ["Select Max(code) From SHEET('table:t')", "Select max_text(code) From SHEET('table:t')", one],
+    // A date reaches the engine as the ISO string the document holds, so AlaSQL
+    // drops it the same way, and ISO sorts lexicographically.
+    ["select min(due) from SHEET('table:t')", "select min_text(due) from SHEET('table:t')", one],
+    // A name the query invents for itself is a number wearing a text column's
+    // name: comparing it as text answered "10" for a minimum of 9.
+    [
+      "select min(code) as m from (select population as code from SHEET('table:t')) z",
+      "select min(code) as m from (select population as code from SHEET('table:t')) z",
+      one,
+    ],
+  ];
+  for (const [code, want, colsOf] of cases) assertEquals(rewriteExtremes(code, colsOf), want);
+
+  const rows = [
+    { code: "no", population: 5, region: "north", due: "2026-03-04" },
+    { code: "dz", population: 45, region: "south", due: "2026-01-02" },
+  ];
+
+  // The bound, and the reason it is there: an unclosed call costs a scan to the
+  // end of the statement, so a body of nothing but `min(` was quadratic.
+  assertThrows(
+    () => rewriteExtremes(`select ${"min(code), ".repeat(MAX_EXTREMES + 1)}1 from SHEET('table:t')`, one),
+    Error,
+    `more than ${MAX_EXTREMES}`,
+  );
+  const started = Date.now();
+  rewriteExtremes(`select ${"min(".repeat(20_000)}code from SHEET('table:t')`, one);
+  assert(Date.now() - started < 1000, "an unbalanced call should stop the pass, not restart the scan");
+  for (const [name, engine] of engines) {
+    serveSheets(engine);
+    const scanned = scanRefs(
+      "select min(code) as lo, MAX(code) as hi, min(population) as small, min(due) as first from @table:t",
+    );
+    const plan = planQuery(scanned.sql, scanned.cells, { "table:t": rows }, one);
+    assertEquals(
+      engine(plan.sql, [{ "table:t": rows }]).data,
+      [{ lo: "dz", hi: "no", small: 5, first: "2026-01-02" }],
+      `${name}: a text min() should answer rather than drop its column`,
+    );
+
+    // The documented cost of the rewrite: an unaliased call is renamed with its
+    // column, so the answer arrives under min_text(code).
+    const plain = scanRefs("select min(code) from @table:t");
+    const bare = planQuery(plain.sql, plain.cells, { "table:t": rows }, one);
+    assertEquals(engine(bare.sql, [{ "table:t": rows }]).data, [{ "min_text(code)": "dz" }], name);
   }
 });
 

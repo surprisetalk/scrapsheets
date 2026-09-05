@@ -4056,6 +4056,30 @@ const QUERIES = {
     system: true,
     doc: { type: "chart", data: [{ source: "@query:pair-zscore", kind: "line", x: "day", y: "z" }] },
   },
+  "chart:pair-latest-z": {
+    name: "pair z-score, latest",
+    tags: ["demo", "markets", "chart"],
+    system: true,
+    doc: { type: "chart", data: [{ source: "@query:pair-zscore", kind: "kpi", x: "day", y: "z" }] },
+  },
+  "chart:ar-exposure": {
+    name: "receivable exposure, cumulative",
+    tags: ["demo", "finance", "chart"],
+    system: true,
+    doc: {
+      type: "chart",
+      data: [{ source: "@query:ar-aging", kind: "area", x: "invoice", y: "running_exposure" }],
+    },
+  },
+  "chart:cost-per-mile": {
+    name: "cost per mile by vehicle",
+    tags: ["demo", "transport", "chart"],
+    system: true,
+    doc: {
+      type: "chart",
+      data: [{ source: "@query:cost-per-mile", kind: "scatter", x: "vehicle", y: "cost_per_mile" }],
+    },
+  },
   "dashboard:budget-watch": {
     name: "budget watch",
     tags: ["demo", "government", "dashboard"],
@@ -4066,7 +4090,7 @@ const QUERIES = {
     name: "pairs desk",
     tags: ["demo", "markets", "dashboard"],
     system: true,
-    doc: { type: "dashboard", data: [{ tiles: ["@chart:pair-z", "@query:pair-zscore", "@query:asof-price"] }] },
+    doc: { type: "dashboard", data: [{ tiles: ["@chart:pair-latest-z", "@chart:pair-z", "@query:pair-zscore", "@query:asof-price"] }] },
   },
   "query:festival-season": {
     name: "festival season",

@@ -8,12 +8,6 @@ items are deleted — what shipped is described in `claude.md`. Anything below t
 
 ---
 
-## Now
-
-The next things to build, in this order.
-
----
-
 ## Query engine
 
 The single biggest gap. Most of the Demo Gallery dies here first.
@@ -68,12 +62,6 @@ The single biggest gap. Most of the Demo Gallery dies here first.
   2. It is what **Geospatial**'s nearest-neighbour item waits on, and the only reason that item is separate is the
      geodesy around it.
 
-- [ ] **`min()` over text answers.** AlaSQL compiles `min`/`max` inline over numbers and dates and drops a text value,
-      so `min(code)` returns nothing. `min_text()`/`max_text()` are the workaround and `checkResultColumns()` names the
-      case.
-  1. The real fix is upstream in AlaSQL, so decide: patch the vendored bundle, or keep the workaround forever and say so
-     in the message.
-
 ---
 
 ## Types & validation
@@ -120,11 +108,13 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
   1. Collapsible groups with subtotals over the rows on screen, the way the totals row already respects the filter.
   2. A pivot UI over the same machinery — AlaSQL's `pivot` is correct once `checkPivot()` has had its say.
 
-- [ ] **You clean a column without writing SQL.** Binning and forward-fill are done in SQL (`width_bucket()`,
-      `last_value(x) ignore nulls`); the rest are UI verbs and do not exist.
-  1. Trim, dedupe rows, split column, text-to-columns, change case, remove blanks.
-  2. Fuzzy dedupe: cluster near-duplicate rows and merge with a chosen survivor. `fuzzy` matching already ships as a
-     UDF, so this is the UI over it.
+- [ ] **You dedupe and split a column without writing SQL.** Trim, change case and drop-blank-rows ship in the column's
+      own panel, each one `DocMsg` so undo covers it. The two left are the two that are not a rewrite of one column.
+  1. Split column and text-to-columns, which make columns rather than change one, so the panel is the wrong home and
+     the column count changing is the whole difficulty.
+  2. Dedupe rows, exact and fuzzy — a whole-sheet verb, and the reason it is not in the panel yet: "Dedupe rows" under
+     column B reads as "dedupe by B", and a sheet-wide action needs a sheet-wide home first. `similarity()`,
+     `token_set_ratio()` and `soundex()` already ship as UDFs, so the fuzzy half is the UI over them.
 
 - [ ] **A very large sheet scrolls.** Every row renders.
   1. Virtualized rendering.
@@ -138,19 +128,16 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
 ## Charts & dashboards
 
-- [ ] **The chart set covers what people plot.** Line and bar ship, baseline pinned to zero, non-numeric y dropped.
-      Histogram needs no kind — `width_bucket()` bins and a bar chart draws it.
-  1. Stacked bar, area, scatter, box plot.
-  2. Dual axis and a secondary series.
-  3. Heatmap and matrix, because cohort grids and loss triangles read naturally that way.
+- [ ] **A chart can plot more than one thing.** `CHART_KINDS` ships line, bar, area, scatter and kpi, and every one of
+      them reads the one x and the one y a chart document holds. Everything left needs a second series, which is the
+      actual work: the document gains a field, `chartSql` selects it, and `chartPoints` stops being a list of pairs.
+  1. A `series` column, which is what stacked bar, heatmap and matrix all mean.
+  2. A second y with its own axis, which is what dual axis means.
+  3. Box plot, which needs five numbers per category rather than one.
 
 - [ ] **A time axis behaves like time.** The x axis is ordinal today, so a gap in the data is a gap in nothing.
   1. Date axis with real spacing, explicit gap handling, and downsampling for a long series.
   2. Annotations: mark a release, a price change, a storm on the axis.
-
-- [ ] **A single number gets its own tile.** A dashboard of one-row charts is the workaround.
-  1. A KPI tile: value, delta against a prior period, and a sparkline.
-  2. It is a `chart` kind, not a new sheet type.
 
 - [ ] **A geo column draws a map.** Nothing renders geometry.
   1. Point maps and choropleths from a geo column.
@@ -474,6 +461,18 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
   2. Branch and merge a sheet — Automerge makes this genuinely possible and nobody else can offer it.
   3. A sandbox: fake webhook deliveries and dry-run schedules.
 
+- [ ] **The suite answers in under ten seconds on a machine that is doing something else.** `deno task test` fails past
+      ten. On an idle machine it is nine, with no headroom at all, so anything else running here — another session's
+      build, another agent — tips it over and refuses a change for a reason that has nothing to do with the change.
+      `page_test.ts` is the whole critical path, and the cost is per test rather than in any one of them: each `boot`
+      builds a jsdom and evaluates the compiled Elm bundle again, ~130ms a test across ~66 of them.
+  1. Share one jsdom across the tests that only read what the page rendered, and prove the isolation that buys back is
+     not something a test depended on.
+  2. `until()` is already there for anything that waits on a real timer; the flat `settle(ms)` sleeps left are the ones
+     that prove something did **not** happen, and those cannot be shortened.
+  3. `--optimize` is not the lever — it shrinks `dist/index.js` by 3% — and `new Function` over the bundle is already
+     hoisted out of the per-test path.
+
 - [ ] **You can run it yourself.** There is no self-host path.
   1. A docker image, for the customers who cannot send data anywhere.
   2. Workspace export and import, stated loudly as a feature rather than buried.
@@ -489,9 +488,6 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
 - [ ] **Everything is reachable without a mouse or a screen.** Ctrl/⌘+K opens a palette over every sheet and every
       runnable shortcut; nothing below it is done.
   1. Full keyboard-only operation, screen reader support, contrast and focus order.
-
-- [ ] **Deleting a sheet is undoable.** It is not.
-  1. Trash and restore.
 
 ---
 

@@ -10,7 +10,7 @@
 // typed into -- and that is a real hole, not an oversight.
 import { assert, assertEquals } from "@std/assert";
 import { serveDir } from "@std/http/file-server";
-import { CANONICAL_TYPES, COLUMN_TYPES } from "./src/sql.mjs";
+import { CANONICAL_TYPES, CHART_KINDS, COLUMN_TYPES } from "./src/sql.mjs";
 
 const dir = new URL(".", import.meta.url).pathname;
 
@@ -329,6 +329,23 @@ Deno.test("the page and the engine accept exactly the same column types", async 
     new Set(Object.keys(COLUMN_TYPES).filter((type) => !(CANONICAL_TYPES as string[]).includes(type))),
     "src/Main.elm's typeAliases",
     "src/sql.mjs's aliases",
+  );
+});
+
+// A chart's kind used to be a plain string nothing checked: the decoder took
+// any of them and viewChart drew a line for everything that was not "bar", so a
+// typo was invisible. CHART_KINDS is the list now, chartSql refuses what is not
+// on it, and this is the guard that keeps the page's own table from drifting off
+// it -- the same shape as the two above.
+Deno.test("the page draws exactly the chart kinds the engine admits", async () => {
+  const elm = await Deno.readTextFile(dir + "src/Main.elm");
+  const page = elm.split("kindSpec kind =")[1]?.split("\n\n\n")[0] ?? "";
+  assert(page.includes('name = "'), "kindSpec should still name each kind in src/Main.elm");
+  same(
+    quoted(page, /name = "([^"]+)"/g),
+    new Set(CHART_KINDS as string[]),
+    "src/Main.elm's kindSpec",
+    "src/sql.mjs's CHART_KINDS",
   );
 });
 

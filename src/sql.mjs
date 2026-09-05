@@ -611,6 +611,27 @@ export const CANONICAL_TYPES = Object.keys(COLUMN_TYPES).filter((type) => !COLUM
 // "pct" happened.
 export const NUMERIC_TYPES = Object.keys(COLUMN_TYPES).filter((type) => COLUMN_TYPES[canonicalType(type)].numeric);
 
+// The column types AlaSQL's own min()/max() drop: every one whose cells reach
+// the engine as a string. Read off the JSON shape rather than listed beside
+// COLUMN_TYPES -- a second list is exactly how "pct" happened.
+//
+// `date` and `timestamp` are in. AlaSQL compares a Date, and a cell is never
+// one: nothing coerces a date column, so it arrives as the ISO string the
+// document holds, and `min(due)` -- the commonest min() a spreadsheet has --
+// dropped its column like any other text. ISO 8601 sorts lexicographically, so
+// comparing it as text is the same order, and the alternative on offer is no
+// answer at all.
+//
+// `bool` is out: its cells are not strings, and turning min(flag) into "false"
+// would be a new wrong answer in place of an old one.
+export const TEXT_TYPES = Object.keys(COLUMN_TYPES).filter((type) =>
+  COLUMN_TYPES[canonicalType(type)].json.type === "string"
+);
+
+/** A type whose values sort as text: the list above, plus the enum family, which
+ * carries its options in its name the way knownType() reads it. */
+const textType = (type) => TEXT_TYPES.includes(type) || /^enum:.+/.test(type);
+
 /** `enum:a,b` carries its own options, so it is a family rather than a name and
  * is matched by its prefix. */
 export const knownType = (type) => Object.hasOwn(COLUMN_TYPES, type) || /^enum:.+/.test(type);
@@ -770,11 +791,14 @@ export const checkResultColumns = (cols, rows, known = [], code = "") => {
     [...code.matchAll(/\bas\s+["'`[]?([A-Za-z_][A-Za-z0-9_]*)/gi)].map((m) => m[1]),
   );
   // Every min()/max() in the query, by the name its column will carry: the alias
-  // if it has one, otherwise AlaSQL's own MIN(expr) spelling.
+  // if it has one, otherwise AlaSQL's own MIN(expr) spelling. One level of
+  // nesting is allowed in the argument, because `min(upper(code))` is a dropped
+  // column too and an argument-shaped hole in this scan is a silent wrong answer
+  // wearing the guard as a disguise.
   const extremes = new Set(
-    [...code.matchAll(/\b(min|max)\s*\(\s*([^()]*?)\s*\)(?:\s+(?:as\s+)?["'`[]?([A-Za-z_][A-Za-z0-9_]*))?/gi)]
+    [...code.matchAll(/\b(min|max)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)(?:\s+(?:as\s+)?["'`[]?([A-Za-z_][A-Za-z0-9_]*))?/gi)]
       .flatMap(([, fn, arg, as]) => [
-        `${fn.toUpperCase()}(${arg})`,
+        `${fn.toUpperCase()}(${arg.trim()})`,
         ...(as && !KEYWORD.test(as) ? [as] : []),
       ]),
   );
@@ -782,10 +806,16 @@ export const checkResultColumns = (cols, rows, known = [], code = "") => {
     if (known.includes(columnid)) continue;
     // Strictly undefined, never null: `select null as x` is a real answer.
     if (!rows.every((row) => row[columnid] === undefined)) continue;
-    if (extremes.has(columnid)) {
+    // The set above reads the query's text; this reads what came back. An
+    // unaliased extreme arrives under its own call, whatever spelling AlaSQL
+    // gave it, and that shape is the one thing no other column has.
+    if (extremes.has(columnid) || /^(min|max)\s*\(/i.test(columnid)) {
       throw new Error(explain(`min() and max() cannot compare the text in "${columnid}".`, {
         Received: `"${columnid}" is empty in all ${rows.length} rows`,
-        Cause: "AlaSQL computes min() and max() over numbers and dates only, and drops a text value",
+        Cause:
+          "AlaSQL computes min() and max() over numbers and dates only, and drops a text value. rewriteExtremes() " +
+          "aims the call at min_text()/max_text() when the argument is a bare column the loaded sheets type as text, " +
+          "and this one is not: an expression, a name nothing loaded holds, or a name typed two ways",
         Fix: `use min_text() or max_text(), which compare as text`,
       }));
     }
@@ -1630,6 +1660,91 @@ export const rewriteUnpivot = (code, columnsOf) => {
   return out;
 };
 
+/** `min(x)` and `max(x)` over a text column, pointed at the two aggregates that
+ * can answer them.
+ *
+ * AlaSQL compiles min() and max() inline, restricted to numbers, bigints and
+ * dates, and turns a text value into undefined -- and the compiler never
+ * consults alasql.aggr for those two names, so a UDF cannot replace them.
+ * min_text()/max_text() are ours and compare as text; this pass aims the call at
+ * them whenever the argument is a column the loaded sheets type as text.
+ *
+ * Rewriting the call is the fix available to us. src/alasql.mjs is a minified
+ * bundle `deno task vendor` regenerates from deno.json, so a patch to the engine
+ * would not survive the next re-vendor.
+ *
+ * Only a bare column name, and only one that every sheet holding it types as
+ * text. An expression, a name nothing loaded holds, and a name typed two ways
+ * are all left alone and land on checkResultColumns()'s message, which still
+ * names min_text() as the way out.
+ *
+ * Two calls it must not touch. One inside a string literal is not a call at all,
+ * which is what the depth array says. A window is: `min(x) over (...)` is
+ * computed by applyWindows, whose comparison already handles text, and
+ * rewriteWindows finds it by the name this pass would have changed.
+ *
+ * An unaliased call is renamed with its column: `min(code)` answers under
+ * `min_text(code)` rather than `MIN(code)`. selectTypes reads the author's own
+ * text, before this pass runs, so the result type is the same either way.
+ */
+export const MAX_EXTREMES = 100;
+
+export const rewriteExtremes = (code, colsOf) => {
+  const text = new Map();
+  for (const cols of Object.values(colsOf ?? {})) {
+    for (const col of cols) {
+      const is = textType(col.type);
+      text.set(col.name, text.has(col.name) ? text.get(col.name) && is : is);
+    }
+  }
+  if (![...text.values()].some(Boolean)) return code;
+
+  // A name the query invents for itself. `select min(a) from (select n as a ...)`
+  // is a number wearing the name of somebody's text column, and comparing it as
+  // text answers "10" for a minimum of 9 -- the silent wrong answer this whole
+  // pass exists to remove, put back one level down. Scope is not something a
+  // regex can see, so an aliased name is simply not rewritten.
+  const aliased = new Set(
+    [...code.matchAll(/\bas\s+["'`[]?([A-Za-z_][A-Za-z0-9_]*)/gi)].map((m) => m[1]),
+  );
+
+  const depth = topLevel(code);
+  const edits = [];
+  const re = /\b(min|max)\s*\(/gi;
+  let seen = 0;
+  for (let m; (m = re.exec(code));) {
+    // Bounded like every other loop here, and the message carries the counter.
+    // Each unclosed call below costs a scan to the end of the statement, so
+    // without this a body of nothing but `min(` is quadratic -- 80KB took 1.5s
+    // on the machine this was written on, and BODY_CAP is 1MiB.
+    if (++seen > MAX_EXTREMES) {
+      throw new Error(explain(`This query calls min() or max() more than ${MAX_EXTREMES} times.`, {
+        Limit: `${MAX_EXTREMES} min() and max() calls in one statement`,
+        Received: `at least ${seen}`,
+        Source: "the select list of this query",
+        Fix: "split the query, or aggregate in a subquery first",
+      }));
+    }
+    const open = m.index + m[0].length - 1;
+    if (depth[open] < 0) continue;
+    const close = closeAt(code, depth, open);
+    // Unbalanced, so this is not SQL the engine will accept either. Stop rather
+    // than scan to the end for every call after it, and let the engine be the
+    // one that points at the character.
+    if (close < 0) return code;
+    if (/^\s*over\b/i.test(code.slice(close + 1))) continue;
+    const arg = bare(code.slice(open + 1, close)).replace(/^[A-Za-z_][A-Za-z0-9_]*\s*\.\s*/, "");
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(arg) || !text.get(arg) || aliased.has(arg)) continue;
+    // Lowercase whatever the author wrote: register() defines min_text and
+    // MIN_TEXT and nothing between, so `MIN(` used to be rewritten to a
+    // `MIN_text` that does not exist and died as a raw TypeError.
+    edits.push([m.index, m.index + m[1].length, `${m[1].toLowerCase()}_text`]);
+  }
+  let out = code;
+  for (const [a, b, name] of edits.sort((x, y) => y[0] - x[0])) out = out.slice(0, a) + name + out.slice(b);
+  return out;
+};
+
 // --- charts
 //
 // A chart is a sheet: a source ref, a kind, and the two columns to plot. Both
@@ -1637,16 +1752,25 @@ export const rewriteUnpivot = (code, columnsOf) => {
 // the rows the server exports are the same answer.
 
 const chartIdent = (what, value) => {
-  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(value ?? "")) return value;
+  // Typed, not coerced: /^[A-Za-z_]\w*$/.test(NaN) reads the string "NaN" and
+  // passes, which would splice a bare NaN into the select list.
+  if (typeof value === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) return value;
   throw new Error(explain(`A chart's ${what} has to be a column name.`, {
     Expected: "a plain column name, e.g. month",
-    Received: JSON.stringify(value ?? null),
+    Received: show(value),
     Source: "this chart sheet's settings",
     Fix: "pick a column from the sheet the chart reads",
   }));
 };
 
-export const chartSql = ({ source, x, y }) => {
+// Every way a chart may be drawn, and the one list of them: `kindSpec` in
+// src/Main.elm is this list on the other side of the wire, and browser_test.ts
+// fails when the two stop agreeing. None of them changes the query -- every
+// chart reads one x and one y -- but a kind nobody draws used to render as a
+// line and say nothing, so a typo survived in the document forever.
+export const CHART_KINDS = ["line", "bar", "area", "scatter", "kpi"];
+
+export const chartSql = ({ source, kind = "line", x, y }) => {
   // Only what a query can reference: the page refuses any other prefix while
   // loading, and a chart that runs on the server but not in the page is worse
   // than one that is refused in both.
@@ -1656,6 +1780,21 @@ export const chartSql = ({ source, x, y }) => {
       Received: JSON.stringify(source ?? null),
       Source: "this chart sheet's settings",
       Fix: "set the source to a table or query sheet, e.g. @query:budget-burn",
+    }));
+  }
+  // A chart that was never given a kind is a line, which is what the page's own
+  // decoder defaults to. Anything else that is not on the list is refused.
+  if (!CHART_KINDS.includes(kind)) {
+    // show(), never JSON.stringify: a chart document can hold a megabyte in that
+    // field, and stringifying it twice is a two-megabyte message in the error
+    // log. show() shortens, and says "number NaN" where JSON says "null".
+    const meant = typeof kind === "string" ? nearest(kind, CHART_KINDS) : undefined;
+    throw new Error(explain(`That is not a kind of chart.`, {
+      Expected: CHART_KINDS.join(", "),
+      Received: show(kind),
+      "Did you mean": meant,
+      Source: "this chart sheet's settings",
+      Fix: meant ? `set the kind to ${meant}` : `set the kind to one of ${CHART_KINDS.join(", ")}`,
     }));
   }
   // Ordered by the x column, so the line is drawn in the order it is read and
@@ -1705,12 +1844,16 @@ export const loadRefs = async (ids, { path, describing, fetch, onLoad, stages })
 /** Everything the engine cannot be trusted with, in the order it has to happen:
  * a cell reference needs its sheet loaded to be checked, unpivot needs its column
  * names, and a window has to be lifted out of whatever those two produce.
+ *
+ * The extremes pass reads the author's own call, so it runs before either
+ * rewrite touches the text -- and before the window pass, which would otherwise
+ * be handed a `min_text` it does not know by that name.
  */
 export const planQuery = (sql, cells, docs, colsOf) => {
   checkCells(cells, docs, colsOf);
   checkJoinRows(sql, docs);
   checkPivot(sql);
-  return rewriteWindows(rewriteUnpivot(sql, colsOf));
+  return rewriteWindows(rewriteUnpivot(rewriteExtremes(sql, colsOf), colsOf));
 };
 
 // --- registration
