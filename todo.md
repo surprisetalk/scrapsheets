@@ -237,10 +237,6 @@ The runner is in **Now**. These are what the Demo Gallery needs on top of it.
   1. Run now, pause, disable, with the next-run time on the sheet.
   2. Backfill: run a schedule over a historical date range.
 
-- [ ] **A re-run does not double-append.** Nothing is idempotent.
-  1. An idempotency key per run, the way `net_hook_signature_idx` refuses a duplicate delivery.
-  2. Partial-failure semantics: one failed source must not silently empty a downstream table.
-
 - [ ] **Sheets run in dependency order.** Each runs on its own timer, so a downstream sheet can run before its source.
   1. A DAG derived from the `@sheet` refs `scanRefs()` already returns.
   2. A cycle is refused as the path that closes it, exactly as `checkRefPath` reports one.

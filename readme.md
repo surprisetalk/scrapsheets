@@ -99,6 +99,11 @@ of each in `meta.shape`, and a run whose columns differ from the run before keep
 other failure takes, so `library:freshness` counts it and the status check pages, and the run after it is the new
 normal.
 
+A feed that answers the same body twice is one row: a good run's body is its idempotency key, in the same slot a
+delivery's signature takes, so the row it matches moves to now instead of being appended again. And a failed poll is
+in the feed's log, where you read it, but not in a query over the feed, so a sheet built downstream keeps what it had
+while `library:freshness` says why.
+
 `GET /library/freshness` names the feeds that stopped. One row per sheet whose runs are recorded — every polled feed,
 every webhook and every alert you can read: when it last ran, when it last succeeded, and how many runs since. A webhook
 nobody has delivered to in three days says so beside a poll that has been failing. It is a sheet, so

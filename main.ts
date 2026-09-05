@@ -619,6 +619,11 @@ const sheet = async (
         from: sql`from sheet_usr su inner join net n using (sheet_id)`,
         where: [
           sql`(su.sheet_id,su.usr_id) = (${sheet_id},${c.get("usr_id")})`,
+          // A query over a feed reads its good runs. The log the sheet shows
+          // keeps every run, failures first among them; a query that read the
+          // failure rows too joined on an error page and emptied whatever was
+          // built on it, silently, while freshness alone knew why.
+          ...(type === "net-http" && path_.length ? [POLL_OK()] : []),
         ],
         // Without an order the heap decides, so paging a log repeats and skips rows.
         order: sql`order by n.created_at desc, n.net_id desc`,
@@ -3175,7 +3180,21 @@ const shapeChange = (
 };
 
 const netRow = async (sheet_id: string, body: string, meta: Record<string, unknown>): Promise<void> => {
-  await sql`insert into net (sheet_id, method, body, meta) values (${sheet_id}, 'GET', ${body}, ${sql.json(meta)})`;
+  // A body this sheet already holds is not appended again. The digest of a
+  // good run's body rides `meta.sig`, the slot a delivery's signature takes,
+  // so the index that refuses a replayed delivery refuses the repeat; the row
+  // it matches moves to now, the way a 304 moves the row before it, and says
+  // it came again. A failure row carries no digest and is never a repeat.
+  const [stored] = await sql`
+    insert into net (sheet_id, method, body, meta) values (${sheet_id}, 'GET', ${body}, ${sql.json(meta)})
+    on conflict (sheet_id, (meta->>'sig')) do nothing returning net_id
+  `;
+  if (!stored) {
+    await sql`
+      update net set created_at = now(), meta = ${sql.json({ ...meta, repeated: true })}
+      where sheet_id = ${sheet_id} and meta->>'sig' = ${String(meta.sig)}
+    `;
+  }
   await trimNet(sheet_id);
   // A body that landed is a change to the feed. A failure row is the log's
   // and not the feed's: a receiver told about every failed poll would hear
@@ -3382,6 +3401,9 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       // nothing, since nothing was known.
       const shape = res.ok ? shapeOf(text) : undefined;
       const change = res.ok && was.shape ? shapeChange(was.shape, shape ?? {}) : null;
+      // The run's idempotency key: what arrived, so the same answer twice is
+      // one row however many polls asked.
+      const sig = res.ok ? await digest(text) : undefined;
       // The run beside the payload: whether a feed is slow, or 200-ing an error
       // page, is a question about the poll and not about the body it returned.
       // The validators and the watermark ride the good rows only, so the next
@@ -3390,7 +3412,7 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
         status: res.status,
         ms: Date.now() - started,
         bytes: raw.byteLength,
-        ...(res.ok ? { ...kept, shape, ...(change ? { shape_change: change } : {}) } : {}),
+        ...(res.ok ? { ...kept, sig, shape, ...(change ? { shape_change: change } : {}) } : {}),
       });
     } catch (err) {
       const message = reason(err);

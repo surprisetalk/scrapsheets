@@ -183,7 +183,11 @@ navigation, in file order:
   otherwise write the same nothing. A run's row carries `meta.shape`, the columns the body answered with and the JSON
   type of each (`shapeOf`); a run whose shape differs from the run before keeps its rows and carries
   `meta.shape_change` naming what was added, dropped and retyped (`shapeChange`), and `POLL_OK` grades it as failed,
-  once, so freshness and the status alarm hear it through the path every other failure takes.
+  once, so freshness and the status alarm hear it through the path every other failure takes. A good run's body is
+  its idempotency key: its digest rides `meta.sig`, the slot a delivery's signature takes, so `net_hook_signature_idx`
+  refuses the same body twice and `netRow` moves the row it matched to now, marked `repeated`. A query over a
+  net-http sheet reads only the runs `POLL_OK` grades (`sheet()` adds it when `path_` is non-empty); the sheet view
+  and the export keep the whole log, failures among them, so one bad poll cannot empty what is built downstream.
 - **Audit**: one log, the `audit` table, read as `library:audit`. `record()` is the one writer. HTTP reads and writes
   land through one middleware keyed on the route patterns in `AUDITED`, after the route succeeded; the sync socket
   records `open` and a first `edit` per peer per document; MCP records `mcp <tool>`; a query records `query` on every

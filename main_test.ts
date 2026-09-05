@@ -2294,9 +2294,11 @@ Deno.test(async function allTests(t) {
       await put(jwt, `/library/net-http:${blankHand.documentId}`, {});
 
       const calls: [string, Record<string, string>][] = [];
+      // A body that differs per call: the same body twice is one row moved to
+      // now, and this test counts rows to see the polls happen.
       const fetcher = (url: string, headers: Record<string, string> = {}) => {
         calls.push([url, headers]);
-        return Promise.resolve(new Response(`{"ok":true}`));
+        return Promise.resolve(new Response(`{"ok":true,"poll":${calls.length}}`));
       };
       const t0 = Date.now();
       await pollNetOnce(fetcher, t0);
@@ -5048,6 +5050,57 @@ Deno.test(async function allTests(t) {
     assertEquals(gone.meta.shape_change, { added: [], dropped: ["extra", "id", "name"], retyped: [] });
     await pollNetOnce(fetcher, at + 244_000);
     assertEquals((await newest()).meta.shape_change, undefined, "and nothing is compared against no shape");
+  });
+
+  // A host with no validators answered the same body every poll and every
+  // poll appended it. A run's body is its idempotency key, in the slot the
+  // delivery index already refuses a replay on; and a failed run is in the
+  // sheet's log and not in a query over it, so one bad poll cannot empty what
+  // is built downstream.
+  await t.step("A re-run does not double-append", async () => {
+    const { jwt } = await usr("rerun@example.com");
+    const feed = automerge.create<Sheet>({ type: "net-http", data: [{ url: "https://rerun.test/rows", interval: 60 }] });
+    const feedId = `net-http:${feed.documentId}`;
+    await put(jwt, `/library/${feedId}`, {});
+    let answer = () => new Response(`[{"n":1}]`);
+    const fetcher = (url: string) => Promise.resolve(url === "https://rerun.test/rows" ? answer() : new Response(`{}`));
+    const log = async () => (await get<Table>(jwt, `/sheet/${feedId}`)).slice(1);
+    const queried = async () => {
+      const { data: [, ...rows] }: { data: Table } = await post(jwt, `/query`, {
+        lang: "sql",
+        code: `select body from @${feedId}`,
+        args: [],
+      });
+      return rows.map((r) => String(r.body));
+    };
+    const at = Date.now() + 130_000_000;
+
+    await pollNetOnce(fetcher, at);
+    await pollNetOnce(fetcher, at + 61_000);
+    const [same] = await log();
+    assertEquals((await log()).length, 1, "the same body twice is one row");
+    const meta = JSON.parse(String(same.meta));
+    assert(meta.sig, "keyed by its digest, in the slot a delivery's signature takes");
+    assertEquals(meta.repeated, true, "and the row says it came again");
+
+    answer = () => new Response(`[{"n":2}]`);
+    await pollNetOnce(fetcher, at + 122_000);
+    assertEquals((await log()).length, 2, "a different body is a second row");
+    answer = () => new Response(`[{"n":1}]`);
+    await pollNetOnce(fetcher, at + 183_000);
+    const back = await log();
+    assertEquals(back.length, 2, "a body this sheet already holds is not a third");
+    assertEquals(String(back[0].body), `[{"n":1}]`, "the row it matches is the newest again");
+
+    // One failed poll: the log shows it, a query over the feed does not, so a
+    // sheet built downstream keeps what it had while freshness says why.
+    assertEquals(await queried(), [`[{"n":1}]`, `[{"n":2}]`]);
+    answer = () => new Response("boom", { status: 500 });
+    await pollNetOnce(fetcher, at + 244_000);
+    assertEquals((await log()).length, 3, "the failed run is in the log");
+    assertEquals(await queried(), [`[{"n":1}]`, `[{"n":2}]`], "and not in a query over the feed");
+    const mine = (await get<Table>(jwt, `/sheet/library:freshness`)).slice(1).find((r) => r.sheet_id === feedId);
+    assertEquals(Number(mine?.failures_since_ok), 1, "which is where the failure is told");
   });
 
   await t.step("The bucket a flood is counted against must be one the flood cannot choose", async () => {
