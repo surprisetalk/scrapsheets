@@ -38,7 +38,10 @@ is a shareable table, every sheet is an API.
 - `deno task build` — copy `src/*` to `dist`, then `elm make`
 - `deno task dev` — build, then serve `dist`
 - `deno task test` — the whole suite. **Not** `deno test --allow-all`: the task is the one place `JWT_SECRET`,
-  `TOKEN_SECRET` and `DSN_ENCRYPTION_KEY` are set, and `main.ts` refuses to load without all three
+  `TOKEN_SECRET` and `DSN_ENCRYPTION_KEY` are set, and `main.ts` refuses to load without all three. It builds `dist`
+  once, runs the files in parallel, and fails past ten seconds of wall time, which is the rule that the suite gets
+  fixed before a feature is added. Time one file with `deno test --allow-all <file>`, and check `top` first: a build
+  job on the same machine makes every number here a lie
 - `deno task review` — elm-review. Runs clean with zero suppressions; keep it that way
 - `deno task status` — print every graded condition from the deployed `GET /status`, exit nonzero if any is below 1.0.
   `.github/workflows/status.yml` runs it on a 15-minute cron; the failure email is the alarm
@@ -73,14 +76,16 @@ Five files. Which one a failure belongs in is usually obvious.
   destructure, `initializeWasm` and the storage stubbed, the websocket adapter genuine, `fetch` and `WebSocket`
   recorded and answered by the test — so `changeDoc`, `arrangeDoc`, `applyPatches`, `Views`, the query re-run guard,
   the share requests, CSV import, `newDoc`, fork and the socket-health report are the real ones; reach for it for
-  anything about what the glue does. `docs` hands it a synced document, which is where a write is watched: the handle
+  anything about what the glue does. Both harnesses count a settle off a mutation observer, not by serializing the
+  body per frame, which was most of what a settle cost. `docs` hands it a synced document, which is where a write is watched: the handle
   holds the test's own object. `realRepo` swaps the stub repo for automerge itself — slower, and the only way to find
   out whether a patch means the same thing to a real document as it does to a plain object. Both harnesses drive
   animation frames off the event loop rather than jsdom's ~16ms clock: a settle waits for the page to go quiet, not
   for real time, and that clock was most of this file's wall time. Anything that does wait on a real timer — the query
-  debounce, a file being read — asks `settle(ms)` for it by name. Always runs `deno task build` first. deno-dom is not
-  enough — it has no `replaceData` on a text node.
-- `browser_test.ts` — no browser: dist builds, `index.html` wires the WASM and the import map, every root-absolute asset
+  debounce, a file being read — asks `settle(ms)` for it by name. Refuses a `dist` older than `src` rather than
+  building one: `deno task test` builds once before any file runs, so the files can run in parallel without a compiler
+  racing a reader of its output. deno-dom is not enough — it has no `replaceData` on a text node.
+- `browser_test.ts` — no browser: dist is fresh, `index.html` wires the WASM and the import map, every root-absolute asset
   is in `_redirects`, every imported name is exported, nothing reaches a CDN. `index.html`'s `<script type="module">`
   body is piped to `deno lint` for real scope analysis. `BROWSER_GLOBALS` is the whole allowlist of names Deno's global
   scope lacks.
@@ -99,7 +104,8 @@ A change that breaks one of these is a bug even if the suite is green.
   string is refused before routing, every body is capped by `bodyLimit` at `BODY_CAP`, and every JSON body is read
   through `jsonBody()`, which refuses what is not one object. `cselect()` refuses a `limit` or `offset` that is not a
   count, and `docData()` refuses a claimed document with no rows. The few surviving `throw new HTTPException` are passthroughs of an `explain()` block
-  `src/sql.mjs` already built. `Received` goes through `show()`, never `JSON.stringify` — `explain()` drops an undefined
+  `src/sql.mjs` already built. The error log is written after the response and not awaited; `errorLogged()` is how a
+  test waits for it instead of sleeping. `Received` goes through `show()`, never `JSON.stringify` — `explain()` drops an undefined
   field, so a stringified `undefined` silently loses the line.
 - **No refusal is an oracle.** A signature rejection never prints the secret, the expected digest, or how close a guess
   was.

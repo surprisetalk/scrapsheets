@@ -12,18 +12,6 @@ items are deleted — what shipped is described in `claude.md`. Anything below t
 
 The next things to build, in this order.
 
-- [ ] **The suite finishes in seconds.** `deno task test` prints its wall time on the last line; it is past the ten
-      seconds after which the rule is to fix the suite before adding a feature. `main_test.ts` and `page_test.ts`
-      are the two that cost anything (`time deno test --allow-all <file>` per file says how much).
-  1. `main_test.ts`: the steps that wait on real time — the retry bound, `Retry-After`, the polite scraper, the sync
-     socket — take the clock they already take for alerts (`pollAlertOnce(send, now)`) or a zero backoff under test,
-     so a wait is an assertion about a timestamp rather than a sleep.
-  2. `page_test.ts`: every glue test that opens a query sheet pays `settle(400)` for the editor debounce; drive that
-     debounce off the same injectable frame clock the harness already uses for animation frames, so the wait is a
-     tick rather than 400ms of real time. The `realRepo` tests are the next cost, and there should be as few of them
-     as prove the patch shapes.
-  3. Then make the rule a check: `deno task test` fails past ten seconds, so the suite cannot drift back.
-
 ---
 
 ## Query engine

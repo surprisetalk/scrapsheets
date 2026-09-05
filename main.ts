@@ -1834,6 +1834,12 @@ setInterval(() => {
   flushFolds().catch((err) => console.error("fold flush:", err));
 }, RATE_LIMIT_WINDOW_MS);
 
+// The error-log writes still in flight, so a test can wait for the log rather
+// than sleep and hope: a sleep long enough on one machine is a flaky test on
+// the next. Nothing in production reads it.
+const logging = new Set<Promise<void>>();
+export const errorLogged = () => Promise.all([...logging]).then(() => {});
+
 app.onError((err, c) => {
   const known = err instanceof HTTPException;
   const res = known ? err.getResponse() : c.json({ error: "Sorry, something went wrong." }, 500);
@@ -1847,14 +1853,16 @@ app.onError((err, c) => {
   // must never replace the failure being logged -- which happens, because the
   // rate limiter throws before seed() has run, so the sheet row may not exist.
   if (res.status !== 429) {
-    logFailure(c, res.status, known ? err.message : String(err?.stack ?? err))
+    const write: Promise<void> = logFailure(c, res.status, known ? err.message : String(err?.stack ?? err))
       .then((wrote) => {
         if (wrote) logWriteFailures = 0;
       })
       .catch((logErr) => {
         logWriteFailures++;
         console.error(`error log ${ERROR_SHEET}:`, logErr);
-      });
+      })
+      .finally(() => logging.delete(write));
+    logging.add(write);
   }
   return res;
 });

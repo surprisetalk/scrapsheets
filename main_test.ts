@@ -22,6 +22,7 @@ import {
   hookBuckets,
   hookSecret,
   hookSign,
+  errorLogged,
   flushWebhooks,
   HOST_GAP_MS,
   WEBHOOK_FAILS_MAX,
@@ -444,13 +445,28 @@ Deno.test(async function allTests(t) {
       ]);
       assertEquals(vFound, "shared", "a viewer should be able to read the sheet");
 
-      // ...but the server must not persist the viewer's edit.
+      // ...but the server must not persist the viewer's edit. It answers the
+      // edit with an error frame, which the adapter logs at a debug namespace
+      // and emits nothing for; hearing it is how this knows the server has
+      // decided, rather than sleeping and hoping it has.
       const before = JSON.stringify((await automerge.find<Sheet>(hand.documentId)).doc());
       const vHandle = await vRepo.find<Sheet>(hand.documentId);
+      const refused = new Promise<string>((resolve) => {
+        const receive = vAdapter.receiveMessage.bind(vAdapter);
+        vAdapter.receiveMessage = (bytes: Uint8Array) => {
+          const frame = AM.cbor.decode(new Uint8Array(bytes)) as { type: string; message?: string };
+          if (frame.type === "error") resolve(frame.message ?? "");
+          return receive(bytes);
+        };
+      });
       vHandle.change((d: Sheet) => {
         (d.data as unknown as Record<string, unknown>[])[1] = { 0: 666 };
       });
-      await new Promise((r) => setTimeout(r, 600));
+      const said = await Promise.race([
+        refused,
+        new Promise<string>((resolve) => setTimeout(() => resolve("timed out"), 2000)),
+      ]);
+      assert(said !== "timed out", "the server should answer a viewer's edit with an error frame");
       assertEquals(
         JSON.stringify((await automerge.find<Sheet>(hand.documentId)).doc()),
         before,
@@ -484,9 +500,9 @@ Deno.test(async function allTests(t) {
         (d.data as unknown as Record<string, unknown>[])[1] = { 0: 4242 };
       });
       const written = AM.decodeHeads(eHandle.heads()!);
-      for (let i = 0; i < 50; i++) {
+      for (let i = 0; i < 500; i++) {
         if (heard.some((heads) => written.every((h) => heads.includes(h)))) break;
-        await new Promise((r) => setTimeout(r, 100));
+        await new Promise((r) => setTimeout(r, 10));
       }
       assert(
         JSON.stringify((await automerge.find<Sheet>(hand.documentId)).doc()).includes("4242"),
@@ -3779,7 +3795,7 @@ Deno.test(async function allTests(t) {
       assertEquals(res.status, 403, `a share token must be refused, not crash: ${res.status} ${said}`);
       assert(said.includes("sync socket"), `and the refusal must say where the token does work: ${said}`);
     }
-    await new Promise((r) => setTimeout(r, 100));
+    await errorLogged();
     assertEquals(await crashes(`/sheet/${sheet_id}`), 0, "a refusal the caller can fix is not the operator's failure");
   });
 
@@ -4082,7 +4098,7 @@ Deno.test(async function allTests(t) {
     // One row per (status, path) per minute. Every 4xx used to cost an insert
     // and a trimNet behind it, so refusing a request was dearer than serving
     // it -- the wrong way round for the path whose whole job is shedding load.
-    const settle = () => new Promise((res) => setTimeout(res, 100));
+    const settle = errorLogged;
     const counted = async (path: string) => {
       const [{ n }] = await sql`
         select count(*) as n from net where sheet_id = 'net-hook:errors' and meta->>'path' = ${path}
@@ -5042,11 +5058,12 @@ Deno.test(async function allTests(t) {
 
       // Delivery: the receiver hears one signed POST per flush however many
       // changes landed, verifiable with the secret GET /library/:id/hook answers.
-      // A change is heard as the save the repo makes of it, which is debounced,
-      // so a flush waits for the save first. The creation save is drained
-      // before anything is counted.
+      // A change is heard as the save the repo makes of it, which is debounced.
+      // `flush()` makes that save now, and a save with nothing new emits
+      // nothing, so the debounced one still queued behind it stays silent. The
+      // creation save is drained before anything is counted.
       const flushed = async () => {
-        await new Promise((r) => setTimeout(r, 250));
+        await automerge.flush();
         await flushWebhooks();
       };
       await flushed();
@@ -5557,7 +5574,7 @@ Deno.test(async function allTests(t) {
       on conflict (doc_id) do nothing
     `;
     await app.request("/net/net-hook:refusal-probe", { method: "POST", body: "{}" });
-    await new Promise((res) => setTimeout(res, 100));
+    await errorLogged();
     const [{ refused: refusedRows }] = await sql`
       select count(*) as refused from net
       where sheet_id = 'net-hook:errors'
@@ -5587,6 +5604,4 @@ Deno.test(async function allTests(t) {
   await sql.end();
   listener.close();
   await pglite.close();
-
-  await new Promise((res) => setTimeout(res, 250));
 });

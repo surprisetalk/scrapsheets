@@ -44,17 +44,21 @@ import { register } from "./src/sql.mjs";
 
 const dir = new URL(".", import.meta.url).pathname;
 
-// Always build rather than trusting whatever is in dist/: a stale bundle would
-// let this file pass against code that no longer exists. elm make is a no-op
-// when nothing changed, so the cost is a fraction of a second.
+// A stale dist/ would let this file pass against code that no longer exists,
+// so it is refused rather than trusted. Not built here: `deno task test`
+// builds once before any file runs, and the files then run in parallel, which
+// a compiler racing a reader of its output would make flaky.
 let built: Promise<void> | undefined;
 const ensureDist = () =>
   built ??= (async () => {
-    const { code, stderr } = await new Deno.Command(Deno.execPath(), {
-      args: ["task", "build"],
-      cwd: dir,
-    }).output();
-    assertEquals(code, 0, `deno task build failed: ${new TextDecoder().decode(stderr)}`);
+    const mtime = async (p: string) => (await Deno.stat(dir + p).catch(() => null))?.mtime?.getTime() ?? 0;
+    for await (const { name } of Deno.readDir(dir + "src")) {
+      const stale = name === "Main.elm" ? "dist/index.js" : `dist/${name}`;
+      assert(
+        (await mtime(stale)) >= (await mtime(`src/${name}`)),
+        `Expected ${stale} at least as new as src/${name}, received an older or missing one. Source: dist/ is built, not checked in. Fix: run deno task build`,
+      );
+    }
   })();
 
 // Read and compiled once. `new Function` over dist/index.js is most of what a
@@ -173,13 +177,18 @@ const boot = async (url: string, { tutorial = -1 } = {}) => {
   // says more than a timeout would.
   const QUIET_FRAMES = 3;
   const SETTLE_MAX = 24;
+  // Quiet is counted off a mutation observer rather than by serializing the
+  // body every frame: a 200-row table is 150KB of HTML, and that string was
+  // most of what a settle cost.
+  let mutations = 0;
+  new dom.window.MutationObserver(() => mutations++)
+    .observe(doc, { subtree: true, childList: true, attributes: true, characterData: true });
   const settle = () =>
     new Promise<void>((resolve) => {
-      let frames = 0, quiet = 0, last = "";
+      let frames = 0, quiet = 0, seen = mutations;
       const tick = () => {
-        const now = doc.body.innerHTML;
-        quiet = now === last ? quiet + 1 : 0;
-        last = now;
+        quiet = mutations === seen ? quiet + 1 : 0;
+        seen = mutations;
         if (quiet >= QUIET_FRAMES || ++frames >= SETTLE_MAX) return resolve();
         dom.window.requestAnimationFrame(tick);
       };
@@ -1828,13 +1837,15 @@ const glue = async (
   // count long enough for a click to go out through a port and back was half a
   // second on every assertion. `ms` is for the parts of the page that wait on a
   // real clock instead -- the query debounce, and a file being read.
+  let mutations = 0;
+  new dom.window.MutationObserver(() => mutations++)
+    .observe(doc, { subtree: true, childList: true, attributes: true, characterData: true });
   const settle = async (ms = 0) => {
     await new Promise<void>((resolve) => {
-      let frames = 0, quiet = 0, last = "";
+      let frames = 0, quiet = 0, seen = mutations;
       const tick = () => {
-        const now = doc.body.innerHTML;
-        quiet = now === last ? quiet + 1 : 0;
-        last = now;
+        quiet = mutations === seen ? quiet + 1 : 0;
+        seen = mutations;
         if (quiet >= 3 || ++frames >= 24) return resolve();
         dom.window.requestAnimationFrame(tick);
       };

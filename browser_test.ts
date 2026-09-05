@@ -14,16 +14,16 @@ import { CANONICAL_TYPES, COLUMN_TYPES } from "./src/sql.mjs";
 
 const dir = new URL(".", import.meta.url).pathname;
 
-Deno.test("build dist", async () => {
-  const { code, stdout, stderr } = await new Deno.Command(Deno.execPath(), {
-    args: ["task", "build"],
-    cwd: dir,
-    stdout: "piped",
-    stderr: "piped",
-  }).output();
-  if (code !== 0) {
-    throw new Error(
-      `deno task build failed:\n${new TextDecoder().decode(stdout)}\n${new TextDecoder().decode(stderr)}`,
+// `deno task test` builds once before any file runs, so this file only refuses
+// a dist/ older than its source: the files run in parallel, and a compiler
+// racing a reader of its output is a flaky suite.
+Deno.test("dist is at least as new as src", async () => {
+  const mtime = async (p: string) => (await Deno.stat(dir + p).catch(() => null))?.mtime?.getTime() ?? 0;
+  for await (const { name } of Deno.readDir(dir + "src")) {
+    const stale = name === "Main.elm" ? "dist/index.js" : `dist/${name}`;
+    assert(
+      (await mtime(stale)) >= (await mtime(`src/${name}`)),
+      `Expected ${stale} at least as new as src/${name}, received an older or missing one. Source: dist/ is built, not checked in. Fix: run deno task build`,
     );
   }
 });
