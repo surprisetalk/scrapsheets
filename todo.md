@@ -12,21 +12,6 @@ items are deleted — what shipped is described in `claude.md`. Anything below t
 
 The next things to build, in this order.
 
-- [ ] **A join that would not fit in memory is refused, not run.** `checkQueryRows()` caps the rows *loaded* across
-      every `@sheet`, and the engine then materializes the cross product: a five-way self-join of `@table:countries`
-      kills the Deno process with a native out-of-memory, with or without `explain`, before `MAX_QUERY_MS` or anything
-      else can speak. On the server that is every request in flight.
-  1. Reproduce first: `select count(*) from @table:countries a, @table:countries b, @table:countries c,
-     @table:countries d, @table:countries e` through `POST /query`, and watch the process die rather than answer.
-  2. Guard in `planQuery()`, so both engines share it: the product of the row counts of the sheets in the from clause
-     against one bound beside `MAX_QUERY_ROWS`. Refuse with the product, each sheet's count, and the fix: filter each
-     `@sheet` in its own query sheet first, or join on a key the engine can index — say in the message that AlaSQL
-     builds every pair before a `where` runs, which is why a keyed join pays the same refusal.
-  3. Trade-off, decided here: the guard is by from-clause row counts, not by estimating what the join keeps, because
-     the engine cannot be preempted and an estimate that is wrong once is an outage. A bundled demo that trips it is a
-     demo to rewrite as two sheets. `examples_test.ts` proves none does.
-  4. `main_test.ts`: the five-way join is a 400 naming the product, and the server answers the next request.
-
 - [ ] **The suite finishes in seconds.** `deno task test` prints its wall time on the last line; it is past the ten
       seconds after which the rule is to fix the suite before adding a feature. `main_test.ts` and `page_test.ts`
       are the two that cost anything (`time deno test --allow-all <file>` per file says how much).

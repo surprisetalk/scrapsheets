@@ -646,6 +646,30 @@ Deno.test(async function allTests(t) {
         args: [],
       });
       assertEquals(row.n, countries.doc.data.length - 1);
+
+      // A join walks the product of its inputs, and the engine cannot be
+      // stopped once it starts: a five-way self-join of this sheet used to
+      // kill the process with a native out-of-memory, every request with it.
+      // Refused before the engine, naming the product, and the server is
+      // still here to answer the next one.
+      const five = ["a", "b", "c", "d", "e"].map((alias) => `@${sheet_id} ${alias}`).join(", ");
+      const walked = await app.request(`/query`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        body: JSON.stringify({ lang: "sql", code: `select count(*) as n from ${five}`, args: [] }),
+      });
+      assertEquals(walked.status, 400);
+      const said = await walked.text();
+      const n = countries.doc.data.length - 1;
+      assert(said.includes(`${n ** 5} pairs`), said);
+      assert(said.includes(`@${sheet_id} (${n})`), said);
+      assert(said.includes("filter each large sheet"), said);
+      const { data: [, again] }: { data: Table } = await post(jwt, `/query`, {
+        lang: "sql",
+        code: `select count(*) as n from @${sheet_id}`,
+        args: [],
+      });
+      assertEquals(again.n, n, "the server answers the next request");
     }
 
     // examples_test.ts replays every bundled sheet through both engines and

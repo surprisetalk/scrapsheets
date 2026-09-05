@@ -20,17 +20,14 @@ import { sheets } from "./src/page.mjs";
 import {
   applyWindows,
   chartSql,
-  checkCells,
   checkColumnTypes,
-  checkPivot,
   checkResultColumns,
   describeRef,
   describeRows,
   knownType,
   NUMERIC_TYPES,
+  planQuery,
   register,
-  rewriteUnpivot,
-  rewriteWindows,
   scanRefs,
   selectTypes,
 } from "./src/sql.mjs";
@@ -122,9 +119,9 @@ const replay = (engine: Engine) => {
       const colsOf = Object.fromEntries(
         Object.entries(loaded).map(([ref, rows_]) => [ref, Object.keys(rows_[0] ?? {}).map((name) => ({ name }))]),
       );
-      checkCells(cells, loaded, colsOf);
-      checkPivot(sql);
-      const plan = rewriteWindows(rewriteUnpivot(sql, colsOf));
+      // The passes in the one order both hosts run them, guards included: a
+      // demo that trips MAX_JOIN_ROWS is a demo to rewrite as two sheets.
+      const plan = planQuery(sql, cells, loaded, colsOf);
       let out = engine(plan.sql, [loaded]);
       if (plan.windows.length)
         out = applyWindows(out, plan, (q: string, params: unknown[]) => engine(q, params).data);

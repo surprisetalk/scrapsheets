@@ -240,8 +240,11 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   its column says — a blank becomes `null`, a numeric string becomes its number. `selectTypes()` types a result column
   off its select item, not off its name, and `WINDOW_TYPES` says the same thing about a window: `sum` and `avg` follow
   their argument in both, so one name cannot mean two types.
-- **Guards**: `checkQueryRows()` caps rows loaded across every `@sheet`; `checkResultColumns()` turns AlaSQL's silent
-  undefined column into an error; `nearest()` backs every "did you mean".
+- **Guards**: `checkQueryRows()` caps rows loaded across every `@sheet`; `checkJoinRows()` caps the product of the
+  from clause's row counts at `MAX_JOIN_ROWS`, every occurrence counted so a self-join multiplies, because the engine
+  walks every pair before a where clause and cannot be stopped once it starts — it is the pairs walked, not the rows
+  kept, so a keyed join over big sheets pays it too; `checkResultColumns()` turns AlaSQL's silent undefined column
+  into an error; `nearest()` backs every "did you mean".
 - **AlaSQL gotchas**: a `group by` expression is evaluated against an empty row, so a UDF named there gets nothing — bin
   in a subquery first. An exception thrown from a function inside a from-clause subquery is discarded;
   `formatQueryError()` replaces the message that destroys. `min()`/`max()` drop text — use `min_text()`/`max_text()`.

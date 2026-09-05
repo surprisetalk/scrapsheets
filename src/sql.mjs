@@ -666,9 +666,19 @@ export const checkColumnTypes = (id, cols, rows) => {
 // actually prevents a runaway is the one applied before the engine starts: cap
 // the rows loaded, not the time spent. MAX_QUERY_MS bounds how long a caller
 // waits for an answer; the work itself still finishes in the background.
+//
+// Loaded rows are not the whole cost: a join walks the product of its inputs,
+// and a five-way self-join of a 200-row sheet is three hundred billion pairs
+// the engine materializes before a where clause sees one -- a native
+// out-of-memory, with every request in flight. MAX_JOIN_ROWS bounds that
+// product, counted over every occurrence in the from clause so a self-join
+// multiplies. It is the pairs walked, not the rows kept: a keyed join over big
+// sheets pays it too, and the fix is the same, filter each sheet first. The
+// bound sits above every bundled demo, which examples_test.ts proves.
 
 export const MAX_QUERY_ROWS = 200_000;
 export const MAX_QUERY_MS = 15_000;
+export const MAX_JOIN_ROWS = 10_000_000;
 
 export const checkQueryRows = (total, id) => {
   if (total <= MAX_QUERY_ROWS) return total;
@@ -677,6 +687,20 @@ export const checkQueryRows = (total, id) => {
     Limit: `${MAX_QUERY_ROWS} rows across every @sheet in one query`,
     Source: "the @sheet refs in this query",
     Fix: "filter the large sheet in its own query sheet, then reference that instead",
+  }));
+};
+
+export const checkJoinRows = (sql, docs) => {
+  // Every SHEET('id') in the scanned SQL is one from-clause occurrence; a cell
+  // ref's scalar subquery is one too, over one row, so it multiplies by one.
+  const walked = [...sql.matchAll(/SHEET\('([^']+)'\)/g)].map((m) => m[1]).filter((id) => docs[id]);
+  const product = walked.reduce((n, id) => n * docs[id].length, 1);
+  if (product <= MAX_JOIN_ROWS) return;
+  throw new Error(explain(`This query joins more rows than one run is allowed.`, {
+    Received: `${product} pairs to walk: ${walked.map((id) => `@${id} (${docs[id].length})`).join(" × ")}`,
+    Limit: `${MAX_JOIN_ROWS} pairs across the from clause of one query, counted before any where or on`,
+    Source: "the @sheet refs joined in this query",
+    Fix: "filter each large sheet in its own query sheet first, then join those",
   }));
 };
 
@@ -1684,6 +1708,7 @@ export const loadRefs = async (ids, { path, describing, fetch, onLoad, stages })
  */
 export const planQuery = (sql, cells, docs, colsOf) => {
   checkCells(cells, docs, colsOf);
+  checkJoinRows(sql, docs);
   checkPivot(sql);
   return rewriteWindows(rewriteUnpivot(sql, colsOf));
 };

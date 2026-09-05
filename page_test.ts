@@ -1414,6 +1414,19 @@ Deno.test("describe answers for a query sheet too, through the chain under it", 
   );
 });
 
+Deno.test("a join that would walk more pairs than one run is allowed is refused before the engine", async () => {
+  // Same guard as the server's, in the same pass, so the page refuses what
+  // the server refuses rather than freezing the tab on it.
+  const four = ["a", "b", "c", "d"].map((alias) => `@table:countries ${alias}`).join(", ");
+  const said = await refused(`select count(*) as n from ${four}`);
+  const n = (shelf["table:countries"] as { doc: { data: unknown[] } }).doc.data.length - 1;
+  assert(said.includes(`${n ** 4} pairs`), said);
+  assert(said.includes("filter each large sheet"), said);
+  // A self-join of two is what the demos do, and it still runs.
+  const [row] = await rowsOf(`select count(*) as n from @table:countries a, @table:countries b where a.code = b.code`);
+  assertEquals(row.n, n);
+});
+
 Deno.test("explain answers the query's profile in the page, one row per stage", async () => {
   const { columns, data } = await resolver().runSql("explain select * from @table:countries", { "": null });
   assertEquals(columns.map((c: { columnid: string }) => c.columnid), ["stage", "rows_in", "rows_out", "ms"]);
