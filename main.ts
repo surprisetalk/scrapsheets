@@ -30,6 +30,7 @@ import { PORTALS } from "./src/portals.mjs";
 import {
   applyWindows,
   chartSql,
+  CANONICAL_TYPES,
   checkColumnTypes,
   checkQueryRows,
   checkResultColumns,
@@ -1831,7 +1832,8 @@ app.onError((err, c) => {
 // case rather than beside it with `and`: Postgres does not promise to evaluate
 // `and` left to right, so a guard next to the cast is a guard the planner may
 // run second.
-const POLL_OK = () => sql`substring(n.meta->>'status' from '^[0-9]{1,9}$')::int between 200 and 299`;
+const POLL_OK = () =>
+  sql`substring(n.meta->>'status' from '^[0-9]{1,9}$')::int between 200 and 299 and n.meta->>'shape_change' is null`;
 const ALERT_OK = () =>
   sql`(case when n.body is json then n.body::jsonb end)->>'status' <> 'error'
       and ((case when n.body is json then n.body::jsonb end)->>'delivery' in ('sent', ${HELD})
@@ -2042,7 +2044,7 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
     // sender that cannot sign -- usually a rotation nobody finished.
     byAgo(`No more than ${REFUSALS_MAX} deliveries were refused in the past hour.`, (r) => r.refusals),
     now("Every failure is reaching the error log.", 1 / (1 + logWriteFailures)),
-    byAgo("Every net-http poll in the past hour returned 2xx.", (r) => r.polls_ok),
+    byAgo("Every net-http poll in the past hour returned 2xx in the shape the feed had before.", (r) => r.polls_ok),
     now(
       `Every net-http sheet that has ever polled did so in the past ${POLL_STALE_S / 3600} hours.`,
       live.polls_fresh,
@@ -3130,6 +3132,48 @@ const readBody = async (res: Response): Promise<Uint8Array> => {
 
 // Every write to this log trims behind itself, the failures included: a feed
 // that only ever fails used to grow until the first success trimmed it.
+/** The columns a body answered with, and the JSON type each carries: the keys
+ * of the objects in an array, or of the one object, in name order. A body that
+ * is not JSON, or is JSON of some other shape, has none. A key that is null
+ * everywhere is "null", which is not a type to be retyped from. */
+const shapeOf = (text: string): Record<string, string> | null => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  const objects = rows.filter((row): row is Record<string, unknown> =>
+    typeof row === "object" && row !== null && !Array.isArray(row)
+  );
+  if (!objects.length) return null;
+  const shape: Record<string, string> = {};
+  for (const row of objects) {
+    for (const [key, value] of Object.entries(row)) {
+      const type = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+      if (shape[key] === undefined || shape[key] === "null") shape[key] = type;
+    }
+  }
+  return Object.fromEntries(Object.keys(shape).sort().map((key) => [key, shape[key]]));
+};
+
+/** What one run's columns are beside the run before's, or null when nothing
+ * is: names added, names dropped, and names whose type changed. */
+const shapeChange = (
+  before: Record<string, string>,
+  after: Record<string, string>,
+): { added: string[]; dropped: string[]; retyped: string[] } | null => {
+  // Sorted, because a shape read back out of jsonb has its keys in
+  // Postgres's order, not the one it was written in.
+  const added = Object.keys(after).filter((key) => !(key in before)).sort();
+  const dropped = Object.keys(before).filter((key) => !(key in after)).sort();
+  const retyped = Object.keys(before).filter((key) =>
+    key in after && before[key] !== after[key] && before[key] !== "null" && after[key] !== "null"
+  ).sort();
+  return added.length || dropped.length || retyped.length ? { added, dropped, retyped } : null;
+};
+
 const netRow = async (sheet_id: string, body: string, meta: Record<string, unknown>): Promise<void> => {
   await sql`insert into net (sheet_id, method, body, meta) values (${sheet_id}, 'GET', ${body}, ${sql.json(meta)})`;
   await trimNet(sheet_id);
@@ -3178,7 +3222,13 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       // tick would fight those edits and mint a change for every open browser.
       const [prev]: {
         net_id: string;
-        meta: { etag?: string; last_modified?: string; cursor?: string; attempt?: number };
+        meta: {
+          etag?: string;
+          last_modified?: string;
+          cursor?: string;
+          attempt?: number;
+          shape?: Record<string, string> | null;
+        };
       }[] = await sql`
         select net_id, meta from net where sheet_id = ${sheet_id} order by net_id desc limit 1
       `;
@@ -3322,6 +3372,16 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       // Errors become log rows too: the user who typed the URL must see them, and
       // must be able to run the same request by hand.
       const body = res.ok ? text : JSON.stringify(fetchFailure(url, headers, res, text));
+      // The columns this run answered with, beside it, and against the run
+      // before: a dropped column read as a sheet of blanks and graded healthy.
+      // The rows still land -- they are what arrived -- and POLL_OK grades the
+      // run as failed on `shape_change`, so freshness and the status alarm hear
+      // it the way they hear every other failure, once: the run after compares
+      // against this one. A body that is not rows has no shape; going from rows
+      // to none dropped every column, and from none to rows is compared to
+      // nothing, since nothing was known.
+      const shape = res.ok ? shapeOf(text) : undefined;
+      const change = res.ok && was.shape ? shapeChange(was.shape, shape ?? {}) : null;
       // The run beside the payload: whether a feed is slow, or 200-ing an error
       // page, is a question about the poll and not about the body it returned.
       // The validators and the watermark ride the good rows only, so the next
@@ -3330,7 +3390,7 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
         status: res.status,
         ms: Date.now() - started,
         bytes: raw.byteLength,
-        ...(res.ok ? kept : {}),
+        ...(res.ok ? { ...kept, shape, ...(change ? { shape_change: change } : {}) } : {}),
       });
     } catch (err) {
       const message = reason(err);
@@ -4762,6 +4822,67 @@ const assertSheetEditor = async (c: Context, sheet_id: string, verb: string): Pr
   }
 };
 
+// --- pre-flight
+//
+// The first thing a new feed did was wait for the poller to fail. This is the
+// poller's own request, once, now: the same safeFetch, the same secret
+// resolution, the same body cap -- and nothing written. The answer is the
+// preview, so the sheet is saved knowing what it will get.
+const PREFLIGHT_BODY_CHARS = 2_000;
+
+app.post("/library/:id/preflight", async (c) => {
+  const sheet_id = c.req.param("id");
+  await assertSheetEditor(c, sheet_id, "test the request of");
+  const { url, headers } = await jsonBody(c);
+  if (typeof url !== "string" || !URL.canParse(url)) {
+    bad(400, `A pre-flight needs the url the sheet would fetch.`, {
+      Expected: '{"url": "https://example.com/feed.json", "headers": "X-Api-Key: {{secret:weather}}"}',
+      Received: show(url),
+      Source: `the "url" field of the request body`,
+      Fix: "put the url in the sheet's url field, then test it",
+    });
+  }
+  if (headers !== undefined && typeof headers !== "string") {
+    bad(400, `A pre-flight's headers are the sheet's header text.`, {
+      Expected: "a string, one Name: value per line",
+      Received: show(headers),
+      Source: `the "headers" field of the request body`,
+      Fix: "send the headers box as it is",
+    });
+  }
+  // What the poller would send, refused here by name where the poller would
+  // have written a failure row an hour from now.
+  const parsed = parseNetHeaders(headers ?? "");
+  const sending = await resolveSecrets(sheet_id, parsed).catch((err) => {
+    if (err instanceof HTTPException) throw err;
+    bad(400, `A header on this request cannot be built.`, {
+      Received: reason(err),
+      Expected: "every {{secret:name}} in the headers stored on this sheet",
+      Source: "the headers box, against this sheet's secrets",
+      Fix: `store the secret with POST /library/${sheet_id}/secret, or take the reference out of the headers`,
+    });
+  });
+  const host = new URL(url).hostname;
+  const started = Date.now();
+  const res = await safeFetch(url, sending).catch((err) => {
+    if (err instanceof HTTPException) throw err;
+    return reason(err);
+  });
+  // One request to the host, spaced like the poller's.
+  holdHost(host, Date.now() + HOST_GAP_MS);
+  if (typeof res === "string") return c.json({ data: fetchFailure(url, parsed, null, res) });
+  const bytes = await readBody(res);
+  return c.json({
+    data: {
+      status: res.status,
+      ms: Date.now() - started,
+      bytes: bytes.byteLength,
+      content_type: res.headers.get("content-type") ?? "",
+      body: new TextDecoder().decode(bytes).slice(0, PREFLIGHT_BODY_CHARS),
+    },
+  });
+});
+
 app.post("/library/:id/webhook", async (c) => {
   const sheet_id = c.req.param("id");
   await assertSheetEditor(c, sheet_id, "send changes from");
@@ -5113,8 +5234,56 @@ app.delete("/library/:id/secret", async (c) => {
 // CSV Import - parse CSV and create a new table sheet
 // --- import/export
 
-app.post("/import/csv", async (c) => {
-  const usr_id = c.get("usr_id");
+// --- import
+//
+// A CSV becomes a table in two steps, so the guess is seen before it is kept:
+// POST /import/preview reads the file and answers the columns with the type
+// each was inferred to carry and the first rows, and POST /import/csv reads
+// the same file again with the types the user settled on and makes the sheet.
+// Both go through readImport, so what the preview shows is what the import
+// stores. The page remembers the settled types by header, so the next file
+// with the same header opens already corrected.
+const IMPORT_PREVIEW_ROWS = 5;
+
+/** The types a caller settled on, keyed by column name, off `?types=`. */
+const importTypes = (raw: string | undefined): Record<string, string> => {
+  if (raw === undefined || raw === "") return {};
+  let types: unknown;
+  try {
+    types = JSON.parse(raw);
+  } catch (err) {
+    bad(400, `The types to import with are not JSON.`, {
+      Received: show(raw.slice(0, 80)),
+      Expected: '{"column name": "num", ...}',
+      Source: "the types query parameter",
+      Fix: `send an object keyed by column name; the parser said: ${reason(err)}`,
+    });
+  }
+  if (typeof types !== "object" || types === null || Array.isArray(types)) {
+    bad(400, `The types to import with are not an object.`, {
+      Received: show(types),
+      Expected: '{"column name": "num", ...}',
+      Source: "the types query parameter",
+      Fix: "send an object keyed by column name",
+    });
+  }
+  for (const [name, type] of Object.entries(types)) {
+    if (!CANONICAL_TYPES.includes(type as string)) {
+      bad(400, `"${name}" cannot be imported as ${show(type)}.`, {
+        Received: show(type),
+        Expected: `one of ${CANONICAL_TYPES.join(", ")}`,
+        Source: `the types query parameter, for column "${name}"`,
+        Fix: "pick a type from that list",
+      });
+    }
+  }
+  return types as Record<string, string>;
+};
+
+/** The file as the sheet it would make: a name, the columns with a type each,
+ * and the rows coerced to those types. Every refusal names the line in the
+ * file, because that is what the person who can fix it is looking at. */
+const readImport = async (c: Context, types: Record<string, string>): Promise<{ name: string; cols: Col[]; rows: Row[] }> => {
   const contentType = c.req.header("content-type") || "";
 
   let csvText: string;
@@ -5265,36 +5434,64 @@ app.post("/import/csv", async (c) => {
     });
   }
 
-  // Build column definitions
+  for (const name of Object.keys(types)) {
+    if (!headers.includes(name)) {
+      bad(400, `The types name a column the file does not have.`, {
+        Received: `"${name}"`,
+        Expected: `one of ${headers.join(", ")}`,
+        Source: "the types query parameter, against the file's header",
+        Fix: "name a column from the header, exactly as spelled",
+      });
+    }
+  }
+  // The type the caller settled on, or the guess. Every non-blank value must
+  // parse under it: a settled type the values do not fit is refused on the
+  // line that does not, not stored as NaN.
   const cols: Col[] = headers.map((name, i) => ({
     name,
-    type: inferType(dataRows.map((row) => row.fields[i] || "")) as Type,
+    type: (types[name] ?? inferType(dataRows.map((row) => row.fields[i] || ""))) as Type,
     key: String(i),
   }));
-
-  // A blank is no value, and it stays one. Number("") is 0, and a blank is in
-  // neither half of the boolean list, so the old shape stored "" in a num column
-  // and an invented false in a bool one -- a reading nobody took and a fact the
-  // file never stated. checkColumnTypes() in src/sql.mjs is the one place a
-  // blank becomes a null; an importer that disagrees with it makes the stored
-  // document and the query answer two different questions about one file. Only
-  // a text column keeps the empty string, because there it is a value.
-  const rows: Row[] = dataRows.map(({ fields }) => {
+  const numeric = new Set(NUMERIC_TYPES as string[]);
+  const rows: Row[] = dataRows.map(({ fields, line }) => {
     const obj: Row = {};
     cols.forEach((col, i) => {
       const val = fields[i] ?? "";
-      if (col.type === "text")
-        obj[col.key] = val;
-      else if (!val.trim())
-        obj[col.key] = null;
-      else if (col.type === "num")
+      const refuse = (what: string) =>
+        bad(400, `Line ${line} of the CSV does not fit the type of "${col.name}".`, {
+          Received: `${show(val)} in "${col.name}"`,
+          Expected: `${what}, because "${col.name}" is imported as ${col.type}`,
+          Source: `line ${line} of the uploaded file`,
+          Fix: `fix the value in the file, or import "${col.name}" as text`,
+        });
+      // A blank is no value and stays one, except in text, where it is one.
+      // checkColumnTypes() in src/sql.mjs is the one place a blank becomes a
+      // null; an importer that disagrees with it makes the stored document
+      // and the query answer two different questions about one file.
+      if (col.type === "text") obj[col.key] = val;
+      else if (!val.trim()) obj[col.key] = null;
+      else if (numeric.has(String(col.type))) {
+        if (isNaN(Number(val))) refuse("a number");
         obj[col.key] = Number(val);
-      else
-        obj[col.key] = ["true", "t", "1", "yes"].includes(val.toLowerCase());
+      } else if (col.type === "bool") {
+        const word = val.toLowerCase();
+        if (!["true", "false", "t", "f", "1", "0", "yes", "no"].includes(word)) refuse("true or false");
+        obj[col.key] = ["true", "t", "1", "yes"].includes(word);
+      } else obj[col.key] = val;
     });
     return obj;
   });
+  return { name: sheetName, cols, rows };
+};
 
+app.post("/import/preview", async (c) => {
+  const { name, cols, rows } = await readImport(c, importTypes(c.req.query("types")));
+  return c.json({ data: { name, cols, rows: rows.slice(0, IMPORT_PREVIEW_ROWS), count: rows.length } });
+});
+
+app.post("/import/csv", async (c) => {
+  const usr_id = c.get("usr_id");
+  const { name: sheetName, cols, rows } = await readImport(c, importTypes(c.req.query("types")));
   // Create automerge document
   const colsRow: Row<Col> = {};
   cols.forEach((col, i) => {

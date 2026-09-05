@@ -180,7 +180,10 @@ navigation, in file order:
   `SOCKET` run, so a socket nobody has watched is absent rather than "never run" forever.
 - **Polling**: `pollNetOnce` and `pollAlertOnce` on a 15-second tick; conditional requests, per-host `Retry-After`,
   bounded retries, and a `net` row per run — including quiet ones, because a healthy quiet alert and a dead timer
-  otherwise write the same nothing.
+  otherwise write the same nothing. A run's row carries `meta.shape`, the columns the body answered with and the JSON
+  type of each (`shapeOf`); a run whose shape differs from the run before keeps its rows and carries
+  `meta.shape_change` naming what was added, dropped and retyped (`shapeChange`), and `POLL_OK` grades it as failed,
+  once, so freshness and the status alarm hear it through the path every other failure takes.
 - **Audit**: one log, the `audit` table, read as `library:audit`. `record()` is the one writer. HTTP reads and writes
   land through one middleware keyed on the route patterns in `AUDITED`, after the route succeeded; the sync socket
   records `open` and a first `edit` per peer per document; MCP records `mcp <tool>`; a query records `query` on every
@@ -246,11 +249,23 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   `repo.find`. `viewGallery` reads `model.library`, so a new demo needs no code change.
 - **Cross-sheet queries in the browser**: `sheets(alasql, shelf, find)` in `src/page.mjs`. Only two things come from the
   browser and both are arguments: the library map and `repo.find`.
-- **One CSV import, whichever way the file arrives.** The footer's file input goes through Elm's `CsvImportFile` and
-  the `importCsv` port; a file dropped on the page is read by `setupDragDrop` and handed to the same `uploadCsv`. The
-  server parses it, because it is the one that registers the sheet, syncs it and infers the column types from the
-  values — and its answer carries the new `sheet_id`, which `Library.set` needs or the sheet lands where this browser
-  cannot see it. `parseCsv` in `Main.elm` is a different job: the clipboard.
+- **One CSV import, whichever way the file arrives, in two steps.** The footer's file input goes through Elm's
+  `CsvImportFile` and the `importCsv` port; a file dropped on the page is read by `setupDragDrop` and handed to the
+  same `uploadCsv`. That posts the file to `POST /import/preview`, lays the types this browser settled on for the
+  same header last time (`scrapsheets-imports`, through `rememberedTypes` in `src/page.mjs`) over the server's
+  guesses, and hands the preview to Elm on `importPreviewed`; `viewImport` shows a select per column and the first
+  rows. `ImportConfirm` sends the settled types on `importConfirm`, and the page posts the kept file to
+  `POST /import/csv?types=…`, remembers the types by header, and opens the sheet its answer names. The server parses
+  both times through `readImport`, because it is the one that registers the sheet, syncs it and coerces the values —
+  a settled type the values do not fit is refused on the line that does not. `parseCsv` in `Main.elm` is a different
+  job: the clipboard.
+- **Import**: `readImport()` is the one CSV reader; `POST /import/preview` answers its columns, types and first rows
+  without a sheet, and `POST /import/csv` makes one. `?types=` is a JSON object keyed by column name, checked
+  against `CANONICAL_TYPES` and the file's header before the file is read.
+- **Pre-flight**: the "test the request" button on a net-http sheet sends `preflight { id, url, headers }`; the page
+  posts it to `POST /library/:id/preflight`, which runs the poller's own request once and writes nothing, and the
+  answer or the refusal comes back on `preflightLoaded` by sheet id, held in `sheet.preflight` and drawn by
+  `viewPreflight`. An answer for another sheet is dropped by id.
 - **Feed health**: `library:freshness` is read by `index.html` and handed to Elm through `freshnessLoaded`. The
   `freshness` column appears only when the answer is non-empty — a blank column over a logged-out library would read as
   "nothing is wrong".

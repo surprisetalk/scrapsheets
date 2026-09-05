@@ -547,6 +547,15 @@ port docQueried : (Idd D.Value -> msg) -> Sub msg
 port docErrored : (String -> msg) -> Sub msg
 
 
+{-| The poller's request, once, now: what the sheet would fetch with what it
+would send. The answer comes back on `preflightLoaded`, named by sheet.
+-}
+port preflight : Idd { url : String, headers : String } -> Cmd msg
+
+
+port preflightLoaded : (Idd D.Value -> msg) -> Sub msg
+
+
 port signup : String -> Cmd msg
 
 
@@ -557,6 +566,17 @@ port logout : () -> Cmd msg
 
 
 port importCsv : { filename : String, content : String } -> Cmd msg
+
+
+{-| How the server reads the chosen file, with the types this browser settled
+on for this header last time laid over its guesses.
+-}
+port importPreviewed : (D.Value -> msg) -> Sub msg
+
+
+{-| The types the user settled on for the file the preview was of.
+-}
+port importConfirm : { types : List ( String, String ) } -> Cmd msg
 
 
 port authResult : (D.Value -> msg) -> Sub msg
@@ -679,6 +699,9 @@ type alias Model =
     , sheet : Sheet
     , auth : Auth
     , deleteConfirm : Maybe String
+
+    -- The file being imported, once the server has said how it reads it.
+    , importing : Maybe Importing
     , showSettings : Bool
     , share : Share
     , showShortcuts : Bool
@@ -794,6 +817,9 @@ type alias Sheet =
     , undoStack : List UndoEntry
     , redoStack : List UndoEntry
     , netStatus : Maybe String
+
+    -- What the feed's request answered when it was last tested, by sheet.
+    , preflight : Maybe (Result String Preview)
     , widths : Dict String Int
     , resizing : Maybe { key : String, startX : Int, startWidth : Int }
 
@@ -835,12 +861,79 @@ emptySheet =
     , undoStack = []
     , redoStack = []
     , netStatus = Nothing
+    , preflight = Nothing
     , lineage = Nothing
     , widths = Dict.empty
     , resizing = Nothing
     , moving = Nothing
     , storedView = emptyView
     }
+
+
+type alias Preview =
+    { status : Int
+    , ms : Int
+    , bytes : Int
+    , contentType : String
+    , body : String
+    }
+
+
+{-| A response is the preview; a failure off the wire arrives as the poller's
+own failure record, and its `error` is the whole of it.
+-}
+previewDecoder : D.Decoder (Result String Preview)
+previewDecoder =
+    D.oneOf
+        [ D.map Err (D.field "error" D.string)
+        , D.map Ok
+            (D.map5 Preview
+                (D.field "status" D.int)
+                (D.field "ms" D.int)
+                (D.field "bytes" D.int)
+                (D.field "content_type" D.string)
+                (D.field "body" D.string)
+            )
+        ]
+
+
+type alias Importing =
+    { filename : String
+    , name : String
+    , cols : List { name : String, typ : String, remembered : Bool }
+    , rows : List (List String)
+    , count : Int
+    }
+
+
+importingDecoder : D.Decoder Importing
+importingDecoder =
+    D.map5 Importing
+        (D.field "filename" D.string)
+        (D.field "name" D.string)
+        (D.field "cols"
+            (D.list
+                (D.map3 (\name typ remembered -> { name = name, typ = typ, remembered = remembered })
+                    (D.field "name" D.string)
+                    (D.field "type" D.string)
+                    (D.field "remembered" D.bool)
+                )
+            )
+        )
+        (D.field "rows" (D.list (D.map Dict.values (D.dict previewCell))))
+        (D.field "count" D.int)
+
+
+{-| A preview cell as text, whatever the server typed it as.
+-}
+previewCell : D.Decoder String
+previewCell =
+    D.oneOf
+        [ D.string
+        , D.map String.fromFloat D.float
+        , D.map (\b -> iif b "true" "false") D.bool
+        , D.null ""
+        ]
 
 
 type alias UndoEntry =
@@ -1761,6 +1854,7 @@ init flags url nav =
                     , password = ""
                     }
                 , deleteConfirm = Nothing
+                , importing = Nothing
                 , showSettings = False
                 , embed = False
                 , share = emptyShare
@@ -1825,6 +1919,8 @@ type Msg
     | DocDeleteCancel
     | SettingsClose
     | ShareLoad D.Value
+    | Preflight
+    | PreflightLoad (Idd D.Value)
     | ShareEmailChange String
     | ShareRoleChange String
     | ShareDaysChange String
@@ -1876,6 +1972,10 @@ type Msg
     | ShopFetch (Result Http.Error Table)
     | CsvImportFile File
     | CsvImportUpload String String
+    | ImportPreviewed D.Value
+    | ImportTypeChange String String
+    | ImportConfirm
+    | ImportCancel
     | AuthMsg AuthMsg
     | AuthResult D.Value
     | ClipboardCopy
@@ -1955,6 +2055,8 @@ subs model =
         , requestCopy (always ClipboardCopy)
         , queryEditorState QueryEditorUpdate
         , shareLoaded ShareLoad
+        , preflightLoaded PreflightLoad
+        , importPreviewed ImportPreviewed
         , freshnessLoaded FreshnessLoad
         , case model.sheet.resizing of
             Just _ ->
@@ -2211,6 +2313,7 @@ update msg ({ sheet, auth } as model) =
                     , undoStack = []
                     , redoStack = []
                     , netStatus = Nothing
+                    , preflight = Nothing
                     , lineage = data.data.doc |> D.decodeValue (D.field "forked_from" D.string) |> Result.toMaybe
                     , widths = stored.widths
                     , resizing = Nothing
@@ -2341,6 +2444,31 @@ update msg ({ sheet, auth } as model) =
 
         ShareLoad value ->
             updateShareLoad value model
+
+        Preflight ->
+            case sheet.doc of
+                Ok (NetHttp cfg) ->
+                    ( { model | sheet = { sheet | preflight = Nothing } }
+                    , preflight { id = sheet.id, data = { url = cfg.url, headers = cfg.headers } }
+                    )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        PreflightLoad data ->
+            if data.id /= sheet.id then
+                ( model, Cmd.none )
+
+            else
+                ( { model
+                    | sheet =
+                        { sheet
+                            | preflight =
+                                Just (D.decodeValue previewDecoder data.data |> Result.mapError D.errorToString |> Result.andThen identity)
+                        }
+                  }
+                , Cmd.none
+                )
 
         ShareEmailChange email ->
             ( { model | share = (\s -> { s | email = email }) model.share }, Cmd.none )
@@ -2491,6 +2619,42 @@ update msg ({ sheet, auth } as model) =
 
         CsvImportUpload filename content ->
             ( model, importCsv { filename = filename, content = content } )
+
+        ImportPreviewed value ->
+            case D.decodeValue importingDecoder value of
+                Ok importing ->
+                    ( { model | importing = Just importing }, Cmd.none )
+
+                Err err ->
+                    ( { model | error = "The import preview could not be read: " ++ D.errorToString err }, Cmd.none )
+
+        ImportTypeChange name typ ->
+            ( { model
+                | importing =
+                    model.importing
+                        |> Maybe.map
+                            (\imp ->
+                                { imp
+                                    | cols =
+                                        List.map (\col -> iif (col.name == name) { col | typ = typ, remembered = False } col) imp.cols
+                                }
+                            )
+              }
+            , Cmd.none
+            )
+
+        ImportConfirm ->
+            case model.importing of
+                Just imp ->
+                    ( { model | importing = Nothing }
+                    , importConfirm { types = List.map (\col -> ( col.name, col.typ )) imp.cols }
+                    )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        ImportCancel ->
+            ( { model | importing = Nothing }, Cmd.none )
 
         InputChange SheetSearch x ->
             ( { model | search = x, sheet = { sheet | table = Err "" } }
@@ -4432,6 +4596,55 @@ viewSettings show info share =
             ]
 
 
+{-| The columns the server read, the type each was guessed to carry, and the
+first rows under them, before the sheet exists. A select per column is where
+the guess is corrected; a remembered type says so beside it.
+-}
+viewImport : Maybe Importing -> Html Msg
+viewImport importing =
+    case importing of
+        Nothing ->
+            text ""
+
+        Just imp ->
+            viewModal ImportCancel
+                [ H.p [ S.marginBottom "1rem" ]
+                    [ text (imp.filename ++ ": " ++ String.fromInt imp.count ++ " rows. Correct a type before the sheet is made.") ]
+                , H.table [ A.class "import-preview", S.marginBottom "1rem" ]
+                    [ H.thead []
+                        [ H.tr [] (List.map (\col -> H.th [] [ text col.name ]) imp.cols)
+                        , H.tr []
+                            (List.map
+                                (\col ->
+                                    H.th []
+                                        [ H.select [ A.onInput (ImportTypeChange col.name), A.value col.typ, A.title ("the type of " ++ col.name) ]
+                                            (List.map
+                                                (\( spelling, _ ) -> H.option [ A.value spelling, A.selected (spelling == col.typ) ] [ text spelling ])
+                                                importTypes
+                                            )
+                                        , iif col.remembered (H.span [ S.fontSizeRem 0.75, S.color "#666" ] [ text " remembered" ]) (text "")
+                                        ]
+                                )
+                                imp.cols
+                            )
+                        ]
+                    , H.tbody [] (List.map (\row -> H.tr [] (List.map (\cell -> H.td [] [ text cell ]) row)) imp.rows)
+                    ]
+                , H.div [ S.displayFlex, S.gapRem 0.5, S.justifyContentFlexEnd ]
+                    [ H.button [ A.onClick ImportCancel, S.padding "0.5rem 1rem" ] [ text "Cancel" ]
+                    , H.button [ A.onClick ImportConfirm, S.padding "0.5rem 1rem" ] [ text "Import" ]
+                    ]
+                ]
+
+
+{-| The types a file's column may be imported as: every type a column may
+declare, less the three that are the app's own furniture and not data.
+-}
+importTypes : List ( String, Type )
+importTypes =
+    List.filter (\( spelling, _ ) -> not (List.member spelling [ "sheet_id", "form", "create" ])) columnTypes
+
+
 viewDeleteConfirm : Maybe String -> Html Msg
 viewDeleteConfirm maybeId =
     case maybeId of
@@ -6033,16 +6246,48 @@ viewNetHttp model cfg =
             [ text "headers"
             , H.textarea [ A.class "mono", A.value cfg.headers, A.placeholder "Name: value\none per line", A.onInput (InputChange NetHeaders) ] []
             ]
-        , H.p [ S.fontSizeRem 0.875, S.color "#666" ]
-            [ text <|
-                case model.sheet.table of
-                    Ok tbl ->
-                        String.fromInt (Array.length tbl.rows) ++ " payloads"
+        , H.div [ S.displayFlex, S.gapRem 0.5, S.alignItemsCenter ]
+            [ H.button [ A.class "chip", A.onClick Preflight, A.title "fetch it once, now, and show what comes back" ] [ text "test the request" ]
+            , H.span [ S.fontSizeRem 0.875, S.color "#666" ]
+                [ text <|
+                    case model.sheet.table of
+                        Ok tbl ->
+                            String.fromInt (Array.length tbl.rows) ++ " payloads"
 
-                    Err _ ->
-                        "no payloads yet"
+                        Err _ ->
+                            "no payloads yet"
+                ]
             ]
+        , viewPreflight model.sheet.preflight
         ]
+
+
+{-| What the request answered: the status, the time and the size on one line,
+then the start of the body. A failure is the poller's own sentence about it.
+-}
+viewPreflight : Maybe (Result String Preview) -> Html Msg
+viewPreflight tested =
+    case tested of
+        Nothing ->
+            text ""
+
+        Just (Err error) ->
+            H.pre [ A.class "mono preflight", S.color "#b00", S.whiteSpacePreWrap, S.fontSizeRem 0.75 ] [ text error ]
+
+        Just (Ok p) ->
+            H.pre [ A.class "mono preflight", S.whiteSpacePreWrap, S.fontSizeRem 0.75 ]
+                [ text
+                    (String.fromInt p.status
+                        ++ " · "
+                        ++ String.fromInt p.ms
+                        ++ " ms · "
+                        ++ String.fromInt p.bytes
+                        ++ " bytes · "
+                        ++ p.contentType
+                        ++ "\n"
+                        ++ p.body
+                    )
+                ]
 
 
 viewAlert : Model -> { code : String, to : String, interval : Int, digest : Bool } -> Html Msg
@@ -6434,6 +6679,7 @@ view ({ sheet } as model) =
             [ viewAuthForm model.auth
             , viewFindReplace sheet.findReplace
             , viewDeleteConfirm model.deleteConfirm
+            , viewImport model.importing
             , viewSettings model.showSettings info model.share
             , viewShortcuts model.showShortcuts
             , viewPalette model

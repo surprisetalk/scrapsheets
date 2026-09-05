@@ -32,9 +32,11 @@ import {
   httpTarget,
   httpUnparsed,
   httpUnreachable,
+  importKey,
   library,
   mergeView,
   PORTALS,
+  rememberedTypes,
   sheets,
 } from "./src/page.mjs";
 import alasql from "./src/alasql.mjs";
@@ -765,6 +767,46 @@ Deno.test("a feed offers no arrangement controls, and a listing still does", asy
   assertEquals(all("span.sort").length, 0, "and nothing to click for a sort");
 });
 
+// A feed's first poll used to be the first news of a wrong url or a missing
+// secret. The button asks for the request now, and what comes back is shown
+// where the fields are, before the sheet has to wait for the poller.
+Deno.test("a feed's request can be tested before the poller runs it", async () => {
+  const { app, all, text, click, settle } = await boot("http://localhost/");
+  const asked: { id: string; data: { url: string; headers: string } }[] = [];
+  app.ports.preflight.subscribe((ask: (typeof asked)[number]) => asked.push(ask));
+  app.ports.docSelected.send({
+    id: "net-http:feed",
+    data: {
+      doc: {
+        type: "net-http",
+        data: [{ url: "https://example.com/feed.json", interval: 3600, headers: "X-Api-Key: {{secret:weather}}" }],
+      },
+    },
+  });
+  await settle();
+
+  await click(all("button.chip").find((b) => b.textContent === "test the request"));
+  assertEquals(asked, [{ id: "net-http:feed", data: { url: "https://example.com/feed.json", headers: "X-Api-Key: {{secret:weather}}" } }]);
+
+  // An answer for another sheet is not this sheet's.
+  app.ports.preflightLoaded.send({ id: "net-http:other", data: { status: 500, ms: 1, bytes: 0, content_type: "", body: "" } });
+  await settle();
+  assertEquals(all("pre.preflight").length, 0, "another sheet's answer is not shown here");
+
+  app.ports.preflightLoaded.send({
+    id: "net-http:feed",
+    data: { status: 200, ms: 12, bytes: 11, content_type: "application/json", body: '{"ok":true}' },
+  });
+  await settle();
+  const shown = all("pre.preflight")[0]?.textContent ?? "";
+  assert(shown.includes("200 · 12 ms · 11 bytes · application/json"), `the status line: ${shown}`);
+  assert(shown.includes('{"ok":true}'), `and the body: ${shown}`);
+
+  app.ports.preflightLoaded.send({ id: "net-http:feed", data: { error: "This sheet does not hold {{secret:weather}}." } });
+  await settle();
+  assert(text().includes("does not hold {{secret:weather}}"), "a refusal is shown in the poller's own words");
+});
+
 Deno.test("a chart sheet draws one bar per row and offers both ways to save it", async () => {
   const { app, all, settle } = await boot("http://localhost/chart:burn-by-department");
   // src/index.html turns a chart's settings into SQL with the same chartSql the
@@ -980,6 +1022,20 @@ Deno.test("the library merges what is stored under what is bundled", () => {
 // of this browser's to write to at all. Both keep their arrangement here: the
 // patches folded into a partial of data[0], merged back over the document on the
 // way in.
+Deno.test("a remembered header lays its types over the server's guesses", () => {
+  const cols = [{ name: "a", type: "num" }, { name: "b", type: "text" }];
+  assertEquals(
+    rememberedTypes({ [importKey(["a", "b"])]: { a: "text" } }, cols),
+    [{ name: "a", type: "text", remembered: true }, { name: "b", type: "text", remembered: false }],
+  );
+  assertEquals(
+    rememberedTypes({ [importKey(["a"])]: { a: "text" } }, cols),
+    [{ name: "a", type: "num", remembered: false }, { name: "b", type: "text", remembered: false }],
+    "a different header is a different memory",
+  );
+  assertEquals(rememberedTypes(undefined, cols).map((c: { type: string }) => c.type), ["num", "text"], "no memory keeps the guess");
+});
+
 Deno.test("an arrangement this browser has to keep is held by column key", () => {
   type Column = Record<string, unknown>;
   const cols: Column[] = [{ key: "a", name: "a", type: "text" }, { key: "b", name: "b", type: "text", sort: "desc" }];
@@ -2075,12 +2131,22 @@ Deno.test({
 // one that registers the sheet, syncs it and infers the column types. A dropped
 // file used to be parsed in the browser and made into a sheet this browser
 // owned, so the same gesture produced two different sheets off two parsers.
+// What the server answers a preview with: the guess, and the first rows.
+const previewOf = {
+  data: {
+    name: "countries of the world",
+    cols: [{ name: "name", type: "text", key: "0" }, { name: "code", type: "num", key: "1" }],
+    rows: [{ "0": "Chile", "1": 56 }],
+    count: 1,
+  },
+};
 const imported = {
   stored: { user: { usr_id: "u1", jwt: "a-token" } },
   docs: {
     imported1: { type: "table", data: [[{ name: "name", type: "text", key: "0" }], { "0": "Chile" }] },
   },
-  respond: (url: string) => url.endsWith("/import/csv") ? { sheet_id: "table:imported1" } : { data: [] },
+  respond: (url: string) =>
+    url.endsWith("/import/preview") ? previewOf : url.includes("/import/csv") ? { sheet_id: "table:imported1" } : { data: [] },
 };
 
 Deno.test({
@@ -2091,12 +2157,32 @@ Deno.test({
     const page = await glue("http://localhost/", imported);
     await page.pickFile("countries of the world.csv", "name,code\nChile,CL\n");
 
-    const post = page.asked.find((r) => r.url.endsWith("/import/csv"));
-    assert(post, `expected the import request, got: ${JSON.stringify(page.asked.map((r) => r.url))}`);
-    assertEquals(post.method, "POST");
-    const sent = (post.body as FormData).get("file") as File;
+    // First the preview: the file goes over, and what comes back is shown
+    // before anything is made -- the guess, and a select to correct it.
+    const previewed = page.asked.find((r) => r.url.endsWith("/import/preview"));
+    assert(previewed, `expected the preview request, got: ${JSON.stringify(page.asked.map((r) => r.url))}`);
+    const sent = (previewed.body as FormData).get("file") as File;
     assertEquals(sent.name, "countries of the world.csv", "the file goes over with the name it had");
     assertEquals(await page.readFile(sent), "name,code\nChile,CL\n", "and the bytes Elm read out of it");
+    assert(page.text().includes("Correct a type before the sheet is made"), `the preview is shown: ${page.text().slice(-300)}`);
+    const selects = page.all("select");
+    assertEquals(selects.map((el) => (el as unknown as { value: string }).value), ["text", "num"], "with the guess per column");
+    assertEquals(page.asked.filter((r) => r.url.includes("/import/csv")).length, 0, "and nothing is made yet");
+
+    // Correct one, then import: the settled types ride the request, and are
+    // remembered for the next file with this header.
+    await page.type_(selects[1], "text");
+    await page.click(page.all("button").find((b) => b.textContent === "Import"));
+    const post = page.asked.find((r) => r.url.includes("/import/csv"));
+    assert(post, `expected the import request, got: ${JSON.stringify(page.asked.map((r) => r.url))}`);
+    assertEquals(post.method, "POST");
+    assertEquals(
+      JSON.parse(decodeURIComponent(post.url.split("?types=")[1])),
+      { name: "text", code: "text" },
+      "the types the user settled on go with the file",
+    );
+    assertEquals(await page.readFile((post.body as FormData).get("file")), "name,code\nChile,CL\n", "the same file");
+    assertEquals(page.stored("imports"), { "name\u0001code": { name: "text", code: "text" } }, "and are remembered by header");
 
     // The sheet is the server's, and the library is what this browser holds plus
     // what ships bundled — so it has to be told the sheet exists, or the import
@@ -2118,6 +2204,23 @@ Deno.test({
 });
 
 Deno.test({
+  name: "a file with a header seen before opens with the types settled last time",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const page = await glue("http://localhost/", {
+      ...imported,
+      stored: { ...imported.stored, imports: { "name\u0001code": { code: "text" } } },
+    });
+    await page.pickFile("more countries.csv", "name,code\nPeru,PE\n");
+    const selects = page.all("select");
+    assertEquals(selects.map((el) => (el as unknown as { value: string }).value), ["text", "text"], "the memory over the guess");
+    assert(page.text().includes("remembered"), "and it says which one was remembered");
+    page.close();
+  },
+});
+
+Deno.test({
   name: "a dropped CSV takes the same path as a chosen one",
   sanitizeOps: false,
   sanitizeResources: false,
@@ -2125,13 +2228,14 @@ Deno.test({
     const page = await glue("http://localhost/", imported);
     await page.dropFile("prices.csv", 'item,cost\n"widget, large",4.50\n');
 
-    const post = page.asked.find((r) => r.url.endsWith("/import/csv"));
+    const post = page.asked.find((r) => r.url.endsWith("/import/preview"));
     assert(
       post,
-      `a dropped file should be imported the same way, got: ${JSON.stringify(page.asked.map((r) => r.url))}`,
+      `a dropped file should be previewed the same way, got: ${JSON.stringify(page.asked.map((r) => r.url))}`,
     );
     assertEquals(await page.readFile((post.body as FormData).get("file")), 'item,cost\n"widget, large",4.50\n');
     assertEquals(page.created, [], "and nothing is parsed and made here any more");
+    await page.click(page.all("button").find((b) => b.textContent === "Import"));
     assertEquals(page.path(), "table:imported1", "the page goes to the sheet the server made");
     page.close();
   },
@@ -2145,7 +2249,7 @@ Deno.test({
     const page = await glue("http://localhost/", {
       stored: { user: { usr_id: "u1", jwt: "a-token" } },
       respond: (url) =>
-        url.endsWith("/import/csv")
+        url.endsWith("/import/preview")
           ? new Response("Expected a header row, received an empty file.", { status: 400 })
           : { data: [] },
     });

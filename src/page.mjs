@@ -393,3 +393,18 @@ export const sheets = (alasql, shelf, find) => {
     types: (id) => types.get(id),
   };
 };
+
+/** The key a CSV's header is remembered under: its column names, in order. */
+export const importKey = (names) => names.join("\u0001");
+
+/** The preview's columns with the types this browser settled on the last time
+ * it imported a file with this header, over the server's guesses. A column
+ * with no memory keeps its guess, and says which it was. */
+export const rememberedTypes = (imports, cols) => {
+  const remembered = imports?.[importKey(cols.map((col) => col.name))] ?? {};
+  return cols.map((col) => ({
+    name: col.name,
+    type: remembered[col.name] ?? col.type,
+    remembered: col.name in remembered,
+  }));
+};

@@ -95,15 +95,6 @@ The single biggest gap. Most of the Demo Gallery dies here first.
   3. A refused row lands in a dead-letter sheet with the reason, rather than being dropped — inspectable, requeueable,
      and the same sheet the action queue uses.
 
-- [ ] **You see the type guess and correct it.** Import infers silently and there is no way back.
-  1. Show the inferred type per column on the import preview.
-  2. Let the user override before the sheet is created; remember the mapping for the next file with the same header.
-
-- [ ] **You are told when an upstream feed changes shape.** A dropped column reads as a sheet of blanks.
-  1. Record each feed's column set per run in `net.meta`.
-  2. A run whose set differs from the last is a failure row naming the added, dropped and retyped columns.
-  3. It is the same alert path everything else uses, not a new one.
-
 - [ ] **A column can be an expression over its own row.** Every derived value is a whole query sheet today.
   1. A computed column on a table sheet, evaluated by the same engine the query sheets use.
   2. Column-level defaults and generated values ride the same field: created-at, row hash, sequence.
@@ -187,9 +178,6 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
   1. Pagination: page, offset, cursor and Link-header, each with a stop condition, and the page count bounded so a feed
      that never says "last" is a failure row rather than a loop.
   2. Write mode per sheet: append, replace, or upsert by key. Append is what every net sheet does today.
-
-- [ ] **You test the request before you save it.** The first thing a new sheet does is wait an hour to fail.
-  1. A pre-flight button: fetch once, show the parsed preview, then save.
 
 ---
 

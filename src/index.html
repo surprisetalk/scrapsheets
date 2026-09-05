@@ -39,8 +39,10 @@
         httpTarget,
         httpUnparsed,
         httpUnreachable,
+        importKey,
         library,
         mergeView,
+        rememberedTypes,
         PARSERS,
         sheets,
       } from "/page.mjs";
@@ -217,6 +219,7 @@
 
         app.ports.deleteDoc.subscribe(catchy((id) => Library.delete(id), 'deleteDoc'));
 
+
         // Through `catchy` so that `Stored.set`'s refusal reaches the page: a
         // full browser store threw into an unhandled port subscriber, and the
         // library stopped saving without a word.
@@ -370,6 +373,25 @@
           // that was renamed away looked exactly like a field that was never
           // sent, so the one thing this payload cannot report is the one thing
           // it most needs to.
+          // The feed's request, once, now. Answered by sheet, so a test started
+          // on one sheet cannot land on another opened while it was in flight.
+          app.ports.preflight.subscribe(catchy(async ({ id, data: { url, headers } }) => {
+            const token = getAuthToken();
+            if (!token) return app.ports.docErrored.send("Log in to test a request.");
+            const res = await fetch(`${API_BASE}/library/${id}/preflight`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+              body: JSON.stringify({ url, headers }),
+            });
+            if (!res.ok) {
+              const error = httpErrorDetail(await res.text(), res.headers.get("Content-Type") ?? "") ||
+                `The test failed (${res.status}).`;
+              return app.ports.preflightLoaded.send({ id, data: { error } });
+            }
+            const { data } = await res.json();
+            app.ports.preflightLoaded.send({ id, data });
+          }, 'preflight'));
+
           app.ports.shareAction.subscribe(catchy(async ({ id, action, email, role, public: isPublic, days, password }) => {
             const token = getAuthToken();
             if (!token) {
@@ -1154,16 +1176,22 @@
           // sent here too. The server is the one that parses it, because it is
           // the one that registers the sheet, syncs it and infers the column
           // types from the values.
-          async function uploadCsv(filename, content) {
-            debug.log('importCsv:', filename);
+          // A file is imported in two steps. The first asks the server how it
+          // reads the file -- the columns, the type each was guessed to carry,
+          // the first rows -- and shows that, with the types this browser
+          // settled on for this header last time laid over the guesses. The
+          // second, once the user has corrected what they will, asks for the
+          // sheet with those types. The file is kept here between the two.
+          let pendingImport = null;
+          const postCsv = async (path, filename, content) => {
             const token = getAuthToken();
             if (!token) {
               app.ports.docErrored.send('Please log in to import CSV files.');
-              return;
+              return null;
             }
             const formData = new FormData();
             formData.append('file', new File([content], filename, { type: 'text/csv' }));
-            const res = await fetch(`${API_BASE}/import/csv`, {
+            const res = await fetch(`${API_BASE}${path}`, {
               method: 'POST',
               headers: { 'Authorization': `Bearer ${token}` },
               body: formData,
@@ -1174,25 +1202,63 @@
                   httpErrorDetail(await res.text(), res.headers.get("Content-Type") ?? "") || res.statusText
                 }`,
               );
-              return;
+              return null;
             }
-            // The sheet is the server's, so this browser has to be told it exists
-            // before it can show it: the library is what localStorage holds plus
-            // what ships bundled, and nothing here reads the server's list.
-            const { sheet_id } = await res.json();
-            if (!sheet_id) {
-              throw new Error(
-                `Expected the imported sheet's id, received an answer without one from POST /import/csv. ` +
-                  `Source: importing ${filename}. The sheet may exist on the server; reload to look for it.`,
-              );
-            }
-            Library.set(sheet_id, { name: filename.replace(/\.csv$/i, ""), tags: [] });
-            window.history.pushState({}, "", `/${sheet_id}`);
-            await changeId(sheet_id);
+            return await res.json();
+          };
+          async function uploadCsv(filename, content) {
+            debug.log('importCsv:', filename);
+            const answer = await postCsv("/import/preview", filename, content);
+            if (!answer) return;
+            const { data } = answer;
+            pendingImport = { filename, content, names: data.cols.map((col) => col.name) };
+            app.ports.importPreviewed.send({
+              filename,
+              name: data.name,
+              cols: rememberedTypes(Stored.get("imports"), data.cols),
+              rows: data.rows,
+              count: data.count,
+            });
           }
 
           app.ports.importCsv.subscribe(
             catchy(({ filename, content }) => uploadCsv(filename, content), 'importCsv'),
+          );
+
+          app.ports.importConfirm.subscribe(
+            catchy(async ({ types }) => {
+              if (!pendingImport) {
+                throw new Error(
+                  `Expected the file the preview was of, received none. Source: importConfirm. ` +
+                    `Choose the file again.`,
+                );
+              }
+              const { filename, content, names } = pendingImport;
+              const settled = Object.fromEntries(types);
+              const answer = await postCsv(
+                `/import/csv?types=${encodeURIComponent(JSON.stringify(settled))}`,
+                filename,
+                content,
+              );
+              if (!answer) return;
+              pendingImport = null;
+              // Remembered by header, so the next file shaped like this one opens
+              // already corrected. Before the store, so a full one is told here.
+              Stored.set("imports", { ...Stored.get("imports"), [importKey(names)]: settled });
+              // The sheet is the server's, so this browser has to be told it exists
+              // before it can show it: the library is what localStorage holds plus
+              // what ships bundled, and nothing here reads the server's list.
+              const { sheet_id } = answer;
+              if (!sheet_id) {
+                throw new Error(
+                  `Expected the imported sheet's id, received an answer without one from POST /import/csv. ` +
+                    `Source: importing ${filename}. The sheet may exist on the server; reload to look for it.`,
+                );
+              }
+              Library.set(sheet_id, { name: filename.replace(/\.csv$/i, ""), tags: [] });
+              window.history.pushState({}, "", `/${sheet_id}`);
+              await changeId(sheet_id);
+            }, 'importConfirm'),
           );
 
           // Restore a logged-in session from a previous visit so the UI shows LoggedIn on load.

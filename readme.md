@@ -40,7 +40,10 @@ curl -X POST "https://api.sheets.scrap.land$path" -H 'Content-Type: application/
 
 A net-http sheet reads a key from there too: write `X-Api-Key: {{secret:weather}}` in its headers and the value is
 resolved at fetch time, so the document holds the reference and never the token. Rotating the secret needs no edit to
-the sheet.
+the sheet. "Test the request" on the sheet runs the poller's request once, now, with the same fetch, the same secret
+resolution and the same body cap, and shows the status, the time, the size and the start of the body, or the refusal
+by name, before the sheet has to wait for the poller to find out. `POST /library/<sheet_id>/preflight` with
+`{"url": "...", "headers": "..."}` is the same thing over HTTP, and it writes nothing.
 
 A sheet can hold its own secrets instead. `POST /library/<sheet_id>/secret` with `{"name":"hook","value":"..."}` sets
 the signing key; writing it again rotates it, and the one before still verifies until a third write retires it. `GET`
@@ -77,11 +80,24 @@ budget. `GET` lists each url with its last outcome, for owners and editors, sinc
 credential; a receiver that fails ten times in a row is left alone until you set it again with the same `POST`, and
 `DELETE` with the url stops it.
 
+A CSV is imported in two steps. Choosing or dropping a file asks the server how it reads it, and what comes back is
+shown before anything is made: each column with the type it was guessed to carry, the first rows under them, and a
+select per column to correct a guess. The sheet is made with the types you settled on, and a settled type the values
+do not fit is refused on the line that does not fit it. The types are remembered by header in this browser, so the
+next file shaped the same opens already corrected. `POST /import/preview` and `POST /import/csv?types={"col":"num"}`
+are the two steps over HTTP.
+
 `GET /sheet/library:audit` is who did what to which sheet: every read and write of a sheet over HTTP, every sheet a
 query selects from, every open and first edit over the sync socket, and every MCP tool call, with `via` saying which
 door. A webhook delivery is not in it, because it is already its own row on that sheet's log. An owner or editor reads every row about
 their sheet; everybody reads the rows they made. It is a sheet, so `select * from @library:audit` and
 `/export/library:audit.csv` both work, and a refused request is not in it because it did nothing.
+
+A feed that changes shape is a failed run, once: every poll records the columns the body answered with and the type
+of each in `meta.shape`, and a run whose columns differ from the run before keeps its rows and carries
+`meta.shape_change` naming the columns added, dropped and retyped. It grades as a failure through the same path every
+other failure takes, so `library:freshness` counts it and the status check pages, and the run after it is the new
+normal.
 
 `GET /library/freshness` names the feeds that stopped. One row per sheet whose runs are recorded — every polled feed,
 every webhook and every alert you can read: when it last ran, when it last succeeded, and how many runs since. A webhook

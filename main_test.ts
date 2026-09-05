@@ -4886,6 +4886,170 @@ Deno.test(async function allTests(t) {
     }
   });
 
+  // The first thing a new feed did was wait for the poller to fail. A
+  // pre-flight is the poller's request, once, now, and nothing is written.
+  await t.step("You test the request before you save it", async () => {
+    const { jwt } = await usr("pilot@example.com");
+    const { jwt: viewer } = await usr("copilot@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "http://93.184.216.34/feed", interval: 3600, headers: "X-Api-Key: {{secret:weather}}" }],
+    });
+    const sheet_id = `net-http:${hand.documentId}`;
+    await put(jwt, `/library/${sheet_id}`, {});
+    await post(jwt, `/library/${sheet_id}/share`, { email: "copilot@example.com", role: "viewer" });
+    const test = (body: unknown, who = jwt) =>
+      app.request(`/library/${sheet_id}/preflight`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${who}` }),
+        body: JSON.stringify(body),
+      });
+    const asked: { url: string; headers: Record<string, string> }[] = [];
+    let answer: () => Response | Promise<Response> = () =>
+      new Response(`{"ok":true}`, { status: 200, headers: { "content-type": "application/json" } });
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = ((url: string, init?: RequestInit) => {
+      asked.push({ url, headers: Object.fromEntries(new Headers(init?.headers).entries()) });
+      return Promise.resolve(answer());
+    }) as typeof fetch;
+    try {
+      const request = { url: "http://93.184.216.34/feed", headers: "X-Api-Key: {{secret:weather}}" };
+      assertEquals((await test(request, viewer)).status, 403, "a viewer may not run the sheet's request");
+      assertEquals((await test({})).status, 400, "a pre-flight needs a url");
+      const inside = await test({ url: "http://127.0.0.1:9/feed" });
+      assertEquals(inside.status, 400, "a url inside our network is refused by name");
+      assert((await inside.text()).includes("own network"));
+      // A header naming a secret the sheet does not hold is refused now, where
+      // the poller would have written a failure row an hour from now.
+      const missing = await test(request);
+      assertEquals(missing.status, 400);
+      assert((await missing.text()).includes("{{secret:weather}}"), "naming the reference");
+      assertEquals(asked.length, 0, "and nothing was sent");
+
+      await post(jwt, `/library/${sheet_id}/secret`, { name: "weather", value: "sk-test" });
+      const { data: got }: { data: { status: number; ms: number; bytes: number; content_type: string; body: string } } =
+        await (await test(request)).json();
+      assertEquals([got.status, got.bytes, got.content_type, got.body], [200, 11, "application/json", `{"ok":true}`]);
+      assert(Number.isInteger(got.ms) && got.ms >= 0, `ms is a number: ${got.ms}`);
+      assertEquals(asked.at(-1)?.headers["x-api-key"], "sk-test", "with the secret resolved");
+      assertEquals(asked.at(-1)?.url, "http://93.184.216.34/feed");
+
+      // What the host answered, whatever it answered, and a wire failure as
+      // the poller's own failure record.
+      answer = () => new Response("gone", { status: 404 });
+      const { data: gone }: { data: { status: number; body: string } } = await (await test(request)).json();
+      assertEquals([gone.status, gone.body], [404, "gone"]);
+      answer = () => Promise.reject(new Error("connection reset"));
+      const { data: failed }: { data: { error: string; status: number | null } } = await (await test(request)).json();
+      assertEquals(failed.status, null);
+      assert(failed.error.includes("connection reset"), `the failure is the poller's record: ${failed.error}`);
+
+      const [{ n }] = await sql`select count(*)::int as n from net where sheet_id = ${sheet_id}`;
+      assertEquals(n, 0, "a pre-flight writes nothing");
+    } finally {
+      globalThis.fetch = origFetch;
+      hostDue.delete("93.184.216.34");
+    }
+  });
+
+  // Import inferred silently and there was no way back. Now the guess is
+  // shown first, the user settles the types, and the sheet is made with those.
+  await t.step("You see the type guess and correct it", async () => {
+    const { jwt } = await usr("guesser@example.com");
+    const csv = "n,flag,label\n1,true,a\n2,false,b\n";
+    const send = (path: string, body = csv) =>
+      app.request(path, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "text/csv", Authorization: `Bearer ${jwt}` }),
+        body,
+      });
+    const sheets = async () => (await sql`select count(*)::int as n from sheet where created_by = (select usr_id from usr where email = 'guesser@example.com')`)[0].n;
+
+    // The preview: every column with the type it was guessed to carry, the
+    // first rows under them, and no sheet.
+    const preview = await send("/import/preview");
+    assertEquals(preview.status, 200);
+    const { data: seen } = await preview.json();
+    assertEquals(seen.cols.map((c: { name: string; type: string }) => `${c.name}:${c.type}`), ["n:num", "flag:bool", "label:text"]);
+    assertEquals(seen.rows, [{ "0": 1, "1": true, "2": "a" }, { "0": 2, "1": false, "2": "b" }]);
+    assertEquals(seen.count, 2);
+    assertEquals(await sheets(), 0, "a preview makes no sheet");
+
+    // A settled type overrides the guess, and the sheet is made with it.
+    const types = (t: unknown) => `?types=${encodeURIComponent(JSON.stringify(t))}`;
+    const made = await send("/import/csv" + types({ n: "text" }));
+    const madeText = await made.text();
+    assertEquals(made.status, 201, madeText);
+    const { sheet_id } = JSON.parse(madeText);
+    const [cols, first] = await get<Table>(jwt, `/sheet/${sheet_id}`);
+    assertEquals((cols as Record<string, { type: string }>)["0"]?.type ?? Object.values(cols)[0], "text");
+    assertEquals(first.n, "1", "the value is kept as the text the file had");
+
+    // A settled type the values do not fit is refused on the line that does
+    // not, and the types themselves are checked before the file is read.
+    const unfit = await send("/import/csv" + types({ label: "num" }));
+    assertEquals(unfit.status, 400);
+    const said = await unfit.text();
+    assert(said.includes("Line 2") && said.includes('"label"'), `the refusal names the line and the column: ${said}`);
+    assertEquals((await send("/import/csv" + types({ n: "nope" }))).status, 400, "an unknown type is refused");
+    assertEquals((await send("/import/csv" + types({ ghost: "num" }))).status, 400, "a column the file lacks is refused");
+    assertEquals((await send("/import/csv?types=not-json")).status, 400, "types that are not JSON are refused");
+    assertEquals(await sheets(), 1, "and none of those made a sheet");
+  });
+
+  // A feed that drops a column read as a sheet of blanks and graded as
+  // healthy. The columns a run answered with are recorded beside it, and a run
+  // whose columns differ from the run before is a failed run naming the
+  // difference -- through POLL_OK, so freshness and the status alarm hear it
+  // the way they hear every other failure.
+  await t.step("You are told when an upstream feed changes shape", async () => {
+    const { jwt } = await usr("shapes@example.com");
+    const feed = automerge.create<Sheet>({ type: "net-http", data: [{ url: "https://shaped.test/rows", interval: 60 }] });
+    const feedId = `net-http:${feed.documentId}`;
+    await put(jwt, `/library/${feedId}`, {});
+    let answer = `[{"id":1,"name":"a"}]`;
+    const fetcher = (url: string) =>
+      Promise.resolve(url === "https://shaped.test/rows" ? new Response(answer) : new Response(`{}`));
+    const newest = async () => {
+      const [row]: { body: string; meta: Record<string, unknown> }[] = await sql`
+        select body, meta from net where sheet_id = ${feedId} order by net_id desc limit 1
+      `;
+      return row;
+    };
+    const failures = async () =>
+      Number((await get<Table>(jwt, `/sheet/library:freshness`)).slice(1).find((r) => r.sheet_id === feedId)?.failures_since_ok);
+    const at = Date.now() + 110_000_000;
+
+    await pollNetOnce(fetcher, at);
+    assertEquals((await newest()).meta.shape, { id: "number", name: "string" }, "the columns a run answered with ride its row");
+    assertEquals(await failures(), 0);
+
+    // A column added, one retyped: the data lands, and the run is a failure
+    // naming what changed.
+    answer = `[{"id":"1","name":"a","extra":true},{"id":"2","name":null}]`;
+    await pollNetOnce(fetcher, at + 61_000);
+    const changed = await newest();
+    assertEquals(changed.body, answer, "the rows that arrived are kept");
+    assertEquals(changed.meta.shape, { extra: "boolean", id: "string", name: "string" });
+    assertEquals(changed.meta.shape_change, { added: ["extra"], dropped: [], retyped: ["id"] }, "and the row names the change");
+    assertEquals(await failures(), 1, "which freshness counts as a failed run");
+    assert((await status())["Every net-http poll in the past hour returned 2xx in the shape the feed had before."]["0"] < 1);
+
+    // The same shape again is the new normal.
+    await pollNetOnce(fetcher, at + 122_000);
+    assertEquals((await newest()).meta.shape_change, undefined, "the run after is not a change");
+    assertEquals(await failures(), 0);
+
+    // A feed that stops answering rows at all dropped every column, once.
+    answer = "<html>maintenance</html>";
+    await pollNetOnce(fetcher, at + 183_000);
+    const gone = await newest();
+    assertEquals(gone.meta.shape, null, "a body that is not rows has no shape");
+    assertEquals(gone.meta.shape_change, { added: [], dropped: ["extra", "id", "name"], retyped: [] });
+    await pollNetOnce(fetcher, at + 244_000);
+    assertEquals((await newest()).meta.shape_change, undefined, "and nothing is compared against no shape");
+  });
+
   await t.step("The bucket a flood is counted against must be one the flood cannot choose", async () => {
     const ip = (xff: string | undefined, remote?: string) =>
       callerIp(
