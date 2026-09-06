@@ -92,12 +92,18 @@ The single biggest gap. Most of the Demo Gallery dies here first.
 
 The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
-- [ ] **You drag a series down.** Insert, delete, duplicate and drag-reorder ship for rows and columns; fill-down is
-      plain today.
-  1. Drag-fill that continues dates, numbers and simple patterns rather than repeating the cell.
+- [ ] **You drag a date series down.** Fill-down continues numbers and numbered text; a date column still repeats its
+      last seed.
+  1. Add a date library to `elm.json`: calendar arithmetic is never hand-rolled.
+  2. Give `fillSeries` in `src/Main.elm` a date branch, before the numeric one: two dates set the step in days or
+     months, one date steps by a day, and the seeds' own format is what comes back.
+  3. Test it in `tests/MainTest.elm`, beside the other `fillSeries` tests.
 
-- [ ] **A number looks like the number it is.** There is no formatting layer at all.
-  1. Decimals, thousands separators, currency symbol, percent, scientific, custom mask — per column.
+- [ ] **A number looks like the number it is.** A per-column decimal count ships, out of the column's own panel and
+      stored beside `width`. The rest of how a number reads is still whatever `formatNumber` decided.
+  1. Thousands separators, currency symbol, percent, scientific and a custom mask, each a per-column field beside
+     `decimals`: one line in `colViewFields`, `viewOf`, `pruneView` and `viewPatches` in `src/Main.elm`, and one
+     control in the column panel beside the decimals box.
   2. Locale-aware, from a per-user setting rather than the browser's guess.
 
 - [ ] **A cell can be coloured by a rule.** Nothing conditions on value today.
@@ -108,13 +114,13 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
   1. Collapsible groups with subtotals over the rows on screen, the way the totals row already respects the filter.
   2. A pivot UI over the same machinery — AlaSQL's `pivot` is correct once `checkPivot()` has had its say.
 
-- [ ] **You dedupe and split a column without writing SQL.** Trim, change case and drop-blank-rows ship in the column's
-      own panel, each one `DocMsg` so undo covers it. The two left are the two that are not a rewrite of one column.
+- [ ] **You dedupe on nearly-equal rows and split a column without writing SQL.** Exact dedupe ships as
+      `SheetRowsDedupe`, out of the palette. The two left are the two that need more than a row's own values.
   1. Split column and text-to-columns, which make columns rather than change one, so the panel is the wrong home and
      the column count changing is the whole difficulty.
-  2. Dedupe rows, exact and fuzzy — a whole-sheet verb, and the reason it is not in the panel yet: "Dedupe rows" under
-     column B reads as "dedupe by B", and a sheet-wide action needs a sheet-wide home first. `similarity()`,
-     `token_set_ratio()` and `soundex()` already ship as UDFs, so the fuzzy half is the UI over them.
+  2. Fuzzy dedupe: the same verb over a threshold rather than over equality. `similarity()`, `token_set_ratio()` and
+     `soundex()` already ship as UDFs, so this is the UI over them — which columns to compare, how close counts, and
+     a preview of what would go, because unlike the exact verb nobody can see the answer before it runs.
 
 - [ ] **A very large sheet scrolls.** Every row renders.
   1. Virtualized rendering.
@@ -147,10 +153,11 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
 ## Ingest — net-http
 
-- [ ] **A feed that needs more than one GET works.** One unauthenticated GET per interval is the whole of it.
-  1. POST and PUT with a templated body.
-  2. OAuth authorization code flow plus automatic refresh, on top of the secret store.
-  3. Static egress IP, which many enterprise sources require before they will talk at all.
+- [ ] **A feed behind OAuth works.** A feed is polled with a GET, a POST or a PUT and a templated body, and a static
+      key out of the secret store is the only credential it can carry.
+  1. OAuth authorization code flow plus automatic refresh, on top of the secret store: the refresh token is a secret
+     like any other, and the access token is written back beside it rather than into the document.
+  2. Static egress IP, which many enterprise sources require before they will talk at all.
 
 - [ ] **The response is parsed, not stored as a blob.** JSON lands as one cell.
   1. Parsers: JSON path, CSV/TSV, NDJSON, XML, RSS/Atom, HTML with CSS selectors, XLSX, Parquet.
@@ -238,9 +245,11 @@ The runner is in **Now**. These are what the Demo Gallery needs on top of it.
       or removed since the run before; a band is neither.
   1. An anomaly band needs the forecasting work under **Stats & modeling**, and waits for it.
 
-- [ ] **An alert reaches you where you are.** Email ships, through the Resend key signup already uses.
-  1. SMS, Slack, Discord, Teams, webhook, push.
-  2. A refused delivery is recorded on the alert and retried next interval, which is already the rule for email.
+- [ ] **An alert reaches you on a phone.** Email and a webhook url ship; nothing reaches a device that is not reading
+      mail.
+  1. SMS, Teams and push, each a sender beside `sendAlertUrl` chosen off the destination the same way.
+  2. Each one needs an account somewhere -- a carrier, a Teams app, a push service -- so each is its own item once one
+     of them is picked.
 
 - [ ] **You can silence an alert without deleting it.** There is no acknowledgement of any kind.
   1. Snooze, acknowledge, escalate.
@@ -311,10 +320,6 @@ The Excel add-in market lives here.
   1. A helper that writes that SQL from a source, a date column and a key.
   2. Clustering and segmentation is the same shape of helper over a different verb.
 
-- [ ] **A hyperbolic decline curve fits.** `fit_exponential()` and `fit_power()` fit by the transform that straightens
-      the curve and refuse a value at or below zero by name.
-  1. Nonlinear least squares, which is what hyperbolic decline actually needs.
-
 ---
 
 ## Geospatial
@@ -371,10 +376,9 @@ The Excel add-in market lives here.
   2. SSO, SAML and SCIM, which is table stakes for any org-sized customer.
   3. Ownership transfer and offboarding: what happens to sheets when someone leaves.
 
-- [ ] **You cannot publish a secret by accident.** Nothing is scanned.
-  1. Refuse to publish a sheet containing an API key.
-  2. Warn before a dataset with personal data goes public.
-  3. Retention policies, legal hold, whole-workspace backup and restore, and region pinning are the rest of this row,
+- [ ] **You cannot publish a secret by accident.** An API key is refused at both doors; nothing else is scanned.
+  1. Warn before a dataset with personal data goes public.
+  2. Retention policies, legal hold, whole-workspace backup and restore, and region pinning are the rest of this row,
      and each is its own item once one customer asks.
 
 ---
@@ -442,9 +446,12 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
 
 ## Offline & mobile
 
-- [ ] **The app works on a phone and on a plane.** The layout assumes a mouse and a connection.
+- [ ] **The app works on a phone and on a plane.** It installs now — `src/manifest.webmanifest` — and then still
+      assumes a mouse and a connection.
   1. Responsive touch-friendly cell editing and swipe navigation.
-  2. A PWA manifest, installable, with offline support.
+  2. Offline: a service worker that answers the app shell and the vendored bundles out of cache, so an installed app
+     opens with no network. `src/_redirects` is already the list of what it has to hold, and `deno task build` copies
+     `src/*` to `dist`, so the worker is one more file there. What it must not cache is the API.
   3. IndexedDB-first sync — Automerge already uses it, so this is optimisation rather than new machinery.
 
 ---
@@ -462,16 +469,22 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
   3. A sandbox: fake webhook deliveries and dry-run schedules.
 
 - [ ] **The suite answers in under ten seconds on a machine that is doing something else.** `deno task test` fails past
-      ten. On an idle machine it is nine, with no headroom at all, so anything else running here — another session's
-      build, another agent — tips it over and refuses a change for a reason that has nothing to do with the change.
-      `page_test.ts` is the whole critical path, and the cost is per test rather than in any one of them: each `boot`
-      builds a jsdom and evaluates the compiled Elm bundle again, ~130ms a test across ~66 of them.
-  1. Share one jsdom across the tests that only read what the page rendered, and prove the isolation that buys back is
-     not something a test depended on.
-  2. `until()` is already there for anything that waits on a real timer; the flat `settle(ms)` sleeps left are the ones
-     that prove something did **not** happen, and those cannot be shortened.
-  3. `--optimize` is not the lever — it shrinks `dist/index.js` by 3% — and `new Function` over the bundle is already
-     hoisted out of the per-test path.
+      ten, and on a loaded machine `page_test.ts` does worse than run slowly: "sorting a query result does not run its
+      SQL again" fails on `nothing to click`, because the query debounce is a real timer and a starved event loop loses
+      the race to it. A failing test on a busy machine is the worse half of this item.
+  1. Fix that flake first, and any other test that races a real timer rather than waiting for something to happen —
+     `until()` is the bounded poll already written for exactly that.
+  2. Sharing a booted page is done and is spent: `rendered()` in `page_test.ts` is the one library page the tests that
+     only read what it painted share, and nothing else in the file can join them — every other boot either opens a
+     different url, which is a different paint, or writes to the model. It bought back two paints and no more.
+  3. What a `boot` costs is Elm's first paint into jsdom, not the harness around it: the jsdom, the hoisted bundle and
+     Elm's init together are a rounding error beside it, so there is nothing left to hoist and no per-test setup left
+     to share. The lever left is fewer boots — merge tests that assert about the same page — or a cheaper paint.
+  4. `settle()` pays QUIET_FRAMES turns of the event loop every time it is called, and a test that clicks ten times
+     pays it ten times. Measure whether one fewer quiet frame survives `--shuffle` before touching anything else.
+  5. Dead ends, so nobody spends the afternoon again: `--optimize` shrinks `dist/index.js` by a few percent and moves
+     nothing, and the flat `settle(ms)` sleeps left are the ones proving something did **not** happen, which cannot be
+     shortened.
 
 - [ ] **You can run it yourself.** There is no self-host path.
   1. A docker image, for the customers who cannot send data anywhere.

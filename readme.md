@@ -40,10 +40,12 @@ curl -X POST "https://api.sheets.scrap.land$path" -H 'Content-Type: application/
 
 A net-http sheet reads a key from there too: write `X-Api-Key: {{secret:weather}}` in its headers and the value is
 resolved at fetch time, so the document holds the reference and never the token. Rotating the secret needs no edit to
-the sheet. "Test the request" on the sheet runs the poller's request once, now, with the same fetch, the same secret
-resolution and the same body cap, and shows the status, the time, the size and the start of the body, or the refusal
-by name, before the sheet has to wait for the poller to find out. `POST /library/<sheet_id>/preflight` with
-`{"url": "...", "headers": "..."}` is the same thing over HTTP, and it writes nothing.
+the sheet. A feed that answers a POST or a PUT is that method and a body on the sheet: the body takes the same
+`{{secret:name}}`, and `{{cursor}}` in it is the moment the last good poll started, which is what a cursor query
+parameter carries. "Test the request" on the sheet runs the poller's request once, now, with the same fetch, the same
+secret resolution and the same body cap, and shows the status, the time, the size and the start of the body, or the
+refusal by name, before the sheet has to wait for the poller to find out. `POST /library/<sheet_id>/preflight` with
+`{"url": "...", "headers": "...", "method": "POST", "body": "..."}` is the same thing over HTTP, and it writes nothing.
 
 A sheet can hold its own secrets instead. `POST /library/<sheet_id>/secret` with `{"name":"hook","value":"..."}` sets
 the signing key; writing it again rotates it, and the one before still verifies until a third write retires it. `GET`
@@ -61,9 +63,9 @@ one. A script carries a key for one sheet rather than your login: `POST /library
 from them. A sheet's API spends the same per-sheet budget a webhook sender spends: a read is one row of it and an
 append is the rows it carries, and past the limit the answer is a 429 that names the limit and the window. An account
 is bounded too: requests per second across every address it sends from, sheets it may own, rows one sheet may hold,
-and alert emails a day across every alert it owns. Each refusal names the count and the limit, and `deno task status`
-fails while any account has hit the sheets, rows or emails cap in the past day; a request past its rate is shed with
-a 429 and not counted.
+and alert deliveries a day across every alert it owns, a post to a url costing what an email does. Each refusal names
+the count and the limit, and `deno task status` fails while any account has hit the sheets, rows or deliveries cap in
+the past day; a request past its rate is shed with a 429 and not counted.
 
 ```sh
 curl -X POST "https://api.sheets.scrap.land/sheet/$sheet_id" -H "scrapsheets-key: $key" \
@@ -118,7 +120,13 @@ the demo strip counts what is in it, and each row there offers restore, with the
 still on it. Delete is still there, inside the trash, and now it means what its warning says.
 
 A column is cleaned from its own panel, beside hide and pin: trim, UPPER, lower, and drop every row this column has
-nothing in. Each one is an ordinary edit, so Ctrl/⌘+Z takes it back and everyone else looking at the sheet sees it.
+nothing in. Each one is an ordinary edit, so Ctrl/⌘+Z takes it back and everyone else looking at the sheet sees it. The
+sheet's own verb is in the palette instead, because it reads every column rather than one: "delete duplicate rows"
+keeps the first of every repeat and deletes the ones under it.
+
+A column of numbers is written at the number of decimal places you ask it for, in the same panel: the cell, the column
+stats and the totals row all read the one count, and an empty box goes back to whatever the number needed. The count
+travels with the sheet, the way the sort and the column widths do.
 
 A chart is drawn as a line, bars, an area, a scatter, or one big number — `kpi` reads the last point, how far it moved
 since the one before, and draws the whole series small beside it. A kind that is not one of those is refused by name

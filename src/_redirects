@@ -8,7 +8,10 @@
 /automerge-repo-idb.mjs /automerge-repo-idb.mjs 200
 /automerge-repo-ws.mjs /automerge-repo-ws.mjs 200
 /style.css /style.css 200
+/manifest.webmanifest /manifest.webmanifest 200
+/icon.svg /icon.svg 200
 /examples.mjs /examples.mjs 200
 /sql.mjs /sql.mjs 200
 /page.mjs /page.mjs 200
+/portals.mjs /portals.mjs 200
 /* / 200

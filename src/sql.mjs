@@ -1976,6 +1976,209 @@ export const register = (alasql) => {
   fn.fit_exponential = (xs, ys, at) => curve("fit_exponential", xs, ys, at, false);
   fn.fit_power = (xs, ys, at) => curve("fit_power", xs, ys, at, true);
 
+  // Arps hyperbolic decline, q(t) = qi / (1 + b*Di*t)^(1/b), which is the curve a
+  // well actually follows and the one every reserve report is written in. The
+  // shape parameter b sits in the exponent, so no log straightens this one: it is
+  // fit by nonlinear least squares instead. Levenberg-Marquardt, because the
+  // damping shrinks a step that lands where the curve has no value rather than
+  // taking it, which is where plain Gauss-Newton walks off.
+  const HYPERBOLIC_STEPS = 200;
+  // b is the shape: 0 is exponential decline, 1 is harmonic, and larger is a
+  // flatter tail. Past 2 the curve integrates to infinite cumulative production,
+  // so a fit that wants to go there is one this family will not answer -- not a
+  // statement about whether the points decline, which they may do perfectly well.
+  const B_MAX = 2;
+  // The fit walks every point four times per step -- the residual and three
+  // Jacobian columns -- so its cost is points times steps, and only the steps
+  // were bounded: a million pairs out of one sheet was seconds of blocked,
+  // uninterruptible event loop from one query. The linear fits need no such
+  // bound; they are a single pass. Two orders of magnitude above any decline
+  // anybody reads by hand, which is a monthly rate over a well's life.
+  const HYPERBOLIC_POINTS = 5000;
+  // A step this small beside the parameter it moves has stopped saying anything,
+  // whatever the damping does next.
+  const LM_STOP = 1e-10;
+  // The b column of the Jacobian is a 0/0 limit at b = 0 -- the exponential
+  // member of the family, and where this fit starts. A forward difference crosses
+  // that point without a series expansion for it.
+  const LM_DIFF = 1e-7;
+  const arps = (qi, di, b, t) => qi * Math.exp(b === 0 ? -di * t : -Math.log1p(b * di * t) / b);
+  // Gaussian elimination with partial pivoting over the damped normal equations.
+  // null is a matrix singular even under the damping, which the caller answers by
+  // damping harder.
+  const solve3 = (a, rhs) => {
+    const m = a.map((row, i) => [...row, rhs[i]]);
+    for (let c = 0; c < 3; c++) {
+      let piv = c;
+      for (let r = c + 1; r < 3; r++) if (Math.abs(m[r][c]) > Math.abs(m[piv][c])) piv = r;
+      [m[c], m[piv]] = [m[piv], m[c]];
+      if (m[c][c] === 0) return null;
+      for (let r = c + 1; r < 3; r++) {
+        const f = m[r][c] / m[c][c];
+        for (let k = c; k < 4; k++) m[r][k] -= f * m[c][k];
+      }
+    }
+    const out = [0, 0, 0];
+    for (let r = 2; r >= 0; r--) {
+      let s = m[r][3];
+      for (let k = r + 1; k < 3; k++) s -= m[r][k] * out[k];
+      out[r] = s / m[r][r];
+    }
+    return out.every(Number.isFinite) ? out : null;
+  };
+  fn.fit_hyperbolic = (xs, ys, at) => {
+    const [x0, y0] = pair("fit_hyperbolic", xs, ys);
+    // Three parameters need three points: two of them are fit exactly by every b.
+    if (x0.length < 3) {
+      throw fail("fit_hyperbolic()", "at least 3 pairs", `${x0.length}`, "widen the query so more rows match");
+    }
+    if (x0.length > HYPERBOLIC_POINTS) {
+      throw fail(
+        "fit_hyperbolic()",
+        `at most ${HYPERBOLIC_POINTS} pairs`,
+        `${x0.length}`,
+        "aggregate the rate to one point per period first, e.g. group by month",
+      );
+    }
+    for (const v of y0) {
+      if (v <= 0) {
+        throw fail(
+          "fit_hyperbolic() argument 2",
+          "only values above zero",
+          show(v),
+          "a decline curve has no rate at or below zero: filter those rows out first",
+        );
+      }
+    }
+    // The step, the damping and LM_STOP all read in the units of the columns, so
+    // the same curve in barrels and in cubic feet, or over months and over unix
+    // seconds, was a different search each time: one settled, one ran out of
+    // steps, one never moved b off the exponential seed. Fit the shape in a unit
+    // box instead and undo the scaling in the answer. A spread throws a
+    // RangeError past about a hundred thousand arguments and a query loads up to
+    // MAX_QUERY_ROWS points, so the three extremes are taken in one pass.
+    let scale = y0[0], t0 = x0[0], tn = x0[0];
+    for (let i = 1; i < x0.length; i++) {
+      if (y0[i] > scale) scale = y0[i];
+      if (x0[i] < t0) t0 = x0[i];
+      if (x0[i] > tn) tn = x0[i];
+    }
+    // Every x the same is a column with no time in it, which the exponential
+    // seed below answers null on; the span only has to be non-zero to get there.
+    const span = tn - t0 || 1;
+    const x = x0.map((v) => (v - t0) / span);
+    const y = y0.map((v) => v / scale);
+    // The exponential fit is the b = 0 member of the same family, so it is both
+    // the starting point and the answer for a rate that declines straight.
+    const { mx, my, sxy, sxx } = fit(x, y.map(Math.log));
+    if (sxx === 0) return null;
+    const slope = sxy / sxx;
+    let p = [Math.exp(my - slope * mx), -slope, 0];
+    const cost = (guess) => {
+      let sum = 0;
+      for (let i = 0; i < x.length; i++) sum += (arps(guess[0], guess[1], guess[2], x[i]) - y[i]) ** 2;
+      // Where the curve has no value the step is not one to take, at any damping.
+      return Number.isFinite(sum) ? sum : Infinity;
+    };
+    let best = cost(p), lambda = 1e-3, steps = 0, climbing = false;
+    for (;;) {
+      if (++steps > HYPERBOLIC_STEPS) {
+        throw new Error(explain(`fit_hyperbolic() did not settle on a curve.`, {
+          Limit: `${HYPERBOLIC_STEPS} least-squares steps`,
+          Received: `${HYPERBOLIC_STEPS} steps, still moving at b ${p[2].toPrecision(4)}`,
+          Source: "the points handed to fit_hyperbolic()",
+          Fix: "read fit_exponential() or fit_power() on the same points to see the shape they have",
+        }));
+      }
+      const base = x.map((t) => arps(p[0], p[1], p[2], t));
+      const cols = p.map((v, j) => {
+        const h = LM_DIFF * (Math.abs(v) || 1);
+        const bumped = [...p];
+        bumped[j] = v + h;
+        return x.map((t, i) => (arps(bumped[0], bumped[1], bumped[2], t) - base[i]) / h);
+      });
+      const dot = (r, c) => {
+        let sum = 0;
+        for (let i = 0; i < x.length; i++) sum += cols[r][i] * cols[c][i];
+        return sum;
+      };
+      // Damping is added to the diagonal rather than scaling it, because a
+      // parameter the curve is flat in has a diagonal of zero — b on a rate that
+      // does not move — and scaling zero leaves the matrix singular forever.
+      const diag = [dot(0, 0), dot(1, 1), dot(2, 2)];
+      const damp = lambda * (Math.max(...diag) || 1);
+      const g = [0, 1, 2].map((r) => {
+        let sum = 0;
+        for (let i = 0; i < x.length; i++) sum += cols[r][i] * (y[i] - base[i]);
+        return sum;
+      });
+      // b is at one end of its range and the fit wants to leave. Hold it there
+      // and solve the other two on their own: a step whose b component is thrown
+      // away afterwards is not the step the other two needed, and the fit crawls
+      // a millionth at a time instead of converging.
+      const bStep = g[2] / (diag[2] || 1);
+      const held = (p[2] === 0 && bStep < 0) || (p[2] === B_MAX && bStep > 0);
+      // Whether the settled fit is pinned at the top of the range and the
+      // descent still pushes past it — read after the loop, where the fit is the
+      // one it kept rather than a trial step that overshot and came back.
+      climbing = p[2] === B_MAX && bStep > LM_STOP;
+      const normal = [0, 1, 2].map((r) =>
+        [0, 1, 2].map((c) => (held && (r === 2 || c === 2) ? (r === c ? 1 : 0) : r === c ? diag[r] + damp : dot(r, c)))
+      );
+      const d = solve3(normal, held ? [g[0], g[1], 0] : g);
+      if (!d) {
+        lambda *= 10;
+        continue;
+      }
+      if (d.every((v, j) => Math.abs(v) <= LM_STOP * (Math.abs(p[j]) + LM_STOP))) break;
+      const next = p.map((v, j) => v + d[j]);
+      // Both ends of b's range stop the step rather than refusing it: zero is the
+      // exponential member of the family and B_MAX is a curve that never runs
+      // out, and a trial step that overshoots either one comes back.
+      next[2] = Math.min(Math.max(next[2], 0), B_MAX);
+      const s = cost(next);
+      if (s < best) {
+        p = next;
+        best = s;
+        lambda = Math.max(lambda / 10, 1e-12);
+      } else lambda *= 10;
+    }
+    if (climbing) {
+      // What actually happened, and not "these points do not decline": a fit
+      // pinned at B_MAX wanting more b is a tail that flattens faster than the
+      // family's bound allows, which an ordinary shale decline reaches. The old
+      // headline sent whoever read it looking for a rate column that rises,
+      // which was never their problem, and called a flattening tail steepening.
+      throw new Error(explain(`fit_hyperbolic() could not settle on a decline exponent inside its range.`, {
+        Expected: `a best fit with b between 0 and ${B_MAX}`,
+        Received: `a fit pinned at b ${B_MAX} whose tail is still flattening there`,
+        Source: "the points handed to fit_hyperbolic()",
+        Fix:
+          `b past ${B_MAX} integrates to infinite cumulative production, so it is not fit here: read fit_exponential() on the same points, or fit the later rows on their own`,
+      }));
+    }
+    const a = num("fit_hyperbolic", 3, at);
+    const answer = arps(p[0], p[1], p[2], (a - t0) / span) * scale;
+    if (!Number.isFinite(answer)) {
+      // b = 0 is the exponential member and has no asymptote, so there is no x to
+      // name: -1 / (0 * di) is -Infinity, a bound every x already clears. That
+      // one overflowed instead.
+      const [expected, why] = p[2] === 0
+        ? ["an x where the fitted rate is still a number", "the rate overflows there"]
+        : [
+          `an x above ${(t0 + span * (-1 / (p[2] * p[1]))).toPrecision(4)}, where the fitted curve begins`,
+          "the curve is vertical there",
+        ];
+      throw fail(
+        "fit_hyperbolic() argument 3",
+        expected,
+        show(a),
+        `${why}: predict inside the ${t0} to ${tn} the points cover`,
+      );
+    }
+    return answer;
+  };
+
   // Median absolute deviation, and the outlier score built on it. 1.4826 scales
   // a MAD to the standard deviation of a normal sample, so robust_z reads on the
   // same scale as a z-score — except that the outlier being measured cannot move

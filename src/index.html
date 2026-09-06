@@ -6,6 +6,8 @@
     <meta name="author" content="Taylor Troesh" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="manifest" href="/manifest.webmanifest" />
     <link href="/style.css" rel="stylesheet" />
     <script src="/index.js"></script>
   </head>
@@ -376,13 +378,13 @@
           // it most needs to.
           // The feed's request, once, now. Answered by sheet, so a test started
           // on one sheet cannot land on another opened while it was in flight.
-          app.ports.preflight.subscribe(catchy(async ({ id, data: { url, headers } }) => {
+          app.ports.preflight.subscribe(catchy(async ({ id, data: { url, headers, method, body } }) => {
             const token = getAuthToken();
             if (!token) return app.ports.docErrored.send("Log in to test a request.");
             const res = await fetch(`${API_BASE}/library/${id}/preflight`, {
               method: "POST",
               headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-              body: JSON.stringify({ url, headers }),
+              body: JSON.stringify({ url, headers, method, body }),
             });
             if (!res.ok) {
               const error = httpErrorDetail(await res.text(), res.headers.get("Content-Type") ?? "") ||

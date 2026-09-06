@@ -13,6 +13,7 @@
     "vendor": "deno run -A vendor.ts"
   },
   "exclude": [
+    ".claude/",
     "dist/",
     "data/",
     "elm-stuff/",

@@ -31,9 +31,11 @@ port module Main exposing
     , displayYToDocY
     , docDecoder
     , dropOf
+    , duplicateRows
     , emptySheet
     , emptyView
     , expandSelection
+    , fillSeries
     , filterAndSortIndexed
     , formatNumber
     , freshnessCell
@@ -60,6 +62,7 @@ port module Main exposing
     , rowSplices
     , selectAll
     , serializeToTsv
+    , seriesEncoder
     , shortcutGroups
     , skipHidden
     , sortRankOf
@@ -449,6 +452,68 @@ round2 =
     (*) 100 >> round >> toFloat >> flip (/) 100
 
 
+{-| Whether a number is written as digits at all. JavaScript writes a magnitude
+of 1e21 or more as "1e+21" and one that is not finite as a word, and a string
+cut by position then splices that into the middle of the number: a usd total
+that overflowed read "$In,fin,ity.00", and 1e11 at ten places read
+"0.000001e+21" because the scaled integer had stopped being digits. Neither is a
+number a column can dress up, so both are handed back the way Elm writes them.
+-}
+positional : Float -> Bool
+positional value =
+    abs value < 1.0e21
+
+
+{-| A number written at exactly this many decimal places. Built off the whole
+part and the scaled fraction rather than off `String.fromFloat`, which drops a
+trailing zero and writes a small number in exponent form: 1.5 at three places
+has to come back "1.500", and rounding the scaled fraction is also what keeps
+binary float error out of the answer -- 0.1 + 0.2 prints as 0.3.
+
+Only the fraction is scaled. `value * 10 ^ places` leaves the digits behind at
+magnitudes a column really holds -- 1e11 at the ten places `maxDecimals`
+allows -- and the answer was then cut out of "1e+21". The magnitude is what is
+scaled, so a half rounds away from zero on both sides of it: `round` sends
+-0.125 to -0.12 and 0.125 to 0.13, which is one number reading two ways in one
+column, and money already rounded the other way through `usd`.
+
+-}
+fixed : Int -> Float -> String
+fixed places value =
+    let
+        magnitude =
+            abs value
+
+        whole =
+            toFloat (floor magnitude)
+
+        scaled =
+            round ((magnitude - whole) * toFloat (10 ^ places))
+
+        -- 0.999 at two places rounds up to 100 hundredths, which is the next
+        -- whole number and no fraction left at all.
+        carried =
+            scaled == 10 ^ places
+
+        units =
+            iif carried (whole + 1) whole
+
+        fraction =
+            iif carried 0 scaled
+    in
+    if not (positional value) then
+        String.fromFloat value
+
+    else
+        -- The sign is taken off the digits that get written and not off the
+        -- value: -0.4 at zero places is written "0", and prefixing it gave a num
+        -- column of small values a "-0" beside a "0", which reads as two
+        -- different numbers.
+        iif (value < 0 && (units > 0 || fraction > 0)) "-" ""
+            ++ String.fromFloat units
+            ++ iif (places == 0) "" ("." ++ (String.fromInt fraction |> String.padLeft places '0'))
+
+
 commas : String -> String
 commas =
     String.reverse
@@ -466,21 +531,32 @@ commas =
         >> String.reverse
 
 
-usd : Float -> String
-usd amount =
+{-| Money at a decimal count: the symbol and the digit grouping are what make it
+money, and neither depends on how many places are asked for.
+
+Cut at a known position rather than split on the dot -- `fixed` writes the dot
+only when there are places, so where the whole part ends is arithmetic and not
+a search, and there is no unreachable branch for a split that cannot fail. The
+one value `fixed` answers without digits at all is not money either, and
+`formatNumber` hands that one back before it ever reaches here.
+
+-}
+usd : Int -> Float -> String
+usd places amount =
     let
-        ( intPart, decPart ) =
-            case amount |> abs |> round2 |> String.fromFloat |> String.split "." of
-                a :: b :: _ ->
-                    ( a, String.left 2 <| String.padRight 2 '0' b )
+        digits =
+            fixed places (abs amount)
 
-                a :: [] ->
-                    ( a, "00" )
-
-                [] ->
-                    ( "0", "00" )
+        cut =
+            iif (places == 0) 0 (places + 1)
     in
-    iif (amount < 0) "-" "" ++ "$" ++ commas intPart ++ "." ++ decPart
+    -- The sign off the digits that get written and not off the amount, the way
+    -- `fixed` takes it: -0.4 at no places is written "0", and a "-$0" beside a
+    -- "$0" reads as two different amounts in one column.
+    iif (amount < 0 && String.any (\c -> Char.isDigit c && c /= '0') digits) "-" ""
+        ++ "$"
+        ++ commas (String.dropRight cut digits)
+        ++ String.right cut digits
 
 
 {-| How a number reads in the column it is in. Three places used to answer this
@@ -492,25 +568,35 @@ A wildcard rather than a table, because the question is only ever asked of a
 column that holds a number, and a type that does not hold one has no reading of
 its own to state.
 
+The count is the column's own, and its absence is the reading each type had
+before anybody could ask: two places for money, and as many as the value needs
+for the other two.
+
 -}
-formatNumber : Type -> Float -> String
-formatNumber typ v =
-    if isNaN v || isInfinite v then
+formatNumber : Type -> Maybe Int -> Float -> String
+formatNumber typ decimals v =
+    if not (positional v) then
         -- Neither a currency symbol nor digit grouping belongs on a value that
-        -- is not a number: `commas` runs over the string form, so a usd total
-        -- that overflowed to Infinity read "$In,fin,ity.00". Two cells of 1e308
-        -- in a usd column is all it takes, and the totals row sums them.
+        -- is not written as digits: `commas` runs over the string form, so a usd
+        -- total that overflowed to Infinity read "$In,fin,ity.00". Two cells of
+        -- 1e308 in a usd column is all it takes, and the totals row sums them.
         String.fromFloat v
 
     else
-        case typ of
-            Usd ->
-                usd v
+        case ( typ, decimals ) of
+            ( Usd, _ ) ->
+                usd (Maybe.withDefault 2 decimals) v
 
-            Percentage ->
+            ( Percentage, Just places ) ->
+                fixed places (v * 100) ++ "%"
+
+            ( Percentage, Nothing ) ->
                 formatPercentage v
 
-            _ ->
+            ( _, Just places ) ->
+                fixed places v
+
+            ( _, Nothing ) ->
                 String.fromFloat (round2 v)
 
 
@@ -595,7 +681,7 @@ port docErrored : (String -> msg) -> Sub msg
 {-| The poller's request, once, now: what the sheet would fetch with what it
 would send. The answer comes back on `preflightLoaded`, named by sheet.
 -}
-port preflight : Idd { url : String, headers : String } -> Cmd msg
+port preflight : Idd { url : String, headers : String, method : String, body : String } -> Cmd msg
 
 
 port preflightLoaded : (Idd D.Value -> msg) -> Sub msg
@@ -865,6 +951,10 @@ type alias Sheet =
     -- What the feed's request answered when it was last tested, by sheet.
     , preflight : Maybe (Result String Preview)
     , widths : Dict String Int
+
+    -- How many decimal places this browser writes a numeric column's values at,
+    -- where it asked for a count at all.
+    , decimals : Dict String Int
     , resizing : Maybe { key : String, startX : Int, startWidth : Int }
 
     -- The column or row being dragged to a new position, while the drag lasts.
@@ -908,6 +998,7 @@ emptySheet =
     , preflight = Nothing
     , lineage = Nothing
     , widths = Dict.empty
+    , decimals = Dict.empty
     , resizing = Nothing
     , moving = Nothing
     , storedView = emptyView
@@ -1034,12 +1125,13 @@ type alias SheetView =
     , sort : List ( String, SortOrder )
     , filters : Dict String Filter
     , widths : Dict String Int
+    , decimals : Dict String Int
     }
 
 
 emptyView : SheetView
 emptyView =
-    { hidden = Set.empty, pinned = Set.empty, sort = [], filters = Dict.empty, widths = Dict.empty }
+    { hidden = Set.empty, pinned = Set.empty, sort = [], filters = Dict.empty, widths = Dict.empty, decimals = Dict.empty }
 
 
 {-| One column's share of the view. Every field is optional and every default is
@@ -1054,6 +1146,7 @@ type alias ColView =
     , rank : Int
     , filter : String
     , width : Maybe Int
+    , decimals : Maybe Int
     }
 
 
@@ -1077,13 +1170,24 @@ autoColWidth =
     140
 
 
+{-| The most decimal places a column may ask its numbers to be written at. A
+count is a document field anybody may write, and `fixed` scales by `10 ^ places`
+before it rounds: past a float's own precision the extra digits are noise, and a
+big enough exponent is Infinity. An unusable count is read as no count at all,
+the way an unusable width is.
+-}
+maxDecimals : Int
+maxDecimals =
+    10
+
+
 {-| One column's view fields, under a key its home decides rather than one
 written beside them. A table's columns carry their own key; a query has no
 stored columns at all, so the map key is the only key there is.
 -}
 colViewFields : String -> D.Decoder ColView
 colViewFields key =
-    D.map6 (ColView key)
+    D.map7 (ColView key)
         (D.oneOf [ D.field "hidden" D.bool, D.succeed False ])
         (D.oneOf [ D.field "pinned" D.bool, D.succeed False ])
         (D.oneOf
@@ -1106,6 +1210,7 @@ colViewFields key =
         (D.oneOf [ D.field "rank" D.int, D.succeed 0 ])
         (D.oneOf [ D.field "filter" D.string, D.succeed "" ])
         (D.oneOf [ D.field "width" (D.map (\w -> iif (w >= minColWidth) (Just w) Nothing) D.int), D.succeed Nothing ])
+        (D.oneOf [ D.field "decimals" (D.map (\d -> iif (d >= 0 && d <= maxDecimals) (Just d) Nothing) D.int), D.succeed Nothing ])
 
 
 colViewDecoder : D.Decoder ColView
@@ -1160,6 +1265,7 @@ viewOf cols =
             |> List.filterMap (\c -> iif (String.isEmpty c.filter) Nothing (Just ( c.key, TextContains c.filter )))
             |> Dict.fromList
     , widths = cols |> List.filterMap (\c -> Maybe.map (Tuple.pair c.key) c.width) |> Dict.fromList
+    , decimals = cols |> List.filterMap (\c -> Maybe.map (Tuple.pair c.key) c.decimals) |> Dict.fromList
     }
 
 
@@ -1198,6 +1304,7 @@ pruneView doc sheet =
                     , sort = List.filter (\( key, _ ) -> Set.member key live) arrangement.sort
                     , filters = Dict.filter (\key _ -> Set.member key live) arrangement.filters
                     , widths = Dict.filter (\key _ -> Set.member key live) arrangement.widths
+                    , decimals = Dict.filter (\key _ -> Set.member key live) arrangement.decimals
                     }
 
                 onScreen =
@@ -1209,6 +1316,7 @@ pruneView doc sheet =
                 , sort = onScreen.sort
                 , filters = onScreen.filters
                 , widths = onScreen.widths
+                , decimals = onScreen.decimals
                 , storedView = keep sheet.storedView
             }
 
@@ -1271,6 +1379,8 @@ viewPatches at cols before after =
                         set x key "pinned" (iif (Set.member key after.pinned) (Just (E.bool True)) Nothing)
                     , only (Dict.get key before.widths) (Dict.get key after.widths) <|
                         set x key "width" (Maybe.map E.int (Dict.get key after.widths))
+                    , only (Dict.get key before.decimals) (Dict.get key after.decimals) <|
+                        set x key "decimals" (Maybe.map E.int (Dict.get key after.decimals))
                     , only (text_ before.filters key) (text_ after.filters key) <|
                         set x key "filter" (Maybe.map E.string (text_ after.filters key))
                     , only (Dict.get key wasSorted) (Dict.get key nowSorted) <|
@@ -1363,6 +1473,7 @@ onScreenView sheet =
     , sort = sheet.sort
     , filters = sheet.filters
     , widths = sheet.widths
+    , decimals = sheet.decimals
     }
 
 
@@ -1505,7 +1616,7 @@ type Doc
     | Tab Table
     | Query Query_
     | NetHook
-    | NetHttp { url : String, interval : Int, headers : String }
+    | NetHttp { url : String, interval : Int, headers : String, method : String, body : String }
     | Alert { code : String, to : String, interval : Int, digest : Bool, when : When }
     | Chart { source : String, kind : ChartKind, x : String, y : String }
     | Dashboard (List String)
@@ -1602,6 +1713,26 @@ whens =
     [ OnRows, OnAdded, OnRemoved ]
 
 
+{-| A field a document may leave out, but may not spell as something else.
+`D.oneOf [ D.field name inner, D.succeed fallback ]` falls through to the
+fallback whenever the field is present and the inner decoder fails, which paints
+a document the server refuses as though it held the fallback it does not: a
+select reading GET over a `"method": 5` the poller will not poll.
+-}
+optionalField : String -> D.Decoder a -> a -> D.Decoder a
+optionalField name inner fallback =
+    D.maybe (D.field name D.value)
+        |> D.andThen
+            (\present ->
+                case present of
+                    Nothing ->
+                        D.succeed fallback
+
+                    Just _ ->
+                        D.field name inner
+            )
+
+
 whenDecoder : String -> D.Decoder When
 whenDecoder name =
     case List.filter (\w -> (whenSpec w).name == name) whens of
@@ -1610,6 +1741,25 @@ whenDecoder name =
 
         _ ->
             D.fail ("not a condition an alert knows: " ++ name ++ "; expected one of " ++ String.join ", " (List.map (whenSpec >> .name) whens))
+
+
+{-| The verbs a feed may be polled with. `NET_METHODS` in `main.ts` is the same
+list on the other side of the wire, and `browser_test.ts` fails when the two
+disagree. One the server would refuse is refused here too: a select reading GET
+over a document that says otherwise is a lie about what the poller sends.
+-}
+netMethods : List String
+netMethods =
+    [ "GET", "POST", "PUT" ]
+
+
+methodDecoder : String -> D.Decoder String
+methodDecoder name =
+    if List.member name netMethods then
+        D.succeed name
+
+    else
+        D.fail ("not a method a feed can be polled with: " ++ name ++ "; expected one of " ++ String.join ", " netMethods)
 
 
 {-| How a chart is drawn. One table with no wildcard, so a new constructor fails
@@ -1816,10 +1966,15 @@ docDecoder =
                     "net-http" ->
                         D.field "data" <|
                             D.index 0 <|
-                                D.map3 (\url interval headers -> NetHttp { url = url, interval = interval, headers = headers })
+                                D.map5
+                                    (\url interval headers method body ->
+                                        NetHttp { url = url, interval = interval, headers = headers, method = method, body = body }
+                                    )
                                     (D.field "url" D.string)
                                     (D.field "interval" D.int)
                                     (D.oneOf [ D.field "headers" D.string, D.succeed "" ])
+                                    (optionalField "method" (D.string |> D.andThen methodDecoder) "GET")
+                                    (optionalField "body" D.string "")
 
                     "alert" ->
                         D.field "data" <|
@@ -1834,17 +1989,7 @@ docDecoder =
                                     -- string, is refused by name rather than shown as rows: a select
                                     -- saying "rows" over a document that says otherwise is a lie the
                                     -- server would not tell.
-                                    (D.maybe (D.field "when" D.value)
-                                        |> D.andThen
-                                            (\present ->
-                                                case present of
-                                                    Nothing ->
-                                                        D.succeed OnRows
-
-                                                    Just _ ->
-                                                        D.field "when" (D.string |> D.andThen whenDecoder)
-                                            )
-                                    )
+                                    (optionalField "when" (D.string |> D.andThen whenDecoder) OnRows)
 
                     "chart" ->
                         D.field "data" <|
@@ -2175,6 +2320,7 @@ type Msg
     | ColumnHide String
     | ColumnsShowAll
     | ColumnPin String
+    | ColumnDecimals String String
     | ColumnMoveStart String
     | RowMoveStart Int
     | MoveEnd
@@ -2243,6 +2389,7 @@ type DocMsg
     | SheetColumnTrim String
     | SheetColumnCase String Casing
     | SheetRowsDropBlank String
+    | SheetRowsDedupe
     | CellCheck Index Bool
 
 
@@ -2260,6 +2407,8 @@ type Input
     | NetUrl
     | NetInterval
     | NetHeaders
+    | NetMethod
+    | NetBody
     | AlertCode
     | AlertTo
     | AlertDigest
@@ -2558,6 +2707,7 @@ update msg ({ sheet, auth } as model) =
                     , preflight = Nothing
                     , lineage = data.data.doc |> D.decodeValue (D.field "forked_from" D.string) |> Result.toMaybe
                     , widths = stored.widths
+                    , decimals = stored.decimals
                     , resizing = Nothing
                     , moving = Nothing
                     , storedView = stored
@@ -2703,7 +2853,7 @@ update msg ({ sheet, auth } as model) =
             case sheet.doc of
                 Ok (NetHttp cfg) ->
                     ( { model | sheet = { sheet | preflight = Nothing } }
-                    , preflight { id = sheet.id, data = { url = cfg.url, headers = cfg.headers } }
+                    , preflight { id = sheet.id, data = { url = cfg.url, headers = cfg.headers, method = cfg.method, body = cfg.body } }
                     )
 
                 _ ->
@@ -2807,7 +2957,11 @@ update msg ({ sheet, auth } as model) =
             ( model, Nav.pushUrl model.nav ("/" ++ id) )
 
         PaletteToggle open ->
-            ( { model | palette = iif open (Just { query = "", selected = 0 }) Nothing }
+            -- Nothing is selected until an arrow or a query says so. It opened
+            -- on the first row, so Enter on a palette nobody had pointed at ran
+            -- whatever the shortcut sheet happened to list first -- two
+            -- keystrokes, and the first row is a verb that deletes rows.
+            ( { model | palette = iif open (Just { query = "", selected = -1 }) Nothing }
             , iif open (Task.attempt (always NoOp) (Dom.focus "palette")) Cmd.none
             )
 
@@ -2817,8 +2971,14 @@ update msg ({ sheet, auth } as model) =
                     let
                         shown =
                             List.length (paletteCommands model.library p.query)
+
+                        -- Nothing selected sits before the first row, so the
+                        -- down arrow lands on that row and the up arrow wraps
+                        -- to the last one.
+                        from =
+                            iif (p.selected < 0) (iif (delta < 0) 0 -1) p.selected
                     in
-                    ( { model | palette = Just { p | selected = iif (shown == 0) 0 (modBy shown (p.selected + delta)) } }
+                    ( { model | palette = Just { p | selected = iif (shown == 0) -1 (modBy shown (from + delta)) } }
                     , Cmd.none
                     )
 
@@ -2826,14 +2986,21 @@ update msg ({ sheet, auth } as model) =
                     ( model, Cmd.none )
 
         PaletteRun i ->
-            case model.palette |> Maybe.andThen (\p -> paletteCommands model.library p.query |> List.drop i |> List.head) of
-                Just command ->
-                    -- Closed first, so a command that opens a dialog does not
-                    -- open it behind the palette.
-                    update command.run { model | palette = Nothing }
+            -- A palette nobody has pointed at runs nothing. It cannot be left to
+            -- the lookup: `List.drop` takes a negative count as none dropped, so
+            -- -1 would run the first row.
+            if i < 0 then
+                ( model, Cmd.none )
 
-                Nothing ->
-                    ( model, Cmd.none )
+            else
+                case model.palette |> Maybe.andThen (\p -> paletteCommands model.library p.query |> List.drop i |> List.head) of
+                    Just command ->
+                        -- Closed first, so a command that opens a dialog does not
+                        -- open it behind the palette.
+                        update command.run { model | palette = Nothing }
+
+                    Nothing ->
+                        ( model, Cmd.none )
 
         SettingsNameChange newName ->
             ( model, updateLibrary (Idd sheet.id { name = Just newName, tags = Nothing, trashed = Nothing }) )
@@ -2925,8 +3092,18 @@ update msg ({ sheet, auth } as model) =
 
         InputChange PaletteQuery x ->
             -- A new query renumbers the matches, so the selection returns to the
-            -- first rather than pointing at whatever now sits at that index.
-            ( { model | palette = model.palette |> Maybe.map (\p -> { p | query = x, selected = 0 }) }, Cmd.none )
+            -- first rather than pointing at whatever now sits at that index. An
+            -- emptied box is the state a freshly opened palette is in and points
+            -- at nothing: the unfiltered list starts with a verb that deletes
+            -- rows, and typing a character and taking it back armed Enter on it
+            -- again, which is the accident opening with -1 was for.
+            ( { model
+                | palette =
+                    model.palette
+                        |> Maybe.map (\p -> { p | query = x, selected = iif (String.isEmpty (String.trim x)) -1 0 })
+              }
+            , Cmd.none
+            )
 
         InputChange CellWrite x ->
             ( { model | sheet = { sheet | write = Just x } }, Cmd.none )
@@ -3058,6 +3235,22 @@ update msg ({ sheet, auth } as model) =
                 }
             )
 
+        InputChange NetMethod x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "method" ], value = E.string x } ]
+                }
+            )
+
+        InputChange NetBody x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "body" ], value = E.string x } ]
+                }
+            )
+
         CopyText str ->
             ( model, copyToClipboard str )
 
@@ -3116,6 +3309,30 @@ update msg ({ sheet, auth } as model) =
 
         ColumnSort shift key ->
             arrange model { sheet | sort = cycleSort shift key sheet.sort }
+
+        ColumnDecimals key input ->
+            -- An empty box is no count at all, and the count is clamped here
+            -- rather than left to the input's own bounds: a paste does not
+            -- respect those, and `fixed` scales by `10 ^ places`.
+            --
+            -- The model only, the way the filter box beside it works: closing
+            -- the panel is when the count reaches the document. Typing "10" is
+            -- two keystrokes, and an arrange each was a patch synced to every
+            -- viewer for a 1 the typist never meant.
+            ( { model
+                | sheet =
+                    { sheet
+                        | decimals =
+                            case String.toInt (String.trim input) of
+                                Just places ->
+                                    Dict.insert key (clamp 0 maxDecimals places) sheet.decimals
+
+                                Nothing ->
+                                    Dict.remove key sheet.decimals
+                    }
+              }
+            , Cmd.none
+            )
 
         ColumnPin key ->
             let
@@ -3673,7 +3890,11 @@ updateDocMsg edit ({ sheet } as model) =
                             ( closed, Cmd.none )
 
                 _ ->
-                    ( closed, Cmd.none )
+                    -- Every other edit, on the one sheet that is a listing and
+                    -- not a document: a silent nothing here read as a verb that
+                    -- had run, and the palette offers them from the library
+                    -- more than from anywhere else.
+                    ( { closed | error = "Expected an edit to a table, received one on the library, which lists your sheets rather than holding rows of its own. Source: a keystroke or the command palette. Fix: open the sheet you meant and run it there." }, Cmd.none )
 
         Ok (Tab table) ->
             let
@@ -3826,6 +4047,9 @@ updateDocMsg edit ({ sheet } as model) =
                         SheetRowsDropBlank key ->
                             withColumn key (\col -> rowDeletions table.rows (blankRows col table.rows))
 
+                        SheetRowsDedupe ->
+                            rowDeletions table.rows (duplicateRows table.rows)
+
                         SheetColumnMove from to ->
                             -- Its own inverse, which is the whole reason a move
                             -- is one patch: a splice out and a splice back in
@@ -3925,10 +4149,13 @@ updateDocMsg edit ({ sheet } as model) =
                                 norm =
                                     normalizeRect r
 
-                                -- The seed is the top data row of the selection: a rect
-                                -- that starts on the header or type row fills from row 1.
+                                -- The seeds start at the top data row of the selection: a
+                                -- rect that starts on the header or type row fills from row 1.
                                 top =
                                     max 1 norm.a.y
+
+                                rows =
+                                    List.range top norm.b.y
 
                                 patchPairs =
                                     List.range norm.a.x norm.b.x
@@ -3940,19 +4167,53 @@ updateDocMsg edit ({ sheet } as model) =
 
                                                     Just col ->
                                                         let
-                                                            seed =
-                                                                getOldValue (toDoc top) col.key
+                                                            -- Blank is what `blankCell` says it is, never
+                                                            -- what `cellText` trims to: a JSON null reads
+                                                            -- as the word "NULL", which is what an
+                                                            -- imported CSV writes for every gap in a
+                                                            -- numeric column. The fold below stopped at
+                                                            -- nothing, so [10, 20, null, null] seeded
+                                                            -- "NULL" and filled the column with a word
+                                                            -- its own type does not allow.
+                                                            texts =
+                                                                rows
+                                                                    |> List.map
+                                                                        (\y ->
+                                                                            Array.get (toDoc y - 1) table.rows
+                                                                                |> Maybe.map (\row -> iif (blankCell col.key row) "" (cellText col.key row))
+                                                                                |> Maybe.withDefault ""
+                                                                        )
+
+                                                            -- The seeds are the selection's leading run of
+                                                            -- filled cells, never the whole of it, so the
+                                                            -- fill always has a row to land on. Fewer than
+                                                            -- two of them repeats the top cell, which is
+                                                            -- what fill-down always did.
+                                                            seeds =
+                                                                texts
+                                                                    |> List.foldl (\t ( stopped, n ) -> iif (stopped || String.trim t == "") ( True, n ) ( False, n + 1 )) ( False, 0 )
+                                                                    |> Tuple.second
+                                                                    |> min (List.length rows - 1)
+                                                                    |> (\n -> List.take n texts)
+
+                                                            values =
+                                                                case ( List.length seeds >= 2, seriesEncoder col.typ ) of
+                                                                    ( True, Just encode ) ->
+                                                                        fillSeries seeds (List.length rows - List.length seeds) |> List.map encode
+
+                                                                    _ ->
+                                                                        List.repeat (List.length rows - 1) (getOldValue (toDoc top) col.key)
                                                         in
-                                                        List.range (top + 1) norm.b.y
+                                                        List.map2 Tuple.pair (List.drop (List.length rows - List.length values) rows) values
                                                             |> List.map
-                                                                (\y ->
+                                                                (\( y, value ) ->
                                                                     let
                                                                         docY =
                                                                             toDoc y
                                                                     in
                                                                     ( { action = "set"
                                                                       , path = [ E.int docY, E.string col.key ]
-                                                                      , value = seed
+                                                                      , value = value
                                                                       }
                                                                     , { action = "set"
                                                                       , path = [ E.int docY, E.string col.key ]
@@ -4139,6 +4400,12 @@ updateKeyDown event ({ sheet } as model) =
 
     else if (event.ctrl || event.meta) && event.key == "h" then
         update (FindOpen True) model
+
+    else if (event.ctrl || event.meta) && String.toLower event.key == "d" && event.shift then
+        -- The whole sheet, not the selection, which is why it is here and in the
+        -- palette rather than in a column's panel. Lowercased because a browser
+        -- reports the shifted key as "D".
+        update (DocMsg SheetRowsDedupe) model
 
     else if (event.ctrl || event.meta) && event.key == "d" then
         update (DocMsg (SheetFillDown sheet.select)) model
@@ -4947,6 +5214,7 @@ shortcutGroups =
         , ( "Ctrl/⌘+Enter", "insert rows above", Nothing )
         , ( "Ctrl/⌘+Shift+Enter", "duplicate rows", Nothing )
         , ( "Ctrl/⌘+D", "fill down", Nothing )
+        , ( "Ctrl/⌘+Shift+D", "delete duplicate rows", Just (DocMsg SheetRowsDedupe) )
         ]
       )
     , ( "Select & clipboard"
@@ -5729,25 +5997,241 @@ cellRewrites col change rows =
     ( List.map Tuple.first pairs, List.map Tuple.second pairs )
 
 
-{-| The document rows whose cell in this column holds nothing: missing, null, or
-text that is only whitespace. A zero is not blank.
+{-| Nothing in this cell: the column is missing from the row, its value is null,
+or it is text that is only whitespace. A zero is not blank.
+-}
+blankCell : String -> Row -> Bool
+blankCell key row =
+    case Dict.get key row of
+        Nothing ->
+            True
+
+        Just value ->
+            (D.decodeValue (D.nullable D.string) value == Ok Nothing)
+                || (D.decodeValue D.string value |> Result.map (String.trim >> String.isEmpty) |> Result.withDefault False)
+
+
+{-| The document rows whose cell in this column holds nothing.
 -}
 blankRows : Col -> Array Row -> List Int
 blankRows col rows =
     rows
         |> Array.toIndexedList
-        |> List.filterMap
-            (\( i, row ) ->
-                case Dict.get col.key row of
-                    Nothing ->
-                        Just (i + 1)
+        |> List.filterMap (\( i, row ) -> iif (blankCell col.key row) (Just (i + 1)) Nothing)
 
-                    Just value ->
-                        iif (D.decodeValue (D.nullable D.string) value == Ok Nothing) (Just (i + 1)) <|
-                            iif (D.decodeValue D.string value |> Result.map (String.trim >> String.isEmpty) |> Result.withDefault False)
-                                (Just (i + 1))
-                                Nothing
+
+{-| The document rows that repeat a row above them, keyed on every cell they
+hold: the first of a repeat stays and the ones under it are what
+`SheetRowsDedupe` deletes. Every row the document holds, not the rows on screen,
+the way the column's cleaning verbs read them -- a filter left on would
+otherwise dedupe half a sheet against itself.
+
+The row's own keys, never the column list: a cell whose key `data[0]` no longer
+names is still a cell, and two peers -- one splicing the column out, one writing
+that column's cell -- merge to exactly that. Signing off the columns instead
+deleted the row holding it, and a sheet whose column list was empty signed every
+row the same and collapsed to its first.
+
+A blank cell reads as blank whichever way it is spelled, so two empty rows are
+one row. Everything else compares as the JSON the document holds, so two strings
+repeat only when they are the same string, code point for code point: nothing
+here folds case or normalizes an accent, because a row this deletes cannot be
+had back except through undo.
+
+-}
+duplicateRows : Array Row -> List Int
+duplicateRows rows =
+    let
+        -- A row as one string, cell by cell, in the key order `Dict.toList`
+        -- keeps so the same row signs the same way whatever order it was
+        -- written in. Key and value are both JSON text and NUL joins them,
+        -- because NUL is the one character JSON text cannot carry unescaped:
+        -- no pair of cells can spell another pair's signature between them.
+        signature row =
+            row
+                |> Dict.toList
+                |> List.filterMap (\( key, value ) -> iif (blankCell key row) Nothing (Just (E.encode 0 (E.string key) ++ E.encode 0 value)))
+                |> String.join "\u{0000}"
+    in
+    rows
+        |> Array.toIndexedList
+        |> List.foldl
+            (\( i, row ) ( seen, repeats ) ->
+                let
+                    key =
+                        signature row
+                in
+                iif (Set.member key seen) ( seen, (i + 1) :: repeats ) ( Set.insert key seen, repeats )
             )
+            ( Set.empty, [] )
+        |> Tuple.second
+        |> List.reverse
+
+
+{-| How a filled-down series is written back, and Nothing for a column no series
+belongs in.
+
+The seeds come out of `cellText`, which renders any JSON as display text, so a
+series is text whatever the column holds. Writing that text back is only right
+where the column holds text: a num column that held 10 and 20 got the strings
+"30" and "40", a bool column got "true" where `E.bool True` had been, and a json
+column's objects were overwritten with "a: 3". `checkColumnTypes` coerces the
+numeric types on the way out and leaves the rest, so those survived every read --
+and MCP's `write_cells` refuses exactly the value the page's own fill-down wrote.
+
+Exhaustive on purpose: a new column type has to say which of the three it is.
+
+-}
+seriesEncoder : Type -> Maybe (String -> E.Value)
+seriesEncoder typ =
+    let
+        asNumber text =
+            String.toFloat text |> Maybe.map E.float |> Maybe.withDefault (E.string text)
+    in
+    case typ of
+        Text ->
+            Just E.string
+
+        Link ->
+            Just E.string
+
+        SheetId ->
+            Just E.string
+
+        Image ->
+            Just E.string
+
+        Thumb ->
+            Just E.string
+
+        Enum _ ->
+            Just E.string
+
+        Number ->
+            Just asNumber
+
+        Usd ->
+            Just asNumber
+
+        Percentage ->
+            Just asNumber
+
+        Unknown ->
+            Nothing
+
+        Boolean ->
+            Nothing
+
+        Date ->
+            Nothing
+
+        Timestamp ->
+            Nothing
+
+        Json ->
+            Nothing
+
+        Many _ ->
+            Nothing
+
+        Delete ->
+            Nothing
+
+        Trash ->
+            Nothing
+
+        Restore ->
+            Nothing
+
+        Create ->
+            Nothing
+
+        Form ->
+            Nothing
+
+
+{-| The values that carry a column on below its seeds. Two or more numbers
+continue the step between the last pair, one number counts up by one, text
+ending in digits counts those digits up, and anything else repeats the last
+seed. A date is none of those: continuing one is calendar arithmetic, nothing
+here does calendar arithmetic by hand, and the trailing digits of "2026-01-31"
+otherwise counted January on to a 32nd day.
+
+Everything this writes is a value a float carries and a cell can hold. A step
+that overflowed, a counter past what a float counts exactly, and a seed written
+in exponent form all used to write a word, a repeated id or a zero into the
+document instead.
+
+-}
+fillSeries : List String -> Int -> List String
+fillSeries seeds count =
+    let
+        last =
+            List.reverse seeds |> List.head |> Maybe.withDefault ""
+
+        numbers =
+            List.filterMap (String.trim >> String.toFloat) seeds
+
+        -- The seeds' own precision: 1, 2 counts in whole numbers and 0.5, 1.0
+        -- in tenths. Bounded by the count a column may ask for, and for the
+        -- same reason: two cells pasted at a double's full precision asked for
+        -- twenty-two places, which `fixed` cannot write.
+        decimals =
+            seeds
+                |> List.map (String.split "." >> List.drop 1 >> List.head >> Maybe.map String.length >> Maybe.withDefault 0)
+                |> List.maximum
+                |> Maybe.withDefault 0
+                |> min maxDecimals
+
+        tail =
+            last
+                |> String.foldr (\c ( stopped, acc ) -> iif (stopped || not (Char.isDigit c)) ( True, acc ) ( False, String.cons c acc )) ( False, "" )
+                |> Tuple.second
+
+        -- The trailing digits, when they are a counter this can carry on. Not a
+        -- date, which `parseDay` is what says. Not more than fifteen digits
+        -- either: `String.toInt` accumulates in a float and `String.fromInt`
+        -- writes one, so a nineteen-digit id came back rounded and every filled
+        -- row got the same one.
+        countable =
+            iif (parseDay last == Nothing && String.length tail <= 15) (String.toInt tail) Nothing
+
+        -- What a step of the series is written as. A value the seeds' own
+        -- precision cannot spell is written the way Elm writes it: a seed in
+        -- exponent form carries no dot at all -- `String.fromFloat` writes 1e-8
+        -- that way and that is what a num cell hands back -- so `fixed 0` filled
+        -- the column with zeros. A step that left the floats behind is not a
+        -- number at all, so it repeats the seed the way anything else this
+        -- cannot continue does: "Infinity" and "NaN" were landing in cells.
+        written value =
+            if isNaN value || isInfinite value then
+                last
+
+            else if decimals == 0 && value /= toFloat (round value) then
+                String.fromFloat value
+
+            else
+                fixed decimals value
+    in
+    -- Two numbers are what a step is, so two is what the pattern asks for. The
+    -- caller already refuses to come here with fewer, and a default step of one
+    -- for a shape that cannot arrive was a number this could not have known.
+    case ( List.length numbers == List.length seeds, List.reverse numbers ) of
+        ( True, latest :: previous :: _ ) ->
+            let
+                step =
+                    latest - previous
+            in
+            List.range 1 count |> List.map (\i -> written (latest + step * toFloat i))
+
+        _ ->
+            case countable of
+                Just counted ->
+                    List.range 1 count
+                        |> List.map (\i -> String.dropRight (String.length tail) last ++ (String.fromInt (counted + i) |> String.padLeft (String.length tail) '0'))
+
+                Nothing ->
+                    List.repeat count last
 
 
 rowSplices : (Int -> Maybe Row) -> Int -> List Int -> (Int -> Int) -> ( List Patch, List Patch )
@@ -5921,8 +6405,8 @@ cellClasses sheet i n =
         ]
 
 
-cellDecoder : Type -> Int -> Int -> D.Decoder (Maybe (Html Msg))
-cellDecoder typ i n =
+cellDecoder : Type -> Maybe Int -> Int -> Int -> D.Decoder (Maybe (Html Msg))
+cellDecoder typ decimals i n =
     D.maybe
         (case typ of
             Unknown ->
@@ -5944,13 +6428,13 @@ cellDecoder typ i n =
                 boolean |> D.map (\c -> H.input [ A.type_ "checkbox", A.checked c, A.onCheck (DocMsg << CellCheck { x = i, y = n }) ] [])
 
             Number ->
-                D.oneOf [ D.map (text << formatNumber Number) number, D.map text string ]
+                D.oneOf [ D.map (text << formatNumber Number decimals) number, D.map text string ]
 
             Usd ->
-                D.oneOf [ D.map (text << formatNumber Usd) number, D.map text string ]
+                D.oneOf [ D.map (text << formatNumber Usd decimals) number, D.map text string ]
 
             Percentage ->
-                D.oneOf [ D.map (text << formatNumber Percentage) number, D.map text string ]
+                D.oneOf [ D.map (text << formatNumber Percentage decimals) number, D.map text string ]
 
             Date ->
                 D.map text string
@@ -6005,8 +6489,8 @@ viewThumb cols rows spark =
         text ""
 
 
-viewStatCell : Type -> Maybe Stat -> List (Html Msg)
-viewStatCell typ maybeStat =
+viewStatCell : Type -> Maybe Int -> Maybe Stat -> List (Html Msg)
+viewStatCell typ decimals maybeStat =
     let
         grid =
             H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gap "0 0.5rem", S.justifyContentFlexStart, S.fontSizeRem 0.75 ]
@@ -6017,9 +6501,9 @@ viewStatCell typ maybeStat =
     case maybeStat of
         Just (Numeric stat) ->
             [ grid <|
-                kv "min" (Maybe.withDefault "" (Maybe.map (formatNumber typ) stat.min))
-                    ++ kv "max" (Maybe.withDefault "" (Maybe.map (formatNumber typ) stat.max))
-                    ++ kv "mean" (iif (stat.count == 0) "" (String.fromInt (round (stat.sum / toFloat stat.count))))
+                kv "min" (Maybe.withDefault "" (Maybe.map (formatNumber typ decimals) stat.min))
+                    ++ kv "max" (Maybe.withDefault "" (Maybe.map (formatNumber typ decimals) stat.max))
+                    ++ kv "mean" (iif (stat.count == 0) "" (formatNumber typ decimals (stat.sum / toFloat stat.count)))
                     ++ kv "count" (String.fromInt stat.count)
             ]
 
@@ -6099,6 +6583,12 @@ viewHeaderCell sheet col =
                         _ ->
                             False
 
+                -- Only a column whose cells are numbers has a decimal count to
+                -- ask for; every other type reads its cells as the text they
+                -- already are.
+                numeric =
+                    List.member col.typ [ Number, Usd, Percentage ]
+
                 isFilterOpen =
                     sheet.filterOpen == Just col.key
 
@@ -6147,6 +6637,22 @@ viewHeaderCell sheet col =
                         [ H.input [ A.placeholder "contains...", A.value currentFilterValue, A.onInput (FilterInput col.key), S.width "100%" ] []
                         , H.button [ A.onClick (ColumnHide col.key), S.marginTop "0.25rem" ] [ text "Hide column" ]
                         , H.button [ A.onClick (ColumnPin col.key), S.marginTop "0.25rem" ] [ text (iif isPinned "Unpin column" "Pin column") ]
+                        , iif numeric
+                            (H.label [ A.class "decimals", S.displayFlex, S.alignItemsCenter, S.gapRem 0.25, S.marginTop "0.25rem" ]
+                                [ text "decimals"
+                                , H.input
+                                    [ A.type_ "number"
+                                    , A.min "0"
+                                    , A.max (String.fromInt maxDecimals)
+                                    , A.placeholder "auto"
+                                    , A.value (Dict.get col.key sheet.decimals |> Maybe.map String.fromInt |> Maybe.withDefault "")
+                                    , A.onInput (ColumnDecimals col.key)
+                                    , S.widthRem 4
+                                    ]
+                                    []
+                                ]
+                            )
+                            (text "")
                         , if movable then
                             H.div [ S.displayFlex, S.flexWrapWrap, S.gapRem 0.25, S.marginTop "0.25rem" ]
                                 [ H.button [ A.onClick (DocMsg (SheetColumnTrim col.key)), A.title "drop the spaces around every value in this column" ] [ text "Trim" ]
@@ -6221,7 +6727,7 @@ viewCell sheet stats pins grab i n col row =
         else
             case String.fromInt n of
                 "-2" ->
-                    viewStatCell col.typ (Maybe.andThen (Array.get i) (Result.toMaybe stats))
+                    viewStatCell col.typ (Dict.get col.key sheet.decimals) (Maybe.andThen (Array.get i) (Result.toMaybe stats))
 
                 "-1" ->
                     [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontSizeRem 0.75 ] [ text col.raw ] ]
@@ -6245,7 +6751,7 @@ viewCell sheet stats pins grab i n col row =
                     , row
                         |> Dict.get col.key
                         |> Maybe.withDefault (E.string "")
-                        |> D.decodeValue (cellDecoder col.typ i n)
+                        |> D.decodeValue (cellDecoder col.typ (Dict.get col.key sheet.decimals) i n)
                         |> Result.map (Maybe.withDefault (text ""))
                         |> Result.mapError (D.errorToString >> text)
                         |> (\r ->
@@ -6448,7 +6954,7 @@ viewTableFooter trash sheet pins cols rows =
                     List.map
                         (\col ->
                             H.td ([ S.textAlignRight, S.fontWeight "600", iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) ] ++ pinAttrs pins col)
-                                [ text (Maybe.withDefault "" (Maybe.map (formatNumber col.typ) (columnTotal rows col))) ]
+                                [ text (Maybe.withDefault "" (Maybe.map (formatNumber col.typ (Dict.get col.key sheet.decimals)) (columnTotal rows col))) ]
                         )
                         (Array.toList cols)
                         ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [] ]
@@ -6622,7 +7128,7 @@ viewNetHook model =
         ]
 
 
-viewNetHttp : Model -> { url : String, interval : Int, headers : String } -> Html Msg
+viewNetHttp : Model -> { url : String, interval : Int, headers : String, method : String, body : String } -> Html Msg
 viewNetHttp model cfg =
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ viewNetWarning model
@@ -6631,12 +7137,21 @@ viewNetHttp model cfg =
             , H.input [ A.type_ "text", A.value cfg.url, A.onInput (InputChange NetUrl) ] []
             ]
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "method"
+            , H.select [ A.value cfg.method, A.onInput (InputChange NetMethod) ] <|
+                List.map (\m -> H.option [ A.value m, A.selected (m == cfg.method) ] [ text m ]) netMethods
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "poll every (seconds)"
             , H.input [ A.type_ "number", A.value (String.fromInt cfg.interval), A.onInput (InputChange NetInterval) ] []
             ]
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "headers"
             , H.textarea [ A.class "mono", A.value cfg.headers, A.placeholder "Name: value\none per line", A.onInput (InputChange NetHeaders) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "body, sent with a POST or a PUT"
+            , H.textarea [ A.class "mono", A.value cfg.body, A.placeholder "{\"since\": \"{{cursor}}\", \"key\": \"{{secret:name}}\"}", A.spellcheck False, A.onInput (InputChange NetBody) ] []
             ]
         , H.div [ S.displayFlex, S.gapRem 0.5, S.alignItemsCenter ]
             [ H.button [ A.class "chip", A.onClick Preflight, A.title "fetch it once, now, and show what comes back" ] [ text "test the request" ]
@@ -6690,8 +7205,8 @@ viewAlert model cfg =
             , H.textarea [ A.id "code", A.class "mono", A.rows 8, A.value cfg.code, A.placeholder "select * from @query:budget-burn where burn_ratio > 1.1", A.spellcheck False, A.onInput (InputChange AlertCode) ] []
             ]
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
-            [ text "email"
-            , H.input [ A.type_ "email", A.value cfg.to, A.placeholder "you@example.com", A.onInput (InputChange AlertTo) ] []
+            [ text "email, or a webhook url"
+            , H.input [ A.value cfg.to, A.placeholder "you@example.com", A.onInput (InputChange AlertTo) ] []
             ]
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "check every (seconds)"
@@ -6716,7 +7231,7 @@ viewAlert model cfg =
                         "no runs yet"
             ]
         , H.p [ S.fontSizeRem 0.875, S.color "#666" ]
-            [ text "Only a run that changes the answer is sent, and every run lands in the rows beside this." ]
+            [ text "Only a run that changes the answer is sent, and every run lands in the rows beside this. A url is posted to rather than mailed: a Slack or Discord webhook gets the shape it reads, and any other url gets the rows." ]
         ]
 
 

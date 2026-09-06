@@ -3315,16 +3315,27 @@ const QUERIES = {
       "select * from (select cohort, 'm' + month_no as month_no, customers from @query:cohort-retention) pivot (sum(customers) for month_no)",
     ),
   },
-  // Decline curves. Production falls off a log-linear line, so fitting one is
-  // fit_exponential(), and the number the fit is for is the rate two years from
-  // now -- which is where the reserve estimate and the loan covenant both live.
+  // Decline curves. Read on a log scale production falls off a straight line, so
+  // fit_exponential() fits one -- but a real well flattens as it ages, which is
+  // the curve fit_hyperbolic() fits and the exponential one cannot. The two
+  // columns for month 36 are the same well a year from now under each. These
+  // three wells were drawn with an exponential tail, so the pair reads close
+  // here; on a real well the gap is what the reserve estimate and the loan
+  // covenant argue about.
   "query:decline-fit": {
     name: "well decline curves",
     tags: ["demo", "energy", "query"],
     system: true,
     doc: QuerySql(
-      { months: "int", peak_bbl: "num", latest_bbl: "num", month_36_bbl: "num", annual_decline: "percentage" },
-      "select well, count(*) as months, round(max(oil_bbl), 0) as peak_bbl, round(fit_exponential(array(month_no), array(oil_bbl), 24), 0) as latest_bbl, round(fit_exponential(array(month_no), array(oil_bbl), 36), 0) as month_36_bbl, round(1 - fit_exponential(array(month_no), array(oil_bbl), 24) / fit_exponential(array(month_no), array(oil_bbl), 12), 4) as annual_decline from @table:well-production group by well order by peak_bbl desc",
+      {
+        months: "int",
+        peak_bbl: "num",
+        latest_bbl: "num",
+        month_36_bbl: "num",
+        arps_36_bbl: "num",
+        annual_decline: "percentage",
+      },
+      "select well, count(*) as months, round(max(oil_bbl), 0) as peak_bbl, round(fit_exponential(array(month_no), array(oil_bbl), 24), 0) as latest_bbl, round(fit_exponential(array(month_no), array(oil_bbl), 36), 0) as month_36_bbl, round(fit_hyperbolic(array(month_no), array(oil_bbl), 36), 0) as arps_36_bbl, round(1 - fit_exponential(array(month_no), array(oil_bbl), 24) / fit_exponential(array(month_no), array(oil_bbl), 12), 4) as annual_decline from @table:well-production group by well order by peak_bbl desc",
     ),
   },
   // Bank against book. The amount matches exactly and the name never does, so

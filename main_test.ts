@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertThrows } from "@std/assert";
+import { assert, assertEquals, assertRejects, assertThrows } from "@std/assert";
 import { PGlite } from "@electric-sql/pglite";
 import { PostgresConnection } from "pg-gateway";
 import { citext } from "@electric-sql/pglite/contrib/citext";
@@ -7,14 +7,18 @@ import { decodeSyncMessage } from "@automerge/automerge";
 import { WebSocketClientAdapter } from "@automerge/automerge-repo-network-websocket";
 import Stripe from "stripe";
 import {
+  accountBuckets,
   app,
+  APPEND_ROWS_MAX,
   arrayify,
   automerge,
   BODY_CAP,
   callerIp,
   createJwt,
   createToken,
+  errorLogged,
   flushFolds,
+  flushWebhooks,
   HOOK_BYTES_PER_WINDOW,
   HOOK_ROWS_PER_WINDOW,
   HOOK_WINDOW_S,
@@ -22,21 +26,11 @@ import {
   hookBuckets,
   hookSecret,
   hookSign,
-  errorLogged,
-  flushWebhooks,
   HOST_GAP_MS,
-  WEBHOOK_FAILS_MAX,
-  webhookTimer,
-  WEBHOOKS_PER_SHEET_MAX,
-  accountBuckets,
-  APPEND_ROWS_MAX,
-  USER_EMAILS_PER_DAY,
-  USER_SHEETS_MAX,
-  LICENSES,
-  safeFetch,
-  USER_AGENT,
   hostDue,
+  LICENSES,
   LOG_EVERY_MS,
+  type Method,
   NET_KEEP,
   netDue,
   parseNetHeaders,
@@ -44,11 +38,18 @@ import {
   pollNetOnce,
   RATE_LIMIT_KEYS_MAX,
   requireSecret,
+  safeFetch,
   seed,
   sendDigestOnce,
   sql,
   status,
   trimNet,
+  USER_AGENT,
+  USER_ALERTS_PER_DAY,
+  USER_SHEETS_MAX,
+  WEBHOOK_FAILS_MAX,
+  WEBHOOKS_PER_SHEET_MAX,
+  webhookTimer,
 } from "./main.ts";
 import type { Col, Query, Sheet, Table, Template } from "./main.ts";
 import { DATASETS } from "./src/examples.mjs";
@@ -493,7 +494,8 @@ Deno.test(async function allTests(t) {
       const receive = eAdapter.receiveMessage.bind(eAdapter);
       eAdapter.receiveMessage = (bytes: Uint8Array) => {
         const frame = AM.cbor.decode(new Uint8Array(bytes)) as { type: string; documentId?: string; data?: Uint8Array };
-        if (frame.type === "sync" && frame.documentId === hand.documentId) heard.push(decodeSyncMessage(frame.data!).heads);
+        if (frame.type === "sync" && frame.documentId === hand.documentId)
+          heard.push(decodeSyncMessage(frame.data!).heads);
         return receive(bytes);
       };
       eHandle.change((d: Sheet) => {
@@ -1006,7 +1008,12 @@ Deno.test(async function allTests(t) {
         });
         await put(jwt, `/library/table:${big.documentId}`, {});
         const alert2 = automerge.create<{ data: [{ code: string; to: string; interval: number; when: string }] }>({
-          data: [{ code: `select n from @table:${big.documentId}`, to: "two@example.com", interval: 60, when: "added" }],
+          data: [{
+            code: `select n from @table:${big.documentId}`,
+            to: "two@example.com",
+            interval: 60,
+            when: "added",
+          }],
         });
         await put(jwt, `/library/alert:${alert2.documentId}`, { name: "big watch" });
         const history2 = async () => {
@@ -1041,6 +1048,88 @@ Deno.test(async function allTests(t) {
         assertEquals([after.status, after.added], ["clear", null]);
         assert(String(after.diff_skipped).includes("the run before failed"), String(after.diff_skipped));
         assertEquals(to("two@example.com").length, 0, "the run after an error must not call every row new");
+      }
+
+      // A destination that is a url is posted to rather than mailed. Slack and
+      // Discord each read one field of the body; anything else gets the alert.
+      {
+        const posts: { url: string; body: Record<string, unknown> }[] = [];
+        const fetcher = (url: string, _headers?: Record<string, string>, _method?: string, body?: string) => {
+          posts.push({ url, body: JSON.parse(String(body)) as Record<string, unknown> });
+          return Promise.resolve(new Response("ok"));
+        };
+        const target = (address: string) =>
+          alert.change((d: { data: [{ to: string }] }) => {
+            d.data[0].to = address;
+          });
+        const mailed = sent.length;
+
+        target("https://hooks.slack.com/services/T0/B0/zzz");
+        burn(2, 1.4);
+        clock += 120_000;
+        await pollAlertOnce(send, clock, fetcher);
+        assertEquals(posts.length, 1, "a url destination is posted to");
+        assertEquals(posts[0].url, "https://hooks.slack.com/services/T0/B0/zzz");
+        assertEquals(Object.keys(posts[0].body), ["text"], "slack reads one field and ignores the rest");
+        assert(String(posts[0].body.text).includes("burn watch"), String(posts[0].body.text));
+        assertEquals((await history())[0].delivery, "sent");
+        assertEquals(sent.length, mailed, "a url destination is not also mailed");
+        // The run row is read by everyone the sheet is shared with, and a
+        // webhook url's path is the whole of its authorization: the log says
+        // which service was posted to and the document keeps the rest.
+        assertEquals((await history())[0].to, "hooks.slack.com");
+        assert(
+          !JSON.stringify(await get<Table>(jwt, `/sheet/${alert_id}`)).includes("T0/B0/zzz"),
+          "the run log holds the webhook's path",
+        );
+
+        // Every other url gets the alert itself: which sheet, its name, its rows.
+        target("https://example.com/hooks/alerts");
+        burn(2, 1.6);
+        clock += 120_000;
+        await pollAlertOnce(send, clock, fetcher);
+        assertEquals(posts.length, 2);
+        assertEquals([posts[1].body.sheet, posts[1].body.name], [alert_id, "burn watch"]);
+        assertEquals((posts[1].body.rows as unknown[]).length, 2);
+
+        // A url inside this server's own network is refused by safeFetch, and a
+        // refused post is recorded and sent again next interval, which is what a
+        // refused email already does.
+        target("http://localhost:9/hooks/alerts");
+        burn(2, 1.8);
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        const refused = (await history())[0];
+        assertEquals(refused.status, "firing");
+        assert(String(refused.delivery).includes("own network"), String(refused.delivery));
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        const retried = (await history())[0];
+        assertEquals(retried.status, "firing", "a refused post is sent again next interval");
+        assert(String(retried.delivery).includes("own network"), String(retried.delivery));
+
+        // A digest is one email a day over many alerts, and there is no summary
+        // to post: the pair is refused by name rather than quietly dropped.
+        alert.change((d: { data: [{ to: string; digest?: boolean }] }) => {
+          d.data[0].digest = true;
+        });
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        const both = (await history())[0];
+        assertEquals(both.status, "error");
+        assert(String(both.error).includes("digest"), String(both.error));
+
+        // Back to an address, and left quiet: the steps after this one share
+        // one database, and an alert that is still firing mails from theirs.
+        alert.change((d: { data: [{ digest?: boolean; to: string }] }) => {
+          d.data[0].digest = false;
+          d.data[0].to = "ops@example.com";
+        });
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        clock += 120_000;
+        await pollAlertOnce(send, clock);
+        assertEquals((await history())[0].status, "unchanged");
       }
 
       // An alert reads as a sheet, so its history is queryable like any log.
@@ -1421,6 +1510,60 @@ Deno.test(async function allTests(t) {
       );
       assertEquals(round(power.p, 6), 128);
 
+      // Arps hyperbolic decline, qi = 1000, Di = 0.1, b = 0.5, which is
+      // q(t) = 1000 / (1 + 0.05t)^2. Two years of it, read back a year past the
+      // end, where the closed form is 1000 / 2.8^2.
+      const months = [...Array(25).keys()];
+      const rows = (q: (t: number) => number) =>
+        `(${months.map((t) => `select ${t} as x, ${q(t).toFixed(4)} as y`).join(" union all ")})`;
+      const decline = (t: number) => 1000 / (1 + 0.05 * t) ** 2;
+      const hyp = await run(`select fit_hyperbolic(array(x),array(y),36) h from ${rows(decline)}`);
+      assertEquals(round(hyp.h, 3), 127.551);
+      // The same curve with five percent of wobble on it. A least-squares fit of
+      // three parameters to noisy points does not land on the parameters that drew
+      // them, so what is checked is that it still lands near the answer.
+      const rough = await run(
+        `select fit_hyperbolic(array(x),array(y),36) h from ${
+          rows((t) => decline(t) * (1 + 0.05 * Math.sin(t * 2.4)))
+        }`,
+      );
+      assert(Math.abs(Number(rough.h) / 127.551 - 1) < 0.02, `noisy decline answered ${rough.h}`);
+      // A rate that declines straight is the b = 0 member of the same family, so
+      // the hyperbolic fit answers what the exponential one does rather than
+      // chasing a b the points do not have.
+      const both = await run(
+        `select fit_hyperbolic(array(x),array(y),36) h, fit_exponential(array(x),array(y),36) e
+         from ${rows((t) => 1000 * Math.exp(-0.1 * t))}`,
+      );
+      assertEquals(round(both.h, 6), round(both.e, 6));
+      // The same decline in different units is the same decline. The fit read
+      // its step tolerance in the units of the columns, so a rate in the billions
+      // answered a quarter low and a month column spelled as unix seconds never
+      // moved b off the exponential seed it starts from.
+      const big = await run(`select fit_hyperbolic(array(x),array(y),36) h from ${rows((t) => decline(t) * 1e9)}`);
+      assertEquals(round(Number(big.h) / 1e9, 3), 127.551, `qi = 1e9 answered ${big.h}`);
+      const month = 2629800, epoch = months.map((t) => 1735689600 + t * month);
+      assertEquals(
+        round(
+          ala.fn.fit_hyperbolic(epoch, epoch.map((t) => decline((t - epoch[0]) / month)), epoch[0] + 36 * month),
+          3,
+        ),
+        127.551,
+      );
+      // b = 2 is the top of the range the fit holds b in, so an exact b = 2
+      // decline is an answer and not a refusal: the guard used to fire on a trial
+      // step that overshot the bound rather than on the fit that came back.
+      const steep = (t: number) => 1000 / (1 + 0.2 * t) ** 0.5;
+      assertEquals(round(ala.fn.fit_hyperbolic(months, months.map(steep), 36), 3), round(steep(36), 3));
+      // A straight exponential decline fits b = 0, the member of the family with
+      // no asymptote, so a refusal past the end of it cannot name where the curve
+      // begins: -1 / (0 * Di) is -Infinity, a bound every x already clears.
+      const overflow = assertThrows(
+        () => ala.fn.fit_hyperbolic(months, months.map((t) => 1000 * Math.exp(-0.1 * t)), -10000),
+        Error,
+      ).message;
+      assert(!overflow.includes("Infinity"), overflow);
+
       // A robust score: one value at 100 among small ones cannot widen the ruler
       // it is measured against, which is what a plain z-score lets it do.
       const outlier = await run(
@@ -1477,6 +1620,37 @@ Deno.test(async function allTests(t) {
       assertThrows(() => ala.fn.t_test([1], [2, 3]), Error, "at least 2 values");
       assertThrows(() => ala.fn.ci_low([1, 2, 3], 95), Error, "between 0 and 1");
       assertThrows(() => ala.fn.fit_exponential([1, 2], [1, 0], 4), Error, "above zero");
+      assertThrows(() => ala.fn.fit_hyperbolic([1, 2, 3], [1, 2, 0], 4), Error, "above zero");
+      // Past b = 2 the curve integrates to infinite production. These points are
+      // drawn with b = 4, so the fit runs out of the range and says so.
+      assertThrows(
+        () => ala.fn.fit_hyperbolic(months, months.map((t) => 1000 / (1 + 0.4 * t) ** 0.25), 36),
+        Error,
+        "between 0 and 2",
+      );
+      // The same refusal reaches an ordinary noisy well whose tail flattens
+      // faster than b = 2 allows. It used to be told its points do not decline;
+      // these fall from 2.83 to 1.53, so that sentence sent whoever read it
+      // looking at a rate column that was fine.
+      const flat = assertThrows(
+        () =>
+          ala.fn.fit_hyperbolic(
+            [1, 2, 3, 4, 5, 6, 7, 8, 9],
+            [2.83, 2.27, 2.15, 2.16, 1.85, 1.86, 1.65, 1.56, 1.53],
+            12,
+          ),
+        Error,
+        "between 0 and 2",
+      );
+      assert(!flat.message.includes("do not decline"), flat.message);
+      // Steps were bounded and points were not, so the cost of one call was the
+      // rows a sheet holds: a million pairs was seconds of blocked event loop.
+      const crowd = Array.from({ length: 5001 }, (_, i) => i + 1);
+      assertThrows(
+        () => ala.fn.fit_hyperbolic(crowd, crowd.map((t) => 1000 / (1 + 0.05 * t) ** 2), 36),
+        Error,
+        "at most 5000 pairs",
+      );
       // JSON.stringify() turns Infinity and NaN into "null", so these used to
       // read "received number null", which names neither the value nor the bug.
       assertThrows(() => ala.fn.width_bucket(Infinity, 0, 30, 6), Error, "received number Infinity");
@@ -2147,7 +2321,10 @@ Deno.test(async function allTests(t) {
         return await res.text();
       };
       assert((await refusal(`explain describe @${id}`)).includes("profiles a query"));
-      assert((await refusal(`explain select nope from @${id}`)).includes("nope"), "a profile of a refused query is refused");
+      assert(
+        (await refusal(`explain select nope from @${id}`)).includes("nope"),
+        "a profile of a refused query is refused",
+      );
     }
 
     // min()/max() over text used to drop the column out of the result: a silent
@@ -2878,6 +3055,188 @@ Deno.test(async function allTests(t) {
     await pollNetOnce(fetcher, t + 300_000);
     const [row] = (await get<Table>(jwt, `/net/${badId}`)).slice(1);
     assert(JSON.parse(String(row.body)).error.includes("query parameter"), String(row.body));
+  });
+
+  // One GET per interval was the whole of a feed. A body is templated where a
+  // header already was -- a secret out of the secret table, the watermark out
+  // of the last good run -- so a search API that takes a POST is a sheet and
+  // not a feature request.
+  await t.step("A feed that posts a body", async () => {
+    const { jwt } = await usr("ivy@example.com");
+    const posted = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{
+        url: "https://post.verbs.test/search",
+        interval: 120,
+        method: "POST",
+        headers: "Content-Type: application/json",
+        body: '{"since":"{{cursor}}","key":"{{secret:searchkey}}"}',
+      }],
+    });
+    const postedId = `net-http:${posted.documentId}`;
+    await put(jwt, `/library/${postedId}`, {});
+    await post(jwt, `/library/${postedId}/secret`, { name: "searchkey", value: "sk-post-1" });
+
+    // An apostrophe is a valid HTTP token character, so a header name may hold
+    // one, and the repro line is pasted into a shell.
+    const quoting = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://quote.verbs.test/feed", interval: 120, headers: "X'Y: abc", method: "POST", body: "b" }],
+    });
+    const quotingId = `net-http:${quoting.documentId}`;
+    await put(jwt, `/library/${quotingId}`, {});
+
+    // A GET carrying a body is refused while the sheet's own text is still in
+    // hand. The refusal is written to this log, which every viewer and every
+    // share-link holder reads, and a size measured on the resolved body is an
+    // oracle on the secret behind it, refreshed every interval.
+    const getBody = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://getbody.verbs.test/feed", interval: 120, body: "{{secret:leaky}}" }],
+    });
+    const getBodyId = `net-http:${getBody.documentId}`;
+    await put(jwt, `/library/${getBodyId}`, {});
+    await post(jwt, `/library/${getBodyId}/secret`, { name: "leaky", value: "0123456789abcdefghij" });
+
+    const sent: { url: string; method: string; body?: string }[] = [];
+    let answer = () => new Response(`{"ok":true,"at":${sent.length}}`);
+    const fetcher = (url: string, _headers: Record<string, string> = {}, method: Method = "GET", body?: string) => {
+      if (url.includes(".verbs.test")) sent.push({ url, method, body });
+      return Promise.resolve(answer());
+    };
+    const t = Date.now() + 70_000_000;
+    // A cycle stops starting sheets past POLL_CYCLE_MS, and by here the suite
+    // has made more net-http sheets than one cycle takes. The next tick takes
+    // the rest, which is what a second cycle at the same instant is.
+    const pollUntil = async (at: number, polled: () => boolean | Promise<boolean>) => {
+      for (let cycle = 0; cycle < 10; cycle++) {
+        await pollNetOnce(fetcher, at);
+        if (await polled()) return;
+      }
+      throw new Error(`ten cycles at ${at} and this sheet still had not been polled`);
+    };
+    const from = (host: string) => sent.filter((s) => s.url.startsWith(`https://${host}.verbs.test`));
+
+    await pollUntil(t, () => from("post").length === 1 && from("quote").length === 1);
+    assertEquals(from("post")[0].method, "POST");
+    assertEquals(
+      from("post")[0].body,
+      '{"since":"","key":"sk-post-1"}',
+      "the secret is resolved and the first poll has no watermark to ask from",
+    );
+
+    await pollUntil(t + 121_000, () => from("post").length === 2);
+    assertEquals(
+      JSON.parse(String(from("post")[1].body)).since,
+      new Date(t).toISOString(),
+      "the next poll asks for what came after the last good one",
+    );
+
+    // A failure row is what the user runs by hand, so it carries the method and
+    // the body the sheet spells -- never the value the secret resolved to.
+    answer = () => new Response("no", { status: 404 });
+    await pollUntil(t + 242_000, () => from("post").length === 3 && from("quote").length === 3);
+    const rows = (await get<Table>(jwt, `/net/${postedId}`)).slice(1);
+    const [failed] = rows;
+    const failure = JSON.parse(String(failed.body));
+    assert(failure.repro.includes("-X POST"), `the repro names the method: ${failure.repro}`);
+    assert(failure.repro.includes("{{secret:searchkey}}"), `and the reference: ${failure.repro}`);
+    assert(!JSON.stringify(await get<Table>(jwt, `/net/${postedId}`)).includes("sk-post-1"), "never the secret");
+    // The log's own column, not just the repro line: `select method from
+    // @net-http:x` reads it, and every export carries it.
+    assertEquals(
+      rows.map((r) => r.method),
+      rows.map(() => "POST"),
+      "and every run says which verb it sent",
+    );
+
+    // Every apostrophe in the line is either a quote of its own or escaped as
+    // `'\''`. One that is neither ends the quoting, and the pasted line hangs
+    // on an unterminated quote instead of running the request it is about.
+    const [quoted] = (await get<Table>(jwt, `/net/${quotingId}`)).slice(1);
+    const repro = String(JSON.parse(String(quoted.body)).repro);
+    assertEquals(
+      (repro.replaceAll(`'\\''`, "").match(/'/g) ?? []).length % 2,
+      0,
+      `an unbalanced curl line: ${repro}`,
+    );
+
+    // PUT is the other verb a feed may be polled with.
+    const putting = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://put.verbs.test/feed", interval: 120, method: "PUT", body: "ping" }],
+    });
+    await put(jwt, `/library/net-http:${putting.documentId}`, {});
+    answer = () => new Response(`{"ok":true}`);
+    await pollUntil(
+      t + 363_000,
+      () => from("post").length === 4 && sent.some((s) => s.url === "https://put.verbs.test/feed"),
+    );
+    const putted = sent.find((s) => s.url === "https://put.verbs.test/feed");
+    assertEquals([putted?.method, putted?.body], ["PUT", "ping"]);
+
+    // The watermark survives a failed poll. Losing it asks the feed for all of
+    // history again -- the one thing the cursor exists to prevent.
+    assertEquals(
+      JSON.parse(String(from("post")[3].body)).since,
+      new Date(t + 121_000).toISOString(),
+      "the poll after a failure resumes from the last good one",
+    );
+
+    // A verb this server does not send is refused by name where the sheet is
+    // read, rather than sent as a GET the feed answers with the wrong thing.
+    const odd = automerge.create({
+      type: "net-http",
+      data: [{ url: "https://odd.verbs.test/feed", interval: 120, method: "DELETE" }],
+    });
+    const oddId = `net-http:${odd.documentId}`;
+    await put(jwt, `/library/${oddId}`, {});
+    await pollUntil(t + 484_000, async () => (await get<Table>(jwt, `/net/${oddId}`)).length > 1);
+    assertEquals(sent.filter((s) => s.url.startsWith("https://odd.")).length, 0, "and nothing was sent");
+    const [refused] = (await get<Table>(jwt, `/net/${oddId}`)).slice(1);
+    assert(JSON.parse(String(refused.body)).error.includes("DELETE"), String(refused.body));
+
+    // And the watermark survives a failure raised before the run log is read at
+    // all. A verb this server will not send is refused off the document, above
+    // where the last row used to be read, so the failure row it wrote carried
+    // no cursor and the next good poll asked the feed for all of history.
+    const posts = from("post").length;
+    await pollUntil(t + 605_000, () => from("post").length === posts + 1);
+    const verb = (sends: string) =>
+      (posted as unknown as { change: (fn: (d: { data: [{ method: string }] }) => void) => void })
+        .change((d) => {
+          d.data[0].method = sends;
+        });
+    verb("DELETE");
+    const newest = async () =>
+      JSON.parse(String((await get<Table>(jwt, `/net/${postedId}`)).slice(1)[0].body)) as { error?: string };
+    await pollUntil(t + 726_000, async () => String((await newest()).error ?? "").includes("DELETE"));
+    assertEquals(from("post").length, posts + 1, "nothing was sent for a verb this server does not send");
+    verb("POST");
+    await pollUntil(t + 847_000, () => from("post").length === posts + 2);
+    assertEquals(
+      JSON.parse(String(from("post")[posts + 1].body)).since,
+      new Date(t + 605_000).toISOString(),
+      "the poll after a config the poller refused still resumes from the last good one",
+    );
+
+    // A run is a run whichever verb made it. RUN_OF used to say a net-http run
+    // was a GET, so a feed polled with a POST wrote rows nothing matched: it
+    // read as never-run in freshness while it was polling, and a dead one could
+    // not fail GET /status.
+    const posting = (await get<Table>(jwt, "/sheet/library:freshness")).slice(1)
+      .find((r) => r.sheet_id === postedId);
+    assert(posting, "a feed polled with a POST is in the freshness read");
+    assert(posting.last_run, `and its runs are its runs: ${JSON.stringify(posting)}`);
+
+    // A GET with a body is refused the same way, before the secret in it is
+    // resolved, so the row it writes measures the sheet's own text and never
+    // the value behind `{{secret:leaky}}`.
+    const [leaked] = (await get<Table>(jwt, `/net/${getBodyId}`)).slice(1);
+    const refusal = String(JSON.parse(String(leaked.body)).error);
+    assert(refusal.includes("A GET carries no body"), refusal);
+    assert(!refusal.includes("20"), `the row measured the secret: ${refusal}`);
+    assertEquals(from("getbody").length, 0, "and nothing was sent");
   });
 
   await t.step("The poller's two maps grow with traffic and nothing ever took anything out of them", async () => {
@@ -4079,6 +4438,138 @@ Deno.test(async function allTests(t) {
     await reject(jwt, `/library/${ghId}/secret`, { method: "DELETE", body: JSON.stringify({ name: "hook:github" }) });
   });
 
+  await t.step("A key pasted into a cell is not published by accident", async () => {
+    const { jwt } = await usr("vera@example.com");
+    // Shaped like a Stripe key and worth nothing: the scan is over the shape,
+    // and a real key in a test file is the accident this step is about.
+    const leaked = "sk_live_" + "0000EXAMPLEKEYNOTREAL0000";
+    const hand = automerge.create<Sheet>({
+      type: "table",
+      data: [
+        arrayify([
+          { name: "service", type: "text", key: 0 },
+          { name: "token", type: "text", key: 1 },
+        ]),
+        { 0: "billing", 1: "ask ops" },
+        { 0: "shipping", 1: leaked },
+      ],
+    });
+    const id = `table:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+
+    const refused = await app.request(`/library/${id}/public`, {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+      body: JSON.stringify({ public: true }),
+    });
+    assertEquals(refused.status, 400, "a sheet holding a key does not go public");
+    const text = await refused.text();
+    assert(text.includes("Stripe"), `the refusal names the shape it matched: ${text}`);
+    assert(text.includes("token"), `and the column it is in: ${text}`);
+    assert(text.includes("row 2"), `and the row, 1-based: ${text}`);
+    assert(!text.includes(leaked), "no refusal is an oracle: the value never comes back");
+    const [still]: { public: boolean }[] = await sql`select public from sheet where sheet_id = ${id}`;
+    assertEquals(still.public, false, "and the sheet stayed private");
+
+    // Taking a sheet private publishes nothing, so nothing is scanned: a key
+    // must never be what stops its own sheet from being locked down.
+    await post(jwt, `/library/${id}/public`, { public: false });
+    // A listing is the other door a stranger reads a sheet through.
+    await reject(jwt, `/sell/${id}`, { method: "POST", body: JSON.stringify({ price: 0, license: "own" }) });
+
+    hand.change((doc) => {
+      (doc.data as Table)[2][1] = "";
+    });
+    await post(jwt, `/library/${id}/public`, { public: true });
+    const [now]: { public: boolean }[] = await sql`select public from sheet where sheet_id = ${id}`;
+    assertEquals(now.public, true, "with the cell cleared, the same sheet publishes");
+    await post(jwt, `/sell/${id}`, { price: 0, license: "own" });
+
+    // An incoming-webhook url is a bearer credential: whoever holds it posts to
+    // the channel. An alert's destination is a cell, and every shape here was a
+    // token, so the one credential this app itself tells you to paste in was the
+    // one it published.
+    const posts = automerge.create<Sheet>({
+      type: "table",
+      data: [
+        arrayify([{ name: "where", type: "text", key: 0 }]),
+        // Short on purpose: a url with the real T…/B…/token widths is one GitHub
+        // push protection refuses to let into the repository, and our shape
+        // reads only the host path.
+        { 0: "https://hooks.slack.com/services/T0/B0/zzz" },
+        { 0: "https://discord.com/api/webhooks/0/zzz" },
+      ],
+    });
+    const hooked = `table:${posts.documentId}`;
+    await put(jwt, `/library/${hooked}`, {});
+    const held = await app.request(`/library/${hooked}/public`, {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+      body: JSON.stringify({ public: true }),
+    });
+    assertEquals(held.status, 400, "a sheet holding a webhook url does not go public");
+    assert((await held.text()).includes("Slack webhook url"), "the refusal names the shape it matched");
+    const [kept]: { public: boolean }[] = await sql`select public from sheet where sheet_id = ${hooked}`;
+    assertEquals(kept.public, false, "and the credential stayed private");
+  });
+
+  // The scan reads whatever a browser synced in, and it used to run before
+  // anything decided whose sheet it was reading.
+  await t.step("A publish scan is bounded, and is nobody's peephole", async () => {
+    const { jwt } = await usr("scanned@example.com");
+    const { jwt: stranger } = await usr("stranger@example.com");
+
+    // Nothing bounded a cell's length, and the signed-token shape walked the
+    // rest of the cell from every `eyJ` in it: four times the cell cost sixteen
+    // times the time, and a megabyte -- which a synced row may hold -- cost
+    // minutes of a blocked event loop.
+    //
+    // What is asserted is that the publish finishes, not how fast: an
+    // unbounded scan over 48 KB of `eyJ` costs minutes, which the suite's own
+    // ten-second budget is the alarm for. A millisecond count read against a
+    // second millisecond count is a test that fails on a busy machine instead.
+    const scanned = `table:${
+      automerge.create<Sheet>({
+        type: "table",
+        data: [arrayify([{ name: "note", type: "text", key: 0 }]), { 0: "eyJ".repeat(16_000) }],
+      }).documentId
+    }`;
+    await put(jwt, `/library/${scanned}`, {});
+    await post(jwt, `/library/${scanned}/public`, { public: true });
+    const [went]: { public: boolean }[] = await sql`select public from sheet where sheet_id = ${scanned}`;
+    assertEquals(went.public, true, "a 48 KB cell of near-misses publishes rather than blocking the isolate");
+
+    // The scan ran before the update that asks whose sheet this is, so a
+    // stranger holding an id learned what a private document holds: that it
+    // holds a credential, which one, which column, and which row.
+    const leaked = "sk_live_" + "0000EXAMPLEKEYNOTREAL0000";
+    const hand = automerge.create<Sheet>({
+      type: "table",
+      data: [
+        arrayify([{ name: "service", type: "text", key: 0 }, { name: "payments_token", type: "text", key: 1 }]),
+        { 0: "billing", 1: leaked },
+      ],
+    });
+    const id = `table:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+    const theirs = await app.request(`/sell/${id}`, {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${stranger}` }),
+      body: JSON.stringify({ price: 0, license: "own" }),
+    });
+    assertEquals(theirs.status, 403, "a listing is the owner's to make");
+    const told = await theirs.text();
+    for (const leakage of ["Stripe", "payments_token", "row 1"])
+      assert(!told.includes(leakage), `a stranger learns ${leakage} about a sheet they have no role on: ${told}`);
+    const mine = await app.request(`/sell/${id}`, {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+      body: JSON.stringify({ price: 0, license: "own" }),
+    });
+    assertEquals(mine.status, 400, "and the owner still hears the whole refusal");
+    assert((await mine.text()).includes("payments_token"), "naming the column");
+  });
+
   // It must carry the path and the status, and it must never carry a header value: an Authorization in a log outlives
   // the request that sent it.
   await t.step('Every failure lands on one sheet, so "what is breaking, and where" is a query', async () => {
@@ -4434,14 +4925,12 @@ Deno.test(async function allTests(t) {
     // Two states and no more, and `__proto__` is not one of them: `in` walked the
     // prototype, so every Object.prototype key answered 200 and wrote a run
     // POLL_OK grades as a failure forever, on a socket that never failed.
-    for (const status of ["disconnected", "__proto__", "toString", "constructor", 7, null, ["connected"], undefined]) {
+    for (const status of ["disconnected", "__proto__", "toString", "constructor", 7, null, ["connected"], undefined])
       await reject(jwt, `/library/${sheet_id}/socket`, { method: "POST", body: JSON.stringify({ status }) });
-    }
     // A body that is not an object at all. JSON `null` parses, so the `.catch`
     // does not see it and destructuring it used to be a 500 anyone could send.
-    for (const body of ["null", "[]", "7", '"connected"', "{", ""]) {
+    for (const body of ["null", "[]", "7", '"connected"', "{", ""])
       await reject(jwt, `/library/${sheet_id}/socket`, { method: "POST", body });
-    }
     assertEquals(
       Number((await fresh())[sheet_id].failures_since_ok),
       1,
@@ -4465,9 +4954,8 @@ Deno.test(async function allTests(t) {
       "net-socket:",
       "net-socket",
     ];
-    for (const id of minted) {
+    for (const id of minted)
       await reject(jwt, `/library/${id}/socket`, { method: "POST", body: JSON.stringify({ status: "connected" }) });
-    }
     assertEquals(
       minted.filter((id) => hookBuckets.has(id)),
       [],
@@ -4753,7 +5241,11 @@ Deno.test(async function allTests(t) {
     // the operator still closes it, or the alarm would ring until somebody
     // muted it.
     await post(jwt, `/sell/${sheet_id}`, { price: 2, license: "own" });
-    assertEquals((await report({ reason: "relisted, still theirs" }, buyer)).status, 409, "one report per account, still");
+    assertEquals(
+      (await report({ reason: "relisted, still theirs" }, buyer)).status,
+      409,
+      "one report per account, still",
+    );
     const { jwt: second } = await usr("second-reporter@example.com");
     assertEquals((await report({ reason: "still not theirs" }, second)).status, 200);
     await post(jwt, `/sell/${sheet_id}`, { price: null });
@@ -4838,8 +5330,14 @@ Deno.test(async function allTests(t) {
     await get(owner, `/net/${hook.documentId}`);
     const spelled = (await get<Table>(owner, `/sheet/library:audit`)).slice(1).map((r) => `${r.sheet_id} ${r.action}`);
     assert(spelled.includes(`${sheet_id} query`), `a query's read of a sheet is a row on that sheet: ${spelled}`);
-    assert(spelled.includes(`codex-db:${conn.documentId} POST /codex-db/:id`), `a codex write is keyed by its sheet: ${spelled}`);
-    assert(spelled.includes(`net-hook:${hook.documentId} GET /net/:id`), `a bare doc id is keyed by its sheet: ${spelled}`);
+    assert(
+      spelled.includes(`codex-db:${conn.documentId} POST /codex-db/:id`),
+      `a codex write is keyed by its sheet: ${spelled}`,
+    );
+    assert(
+      spelled.includes(`net-hook:${hook.documentId} GET /net/:id`),
+      `a bare doc id is keyed by its sheet: ${spelled}`,
+    );
 
     // A sheet, so it exports and queries like one.
     const csv = await raw(owner, `/export/library:audit.csv`);
@@ -4847,7 +5345,8 @@ Deno.test(async function allTests(t) {
     assertEquals((await csv.text()).split("\n")[0], "created_at,sheet_id,who,action,via,detail");
     const { data: [, ...queried] }: { data: Table } = await post(owner, `/query`, {
       lang: "sql",
-      code: `select action, count(*) as n from @library:audit where sheet_id = '${sheet_id}' group by action order by action`,
+      code:
+        `select action, count(*) as n from @library:audit where sheet_id = '${sheet_id}' group by action order by action`,
       args: [],
     });
     assert(queried.some((r) => r.action === "GET /sheet/:id"), `the log is a query source: ${JSON.stringify(queried)}`);
@@ -4906,7 +5405,9 @@ Deno.test(async function allTests(t) {
     assertEquals((await read(stranger)).status, 403);
     assert((await read()).ok, "a stranger's 403 did not spend the row");
     hookBucket(sheet_id).rows = 1;
-    const csv = await app.request(`/export/${sheet_id}.csv`, { headers: new Headers({ Authorization: `Bearer ${jwt}` }) });
+    const csv = await app.request(`/export/${sheet_id}.csv`, {
+      headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+    });
     assert(csv.ok, `an export is a read: ${csv.status}`);
     assertEquals((await read()).status, 429, "and it spent the row");
 
@@ -4981,7 +5482,7 @@ Deno.test(async function allTests(t) {
     await sql`
       insert into net (sheet_id, method, body, meta)
       select ${alertId}, 'ALERT', ${JSON.stringify({ status: "firing", delivery: "sent" })}, '{}'
-      from generate_series(1, ${USER_EMAILS_PER_DAY}) g
+      from generate_series(1, ${USER_ALERTS_PER_DAY}) g
     `;
     let sent = 0;
     await pollAlertOnce(() => {
@@ -4991,7 +5492,19 @@ Deno.test(async function allTests(t) {
     assertEquals(sent, 0, "nothing is sent past the account's daily quota");
     const [run] = (await get<Table>(jwt, `/sheet/${alertId}`)).slice(1);
     const delivery = String(JSON.parse(String(run.body)).delivery);
-    assert(delivery.includes("quota") && delivery.includes(`${USER_EMAILS_PER_DAY}`), `the run names it: ${delivery}`);
+    assert(delivery.includes("quota") && delivery.includes(`${USER_ALERTS_PER_DAY}`), `the run names it: ${delivery}`);
+
+    // A url delivery costs what an email does: one quota over both destinations,
+    // so a cannon cannot be rebuilt by swapping the address for a webhook.
+    alert.change((d: { data: [{ to: string }] }) => {
+      d.data[0].to = "https://hooks.slack.com/services/T0/B0/zzz";
+    });
+    let posted = 0;
+    await pollAlertOnce(() => Promise.resolve("sent"), later + 120_000, () => {
+      posted++;
+      return Promise.resolve(new Response("ok"));
+    });
+    assertEquals(posted, 0, "a url delivery is refused past the same quota an email is");
 
     // The operator hears about it.
     assert((await status())["No account hit a quota in the past day."]["0"] < 1, "a quota hit is a failing grade");
@@ -5051,12 +5564,15 @@ Deno.test(async function allTests(t) {
       assertEquals((await register("http://93.184.216.34/hook?via=sheets")).status, 201);
       assertEquals((await hooks()).map((h) => h.url), ["http://93.184.216.34/hook?via=sheets"], "one row per url");
       assertEquals(
-        (await app.request(`/library/${sheet_id}/webhook`, { headers: new Headers({ Authorization: `Bearer ${viewer}` }) }))
+        (await app.request(`/library/${sheet_id}/webhook`, {
+          headers: new Headers({ Authorization: `Bearer ${viewer}` }),
+        }))
           .status,
         403,
         "a receiver's url is a credential, so a viewer may not read it",
       );
-      for (let i = 1; i < WEBHOOKS_PER_SHEET_MAX; i++) assertEquals((await register(`http://93.184.216.34/${i}`)).status, 201);
+      for (let i = 1; i < WEBHOOKS_PER_SHEET_MAX; i++)
+        assertEquals((await register(`http://93.184.216.34/${i}`)).status, 201);
       const past = await register("http://93.184.216.34/one-too-many");
       assertEquals(past.status, 413);
       assert((await past.text()).includes(`${WEBHOOKS_PER_SHEET_MAX} per sheet`), "naming the cap");
@@ -5168,12 +5684,17 @@ Deno.test(async function allTests(t) {
         headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${who}` }),
         body: JSON.stringify(body),
       });
-    const asked: { url: string; headers: Record<string, string> }[] = [];
+    const asked: { url: string; method?: string; body?: string; headers: Record<string, string> }[] = [];
     let answer: () => Response | Promise<Response> = () =>
       new Response(`{"ok":true}`, { status: 200, headers: { "content-type": "application/json" } });
     const origFetch = globalThis.fetch;
     globalThis.fetch = ((url: string, init?: RequestInit) => {
-      asked.push({ url, headers: Object.fromEntries(new Headers(init?.headers).entries()) });
+      asked.push({
+        url,
+        method: init?.method,
+        body: init?.body as string | undefined,
+        headers: Object.fromEntries(new Headers(init?.headers).entries()),
+      });
       return Promise.resolve(answer());
     }) as typeof fetch;
     try {
@@ -5197,6 +5718,20 @@ Deno.test(async function allTests(t) {
       assert(Number.isInteger(got.ms) && got.ms >= 0, `ms is a number: ${got.ms}`);
       assertEquals(asked.at(-1)?.headers["x-api-key"], "sk-test", "with the secret resolved");
       assertEquals(asked.at(-1)?.url, "http://93.184.216.34/feed");
+
+      // The method and the body are the poller's too, templated the same way:
+      // a pre-flight that sent a GET would be testing another request.
+      const posting = { ...request, method: "POST", body: '{"key":"{{secret:weather}}","since":"{{cursor}}"}' };
+      assertEquals((await (await test(posting)).json()).data.status, 200);
+      assertEquals(asked.at(-1)?.method, "POST");
+      assertEquals(
+        asked.at(-1)?.body,
+        '{"key":"sk-test","since":""}',
+        "with the secret resolved, and nothing where a first poll's watermark would be",
+      );
+      const patched = await test({ ...request, method: "PATCH" });
+      assertEquals(patched.status, 400, "a verb this server does not send is refused before it is sent");
+      assert((await patched.text()).includes("PATCH"));
 
       // What the host answered, whatever it answered, and a wire failure as
       // the poller's own failure record.
@@ -5227,14 +5762,21 @@ Deno.test(async function allTests(t) {
         headers: new Headers({ "Content-Type": "text/csv", Authorization: `Bearer ${jwt}` }),
         body,
       });
-    const sheets = async () => (await sql`select count(*)::int as n from sheet where created_by = (select usr_id from usr where email = 'guesser@example.com')`)[0].n;
+    const sheets = async () =>
+      (await sql`select count(*)::int as n from sheet where created_by = (select usr_id from usr where email = 'guesser@example.com')`)[
+        0
+      ].n;
 
     // The preview: every column with the type it was guessed to carry, the
     // first rows under them, and no sheet.
     const preview = await send("/import/preview");
     assertEquals(preview.status, 200);
     const { data: seen } = await preview.json();
-    assertEquals(seen.cols.map((c: { name: string; type: string }) => `${c.name}:${c.type}`), ["n:num", "flag:bool", "label:text"]);
+    assertEquals(seen.cols.map((c: { name: string; type: string }) => `${c.name}:${c.type}`), [
+      "n:num",
+      "flag:bool",
+      "label:text",
+    ]);
     assertEquals(seen.rows, [{ "0": 1, "1": true, "2": "a" }, { "0": 2, "1": false, "2": "b" }]);
     assertEquals(seen.count, 2);
     assertEquals(await sheets(), 0, "a preview makes no sheet");
@@ -5256,7 +5798,11 @@ Deno.test(async function allTests(t) {
     const said = await unfit.text();
     assert(said.includes("Line 2") && said.includes('"label"'), `the refusal names the line and the column: ${said}`);
     assertEquals((await send("/import/csv" + types({ n: "nope" }))).status, 400, "an unknown type is refused");
-    assertEquals((await send("/import/csv" + types({ ghost: "num" }))).status, 400, "a column the file lacks is refused");
+    assertEquals(
+      (await send("/import/csv" + types({ ghost: "num" }))).status,
+      400,
+      "a column the file lacks is refused",
+    );
     assertEquals((await send("/import/csv?types=not-json")).status, 400, "types that are not JSON are refused");
     assertEquals(await sheets(), 1, "and none of those made a sheet");
   });
@@ -5268,7 +5814,10 @@ Deno.test(async function allTests(t) {
   // the way they hear every other failure.
   await t.step("You are told when an upstream feed changes shape", async () => {
     const { jwt } = await usr("shapes@example.com");
-    const feed = automerge.create<Sheet>({ type: "net-http", data: [{ url: "https://shaped.test/rows", interval: 60 }] });
+    const feed = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://shaped.test/rows", interval: 60 }],
+    });
     const feedId = `net-http:${feed.documentId}`;
     await put(jwt, `/library/${feedId}`, {});
     let answer = `[{"id":1,"name":"a"}]`;
@@ -5281,11 +5830,18 @@ Deno.test(async function allTests(t) {
       return row;
     };
     const failures = async () =>
-      Number((await get<Table>(jwt, `/sheet/library:freshness`)).slice(1).find((r) => r.sheet_id === feedId)?.failures_since_ok);
+      Number(
+        (await get<Table>(jwt, `/sheet/library:freshness`)).slice(1).find((r) => r.sheet_id === feedId)
+          ?.failures_since_ok,
+      );
     const at = Date.now() + 110_000_000;
 
     await pollNetOnce(fetcher, at);
-    assertEquals((await newest()).meta.shape, { id: "number", name: "string" }, "the columns a run answered with ride its row");
+    assertEquals(
+      (await newest()).meta.shape,
+      { id: "number", name: "string" },
+      "the columns a run answered with ride its row",
+    );
     assertEquals(await failures(), 0);
 
     // A column added, one retyped: the data lands, and the run is a failure
@@ -5295,9 +5851,15 @@ Deno.test(async function allTests(t) {
     const changed = await newest();
     assertEquals(changed.body, answer, "the rows that arrived are kept");
     assertEquals(changed.meta.shape, { extra: "boolean", id: "string", name: "string" });
-    assertEquals(changed.meta.shape_change, { added: ["extra"], dropped: [], retyped: ["id"] }, "and the row names the change");
+    assertEquals(
+      changed.meta.shape_change,
+      { added: ["extra"], dropped: [], retyped: ["id"] },
+      "and the row names the change",
+    );
     assertEquals(await failures(), 1, "which freshness counts as a failed run");
-    assert((await status())["Every net-http poll in the past hour returned 2xx in the shape the feed had before."]["0"] < 1);
+    assert(
+      (await status())["Every net-http poll in the past hour returned 2xx in the shape the feed had before."]["0"] < 1,
+    );
 
     // The same shape again is the new normal.
     await pollNetOnce(fetcher, at + 122_000);
@@ -5321,7 +5883,10 @@ Deno.test(async function allTests(t) {
   // is built downstream.
   await t.step("A re-run does not double-append", async () => {
     const { jwt } = await usr("rerun@example.com");
-    const feed = automerge.create<Sheet>({ type: "net-http", data: [{ url: "https://rerun.test/rows", interval: 60 }] });
+    const feed = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://rerun.test/rows", interval: 60 }],
+    });
     const feedId = `net-http:${feed.documentId}`;
     await put(jwt, `/library/${feedId}`, {});
     let answer = () => new Response(`[{"n":1}]`);
@@ -5612,6 +6177,118 @@ Deno.test(async function allTests(t) {
     for (const series of Object.values(body as Record<string, Record<string, number>>))
       for (const value of Object.values(series)) assertEquals(typeof value, "number");
     await sql`delete from net where sheet_id = 'net-hook:errors' and body = 'boom'`;
+  });
+
+  // The guard is over an address, and an address has more than one spelling.
+  await t.step("A url inside our own network is refused however it is spelled", async () => {
+    const heard: string[] = [];
+    const inside = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen: () => {} }, (req) => {
+      heard.push(new URL(req.url).pathname);
+      return new Response("ok");
+    });
+    const port = (inside.addr as Deno.NetAddr).port;
+    const refusal = (url: string) =>
+      safeFetch(url).then(() => "", (err) => (err instanceof Error ? err.message : String(err)));
+    try {
+      // new URL() normalizes [::ffff:127.0.0.1] to ::ffff:7f00:1, which is the
+      // only spelling that ever came out of a url -- and the one the guard did
+      // not read as IPv4, so loopback and the metadata address walked out
+      // through the IPv6 rules.
+      for (
+        const url of [
+          `http://[::ffff:127.0.0.1]:${port}/hook`,
+          `http://[::127.0.0.1]:${port}/hook`,
+          `http://[::ffff:169.254.169.254]/latest/meta-data`,
+        ]
+      ) {
+        assert((await refusal(url)).includes("own network"), `${url} must be refused by name: ${await refusal(url)}`);
+      }
+      assertEquals(heard, [], `a loopback listener was reached: ${heard.join()}`);
+
+      // Deno's resolver reads neither /etc/hosts nor the OS resolver, so a name
+      // only this machine knows resolves to nothing here and to loopback in
+      // fetch. An empty answer graded as "no blocked address among them".
+      const nowhere = await refusal("http://nothing-resolves-here.invalid/x");
+      assert(nowhere.includes("no address"), `a host that resolves to nothing is not a public host: ${nowhere}`);
+    } finally {
+      await inside.shutdown();
+    }
+  });
+
+  // A destination is a url somebody typed, and both what it answers and what it
+  // is spelled like are this server's to hold.
+  await t.step("A refused alert delivery is bounded by what it reads and by what it says", async () => {
+    const { jwt } = await usr("hostile@example.com");
+    const watched = automerge.create<Sheet>({
+      type: "table",
+      data: [arrayify([{ name: "n", type: "num", key: 0 }]), { 0: 1 }],
+    });
+    await put(jwt, `/library/table:${watched.documentId}`, {});
+    const alertOn = async (to: string, name: string) => {
+      const hand = automerge.create<{ data: [{ code: string; to: string; interval: number }] }>({
+        data: [{ code: `select n from @table:${watched.documentId}`, to, interval: 60 }],
+      });
+      const id = `alert:${hand.documentId}`;
+      await put(jwt, `/library/${id}`, { name });
+      return id;
+    };
+    const delivery = async (id: string) => {
+      const [, run] = await get<Table>(jwt, `/sheet/${id}`);
+      return String((JSON.parse(String(run.body)) as { delivery: string }).delivery);
+    };
+    const mail = () => Promise.resolve("sent");
+    // A destination inside our own network, so the background poller's own
+    // fetch is refused before it leaves: every request in this step is the stub.
+    const endless = await alertOn("http://127.0.0.1:9/hook", "endless");
+    let pulled = 0;
+    const chunk = new Uint8Array(512 * 1024).fill(65);
+    const fetcher = () =>
+      Promise.resolve(
+        new Response(
+          // Nothing is queued ahead of a read, so what was pulled is what the
+          // reader asked for rather than what the stream buffered for it.
+          new ReadableStream({
+            pull(c) {
+              if (++pulled >= 64) return c.close();
+              c.enqueue(chunk);
+            },
+          }, { highWaterMark: 0 }),
+          { status: 500 },
+        ),
+      );
+    let clock = Date.now() + 200_000_000;
+    await pollAlertOnce(mail, clock, fetcher);
+    assert((await delivery(endless)).includes("refused it with 500"), "the post was refused");
+    const read = pulled * chunk.byteLength;
+    // readBody stops one chunk past the cap, which is how it knows it is past it.
+    assert(
+      read <= BODY_CAP + chunk.byteLength,
+      `a refused delivery read ${read} bytes of the receiver's answer, past the ${BODY_CAP}-byte cap`,
+    );
+
+    // A url that will not parse is still a credential. new URL()'s TypeError
+    // quotes the whole input, and that message was the delivery line everyone
+    // the sheet is shared with reads, and the operator's log line.
+    const token = "T11111111/B11111111/zzzzZZZZzzzzZZZZzzzzZZZZ";
+    const typo = await alertOn(`https://hooks.slack.com:99999/services/${token}`, "typo");
+    clock += 120_000;
+    await pollAlertOnce(mail, clock, fetcher);
+    const line = await delivery(typo);
+    assert(!line.includes(token), `the delivery line quoted the whole url: ${line}`);
+    for (const field of ["Expected", "Received", "Source", "Fix"])
+      assert(line.includes(field), `a refusal states ${field}, got: ${line}`);
+
+    // The other half of the same promise: fetch quotes the url it was handed in
+    // the error it throws, and that message was the delivery line whole.
+    const path = "B22222222/yyyyYYYYyyyyYYYYyyyyYYYY";
+    const unreachable = await alertOn(`http://127.0.0.1:9/services/${path}`, "unreachable");
+    clock += 120_000;
+    await pollAlertOnce(mail, clock, (url: string) => {
+      throw new Error(`error sending request for url (${url})`);
+    });
+    const failed = await delivery(unreachable);
+    assert(!failed.includes(path), `the delivery line quoted the url the failure named: ${failed}`);
+    assert(failed.includes("127.0.0.1"), `and it still names the host: ${failed}`);
   });
 
   await sql.end();

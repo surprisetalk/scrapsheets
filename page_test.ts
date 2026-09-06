@@ -128,9 +128,19 @@ const globalize = (w: Record<string, unknown>) => {
 
 const boot = async (url: string, { tutorial = -1 } = {}) => {
   await ensureDist();
+  // Resolved before the window exists, and nothing between here and Elm's init
+  // awaits. `globalize` writes the process-wide `document` and
+  // `requestAnimationFrame` that the compiled bundle captures as it evaluates,
+  // so a boot that suspends after it hands those globals to whatever boots
+  // next: two overlapping boots then leave the first page bound to the second
+  // page's document, rendering nothing at all, with no throw to say so.
+  const evalElm = await compiled();
+  // No `pretendToBeVisual`: `globalize` replaces requestAnimationFrame with the
+  // event loop anyway, so the only thing the flag still bought was jsdom's own
+  // 16ms frame loop, ticking for the life of every window this file never
+  // closes. Sixty of those running at once was a second and a half of the suite.
   const dom = new JSDOM(`<!doctype html><html><body><div id="elm"></div></body></html>`, {
     url,
-    pretendToBeVisual: true, // supplies requestAnimationFrame, which is when Elm paints
   });
   const w = dom.window as unknown as Record<string, unknown>;
   globalize(w);
@@ -142,7 +152,7 @@ const boot = async (url: string, { tutorial = -1 } = {}) => {
   // half a megabyte per test is not: that is hoisted to module scope, and every
   // boot is one `.call`.
   const scope: { Elm?: { Main: { init: (o: unknown) => { ports: Ports } } } } = {};
-  (await compiled()).call(scope);
+  evalElm.call(scope);
   assert(scope.Elm?.Main, "dist/index.js should define Elm.Main");
 
   const app = scope.Elm.Main.init({
@@ -225,8 +235,28 @@ const boot = async (url: string, { tutorial = -1 } = {}) => {
   return { dom, doc, app, settle, click, fire, text, all, type_, asks };
 };
 
+// Three tests boot the library and then only read what it rendered, so they
+// share one page. What that saves is Elm's first paint and not the harness
+// around it: a jsdom, a re-evaluation of the already-hoisted bundle and Elm's
+// init together are a rounding error beside the paint, and it is the same paint
+// all three times. Nothing else in the file can share one -- every other boot
+// either opens a different url, which is a different paint, or sends a port,
+// clicks, types or fires, and a shared page carries whatever the test before it
+// did to the model.
+// Only the reading surface goes out: `app`, `click`, `type_`, `fire` and
+// `settle` stay behind the memo. A shared page nobody can write to needs no
+// rule that nobody should -- and the rule was not enforceable, since sending a
+// doc down `docSelected` is what forty other tests in this file do to the page
+// they booted, and doing it to this one replaced the library for every reader
+// after, three tests failing on code nobody had touched.
+let libraryPage: ReturnType<typeof boot> | undefined;
+const rendered = async () => {
+  const { text, all } = await (libraryPage ??= boot("http://localhost/", { tutorial: -1 }));
+  return { text, all };
+};
+
 Deno.test("the page boots: Elm initializes and renders the library", async () => {
-  const { text, all } = await boot("http://localhost/");
+  const { text, all } = await rendered();
   assert(text().includes("scrapsheets"), `expected the app shell, got: ${text().slice(0, 200)}`);
   assert(!text().includes("loading"), "the library should have resolved, not stayed on loading");
   // Every tag in the library becomes a filter chip, so this is also the check
@@ -236,8 +266,33 @@ Deno.test("the page boots: Elm initializes and renders the library", async () =>
     assert(chips.includes(tag), `expected a "${tag}" filter chip, got: ${chips.join("|")}`);
 });
 
+// `boot` owns the process globals between `globalize` and Elm's init, and this
+// is the check that it never lets go of them mid-boot: a boot that suspends
+// there loses the globals to the next one and renders an empty body -- no
+// throw, no refusal, just a blank page and an assertion failing somewhere else.
+// Awaiting two pages together is exactly what chasing this file's wall time
+// invites, so the failure mode is bought back by a test rather than by a rule.
+Deno.test("two pages booted at once each render their own document", async () => {
+  const [countries, lib] = await Promise.all([
+    boot("http://localhost/table:countries"),
+    boot("http://localhost/"),
+  ]);
+  assert(
+    countries.text().includes("China"),
+    `Expected the page at /table:countries to render its rows, received a body of ` +
+      `${countries.text().length} characters. Source: boot() writes the process globals the compiled Elm ` +
+      `captures. Fix: do not await between globalize() and Elm's init.`,
+  );
+  assert(
+    lib.text().includes("start from a demo"),
+    `Expected the page at / to render the library, received: ${lib.text().slice(0, 160)}. ` +
+      `Source: boot() writes the process globals the compiled Elm captures. ` +
+      `Fix: do not await between globalize() and Elm's init.`,
+  );
+});
+
 Deno.test("the gallery strip links every demo pipeline, and only those", async () => {
-  const { all, text } = await boot("http://localhost/");
+  const { all, text } = await rendered();
   assert(text().includes("start from a demo"), "expected the gallery strip");
 
   // The strip renders each demo as an <a class="chip"> whose title is the sheet
@@ -261,7 +316,7 @@ Deno.test("a first visit gets the tutorial, and -1 dismisses it", async () => {
   assert(fresh.text().includes("get started"), "a first visit should show the tutorial card");
   assert(fresh.text().includes("create a table"), "expected the first tutorial step");
 
-  const dismissed = await boot("http://localhost/", { tutorial: -1 });
+  const dismissed = await rendered();
   assert(!dismissed.text().includes("get started"), "-1 means the tutorial was dismissed");
 });
 
@@ -739,7 +794,8 @@ Deno.test("dragging a row onto another moves it there, and a sorted table offers
 
   // Data rows start after the three meta rows; row 3 of the document is the
   // fourth data row. Grab its handle, hover row 1, let go.
-  const rowHandle = (y: number) => [...all("tbody tr")[2 + y].querySelectorAll(`span.grab[title^="drag onto the row"]`)][0];
+  const rowHandle = (y: number) =>
+    [...all("tbody tr")[2 + y].querySelectorAll(`span.grab[title^="drag onto the row"]`)][0];
   const rowCell = (y: number) => [...all("tbody tr")[2 + y].querySelectorAll("td")][0];
   assert(rowHandle(3), "a table in document order offers a handle on every row");
   await fire(rowHandle(3), "mousedown");
@@ -834,24 +890,43 @@ Deno.test("a feed offers no arrangement controls, and a listing still does", asy
 // where the fields are, before the sheet has to wait for the poller.
 Deno.test("a feed's request can be tested before the poller runs it", async () => {
   const { app, all, text, click, settle } = await boot("http://localhost/");
-  const asked: { id: string; data: { url: string; headers: string } }[] = [];
+  const asked: { id: string; data: { url: string; headers: string; method: string; body: string } }[] = [];
   app.ports.preflight.subscribe((ask: (typeof asked)[number]) => asked.push(ask));
   app.ports.docSelected.send({
     id: "net-http:feed",
     data: {
       doc: {
         type: "net-http",
-        data: [{ url: "https://example.com/feed.json", interval: 3600, headers: "X-Api-Key: {{secret:weather}}" }],
+        data: [{
+          url: "https://example.com/feed.json",
+          interval: 3600,
+          headers: "X-Api-Key: {{secret:weather}}",
+          method: "POST",
+          body: '{"since":"{{cursor}}"}',
+        }],
       },
     },
   });
   await settle();
 
   await click(all("button.chip").find((b) => b.textContent === "test the request"));
-  assertEquals(asked, [{ id: "net-http:feed", data: { url: "https://example.com/feed.json", headers: "X-Api-Key: {{secret:weather}}" } }]);
+  // The whole request, and not the url alone: a pre-flight that dropped the
+  // method and the body would test something the poller never sends.
+  assertEquals(asked, [{
+    id: "net-http:feed",
+    data: {
+      url: "https://example.com/feed.json",
+      headers: "X-Api-Key: {{secret:weather}}",
+      method: "POST",
+      body: '{"since":"{{cursor}}"}',
+    },
+  }]);
 
   // An answer for another sheet is not this sheet's.
-  app.ports.preflightLoaded.send({ id: "net-http:other", data: { status: 500, ms: 1, bytes: 0, content_type: "", body: "" } });
+  app.ports.preflightLoaded.send({
+    id: "net-http:other",
+    data: { status: 500, ms: 1, bytes: 0, content_type: "", body: "" },
+  });
   await settle();
   assertEquals(all("pre.preflight").length, 0, "another sheet's answer is not shown here");
 
@@ -864,7 +939,10 @@ Deno.test("a feed's request can be tested before the poller runs it", async () =
   assert(shown.includes("200 · 12 ms · 11 bytes · application/json"), `the status line: ${shown}`);
   assert(shown.includes('{"ok":true}'), `and the body: ${shown}`);
 
-  app.ports.preflightLoaded.send({ id: "net-http:feed", data: { error: "This sheet does not hold {{secret:weather}}." } });
+  app.ports.preflightLoaded.send({
+    id: "net-http:feed",
+    data: { error: "This sheet does not hold {{secret:weather}}." },
+  });
   await settle();
   assert(text().includes("does not hold {{secret:weather}}"), "a refusal is shown in the poller's own words");
 });
@@ -1015,6 +1093,29 @@ Deno.test("Ctrl+K opens the palette, which jumps to a sheet and runs a command",
   for (const label of ["select all", "copy", "find", "replace", "undo", "redo", "shortcut sheet"])
     assert(rows().includes(label), `expected "${label}" in the palette, got: ${rows().join("|")}`);
 
+  // Enter on a palette nobody has pointed at runs nothing. It opened on the
+  // first row, and the first row is a verb that deletes rows -- two keystrokes,
+  // no confirmation. The arrow is what points at one, and a whole-sheet verb on
+  // the library then says why it cannot run: the library lists sheets, it holds
+  // no rows of its own, and it is the sheet the palette is opened from most.
+  await key(doc.getElementById("palette"), { key: "Enter" });
+  assert(doc.getElementById("palette"), "Enter on an untouched palette runs nothing, so the palette stays open");
+  assertEquals(doc.location.pathname, "/", "and nothing was opened");
+  // An emptied box is that same state. Typing set the selection to the first
+  // row whatever was typed, so a character and a backspace put Enter back on
+  // the verb that deletes rows -- three keystrokes from opening the palette.
+  await type("s");
+  await type("");
+  await key(doc.getElementById("palette"), { key: "Enter" });
+  assert(doc.getElementById("palette"), "an emptied box points at nothing again, so the palette stays open");
+  await key(doc.getElementById("palette"), { key: "ArrowDown" });
+  await key(doc.getElementById("palette"), { key: "Enter" });
+  assert(
+    text().includes("lists your sheets rather than holding rows of its own"),
+    `a verb the library cannot run should say so, got: ${text().slice(0, 300)}`,
+  );
+
+  await key(doc.body, { key: "k", ctrlKey: true });
   await type("budget");
   assert(!rows().includes("select all"), `typing narrows the list, got: ${rows().join("|")}`);
   assert(rows().length > 1, "several sheets match budget");
@@ -1067,7 +1168,11 @@ Deno.test("the library merges what is stored under what is bundled", () => {
   const stored = {
     "table:mine": { name: "mine", seen: "2026-09-03T10:00:00.000Z", doc: { type: "table", data: [{}] } },
     // A stale copy of a bundled example must not shadow the real one.
-    "table:countries": { name: "an old countries", seen: "2026-09-04T10:00:00.000Z", doc: { type: "table", data: [{}] } },
+    "table:countries": {
+      name: "an old countries",
+      seen: "2026-09-04T10:00:00.000Z",
+      doc: { type: "table", data: [{}] },
+    },
   };
   const shelf = library(stored) as Record<string, { name: string; system?: boolean; thumb?: unknown; seen?: string }>;
 
@@ -1140,7 +1245,11 @@ Deno.test("a sheet is trashed without a dialog, hidden from the library, and res
     [...(row?.querySelectorAll("button") ?? [])].find((b) => b.textContent?.trim() === label);
 
   await click(button(rowFor("mine"), "trash"));
-  assertEquals(sent.map((s) => [s.id, s.data.trashed]), [["table:mine", true]], "trashing writes the flag, and only it");
+  assertEquals(
+    sent.map((s) => [s.id, s.data.trashed]),
+    [["table:mine", true]],
+    "trashing writes the flag, and only it",
+  );
   assertEquals(all(".scrim").length, 0, "and asks nothing first, because it is undoable");
 
   // The page is told what the browser stored, the way index.html tells it.
@@ -1223,7 +1332,11 @@ Deno.test("a remembered header lays its types over the server's guesses", () => 
     [{ name: "a", type: "num", remembered: false }, { name: "b", type: "text", remembered: false }],
     "a different header is a different memory",
   );
-  assertEquals(rememberedTypes(undefined, cols).map((c: { type: string }) => c.type), ["num", "text"], "no memory keeps the guess");
+  assertEquals(
+    rememberedTypes(undefined, cols).map((c: { type: string }) => c.type),
+    ["num", "text"],
+    "no memory keeps the guess",
+  );
 });
 
 Deno.test("an arrangement this browser has to keep is held by column key", () => {
@@ -1525,7 +1638,10 @@ Deno.test("explain answers the query's profile in the page, one row per stage", 
   for (const r of rows) assert(typeof r.ms === "number" && (r.ms as number) >= 0, JSON.stringify(r));
   assert((await refused("explain describe @table:countries")).includes("profiles a query"));
   assert((await refused("explain")).includes("nothing after explain"), "a bare explain is ours, not AlaSQL's");
-  assert((await refused("explain select nope from @table:countries")).includes("nope"), "the query's own checks still stand");
+  assert(
+    (await refused("explain select nope from @table:countries")).includes("nope"),
+    "the query's own checks still stand",
+  );
 
   // A @query ref's load is the nested run, which is what names the slow ref.
   const nested = (await resolver().runSql("explain select * from @query:budget-burn", { "": null }))
@@ -1780,9 +1896,11 @@ const glue = async (
   } = {},
 ) => {
   await ensureDist();
+  // Resolved before the window exists, for the reason `boot` gives above.
+  const evalElm = await compiled();
+  // No `pretendToBeVisual`, for the reason `boot` gives above.
   const dom = new JSDOM(`<!doctype html><html><body><div id="elm"></div></body></html>`, {
     url,
-    pretendToBeVisual: true,
   });
   const w = dom.window as unknown as Record<string, unknown>;
   globalize(w);
@@ -1845,7 +1963,7 @@ const glue = async (
   });
 
   const scope: { Elm?: { Main: { init: (o: unknown) => { ports: Ports } } } } = {};
-  (await compiled()).call(scope);
+  evalElm.call(scope);
   let app!: { ports: Ports };
   define("Elm", { Main: { init: (o: unknown) => (app = scope.Elm!.Main.init(o)) } });
 
@@ -1933,6 +2051,18 @@ const glue = async (
     if (ms) await new Promise((r) => setTimeout(r, ms));
   };
   await settle();
+  // An empty body is the one tell that another harness took the process globals
+  // while this page was coming up. `boot` cannot lose them -- it holds them
+  // across no await -- but index.html's module script reads `fetch`,
+  // `localStorage`, `document` and the socket for the life of the page, and
+  // `define` writes them globally, so two glue pages under construction at once
+  // share one set and the first renders nothing. Named here rather than left to
+  // surface as a blank assertion in whichever test booted second.
+  assert(
+    dom.window.document.body.textContent,
+    `Expected the page at ${url} to render, received an empty body. Source: glue() owns the process ` +
+      `globals for the life of its page. Fix: await each glue() before starting the next.`,
+  );
   return {
     app,
     settle,
@@ -1976,6 +2106,13 @@ const glue = async (
     },
     keyUp: async () => {
       doc.dispatchEvent(new dom.window.MouseEvent("mouseup", { bubbles: true }));
+      await settle();
+    },
+    /** A keystroke the page hears the way the global handler hears one: on the
+     * body, because Elm's decoder ignores a key typed into an input.
+     */
+    key: async (init: Record<string, unknown>) => {
+      doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, ...init }));
       await settle();
     },
     type_: async (el: El | undefined | null, value: string) => {
@@ -2144,7 +2281,11 @@ Deno.test({
     assertEquals(bundled.name, undefined, "and nothing else: the bundled entry stays the bundled one");
 
     await page.go("/table:nowhere1");
-    assertEquals(page.stored("library")["table:nowhere1"], undefined, "a sheet the library does not list is not added to it");
+    assertEquals(
+      page.stored("library")["table:nowhere1"],
+      undefined,
+      "a sheet the library does not list is not added to it",
+    );
 
     await page.go("/");
     const row = page.all("tbody tr").find((tr) => tr.textContent?.includes("shared"));
@@ -2311,7 +2452,12 @@ Deno.test({
     await until(page.settle, "the debounce to run the query once", () => runs === 1);
     assertEquals(runs, 1, "opening a query sheet runs it once");
 
-    await page.click(page.all("span.sort").find((s) => s.textContent?.startsWith("n")));
+    // runs === 1 is runSql entered, not its answer drawn, and the header this
+    // clicks exists only once the result rendered. Waiting for the count alone
+    // clicked nothing about one run in three on a loaded machine.
+    const sortN = () => page.all("span.sort").find((s) => s.textContent?.startsWith("n"));
+    await until(page.settle, "the query's answer to draw its columns", () => !!sortN());
+    await page.click(sortN());
     // Proving nothing ran has no earlier moment than the debounce itself, so
     // this one stays a flat wait -- 320 for src/index.html's 300, and not a
     // rounder number, because every millisecond over is one the suite spends
@@ -2487,7 +2633,11 @@ const imported = {
     imported1: { type: "table", data: [[{ name: "name", type: "text", key: "0" }], { "0": "Chile" }] },
   },
   respond: (url: string) =>
-    url.endsWith("/import/preview") ? previewOf : url.includes("/import/csv") ? { sheet_id: "table:imported1" } : { data: [] },
+    url.endsWith("/import/preview")
+      ? previewOf
+      : url.includes("/import/csv")
+      ? { sheet_id: "table:imported1" }
+      : { data: [] },
 };
 
 Deno.test({
@@ -2505,9 +2655,16 @@ Deno.test({
     const sent = (previewed.body as FormData).get("file") as File;
     assertEquals(sent.name, "countries of the world.csv", "the file goes over with the name it had");
     assertEquals(await page.readFile(sent), "name,code\nChile,CL\n", "and the bytes Elm read out of it");
-    assert(page.text().includes("Correct a type before the sheet is made"), `the preview is shown: ${page.text().slice(-300)}`);
+    assert(
+      page.text().includes("Correct a type before the sheet is made"),
+      `the preview is shown: ${page.text().slice(-300)}`,
+    );
     const selects = page.all("select");
-    assertEquals(selects.map((el) => (el as unknown as { value: string }).value), ["text", "num"], "with the guess per column");
+    assertEquals(
+      selects.map((el) => (el as unknown as { value: string }).value),
+      ["text", "num"],
+      "with the guess per column",
+    );
     assertEquals(page.asked.filter((r) => r.url.includes("/import/csv")).length, 0, "and nothing is made yet");
 
     // Correct one, then import: the settled types ride the request, and are
@@ -2523,7 +2680,11 @@ Deno.test({
       "the types the user settled on go with the file",
     );
     assertEquals(await page.readFile((post.body as FormData).get("file")), "name,code\nChile,CL\n", "the same file");
-    assertEquals(page.stored("imports"), { "name\u0001code": { name: "text", code: "text" } }, "and are remembered by header");
+    assertEquals(
+      page.stored("imports"),
+      { "name\u0001code": { name: "text", code: "text" } },
+      "and are remembered by header",
+    );
 
     // The sheet is the server's, and the library is what this browser holds plus
     // what ships bundled — so it has to be told the sheet exists, or the import
@@ -2555,7 +2716,11 @@ Deno.test({
     });
     await page.pickFile("more countries.csv", "name,code\nPeru,PE\n");
     const selects = page.all("select");
-    assertEquals(selects.map((el) => (el as unknown as { value: string }).value), ["text", "text"], "the memory over the guess");
+    assertEquals(
+      selects.map((el) => (el as unknown as { value: string }).value),
+      ["text", "text"],
+      "the memory over the guess",
+    );
     assert(page.text().includes("remembered"), "and it says which one was remembered");
     page.close();
   },
@@ -2771,7 +2936,10 @@ Deno.test({
     const second = [...page.all("tbody tr")[4].querySelectorAll("td")][2];
     for (const type of ["mouseenter", "click", "dblclick"]) await page.fire(second, type);
     await page.type_(page.all("#new-cell")[0], "two");
-    await page.fire([...page.all("tbody tr")[4].querySelectorAll(`span.grab[title^="drag onto the row"]`)][0], "mousedown");
+    await page.fire(
+      [...page.all("tbody tr")[4].querySelectorAll(`span.grab[title^="drag onto the row"]`)][0],
+      "mousedown",
+    );
     await page.fire([...page.all("tbody tr")[3].querySelectorAll("td")][0], "mouseenter");
     await page.keyUp();
     const moved = (await page.document(id)) as { data: Record<string, string>[] };
@@ -2850,6 +3018,142 @@ Deno.test({
     for (const type of ["mouseenter", "click", "dblclick"]) await page.fire(cell, type);
     await page.type_(page.all("#new-cell")[0], "once");
     assertEquals(sent, 1, "one change is delivered to the page once");
+    page.close();
+  },
+});
+
+// Fill-down continues the selection's seeds instead of repeating one cell: the
+// leading run of filled rows is the series and the rows under it are where it
+// lands. Two numbers are the whole of it -- 10, 20 means 30, 40 -- and the
+// seeds themselves are never written over.
+//
+// Spelled the way an imported CSV spells it: numbers, and a JSON null for every
+// gap. `cellText` renders a null as the word "NULL", so the seed scan read four
+// filled cells and wrote "NULL" into a num column, which then failed the type
+// check on every query, export and alert over the sheet.
+Deno.test("filling a column down continues the series it starts with", async () => {
+  const { app, all, dom, doc, fire, settle } = await boot("http://localhost/table:countries");
+  const patches: { action: string; path: unknown[]; value: unknown }[] = [];
+  app.ports.changeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
+  app.ports.docSelected.send({
+    id: "table:series",
+    data: {
+      doc: {
+        type: "table",
+        data: [
+          [{ name: "n", type: "num", key: "0" }],
+          { "0": 10 },
+          { "0": 20 },
+          { "0": null },
+          { "0": null },
+        ],
+      },
+    },
+  });
+  await settle();
+
+  const seed = all("td").find((td) => td.textContent?.trim() === "10");
+  assert(seed, "the sheet is drawn");
+  await fire(seed, "mouseenter");
+  await fire(seed, "mousedown");
+  await fire(seed, "mouseup");
+  const key = async (init: Record<string, unknown>) => {
+    doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, ...init }));
+    await settle();
+  };
+  for (let i = 0; i < 3; i++) await key({ key: "ArrowDown", shiftKey: true });
+  patches.length = 0;
+  await key({ key: "d", ctrlKey: true });
+  assertEquals(
+    patches.map((p) => [p.path, p.value]),
+    [[[3, "0"], 30], [[4, "0"], 40]],
+    "the blank rows under the seeds carry the step on, as numbers the column's own type allows",
+  );
+});
+
+// Dedupe is a whole-sheet verb -- it reads every column of every row -- so the
+// palette is its home rather than a column's panel. One DocMsg like every other
+// cleaning verb, which is the whole of why undo works on it.
+Deno.test({
+  name: "the palette deletes the rows that repeat, and undo brings them back",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const doc = {
+      type: "table",
+      data: [
+        [{ name: "city", type: "text", key: "0" }, { name: "note", type: "text", key: "1" }],
+        { "0": "Oslo", "1": "a" },
+        { "0": "Bergen", "1": "b" },
+        { "0": "Oslo", "1": "a" },
+      ],
+    } as { type: string; data: unknown[] };
+    const was = JSON.stringify(doc.data);
+    const page = await glue("http://localhost/table:dupes1", { docs: { dupes1: doc } });
+    const rows = () => page.all("tbody tr").length;
+    const drawn = rows();
+
+    await page.key({ key: "k", ctrlKey: true });
+    // Enter before anything is pointed at, over a document that has rows to
+    // lose: the palette opened on its first row and this verb is that row.
+    // `page.key` is the body, and the palette's own keys are on its input.
+    const input = page.all("#palette")[0];
+    assert(input, "the palette is open");
+    const window_ = (input as unknown as {
+      ownerDocument: { defaultView: { KeyboardEvent: new (t: string, i: unknown) => unknown } };
+    })
+      .ownerDocument.defaultView;
+    input.dispatchEvent(new window_.KeyboardEvent("keydown", { bubbles: true, key: "Enter" }));
+    await page.settle();
+    assertEquals(doc.data.length, 4, "Enter on a palette nobody has typed into must not delete anything");
+
+    const command = page.all(".scrim .panel button").find((b) => b.textContent?.startsWith("delete duplicate rows"));
+    assert(command, "the palette offers the verb the shortcut sheet lists");
+    await page.click(command);
+    assertEquals(
+      doc.data.slice(1),
+      [{ "0": "Oslo", "1": "a" }, { "0": "Bergen", "1": "b" }],
+      "the third row repeats the first, so the first is the one that stays",
+    );
+    assertEquals(rows(), drawn - 1, "and the sheet is drawn a row shorter");
+
+    await page.key({ key: "z", ctrlKey: true });
+    assertEquals(JSON.stringify(doc.data), was, "undo puts the row back where it left");
+    assertEquals(rows(), drawn, "and draws it again");
+    page.close();
+  },
+});
+
+// The count is an arrangement, not data: it rides `arrange` the way a filter
+// does -- written when the panel closes, not per keystroke -- lands on the
+// column in `data[0]`, and every place a number becomes text -- the cell and the
+// totals row below it -- reads the same one.
+Deno.test({
+  name: "a column's decimal count rides its column and every number in it is written at it",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const doc = { type: "table", data: [[{ name: "n", type: "num", key: "0" }], { "0": 1.5 }] };
+    const page = await glue("http://localhost/table:places1", { docs: { places1: doc } });
+    const column = () => (doc.data[0] as { decimals?: number }[])[0];
+    const reading = (want: string) => page.all("tbody td").filter((td) => td.textContent?.trim() === want).length;
+    const plain = reading("1.5");
+    assert(plain > 0, `the cell and its total should read 1.5, got: ${page.text().slice(0, 200)}`);
+
+    await page.click(page.all("span.funnel")[0]);
+    const box = () => page.all("label.decimals input")[0];
+    assert(box(), "a numeric column's panel offers a decimal count");
+    await page.type_(box(), "3");
+    assertEquals(reading("1.500"), plain, "every number in the column is written at the count it asks for");
+    assertEquals(column().decimals, undefined, "and nothing is synced while the box is still being typed in");
+    await page.click(page.all("span.funnel")[0]);
+    assertEquals(column().decimals, 3, "closing the panel is when the count reaches the column, the way a filter does");
+
+    await page.click(page.all("span.funnel")[0]);
+    await page.type_(box(), "");
+    await page.click(page.all("span.funnel")[0]);
+    assertEquals(reading("1.5"), plain, "an empty box is no count at all");
+    assertEquals(column().decimals, undefined, "and takes the field back off the column rather than writing a null");
     page.close();
   },
 });

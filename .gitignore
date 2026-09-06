@@ -5,3 +5,4 @@ CLAUDE.local.md
 /data
 .env
 /review/elm-stuff
+/.claude

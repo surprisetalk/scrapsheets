@@ -29,12 +29,12 @@ import { DATASETS } from "./src/examples.mjs";
 import { PORTALS } from "./src/portals.mjs";
 import {
   applyWindows,
-  chartSql,
   CANONICAL_TYPES,
+  canonicalType,
+  chartSql,
   checkColumnTypes,
   checkQueryRows,
   checkResultColumns,
-  canonicalType,
   COLUMN_TYPES,
   DESCRIBE_COLUMNS,
   describeRef,
@@ -43,6 +43,7 @@ import {
   formatQueryError,
   loadRefs,
   MAX_QUERY_MS,
+  MAX_QUERY_ROWS,
   nearest,
   NUMERIC_TYPES,
   planQuery,
@@ -55,7 +56,6 @@ import {
   show,
   timed,
   WINDOW_TYPES,
-  MAX_QUERY_ROWS,
 } from "./src/sql.mjs";
 import Stripe from "stripe";
 
@@ -377,9 +377,24 @@ export type Template =
   | Tag<"net-socket", [NetSocket]>
   | Tag<`codex-${string}`, []>;
 export type Query = { lang: "sql"; code: string; args: Args };
+// The verbs a feed may be polled with. A sheet spelling anything else is
+// refused by name where it is read: a verb this server does not send would go
+// out as a GET, which a feed answers with the wrong thing rather than not at
+// all. `netMethods` in `src/Main.elm` is the copy the language boundary forces.
+export const NET_METHODS = ["GET", "POST", "PUT"] as const;
+export type Method = typeof NET_METHODS[number];
 // `cursor` names the query parameter this feed takes a since-value in. The
-// watermark itself is not here: it is the poller's, not the user's.
-export type NetHttp = { url: string; interval: number; headers?: string; cursor?: string };
+// watermark itself is not here: it is the poller's, not the user's. `body` is
+// templated the way a header is: `{{secret:name}}` out of the secret table, and
+// `{{cursor}}` the same watermark the cursor parameter carries.
+export type NetHttp = {
+  url: string;
+  interval: number;
+  headers?: string;
+  cursor?: string;
+  method?: Method;
+  body?: string;
+};
 // An alert is a query plus somewhere to send it. The condition is the query's
 // own where clause: it fires when the query returns a row, which is the only
 // definition that needs no second language.
@@ -737,18 +752,18 @@ const executeSql = async (
           return r.data;
         })
         .catch(async (err) => {
-        // A mistyped @ref reads as "no access". Name the sheet the author meant.
-        const mine: { sheet_id: string }[] = await sql`
+          // A mistyped @ref reads as "no access". Name the sheet the author meant.
+          const mine: { sheet_id: string }[] = await sql`
           select sheet_id from sheet_usr where usr_id = ${c.get("usr_id")}
         `;
-        const hit = nearest(sheet_id, mine.map((r) => r.sheet_id));
-        if (!hit) throw err;
-        bad(400, `I could not load the sheet "@${sheet_id}".`, {
-          "Did you mean": `@${hit}`,
-          Source: "the @sheet refs in this query",
-          Fix: `write @${hit} instead`,
-        });
-      }),
+          const hit = nearest(sheet_id, mine.map((r) => r.sheet_id));
+          if (!hit) throw err;
+          bad(400, `I could not load the sheet "@${sheet_id}".`, {
+            "Did you mean": `@${hit}`,
+            Source: "the @sheet refs in this query",
+            Fix: `write @${hit} instead`,
+          });
+        }),
     // The row budget, spent as each sheet lands rather than after all of them:
     // this is the guard that stops a runaway before it starts, so it has to
     // refuse while there is still something left to refuse.
@@ -1818,9 +1833,8 @@ export const flushFolds = async (now = Date.now()): Promise<void> => {
 setInterval(() => {
   const now = Date.now();
   for (const buckets of [rateLimitBuckets, accountBuckets]) {
-    for (const [key, bucket] of buckets) {
+    for (const [key, bucket] of buckets)
       if (now - bucket.lastRefill > RATE_LIMIT_WINDOW_MS) buckets.delete(key);
-    }
   }
   for (const [key, bucket] of hookBuckets) {
     if (now - bucket.lastRefill > HOOK_WINDOW_S * 1000)
@@ -1902,8 +1916,11 @@ const ALERT_OK = () =>
 // the delivery it was sent, and every delivery that reached the table landed,
 // since a refused one is never stored. Both name `s` and `n`, and RUN_OF is
 // spliced into freshness() three times -- the count subquery and both laterals
-// -- so it lives here rather than as three hand-copied copies, which is exactly
-// how POLL_OK and ALERT_OK came to live here.
+// -- and into /status twice, so it lives here rather than as five hand-copied
+// copies, which is exactly how POLL_OK and ALERT_OK came to live here. The
+// net-http arm reads NET_METHODS and not 'GET': a feed polled with POST wrote
+// rows RUN_OF matched none of, so it read as never-run in freshness and could
+// not fail /status while it was dead.
 //
 // Searched rather than `case s.type when`, because a codex type is a prefix
 // (codex-db, codex-scrapsheets) and not one string to compare against. A codex
@@ -1912,7 +1929,7 @@ const ALERT_OK = () =>
 // this pair exists to prevent get made.
 const RUN_OF = () =>
   sql`case when s.type = 'alert' then n.method = 'ALERT'
-           when s.type = 'net-http' then n.method = 'GET'
+           when s.type = 'net-http' then n.method = any(${NET_METHODS as unknown as string[]})
            when s.type like 'codex-%' then n.method = 'CODEX'
            when s.type = 'net-socket' then n.method = 'SOCKET'
            else true end`;
@@ -2015,7 +2032,7 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
       (select case when count(*) = 0 then 1
                    else count(*) filter (where ${POLL_OK()})::numeric / count(*) end
        from net n inner join sheet s using (sheet_id)
-       where s.type = 'net-http' and n.method = 'GET'
+       where s.type = 'net-http' and (${RUN_OF()})
          and n.created_at > at.t - interval '1 hour' and n.created_at <= at.t) as polls_ok,
       (select case when count(*) = 0 then 1
                    else count(*) filter (where ${ALERT_OK()})::numeric / count(*) end
@@ -2035,7 +2052,7 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
       (select coalesce(min(${POLL_STALE_S}::numeric / greatest(1, extract(epoch from (now() - last)))), 1)
        from (select max(n.created_at) as last
              from sheet s inner join net n using (sheet_id)
-             where s.type = 'net-http' and n.method = 'GET' group by s.sheet_id) feeds) as polls_fresh,
+             where s.type = 'net-http' and (${RUN_OF()}) group by s.sheet_id) feeds) as polls_fresh,
       -- Each alert against its own interval, taken off its newest run rather
       -- than an automerge document. Twice, not once: one missed tick is a slow
       -- poll, two in a row is a poller that stopped.
@@ -2417,7 +2434,6 @@ app.get("/shop", async (c) => {
   );
 });
 
-
 // How far a delivery's signed timestamp may sit from ours. It is replay
 // protection only in the crude sense -- a delivery id dedupe is a separate item
 // -- but it bounds how long a captured request stays usable.
@@ -2723,10 +2739,10 @@ export const hookBucket = (sheet_id: string): { rows: number; bytes: number; las
 // their own: a feed polls at most once a minute, so an account's fetches are
 // bounded by its sheets, which are. A refusal that changed what an account
 // keeps or sends carries the word "quota" where GET /status reads it: the
-// sheet and row caps on the error log, the email cap on the alert's own run.
+// sheet and row caps on the error log, the delivery cap on the alert's own run.
 // A 429 is shed and never logged, so the request and sheet budgets are not.
 export const USER_SHEETS_MAX = 500;
-export const USER_EMAILS_PER_DAY = 200;
+export const USER_ALERTS_PER_DAY = 200;
 
 /** Refuses a sheet past the account's cap. Nothing deletes a sheet through the
  * API yet, so the fix is the operator's number and not the caller's. */
@@ -2875,21 +2891,21 @@ app.post("/net/:id", async (c) => {
   let stored;
   try {
     [stored] = await sql`insert into net ${
-    sql({
-      sheet_id,
-      body,
-      method: c.req.method,
-      req_headers: sql.json(Object.fromEntries(c.req.raw.headers)),
-      query_params: sql.json(c.req.query()),
-      // Which scheme and which key said yes, and the exact signature that did.
-      // The first two make "is anyone still sending the old secret, or the old
-      // scheme" a query, so a rollover has a visible end. The third is what the
-      // unique index keys on: a header name cannot be the key once a sheet may
-      // be signed by a provider, because then the sender chooses which header
-      // the index reads and a replay costs one junk header.
-      meta: sql.json({ bytes: size, scheme, secret_at, sig }),
-    })
-  } on conflict (sheet_id, (meta->>'sig')) do nothing returning net_id`;
+      sql({
+        sheet_id,
+        body,
+        method: c.req.method,
+        req_headers: sql.json(Object.fromEntries(c.req.raw.headers)),
+        query_params: sql.json(c.req.query()),
+        // Which scheme and which key said yes, and the exact signature that did.
+        // The first two make "is anyone still sending the old secret, or the old
+        // scheme" a query, so a rollover has a visible end. The third is what the
+        // unique index keys on: a header name cannot be the key once a sheet may
+        // be signed by a provider, because then the sender chooses which header
+        // the index reads and a replay costs one junk header.
+        meta: sql.json({ bytes: size, scheme, secret_at, sig }),
+      })
+    } on conflict (sheet_id, (meta->>'sig')) do nothing returning net_id`;
   } catch (err) {
     refund();
     throw err;
@@ -2922,15 +2938,24 @@ app.post("/net/:id", async (c) => {
 
 // Reject loopback, private, link-local (incl. cloud metadata 169.254.169.254), CGNAT, and IPv6 ULA/link-local ranges.
 const ipBlocked = (ipRaw: string): boolean => {
-  const mapped = ipRaw.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
-  const ip = mapped ? mapped[1] : ipRaw;
+  const raw = ipRaw.toLowerCase();
+  // One address, three spellings, all of them IPv4: dotted; IPv4-mapped the way
+  // a resolver prints it (::ffff:127.0.0.1); and IPv4-mapped the way new URL()
+  // prints it (::ffff:7f00:1), which is what a url's [::ffff:127.0.0.1] arrives
+  // as and therefore the only one that ever reached here from a url. That last
+  // one used to fall through to the IPv6 rules, where loopback and
+  // 169.254.169.254 are not written down, and out.
+  const hex = raw.match(/^::(?:ffff:)?(?:([0-9a-f]{1,4}):)?([0-9a-f]{1,4})$/);
+  const [hi, lo] = hex ? [parseInt(hex[1] ?? "0", 16), parseInt(hex[2], 16)] : [0, 0];
+  const ip = hex
+    ? [hi >> 8, hi & 255, lo >> 8, lo & 255].join(".")
+    : raw.match(/^::(?:ffff:)?(\d+\.\d+\.\d+\.\d+)$/)?.[1] ?? raw;
   if (ip.includes(".")) {
     const [a, b] = ip.split(".").map(Number);
     return a === 0 || a === 127 || a === 10 || a === 169 && b === 254 ||
       a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 || a === 100 && b >= 64 && b <= 127;
   }
-  const v6 = ip.toLowerCase();
-  return v6 === "::" || v6 === "::1" || /^f[cd]/.test(v6) || /^fe[89ab]/.test(v6);
+  return raw === "::" || raw === "::1" || /^f[cd]/.test(raw) || /^fe[89ab]/.test(raw);
 };
 
 // How many hops one fetch may follow. Named rather than written twice: the
@@ -2945,6 +2970,7 @@ export const USER_AGENT = "Scrapsheets/1.0 (+https://github.com/surprisetalk/scr
 export const safeFetch = async (
   start: string,
   headers: Record<string, string> = {},
+  method: Method = "GET",
   body?: string,
 ): Promise<Response> => {
   let url = start;
@@ -2968,9 +2994,38 @@ export const safeFetch = async (
       });
     }
     const isLiteral = /^[0-9.]+$/.test(host) || host.includes(":");
-    const ips = isLiteral ? [host] : (await Promise.all(
-      (["A", "AAAA"] as const).map((t) => Deno.resolveDns(host, t).catch(() => [] as string[])),
-    )).flat();
+    // Two lookups, and what each one has to say for itself when it fails. Only
+    // "this name has no such record" is an answer about the host: a resolver
+    // that timed out or is not there at all is ours, and folding the two into
+    // one empty array told every feed's owner to check a spelling that was
+    // right. A host with A records and no AAAA is the ordinary case, so the
+    // resolver's own failure is reported only when nothing resolved at all.
+    const answers: (string[] | Error)[] = isLiteral ? [[host]] : await Promise.all(
+      (["A", "AAAA"] as const).map((t) =>
+        Deno.resolveDns(host, t).catch((err) => (err instanceof Deno.errors.NotFound ? [] : err as Error))
+      ),
+    );
+    const ips = answers.flatMap((answer) => Array.isArray(answer) ? answer : []);
+    // An empty answer is not "no blocked address among them": Deno's resolver
+    // reads neither /etc/hosts nor the OS resolver, so a name only this machine
+    // knows resolves to nothing here and to loopback in the fetch below.
+    if (!ips.length) {
+      const broke = answers.find((answer) => !Array.isArray(answer)) as Error | undefined;
+      if (broke) {
+        bad(502, `This server's resolver could not answer for that host.`, {
+          Expected: "a DNS answer for the host this url names",
+          Received: `the resolver said ${reason(broke)}`,
+          Source: `the DNS lookup of ${u.hostname}`,
+          Fix: "nothing here says the host is wrong; this is ours, so try again",
+        });
+      }
+      bad(400, `That host has no address.`, {
+        Expected: "a host that resolves to a public address",
+        Received: `${u.hostname}, which resolved to no address at all`,
+        Source: "the DNS answer for this url",
+        Fix: "check the spelling of the host, or point it at a host reachable from the public internet",
+      });
+    }
     if (ips.some(ipBlocked)) {
       bad(400, `That host resolves inside this server's own network.`, {
         Expected: "a host resolving to a public address",
@@ -2980,7 +3035,7 @@ export const safeFetch = async (
       });
     }
     const res = await fetch(url, {
-      method: body === undefined ? "GET" : "POST",
+      method,
       body,
       redirect: "manual",
       // Ten seconds, not thirty: the poller runs on a 15s tick, and a request
@@ -2995,9 +3050,9 @@ export const safeFetch = async (
         ...(u.origin === new URL(start).origin ? headers : {}),
       },
     });
-    // A POST is not followed anywhere: a webhook that redirects is a webhook
-    // set wrong, and a redirect that turns a POST into a GET drops the body.
-    const location = body === undefined && res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+    // Only a GET is followed: a webhook that redirects is a webhook set wrong,
+    // and a redirect that turns a POST into a GET drops the body.
+    const location = method === "GET" && res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
     if (!location) return res;
     url = new URL(location, url).href;
   }
@@ -3026,10 +3081,10 @@ export const parseNetHeaders = (raw = ""): Record<string, string> =>
 // a header is a token a share link can be pointed at.
 const SECRET_REF = /\{\{secret:([a-z0-9][a-z0-9:_-]{0,63})\}\}/g;
 
-/** The headers to actually send, with every `{{secret:name}}` replaced by the
- * newest secret of that name on this sheet. Answers a fresh object rather than
- * editing the one it was given, so the caller keeps the unresolved headers and
- * only names can reach a log. */
+/** What to actually send -- headers, or the one-field record a body is --
+ * with every `{{secret:name}}` replaced by the newest secret of that name on
+ * this sheet. Answers a fresh object rather than editing the one it was given,
+ * so the caller keeps the unresolved text and only names can reach a log. */
 const resolveSecrets = async (
   sheet_id: string,
   headers: Record<string, string>,
@@ -3052,10 +3107,10 @@ const resolveSecrets = async (
     // Sending the request without the header instead would come back as
     // somebody else's 401 and read as the API's fault. This names ours.
     throw new Error(
-      explain(`This sheet's headers name ${missing.length > 1 ? "secrets" : "a secret"} it does not hold.`, {
+      explain(`This sheet's request names ${missing.length > 1 ? "secrets" : "a secret"} it does not hold.`, {
         Received: missing.map((name) => `{{secret:${name}}}`).join(", "),
         Expected: `a secret of ${missing.length > 1 ? "each of those names" : "that name"} on this sheet`,
-        Source: "the headers on this net-http sheet, against the secret table",
+        Source: "the headers and body of this net-http sheet, against the secret table",
         Fix: `store it with POST /library/${sheet_id}/secret, or take the reference out of the header`,
       }),
     );
@@ -3065,16 +3120,71 @@ const resolveSecrets = async (
   );
 };
 
+/** The method and body a request is made with, from wherever the two fields
+ * arrive: a net-http sheet's document, or a pre-flight's JSON. */
+const netRequest = (config: { method?: unknown; body?: unknown }): { method: Method; body?: string } => {
+  const { method = "GET", body } = config;
+  if (typeof method !== "string" || !(NET_METHODS as readonly string[]).includes(method)) {
+    bad(400, `That is not a method this server sends.`, {
+      Received: show(method),
+      Expected: `one of ${NET_METHODS.join(", ")}, or no method at all for a GET`,
+      Source: "the method on this net-http request",
+      Fix: `spell it ${NET_METHODS.join(" or ")}`,
+    });
+  }
+  if (body !== undefined && typeof body !== "string") {
+    bad(400, `A request body is text.`, {
+      Received: show(body),
+      Expected: "a string, or no body at all",
+      Source: "the body on this net-http request",
+      Fix: "write the body out as text; its templates are resolved into it just before it is sent",
+    });
+  }
+  // An empty box is no body at all, which is what a sheet that was never given
+  // one means.
+  const sending = body || undefined;
+  // Refused here, where the sheet's own text is still what is held, rather than
+  // in safeFetch, which is handed the body after `{{secret:name}}` resolved: a
+  // poller's refusal is written to the sheet's run log, and a size measured on
+  // the resolved text is an oracle on the secret behind it, refreshed every
+  // interval for every viewer of the sheet to read.
+  if (method === "GET" && sending !== undefined) {
+    bad(400, `A GET carries no body.`, {
+      Received: `a GET with ${new TextEncoder().encode(sending).byteLength} bytes of body`,
+      Expected: "a POST or a PUT for a request with a body",
+      Source: "the method and body on this net-http request",
+      Fix: "set the method to POST or PUT, or take the body out",
+    });
+  }
+  return { method: method as Method, body: sending };
+};
+
 // A failure the user can reproduce. The curl line names the header keys the sheet
-// sent but never their values: a net-http header may carry a token.
-const curlFor = (url: string, headers: Record<string, string>): string =>
-  ["curl -i", ...Object.keys(headers).map((k) => `-H '${k}: <value>'`), `'${url.replace(/'/g, "'\\''")}'`].join(" ");
+// sent but never their values: a net-http header may carry a token. The body is
+// the sheet's own text, `{{secret:name}}` and all, for that rule in reverse: the
+// resolved one is the token the log must not learn.
+const curlFor = (url: string, headers: Record<string, string>, method: Method, body?: string): string => {
+  // One apostrophe in the value otherwise ends the quoting, and the line the
+  // user pastes runs as something else.
+  const quoted = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+  return [
+    "curl -i",
+    ...(method === "GET" ? [] : [`-X ${method}`]),
+    // The name goes through it too: an apostrophe is a valid HTTP token
+    // character, so a header name can end the quoting the same way a url can.
+    ...Object.keys(headers).map((k) => `-H ${quoted(`${k}: <value>`)}`),
+    ...(body === undefined ? [] : [`--data ${quoted(body)}`]),
+    quoted(url),
+  ].join(" ");
+};
 
 const fetchFailure = (
   url: string,
   headers: Record<string, string>,
   res: Response | null,
   detail: string,
+  method: Method = "GET",
+  body?: string,
 ): Record<string, unknown> => ({
   error: res ? `HTTP ${res.status}${res.statusText ? " " + res.statusText : ""}` : detail,
   status: res?.status ?? null,
@@ -3082,7 +3192,7 @@ const fetchFailure = (
   url: res?.url || url,
   content_type: res?.headers.get("content-type") ?? null,
   body: res ? detail.slice(0, 1000) : null,
-  repro: curlFor(res?.url || url, headers),
+  repro: curlFor(res?.url || url, headers, method, body),
 });
 
 // Both hold a *future* due time: one entry per net-http sheet that ever polled
@@ -3229,14 +3339,19 @@ const shapeChange = (
   return added.length || dropped.length || retyped.length ? { added, dropped, retyped } : null;
 };
 
-const netRow = async (sheet_id: string, body: string, meta: Record<string, unknown>): Promise<void> => {
+const netRow = async (
+  sheet_id: string,
+  method: Method,
+  body: string,
+  meta: Record<string, unknown>,
+): Promise<void> => {
   // A body this sheet already holds is not appended again. The digest of a
   // good run's body rides `meta.sig`, the slot a delivery's signature takes,
   // so the index that refuses a replayed delivery refuses the repeat; the row
   // it matches moves to now, the way a 304 moves the row before it, and says
   // it came again. A failure row carries no digest and is never a repeat.
   const [stored] = await sql`
-    insert into net (sheet_id, method, body, meta) values (${sheet_id}, 'GET', ${body}, ${sql.json(meta)})
+    insert into net (sheet_id, method, body, meta) values (${sheet_id}, ${method}, ${body}, ${sql.json(meta)})
     on conflict (sheet_id, (meta->>'sig')) do nothing returning net_id
   `;
   if (!stored) {
@@ -3266,29 +3381,33 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
     // The only set here that can introduce a key: every later one this cycle is
     // this same sheet, and Map.set on a key it holds keeps its position.
     bound(netDue, RATE_LIMIT_KEYS_MAX);
-    // Declared out here so the catch can name the URL and headers it failed on.
-    let url = `sheet ${sheet_id}`, headers: Record<string, string> = {};
+    // Declared out here so the catch can name the request it failed on. The
+    // body is the sheet's own text and not what its templates resolve to: the
+    // failure row is built from these four, and a token must not reach the log.
+    let url = `sheet ${sheet_id}`;
+    let headers: Record<string, string> = {};
+    let method: Method = "GET";
+    let body: string | undefined;
+    // The watermark this feed had already reached, out here for the same
+    // reason: it rides every row this poll writes, the failures among them.
+    // The newest row is where this feed's state lives, and a failed poll that
+    // dropped the watermark asked the feed for all of history on the next one
+    // -- the single thing the cursor exists to prevent. The validators do not
+    // travel with it: a 304 moves the row the validator came with, and a
+    // failure row does not hold that body.
+    let carried: Record<string, string> = {};
     try {
-      const config = (await automerge.find<{ data: [NetHttp] }>(doc_id)).doc()?.data?.[0];
-      if (!config) throw new Error("The document has no config in data[0].");
-      netDue.set(sheet_id, now + Math.max(60, Number(config.interval) || 3600) * 1000);
-      if (!config.url) continue;
-      url = config.url;
-      headers = parseNetHeaders(config.headers);
-      const host = new URL(url).hostname;
-      const holdoff = hostDue.get(host) ?? 0;
-      // Waiting out what another sheet on this host was told. Nothing ran, so
-      // there is nothing to log.
-      if (holdoff > now) {
-        netDue.set(sheet_id, holdoff);
-        continue;
-      }
       // The last row is where this feed's state lives: the validators the last
       // good body carried, the watermark it was fetched at, and how many
       // failures have happened in a row since. It lives in `net.meta` rather
       // than in the automerge document because that document is what sync hands
       // every viewer and what the user edits -- a poller writing to it every
       // tick would fight those edits and mint a change for every open browser.
+      //
+      // Read before anything about the config can throw. A method the sheet
+      // spells DELETE, a url that will not parse and a document that will not
+      // load all land in the catch below, and a failure row written without the
+      // watermark in hand is a feed asked for all of history on the next poll.
       const [prev]: {
         net_id: string;
         meta: {
@@ -3302,6 +3421,22 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
         select net_id, meta from net where sheet_id = ${sheet_id} order by net_id desc limit 1
       `;
       const was = prev?.meta ?? {};
+      if (was.cursor) carried = { cursor: String(was.cursor) };
+      const config = (await automerge.find<{ data: [NetHttp] }>(doc_id)).doc()?.data?.[0];
+      if (!config) throw new Error("The document has no config in data[0].");
+      netDue.set(sheet_id, now + Math.max(60, Number(config.interval) || 3600) * 1000);
+      if (!config.url) continue;
+      url = config.url;
+      headers = parseNetHeaders(config.headers);
+      ({ method, body } = netRequest(config));
+      const host = new URL(url).hostname;
+      const holdoff = hostDue.get(host) ?? 0;
+      // Waiting out what another sheet on this host was told. Nothing ran, so
+      // there is nothing to log.
+      if (holdoff > now) {
+        netDue.set(sheet_id, holdoff);
+        continue;
+      }
       // Resolved into a separate object. `headers` is what a failure row is
       // built from, so a resolved token cannot reach the log even if curlFor
       // one day prints more than the keys. The conditional headers are ours and
@@ -3312,6 +3447,14 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
         ...(was.etag ? { "If-None-Match": was.etag } : {}),
         ...(was.last_modified ? { "If-Modified-Since": was.last_modified } : {}),
       };
+      // The body is templated where a header already was, and resolved into a
+      // second object for the same reason. `{{cursor}}` is the watermark the
+      // cursor parameter would have carried; the first poll has none, and asks
+      // for everything the way an unset parameter does.
+      const sendingBody = body === undefined ? undefined : (await resolveSecrets(sheet_id, {
+        body: body.replaceAll("{{cursor}}", was.cursor ? String(was.cursor) : ""),
+      }))
+        .body;
       // The watermark is when the last good poll started, not when it finished:
       // a row created while that request was in flight is asked for twice
       // rather than missed once. It rides every good run, so a sheet that
@@ -3337,7 +3480,7 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       // reset. Everything safeFetch refuses on its own arrives as an
       // HTTPException instead, because a private address or a redirect loop
       // answers a retry exactly as it answered this one.
-      const res = await fetcher(url, sending).catch((err) => {
+      const res = await fetcher(url, sending, method, sendingBody).catch((err) => {
         if (err instanceof HTTPException) throw err;
         return reason(err);
       });
@@ -3382,12 +3525,13 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
         netDue.set(sheet_id, wait);
         await netRow(
           sheet_id,
+          method,
           JSON.stringify({
-            ...fetchFailure(url, headers, answered, detail),
+            ...fetchFailure(url, headers, answered, detail, method, body),
             attempt,
             retry_at: new Date(wait).toISOString(),
           }),
-          { status: answered?.status ?? 0, ms: Date.now() - started, bytes: detail.length, attempt },
+          { status: answered?.status ?? 0, ms: Date.now() - started, bytes: detail.length, attempt, ...carried },
         );
         continue;
       }
@@ -3440,7 +3584,7 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       const text = new TextDecoder().decode(raw);
       // Errors become log rows too: the user who typed the URL must see them, and
       // must be able to run the same request by hand.
-      const body = res.ok ? text : JSON.stringify(fetchFailure(url, headers, res, text));
+      const logged = res.ok ? text : JSON.stringify(fetchFailure(url, headers, res, text, method, body));
       // The columns this run answered with, beside it, and against the run
       // before: a dropped column read as a sheet of blanks and graded healthy.
       // The rows still land -- they are what arrived -- and POLL_OK grades the
@@ -3456,21 +3600,23 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       const sig = res.ok ? await digest(text) : undefined;
       // The run beside the payload: whether a feed is slow, or 200-ing an error
       // page, is a question about the poll and not about the body it returned.
-      // The validators and the watermark ride the good rows only, so the next
-      // poll asks its question about the body this sheet actually holds.
-      await netRow(sheet_id, body, {
+      // The validators ride the good rows only, so the next poll asks its
+      // question about the body this sheet actually holds; the watermark is
+      // carried onto this one, because where the feed had been read to is true
+      // whether or not this poll answered.
+      await netRow(sheet_id, method, logged, {
         status: res.status,
         ms: Date.now() - started,
         bytes: raw.byteLength,
-        ...(res.ok ? { ...kept, sig, shape, ...(change ? { shape_change: change } : {}) } : {}),
+        ...(res.ok ? { ...kept, sig, shape, ...(change ? { shape_change: change } : {}) } : carried),
       });
     } catch (err) {
       const message = reason(err);
       console.error(`net-http poll ${sheet_id}:`, message);
-      const failure = fetchFailure(url, headers, null, message);
+      const failure = fetchFailure(url, headers, null, message, method, body);
       // No attempt count: giving up, a malformed Retry-After and a sheet that
       // cannot be read all land here, and the next scheduled poll starts over.
-      await netRow(sheet_id, JSON.stringify(failure), { status: 0, ms: 0, bytes: 0 })
+      await netRow(sheet_id, method, JSON.stringify(failure), { status: 0, ms: 0, bytes: 0, ...carried })
         .catch((dbErr: unknown) => console.error(`net-http poll ${sheet_id}: could not record the error:`, dbErr));
     }
   }
@@ -3558,7 +3704,7 @@ const deliverWebhook = async (
     "Content-Type": "application/json",
     "scrapsheets-signature": await hookSign(keys[0].value, target.pathname + target.search, body),
   };
-  return await fetcher(hook.url, headers, body).then((res) => res.status).catch((err) => {
+  return await fetcher(hook.url, headers, "POST", body).then((res) => res.status).catch((err) => {
     if (err instanceof HTTPException) throw err;
     console.error(`webhook ${hook.sheet_id} -> ${hook.url}:`, reason(err));
     return 0;
@@ -3584,25 +3730,27 @@ export const flushWebhooks = async (fetcher = safeFetch, now = Date.now()): Prom
   for (let i = 0; i < hooks.length; i += WEBHOOK_PARALLEL) {
     // Each hook on its own: one sheet whose keys cannot be read, or one row
     // the database refuses, must not silence every hook after it.
-    await Promise.all(hooks.slice(i, i + WEBHOOK_PARALLEL).map(async (hook) => {
-      try {
-        spend(hook.sheet_id, "webhooks", 1, 0, "change the sheet less often");
-      } catch (err) {
-        if (err instanceof HTTPException && err.status === 429) return;
-        throw err;
-      }
-      // A refusal of the url at delivery time -- a host that now resolves
-      // inside our network -- is a failure on the row like any other.
-      const status = await deliverWebhook(hook, "change", fetcher, now).catch((err) => {
-        console.error(`webhook ${hook.sheet_id} -> ${hook.url}:`, reason(err));
-        return 0;
-      });
-      const ok = status >= 200 && status < 300;
-      await sql`
+    await Promise.all(
+      hooks.slice(i, i + WEBHOOK_PARALLEL).map(async (hook) => {
+        try {
+          spend(hook.sheet_id, "webhooks", 1, 0, "change the sheet less often");
+        } catch (err) {
+          if (err instanceof HTTPException && err.status === 429) return;
+          throw err;
+        }
+        // A refusal of the url at delivery time -- a host that now resolves
+        // inside our network -- is a failure on the row like any other.
+        const status = await deliverWebhook(hook, "change", fetcher, now).catch((err) => {
+          console.error(`webhook ${hook.sheet_id} -> ${hook.url}:`, reason(err));
+          return 0;
+        });
+        const ok = status >= 200 && status < 300;
+        await sql`
         update webhook set delivered_at = now(), status = ${status}, failures = ${ok ? 0 : hook.failures + 1}
         where webhook_id = ${hook.webhook_id}
       `.catch((err: unknown) => console.error(`webhook ${hook.sheet_id}: could not record the outcome:`, reason(err)));
-    }));
+      }),
+    );
   }
 };
 
@@ -3650,6 +3798,16 @@ const digest = async (value: unknown) =>
     new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value)))),
   ).slice(0, 8).map((b) => b.toString(16).padStart(2, "0")).join("");
 
+// What the run amounts to, in one clause. Both destinations lead with it, so
+// an email subject and a Slack line cannot come to disagree about one run.
+const alertHeadline = (rows: Row[], diff: { added: Row[]; removed: number } | null): string => {
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  // What changed is the news; the whole matching set is the context underneath.
+  return diff
+    ? `${plural(diff.added.length, "new row")}, ${plural(diff.removed, "gone")}, ${plural(rows.length, "row")} in all`
+    : plural(rows.length, "row");
+};
+
 export const sendAlertEmail = async (
   to: string,
   sheet_id: string,
@@ -3659,11 +3817,7 @@ export const sendAlertEmail = async (
 ): Promise<string> => {
   const key = Deno.env.get(`RESEND_API_KEY`);
   if (!key) return "no RESEND_API_KEY, so nothing was sent";
-  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
-  // What changed is the news; the whole matching set is the context underneath.
-  const headline = diff
-    ? `${plural(diff.added.length, "new row")}, ${plural(diff.removed, "gone")}, ${plural(rows.length, "row")} in all`
-    : plural(rows.length, "row");
+  const headline = alertHeadline(rows, diff);
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
@@ -3691,32 +3845,88 @@ export const sendAlertEmail = async (
   return `resend refused it with ${res.status}: ${detail.slice(0, 200)}`;
 };
 
-/** Sends unless the account has sent its day's worth already. Counted off
- * the run log rather than kept in memory, so a restart forgets nothing, and
- * across every alert the account owns, so splitting a cannon into many sheets
- * buys it nothing. The refusal is the run's own delivery line. */
-const sendWithinQuota = async (
-  created_by: string,
+// A destination that is a url is posted to rather than mailed. Slack and
+// Discord each read one field of the body and ignore the rest, so those two get
+// the shape they document and every other url gets the alert itself.
+const alertUrl = (to: string) => /^https?:\/\//i.test(to);
+
+/** Posts the alert to its url. Nothing here throws: an SSRF refusal, a url that
+ * will not parse and a 500 all come back as the delivery line, so a refused post
+ * is recorded and sent again next interval exactly as a refused email is. The
+ * line names the host and never the url, because a webhook url is a credential
+ * and the run log is read by everyone the sheet is shared with. */
+const sendAlertUrl = async (
+  fetcher: typeof safeFetch,
   to: string,
   sheet_id: string,
   name: string,
-  rows: Record<string, unknown>[],
-  diff: { added: Record<string, unknown>[]; removed: number } | null,
-  send: typeof sendAlertEmail,
+  rows: Row[],
+  diff: { added: Row[]; removed: number } | null,
 ): Promise<string> => {
+  // Parsed before the try, and its own refusal: new URL()'s TypeError quotes the
+  // whole input, and the input is the credential every line below is careful not
+  // to name.
+  let u: URL;
+  try {
+    u = new URL(to);
+  } catch {
+    return explain(`That alert's destination will not parse as a url.`, {
+      Expected: "an https:// url, such as a Slack or Discord incoming webhook",
+      Received: `${to.length} characters that are not a url`,
+      Source: `data[0].to on ${sheet_id}`,
+      Fix: "paste the webhook url again, port and all",
+    });
+  }
+  const host = u.hostname;
+  try {
+    const line = `${name || sheet_id}: ${alertHeadline(rows, diff)}. https://sheets.scrap.land/${sheet_id}`;
+    const body = host === "hooks.slack.com"
+      ? { text: line }
+      : host === "discord.com" && u.pathname.startsWith("/api/webhooks")
+      ? { content: line }
+      // The rows the run itself keeps, which is the most it can say about a run
+      // anyway: past that the run is marked truncated and says so.
+      : { sheet: sheet_id, name, rows: rows.slice(0, ALERT_ROWS) };
+    const res = await fetcher(to, { "Content-Type": "application/json" }, "POST", JSON.stringify(body));
+    if (res.ok) return "sent";
+    // Through readBody, the way a failing poll's body is read: a destination
+    // answering 500 with an endless one otherwise decides how much of this
+    // server's memory one refused delivery costs, on a 15s tick, per alert.
+    const detail = new TextDecoder().decode(await readBody(res)).slice(0, 200);
+    console.error(`alert ${sheet_id}: ${host} refused the post:`, res.status, detail);
+    return `${host} refused it with ${res.status}: ${detail}`;
+  } catch (err) {
+    // fetch quotes the whole url it was handed in the message it throws, so the
+    // url is taken back out of it: the host is the most this line may name,
+    // whichever way the post failed.
+    const message = reason(err).replaceAll(to, host).replaceAll(u.href, host);
+    console.error(`alert ${sheet_id}: the post to ${host} failed:`, message);
+    return `the post to ${host} failed: ${message.slice(0, 400)}`;
+  }
+};
+
+/** Delivers unless the account has spent its day's worth already. Counted off
+ * the run log rather than kept in memory, so a restart forgets nothing, and
+ * across every alert the account owns, so splitting a cannon into many sheets
+ * buys it nothing. A url costs what an email does, or swapping the address for a
+ * webhook rebuilds the cannon. The refusal is the run's own delivery line. */
+const sendWithinQuota = async (created_by: string, deliver: () => Promise<string>): Promise<string> => {
   const [{ n }] = await sql`
     select count(*)::int as n from net n inner join sheet s using (sheet_id)
     where s.type = 'alert' and s.created_by = ${created_by}
       and n.method = 'ALERT' and n.created_at > now() - interval '1 day'
       and (case when n.body is json then n.body::jsonb end)->>'delivery' = 'sent'
   `;
-  if (n >= USER_EMAILS_PER_DAY) {
-    return `this account's quota of ${USER_EMAILS_PER_DAY} emails a day is spent (${n} sent), so nothing was sent`;
-  }
-  return await send(to, sheet_id, name, rows, diff);
+  if (n >= USER_ALERTS_PER_DAY)
+    return `this account's quota of ${USER_ALERTS_PER_DAY} alert deliveries a day is spent (${n} sent), so nothing was sent`;
+  return await deliver();
 };
 
-export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Promise<void> => {
+export const pollAlertOnce = async (
+  send = sendAlertEmail,
+  now = Date.now(),
+  fetcher = safeFetch,
+): Promise<void> => {
   const sheets = await sql`select sheet_id, doc_id, name, created_by from sheet where type = 'alert'`;
   for (const { sheet_id, doc_id, name, created_by } of sheets) {
     if ((alertDue.get(sheet_id) ?? 0) > now) continue;
@@ -3756,6 +3966,19 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
           Expected: `one of ${ALERT_WHEN.join(", ")}, or no when at all for rows`,
           Source: "data[0].when on the alert document",
           Fix: "pick one in the alert's settings",
+        }));
+      }
+      const to = config.to ?? "";
+      // A digest is one email a day gathering many alerts, and there is nothing
+      // to post: refused by name, rather than held for a summary that will never
+      // carry it. The url itself stays out of the message -- it is a credential,
+      // and this line reaches the error log.
+      if (config.digest && alertUrl(to)) {
+        throw new Error(explain(`The alert on ${sheet_id} is held for the daily digest and sent to a url.`, {
+          Received: "a url, with the digest box ticked",
+          Expected: "an email address, because a digest is one email a day",
+          Source: "data[0].to and data[0].digest on the alert document",
+          Fix: "clear the digest box, or send this alert to an email address",
         }));
       }
       const code = config.code?.trim() ?? "";
@@ -3820,12 +4043,17 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
       // neither run had more rows than it keeps. Say so rather than guess.
       const truncated = rows.length > ALERT_ROWS;
       if (truncated && when !== "rows") {
-        throw new Error(explain(`This run matched more than the ${ALERT_ROWS} rows an alert keeps, so it cannot tell which are ${when}.`, {
-          Received: `${rows.length} rows`,
-          Expected: `at most ${ALERT_ROWS} rows on this run and the run before`,
-          Source: `when = ${when} on ${sheet_id}`,
-          Fix: "narrow the query, or fire on rows",
-        }));
+        throw new Error(
+          explain(
+            `This run matched more than the ${ALERT_ROWS} rows an alert keeps, so it cannot tell which are ${when}.`,
+            {
+              Received: `${rows.length} rows`,
+              Expected: `at most ${ALERT_ROWS} rows on this run and the run before`,
+              Source: `when = ${when} on ${sheet_id}`,
+              Fix: "narrow the query, or fire on rows",
+            },
+          ),
+        );
       }
       // An error run kept no rows, so a diff against it would call every row new.
       const comparable = !truncated && before !== null && before.status !== "error" && !before.truncated;
@@ -3856,12 +4084,25 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
         : diff
         ? `no rows ${when} since the run before`
         : "nothing to compare with";
+      // Where the destination decides how it is reached, once, so the quota
+      // above it counts a post and an email the same.
+      const deliver = () =>
+        alertUrl(to) ? sendAlertUrl(fetcher, to, sheet_id, name, rows, diff) : send(to, sheet_id, name, rows, diff);
       record = {
         status: !code ? "idle" : unchanged ? "unchanged" : hit ? "firing" : "clear",
         when,
         rows: rows.length,
         fingerprint,
-        to: config.to ?? "",
+        // The host and not the url. A webhook url is a credential -- its path
+        // is the whole of the authorization, which is why KEY_SHAPES knows a
+        // Slack one by sight -- and this row is read by everyone the sheet is
+        // shared with, viewers included, through GET /sheet, every export and
+        // the MCP read. sendAlertUrl already rewrites the url out of every
+        // failure it reports for that reason; writing it here in full undid
+        // that. The document still holds the real value, for whoever may edit
+        // it. Parsed without throwing: a TypeError from `new URL` quotes the
+        // whole input, and the catch below writes that message to this log.
+        to: alertUrl(to) ? URL.parse(to)?.hostname ?? "a url this server could not read" : to,
         truncated,
         matched: rows.slice(0, ALERT_ROWS),
         added: diff ? diff.added.length : null,
@@ -3883,8 +4124,8 @@ export const pollAlertOnce = async (send = sendAlertEmail, now = Date.now()): Pr
           ? `${missed}, so nothing was sent`
           : config.digest
           ? HELD
-          : config.to
-          ? await sendWithinQuota(created_by, config.to, sheet_id, name, rows, diff, send)
+          : to
+          ? await sendWithinQuota(created_by, deliver)
           : "no destination, so nothing was sent",
       };
     } catch (err) {
@@ -4289,6 +4530,106 @@ app.post("/buy/:id", async (c) => {
 // arrives under.
 export const LICENSES = ["own", "public-domain", "cc0", "cc-by", "cc-by-sa", "odbl"] as const;
 
+// The shapes a credential is recognized by, and the name each one is refused
+// under. Anchored on the issuer's own prefix rather than on "long and random",
+// because an id column is long and random too and a refusal here has no
+// override: the publish simply does not happen.
+const KEY_SHAPES: [string, RegExp][] = [
+  ["a Stripe secret key", /(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}/],
+  ["an AWS access key id", /AKIA[0-9A-Z]{16}/],
+  ["a GitHub token", /gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}/],
+  ["a Slack token", /xox[abprs]-[A-Za-z0-9-]{10,}/],
+  ["a Google API key", /AIza[A-Za-z0-9_-]{35}/],
+  ["a private key", /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
+  // The header segment is bounded and the payload is not. A JWT header is a few
+  // dozen characters; leaving it open made the scan quadratic in one cell's
+  // bytes, because every `eyJ` in it walked the rest of the cell looking for a
+  // dot that a cell of nothing but `eyJ` never has -- 48 KB cost 1.4 seconds of
+  // blocked event loop, a megabyte cost minutes.
+  ["a signed token", /eyJ[A-Za-z0-9_-]{8,512}\.eyJ[A-Za-z0-9_-]{8,}\./],
+  // An incoming-webhook url is a bearer credential: whoever holds it posts to
+  // the channel. It is also the one credential this app tells you to paste into
+  // a cell, since an alert's destination is a cell.
+  ["a Slack webhook url", /https:\/\/hooks\.slack\.com\/services\/\S+/],
+  ["a Discord webhook url", /https:\/\/discord(?:app)?\.com\/api\/webhooks\/\S+/],
+];
+
+// What a scan will read. A sheet's rows are capped where this server writes
+// them -- an import, an append -- and not at all where a browser syncs them in.
+// Cells alone bound nothing: one synced cell may hold a megabyte, and the scan
+// costs the bytes it reads, so both are counted and either one refuses.
+//
+// The byte cap is the scan's own cost and not the document's. The signed-token
+// shape walks up to its header bound from every `eyJ`, so a cell of near-misses
+// costs the bytes times that bound however the shape is written -- bounding the
+// payload too changes nothing, measured. 4 MB of `eyJ` was 2.5 seconds of
+// blocked event loop on one authenticated publish, on an isolate that is
+// serving every other request and both poll ticks; 256 KB is a sixth of a
+// second. The 413 already says to publish a smaller answer out of the sheet.
+const KEY_SCAN_CELLS = 500_000;
+const KEY_SCAN_BYTES = 256_000;
+
+// Publishing a sheet hands its whole document to strangers, which is where a
+// key pasted into a cell stops being the author's own business. A key a request
+// needs lives in the `secret` table and reaches a document only as a
+// {{secret:name}} reference, so a literal one in a cell is always the accident.
+const assertNoKeys = async (sheet_id: string): Promise<void> => {
+  // A computed sheet has no document and a codex sheet's doc_id names none;
+  // neither holds a cell of its own to leak. Named here rather than caught off
+  // a rejected find: a document that will not load is a scan that did not run,
+  // and it used to take the same silent exit as a sheet with nothing to scan --
+  // so a publish nobody could check went out anyway, which is the one answer
+  // this function exists to refuse to guess.
+  const [type, doc_id] = sheet_id.split(":");
+  if (type.startsWith("codex-")) return;
+  if ([FRESHNESS_SHEET, AUDIT_SHEET, ERROR_SHEET, REPORT_SHEET].includes(sheet_id)) return;
+  const unscannable = (): never =>
+    bad(404, `Sheet ${sheet_id} cannot be published: its document did not arrive.`, {
+      Expected: "the automerge document behind this sheet, so it can be checked for credentials",
+      Received: "none",
+      Source: `doc_id ${doc_id}`,
+      Fix: "keep the sheet's tab open so the document can be pushed to this server, then publish again",
+    });
+  const data = await automerge
+    .find<{ data: unknown }>(doc_id as AnyDocumentId)
+    .then((hand) => hand.doc()?.data)
+    .catch(unscannable);
+  if (!Array.isArray(data)) return unscannable();
+  const cols = Object.values((data[0] ?? {}) as Row<Col>);
+  let cells = 0;
+  let bytes = 0;
+  for (const [row, values] of data.entries()) {
+    for (const [key, value] of Object.entries((values ?? {}) as Row)) {
+      // The value's text rather than only a string cell: a json cell holds an
+      // object, and a feed's settings hold the headers it sends.
+      const text = typeof value === "string" ? value : (JSON.stringify(value) ?? "");
+      cells++;
+      bytes += text.length;
+      if (cells > KEY_SCAN_CELLS || bytes > KEY_SCAN_BYTES) {
+        bad(413, `Sheet ${sheet_id} is too large to check before publishing.`, {
+          Expected: `at most ${KEY_SCAN_CELLS} cells holding at most ${KEY_SCAN_BYTES} bytes`,
+          Received: `cell ${cells}, holding ${bytes} bytes with it, and more`,
+          Source: `the automerge document behind ${sheet_id}`,
+          Fix: "query a smaller answer out of the sheet and publish that instead",
+        });
+      }
+      const [shape] = KEY_SHAPES.find(([, look]) => look.test(text)) ?? [];
+      if (!shape) continue;
+      const col = cols.find((col) => col && String(col.key) === key);
+      // Where it is, never what it is, and never how much of it matched. Whoever
+      // publishes reads this, and is not always whoever pasted the value.
+      const place = row ? `column ${col?.name ?? key}, row ${row}` : `the sheet's settings, under ${key}`;
+      bad(400, `Sheet ${sheet_id} cannot be published: it holds ${shape}.`, {
+        Expected: "no credential in a sheet anybody can read",
+        Received: `${shape} in ${place}`,
+        Source: `the automerge document behind ${sheet_id}`,
+        Fix: `clear that cell, then publish again; a key a request needs is stored with ` +
+          `POST /library/${sheet_id}/secret and written into a header as {{secret:name}}`,
+      });
+    }
+  }
+};
+
 app.post("/sell/:id", async (c) => {
   const body = await jsonBody(c);
   const { price, license } = body;
@@ -4325,6 +4666,14 @@ app.post("/sell/:id", async (c) => {
       Fix: "sell the query the alert watches instead, and let the buyer point their own alert at it",
     });
   }
+  // Ownership first, the way POST /library/:id/public asks it. The update below
+  // is the resale check and not an access check, so the scan used to run for
+  // anybody holding an id: its refusal names the credential a private document
+  // holds, which column and which row.
+  await assertSheetOwner(c, c.req.param("id"));
+  // A listing is read by strangers the way a public sheet is. A null price
+  // takes the listing down, and taking something down publishes nothing.
+  if (price !== null) await assertNoKeys(c.req.param("id"));
   const updated = await sql`
     update sheet set sell_price = ${price}${price === null ? sql`` : sql`, license = ${license as string}`}
     where true
@@ -4799,6 +5148,7 @@ app.post("/library/:id/public", async (c) => {
       Fix: `post {"public": true} or {"public": false}`,
     });
   }
+  if (isPublic) await assertNoKeys(sheet_id);
   await sql`update sheet set public = ${isPublic} where sheet_id = ${sheet_id}`;
   invalidateSync(sheet_id.split(":")[1]);
   return c.json({ data: { public: isPublic } });
@@ -4963,7 +5313,7 @@ const PREFLIGHT_BODY_CHARS = 2_000;
 app.post("/library/:id/preflight", async (c) => {
   const sheet_id = c.req.param("id");
   await assertSheetEditor(c, sheet_id, "test the request of");
-  const { url, headers } = await jsonBody(c);
+  const { url, headers, method: askedMethod, body: askedBody } = await jsonBody(c);
   if (typeof url !== "string" || !URL.canParse(url)) {
     bad(400, `A pre-flight needs the url the sheet would fetch.`, {
       Expected: '{"url": "https://example.com/feed.json", "headers": "X-Api-Key: {{secret:weather}}"}',
@@ -4983,24 +5333,31 @@ app.post("/library/:id/preflight", async (c) => {
   // What the poller would send, refused here by name where the poller would
   // have written a failure row an hour from now.
   const parsed = parseNetHeaders(headers ?? "");
-  const sending = await resolveSecrets(sheet_id, parsed).catch((err) => {
+  const { method, body } = netRequest({ method: askedMethod, body: askedBody });
+  const cannotBuild = (err: unknown): never => {
     if (err instanceof HTTPException) throw err;
-    bad(400, `A header on this request cannot be built.`, {
+    bad(400, `A header or the body of this request cannot be built.`, {
       Received: reason(err),
-      Expected: "every {{secret:name}} in the headers stored on this sheet",
-      Source: "the headers box, against this sheet's secrets",
-      Fix: `store the secret with POST /library/${sheet_id}/secret, or take the reference out of the headers`,
+      Expected: "every {{secret:name}} in the headers and body stored on this sheet",
+      Source: "the headers and body boxes, against this sheet's secrets",
+      Fix: `store the secret with POST /library/${sheet_id}/secret, or take the reference out`,
     });
-  });
+  };
+  const sending = await resolveSecrets(sheet_id, parsed).catch(cannotBuild);
+  // A pre-flight has no last good poll, so `{{cursor}}` is what a first poll's
+  // is: nothing.
+  const sendingBody = body === undefined
+    ? undefined
+    : (await resolveSecrets(sheet_id, { body: body.replaceAll("{{cursor}}", "") }).catch(cannotBuild)).body;
   const host = new URL(url).hostname;
   const started = Date.now();
-  const res = await safeFetch(url, sending).catch((err) => {
+  const res = await safeFetch(url, sending, method, sendingBody).catch((err) => {
     if (err instanceof HTTPException) throw err;
     return reason(err);
   });
   // One request to the host, spaced like the poller's.
   holdHost(host, Date.now() + HOST_GAP_MS);
-  if (typeof res === "string") return c.json({ data: fetchFailure(url, parsed, null, res) });
+  if (typeof res === "string") return c.json({ data: fetchFailure(url, parsed, null, res, method, body) });
   const bytes = await readBody(res);
   return c.json({
     data: {
@@ -5413,7 +5770,10 @@ const importTypes = (raw: string | undefined): Record<string, string> => {
 /** The file as the sheet it would make: a name, the columns with a type each,
  * and the rows coerced to those types. Every refusal names the line in the
  * file, because that is what the person who can fix it is looking at. */
-const readImport = async (c: Context, types: Record<string, string>): Promise<{ name: string; cols: Col[]; rows: Row[] }> => {
+const readImport = async (
+  c: Context,
+  types: Record<string, string>,
+): Promise<{ name: string; cols: Col[]; rows: Row[] }> => {
   const contentType = c.req.header("content-type") || "";
 
   let csvText: string;
@@ -5422,7 +5782,7 @@ const readImport = async (c: Context, types: Record<string, string>): Promise<{ 
   if (contentType.includes("multipart/form-data")) {
     const formData = await c.req.formData().catch((err) =>
       bad(400, `That upload is not a multipart body.`, {
-        Expected: "multipart/form-data with a boundary, carrying a field named \"file\"",
+        Expected: 'multipart/form-data with a boundary, carrying a field named "file"',
         Received: reason(err),
         Source: "the request body, against its Content-Type",
         Fix: "send the CSV as -F file=@data.csv, or post the raw text with Content-Type: text/csv",
@@ -5432,7 +5792,9 @@ const readImport = async (c: Context, types: Record<string, string>): Promise<{ 
     if (!(file instanceof File)) {
       bad(400, `That upload carries no file.`, {
         Expected: `a multipart field named "file" holding a file`,
-        Received: file === null ? `fields: ${[...formData.keys()].join(", ") || "(none)"}` : `a text field ${show(file)}`,
+        Received: file === null
+          ? `fields: ${[...formData.keys()].join(", ") || "(none)"}`
+          : `a text field ${show(file)}`,
         Source: "the multipart request body",
         Fix: "send the CSV as -F file=@data.csv, or post the raw text with Content-Type: text/csv",
       });
@@ -5607,7 +5969,7 @@ const readImport = async (c: Context, types: Record<string, string>): Promise<{ 
         const word = val.toLowerCase();
         if (!["true", "false", "t", "f", "1", "0", "yes", "no"].includes(word)) refuse("true or false");
         obj[col.key] = ["true", "t", "1", "yes"].includes(word);
-      } else obj[col.key] = val;
+      } else { obj[col.key] = val; }
     });
     return obj;
   });
@@ -5949,7 +6311,13 @@ app.post("/sheet/:id", async (c) => {
   // and promised a retry the bucket could never keep. The bytes bound the
   // volume.
   assertRoom(sheet_id, hand.doc().data.length - 1, rows.length);
-  spend(sheet_id, "appends", 1, new TextEncoder().encode(JSON.stringify(rows)).byteLength, "send fewer, larger batches");
+  spend(
+    sheet_id,
+    "appends",
+    1,
+    new TextEncoder().encode(JSON.stringify(rows)).byteLength,
+    "send fewer, larger batches",
+  );
   hand.change((doc) => {
     for (const row of rows as Row[])
       doc.data.push(Object.fromEntries(cols.map((col) => [col.key, row[col.name]])) as Row);
@@ -6511,10 +6879,9 @@ const mcpTools: Record<string, McpTool> = {
               row: { type: "integer", minimum: 0 },
               col: { type: "string", description: "column key or column name" },
               value: {
-                description:
-                  `must match the column type: number for ${
-                    (NUMERIC_TYPES as string[]).join("/")
-                  }, boolean for bool, string otherwise`,
+                description: `must match the column type: number for ${
+                  (NUMERIC_TYPES as string[]).join("/")
+                }, boolean for bool, string otherwise`,
               },
             },
           },

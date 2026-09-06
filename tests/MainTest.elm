@@ -490,14 +490,33 @@ suite =
              ]
             )
         , describe "docDecoder"
-            [ test "net-http decodes url and interval, headers default to empty" <|
+            [ test "net-http decodes url and interval; headers, method and body default to a plain GET" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "" }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "" }))
             , test "net-http decodes a headers string" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"headers":"X-Key: abc"}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "X-Key: abc" }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "X-Key: abc", method = "GET", body = "" }))
+            , test "net-http decodes the method and body it posts with" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"method":"POST","body":"{}"}]}"""
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "POST", body = "{}" }))
+            , test "net-http refuses a method the poller would not send" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"method":"PATCH"}]}"""
+                        |> Result.toMaybe
+                        |> Expect.equal Nothing
+            , test "net-http with a method that is not a string is refused, the way the server refuses it" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"method":5}]}"""
+                        |> Result.toMaybe
+                        |> Expect.equal Nothing
+            , test "net-http with a body that is not a string is refused, the way the server refuses it" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"body":5}]}"""
+                        |> Result.toMaybe
+                        |> Expect.equal Nothing
             , test "net-http without interval is still rejected" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test"}]}"""
@@ -776,25 +795,162 @@ suite =
                         |> Tuple.mapBoth (List.map spliceOf) (List.map spliceOf)
                         |> Expect.equal ( [ "[2,1]" ], [ "[2,0,{\"0\":\"b\"}]" ] )
             ]
+        , describe "duplicateRows"
+            [ test "the first of a repeat stays, the ones under it go, in document order" <|
+                \_ ->
+                    duplicateRows (dupeRows [ [ "x", "1" ], [ "y", "2" ], [ "x", "1" ], [ "y", "2" ], [ "x", "1" ] ])
+                        |> Expect.equal [ 3, 4, 5 ]
+            , test "a row repeats another only when every column matches" <|
+                \_ ->
+                    duplicateRows (dupeRows [ [ "x", "1" ], [ "x", "2" ] ])
+                        |> Expect.equal []
+            , test "rows with nothing in them are one row, however the blank is spelled" <|
+                \_ ->
+                    duplicateRows
+                        (Array.fromList
+                            [ Dict.empty
+                            , Dict.fromList [ ( "0", E.string "  " ) ]
+                            , Dict.fromList [ ( "0", E.null ) ]
+                            ]
+                        )
+                        |> Expect.equal [ 2, 3 ]
+            , test "two strings repeat only when they are the same string, code point for code point" <|
+                \_ ->
+                    -- e-acute as one code point, then as e plus a combining
+                    -- acute: the same word on screen, two different strings.
+                    duplicateRows (dupeRows [ [ "café" ], [ "café" ], [ "café" ] ])
+                        |> Expect.equal [ 3 ]
+            , test "a row is signed by the cells it holds, not by the columns data[0] names" <|
+                \_ ->
+                    -- Two peers, one splicing a column out of the list and one
+                    -- writing that column's cell, merge to a row holding a cell
+                    -- nothing names. Signing off the column list deleted the row
+                    -- that held it, and an empty list signed every row the same.
+                    [ duplicateRows (dupeRows [ [ "x", "kept" ], [ "x", "lost" ] ])
+                    , duplicateRows (dupeRows [ [ "x" ], [ "y" ], [ "z" ] ])
+                    ]
+                        |> Expect.equal [ [], [] ]
+            ]
+        , describe "fillSeries"
+            [ test "two numbers continue the step between them" <|
+                \_ -> fillSeries [ "10", "20" ] 3 |> Expect.equal [ "30", "40", "50" ]
+            , test "a step down keeps going down, past zero" <|
+                \_ -> fillSeries [ "3", "1" ] 2 |> Expect.equal [ "-1", "-3" ]
+            , test "the seeds' decimals are the answer's, and binary float error is not" <|
+                \_ -> fillSeries [ "0.1", "0.2" ] 2 |> Expect.equal [ "0.3", "0.4" ]
+            , test "text ending in digits counts those digits up, keeping their width" <|
+                \_ -> fillSeries [ "item 08" ] 2 |> Expect.equal [ "item 09", "item 10" ]
+            , test "anything else repeats the last seed" <|
+                \_ -> fillSeries [ "red", "blue" ] 2 |> Expect.equal [ "blue", "blue" ]
+            , test "no rows to fill writes nothing" <|
+                \_ -> fillSeries [ "1", "2" ] 0 |> Expect.equal []
+            , test "a date is not a series, so January never gains a 32nd day" <|
+                \_ -> fillSeries [ "2026-01-30", "2026-01-31" ] 2 |> Expect.equal [ "2026-01-31", "2026-01-31" ]
+            , test "a counter past what a float counts exactly repeats rather than writing the same id twice" <|
+                \_ ->
+                    -- String.toInt accumulates in a float and String.fromInt
+                    -- writes one, so counting a nineteen-digit id on answered
+                    -- ...457000 for every row under it: duplicate keys, silently.
+                    fillSeries [ "id-1234567890123456789", "id-1234567890123456790" ] 2
+                        |> Expect.equal [ "id-1234567890123456790", "id-1234567890123456790" ]
+            , test "a seed asks for no more decimals than a column may" <|
+                \_ ->
+                    fillSeries [ "1.00000000000000000000000000001", "1.00000000000000000000000000002" ] 1
+                        |> Expect.equal [ "1.0000000000" ]
+            , test "a seed written in exponent form keeps its magnitude" <|
+                \_ ->
+                    -- String.fromFloat writes 1e-8 that way and that is what a
+                    -- num cell hands back, so counting the places after a dot
+                    -- that is not there filled the column with "0".
+                    -- Scaled back up because the step itself is a float: what
+                    -- this is about is that the magnitude is still there at all,
+                    -- where the column used to be filled with "0".
+                    fillSeries [ "1e-8", "2e-8" ] 2
+                        |> List.filterMap String.toFloat
+                        |> List.map (\v -> round (v * 1.0e9))
+                        |> Expect.equal [ 30, 40 ]
+            , test "a step that is not a finite number repeats instead of writing one" <|
+                \_ ->
+                    [ fillSeries [ "-1e308", "1e308" ] 1, fillSeries [ "Infinity", "Infinity" ] 1 ]
+                        |> Expect.equal [ [ "1e308" ], [ "Infinity" ] ]
+            ]
         , describe "formatNumber"
             [ test "a total that overflowed is not dressed up as money" <|
                 \_ ->
                     -- `usd` groups the digits of the string form, so Infinity
                     -- came out "$In,fin,ity.00". Two 1e308 cells in a usd column
-                    -- is all the totals row needs.
-                    [ reads "usd" (1.0e308 + 1.0e308), reads "usd" -(1.0e308 + 1.0e308) ]
+                    -- is all the totals row needs, and a decimal count is no
+                    -- help to a value that is not a number either.
+                    [ reads "usd" Nothing (1.0e308 + 1.0e308), reads "usd" (Just 4) -(1.0e308 + 1.0e308) ]
                         |> Expect.equal [ "Infinity", "-Infinity" ]
             , test "a usd column reads as money everywhere it is summed" <|
                 \_ ->
-                    [ reads "usd" 1234.5, reads "num" 1234.5, reads "percentage" 0.25 ]
+                    [ reads "usd" Nothing 1234.5, reads "num" Nothing 1234.5, reads "percentage" Nothing 0.25 ]
                         |> Expect.equal [ "$1,234.50", "1234.5", "25%" ]
+            , test "a column's decimal count is what every number in it is rounded and padded to" <|
+                \_ ->
+                    [ reads "num" (Just 0) 1234.56, reads "num" (Just 3) 1.5, reads "num" (Just 2) -0.006 ]
+                        |> Expect.equal [ "1235", "1.500", "-0.01" ]
+            , test "a usd column keeps its symbol and its grouping at any count" <|
+                \_ ->
+                    [ reads "usd" (Just 0) 1234.6, reads "usd" (Just 4) -1234.5 ]
+                        |> Expect.equal [ "$1,235", "-$1,234.5000" ]
+            , test "a percentage column counts the decimals of the percent, not of the fraction" <|
+                \_ ->
+                    [ reads "percentage" (Just 1) 0.12345, reads "percentage" (Just 0) 0.126 ]
+                        |> Expect.equal [ "12.3%", "13%" ]
+            , test "a big number at a count the column is allowed to ask for is still a number" <|
+                \_ ->
+                    -- `value * 10 ^ places` reaches the magnitude JavaScript
+                    -- writes as "1e+21" at 1e11 and ten places, and the digits
+                    -- were then cut out of that: the cell read "0.000001e+21",
+                    -- and a usd column with no count at all read "$1e+.21".
+                    ( [ reads "num" (Just 10) 1.0e11, reads "num" (Just 2) 1.0e19, reads "usd" Nothing 1.0e19 ]
+                    , String.contains "Infinity" (reads "num" (Just 10) 1.0e300)
+                    )
+                        |> Expect.equal
+                            ( [ "100000000000.0000000000", "10000000000000000000.00", "$10,000,000,000,000,000,000.00" ]
+                            , False
+                            )
+            , test "a half rounds the same way whichever side of zero it is on" <|
+                \_ ->
+                    -- `round` sends a half to +Infinity, so the scaled -0.125
+                    -- went down while `usd`, which scales the magnitude, sent
+                    -- the same number up: one value, two readings, one column.
+                    [ reads "num" (Just 2) 0.125, reads "num" (Just 2) -0.125, reads "usd" (Just 2) -0.125 ]
+                        |> Expect.equal [ "0.13", "-0.13", "-$0.13" ]
+            , test "a value that rounds to nothing is written without a minus" <|
+                \_ ->
+                    -- The sign came off the value and the digits off its
+                    -- magnitude, with nothing tying the two together: a column
+                    -- of small values at no decimals drew "-0" beside "0",
+                    -- which reads as two different numbers.
+                    [ reads "num" (Just 0) -0.4, reads "usd" (Just 0) -0.4, reads "num" (Just 2) -0.001 ]
+                        |> Expect.equal [ "0", "$0", "0.00" ]
+            ]
+        , describe "seriesEncoder"
+            [ test "a numeric column gains numbers and a text column gains text" <|
+                \_ ->
+                    -- fillSeries answers in text, because cellText is what the
+                    -- seeds were read through. Written back as text, a num
+                    -- column held "30" where it had held 10 -- which MCP's
+                    -- write_cells refuses for that very column.
+                    [ fills "num" "30", fills "usd" "30", fills "text" "30" ]
+                        |> Expect.equal [ Just "30", Just "30", Just "\"30\"" ]
+            , test "a column no series belongs in keeps the value it held" <|
+                \_ ->
+                    -- A bool column's seeds render "true" and a json column's
+                    -- render "a: 1", and both used to be written straight back
+                    -- as those strings, over an E.bool and over an object.
+                    [ fills "bool" "true", fills "json" "a: 3", fills "date" "2026-01-31" ]
+                        |> Expect.equal [ Nothing, Nothing, Nothing ]
             ]
         , describe "paletteCommands"
             [ test "an empty query offers every runnable shortcut, in the order the sheet lists them" <|
                 \_ ->
                     paletteCommands Dict.empty ""
                         |> List.map .label
-                        |> Expect.equal [ "select all", "copy", "find", "replace", "undo", "redo", "shortcut sheet" ]
+                        |> Expect.equal [ "delete duplicate rows", "select all", "copy", "find", "replace", "undo", "redo", "shortcut sheet" ]
             , test "a sheet is matched on its name" <|
                 \_ -> paletteCommands paletteShelf "countr" |> List.map .label |> Expect.equal [ "countries" ]
             , test "a sheet is matched on its id too, which is what you remember of a net sheet" <|
@@ -882,7 +1038,7 @@ suite =
                         |> Expect.equal []
             , test "money rounds to the cent rather than dropping it" <|
                 \_ ->
-                    List.map usd [ 1.999, 1.994, -1.999, 0, 1234.5 ]
+                    List.map (usd 2) [ 1.999, 1.994, -1.999, 0, 1234.5 ]
                         |> Expect.equal [ "$2.00", "$1.99", "-$2.00", "$0.00", "$1,234.50" ]
             ]
         , describe "The stored view"
@@ -1065,13 +1221,14 @@ libraryOf entries =
         |> Dict.fromList
 
 
-{-| A number as the column named by that type spelling reads it. The type comes
-back through `docDecoder`, the way every other fixture here is built, so this
-needs no `Type` constructor exposed for one test.
+{-| A number as the column named by that type spelling reads it, at the decimal
+count that column asks for. The type comes back through `docDecoder`, the way
+every other fixture here is built, so this needs no `Type` constructor exposed
+for one test.
 -}
-reads spelling v =
+reads spelling decimals v =
     D.decodeString docDecoder
-        ("""{"type":"table","data":[[{"name":"a","type":\"""" ++ spelling ++ """\","key":"0"}]]}""")
+        ("""{"type":"table","data":[[{"name":"a","type":\"""" ++ spelling ++ """","key":"0"}]]}""")
         |> Result.toMaybe
         |> Maybe.andThen
             (\doc ->
@@ -1082,8 +1239,29 @@ reads spelling v =
                     _ ->
                         Nothing
             )
-        |> Maybe.map (\col -> formatNumber col.typ v)
+        |> Maybe.map (\col -> formatNumber col.typ decimals v)
         |> Maybe.withDefault "no such column"
+
+
+{-| What fill-down writes into a column of that type spelling, as JSON, and
+Nothing where a series does not belong in the column at all. The type comes back
+through `docDecoder` for the same reason `reads` builds one that way.
+-}
+fills spelling text =
+    D.decodeString docDecoder
+        ("""{"type":"table","data":[[{"name":"a","type":\"""" ++ spelling ++ """","key":"0"}]]}""")
+        |> Result.toMaybe
+        |> Maybe.andThen
+            (\doc ->
+                case doc of
+                    Tab tbl ->
+                        Array.get 0 tbl.cols
+
+                    _ ->
+                        Nothing
+            )
+        |> Maybe.andThen (\col -> seriesEncoder col.typ)
+        |> Maybe.map (\encode -> E.encode 0 (encode text))
 
 
 {-| Every cleaning test runs against one text column keyed "0", which is the key
@@ -1102,6 +1280,15 @@ rewritten change values =
 
 cleanRows values =
     values |> List.map (\v -> Dict.fromList [ ( "0", E.string v ) ]) |> Array.fromList
+
+
+{-| One row per list, its cells keyed by position the way `namedCols` keys the
+columns it builds.
+-}
+dupeRows values =
+    values
+        |> List.map (List.indexedMap (\i v -> ( String.fromInt i, E.string v )) >> Dict.fromList)
+        |> Array.fromList
 
 
 {-| A cell patch as the row it addresses and the value it writes, which is all

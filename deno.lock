@@ -28,8 +28,9 @@
     "npm:@automerge/automerge@3.4.0": "3.4.0",
     "npm:@automerge/automerge@^3.4.0": "3.4.0",
     "npm:@electric-sql/pglite@~0.5.4": "0.5.4",
-    "npm:alasql@4.17.3": "4.17.3_@babel+core@7.29.7_react@19.2.8_react-native@0.86.2__react@19.2.8__@babel+core@7.29.7",
-    "npm:alasql@^4.17.3": "4.17.3_@babel+core@7.29.7_react@19.2.8_react-native@0.86.2__react@19.2.8__@babel+core@7.29.7",
+    "npm:alasql@*": "4.17.3_@babel+core@7.29.7_react@19.2.8_react-native@0.86.2",
+    "npm:alasql@4.17.3": "4.17.3_@babel+core@7.29.7_react@19.2.8_react-native@0.86.2",
+    "npm:alasql@^4.17.3": "4.17.3_@babel+core@7.29.7_react@19.2.8_react-native@0.86.2",
     "npm:elm-format@~0.8.8": "0.8.8",
     "npm:elm-review@*": "2.13.5",
     "npm:elm-review@2.13.5": "2.13.5",
@@ -344,14 +345,14 @@
     "@csstools/color-helpers@5.1.0": {
       "integrity": "sha512-S11EXWJyy0Mz5SYvRmY8nJYTFFd1LCNV+7cXyAgQtOOuzb4EsgfqDufL+9esx72/eLhsRdGZwaldu/h+E4t4BA=="
     },
-    "@csstools/css-calc@2.1.4_@csstools+css-parser-algorithms@3.0.5__@csstools+css-tokenizer@3.0.4_@csstools+css-tokenizer@3.0.4": {
+    "@csstools/css-calc@2.1.4_@csstools+css-parser-algorithms@3.0.5_@csstools+css-tokenizer@3.0.4": {
       "integrity": "sha512-3N8oaj+0juUw/1H3YwmDDJXCgTB1gKU6Hc/bB502u9zR0q2vd786XJH9QfrKIEgFlZmhZiq6epXl4rHqhzsIgQ==",
       "dependencies": [
         "@csstools/css-parser-algorithms",
         "@csstools/css-tokenizer"
       ]
     },
-    "@csstools/css-color-parser@3.1.0_@csstools+css-parser-algorithms@3.0.5__@csstools+css-tokenizer@3.0.4_@csstools+css-tokenizer@3.0.4": {
+    "@csstools/css-color-parser@3.1.0_@csstools+css-parser-algorithms@3.0.5_@csstools+css-tokenizer@3.0.4": {
       "integrity": "sha512-nbtKwh3a6xNVIp/VRuXV64yTKnb1IjTAEEh3irzS+HkKjAOYLTGNb9pmVNntZ8iVBHcWDA2Dof0QtPgFI1BaTA==",
       "dependencies": [
         "@csstools/color-helpers",
@@ -662,7 +663,7 @@
     "@react-native/normalize-colors@0.86.2": {
       "integrity": "sha512-EzPFc9Y6lzYOWeso2almwXI7f8+qReHxWvT+algsOczb2UhWXIWXDoSvkdwoSfiwwmGt/ijJgKJoeHlzPkLwRg=="
     },
-    "@react-native/virtualized-lists@0.86.2_react@19.2.8_react-native@0.86.2__react@19.2.8__@babel+core@7.29.7": {
+    "@react-native/virtualized-lists@0.86.2_react@19.2.8_react-native@0.86.2": {
       "integrity": "sha512-uO0J72gh3EvE+1/GHRk18QRyBDTRHRB0AraAfojsRjbT7VMuJwKrZYaKGshavoaEud6aw00ZB9/8mTMIKjjcAw==",
       "dependencies": [
         "invariant",
@@ -757,7 +758,7 @@
     "agent-base@7.1.4": {
       "integrity": "sha512-MnA+YT8fwfJPgBx3m60MNqakm30XOkyIoH1y6huTQvC0PwZG7ki8NacLBcrPbNoo8vEZy7Jpuk7+jMO+CUovTQ=="
     },
-    "alasql@4.17.3_@babel+core@7.29.7_react@19.2.8_react-native@0.86.2__react@19.2.8__@babel+core@7.29.7": {
+    "alasql@4.17.3_@babel+core@7.29.7_react@19.2.8_react-native@0.86.2": {
       "integrity": "sha512-EOBD6zfZJ1u6Y76672MapJOyahzjDIQGE7nspt4yKhBWZB2k0cIHHakx6iJaolKkjB4vMPIo09ysw52aQfZ9rw==",
       "dependencies": [
         "cross-fetch",
@@ -2130,7 +2131,7 @@
     "react-is@18.3.1": {
       "integrity": "sha512-/LLMVyas0ljjAtoYiPqYiL8VWXzUUdThrmU5+n20DZv+a+ClRoevUzw5JxU+Ieh5/c87ytoTBV9G1FiKfNJdmg=="
     },
-    "react-native-fs@2.20.0_react-native@0.86.2__react@19.2.8__@babel+core@7.29.7_@babel+core@7.29.7_react@19.2.8": {
+    "react-native-fs@2.20.0_react-native@0.86.2_@babel+core@7.29.7_react@19.2.8": {
       "integrity": "sha512-VkTBzs7fIDUiy/XajOSNk0XazFE9l+QlMAce7lGuebZcag5CnjszB+u4BdqzwaQOdcYb5wsJIsqq4kxInIRpJQ==",
       "dependencies": [
         "base-64",
