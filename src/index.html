@@ -1445,6 +1445,16 @@
             }, 'arrangeDoc'),
           );
         }
+
+        // Last, because everything above is the app coming up and this is only
+        // the next open: the worker answers the shell out of its cache, so an
+        // installed app opens with no network. A page with no serviceWorker at
+        // all -- jsdom, plain http -- takes the short circuit, and a refused
+        // registration is logged by name rather than taking the boot down with
+        // it: the app works without one.
+        navigator.serviceWorker?.register("/sw.js").catch((error) =>
+          debug.error("service worker registration refused:", error?.message ?? error)
+        );
       } catch (error) {
         console.error('[scrapsheets] Fatal initialization error:', error);
         const detail = `Initialization failed: ${error?.message ?? "Something went wrong."}`;

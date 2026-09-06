@@ -30,10 +30,23 @@ create table sheet
 , check (sell_price is null or license is not null)
 );
 
+-- The connections behind codex sheets: a DSN per row, encrypted with the same
+-- AES-GCM key a sheet secret uses.
+--
+-- There is no unique key on sheet_id on purpose, the way secret has none on
+-- (sheet_id, name). The newest row for a sheet is the current credential and
+-- the one before it is the previous one, which is what lets a rotation land
+-- without breaking the sheets reading through it: GET /codex/:id opens the
+-- newest, and falls back to the one before when the newest cannot connect or
+-- authenticate. Older rows are trimmed behind the write, the way secret is.
 create table db
-( sheet_id text not null primary key references sheet (sheet_id)
+( db_id bigint not null generated always as identity primary key
+, sheet_id text not null references sheet (sheet_id)
 , dsn text not null
+, created_at timestamptz not null default now()
 );
+
+create index db_sheet_id_created_at_idx on db (sheet_id, created_at desc);
 
 -- A sheet's own secrets, encrypted with the same AES-GCM key the codex DSNs
 -- use. Never in the automerge document and never in a cell: the document is

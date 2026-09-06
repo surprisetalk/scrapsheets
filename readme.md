@@ -150,7 +150,8 @@ browser can read it. `POST /library/<sheet_id>/link` is the same thing over HTTP
 
 Every request this server makes to somebody else's host carries the user agent `Scrapsheets/1.0 (+this page)`. It is
 the poller behind net-http sheets and the page's `/proxy`, and nothing else. The poller asks one host at most once per
-`HOST_GAP_MS` (`main.ts` names the number) however many sheets point there, it honours `Retry-After` for every sheet on
+`HOST_GAP_MS` (`main.ts` names the number) however many sheets point there -- a feed that answers in pages is read to
+its end within that one poll, page after page, bounded by `PAGE_MAX` -- it honours `Retry-After` for every sheet on
 that host, it follows at most five redirects, and it stops retrying a feed after three failures in a row. To keep it
 off a host, block that user agent; to ask about it, open an issue here.
 

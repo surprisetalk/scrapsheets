@@ -14,7 +14,7 @@
 // module script over the same jsdom, so the ports, the browser store and the
 // sync-refusal hook are the real ones. Reach for `boot` for anything about what
 // the page renders, and for `glue` for anything about what the glue does.
-import { assert, assertEquals, assertThrows } from "@std/assert";
+import { assert, assertEquals, assertRejects, assertThrows } from "@std/assert";
 import { cbor, decodeHeads, encodeHeads, Repo as AutomergeRepo } from "@automerge/automerge-repo";
 import { decodeSyncMessage, encodeSyncMessage } from "@automerge/automerge";
 import { JSDOM } from "jsdom";
@@ -945,6 +945,43 @@ Deno.test("a feed's request can be tested before the poller runs it", async () =
   });
   await settle();
   assert(text().includes("does not hold {{secret:weather}}"), "a refusal is shown in the poller's own words");
+});
+
+// The paging mode is a field on the document like any other, and the inputs
+// beside it -- the page parameter, the cursor path -- follow whatever the
+// document answers back rather than the click itself: `InputChange NetPageBy`
+// sends the patch and waits, the way every other field on this form does.
+Deno.test({
+  name: "the paging form writes the document, and its own fields follow the mode",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const doc = {
+      type: "net-http",
+      data: [{ url: "https://example.com/feed.json", interval: 3600, method: "GET", page_by: "page" }],
+    };
+    const page = await glue("http://localhost/net-http:feed", { docs: { feed: doc } });
+    const cfg = () => doc.data[0] as { page_by?: string; page_path?: string };
+
+    const pageSelect = page.all("select").find((s) =>
+      [...s.querySelectorAll("option")].some((o) => o.textContent === "no, one request")
+    );
+    assert(pageSelect, "the feed offers a way to read every page");
+    assertEquals(
+      page.all("label").some((l) => l.textContent?.includes("cursor path")),
+      false,
+      'no cursor path input under "page"',
+    );
+
+    await page.type_(pageSelect, "cursor");
+    assertEquals(cfg().page_by, "cursor", "choosing a page mode writes it to the document");
+
+    const pathInput = page.all("label").find((l) => l.textContent?.includes("cursor path"))?.querySelector("input");
+    assert(pathInput, "a cursor path input appears once the mode asks for one");
+    await page.type_(pathInput, "meta.next");
+    assertEquals(cfg().page_path, "meta.next", "typing into the cursor path field writes it to the document");
+    page.close();
+  },
 });
 
 Deno.test("a chart sheet draws one bar per row and offers both ways to save it", async () => {
@@ -2087,8 +2124,17 @@ const glue = async (
       const input = [...doc.querySelectorAll('input[type="file"]')][0];
       assert(input, "expected a file input on the library sheet");
       Object.defineProperty(input, "files", { value: [csvFile(name, content)], configurable: true });
+      // Reading the file is real IO, and a flat sleep after the dispatch lost
+      // the race to it on a loaded machine. The page has reacted when it asked
+      // the server something or painted a word -- a logged-out import asks
+      // nothing and says why.
+      const before = { asked: asked.length, text: doc.body.textContent };
       input.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
-      await settle(50);
+      await until(
+        settle,
+        "the page to react to the chosen file",
+        () => asked.length > before.asked || doc.body.textContent !== before.text,
+      );
     },
     /** A file dropped on the page, which src/index.html handles itself. jsdom
      * builds no `dataTransfer`, so the handler is given the one it reads.
@@ -2096,8 +2142,13 @@ const glue = async (
     dropFile: async (name: string, content: string) => {
       const event = new dom.window.Event("drop", { bubbles: true });
       Object.defineProperty(event, "dataTransfer", { value: { files: [csvFile(name, content)] } });
+      const before = { asked: asked.length, text: doc.body.textContent };
       dom.window.document.body.dispatchEvent(event);
-      await settle(50);
+      await until(
+        settle,
+        "the page to react to the dropped file",
+        () => asked.length > before.asked || doc.body.textContent !== before.text,
+      );
     },
     all: (sel: string): El[] => [...doc.querySelectorAll(sel)],
     fire: async (el: El, type: string) => {
@@ -3041,11 +3092,11 @@ Deno.test("filling a column down continues the series it starts with", async () 
       doc: {
         type: "table",
         data: [
-          [{ name: "n", type: "num", key: "0" }],
-          { "0": 10 },
-          { "0": 20 },
-          { "0": null },
-          { "0": null },
+          [{ name: "n", type: "num", key: "0" }, { name: "d", type: "date", key: "1" }],
+          { "0": 10, "1": "2026-02-27" },
+          { "0": 20, "1": null },
+          { "0": null, "1": null },
+          { "0": null, "1": null },
         ],
       },
     },
@@ -3069,6 +3120,28 @@ Deno.test("filling a column down continues the series it starts with", async () 
     [[[3, "0"], 30], [[4, "0"], 40]],
     "the blank rows under the seeds carry the step on, as numbers the column's own type allows",
   );
+
+  // A single date seed is a series on its own -- a day is the step nobody has
+  // to name -- unlike a lone number, which just repeats.
+  const dateSeed = all("td").find((td) => td.textContent?.trim() === "2026-02-27");
+  assert(dateSeed, "the date seed is drawn");
+  await fire(dateSeed, "mouseenter");
+  await fire(dateSeed, "mousedown");
+  await fire(dateSeed, "mouseup");
+  for (let i = 0; i < 2; i++) await key({ key: "ArrowDown", shiftKey: true });
+  patches.length = 0;
+  await key({ key: "d", ctrlKey: true });
+  assertEquals(
+    patches.map((p) => [p.path, p.value]),
+    [[[2, "1"], "2026-02-28"], [[3, "1"], "2026-03-01"]],
+    "one date seed steps the fill on by a day",
+  );
+
+  // A table offers both export formats, downloaded off the API rather than
+  // built on the page.
+  const chips = all("a.chip").map((a) => a.getAttribute("href"));
+  assert(chips.includes(`${API_BASE}/export/table:series.csv`), chips.join(", "));
+  assert(chips.includes(`${API_BASE}/export/table:series.xlsx`), chips.join(", "));
 });
 
 // Dedupe is a whole-sheet verb -- it reads every column of every row -- so the
@@ -3135,7 +3208,7 @@ Deno.test({
   fn: async () => {
     const doc = { type: "table", data: [[{ name: "n", type: "num", key: "0" }], { "0": 1.5 }] };
     const page = await glue("http://localhost/table:places1", { docs: { places1: doc } });
-    const column = () => (doc.data[0] as { decimals?: number }[])[0];
+    const column = () => (doc.data[0] as { decimals?: number; format?: string }[])[0];
     const reading = (want: string) => page.all("tbody td").filter((td) => td.textContent?.trim() === want).length;
     const plain = reading("1.5");
     assert(plain > 0, `the cell and its total should read 1.5, got: ${page.text().slice(0, 200)}`);
@@ -3154,6 +3227,238 @@ Deno.test({
     await page.click(page.all("span.funnel")[0]);
     assertEquals(reading("1.5"), plain, "an empty box is no count at all");
     assertEquals(column().decimals, undefined, "and takes the field back off the column rather than writing a null");
+
+    // A format is a select, not keystrokes to debounce, so `ColumnFormat`
+    // writes the column the moment it changes rather than waiting for the
+    // panel to close.
+    await page.click(page.all("span.funnel")[0]);
+    const format = () => page.all("label.format select")[0];
+    assert(format(), "a numeric column's panel offers a number format");
+    await page.type_(format(), "scientific");
+    assertEquals(column().format, "scientific", "the format reaches the column immediately, unlike the decimal count");
+    assertEquals(reading("1.5e0"), plain, "1.5 with no decimal count reads as a mantissa of 1.5 and an exponent of 0");
     page.close();
   },
+});
+
+// --- the service worker
+//
+// src/sw.js is a classic script that nothing imports: the browser loads it by
+// url and hands it three globals. So it is run here rather than imported, over
+// a hand-made `self`, `caches` and `fetch` -- which is also the only way to take
+// the network away, which is the whole of what this file is for.
+
+const ORIGIN = "https://sheets.test";
+
+const swSource = await Deno.readTextFile(dir + "src/sw.js");
+
+/** src/sw.js's own pre-cache list, read out of it: the test is the browser, and
+ * a browser does not get to decide what the shell is.
+ */
+const SHELL = [...(swSource.split("const SHELL = [")[1]?.split("]")[0] ?? "").matchAll(/"([^"]+)"/g)]
+  .map((m) => m[1]);
+if (SHELL.length < 2) {
+  throw new Error(
+    `Expected src/sw.js to hold a SHELL array of quoted paths, received ${SHELL.length} of them. ` +
+      `Source: page_test.ts parses it so the fake host serves exactly what the worker asks for. ` +
+      `Fix: keep SHELL a literal array in src/sw.js, or teach this parser the new shape.`,
+  );
+}
+
+/** src/sw.js, running. `online` is the network: a Response for a url it answers,
+ * and a network that is gone answers nothing at all. The cache is a Map keyed
+ * the way a real Cache is -- by resolved url, so a plain "/" and a full href are
+ * one entry.
+ */
+const worker = (
+  online: (url: string) => Response | undefined,
+  { putFails = false }: { putFails?: boolean } = {},
+) => {
+  const key = (request: string | { url: string }) =>
+    new URL(typeof request === "string" ? request : request.url, ORIGIN).href;
+  const store = new Map<string, Response>();
+  const fetched = (request: string | { url: string }) => {
+    const res = online(key(request));
+    // What a browser with no network throws, and the one thing the worker
+    // catches: anything else it lets through.
+    return res ? Promise.resolve(res) : Promise.reject(new TypeError("Failed to fetch"));
+  };
+  const caches = {
+    open: () =>
+      Promise.resolve({
+        // The real addAll() fetches every path, and is atomic: a non-ok status
+        // on any one of them rejects the whole call and stores none of the
+        // others either, so a batch write is the only write -- never a loop of
+        // separate ones a later path can fail out of midway.
+        addAll: async (paths: string[]) => {
+          const answers = await Promise.all(paths.map(async (path) => {
+            const res = await fetched(path);
+            if (!res.ok) throw new TypeError(`addAll refused ${key(path)}: status ${res.status} is not ok`);
+            return [key(path), res] as const;
+          }));
+          for (const [url, res] of answers) store.set(url, res);
+        },
+        match: (request: string | { url: string }) => Promise.resolve(store.get(key(request))),
+        // A real Cache.put() rejects on a quota error or a response carrying
+        // `Vary: *` -- neither is this worker's to fix, but the network answer
+        // it was trying to save is already good and must still reach the page.
+        put: (request: { url: string }, res: Response) => {
+          if (putFails) return Promise.reject(new Error("QuotaExceededError"));
+          store.set(key(request), res);
+          return Promise.resolve();
+        },
+      }),
+  };
+  const listeners: Record<string, (event: unknown) => void> = {};
+  const self = {
+    addEventListener: (type: string, fn: (event: unknown) => void) => listeners[type] = fn,
+    location: { origin: ORIGIN, protocol: new URL(ORIGIN).protocol },
+  };
+  new Function("self", "caches", "fetch", swSource)(self, caches, fetched);
+
+  return {
+    cached: () => [...store.keys()].sort(),
+    /** What the cache holds for a path, which is what the next offline open
+     * gets. Reading it consumes the body, the way any Response is read once. */
+    held: (path: string) => store.get(key(path)),
+    install: async () => {
+      let held: Promise<unknown> = Promise.resolve();
+      listeners.install({ waitUntil: (p: Promise<unknown>) => held = p });
+      await held;
+    },
+    /** What the page hears back, or null for a request the worker did not
+     * answer at all -- which is the browser doing what it always did. A list
+     * rather than a variable so that nothing narrows the empty case away. */
+    hit: async (url: string, init: Record<string, unknown> = {}) => {
+      const answered: Promise<Response>[] = [];
+      listeners.fetch({
+        request: { url: key(url), method: "GET", ...init },
+        respondWith: (p: Promise<Response>) => answered.push(p),
+      });
+      return answered.length ? await answered[0] : null;
+    },
+  };
+};
+
+/** The host src/_redirects describes: a SHELL path answered as itself, every
+ * other path answered with the shell, and `build` naming which deploy it is.
+ */
+const served = (build: () => string) => (url: string) => {
+  const path = new URL(url).pathname;
+  // What the host actually answers: a module or asset for a SHELL path, the
+  // shell for anything else -- and one file it happens to serve as itself.
+  if (path === "/robots.txt") return new Response("User-agent: *", { headers: { "content-type": "text/plain" } });
+  const shell = path === "/" || !SHELL.includes(path);
+  return new Response(`${build()} ${shell ? "/" : path}`, {
+    headers: { "content-type": shell ? "text/html; charset=utf-8" : "text/javascript" },
+  });
+};
+
+Deno.test("the service worker pre-caches the shell, refreshes it, and leaves the API alone", async () => {
+  // The deploy this browser has, and then the one after it: what the worker
+  // keeps is what the last good answer said, which is why no cache name has a
+  // version in it.
+  let deployed = "old";
+  const sw = worker(served(() => deployed));
+  await sw.install();
+  assertEquals(
+    sw.cached(),
+    SHELL.map((path) => new URL(path, ORIGIN).href).sort(),
+    "install pre-caches every path the worker lists and nothing else",
+  );
+
+  deployed = "new";
+  const res = await sw.hit("/index.js");
+  assert(res, "a same-origin GET is the worker's to answer");
+  assertEquals(await res.text(), "new /index.js", "online, the network is what answers");
+
+  // Not handled at all: no respondWith, so the browser does what it did before
+  // there was a worker. The API and the sync socket are a different origin, and
+  // a cached POST is not a thing.
+  assertEquals(await sw.hit(`${API_BASE}/sheet/table:x`), null, "the API is another origin and is not answered");
+  assertEquals(await sw.hit("/import/csv", { method: "POST" }), null, "and a POST is not a thing to cache");
+
+  // A blob: url the page made with URL.createObjectURL (the chart-export
+  // download) reports its *origin* as us -- the spec inherits it from the
+  // context that created the blob -- even though nothing here created or holds
+  // it and its scheme is not one we are ever served over.
+  assertEquals(
+    await sw.hit(`blob:${ORIGIN}/550e8400-e29b-41d4-a716-446655440000`),
+    null,
+    "a blob: url is not http(s), even when URL() reports our own origin for it",
+  );
+
+  // The deep link a share hands out, and the same link with a query string on
+  // it. The host answers both with the shell, so both refresh the one "/" entry
+  // and neither leaves one of its own: a browser that only ever opens deep
+  // links would otherwise keep the shell the install fetched forever, and open
+  // offline on a stale index.html beside a fresh index.js.
+  await sw.hit("/table:countries");
+  await sw.hit("/?embed=1");
+  // A same-origin 200 that is not the shell -- a file the host serves as
+  // itself -- is answered and never written over "/": the next offline open
+  // would have rendered it in the shell's place.
+  const robots = await sw.hit("/robots.txt");
+  assertEquals(await robots?.text(), "User-agent: *", "a file the host serves as itself is answered from the network");
+  assertEquals(sw.cached().length, SHELL.length, "the cache cannot grow past the shell");
+  assertEquals(
+    await sw.held("/")?.text(),
+    "new /",
+    "and the shell it holds is the deploy this browser last saw, not the file that answered last",
+  );
+  assertEquals(await sw.held("/index.js")?.text(), "new /index.js", "as is every other path it holds");
+});
+
+Deno.test("with no network the shell comes out of the cache", async () => {
+  let online = true;
+  const fresh = served(() => "fresh");
+  const sw = worker((url) => online ? fresh(url) : undefined);
+  await sw.install();
+  online = false;
+
+  const held = await sw.hit("/index.js");
+  assert(held, "a same-origin GET is the worker's to answer");
+  assertEquals(await held.text(), "fresh /index.js", "a cached path answers with no network");
+  // The deep link a share hands out. Nothing was ever cached under it -- the
+  // host answers it with the shell, so the worker keeps it under "/".
+  const deep = await sw.hit("/table:countries");
+  assert(deep, "a deep link is the worker's to answer");
+  assertEquals(await deep.text(), "fresh /", "a deep link with no network opens the shell");
+
+  // A worker that registered but whose install never finished -- a first open
+  // that lost the network partway through it -- has nothing to fall back to,
+  // and says which url and what to do rather than answering with nothing.
+  const bare = worker(() => undefined);
+  await assertRejects(
+    () => bare.hit("/index.js"),
+    Error,
+    "Expected https://sheets.test/index.js from the network or from the scrapsheets-shell cache, received neither",
+    "a path with no network and no cached copy is refused by name, not silently",
+  );
+});
+
+// The real Cache.addAll() rejects if any fetch answers with a non-2xx status,
+// and stores none of them -- not even the ones that came back fine. A mid-deploy
+// 404 on one file must not leave the other 15 cached under a stale worker that
+// never activates: the next install (once the deploy finishes) starts from
+// nothing, not from a half-written shell.
+Deno.test("install refuses the whole shell if one path 404s, and keeps none of it", async () => {
+  const sw = worker((url) => {
+    const path = new URL(url).pathname;
+    return path === "/style.css" ? new Response("not found", { status: 404 }) : new Response(`ok ${path}`);
+  });
+  await assertRejects(() => sw.install(), Error, undefined, "addAll rejects when one path is not ok");
+  assertEquals(sw.cached(), [], "a failed install caches nothing, not even the paths that answered fine");
+});
+
+// cache.put() rejects for reasons that have nothing to do with the network
+// answer being bad -- a full quota, a response carrying `Vary: *`. Caching the
+// shell for later is best-effort; it must never cost the page the good answer
+// the network just gave it.
+Deno.test("a cache write that fails still returns the network answer it was trying to save", async () => {
+  const sw = worker(served(() => "ok"), { putFails: true });
+  const res = await sw.hit("/index.js");
+  assert(res, "a same-origin GET is the worker's to answer even when caching it fails");
+  assertEquals(await res.text(), "ok /index.js", "the network answer reaches the page unchanged");
+  assertEquals(sw.cached(), [], "the failed write left nothing behind");
 });

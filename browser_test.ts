@@ -37,6 +37,16 @@ const manifest = async () => {
   }
 };
 
+/** src/_redirects, parsed into rules. Two tests read it: the one that walks the
+ * page's module graph against it, and the one that holds the service worker's
+ * pre-cache list to it.
+ */
+const redirects = async () =>
+  (await Deno.readTextFile(dir + "src/_redirects")).split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .map((line) => line.split(/\s+/));
+
 // `deno task test` builds once before any file runs, so this file only refuses
 // a dist/ older than its source: the files run in parallel, and a compiler
 // racing a reader of its output is a flaky suite.
@@ -165,20 +175,15 @@ const BROWSER_GLOBALS = [
   "XMLSerializer",
 ];
 
-Deno.test("index.html has no undefined identifier and no dead import", async () => {
-  // The regex half of this used to match call shapes only, so a value use like
-  // PARSERS[ct] was invisible and a `const x` anywhere whitelisted `x`
-  // everywhere. deno lint does the real scope analysis -- it resolves module
-  // bindings, block scope and hoisting -- and reads from stdin, so index.html
-  // needs neither a build step nor to stop being one file to get it.
-  const html = await Deno.readTextFile(dir + "src/index.html");
-  const open = html.indexOf('<script type="module">');
-  assert(open >= 0, 'expected one <script type="module"> in src/index.html, found none');
-  const from = html.indexOf(">", open) + 1;
-  const script = html.slice(from, html.indexOf("</script>", open));
-  // Line numbers come back relative to the slice; this puts them back on the file.
-  const offset = html.slice(0, from).split("\n").length - 1;
-
+/** The names deno lint cannot resolve in a script body, one entry per name --
+ * `document` alone is 14 diagnostics -- against the line it first appears on.
+ * The regex half of this used to match call shapes only, so a value use like
+ * PARSERS[ct] was invisible and a `const x` anywhere whitelisted `x` everywhere.
+ * deno lint does the real scope analysis -- it resolves module bindings, block
+ * scope and hoisting -- and reads from stdin, so a script inside an html file
+ * needs neither a build step nor to stop being one file to get it.
+ */
+const unresolved = async (where: string, script: string, offset: number) => {
   const lint = new Deno.Command(Deno.execPath(), {
     // --no-config or the project deno.json applies, which excludes this very
     // file and would restore the default rule tags. An empty --rules-tags
@@ -207,13 +212,12 @@ Deno.test("index.html has no undefined identifier and no dead import", async () 
     report = JSON.parse(out);
   } catch {
     throw new Error(
-      `deno lint did not return JSON for index.html's module script.\n` +
+      `deno lint did not return JSON for ${where}.\n` +
         `stdout: ${out.slice(0, 400)}\nstderr: ${new TextDecoder().decode(stderr).slice(0, 400)}`,
     );
   }
-  assertEquals(report.errors, [], "deno lint could not parse index.html's module script");
+  assertEquals(report.errors, [], `deno lint could not parse ${where}`);
 
-  // One entry per name, not per call site: `document` alone is 14 diagnostics.
   const found = new Map<string, number>();
   for (const d of report.diagnostics) {
     // no-unused-vars backticks the name, no-undef does not.
@@ -221,17 +225,35 @@ Deno.test("index.html has no undefined identifier and no dead import", async () 
     if (BROWSER_GLOBALS.includes(name) && d.code === "no-undef") continue;
     if (!found.has(name)) found.set(name, d.range.start.line + offset);
   }
-  if (found.size > 0) {
-    const lines = [...found].map(([name, line]) => `    ${name} (src/index.html:${line})`).join("\n");
-    throw new Error(
-      `index.html's module script has bindings that do not resolve.\n` +
-        `    expected  every identifier bound by an import, a declaration, or a known browser global\n` +
-        `    received  ${found.size} that are not:\n${lines}\n` +
-        `    source    deno lint no-undef,no-unused-vars over the <script type="module"> body\n` +
-        `    fix       import the name, delete it if it is dead, or -- if it is a browser API the page\n` +
-        `              is meant to reach for -- add it to BROWSER_GLOBALS in browser_test.ts`,
-    );
-  }
+  if (found.size === 0) return;
+  const lines = [...found].map(([name, line]) => `    ${name} (${where}:${line})`).join("\n");
+  throw new Error(
+    `${where} has bindings that do not resolve.\n` +
+      `    expected  every identifier bound by an import, a declaration, or a known browser global\n` +
+      `    received  ${found.size} that are not:\n${lines}\n` +
+      `    source    deno lint no-undef,no-unused-vars over the script body\n` +
+      `    fix       import the name, delete it if it is dead, or -- if it is a browser API the page\n` +
+      `              is meant to reach for -- add it to BROWSER_GLOBALS in browser_test.ts`,
+  );
+};
+
+Deno.test("index.html has no undefined identifier and no dead import", async () => {
+  const html = await Deno.readTextFile(dir + "src/index.html");
+  const open = html.indexOf('<script type="module">');
+  assert(open >= 0, 'expected one <script type="module"> in src/index.html, found none');
+  const from = html.indexOf(">", open) + 1;
+  const script = html.slice(from, html.indexOf("</script>", open));
+  // Line numbers come back relative to the slice; this puts them back on the file.
+  await unresolved("src/index.html", script, html.slice(0, from).split("\n").length - 1);
+});
+
+// The service worker is a classic script, loaded by url and imported by nobody,
+// so a name it reaches for that no browser defines fails as an install nothing
+// reports rather than as a build error. Same lint, same allowlist.
+Deno.test("the service worker has no undefined identifier and no dead binding", async () => {
+  // The whole file, unlike index.html's script, which is a slice with the lines
+  // above it subtracted back in: there is nothing above line 1 here.
+  await unresolved("src/sw.js", await Deno.readTextFile(dir + "src/sw.js"), 0);
 });
 
 // src/_redirects is an allowlist ending in `/* / 200`, so an asset with no rule
@@ -246,10 +268,7 @@ Deno.test("index.html has no undefined identifier and no dead import", async () 
 // the same reason -- nothing but the manifest names them.
 const MAX_MODULES = 100;
 Deno.test("every asset the page loads is served by _redirects, above the catch-all", async () => {
-  const rules = (await Deno.readTextFile(dir + "src/_redirects")).split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith("#"))
-    .map((line) => line.split(/\s+/));
+  const rules = await redirects();
   const catchAll = rules.findIndex(([from]) => from === "/*");
   assert(
     catchAll >= 0,
@@ -307,6 +326,50 @@ Deno.test("every asset the page loads is served by _redirects, above the catch-a
         `Source: src/_redirects. Fix: add a line above the /* catch-all: ${path} ${path} 200`,
     );
   }
+});
+
+// The service worker is what makes an installed app open with no network, and
+// what it pre-caches is a hand-written list: nothing imports it, so no module
+// walk can find out what the shell is. src/_redirects is the list of what the
+// host serves as itself, which is the same list, and this is what holds the two
+// together -- a path missing from SHELL is a file the installed app cannot open
+// offline, and one in SHELL the host does not serve is a 404 that fails the
+// whole install, because addAll is all-or-nothing.
+Deno.test("the service worker pre-caches exactly what _redirects serves", async () => {
+  const rules = await redirects();
+  const catchAll = rules.findIndex(([from]) => from === "/*");
+  const served = new Set(rules.slice(0, catchAll).filter(([from, to]) => from === to).map(([from]) => from));
+
+  const sw = await Deno.readTextFile(dir + "src/sw.js");
+  const block = sw.split("const SHELL = [")[1]?.split("]")[0] ?? "";
+  assert(block.includes('"/'), "SHELL should still be a list of paths in src/sw.js");
+  const shell = quoted(block, /"([^"]+)"/g);
+
+  const missing = [...served].filter((path) => !shell.has(path)).sort();
+  assertEquals(
+    missing,
+    [],
+    `Expected src/sw.js's SHELL to hold every path src/_redirects serves, received one without ` +
+      `${missing.join(", ")}. Source: install pre-caches SHELL and nothing else. ` +
+      `Fix: add it to SHELL, or an installed app opens without it offline.`,
+  );
+  const extra = [...shell].filter((path) => !served.has(path)).sort();
+  assertEquals(
+    extra,
+    [],
+    `Expected every path in src/sw.js's SHELL to be one src/_redirects serves, received ${extra.join(", ")}. ` +
+      `Source: install pre-caches with addAll, which refuses the whole install on one 404. ` +
+      `Fix: serve it above the /* catch-all, or take it out of SHELL.`,
+  );
+
+  const html = await Deno.readTextFile(dir + "src/index.html");
+  assert(
+    html.includes('navigator.serviceWorker?.register("/sw.js")'),
+    `Expected src/index.html to register the service worker, received a boot without it. ` +
+      `Source: src/index.html is the only thing that registers one. ` +
+      `Fix: add navigator.serviceWorker?.register("/sw.js") at the end of boot; a worker nobody ` +
+      `registers caches nothing.`,
+  );
 });
 
 // The manifest is what makes the app installable on a phone. Its icon is
@@ -531,6 +594,18 @@ Deno.test("the page offers exactly the methods the poller sends", async () => {
   const page = elm.split("netMethods =")[1]?.split("]")[0] ?? "";
   assert(page.includes('"'), "netMethods should still be a list of spellings in src/Main.elm");
   same(quoted(poller, /"([^"]+)"/g), quoted(page, /"([^"]+)"/g), "main.ts's NET_METHODS", "src/Main.elm's netMethods");
+});
+
+// A feed's paging mode is spelled on the document too: read by pageConfig in
+// main.ts and offered by the select in Main.elm. Same reason, same guard.
+Deno.test("the page offers exactly the paging modes the poller reads", async () => {
+  const ts = await Deno.readTextFile(dir + "main.ts");
+  const elm = await Deno.readTextFile(dir + "src/Main.elm");
+  const poller = ts.split("const PAGE_BY = [")[1]?.split("]")[0] ?? "";
+  assert(poller.includes('"'), "PAGE_BY should still be a list of spellings in main.ts");
+  const page = elm.split("pageBy =")[1]?.split("]")[0] ?? "";
+  assert(page.includes('"'), "pageBy should still be a list of spellings in src/Main.elm");
+  same(quoted(poller, /"([^"]+)"/g), quoted(page, /"([^"]+)"/g), "main.ts's PAGE_BY", "src/Main.elm's pageBy");
 });
 
 Deno.test("the server's union admits exactly the column types the engine knows", async () => {

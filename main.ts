@@ -58,6 +58,9 @@ import {
   WINDOW_TYPES,
 } from "./src/sql.mjs";
 import Stripe from "stripe";
+// Written with, never read with: every advisory SheetJS carries is in its
+// parsers, and no route here calls one.
+import * as XLSX from "xlsx";
 
 // --- refusals
 //
@@ -383,10 +386,23 @@ export type Query = { lang: "sql"; code: string; args: Args };
 // all. `netMethods` in `src/Main.elm` is the copy the language boundary forces.
 export const NET_METHODS = ["GET", "POST", "PUT"] as const;
 export type Method = typeof NET_METHODS[number];
+// The ways a feed hands out its pages, and the one list of them. A sheet
+// spelling anything else is refused by name where it is read, the way a method
+// outside NET_METHODS is: a scheme this server cannot follow would read page
+// one forever and call the feed complete.
+export const PAGE_BY = ["page", "offset", "cursor", "link"] as const;
+export type PageBy = typeof PAGE_BY[number];
 // `cursor` names the query parameter this feed takes a since-value in. The
 // watermark itself is not here: it is the poller's, not the user's. `body` is
 // templated the way a header is: `{{secret:name}}` out of the secret table, and
 // `{{cursor}}` the same watermark the cursor parameter carries.
+//
+// `page_by` says how this feed hands out its pages, and a sheet without one is
+// the one request it always was. `page_param` names the query parameter the
+// page number, the offset or the next-page cursor is sent in, which `page`,
+// `offset` and `cursor` each need and `link` does not: a link feed names the
+// whole url itself. `page_path` is the dotted path in the answer where the next
+// cursor sits, such as `meta.next`, and it is read under `cursor` alone.
 export type NetHttp = {
   url: string;
   interval: number;
@@ -394,6 +410,9 @@ export type NetHttp = {
   cursor?: string;
   method?: Method;
   body?: string;
+  page_by?: PageBy;
+  page_param?: string;
+  page_path?: string;
 };
 // An alert is a query plus somewhere to send it. The condition is the query's
 // own where clause: it fires when the query returns a row, which is the only
@@ -1901,8 +1920,12 @@ app.onError((err, c) => {
 // case rather than beside it with `and`: Postgres does not promise to evaluate
 // `and` left to right, so a guard next to the cast is a guard the planner may
 // run second.
+// A rolled-over codex run answered, and is graded failed all the same: the
+// newest credential is dead, and a green freshness would hide that until the
+// next rotation retires the one holding the sheet up.
 const POLL_OK = () =>
-  sql`substring(n.meta->>'status' from '^[0-9]{1,9}$')::int between 200 and 299 and n.meta->>'shape_change' is null`;
+  sql`substring(n.meta->>'status' from '^[0-9]{1,9}$')::int between 200 and 299 and n.meta->>'shape_change' is null
+      and n.meta->>'rolled_over' is distinct from 'true'`;
 const ALERT_OK = () =>
   sql`(case when n.body is json then n.body::jsonb end)->>'status' <> 'error'
       and ((case when n.body is json then n.body::jsonb end)->>'delivery' in ('sent', ${HELD})
@@ -2966,6 +2989,64 @@ const REDIRECT_MAX = 5;
 // wants us gone blocks this string; the readme says what we do and how often.
 export const USER_AGENT = "Scrapsheets/1.0 (+https://github.com/surprisetalk/scrapsheets#polite-scraper)";
 
+/** Refuses a host inside this server's own network, by literal address and by
+ * every address its name resolves to. safeFetch asks it on every hop and the
+ * codex guard asks it for a DSN's host, so the two doors out of this server
+ * share one answer. `what` is the word the refusal names the thing by, and
+ * `source` where it came from. */
+const assertPublicHost = async (hostname: string, what: string, source: string): Promise<void> => {
+  const host = hostname.replace(/^\[|\]$/g, "");
+  if (host === "localhost" || host.endsWith(".local")) {
+    bad(400, `That ${what} points inside this server's own network.`, {
+      Expected: "a public host",
+      Received: hostname,
+      Source: source,
+      Fix: "point it at a host reachable from the public internet",
+    });
+  }
+  const isLiteral = /^[0-9.]+$/.test(host) || host.includes(":");
+  // Two lookups, and what each one has to say for itself when it fails. Only
+  // "this name has no such record" is an answer about the host: a resolver
+  // that timed out or is not there at all is ours, and folding the two into
+  // one empty array told every feed's owner to check a spelling that was
+  // right. A host with A records and no AAAA is the ordinary case, so the
+  // resolver's own failure is reported only when nothing resolved at all.
+  const answers: (string[] | Error)[] = isLiteral ? [[host]] : await Promise.all(
+    (["A", "AAAA"] as const).map((t) =>
+      Deno.resolveDns(host, t).catch((err) => (err instanceof Deno.errors.NotFound ? [] : err as Error))
+    ),
+  );
+  const ips = answers.flatMap((answer) => Array.isArray(answer) ? answer : []);
+  // An empty answer is not "no blocked address among them": Deno's resolver
+  // reads neither /etc/hosts nor the OS resolver, so a name only this machine
+  // knows resolves to nothing here and to loopback in the fetch below.
+  if (!ips.length) {
+    const broke = answers.find((answer) => !Array.isArray(answer)) as Error | undefined;
+    if (broke) {
+      bad(502, `This server's resolver could not answer for that host.`, {
+        Expected: "a DNS answer for the host this url names",
+        Received: `the resolver said ${reason(broke)}`,
+        Source: `the DNS lookup of ${hostname}`,
+        Fix: "nothing here says the host is wrong; this is ours, so try again",
+      });
+    }
+    bad(400, `That host has no address.`, {
+      Expected: "a host that resolves to a public address",
+      Received: `${hostname}, which resolved to no address at all`,
+      Source: `the DNS answer for ${hostname}`,
+      Fix: "check the spelling of the host, or point it at a host reachable from the public internet",
+    });
+  }
+  if (ips.some(ipBlocked)) {
+    bad(400, `That host resolves inside this server's own network.`, {
+      Expected: "a host resolving to a public address",
+      Received: `${hostname} -> ${ips.join(", ")}`,
+      Source: `the DNS answer for ${hostname}`,
+      Fix: "point it at a host reachable from the public internet",
+    });
+  }
+};
+
 // SSRF guard: block internal hosts by literal IP and by resolved DNS; follow redirects manually re-validating each hop.
 export const safeFetch = async (
   start: string,
@@ -2984,56 +3065,7 @@ export const safeFetch = async (
         Fix: "point it at an http or https url",
       });
     }
-    const host = u.hostname.replace(/^\[|\]$/g, "");
-    if (host === "localhost" || host.endsWith(".local")) {
-      bad(400, `That url points inside this server's own network.`, {
-        Expected: "a public host",
-        Received: u.hostname,
-        Source: "the url this sheet was pointed at",
-        Fix: "point it at a host reachable from the public internet",
-      });
-    }
-    const isLiteral = /^[0-9.]+$/.test(host) || host.includes(":");
-    // Two lookups, and what each one has to say for itself when it fails. Only
-    // "this name has no such record" is an answer about the host: a resolver
-    // that timed out or is not there at all is ours, and folding the two into
-    // one empty array told every feed's owner to check a spelling that was
-    // right. A host with A records and no AAAA is the ordinary case, so the
-    // resolver's own failure is reported only when nothing resolved at all.
-    const answers: (string[] | Error)[] = isLiteral ? [[host]] : await Promise.all(
-      (["A", "AAAA"] as const).map((t) =>
-        Deno.resolveDns(host, t).catch((err) => (err instanceof Deno.errors.NotFound ? [] : err as Error))
-      ),
-    );
-    const ips = answers.flatMap((answer) => Array.isArray(answer) ? answer : []);
-    // An empty answer is not "no blocked address among them": Deno's resolver
-    // reads neither /etc/hosts nor the OS resolver, so a name only this machine
-    // knows resolves to nothing here and to loopback in the fetch below.
-    if (!ips.length) {
-      const broke = answers.find((answer) => !Array.isArray(answer)) as Error | undefined;
-      if (broke) {
-        bad(502, `This server's resolver could not answer for that host.`, {
-          Expected: "a DNS answer for the host this url names",
-          Received: `the resolver said ${reason(broke)}`,
-          Source: `the DNS lookup of ${u.hostname}`,
-          Fix: "nothing here says the host is wrong; this is ours, so try again",
-        });
-      }
-      bad(400, `That host has no address.`, {
-        Expected: "a host that resolves to a public address",
-        Received: `${u.hostname}, which resolved to no address at all`,
-        Source: "the DNS answer for this url",
-        Fix: "check the spelling of the host, or point it at a host reachable from the public internet",
-      });
-    }
-    if (ips.some(ipBlocked)) {
-      bad(400, `That host resolves inside this server's own network.`, {
-        Expected: "a host resolving to a public address",
-        Received: `${u.hostname} -> ${ips.join(", ")}`,
-        Source: "the DNS answer for this url",
-        Fix: "point it at a host reachable from the public internet",
-      });
-    }
+    await assertPublicHost(u.hostname, "url", "the url this sheet was pointed at");
     const res = await fetch(url, {
       method,
       body,
@@ -3295,6 +3327,242 @@ const readBody = async (res: Response): Promise<Uint8Array> => {
   return buf;
 };
 
+// The most pages one poll reads. A feed that still has a next page here is a
+// feed that never says "last", which is a loop and not a backlog: the row that
+// gives up carries the page it stopped on, the sheet keeps nothing from that
+// poll, and the next scheduled one starts at page one again.
+export const PAGE_MAX = 100;
+
+type Paging = { by: PageBy; param: string; path: string };
+
+/** How this feed hands out its pages, or null for the one request a sheet with
+ * no `page_by` makes. Refused here, off the document, the way netRequest
+ * refuses a method: a poll that cannot be built is this sheet's failure row
+ * rather than a request sent wrong. */
+const pageConfig = (config: { page_by?: unknown; page_param?: unknown; page_path?: unknown }): Paging | null => {
+  const { page_by, page_param, page_path } = config;
+  // An empty box is no paging at all, which is what a sheet that was never
+  // given one means.
+  if (page_by === undefined || page_by === null || page_by === "") return null;
+  if (typeof page_by !== "string" || !(PAGE_BY as readonly string[]).includes(page_by)) {
+    throw new Error(
+      explain("That is not a way this server reads a feed's pages.", {
+        Received: show(page_by),
+        Expected: `one of ${PAGE_BY.join(", ")}, or nothing at all for a feed that answers in one page`,
+        Source: "the page_by field on this net-http sheet",
+        Fix: `spell it ${PAGE_BY.join(" or ")}`,
+      }),
+    );
+  }
+  const by = page_by as PageBy;
+  // A link feed names the whole url of its next page, so it needs no parameter
+  // and is not asked for one.
+  if (by !== "link" && !(typeof page_param === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(page_param))) {
+    throw new Error(
+      explain(`A ${by}-paged feed is asked for its next page by a query parameter.`, {
+        Received: show(page_param),
+        Expected: "letters, digits, dot, dash or underscore, at most 64 of them",
+        Source: "the page_param field on this net-http sheet",
+        Fix: by === "cursor"
+          ? "name the parameter this feed takes its next-page cursor in, such as `cursor` or `page_token`"
+          : `name the parameter this feed takes its ${by} in, such as \`${by}\``,
+      }),
+    );
+  }
+  if (by === "cursor" && !(typeof page_path === "string" && /^\w[\w-]{0,63}(\.\w[\w-]{0,63}){0,7}$/.test(page_path))) {
+    throw new Error(
+      explain("A cursor-paged feed names where in its answer the next cursor sits.", {
+        Received: show(page_path),
+        Expected: "a dotted path of at most eight names, such as `meta.next`",
+        Source: "the page_path field on this net-http sheet",
+        Fix: "write the path to the field this feed holds its next-page cursor in",
+      }),
+    );
+  }
+  return {
+    by,
+    param: by === "link" ? "" : String(page_param),
+    path: by === "cursor" ? String(page_path) : "",
+  };
+};
+
+const withParam = (url: string, param: string, value: string): string => {
+  const target = new URL(url);
+  target.searchParams.set(param, value);
+  return target.href;
+};
+
+/** The value at a dotted path in a page's parsed body: the cursor the next page
+ * is asked for by. Nothing, null and "" all mean this page was the last, which
+ * is the whole of a cursor feed's stop condition -- but only where the path
+ * itself was hollow, a name genuinely missing from an object that held the
+ * names before it. A name met along the way that is not an object (a string,
+ * a number, an array) is not a missing field; it is page_path aimed at
+ * something that was never going to hold a next name, and reading that the
+ * same way as "done" would run a misconfigured feed one page short forever,
+ * a 200 in its log and nothing to say why. */
+const atPath = (parsed: unknown, path: string, url: string, number: number): string | null => {
+  let at: unknown = parsed;
+  const names = path.split(".");
+  for (const [i, key] of names.entries()) {
+    if (at === null || at === undefined) {
+      // A name before the last that page one does not hold is a path this feed
+      // never had -- an envelope renamed under a stored page_path read as "no
+      // next page" on every poll, and the feed was one page long forever with
+      // a green run row. A later page dropping the envelope is the feed's own
+      // way of saying there is no next, and stays one.
+      if (number === 1 && i > 0) {
+        throw new Error(
+          explain("This feed's first page holds nothing where page_path says the next cursor sits.", {
+            Received: `nothing at ${names.slice(0, i).join(".")} on page 1`,
+            Expected: `an object at ${names.slice(0, i).join(".")}, on page 1 at least; a later page may drop it to say there is no next`,
+            Source: url,
+            Fix: "point page_path at the field this feed holds its next-page cursor in",
+          }),
+        );
+      }
+      return null;
+    }
+    if (typeof at !== "object" || Array.isArray(at)) {
+      throw new Error(
+        explain("This feed's page_path runs through a field that is not an object.", {
+          Received: `${path} passes through ${show(at)}`,
+          Expected: "an object at every name before the last",
+          Source: url,
+          Fix: "point page_path at the field this feed holds its next-page cursor in",
+        }),
+      );
+    }
+    at = (at as Record<string, unknown>)[key];
+  }
+  if (at === null || at === undefined || at === "") return null;
+  if (typeof at === "string" || typeof at === "number") return String(at);
+  throw new Error(
+    explain("This feed's next-page cursor is not a value that can be sent back.", {
+      Received: `${path} holds ${show(at)}`,
+      Expected: "text or a number at that path, or nothing at all on the last page",
+      Source: url,
+      Fix: "point page_path at the field this feed holds its next-page cursor in",
+    }),
+  );
+};
+
+// RFC 8288: `<url>; rel="next"`, among however many other links one header
+// carries. The quotes are optional, the parameters come in any order, and a
+// rel may name several relations at once, space-separated inside the one
+// quoted value.
+const LINK = /<([^>]+)>([^,<]*)/g;
+const REL = /rel\s*=\s*"?([^",]*)"?/i;
+const linkNext = (header: string | null): string | null => {
+  for (const [, target, params] of (header ?? "").matchAll(LINK)) {
+    // Split into whole tokens rather than testing the value for the
+    // substring "next": `\bnext\b` alone still matches inside "x-next" or
+    // "archive-next", since a hyphen is a word boundary on both sides.
+    const rels = (params.match(REL)?.[1] ?? "").trim().toLowerCase().split(/\s+/);
+    if (rels.includes("next")) return target.trim();
+  }
+  return null;
+};
+
+/** One page's rows, and what the whole page parsed to. Every page is JSON: the
+ * array of rows itself, or -- under `cursor` and `link`, whose next page is
+ * named in an envelope around the rows -- an object whose one array-valued key
+ * holds them. Two arrays is a guess this refuses by name: `{warnings: [],
+ * items: [...]}` read as no rows at all, every page, with a green run row. A
+ * page that is neither is this poll's failure row, naming the page it arrived
+ * on and what arrived instead. */
+const pageRows = (paging: Paging, text: string, number: number, url: string): { rows: unknown[]; parsed: unknown } => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(
+      explain(`Page ${number} of this feed is not JSON.`, {
+        Received: `${text.length} characters the JSON parser refused: ${reason(err)}`,
+        Expected: "one page of JSON rows",
+        Source: url,
+        Fix: "point the sheet at an endpoint that answers JSON, or take its page_by out",
+      }),
+    );
+  }
+  if (Array.isArray(parsed)) return { rows: parsed, parsed };
+  const envelope = typeof parsed === "object" && parsed !== null ? parsed as Record<string, unknown> : null;
+  // The envelope is an answer only where the next page is named inside it. A
+  // `page` or an `offset` feed says "no more" with an empty array, and an
+  // object arriving where that array belongs is a feed answering something
+  // else -- an error page, a count, a single record.
+  const arrays = envelope && (paging.by === "cursor" || paging.by === "link")
+    ? Object.entries(envelope).filter(([, value]) => Array.isArray(value))
+    : [];
+  if (arrays.length === 1) return { rows: arrays[0][1] as unknown[], parsed };
+  if (arrays.length > 1) {
+    throw new Error(
+      explain(`Page ${number} of this feed holds more than one array.`, {
+        Received: `arrays at ${arrays.map(([key]) => key).join(", ")}`,
+        Expected: "one array of rows in the envelope, or the array itself, so that no guess is made about which one is the rows",
+        Source: url,
+        Fix: "point the sheet at the endpoint that answers the rows themselves",
+      }),
+    );
+  }
+  throw new Error(
+    explain(`Page ${number} of this feed is not an array of rows.`, {
+      Received: envelope ? `an object holding ${Object.keys(envelope).join(", ") || "nothing"}` : show(parsed),
+      Expected: paging.by === "cursor" || paging.by === "link"
+        ? "a JSON array of rows, or an object holding one"
+        : "a JSON array of rows",
+      Source: url,
+      Fix: "point the sheet at the endpoint that answers the rows themselves",
+    }),
+  );
+};
+
+/** Where this feed's next page is, or null when the page just read was the last
+ * one. Each mode says so its own way: a `page` and an `offset` feed answer an
+ * empty array, a `cursor` feed holds nothing at page_path, and a `link` feed
+ * stops naming one. */
+const nextPage = (
+  paging: Paging,
+  from: string,
+  origin: string,
+  res: Response,
+  page: { rows: unknown[]; parsed: unknown },
+  read: number,
+  number: number,
+): string | null => {
+  switch (paging.by) {
+    case "page":
+      return page.rows.length ? withParam(from, paging.param, String(number + 1)) : null;
+    case "offset":
+      return page.rows.length ? withParam(from, paging.param, String(read)) : null;
+    case "cursor": {
+      const next = atPath(page.parsed, paging.path, from, number);
+      return next === null ? null : withParam(from, paging.param, next);
+    }
+    case "link": {
+      const named = linkNext(res.headers.get("link"));
+      if (named === null) return null;
+      const target = URL.parse(named, from);
+      // safeFetch refuses a private address on every page whatever this says,
+      // so this is not the SSRF guard. It is the rule that a feed cannot walk
+      // the poller off the host its sheet names, one Link header at a time --
+      // scheme and port included, since a downgrade to plain http is still a
+      // different door than the one the sheet was pointed at.
+      if (!target || target.origin !== origin) {
+        throw new Error(
+          explain("This feed's next page is not on the host this sheet names.", {
+            Received: `${show(named)}, from the Link header of page ${number}`,
+            Expected: `a next-page url on ${origin}`,
+            Source: from,
+            Fix: "point the sheet at the host that pages, or take its page_by out",
+          }),
+        );
+      }
+      return target.href;
+    }
+  }
+};
+
 // Every write to this log trims behind itself, the failures included: a feed
 // that only ever fails used to grow until the first success trimmed it.
 /** The columns a body answered with, and the JSON type each carries: the keys
@@ -3429,7 +3697,13 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       url = config.url;
       headers = parseNetHeaders(config.headers);
       ({ method, body } = netRequest(config));
-      const host = new URL(url).hostname;
+      const pointed = new URL(url);
+      const host = pointed.hostname;
+      // The identity a `link` page must stay on: scheme and host together, so
+      // a next page cannot downgrade to plain http on the same host either.
+      // `host` alone still keys the per-host request gap below, which cares
+      // about the wire and not the scheme.
+      const origin = pointed.origin;
       const holdoff = hostDue.get(host) ?? 0;
       // Waiting out what another sheet on this host was told. Nothing ran, so
       // there is nothing to log.
@@ -3471,27 +3745,54 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
             }),
           );
         }
-        const target = new URL(url);
-        if (was.cursor) target.searchParams.set(config.cursor, was.cursor);
-        url = target.href;
+        if (was.cursor) url = withParam(url, config.cursor, was.cursor);
       }
+      // How this feed hands out its pages, and where page one is: a page number
+      // and an offset ride the first request, a cursor and a Link header only
+      // arrive with an answer. A sheet with no `page_by` makes the one request
+      // it always made, and `url` is what it always was.
+      const paging = pageConfig(config);
+      // `pageStart` and `nextPage` overwrite `paging.param` on every request a
+      // paged mode sends, page one included. Naming it the same as `cursor`
+      // does not fail to parse -- both are lone parameter names -- so the two
+      // features would silently fight instead: the since-value `cursor` wrote
+      // onto the url a moment ago is gone before the request goes out, and
+      // every poll re-reads the feed from its start.
+      if (paging && config.cursor && paging.param === config.cursor) {
+        throw new Error(
+          explain("page_param is the same query parameter as this sheet's own cursor.", {
+            Received: `both page_param and cursor name ${show(paging.param)}`,
+            Expected: "two different parameter names -- paging overwrites this one on every request",
+            Source: "the page_param and cursor fields on this net-http sheet",
+            Fix: "name page_param something else, such as `page` or `after`",
+          }),
+        );
+      }
+      // Page one: a `page` feed counts from one and an `offset` feed from zero,
+      // each in the parameter the sheet names. A `cursor` feed is asked for
+      // nothing on its first request -- it has no cursor until an answer
+      // carries one -- and a `link` feed is asked exactly as the sheet writes it.
+      if (paging?.by === "page") url = withParam(url, paging.param, "1");
+      if (paging?.by === "offset") url = withParam(url, paging.param, "0");
       const started = Date.now();
       // A string instead of a response is a failure off the wire: a timeout, a
       // reset. Everything safeFetch refuses on its own arrives as an
       // HTTPException instead, because a private address or a redirect loop
       // answers a retry exactly as it answered this one.
-      const res = await fetcher(url, sending, method, sendingBody).catch((err) => {
-        if (err instanceof HTTPException) throw err;
-        return reason(err);
-      });
-      // Asked once; the next sheet on this host in the same cycle steps over it.
-      holdHost(host, now + HOST_GAP_MS);
+      const request = (target: string) =>
+        fetcher(target, sending, method, sendingBody).catch((err) => {
+          if (err instanceof HTTPException) throw err;
+          return reason(err);
+        });
       // A 5xx and a 429 are the host saying "later". A 404, a 401, an SSRF
       // refusal are a "no", and retrying a "no" is noise on top of the failure
-      // row that already answered it.
-      if (typeof res === "string" || res.status === 429 || res.status >= 500) {
-        const answered = typeof res === "string" ? null : res;
-        const detail = typeof res === "string" ? res : new TextDecoder().decode(await readBody(res));
+      // row that already answered it. Said on page one or on page five, it is
+      // one answer about the whole poll: the pages already read are dropped and
+      // the retry starts at page one again, because a feed that ran out of
+      // patience halfway has no place to resume from.
+      const later = async (answer: Response | string, at: string): Promise<void> => {
+        const answered = typeof answer === "string" ? null : answer;
+        const detail = typeof answer === "string" ? answer : new TextDecoder().decode(await readBody(answer));
         const after = answered?.headers.get("retry-after") ?? null;
         // The wait is the host's and not this sheet's, so it holds every sheet
         // pointed there. It is a floor and not a schedule: this sheet takes the
@@ -3516,23 +3817,34 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
             explain(`This feed has failed ${attempt} polls in a row, which is the retry bound.`, {
               Received: `${attempt} failures, the last of them: ${detail.slice(0, 200)}`,
               Expected: `a 2xx within ${RETRY_MAX} attempts`,
-              Source: url,
+              Source: at,
               Fix: "fix the feed or the sheet; the next scheduled poll starts the count again",
             }),
           );
         }
         const wait = Math.max(hostDue.get(host) ?? 0, now + RETRY_BACKOFF_MS * 2 ** (attempt - 1));
         netDue.set(sheet_id, wait);
+        // `at` is the page this answer actually came from, page one or a
+        // later one: a reader who pastes the failure row's repro must reach
+        // the request that failed, not always the first one this poll sent.
         await netRow(
           sheet_id,
           method,
           JSON.stringify({
-            ...fetchFailure(url, headers, answered, detail, method, body),
+            ...fetchFailure(at, headers, answered, detail, method, body),
             attempt,
             retry_at: new Date(wait).toISOString(),
           }),
           { status: answered?.status ?? 0, ms: Date.now() - started, bytes: detail.length, attempt, ...carried },
         );
+      };
+      const res = await request(url);
+      // Asked once; the next sheet on this host in the same cycle steps over it.
+      // The pages after this one go out back to back: the gap is between
+      // cycles, and one poll is one reader walking one feed to its end.
+      holdHost(host, now + HOST_GAP_MS);
+      if (typeof res === "string" || res.status === 429 || res.status >= 500) {
+        await later(res, url);
         continue;
       }
       const kept = {
@@ -3582,9 +3894,79 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
         );
       }
       const text = new TextDecoder().decode(raw);
+      // The pages after the first, and what the run stores: every page answers
+      // an array, and the arrays concatenated are one body, so shapeOf, the
+      // digest, the cap and everything downstream see exactly what a one-page
+      // feed hands them. The validators and the `{{cursor}}` watermark rode the
+      // first request alone -- they are about the feed, not about a page of it.
+      // A sheet with no `page_by` runs none of this and stores what arrived.
+      let payload = text;
+      let bytes = raw.byteLength;
+      // The host said "later" on a page: `later` has written the row and this
+      // sheet is done until its backoff.
+      let retrying = false;
+      if (paging && res.ok) {
+        const first = pageRows(paging, text, 1, url);
+        const rows = [...first.rows];
+        let target = nextPage(paging, url, origin, res, first, rows.length, 1);
+        for (let number = 2; target !== null; number++) {
+          if (number > PAGE_MAX) {
+            throw new Error(
+              explain(`This feed asked for page ${number}, and one poll reads ${PAGE_MAX}.`, {
+                Received: `${PAGE_MAX} pages holding ${rows.length} rows, and still a next page`,
+                Expected: `a feed that runs out of pages within ${PAGE_MAX} of them`,
+                Source: url,
+                Fix: "give the sheet a cursor so each poll asks for less, or point it at a filtered endpoint",
+              }),
+            );
+          }
+          // The page this poll is on, which is what the catch below builds its
+          // failure row from: a reader who pastes the row's curl must reach the
+          // request that broke, the way `later` is handed the page it answered.
+          url = target;
+          const answer = await request(target);
+          if (typeof answer === "string" || answer.status === 429 || answer.status >= 500) {
+            await later(answer, target);
+            retrying = true;
+            break;
+          }
+          if (!answer.ok) {
+            throw new Error(
+              explain(`This feed answered ${answer.status} on page ${number}.`, {
+                Received: `HTTP ${answer.status}${answer.statusText ? " " + answer.statusText : ""}`,
+                Expected: "a 2xx on every page a feed names, or no next page at all",
+                Source: target,
+                Fix: "page one answered, so the sheet is right and the feed is not; ask whoever runs it",
+              }),
+            );
+          }
+          const chunk = await readBody(answer);
+          bytes += chunk.byteLength;
+          // Checked as it grows. A feed that never says "last" otherwise costs
+          // every page it has before one number past the cap refuses the lot.
+          if (bytes > BODY_CAP) {
+            throw new Error(
+              explain("This feed's pages are too large to store.", {
+                Received: `at least ${bytes} bytes over ${number} pages`,
+                Limit: `${BODY_CAP} bytes per run`,
+                Source: url,
+                Fix: "give the sheet a cursor so each poll asks for less, or point it at a filtered endpoint",
+              }),
+            );
+          }
+          const page = pageRows(paging, new TextDecoder().decode(chunk), number, target);
+          // Pushed one at a time: a spread of a hundred thousand rows is an
+          // argument list, and an argument list has a length the runtime caps.
+          for (const row of page.rows) rows.push(row);
+          target = nextPage(paging, target, origin, answer, page, rows.length, number);
+        }
+        // Nothing of what those pages held is kept: the retry starts at page one.
+        if (retrying) continue;
+        payload = JSON.stringify(rows);
+      }
       // Errors become log rows too: the user who typed the URL must see them, and
       // must be able to run the same request by hand.
-      const logged = res.ok ? text : JSON.stringify(fetchFailure(url, headers, res, text, method, body));
+      const logged = res.ok ? payload : JSON.stringify(fetchFailure(url, headers, res, text, method, body));
       // The columns this run answered with, beside it, and against the run
       // before: a dropped column read as a sheet of blanks and graded healthy.
       // The rows still land -- they are what arrived -- and POLL_OK grades the
@@ -3593,11 +3975,11 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       // against this one. A body that is not rows has no shape; going from rows
       // to none dropped every column, and from none to rows is compared to
       // nothing, since nothing was known.
-      const shape = res.ok ? shapeOf(text) : undefined;
+      const shape = res.ok ? shapeOf(payload) : undefined;
       const change = res.ok && was.shape ? shapeChange(was.shape, shape ?? {}) : null;
       // The run's idempotency key: what arrived, so the same answer twice is
       // one row however many polls asked.
-      const sig = res.ok ? await digest(text) : undefined;
+      const sig = res.ok ? await digest(payload) : undefined;
       // The run beside the payload: whether a feed is slow, or 200-ing an error
       // page, is a question about the poll and not about the body it returned.
       // The validators ride the good rows only, so the next poll asks its
@@ -3607,7 +3989,9 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
       await netRow(sheet_id, method, logged, {
         status: res.status,
         ms: Date.now() - started,
-        bytes: raw.byteLength,
+        // What the run read off the wire, every page of it, which is what the
+        // cap refused a byte past and what a slow feed is measured by.
+        bytes,
         ...(res.ok ? { ...kept, sig, shape, ...(change ? { shape_change: change } : {}) } : carried),
       });
     } catch (err) {
@@ -5308,6 +5692,11 @@ const assertSheetEditor = async (c: Context, sheet_id: string, verb: string): Pr
 // poller's own request, once, now: the same safeFetch, the same secret
 // resolution, the same body cap -- and nothing written. The answer is the
 // preview, so the sheet is saved knowing what it will get.
+//
+// One request, whatever the sheet's `page_by` says: the question a pre-flight
+// answers is whether this url, these headers and this body come back with
+// something, and walking a feed to its hundredth page to answer it is a
+// person waiting on a poll they asked to see now.
 const PREFLIGHT_BODY_CHARS = 2_000;
 
 app.post("/library/:id/preflight", async (c) => {
@@ -6052,12 +6441,26 @@ const icsLine = (name: string, val: string): string => {
   return parts.join("\r\n ");
 };
 
-// A date-only value stays a date: an all-day event must not shift by a timezone.
+// When a stored date happened, in epoch milliseconds, or NaN. A date-only value
+// is read at UTC midnight: an all-day event must not shift by a timezone, and
+// neither must an all-day cell in a spreadsheet. A full date-time with no zone
+// of its own -- what a browser's datetime-local input writes -- gets the same
+// treatment for the same reason: Date.parse reads a bare "yyyy-mm-ddThh:mm:ss"
+// as the *server's* local time, so a stored instant with no zone would answer
+// one time in dev and another once deployed. Anything already carrying a zone
+// (a trailing Z, or a +/-offset) is untouched.
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+const DATETIME_NO_ZONE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/;
+const dateMs = (val: string): number =>
+  Date.parse(
+    DATE_ONLY.test(val) ? `${val}T00:00:00Z` : DATETIME_NO_ZONE.test(val) ? `${val}Z` : val,
+  );
+
 const icsStamp = (val: string): string => {
-  const d = new Date(/^\d{4}-\d{2}-\d{2}$/.test(val) ? `${val}T00:00:00Z` : val);
-  if (Number.isNaN(d.getTime())) return "";
-  const iso = d.toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "");
-  return /^\d{4}-\d{2}-\d{2}$/.test(val) ? `;VALUE=DATE:${iso.slice(0, 8)}` : `:${iso}`;
+  const ms = dateMs(val);
+  if (Number.isNaN(ms)) return "";
+  const iso = new Date(ms).toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "");
+  return DATE_ONLY.test(val) ? `;VALUE=DATE:${iso.slice(0, 8)}` : `:${iso}`;
 };
 
 const DATE_TYPES = ["date", "timestamp", "create"];
@@ -6084,7 +6487,82 @@ const named = (sheet_id: string, cols: Col[], rows: Row[]): Record<string, unkno
   return rows.map((row) => Object.fromEntries(cols.map((col) => [col.name, row[col.key] ?? null])));
 };
 
-const EXPORTS: Record<string, { mime: string; render: (id: string, cols: Col[], rows: Row[]) => string }> = {
+// The workbook half of the exports. Everything below is what the community
+// edition can write: values, a number format per column and a width per column.
+// Cell styles -- a bold header, a fill, a border -- are SheetJS Pro only, so the
+// header is a row of text like any other row.
+
+// The format each column type opens with, so a spreadsheet shows what the sheet
+// showed. Every other type opens as General, which is what a number with no
+// format means. A percentage cell holds a decimal (0.25 is 25%), the way
+// formatNumber in src/Main.elm reads one, and "0.00%" is the format that says
+// so.
+const XLSX_FORMATS: Record<string, string> = {
+  usd: "$#,##0.00",
+  percentage: "0.00%",
+  date: "yyyy-mm-dd",
+  timestamp: "yyyy-mm-dd hh:mm:ss",
+};
+
+// There is no date type in the xlsx file format: a date is a number wearing a
+// date format, counted in days from 1899-12-30, which puts 1970-01-01 at 25569.
+// Computed here rather than handed to SheetJS as a Date, because SheetJS turns
+// a Date into that number through the server's own timezone and an all-day cell
+// then opens on the day before wherever the clock is behind UTC.
+const XLSX_EPOCH_DAYS = 25569;
+const XLSX_DAY_MS = 86400000;
+
+// Excel refuses these characters in a sheet name and refuses one past 31
+// characters, so the sheet id is cut and stripped rather than handed over to be
+// rejected. A sheet id is `type:doc_id`, so this always leaves a name.
+const XLSX_NAME_BAD = /[\\/?*[\]:]/g;
+const XLSX_NAME_MAX = 31;
+
+// A column opens as wide as its widest value, in characters. Bounded because
+// one synced cell may hold a megabyte, and a column that wide is a column
+// nobody can see past.
+const XLSX_WIDTH_MAX = 60;
+
+// Excel's own hard limit on the length of one cell's text, and XLSX.write
+// throws past it rather than cutting. Refused by name rather than cut, the way
+// named() refuses a sheet it cannot key a row by: a workbook that silently
+// drops the tail of a cell is a wrong answer, and .csv and .json carry the
+// whole value. Where it is and how long it is, never what it is -- whoever
+// exports is not always whoever pasted it.
+const XLSX_CELL_MAX = 32767;
+const assertXlsxCell = (sheet_id: string, where: string, len: number) => {
+  if (len > XLSX_CELL_MAX) {
+    bad(400, `Sheet ${sheet_id} has a value too long for a workbook cell.`, {
+      Received: `${where} holds ${len} characters`,
+      Expected: `at most ${XLSX_CELL_MAX}, which is the limit the file format has`,
+      Source: "the sheet as it is stored",
+      Fix: "export .csv or .json, which carry the whole value, or shorten that cell",
+    });
+  }
+};
+
+// One cell, typed by its column so a spreadsheet can sum it. `text` is the
+// value as the width and the length guard already read it. A value the column
+// cannot hold -- a word in a num column, a date that does not parse -- is
+// written as the text it is rather than coerced into a wrong number or dropped:
+// the sheet holds it, and an export that loses it is worse than one that shows
+// it.
+const xlsxCell = (type: string, val: unknown, text: string): XLSX.CellObject => {
+  const z = XLSX_FORMATS[type];
+  if ((NUMERIC_TYPES as string[]).includes(type) && typeof val === "number" && Number.isFinite(val))
+    return z === undefined ? { t: "n", v: val } : { t: "n", v: val, z };
+  if (type === "bool" && typeof val === "boolean") return { t: "b", v: val };
+  if (type === "date" || type === "timestamp") {
+    const ms = dateMs(text);
+    if (!Number.isNaN(ms)) return { t: "n", v: ms / XLSX_DAY_MS + XLSX_EPOCH_DAYS, z };
+  }
+  return { t: "s", v: text };
+};
+
+const EXPORTS: Record<
+  string,
+  { mime: string; render: (id: string, cols: Col[], rows: Row[]) => string | Uint8Array<ArrayBuffer> }
+> = {
   csv: {
     mime: "text/csv; charset=utf-8",
     render: (_id, cols, rows) =>
@@ -6152,6 +6630,52 @@ const EXPORTS: Record<string, { mime: string; render: (id: string, cols: Col[], 
         ...events,
         "END:VCALENDAR",
       ].join("\r\n");
+    },
+  },
+  xlsx: {
+    mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    render: (id, cols, rows) => {
+      const ws: XLSX.WorkSheet = {};
+      const types = cols.map((col) => canonicalType(String(col.type)));
+      // col.name is the document's own spelling and, like every cell, untyped
+      // in memory: a sync peer can write null, a number, anything into
+      // data[0]. Read through String() here, the way csvCell already treats
+      // it, rather than trusting it to already be text.
+      const names = cols.map((col, c) => {
+        const name = String(col.name ?? "");
+        assertXlsxCell(id, `the name of column ${c + 1}`, name.length);
+        return name;
+      });
+      // The header row is the first row, and its name is the floor on the width.
+      const widths = names.map((name) => name.length);
+      cols.forEach((_col, c) => {
+        ws[XLSX.utils.encode_cell({ r: 0, c })] = { t: "s", v: names[c] };
+      });
+      rows.forEach((row, r) => {
+        cols.forEach((col, c) => {
+          const val = row[col.key];
+          // A blank cell is an absent cell: the file format has no null, and a
+          // written empty string is a value a spreadsheet counts.
+          if (val === null || val === undefined) return;
+          // Measured off the value the sheet holds, not off the number a date
+          // becomes: 46174 is not how wide "2026-06-01" opens.
+          const text = String(val);
+          assertXlsxCell(id, `column ${names[c]}, row ${r + 1}`, text.length);
+          widths[c] = Math.max(widths[c], text.length);
+          ws[XLSX.utils.encode_cell({ r: r + 1, c })] = xlsxCell(types[c], val, text);
+        });
+      });
+      // A sheet with no columns is a workbook with one empty sheet, the way it
+      // is an empty file in every other format.
+      ws["!ref"] = XLSX.utils.encode_range({
+        s: { r: 0, c: 0 },
+        e: { r: rows.length, c: Math.max(0, cols.length - 1) },
+      });
+      ws["!cols"] = widths.map((wch) => ({ wch: Math.min(wch, XLSX_WIDTH_MAX) }));
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, id.replace(XLSX_NAME_BAD, "").slice(0, XLSX_NAME_MAX));
+      const file: ArrayBuffer = XLSX.write(wb, { type: "array", bookType: "xlsx" });
+      return new Uint8Array(file);
     },
   },
 };
@@ -6494,12 +7018,140 @@ app.post("/query", async (c) => {
 // the read it is about. The failure message is stored as raised -- it names the
 // host or the parse error, which is what the sheet's own members need in order
 // to fix it, and neither the DSN nor its password reaches it.
-const codexRun = async (sheet_id: string, started: number, status: number, body: string) => {
+//
+// `rolled_over` is which credential answered: false is the current one, true is
+// the one before it, which means the current one is dead and somebody has to
+// save a new one before the next rotation retires the one holding this sheet
+// up. It rides the run row rather than a log line because the sheet's own
+// members read this sheet, and they are the ones who can fix it; POLL_OK grades
+// the run failed for the same reason, so freshness and GET /status say so too.
+const codexRun = async (sheet_id: string, started: number, status: number, body: string, rolled_over: boolean) => {
   await sql`
     insert into net (sheet_id, method, body, meta)
-    values (${sheet_id}, 'CODEX', ${body}, ${sql.json({ status, ms: Date.now() - started })})
+    values (${sheet_id}, 'CODEX', ${body}, ${sql.json({ status, ms: Date.now() - started, rolled_over })})
   `.catch((err: unknown) => console.error(`codex run ${sheet_id}:`, err));
   await trimNet(sheet_id);
+};
+
+// Current and previous, tried in that order, the way a sheet secret is. Two is
+// what a rollover needs and one more than that is a credential nobody meant to
+// leave working.
+export const DSN_KEEP = 2;
+
+/** Did this credential fail to get in, as opposed to the far server answering
+ * about the statement it was sent?
+ *
+ * postgres.js raises a PostgresError only for an answer from the server, so
+ * anything else -- no such host, refused, timed out, a DSN the driver decodes
+ * and refuses -- is the connection itself. The three SQLSTATE classes are the
+ * server's own ways of saying the credential is not in: 28 invalid
+ * authorization, 08 connection exception, 3D no such database.
+ *
+ * The distinction is the whole guard on the rollover: a statement a live
+ * connection refused (no such table, not allowed to read it) means the current
+ * credential works and the query is wrong, and running that query again under
+ * the previous credential would answer from a connection nobody rotated to. */
+export const cannotConnect = (err: unknown): boolean =>
+  !(err instanceof pg.PostgresError) || /^(08|28|3D)/.test(String((err as { code?: string }).code ?? ""));
+
+/** The one connection this server opens into somebody else's database: read
+ * only, bounded by a statement timeout, and closed however it ends. It asks for
+ * the shape of the public schema and for nothing in it. */
+const codexTables = async (dsn: string) => {
+  const sql_ = pg(dsn, {
+    onnotice: (msg: { severity?: string }) => msg.severity !== "DEBUG" && console.log(msg),
+    connect_timeout: 5,
+    idle_timeout: 10,
+  });
+  try {
+    await sql_`SET statement_timeout = '10s'`;
+    await sql_`SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`;
+    return await sql_`
+      select
+        table_name as name,
+        '[[{"name":"name","type":"text","key":"column_name"},{"name":"type","type":"text","key":"data_type"},{"name":"key","type":"int","key":"ordinal_position"}]]'::jsonb || jsonb_agg(t)::jsonb as columns
+      from information_schema.tables t
+      inner join information_schema.columns c using (table_catalog,table_schema,table_name)
+      where table_schema = 'public'
+      group by table_name, table_type
+    `;
+  } finally {
+    await sql_.end();
+  }
+};
+
+// postgres: is a "non-special" scheme to the URL parser, so its host is opaque
+// text: "127.1", "0x7f.1" and "2130706433" are three more spellings of
+// 127.0.0.1 that the kernel dialer resolves identically and that compare
+// unequal to every one of them as strings. http: shares the same host parser
+// but is special, and a special scheme's host is IPv4/IPv6-canonicalized -- so
+// reparsing the same text as an http: host is what folds every spelling down
+// to one, using the parser the platform ships rather than one hand-rolled
+// here. A host the reparse refuses is null, and a DSN whose host will not
+// parse is refused by name: a fallback to the text as postgres: parsed it was a
+// check that could not run passing as one that did. An IPv4-mapped IPv6 host
+// comes back as ::ffff:7f00:1 -- the parser's spelling of [::ffff:127.0.0.1]
+// -- and is folded to the IPv4 it maps, the way ipBlocked folds it, because
+// the dialer opens it as that IPv4 and the guard below compares hosts.
+const canonicalHost = (hostname: string, port: string): string | null => {
+  const host = URL.parse(`http://${hostname}:${port || "80"}/`)?.hostname.replace(/^\[|\]$/g, "");
+  if (!host) return null;
+  const mapped = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+  if (!mapped) return host;
+  const [hi, lo] = [parseInt(mapped[1], 16), parseInt(mapped[2], 16)];
+  return [hi >> 8, hi & 255, lo >> 8, lo & 255].join(".");
+};
+
+/** Refuses a stored DSN that is not one this server may open, before it is
+ * opened. Every refusal is about the credential itself and not about reaching
+ * anything, so none is a rollover: an unreadable or self-aimed DSN sitting
+ * quietly behind a working older one is how a sheet ends up held up by a
+ * credential nobody remembers writing. No refusal quotes the string: a DSN
+ * carries its password, and the viewer reading the refusal may not be the
+ * owner who wrote it.
+ *
+ * The host is checked the way safeFetch checks a url's, by literal address and
+ * by every address its name resolves to, on a server whose own database is
+ * somewhere else. A server whose own database is on loopback is a developer's
+ * machine -- this suite's, or a laptop -- and its network is the developer's
+ * own; there the only refusal is this server's own database. */
+const checkCodexDsn = async (dsn: string, sheet_id: string): Promise<void> => {
+  const appDbUrl = Deno.env.get("DATABASE_URL") ?? "postgresql://postgres@127.0.0.1:5434/postgres";
+  const app_ = URL.parse(appDbUrl);
+  if (!app_) throw new Error(`Expected DATABASE_URL to parse as a url, received ${appDbUrl.length} characters that did not.`);
+  const ext = URL.parse(dsn);
+  const source = `the dsn stored for ${sheet_id}`;
+  if (!ext) {
+    bad(400, `That connection string will not parse.`, {
+      Expected: "a postgres DSN",
+      Received: `${dsn.length} characters the URL parser refused`,
+      Source: source,
+      Fix: "re-save it as postgresql://user:password@host:port/database",
+    });
+  }
+  const blockedHosts = ["localhost", "127.0.0.1", "0.0.0.0", "::1"];
+  const appHostCanon = canonicalHost(app_.hostname, app_.port);
+  const extHostCanon = canonicalHost(ext.hostname, ext.port);
+  if (!appHostCanon) throw new Error(`Expected DATABASE_URL to name a host, received ${show(app_.hostname)}.`);
+  if (!extHostCanon) {
+    bad(400, `That connection string's host will not parse.`, {
+      Expected: "a hostname or an IP address",
+      Received: show(ext.hostname),
+      Source: source,
+      Fix: "re-save it as postgresql://user:password@host:port/database",
+    });
+  }
+  const appHost = blockedHosts.includes(appHostCanon) ? "127.0.0.1" : appHostCanon;
+  const extHost = blockedHosts.includes(extHostCanon) ? "127.0.0.1" : extHostCanon;
+  if (extHost === appHost && (ext.port || "5432") === (app_.port || "5432")) {
+    bad(403, `A codex cannot point at this server's own database.`, {
+      Expected: "a host other than this server's own",
+      Received: `${extHost}:${ext.port || "5432"}`,
+      Source: source,
+      Fix: "point it at an external database",
+    });
+  }
+  if (!ipBlocked(appHost)) await assertPublicHost(ext.hostname, "connection string", source);
 };
 
 app.get("/codex/:id", async (c) => {
@@ -6512,80 +7164,79 @@ app.get("/codex/:id", async (c) => {
     });
   }
   const sheet_id = c.req.param("id");
-  const [type, _doc_id] = sheet_id.split(":");
+  const [type, doc_id] = sheet_id.split(":");
   // Before the clock starts, because a caller with no share on this sheet is
   // not a connection that failed: logging their refusal would let anyone
   // holding a doc_id write failures into somebody else's freshness.
   await assertSheetAccess(c, sheet_id);
   const started = Date.now();
+  // Which of the stored credentials this read reached for, so the refusal below
+  // can say how many were tried without naming one of them.
+  let tried = 0;
   try {
     switch (type) {
       case "codex-db": {
-        const [db] = await sql`select dsn from db where sheet_id = ${sheet_id}`;
-        if (!db) {
+        // Newest first, and at most the two a rollover needs. A credential is
+        // rotated by writing another one, so the newest is the current one and
+        // the one before it is what a sheet keeps reading through while the
+        // far end is still catching up -- the same rule, and the same two
+        // rows, that a sheet secret is verified by.
+        const creds = await sql`
+          select dsn from db where sheet_id = ${sheet_id}
+          order by created_at desc, db_id desc limit ${DSN_KEEP}
+        `;
+        if (!creds.length) {
           bad(400, `That codex sheet is not connected to anything.`, {
             Expected: `a stored dsn for ${sheet_id}`,
             Received: "no row",
             Source: "the db table",
-            Fix: "save a connection string with PUT /codex/:id first",
+            Fix: `save a connection string with POST /codex-db/${doc_id} first`,
           });
         }
-        db.dsn = await decrypt("connection string", db.dsn);
-        // Block connections to the application's own database
-        const appDbUrl = Deno.env.get("DATABASE_URL") ?? "postgresql://postgres@127.0.0.1:5434/postgres";
-        try {
-          const app_ = new URL(appDbUrl);
-          const ext = new URL(db.dsn);
-          const blockedHosts = ["localhost", "127.0.0.1", "0.0.0.0", "::1"];
-          const appHost = blockedHosts.includes(app_.hostname) ? "127.0.0.1" : app_.hostname;
-          const extHost = blockedHosts.includes(ext.hostname) ? "127.0.0.1" : ext.hostname;
-          if (extHost === appHost && (ext.port || "5432") === (app_.port || "5432")) {
-            bad(403, `A codex cannot point at this server's own database.`, {
-              Expected: "a host other than this server's own",
-              Received: `${extHost}:${ext.port || "5432"}`,
-              Source: "the dsn stored for this codex sheet",
-              Fix: "point it at an external database",
-            });
-          }
-        } catch (e) {
-          if (e instanceof HTTPException) throw e;
-          bad(400, `That connection string will not parse.`, {
-            Expected: "a postgres DSN",
-            Received: reason(e),
-            Source: `the dsn stored for ${c.req.param("id")}`,
-            Fix: "re-save it as postgresql://user:password@host:port/database",
+        // Bounded by the limit above: at most DSN_KEEP attempts, and the last
+        // one's failure is the one the catch below reports.
+        // Why the credential before the one that answered could not connect,
+        // which is the body of a rolled-over run: the sheet's members read
+        // this row, and the reason is theirs to act on before the next
+        // rotation retires the credential holding the read up.
+        let skipped = "";
+        for (const cred of creds) {
+          tried++;
+          const dsn = await decrypt("connection string", String(cred.dsn));
+          await checkCodexDsn(dsn, sheet_id);
+          // The connection is what is caught, and nothing after it:
+          // cannotConnect reads anything that is not the far server's own
+          // answer as a credential that did not get in, and a bug in the lines
+          // below is not that.
+          const rows = await codexTables(dsn).catch((err: unknown) => {
+            // The credential did not get in and there is an older one to try.
+            // Anything else -- a statement the far server answered about, or
+            // the last credential there is -- is this read's failure.
+            if (tried >= creds.length || !cannotConnect(err)) throw err;
+            skipped = reason(err);
+            return null;
           });
-        }
-        const sql_ = pg(db.dsn, {
-          onnotice: (msg: { severity?: string }) => msg.severity !== "DEBUG" && console.log(msg),
-          connect_timeout: 5,
-          idle_timeout: 10,
-        });
-        try {
-          await sql_`SET statement_timeout = '10s'`;
-          await sql_`SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`;
-          const rows = await sql_`
-            select
-              table_name as name,
-              '[[{"name":"name","type":"text","key":"column_name"},{"name":"type","type":"text","key":"data_type"},{"name":"key","type":"int","key":"ordinal_position"}]]'::jsonb || jsonb_agg(t)::jsonb as columns
-            from information_schema.tables t
-            inner join information_schema.columns c using (table_catalog,table_schema,table_name)
-            where table_schema = 'public'
-            group by table_name, table_type
-          `;
+          if (!rows) continue;
           const cols = rows.columns.map((col: { name: string }) => ({
             name: col.name,
             type: "text",
             key: col.name,
           })); // TODO:
-          await codexRun(sheet_id, started, 200, "");
+          await codexRun(sheet_id, started, 200, skipped, tried > 1);
           return c.json({ data: [cols, ...rows] }, 200);
-        } finally {
-          await sql_.end();
         }
+        // The loop returns on the first credential that answers and rethrows on
+        // the last one that does not, so reaching here is this server's bug and
+        // not the far database's.
+        bad(500, `The connection behind ${sheet_id} was neither opened nor refused.`, {
+          Received: `${tried} of ${creds.length} stored credentials tried, and no answer either way`,
+          Expected: "an answer or a refusal from each credential in turn",
+          Source: "the credential loop in GET /codex/:id",
+          Fix: "report this with the sheet id; nothing the caller sent can cause it",
+        });
       }
       case "codex-scrapsheets": {
-        await codexRun(sheet_id, started, 200, "");
+        await codexRun(sheet_id, started, 200, "", false);
         return c.json(
           {
             data: [
@@ -6647,6 +7298,7 @@ app.get("/codex/:id", async (c) => {
         started,
         err instanceof HTTPException ? err.status : 502,
         reason(err),
+        false,
       );
     }
     if (err instanceof HTTPException) throw err;
@@ -6658,10 +7310,12 @@ app.get("/codex/:id", async (c) => {
     bad(502, `The database behind ${sheet_id} did not answer.`, {
       Received: reason(err),
       Expected: "a reachable postgres server that takes the stored credentials",
-      Source: `the dsn stored for ${sheet_id}`,
-      Fix: `check the host, the credentials and the network, then save the dsn again with POST /codex-db/${
-        sheet_id.split(":")[1]
-      }`,
+      // The count and never the credentials: a reader of this sheet is told
+      // that the rollover was spent, not what was in it.
+      Source: tried
+        ? `the ${tried} stored credential${tried === 1 ? "" : "s"} for ${sheet_id}, newest first`
+        : `the connection behind ${sheet_id}`,
+      Fix: `check the host, the credentials and the network, then save the dsn again with POST /codex-db/${doc_id}`,
     });
   }
 });
@@ -6686,9 +7340,19 @@ app.post("/codex-db/:id", async (c) => {
       Fix: "send the connection string under dsn",
     });
   }
+  // Writing a connection IS rotating it: the row lands beside the one before it
+  // rather than over it, so a sheet reading through the old credential keeps
+  // reading while the new one is still being granted at the far end.
+  await sql`insert into db (sheet_id, dsn) values (${sheet_id}, ${await encrypt(dsn)})`;
+  // Current and previous, and nothing older. A third is a credential nobody
+  // meant to leave working, and the rollover has to end somewhere visible.
   await sql`
-    insert into db (sheet_id, dsn) values (${sheet_id}, ${await encrypt(dsn)})
-    on conflict (sheet_id) do update set dsn = excluded.dsn
+    delete from db
+    where sheet_id = ${sheet_id}
+      and db_id not in (
+        select db_id from db where sheet_id = ${sheet_id}
+        order by created_at desc, db_id desc limit ${DSN_KEEP}
+      )
   `;
   return c.json(null, 200);
 });

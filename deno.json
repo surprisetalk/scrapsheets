@@ -69,6 +69,7 @@
     "elm-review": "npm:elm-review@^2.13.5",
     "elm-test": "npm:elm-test@0.19.2-0",
     "pg-gateway": "npm:pg-gateway@^0.3.0-beta.4",
-    "stripe": "npm:stripe@22.5.0"
+    "stripe": "npm:stripe@22.5.0",
+    "xlsx": "npm:xlsx@0.18.5"
   }
 }

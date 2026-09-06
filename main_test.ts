@@ -6,6 +6,8 @@ import * as AM from "@automerge/automerge-repo";
 import { decodeSyncMessage } from "@automerge/automerge";
 import { WebSocketClientAdapter } from "@automerge/automerge-repo-network-websocket";
 import Stripe from "stripe";
+import pg from "postgresjs";
+import * as XLSX from "xlsx";
 import {
   accountBuckets,
   app,
@@ -14,8 +16,10 @@ import {
   automerge,
   BODY_CAP,
   callerIp,
+  cannotConnect,
   createJwt,
   createToken,
+  DSN_KEEP,
   errorLogged,
   flushFolds,
   flushWebhooks,
@@ -33,6 +37,7 @@ import {
   type Method,
   NET_KEEP,
   netDue,
+  PAGE_MAX,
   parseNetHeaders,
   pollAlertOnce,
   pollNetOnce,
@@ -51,7 +56,7 @@ import {
   WEBHOOKS_PER_SHEET_MAX,
   webhookTimer,
 } from "./main.ts";
-import type { Col, Query, Sheet, Table, Template } from "./main.ts";
+import type { Col, NetHttp, Query, Sheet, Table, Template } from "./main.ts";
 import { DATASETS } from "./src/examples.mjs";
 import { MAX_QUERY_ROWS } from "./src/sql.mjs";
 import ala from "alasql";
@@ -129,22 +134,41 @@ const usr = async (email: string) => {
 };
 
 Deno.test(async function allTests(t) {
-  const listener = Deno.listen({ hostname: "127.0.0.1", port: 5434 });
   const pglite = new PGlite({ extensions: { citext } });
-
-  (async () => {
-    for await (const conn of listener) {
-      new PostgresConnection(conn, {
-        async onStartup() {
-          await pglite.waitReady;
-        },
-        async onMessage(data, { isAuthenticated }) {
-          if (!isAuthenticated) return;
-          return await pglite.execProtocolRaw(data);
-        },
-      });
-    }
+  // The database a codex sheet points at: its own PGlite, behind its own
+  // address, because the gateway hands every connection onto one PGlite
+  // session -- a codex connection setting its session read only would set it
+  // for main.ts's own connection too, and the next insert anywhere in the
+  // suite would be refused. Started here and awaited on connect, so its boot
+  // overlaps the run rather than adding to it. 5435 and not 5434 is also what
+  // makes it external at all: GET /codex/:id refuses a dsn on this server's
+  // own host and port.
+  const external = (async () => {
+    const db = new PGlite();
+    await db.waitReady;
+    await db.exec(`create table widget (widget_id int, name text)`);
+    return db;
   })();
+
+  const serve = (port: number, of: PGlite | Promise<PGlite>) => {
+    const listener = Deno.listen({ hostname: "127.0.0.1", port });
+    (async () => {
+      for await (const conn of listener) {
+        const db = await of;
+        new PostgresConnection(conn, {
+          async onStartup() {
+            await db.waitReady;
+          },
+          async onMessage(data, { isAuthenticated }) {
+            if (!isAuthenticated) return;
+            return await db.execProtocolRaw(data);
+          },
+        });
+      }
+    })();
+    return listener;
+  };
+  const listeners = [serve(5434, pglite), serve(5435, external)];
 
   await pglite.waitReady;
   await pglite.exec(dbSql);
@@ -2087,6 +2111,11 @@ Deno.test(async function allTests(t) {
           ]),
           { 0: "2026-06-01", 1: "Kickoff; with a comma", 2: 40 },
           { 0: "2026-07-04T18:30:00Z", 1: "Fireworks", 2: 900 },
+          // No zone at all -- the same shape `at2` holds in the xlsx fixture
+          // above. `dateMs` reads it as UTC, so it must land on the exact same
+          // instant, and therefore the exact same DTSTART line, as the row
+          // above that spells the zone out.
+          { 0: "2026-07-04T18:30:00", 1: "Afterparty", 2: 50 },
         ],
       });
       await put(jwt, `/library/table:${cal.documentId}`, {});
@@ -2095,10 +2124,14 @@ Deno.test(async function allTests(t) {
       const lines = (await ics.text()).split("\r\n");
       assertEquals(lines[0], "BEGIN:VCALENDAR");
       assertEquals(lines.at(-1), "END:VCALENDAR");
-      assertEquals(lines.filter((l) => l === "BEGIN:VEVENT").length, 2);
+      assertEquals(lines.filter((l) => l === "BEGIN:VEVENT").length, 3);
       // A date-only value stays all-day; a timestamp keeps its time.
       assert(lines.includes("DTSTART;VALUE=DATE:20260601"), lines.join("\n"));
-      assert(lines.includes("DTSTART:20260704T183000Z"), lines.join("\n"));
+      assertEquals(
+        lines.filter((l) => l === "DTSTART:20260704T183000Z").length,
+        2,
+        "a zone-less timestamp and its zoned twin both stamp UTC, so both rows share this line",
+      );
       // RFC 5545 reserves the comma and semicolon inside a value.
       assert(lines.includes("SUMMARY:Kickoff\\; with a comma"), lines.join("\n"));
 
@@ -2156,6 +2189,95 @@ Deno.test(async function allTests(t) {
       const said = await (await exp(`table:${blank.documentId}`, "csv")).text();
       assert(said.includes(`"" appears more than once`), said);
       assert(said.includes("rename one of them"), said);
+    }
+
+    // .xlsx is the one export that answers bytes rather than text. Parsed back
+    // with the library that wrote it, because a workbook that does not open is
+    // the failure worth catching and nothing else in the suite would see it.
+    {
+      const book = await exp(sheet_id, "xlsx");
+      assertEquals(
+        book.headers.get("content-type"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      );
+      // cellNF keeps each cell's number format; without it a read answers only
+      // the text the format produced.
+      const wb = XLSX.read(new Uint8Array(await book.arrayBuffer()), { type: "array", cellNF: true });
+      // Excel refuses a colon in a sheet name and refuses one past 31 characters.
+      assertEquals(wb.SheetNames, [sheet_id.replace(":", "").slice(0, 31)]);
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      assertEquals([ws.A1.v, ws.B1.v], ["name", "age"], "the header is the first row");
+      assertEquals([ws.A2.v, ws.B2.v], ["Alice", 30]);
+      assertEquals(ws.B2.t, "n", "a number column opens as a number, not as text");
+
+      // The column type is the number format, and a value the column cannot
+      // hold stays the text it is rather than becoming a wrong number.
+      const money = automerge.create<{ data: Sheet["data"] }>({
+        data: [
+          arrayify([
+            { name: "paid", type: "usd", key: 0 },
+            { name: "cut", type: "percentage", key: 1 },
+            { name: "day", type: "date", key: 2 },
+            { name: "at", type: "timestamp", key: 3 },
+            { name: "qty", type: "num", key: 4 },
+            { name: "at2", type: "timestamp", key: 5 },
+            // A column's name comes straight off the document and is untyped in
+            // memory -- a sync peer can write anything into data[0] -- and this
+            // render is the one export that reads it as anything but a string.
+            { name: null, type: "text", key: 6 } as unknown as Col,
+          ]),
+          {
+            0: 1234.5,
+            1: 0.155,
+            2: "2026-06-01",
+            3: "2026-07-04T18:30:00Z",
+            4: "n/a",
+            // No zone designator at all -- the shape a browser's
+            // datetime-local input writes, and JS reads a bare date-time
+            // string like this as the server's own local time rather than
+            // UTC. A stored instant with no zone still means one thing.
+            5: "2026-07-04T18:30:00",
+            6: "kept",
+          },
+        ],
+      });
+      await put(jwt, `/library/table:${money.documentId}`, {});
+      const cells = XLSX.read(
+        new Uint8Array(await (await exp(`table:${money.documentId}`, "xlsx")).arrayBuffer()),
+        { type: "array", cellNF: true },
+      );
+      const m = cells.Sheets[cells.SheetNames[0]];
+      assertEquals([m.A2.z, m.A2.v], ["$#,##0.00", 1234.5]);
+      assertEquals([m.B2.z, m.B2.v], ["0.00%", 0.155]);
+      // A date is a number wearing a date format, so what it shows is the
+      // assertion: the serial is computed off the UTC instant, and the day it
+      // opens on must not follow the server's timezone.
+      assertEquals([m.C2.z, m.C2.w], ["yyyy-mm-dd", "2026-06-01"]);
+      assertEquals([m.D2.z, m.D2.w], ["yyyy-mm-dd hh:mm:ss", "2026-07-04 18:30:00"]);
+      assertEquals([m.E2.t, m.E2.v], ["s", "n/a"], "a word in a num column is text, not NaN");
+      assertEquals(
+        [m.F2.z, m.F2.w],
+        ["yyyy-mm-dd hh:mm:ss", "2026-07-04 18:30:00"],
+        "a timestamp with no zone still reads as UTC, not the server's own zone",
+      );
+      assertEquals([m.G1.v, m.G2.v], ["", "kept"], "a null column name is a blank header, and its row survives");
+
+      // A cell past Excel's own 32,767-character limit throws out of
+      // XLSX.write. It is refused by name here rather than cut to fit: a
+      // workbook missing the tail of a cell is a wrong answer, and the formats
+      // with no such limit still carry the whole value.
+      const wide = automerge.create<{ data: Sheet["data"] }>({
+        data: [arrayify([{ name: "note", type: "text", key: 0 }]), { 0: "x".repeat(40000) }],
+      });
+      await put(jwt, `/library/table:${wide.documentId}`, {});
+      const wideRes = await exp(`table:${wide.documentId}`, "xlsx");
+      assertEquals(wideRes.status, 400, "a cell over the limit is a refusal, not a cut and not a 500");
+      const cut = await wideRes.text();
+      assert(cut.includes("column note, row 1"), `the refusal says where it is: ${cut}`);
+      assert(cut.includes("40000 characters"), `and how long it is: ${cut}`);
+      assert(!cut.includes("xxxx"), `and never what it is: ${cut}`);
+      const whole = await (await exp(`table:${wide.documentId}`, "csv")).text();
+      assert(whole.includes("x".repeat(40000)), "and the .csv the refusal names carries the whole value");
     }
   });
 
@@ -3272,6 +3394,603 @@ Deno.test(async function allTests(t) {
     assert(!hostDue.has("ghost-0.test"), "on both maps, by the one rule");
     // Nothing after this polls, and 10,000 ghosts are not this suite's state.
     netDue.clear();
+    hostDue.clear();
+  });
+
+  // Conditional requests and the since-last-run cursor shipped, and one poll was still one request: a feed that
+  // answers in pages delivered its first page forever, and every sheet built on it read a slice as the whole. A poll
+  // now walks the feed to its end and concatenates the pages into one array, so shapeOf, the digest, the cap and
+  // every reader downstream see one body per run exactly as they do from a feed that answers in one page.
+  await t.step("A feed that answers in pages is read to the end", async () => {
+    const { jwt } = await usr("pia@example.com");
+    const feed = async (data: NetHttp) => {
+      const hand = automerge.create<Sheet>({ type: "net-http", data: [data] });
+      const id = `net-http:${hand.documentId}`;
+      await put(jwt, `/library/${id}`, {});
+      return id;
+    };
+    const ids = {
+      // Each on its own host: two sheets on one host take turns across cycles,
+      // which is a fact about the gap and not about paging.
+      numbered: await feed({
+        url: "https://numbered.pages.test/feed",
+        interval: 3600,
+        page_by: "page",
+        page_param: "page",
+      }),
+      offset: await feed({
+        url: "https://offset.pages.test/feed",
+        interval: 3600,
+        page_by: "offset",
+        page_param: "from",
+      }),
+      cursor: await feed({
+        url: "https://cursor.pages.test/feed",
+        interval: 3600,
+        page_by: "cursor",
+        page_param: "after",
+        page_path: "meta.next",
+      }),
+      link: await feed({ url: "https://link.pages.test/p1", interval: 3600, page_by: "link" }),
+      endless: await feed({
+        url: "https://endless.pages.test/feed",
+        interval: 3600,
+        page_by: "page",
+        page_param: "page",
+      }),
+      ragged: await feed({
+        url: "https://ragged.pages.test/feed",
+        interval: 3600,
+        page_by: "page",
+        page_param: "page",
+      }),
+      roaming: await feed({ url: "https://roaming.pages.test/p1", interval: 3600, page_by: "link" }),
+      plain: await feed({ url: "https://plain.pages.test/feed", interval: 3600 }),
+    };
+
+    const calls: string[] = [];
+    const rows = (n: number | string) => JSON.stringify([{ n }]);
+    const answer = (raw: string): Response => {
+      const url = new URL(raw);
+      const page = Number(url.searchParams.get("page") ?? 0);
+      switch (url.hostname) {
+        case "numbered.pages.test":
+          return new Response(page <= 3 ? rows(page) : "[]");
+        case "offset.pages.test": {
+          const from = Number(url.searchParams.get("from") ?? -1);
+          return new Response(from < 3 ? rows(from) : "[]");
+        }
+        case "cursor.pages.test": {
+          // The rows sit under an envelope, because the envelope is where the
+          // next cursor sits: the first array-valued key is the page.
+          const after = url.searchParams.get("after") ?? "a";
+          return new Response(
+            JSON.stringify({ rows: [{ n: after }], meta: { next: after === "a" ? "b" : after === "b" ? "c" : null } }),
+          );
+        }
+        case "link.pages.test":
+          // A relative next, an absolute one beside a link that is not next,
+          // and a last page that names none.
+          return url.pathname === "/p1"
+            ? new Response(rows(1), { headers: { link: `</p2>; rel="next"` } })
+            : url.pathname === "/p2"
+            ? new Response(JSON.stringify({ items: [{ n: 2 }] }), {
+              headers: {
+                link: `<https://link.pages.test/p1>; rel="prev", <https://link.pages.test/p3>; rel="next"`,
+              },
+            })
+            : new Response(rows(3));
+        case "endless.pages.test":
+          return new Response(rows(page));
+        case "ragged.pages.test":
+          return new Response(page <= 1 ? rows(page) : JSON.stringify({ items: [] }));
+        case "roaming.pages.test":
+          return new Response(rows(1), { headers: { link: `<https://elsewhere.test/p2>; rel="next"` } });
+        default:
+          // A next page named every way a paged feed names one, on a sheet
+          // that asked for none.
+          return new Response(JSON.stringify({ rows: [{ n: 1 }], meta: { next: "b" } }), {
+            headers: { link: `<https://plain.pages.test/p2>; rel="next"` },
+          });
+      }
+    };
+    const fetcher = (url: string) => {
+      if (!url.includes(".pages.test")) return Promise.resolve(new Response(`{"ok":true}`));
+      calls.push(url);
+      return Promise.resolve(answer(url));
+    };
+
+    const logOf = async (id: string) => (await get<Table>(jwt, `/net/${id}`)).slice(1);
+    const at = Date.now() + 90_000_000;
+    // A cycle stops starting sheets past POLL_CYCLE_MS, and by here the suite
+    // holds more net-http sheets than one cycle takes.
+    for (let cycle = 0;; cycle++) {
+      if (cycle >= 10) throw new Error(`ten cycles at ${at} and a paged sheet still had not been polled`);
+      await pollNetOnce(fetcher, at);
+      let polled = true;
+      for (const id of Object.values(ids)) polled = polled && (await logOf(id)).length > 0;
+      if (polled) break;
+    }
+    const bodyOf = async (id: string) => JSON.parse(String((await logOf(id))[0].body));
+    const sent = (host: string) => calls.filter((u) => new URL(u).hostname === host);
+
+    // Page one, two, three, and a fourth answering an empty array, which is the
+    // whole of a numbered feed's stop condition.
+    assertEquals(sent("numbered.pages.test").map((u) => new URL(u).searchParams.get("page")), ["1", "2", "3", "4"]);
+    assertEquals(await bodyOf(ids.numbered), [{ n: 1 }, { n: 2 }, { n: 3 }], "the pages are one body");
+    assertEquals((await logOf(ids.numbered)).length, 1, "and three pages are one run");
+    // The one body every reader downstream sees: shapeOf reads the
+    // concatenation, and the run grades off the answer and not off the paging.
+    const [{ meta }]: { meta: { status: number; shape: Record<string, string>; bytes: number } }[] = await sql`
+      select meta from net where sheet_id = ${ids.numbered}
+    `;
+    assertEquals(meta.status, 200);
+    assertEquals(meta.shape, { n: "number" }, `the shape is the concatenation's: ${JSON.stringify(meta)}`);
+
+    // An offset feed is asked from the count of rows it has already handed over.
+    assertEquals(sent("offset.pages.test").map((u) => new URL(u).searchParams.get("from")), ["0", "1", "2", "3"]);
+    assertEquals(await bodyOf(ids.offset), [{ n: 0 }, { n: 1 }, { n: 2 }]);
+
+    // A cursor feed is asked for nothing on the first request -- it has none
+    // yet -- and stops when the path it names holds nothing.
+    assertEquals(sent("cursor.pages.test").map((u) => new URL(u).searchParams.get("after")), [null, "b", "c"]);
+    assertEquals(await bodyOf(ids.cursor), [{ n: "a" }, { n: "b" }, { n: "c" }]);
+
+    // A link feed names the whole url, relative or absolute, beside however
+    // many links that are not next, and stops by naming none.
+    assertEquals(sent("link.pages.test").map((u) => new URL(u).pathname), ["/p1", "/p2", "/p3"]);
+    assertEquals(await bodyOf(ids.link), [{ n: 1 }, { n: 2 }, { n: 3 }]);
+
+    // A feed that never says "last" is a failure row carrying the counter, and
+    // the sheet keeps nothing from that poll.
+    assertEquals(sent("endless.pages.test").length, PAGE_MAX, "every page the cap allows, and the one past it refused");
+    const endless = String((await bodyOf(ids.endless)).error);
+    assert(endless.includes(`page ${PAGE_MAX + 1}`), endless);
+    assert(endless.includes(`${PAGE_MAX} pages`), endless);
+    assertEquals((await logOf(ids.endless)).length, 1, "and nothing of what those pages held is kept");
+
+    // A page that is not an array is a failure row naming the page it arrived on.
+    assertEquals(sent("ragged.pages.test").length, 2, "and the poll stops on it");
+    const ragged = String((await bodyOf(ids.ragged)).error);
+    assert(ragged.includes("Page 2"), ragged);
+    assert(ragged.includes("not an array of rows"), ragged);
+
+    // A feed must not walk the poller off the host its sheet names: safeFetch
+    // guards every page whatever the Link header says, and this is the rule
+    // that a next page is the same feed.
+    assertEquals(sent("roaming.pages.test").length, 1);
+    const roaming = String((await bodyOf(ids.roaming)).error);
+    assert(roaming.includes("elsewhere.test"), roaming);
+    assert(roaming.includes("not on the host this sheet names"), roaming);
+
+    // And a sheet with no page_by is the one request it always was, whatever
+    // the answer names.
+    assertEquals(sent("plain.pages.test").length, 1);
+    assertEquals(await bodyOf(ids.plain), { rows: [{ n: 1 }], meta: { next: "b" } }, "and stores what arrived");
+
+    // These feeds have answered. Parked out of every later step's clock: a step
+    // that re-polls a hundred-page sheet it does not care about spends the
+    // suite's ten seconds walking it.
+    for (const id of Object.values(ids)) netDue.set(id, Number.MAX_SAFE_INTEGER);
+  });
+
+  // Every way a paged sheet can be wrong, and the shapes a right one still takes: config the form should have
+  // refused, a page that breaks after page one answered, a next-page cursor that is not a value that can be sent
+  // back, a Link relation that merely contains "next", a next page on another origin, and the two edges PAGE_MAX
+  // and BODY_CAP draw -- a feed that stops exactly at the cap, and one whose pages sum past it.
+  await t.step("Paging refuses the sheets it cannot follow, and follows the odd ones it can", async () => {
+    const { jwt } = await usr("bree@example.com");
+    const feed = async (data: NetHttp) => {
+      const hand = automerge.create<Sheet>({ type: "net-http", data: [data] });
+      const id = `net-http:${hand.documentId}`;
+      await put(jwt, `/library/${id}`, {});
+      return id;
+    };
+    const ids = {
+      noParam: await feed({ url: "https://noparam.paged.test/feed", interval: 3600, page_by: "page" }),
+      noPath: await feed({
+        url: "https://nopath.paged.test/feed",
+        interval: 3600,
+        page_by: "cursor",
+        page_param: "after",
+      }),
+      badBy: await feed({ url: "https://badby.paged.test/feed", interval: 3600, page_by: "pages" as "page" }),
+      paramLong: await feed({
+        url: "https://paramlong.paged.test/feed",
+        interval: 3600,
+        page_by: "offset",
+        page_param: "x".repeat(65),
+      }),
+      pathDeep: await feed({
+        url: "https://pathdeep.paged.test/feed",
+        interval: 3600,
+        page_by: "cursor",
+        page_param: "after",
+        page_path: Array(9).fill("a").join("."),
+      }),
+      // page_param naming the parameter this feed already takes its
+      // since-value in: paging overwrites it on every request.
+      cursorCollide: await feed({
+        url: "https://cursorcollide.paged.test/feed",
+        interval: 3600,
+        page_by: "page",
+        page_param: "since",
+        cursor: "since",
+      }),
+      cursorObject: await feed({
+        url: "https://cursorobject.paged.test/feed",
+        interval: 3600,
+        page_by: "cursor",
+        page_param: "after",
+        page_path: "meta.next",
+      }),
+      jsonBad: await feed({
+        url: "https://jsonbad.paged.test/feed",
+        interval: 3600,
+        page_by: "page",
+        page_param: "page",
+      }),
+      status404: await feed({
+        url: "https://status404.paged.test/feed",
+        interval: 3600,
+        page_by: "page",
+        page_param: "page",
+      }),
+      retryMidRun: await feed({
+        url: "https://retrymidrun.paged.test/feed",
+        interval: 3600,
+        page_by: "page",
+        page_param: "page",
+      }),
+      atCap: await feed({ url: "https://atcap.paged.test/feed", interval: 3600, page_by: "page", page_param: "page" }),
+      overCap: await feed({
+        url: "https://overcap.paged.test/feed",
+        interval: 3600,
+        page_by: "page",
+        page_param: "page",
+      }),
+      relAmbig: await feed({ url: "https://relambig.paged.test/p1", interval: 3600, page_by: "link" }),
+      scheme: await feed({ url: "https://scheme.paged.test/p1", interval: 3600, page_by: "link" }),
+      noArray: await feed({
+        url: "https://noarray.paged.test/feed",
+        interval: 3600,
+        page_by: "cursor",
+        page_param: "after",
+        page_path: "meta.next",
+      }),
+      // page_path pointed at a field inside the rows array itself, rather than
+      // beside it: a plausible slip rather than a made-up shape.
+      arrayPath: await feed({
+        url: "https://arraypath.paged.test/feed",
+        interval: 3600,
+        page_by: "cursor",
+        page_param: "after",
+        page_path: "items.next",
+      }),
+      encoded: await feed({
+        url: "https://encoded.paged.test/feed",
+        interval: 3600,
+        page_by: "cursor",
+        page_param: "after",
+        page_path: "meta.next",
+      }),
+      numericCursor: await feed({
+        url: "https://numericcursor.paged.test/feed",
+        interval: 3600,
+        page_by: "cursor",
+        page_param: "after",
+        page_path: "meta.next",
+      }),
+      bareValues: await feed({
+        url: "https://barevalues.paged.test/feed",
+        interval: 3600,
+        page_by: "page",
+        page_param: "page",
+      }),
+      paramInUrl: await feed({
+        url: "https://paraminurl.paged.test/feed?from=999",
+        interval: 3600,
+        page_by: "offset",
+        page_param: "from",
+      }),
+      shaped: await feed({
+        url: "https://shapedpages.paged.test/feed",
+        interval: 60,
+        page_by: "page",
+        page_param: "page",
+      }),
+      twoArrays: await feed({
+        url: "https://twoarrays.paged.test/feed",
+        interval: 3600,
+        page_by: "cursor",
+        page_param: "after",
+        page_path: "meta.next",
+      }),
+      noMeta: await feed({
+        url: "https://nometa.paged.test/feed",
+        interval: 3600,
+        page_by: "cursor",
+        page_param: "after",
+        page_path: "meta.next",
+      }),
+      metaDropped: await feed({
+        url: "https://metadropped.paged.test/feed",
+        interval: 3600,
+        page_by: "cursor",
+        page_param: "after",
+        page_path: "meta.next",
+      }),
+    };
+
+    const calls: string[] = [];
+    const rows = (n: number | string) => JSON.stringify([{ n }]);
+    // Round-trips through a real URL: set on one request, read back on the
+    // next, exactly as the wire would carry it.
+    const cursorValue = "b c&d=e/f+g #h 🎉";
+    let shapedAnswer = [`[{"a":1}]`, `[{"a":1,"b":"x"}]`];
+    const answer = (raw: string): Response => {
+      const url = new URL(raw);
+      const page = Number(url.searchParams.get("page") ?? 0);
+      switch (url.hostname) {
+        case "cursorobject.paged.test":
+          return new Response(JSON.stringify({ rows: [{ n: 1 }], meta: { next: { weird: true } } }));
+        case "jsonbad.paged.test":
+          return new Response(page === 1 ? rows(1) : "{not json");
+        case "status404.paged.test":
+          return page === 1 ? new Response(rows(1)) : new Response("nope", { status: 404 });
+        case "retrymidrun.paged.test":
+          return page === 1
+            ? new Response(rows(1))
+            : new Response("slow down", { status: 429, headers: { "retry-after": "45" } });
+        case "atcap.paged.test":
+          // Every page but the last holds a row. The last one the cap allows is
+          // empty, and must not be read as the first one past it.
+          return new Response(page < PAGE_MAX ? rows(page) : "[]");
+        case "overcap.paged.test":
+          // Two pages under the per-response cap on their own, over it together.
+          return new Response(JSON.stringify([{ n: "x".repeat(600_000) }]));
+        case "relambig.paged.test":
+          // A decoy relation holding "next" as a substring, and the real one
+          // beside it: only the real one may be followed.
+          return url.pathname === "/p1"
+            ? new Response(rows(1), { headers: { link: `</decoy>; rel="x-next", </p2>; rel="next"` } })
+            : url.pathname === "/p2"
+            ? new Response(rows(2))
+            : new Response(rows("decoy was fetched"));
+        case "scheme.paged.test":
+          // Same host, dropped to plain http. No next link past page one, so a
+          // poller that (wrongly) followed it stops at two requests rather than
+          // running to the cap.
+          return url.pathname === "/p1"
+            ? new Response(rows(1), { headers: { link: `<http://scheme.paged.test/p2>; rel="next"` } })
+            : new Response(rows(2));
+        case "noarray.paged.test":
+          return new Response(JSON.stringify({ meta: { next: "b" }, count: 5 }));
+        case "arraypath.paged.test":
+          return new Response(JSON.stringify({ items: [{ n: 1 }], count: 1 }));
+        case "encoded.paged.test": {
+          const after = url.searchParams.get("after");
+          return after === null
+            ? new Response(JSON.stringify({ rows: [{ n: "a" }], meta: { next: cursorValue } }))
+            : new Response(JSON.stringify({ rows: [{ n: after }], meta: { next: null } }));
+        }
+        case "numericcursor.paged.test": {
+          const after = url.searchParams.get("after");
+          return after === null
+            ? new Response(JSON.stringify({ rows: [{ n: 1 }], meta: { next: 42 } }))
+            : new Response(JSON.stringify({ rows: [{ n: after }], meta: { next: null } }));
+        }
+        case "barevalues.paged.test":
+          return new Response(page <= 1 ? JSON.stringify([10, 20, 30]) : "[]");
+        case "paraminurl.paged.test": {
+          const from = Number(url.searchParams.get("from") ?? -1);
+          return new Response(from < 3 ? JSON.stringify([{ n: from }]) : "[]");
+        }
+        case "shapedpages.paged.test":
+          return new Response(shapedAnswer[page - 1] ?? "[]");
+        case "twoarrays.paged.test":
+          // An empty array beside the rows. The first array read as the page,
+          // and this feed landed nothing, every poll, under a green run row.
+          return new Response(JSON.stringify({ warnings: [], items: [{ n: 1 }], meta: { next: null } }));
+        case "nometa.paged.test":
+          return new Response(JSON.stringify({ items: [{ n: 1 }] }));
+        case "metadropped.paged.test": {
+          const after = url.searchParams.get("after");
+          return after === null
+            ? new Response(JSON.stringify({ items: [{ n: 1 }], meta: { next: "c2" } }))
+            : new Response(JSON.stringify({ items: [{ n: after }] }));
+        }
+        default:
+          // Every sheet whose config is refused before a request belongs here:
+          // reaching the wire at all is the failure.
+          throw new Error(`no mock answer wired for ${raw}`);
+      }
+    };
+    const fetcher = (url: string) => {
+      if (!url.includes(".paged.test")) return Promise.resolve(new Response(`{"ok":true}`));
+      calls.push(url);
+      return Promise.resolve(answer(url));
+    };
+
+    // Read out of the table rather than through `GET /net/:id`: that route is
+    // itself a read and spends the very budget asked about below.
+    const newest = async (id: string) => {
+      const [row]: { body: string; meta: Record<string, unknown> }[] = await sql`
+        select body, meta from net where sheet_id = ${id} order by net_id desc limit 1
+      `;
+      return row;
+    };
+    const bodyOf = async (id: string) => JSON.parse((await newest(id)).body);
+    const errorOf = async (id: string) => String((await bodyOf(id)).error ?? "");
+    const sent = (host: string) => calls.filter((u) => new URL(u).hostname === host);
+
+    const at = Date.now() + 91_000_000;
+    // A cycle stops starting sheets past POLL_CYCLE_MS, and by here the suite
+    // holds more net-http sheets than one cycle takes.
+    for (let cycle = 0;; cycle++) {
+      if (cycle >= 10) throw new Error(`ten cycles at ${at} and a paged sheet still had not been polled`);
+      await pollNetOnce(fetcher, at);
+      const [{ n }]: { n: number }[] = await sql`
+        select count(distinct sheet_id)::int as n from net where sheet_id = any(${Object.values(ids)})
+      `;
+      if (n === Object.values(ids).length) break;
+    }
+
+    // Polling has no door of its own into a sheet's budget: `spend()` is never
+    // called anywhere in `pollNetOnce`, so a hundred pages and one page leave
+    // the same nothing behind. Asked before anything below reads a sheet.
+    assertEquals(Object.values(ids).filter((id) => hookBuckets.has(id)), []);
+
+    // Config the form should have refused. Every one of these is the sheet's
+    // own failure, made before a request goes out, and names the field to fix.
+    for (
+      const [id, host, headline, source] of [
+        [ids.noParam, "noparam", "asked for its next page by a query parameter", "the page_param field"],
+        [ids.noPath, "nopath", "names where in its answer the next cursor sits", "the page_path field"],
+        [ids.badBy, "badby", "That is not a way this server reads a feed's pages.", "the page_by field"],
+        // Past 64 characters: the regex is the gate, not a length check on top.
+        [ids.paramLong, "paramlong", "asked for its next page by a query parameter", "the page_param field"],
+        // Past eight dotted names.
+        [ids.pathDeep, "pathdeep", "names where in its answer the next cursor sits", "the page_path field"],
+        [
+          ids.cursorCollide,
+          "cursorcollide",
+          "the same query parameter as this sheet's own cursor",
+          "the page_param and cursor fields",
+        ],
+      ] as const
+    ) {
+      assertEquals(sent(`${host}.paged.test`).length, 0, `${host} asked the wire before its config was refused`);
+      const said = await errorOf(id);
+      assert(said.includes(headline), said);
+      assert(said.includes(`${source} on this net-http sheet`), said);
+    }
+
+    // A cursor that names an object cannot be sent back on the next request,
+    // and the poll says so instead of stringifying whatever it found.
+    assertEquals(sent("cursorobject.paged.test").length, 1);
+    assert((await errorOf(ids.cursorObject)).includes("not a value that can be sent back"));
+
+    // Two arrays in the envelope is a guess about which one holds the rows, and
+    // the wrong guess is a sheet of nothing under a green run row. Refused by
+    // name, both names.
+    assertEquals(sent("twoarrays.paged.test").length, 1);
+    const twoArrays = await errorOf(ids.twoArrays);
+    assert(twoArrays.includes("holds more than one array"), twoArrays);
+    assert(twoArrays.includes("warnings, items"), twoArrays);
+
+    // page_path through a name page one does not hold is a path this feed never
+    // had, not a one-page feed: a renamed envelope read as "last page" on every
+    // poll. A later page dropping the envelope is still the last page.
+    assertEquals(sent("nometa.paged.test").length, 1);
+    const noMeta = await errorOf(ids.noMeta);
+    assert(noMeta.includes("nothing at meta on page 1"), noMeta);
+    assertEquals(sent("metadropped.paged.test").length, 2);
+    assertEquals(await bodyOf(ids.metaDropped), [{ n: 1 }, { n: "c2" }]);
+
+    // A parse failure on page two, not page one, names the page it broke on --
+    // the counter in the message is the page, not a request tally -- and the
+    // repro replays that page, not the one that answered.
+    assertEquals(sent("jsonbad.paged.test").length, 2);
+    const jsonBad = await bodyOf(ids.jsonBad);
+    assert(String(jsonBad.error).includes("Page 2 of this feed is not JSON"), jsonBad.error);
+    assert(String(jsonBad.repro).includes("page=2"), `repro replays the wrong page: ${jsonBad.repro}`);
+
+    // A 404 on page two is this feed's answer, not the wire's: the sheet is
+    // right to have asked, and the fix says so.
+    assertEquals(sent("status404.paged.test").length, 2);
+    assert((await errorOf(ids.status404)).includes("This feed answered 404 on page 2."));
+
+    // The host says "later" on page two: the pages already read are dropped,
+    // the failure row carries the attempt and the page-two response, and its
+    // repro fetches page two, which is the request that actually failed.
+    assertEquals(sent("retrymidrun.paged.test").length, 2);
+    const retryRow = await bodyOf(ids.retryMidRun);
+    assert(!Array.isArray(retryRow), `page one's row must not survive the poll: ${JSON.stringify(retryRow)}`);
+    assert(String(retryRow.error).includes("429"), JSON.stringify(retryRow));
+    assertEquals(retryRow.attempt, 1);
+    // The host's Retry-After (45s) outweighs the first backoff step (30s), so
+    // the later of the two -- what `holdHost` keeps -- is the host's own answer.
+    assertEquals(retryRow.retry_at, new Date(at + 45_000).toISOString(), JSON.stringify(retryRow));
+    assert(String(retryRow.repro).includes("page=2"), `repro replays the wrong page: ${retryRow.repro}`);
+
+    // A feed that stops exactly at the cap succeeds: the last page it allows is
+    // the last one allowed, not the first one refused.
+    assertEquals(sent("atcap.paged.test").length, PAGE_MAX, "every page the cap allows, all of them kept");
+    const atCapBody = await bodyOf(ids.atCap);
+    assertEquals(atCapBody.length, PAGE_MAX - 1, "a row a page, and an empty last one that stops it");
+    assertEquals(atCapBody[0], { n: 1 });
+    assertEquals(atCapBody[PAGE_MAX - 2], { n: PAGE_MAX - 1 });
+
+    // Two pages under the per-response cap sum past it, and the failure names
+    // the run's total rather than either page's -- the run-total guard's own
+    // headline, not the per-response guard's, which "too large to store" alone
+    // would also match.
+    assertEquals(sent("overcap.paged.test").length, 2, "the second page is read, then refused for its sum");
+    assert((await errorOf(ids.overCap)).includes("This feed's pages are too large to store."));
+
+    // The decoy is never fetched: a relation that merely holds "next" as a
+    // substring ("x-next") is not the "next" relation.
+    assertEquals(sent("relambig.paged.test").map((u) => new URL(u).pathname), ["/p1", "/p2"]);
+    assertEquals(await bodyOf(ids.relAmbig), [{ n: 1 }, { n: 2 }]);
+
+    // A next page naming the same host on plain http is not the origin the
+    // sheet was pointed at, exactly as a different host is not.
+    assertEquals(sent("scheme.paged.test").length, 1);
+    assert((await errorOf(ids.scheme)).includes("not on the host this sheet names"));
+
+    // A cursor feed's envelope with no array in it at all is the same refusal
+    // as one holding something else where the rows belong.
+    assertEquals(sent("noarray.paged.test").length, 1);
+    assert((await errorOf(ids.noArray)).includes("not an array of rows"));
+
+    // page_path pointing into the rows array itself cannot be traversed --
+    // "items" holds the array pageRows already read as the rows, and there is
+    // no ".next" inside it. Reading that as "no more pages" would run a
+    // misconfigured sheet one page short forever, a 200 in its log and nothing
+    // to say why.
+    assertEquals(sent("arraypath.paged.test").length, 1);
+    assert((await errorOf(ids.arrayPath)).includes("not an object"));
+
+    // A cursor holding a space, an ampersand, an equals sign, a slash, a plus,
+    // a hash and an emoji comes back exactly as it went out.
+    assertEquals(sent("encoded.paged.test").length, 2);
+    assertEquals(new URL(sent("encoded.paged.test")[1]).searchParams.get("after"), cursorValue);
+    assertEquals(await bodyOf(ids.encoded), [{ n: "a" }, { n: cursorValue }]);
+
+    // A cursor that is a JSON number, not a string, is still sent back --
+    // `atPath` reads either -- and comes back as the digits alone.
+    assertEquals(sent("numericcursor.paged.test").map((u) => new URL(u).searchParams.get("after")), [null, "42"]);
+    assertEquals(await bodyOf(ids.numericCursor), [{ n: 1 }, { n: "42" }]);
+
+    // A page of bare numbers concatenates like any other: nothing here assumes
+    // a row is an object, and a page with no objects has no shape.
+    assertEquals(await bodyOf(ids.bareValues), [10, 20, 30]);
+    assertEquals((await newest(ids.bareValues)).meta.shape, null, "no object rows, so no shape");
+
+    // page_param overwrites a same-named parameter already baked into the
+    // sheet's own url: paging starts fresh, at zero and not at whatever the
+    // url happened to hold.
+    assertEquals(sent("paraminurl.paged.test").map((u) => new URL(u).searchParams.get("from")), ["0", "1", "2", "3"]);
+
+    // One run, two pages of different shape: shapeOf sees the concatenation,
+    // not either page alone, so the merged shape carries every key either page
+    // answered with, and the first run is a baseline rather than a change.
+    assertEquals((await newest(ids.shaped)).meta.shape, { a: "number", b: "string" });
+    assertEquals((await newest(ids.shaped)).meta.shape_change, undefined);
+
+    // The next run answers one page of a different shape. The change compares
+    // against the run before -- never page one against page two, which is one
+    // body and one shape.
+    shapedAnswer = [`[{"a":"text now"}]`];
+    await pollNetOnce(fetcher, at + 65_000);
+    assertEquals((await newest(ids.shaped)).meta.shape, { a: "string" });
+    assertEquals((await newest(ids.shaped)).meta.shape_change, { added: [], dropped: ["b"], retyped: ["a"] });
+
+    // Parked out of every later step's clock, the way the step before parks its
+    // own: a step that re-polls a hundred-page sheet it does not care about
+    // spends the suite's ten seconds walking it.
+    for (const id of Object.values(ids)) netDue.set(id, Number.MAX_SAFE_INTEGER);
     hostDue.clear();
   });
 
@@ -5016,6 +5735,161 @@ Deno.test(async function allTests(t) {
     hookBuckets.delete(sheet_id);
   });
 
+  // Writing a connection is rotating it: the row lands beside the one before it,
+  // and a sheet reading through the old credential keeps reading while the new
+  // one is still being granted at the far end.
+  await t.step("A rotated credential does not break the sheets reading through it", async () => {
+    const { jwt } = await usr("rota@example.com");
+    const hand = automerge.create<Sheet>({ type: "codex-db", data: [] });
+    const doc_id = hand.documentId;
+    const sheet_id = `codex-db:${doc_id}`;
+    await put(jwt, `/library/${sheet_id}`, { name: "the warehouse" });
+
+    const live = "postgresql://postgres@127.0.0.1:5435/postgres";
+    // A port nobody listens on, so the socket is refused as fast as the loop
+    // can ask -- and asked of an address this suite already holds the net
+    // permission for, rather than of a hostname a resolver has to answer for.
+    const dead = (port: number) => `postgresql://postgres:p4ssw0rd@127.0.0.1:${port}/postgres`;
+    const meta = async () => {
+      const [run] = await sql`select meta from net where sheet_id = ${sheet_id} order by net_id desc limit 1`;
+      return run?.meta as { status: number; rolled_over: boolean };
+    };
+
+    // One credential, and it answers with the far database's own schema.
+    const opened = async () =>
+      (await get<Table>(jwt, `/codex/${sheet_id}`)).slice(1).some((row) => row.name === "widget");
+    await post(jwt, `/codex-db/${doc_id}`, { dsn: live });
+    assert(await opened(), "the stored credential must open the far schema");
+    assertEquals((await meta()).rolled_over, false, "the current credential is what answered");
+
+    // The rollover. The credential just written cannot connect, the one before
+    // it still can, and the sheets reading through this codex do not notice --
+    // while the run row says the newest one is dead, which is what freshness
+    // and the sheet's own log read back.
+    await post(jwt, `/codex-db/${doc_id}`, { dsn: dead(5436) });
+    assert(await opened(), "the previous credential holds the read up");
+    assertEquals((await meta()).rolled_over, true, "and the run names which one answered");
+    // The run's body is why the newest credential could not connect, for the
+    // members who read this sheet and can fix it -- never any part of it.
+    const [rolled] = await sql`select body from net where sheet_id = ${sheet_id} order by net_id desc limit 1`;
+    assert(String(rolled.body).length > 0, "a rolled-over run says why the newest credential did not get in");
+    assert(!String(rolled.body).includes("p4ssw0rd"), `and carries no part of it: ${rolled.body}`);
+    const fresh = (await get<Table>(jwt, `/library/freshness`)).slice(1).find((r) => r.sheet_id === sheet_id);
+    assert(fresh, "a codex connection is a run, so it has a freshness");
+    assertEquals(JSON.parse(String(fresh.last_meta)).rolled_over, true, "which freshness carries");
+    // Graded failed, though the read answered: a dead newest credential under
+    // a green freshness would be heard about when the next rotation retires
+    // the one holding the sheet up.
+    assert(fresh.last_ok !== fresh.last_run, "a rolled-over run is not a good run");
+
+    // A third write evicts the oldest, so the rollover ends somewhere visible:
+    // both stored credentials are dead now, and the read is the failure it
+    // always was -- counting what it tried and naming none of it.
+    await post(jwt, `/codex-db/${doc_id}`, { dsn: dead(5437) });
+    const [{ n }] = await sql`select count(*)::int as n from db where sheet_id = ${sheet_id}`;
+    assertEquals(n, DSN_KEEP, "a sheet keeps the current credential and the one before it, and no more");
+    const res = await app.request(`/codex/${sheet_id}`, { headers: new Headers({ Authorization: `Bearer ${jwt}` }) });
+    assertEquals(res.status, 502, "both credentials failed, so the connection did");
+    const said = await res.text();
+    assert(said.includes(`${DSN_KEEP} stored credentials`), `the refusal says how many it tried: ${said}`);
+    assert(!said.includes("p4ssw0rd"), `and it carries no part of a credential: ${said}`);
+    assertEquals((await meta()).status, 502, "a failure is a run like any other");
+
+    // What the rollover is allowed to be spent on. A far server that answered
+    // about the statement it was sent is a credential that works, and running
+    // that statement again under the previous one would answer from a
+    // connection nobody rotated to.
+    assert(cannotConnect(new Error("write ECONNREFUSED 10.0.0.1:5432")), "a socket that never opened is not an answer");
+    assert(
+      cannotConnect(new pg.PostgresError({ message: "password authentication failed", code: "28P01" })),
+      "and neither is a server saying the credential is not in",
+    );
+    assert(
+      !cannotConnect(new pg.PostgresError({ message: "relation widget does not exist", code: "42P01" })),
+      "a statement the far server answered about is a credential that works",
+    );
+
+    // Downstream. A query selecting from the codex is refused by name, so a
+    // dead credential cannot read as a far database with nothing in it -- an
+    // empty answer here is a join that silently empties whatever is built on it.
+    const query = await app.request(`/query`, {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+      body: JSON.stringify({ lang: "sql", code: `select * from @${sheet_id}`, args: [] }),
+    });
+    const refused = await query.text();
+    assertEquals(query.status, 400, `a query over a codex must refuse: ${refused}`);
+    assert(refused.includes(sheet_id), `and the refusal must name the codex sheet: ${refused}`);
+  });
+
+  // A newest credential the guard refuses -- unparseable, or aimed at this
+  // server's own database -- is not a rollover even with a good credential
+  // sitting right behind it: both refusals are about the credential itself, and
+  // rolling past one is how a sheet ends up quietly held up by a credential
+  // nobody remembers writing. The guard compares URL.hostname text, and
+  // postgres: is a "non-special" scheme to that parser, so it does not fold
+  // "127.1" or "2130706433" down to the one spelling the block list holds --
+  // though the kernel dialer that opens the socket treats every one of them as
+  // this machine's own loopback.
+  await t.step("A newest credential aimed at this server refuses rather than rolling over", async () => {
+    const { jwt } = await usr("selfaim@example.com");
+    const hand = automerge.create<Sheet>({ type: "codex-db", data: [] });
+    const doc_id = hand.documentId;
+    const sheet_id = `codex-db:${doc_id}`;
+    await put(jwt, `/library/${sheet_id}`, { name: "self-aimed" });
+    const read = () => app.request(`/codex/${sheet_id}`, { headers: new Headers({ Authorization: `Bearer ${jwt}` }) });
+
+    await post(jwt, `/codex-db/${doc_id}`, { dsn: "postgresql://postgres@127.0.0.1:5435/postgres" });
+    assert(
+      (await get<Table>(jwt, `/codex/${sheet_id}`)).slice(1).some((row) => row.name === "widget"),
+      "the good credential must open the far schema before the rotation",
+    );
+
+    // Another spelling of the host and port this server's own DATABASE_URL
+    // falls back to in this suite, with that working credential right behind it.
+    await post(jwt, `/codex-db/${doc_id}`, { dsn: "postgresql://postgres@127.1:5434/postgres" });
+    const spelled = await read();
+    const spelledSaid = await spelled.text();
+    assertEquals(spelled.status, 403, `"127.1" is "127.0.0.1" to the socket that would open: ${spelledSaid}`);
+    assert(spelledSaid.includes("own database"), `the refusal must name what it refused: ${spelledSaid}`);
+    assert(
+      !spelledSaid.includes("widget"),
+      `a refused newest credential must never answer with the older one's schema: ${spelledSaid}`,
+    );
+    assert(
+      !spelledSaid.includes("sheet_usr"),
+      `and a bypassed guard would answer with this server's own table names: ${spelledSaid}`,
+    );
+
+    // The literal spelling, which is the same refusal by the same guard.
+    await post(jwt, `/codex-db/${doc_id}`, { dsn: "postgresql://postgres@127.0.0.1:5434/postgres" });
+    assertEquals((await read()).status, 403, "the host on record refuses like every other spelling of it");
+
+    // IPv4 mapped into IPv6, which the URL parser writes as [::ffff:7f00:1]
+    // and the dialer opens as 127.0.0.1: neither the block list's spelling nor
+    // the app's own, until it is folded back.
+    await post(jwt, `/codex-db/${doc_id}`, { dsn: "postgresql://postgres@[::ffff:127.0.0.1]:5434/postgres" });
+    assertEquals((await read()).status, 403, "an IPv4-mapped spelling of the host on record refuses too");
+
+    // On a server whose own database is somewhere else, a credential aimed
+    // inside this server's network is refused the way safeFetch refuses a url
+    // there: the cloud's metadata address is a Postgres nobody meant to open.
+    // This suite's own database is on loopback, so the guard is asked only
+    // while DATABASE_URL says otherwise.
+    const was = Deno.env.get("DATABASE_URL");
+    Deno.env.set("DATABASE_URL", "postgresql://app@db.example.net:5432/app");
+    try {
+      await post(jwt, `/codex-db/${doc_id}`, { dsn: "postgresql://postgres@169.254.169.254:5432/postgres" });
+      const inside = await read();
+      const insideSaid = await inside.text();
+      assertEquals(inside.status, 400, `a private address is refused before it is dialled: ${insideSaid}`);
+      assert(insideSaid.includes("inside this server's own network"), insideSaid);
+    } finally {
+      if (was === undefined) Deno.env.delete("DATABASE_URL");
+      else Deno.env.set("DATABASE_URL", was);
+    }
+  });
+
   // Three ways a caller holding a real credential reached an unexplained 500.
   // Each is one guard at the boundary the input crosses, so no handler has to
   // remember it.
@@ -5432,9 +6306,14 @@ Deno.test(async function allTests(t) {
         headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}`, ...init.headers }),
       });
 
-    // Requests, whatever address they come from.
-    accountBuckets.set(usr_id, { tokens: 1, lastRefill: Date.now() });
+    // Requests, whatever address they come from. The account's bucket is
+    // emptied right before the request that must be refused and not before the
+    // pair: it refills at RATE_LIMIT_REFILL_RATE, so a first request that took
+    // longer than one token is worth handed the second one a token nobody
+    // granted, and this step failed on a loaded machine and passed on an idle
+    // one.
     assert((await raw(`/library`)).ok);
+    accountBuckets.set(usr_id, { tokens: 0, lastRefill: Date.now() });
     const flooded = await raw(`/library`, { headers: { "x-forwarded-for": "203.0.113.9" } });
     assertEquals(flooded.status, 429, "the account's bucket, not the address's, refuses");
     assert((await flooded.text()).includes("account"), "and says so");
@@ -6292,6 +7171,7 @@ Deno.test(async function allTests(t) {
   });
 
   await sql.end();
-  listener.close();
+  for (const listener of listeners) listener.close();
   await pglite.close();
+  await (await external).close();
 });

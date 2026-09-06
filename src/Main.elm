@@ -9,6 +9,7 @@ port module Main exposing
     , Freshness
     , Index
     , Moving(..)
+    , NumberFormat(..)
     , Rect
     , Sheet
     , SheetView
@@ -81,6 +82,7 @@ import Browser
 import Browser.Dom as Dom
 import Browser.Events as Browser
 import Browser.Navigation as Nav
+import Date
 import Dict exposing (Dict)
 import File exposing (File)
 import Html as H exposing (Html, text)
@@ -531,32 +533,186 @@ commas =
         >> String.reverse
 
 
+{-| A separator every three digits of the whole part of a number already
+written. `commas` counts from the right over everything it is handed, which is
+why the sign and the fraction are held back from it: it made "1234.5" into
+"1,23,4.5" and "-123" into "-,123".
+-}
+groupWhole : String -> String
+groupWhole written =
+    let
+        sign =
+            iif (String.startsWith "-" written) "-" ""
+
+        unsigned =
+            String.dropLeft (String.length sign) written
+
+        whole =
+            String.indexes "." unsigned |> List.head |> Maybe.withDefault (String.length unsigned)
+    in
+    sign ++ commas (String.left whole unsigned) ++ String.dropLeft whole unsigned
+
+
 {-| Money at a decimal count: the symbol and the digit grouping are what make it
-money, and neither depends on how many places are asked for.
-
-Cut at a known position rather than split on the dot -- `fixed` writes the dot
-only when there are places, so where the whole part ends is arithmetic and not
-a search, and there is no unreachable branch for a split that cannot fail. The
-one value `fixed` answers without digits at all is not money either, and
-`formatNumber` hands that one back before it ever reaches here.
-
+money, and neither depends on how many places are asked for. The grouping is
+`groupWhole`, the one a `grouped` column asks for by name: money is the column
+that always asked for it. The one value `fixed` answers without digits at all is
+not money either, and `formatNumber` hands that one back before it ever reaches
+here.
 -}
 usd : Int -> Float -> String
 usd places amount =
     let
         digits =
             fixed places (abs amount)
-
-        cut =
-            iif (places == 0) 0 (places + 1)
     in
     -- The sign off the digits that get written and not off the amount, the way
     -- `fixed` takes it: -0.4 at no places is written "0", and a "-$0" beside a
     -- "$0" reads as two different amounts in one column.
     iif (amount < 0 && String.any (\c -> Char.isDigit c && c /= '0') digits) "-" ""
         ++ "$"
-        ++ commas (String.dropRight cut digits)
-        ++ String.right cut digits
+        ++ groupWhole digits
+
+
+{-| How a number is written, beyond how many places it carries. `Grouped` is
+the separator every three digits money already puts in; `Scientific` is a
+mantissa and a signed exponent.
+
+Neither is a column type. A currency symbol and a percent sign are `usd` and
+`percentage`, which a column already declares, so a format says how the digits
+read and never what they mean.
+
+-}
+type NumberFormat
+    = Grouped
+    | Scientific
+
+
+{-| The one table of formats: the word a document stores, and the reading it
+asks for, which is the label the column's panel offers. `label` is an example
+rather than a description, because the choice is about how a number looks.
+-}
+formatSpec : NumberFormat -> { name : String, label : String }
+formatSpec format =
+    case format of
+        Grouped ->
+            { name = "grouped", label = "1,234.5" }
+
+        Scientific ->
+            { name = "scientific", label = "1.2345e3" }
+
+
+numberFormats : List NumberFormat
+numberFormats =
+    [ Grouped, Scientific ]
+
+
+{-| The format a word names, or none at all. A spelling outside the list is a
+column nobody formatted rather than an error, the way a decimal count out of
+range is a column with no count: the format is how you were reading the numbers,
+and losing it must never cost you the numbers.
+-}
+numberFormat : String -> Maybe NumberFormat
+numberFormat name =
+    numberFormats |> List.filter (\f -> (formatSpec f).name == name) |> List.head
+
+
+{-| A value with its exponent divided out, `10 ^ exponent` computed as two
+smaller powers rather than one. `10 ^ exponent` alone overflows to Infinity
+past 308 and underflows to 0 past -323 -- both real exponents a float can
+carry -- and a divide by either turns a plain value into `0` or `Infinity`:
+the smallest positive float (5e-324, exponent -324) came back "Infinitye-324".
+Halving the exponent first keeps each power within a double's normal range for
+every exponent a float has, at the cost of the same rounding a divide already
+carries.
+-}
+descaled : Float -> Int -> Float
+descaled value exponent =
+    let
+        half =
+            exponent // 2
+    in
+    value / 10 ^ toFloat half / 10 ^ toFloat (exponent - half)
+
+
+{-| A number as a mantissa and a signed exponent. Elm has no `toExponential`, so
+the exponent is the floor of the base-10 log and the mantissa is what is left
+when it is divided out. Zero is answered by name: `logBase 10 0` is -Infinity.
+
+Two digits before the point mean the exponent was one too low, and the mantissa
+is written again one exponent higher. That happens two ways and one check
+answers both, because the mantissa is in [1, 10) until one of them does: `fixed`
+rounds, so 9.99 at one place is "10.0"; and `logBase` divides two logs, so
+1000 comes back at an exponent of 2 and a mantissa of exactly 10.
+
+-}
+scientific : Maybe Int -> Float -> String
+scientific decimals v =
+    let
+        mantissa exponent =
+            case decimals of
+                Just places ->
+                    fixed places (descaled (abs v) exponent)
+
+                Nothing ->
+                    -- No count is "as many digits as the mantissa needs," not
+                    -- two places -- a fixed count the way money reads would
+                    -- have cut 1.23456789e3 down to 1.23e3. But the divide
+                    -- that makes the mantissa is itself a binary float rarely
+                    -- exact, and `String.fromFloat` wrote its own noise
+                    -- straight into the cell: 1234.56789 read
+                    -- "1.2345678900000001e3". A double holds about 15 decimal
+                    -- digits before it runs out of precision at all, so
+                    -- rounding the mantissa to 12 drops the noise and stops
+                    -- short of any digit a typed value could have meant.
+                    let
+                        clean =
+                            1.0e12
+                    in
+                    String.fromFloat (toFloat (round (descaled (abs v) exponent * clean)) / clean)
+    in
+    if v == 0 then
+        mantissa 0 ++ "e0"
+
+    else
+        let
+            found =
+                floor (logBase 10 (abs v))
+
+            exponent =
+                iif (String.startsWith "10" (mantissa found)) (found + 1) found
+        in
+        -- The sign off the value rather than off the digits, the way `fixed`
+        -- takes it off them: a mantissa is never all zeroes, so there is no
+        -- "-0" here for it to have to answer for.
+        iif (v < 0) "-" "" ++ mantissa exponent ++ "e" ++ String.fromInt exponent
+
+
+{-| The digits a number is written with, before whatever its type puts around
+them: the count the column asked for, and the way it asked them to read. No
+count is two places of rounding, which is what a numeric column did before a
+count could be asked for at all.
+-}
+digitsOf : Maybe Int -> Maybe NumberFormat -> Float -> String
+digitsOf decimals format v =
+    let
+        plain =
+            case decimals of
+                Just places ->
+                    fixed places v
+
+                Nothing ->
+                    String.fromFloat (round2 v)
+    in
+    case format of
+        Just Grouped ->
+            groupWhole plain
+
+        Just Scientific ->
+            scientific decimals v
+
+        Nothing ->
+            plain
 
 
 {-| How a number reads in the column it is in. Three places used to answer this
@@ -568,13 +724,16 @@ A wildcard rather than a table, because the question is only ever asked of a
 column that holds a number, and a type that does not hold one has no reading of
 its own to state.
 
-The count is the column's own, and its absence is the reading each type had
-before anybody could ask: two places for money, and as many as the value needs
-for the other two.
+The count and the format are the column's own, and their absence is the reading
+each type had before anybody could ask: two places for money, as many as the
+value needs for the other two, and a separator every three digits where money
+already put one. A format lands on top of the type rather than instead of it --
+money asked for an exponent keeps its symbol and a percentage keeps its sign --
+so `grouped` on a usd column asks for exactly what that column already writes.
 
 -}
-formatNumber : Type -> Maybe Int -> Float -> String
-formatNumber typ decimals v =
+formatNumber : Type -> Maybe Int -> Maybe NumberFormat -> Float -> String
+formatNumber typ decimals format v =
     if not (positional v) then
         -- Neither a currency symbol nor digit grouping belongs on a value that
         -- is not written as digits: `commas` runs over the string form, so a usd
@@ -583,38 +742,18 @@ formatNumber typ decimals v =
         String.fromFloat v
 
     else
-        case ( typ, decimals ) of
+        case ( typ, format ) of
+            ( Usd, Just Scientific ) ->
+                iif (v < 0) "-" "" ++ "$" ++ scientific (Just (Maybe.withDefault 2 decimals)) (abs v)
+
             ( Usd, _ ) ->
                 usd (Maybe.withDefault 2 decimals) v
 
-            ( Percentage, Just places ) ->
-                fixed places (v * 100) ++ "%"
+            ( Percentage, _ ) ->
+                digitsOf decimals format (v * 100) ++ "%"
 
-            ( Percentage, Nothing ) ->
-                formatPercentage v
-
-            ( _, Just places ) ->
-                fixed places v
-
-            ( _, Nothing ) ->
-                String.fromFloat (round2 v)
-
-
-formatPercentage : Float -> String
-formatPercentage value =
-    -- Assumes value is a decimal (e.g., 0.25 = 25%)
-    let
-        percentage =
-            value * 100 |> round2
-
-        formatted =
-            if percentage == toFloat (round percentage) then
-                String.fromInt (round percentage)
-
-            else
-                String.fromFloat percentage
-    in
-    formatted ++ "%"
+            _ ->
+                digitsOf decimals format v
 
 
 
@@ -955,6 +1094,10 @@ type alias Sheet =
     -- How many decimal places this browser writes a numeric column's values at,
     -- where it asked for a count at all.
     , decimals : Dict String Int
+
+    -- How the digits of a numeric column read, where it asked for a reading
+    -- other than the one its type has.
+    , formats : Dict String NumberFormat
     , resizing : Maybe { key : String, startX : Int, startWidth : Int }
 
     -- The column or row being dragged to a new position, while the drag lasts.
@@ -999,6 +1142,7 @@ emptySheet =
     , lineage = Nothing
     , widths = Dict.empty
     , decimals = Dict.empty
+    , formats = Dict.empty
     , resizing = Nothing
     , moving = Nothing
     , storedView = emptyView
@@ -1126,12 +1270,13 @@ type alias SheetView =
     , filters : Dict String Filter
     , widths : Dict String Int
     , decimals : Dict String Int
+    , formats : Dict String NumberFormat
     }
 
 
 emptyView : SheetView
 emptyView =
-    { hidden = Set.empty, pinned = Set.empty, sort = [], filters = Dict.empty, widths = Dict.empty, decimals = Dict.empty }
+    { hidden = Set.empty, pinned = Set.empty, sort = [], filters = Dict.empty, widths = Dict.empty, decimals = Dict.empty, formats = Dict.empty }
 
 
 {-| One column's share of the view. Every field is optional and every default is
@@ -1147,6 +1292,7 @@ type alias ColView =
     , filter : String
     , width : Maybe Int
     , decimals : Maybe Int
+    , format : Maybe NumberFormat
     }
 
 
@@ -1187,7 +1333,7 @@ stored columns at all, so the map key is the only key there is.
 -}
 colViewFields : String -> D.Decoder ColView
 colViewFields key =
-    D.map7 (ColView key)
+    D.map8 (ColView key)
         (D.oneOf [ D.field "hidden" D.bool, D.succeed False ])
         (D.oneOf [ D.field "pinned" D.bool, D.succeed False ])
         (D.oneOf
@@ -1211,6 +1357,7 @@ colViewFields key =
         (D.oneOf [ D.field "filter" D.string, D.succeed "" ])
         (D.oneOf [ D.field "width" (D.map (\w -> iif (w >= minColWidth) (Just w) Nothing) D.int), D.succeed Nothing ])
         (D.oneOf [ D.field "decimals" (D.map (\d -> iif (d >= 0 && d <= maxDecimals) (Just d) Nothing) D.int), D.succeed Nothing ])
+        (D.oneOf [ D.field "format" (D.map numberFormat D.string), D.succeed Nothing ])
 
 
 colViewDecoder : D.Decoder ColView
@@ -1266,6 +1413,7 @@ viewOf cols =
             |> Dict.fromList
     , widths = cols |> List.filterMap (\c -> Maybe.map (Tuple.pair c.key) c.width) |> Dict.fromList
     , decimals = cols |> List.filterMap (\c -> Maybe.map (Tuple.pair c.key) c.decimals) |> Dict.fromList
+    , formats = cols |> List.filterMap (\c -> Maybe.map (Tuple.pair c.key) c.format) |> Dict.fromList
     }
 
 
@@ -1305,6 +1453,7 @@ pruneView doc sheet =
                     , filters = Dict.filter (\key _ -> Set.member key live) arrangement.filters
                     , widths = Dict.filter (\key _ -> Set.member key live) arrangement.widths
                     , decimals = Dict.filter (\key _ -> Set.member key live) arrangement.decimals
+                    , formats = Dict.filter (\key _ -> Set.member key live) arrangement.formats
                     }
 
                 onScreen =
@@ -1317,6 +1466,7 @@ pruneView doc sheet =
                 , filters = onScreen.filters
                 , widths = onScreen.widths
                 , decimals = onScreen.decimals
+                , formats = onScreen.formats
                 , storedView = keep sheet.storedView
             }
 
@@ -1381,6 +1531,8 @@ viewPatches at cols before after =
                         set x key "width" (Maybe.map E.int (Dict.get key after.widths))
                     , only (Dict.get key before.decimals) (Dict.get key after.decimals) <|
                         set x key "decimals" (Maybe.map E.int (Dict.get key after.decimals))
+                    , only (Dict.get key before.formats) (Dict.get key after.formats) <|
+                        set x key "format" (Maybe.map (formatSpec >> .name >> E.string) (Dict.get key after.formats))
                     , only (text_ before.filters key) (text_ after.filters key) <|
                         set x key "filter" (Maybe.map E.string (text_ after.filters key))
                     , only (Dict.get key wasSorted) (Dict.get key nowSorted) <|
@@ -1474,6 +1626,7 @@ onScreenView sheet =
     , filters = sheet.filters
     , widths = sheet.widths
     , decimals = sheet.decimals
+    , formats = sheet.formats
     }
 
 
@@ -1616,7 +1769,7 @@ type Doc
     | Tab Table
     | Query Query_
     | NetHook
-    | NetHttp { url : String, interval : Int, headers : String, method : String, body : String }
+    | NetHttp { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String }
     | Alert { code : String, to : String, interval : Int, digest : Bool, when : When }
     | Chart { source : String, kind : ChartKind, x : String, y : String }
     | Dashboard (List String)
@@ -1760,6 +1913,57 @@ methodDecoder name =
 
     else
         D.fail ("not a method a feed can be polled with: " ++ name ++ "; expected one of " ++ String.join ", " netMethods)
+
+
+{-| How a feed's next page is asked for. `PAGE_BY` in `main.ts` is the same list
+on the other side of the wire, and the poller refuses a mode that is not on it.
+Empty is not a fifth mode: it is the feed that says nothing about
+paging, which is one request a poll, and it is what the select clears to. A mode
+the server would refuse is refused here too, the way a method is: a select the
+page draws empty over a document holding a mode it does not know is a lie about
+what the poller asks for.
+-}
+pageBy : List String
+pageBy =
+    [ "page", "offset", "cursor", "link" ]
+
+
+pageByDecoder : String -> D.Decoder String
+pageByDecoder name =
+    if name == "" || List.member name pageBy then
+        D.succeed name
+
+    else
+        D.fail ("not a way a feed reads its pages: " ++ name ++ "; expected one of " ++ String.join ", " pageBy ++ ", or nothing for one request a poll")
+
+
+{-| What a mode reads and where it stops, beside the two fields that set it:
+`param` is the query parameter it counts in, `path` the place in the answer it
+reads the next cursor out of. One table rather than three, because a mode that
+gained a hint and lost the input that fills it in drew a form nobody could
+finish.
+
+`pageByDecoder` refuses a mode outside `pageBy`, so the last branch is the empty
+select.
+
+-}
+pageForm : String -> { param : Bool, path : Bool, hint : String }
+pageForm mode =
+    case mode of
+        "page" ->
+            { param = True, path = False, hint = "sends the parameter as 1, then 2, 3 … and stops at a page that is an empty JSON array. Every page must be a JSON array." }
+
+        "offset" ->
+            { param = True, path = False, hint = "sends the parameter as 0, then the rows received so far, and stops at a page that is an empty JSON array. Every page must be a JSON array." }
+
+        "cursor" ->
+            { param = True, path = True, hint = "sends no parameter first, then the value at the path in the page before, and stops when that path holds nothing. A page is an array, or an object whose first array holds the rows." }
+
+        "link" ->
+            { param = False, path = False, hint = "follows the Link header's rel=\"next\" url, which must be on the same origin as the URL above, and stops when no next is named." }
+
+        _ ->
+            { param = False, path = False, hint = "one request a poll: what comes back is what is stored." }
 
 
 {-| How a chart is drawn. One table with no wildcard, so a new constructor fails
@@ -1966,15 +2170,18 @@ docDecoder =
                     "net-http" ->
                         D.field "data" <|
                             D.index 0 <|
-                                D.map5
-                                    (\url interval headers method body ->
-                                        NetHttp { url = url, interval = interval, headers = headers, method = method, body = body }
+                                D.map8
+                                    (\url interval headers method body by param path ->
+                                        NetHttp { url = url, interval = interval, headers = headers, method = method, body = body, pageBy = by, pageParam = param, pagePath = path }
                                     )
                                     (D.field "url" D.string)
                                     (D.field "interval" D.int)
                                     (D.oneOf [ D.field "headers" D.string, D.succeed "" ])
                                     (optionalField "method" (D.string |> D.andThen methodDecoder) "GET")
                                     (optionalField "body" D.string "")
+                                    (optionalField "page_by" (D.string |> D.andThen pageByDecoder) "")
+                                    (optionalField "page_param" D.string "")
+                                    (optionalField "page_path" D.string "")
 
                     "alert" ->
                         D.field "data" <|
@@ -2321,6 +2528,7 @@ type Msg
     | ColumnsShowAll
     | ColumnPin String
     | ColumnDecimals String String
+    | ColumnFormat String String
     | ColumnMoveStart String
     | RowMoveStart Int
     | MoveEnd
@@ -2409,6 +2617,9 @@ type Input
     | NetHeaders
     | NetMethod
     | NetBody
+    | NetPageBy
+    | NetPageParam
+    | NetPagePath
     | AlertCode
     | AlertTo
     | AlertDigest
@@ -2708,6 +2919,7 @@ update msg ({ sheet, auth } as model) =
                     , lineage = data.data.doc |> D.decodeValue (D.field "forked_from" D.string) |> Result.toMaybe
                     , widths = stored.widths
                     , decimals = stored.decimals
+                    , formats = stored.formats
                     , resizing = Nothing
                     , moving = Nothing
                     , storedView = stored
@@ -3251,6 +3463,30 @@ update msg ({ sheet, auth } as model) =
                 }
             )
 
+        InputChange NetPageBy x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "page_by" ], value = E.string x } ]
+                }
+            )
+
+        InputChange NetPageParam x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "page_param" ], value = E.string x } ]
+                }
+            )
+
+        InputChange NetPagePath x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "page_path" ], value = E.string x } ]
+                }
+            )
+
         CopyText str ->
             ( model, copyToClipboard str )
 
@@ -3333,6 +3569,20 @@ update msg ({ sheet, auth } as model) =
               }
             , Cmd.none
             )
+
+        ColumnFormat key name ->
+            -- One click is one arrangement, unlike the count beside it: there
+            -- are no keystrokes here to write a patch for each of.
+            arrange model
+                { sheet
+                    | formats =
+                        case numberFormat name of
+                            Just format ->
+                                Dict.insert key format sheet.formats
+
+                            Nothing ->
+                                Dict.remove key sheet.formats
+                }
 
         ColumnPin key ->
             let
@@ -4196,8 +4446,19 @@ updateDocMsg edit ({ sheet } as model) =
                                                                     |> min (List.length rows - 1)
                                                                     |> (\n -> List.take n texts)
 
+                                                            -- Two seeds are what a step is made of, except
+                                                            -- a date: one date is a series on its own,
+                                                            -- because a day is the step nobody has to name.
+                                                            enough =
+                                                                case seeds of
+                                                                    [ one ] ->
+                                                                        parseDay one /= Nothing
+
+                                                                    _ ->
+                                                                        List.length seeds >= 2
+
                                                             values =
-                                                                case ( List.length seeds >= 2, seriesEncoder col.typ ) of
+                                                                case ( enough, seriesEncoder col.typ ) of
                                                                     ( True, Just encode ) ->
                                                                         fillSeries seeds (List.length rows - List.length seeds) |> List.map encode
 
@@ -6078,6 +6339,8 @@ where the column holds text: a num column that held 10 and 20 got the strings
 column's objects were overwritten with "a: 3". `checkColumnTypes` coerces the
 numeric types on the way out and leaves the rest, so those survived every read --
 and MCP's `write_cells` refuses exactly the value the page's own fill-down wrote.
+A date and a timestamp are text on the way in and out, so a filled one is written
+the way `fillSeries` spelled it.
 
 Exhaustive on purpose: a new column type has to say which of the three it is.
 
@@ -6123,10 +6386,10 @@ seriesEncoder typ =
             Nothing
 
         Date ->
-            Nothing
+            Just E.string
 
         Timestamp ->
-            Nothing
+            Just E.string
 
         Json ->
             Nothing
@@ -6150,12 +6413,16 @@ seriesEncoder typ =
             Nothing
 
 
-{-| The values that carry a column on below its seeds. Two or more numbers
-continue the step between the last pair, one number counts up by one, text
-ending in digits counts those digits up, and anything else repeats the last
-seed. A date is none of those: continuing one is calendar arithmetic, nothing
-here does calendar arithmetic by hand, and the trailing digits of "2026-01-31"
-otherwise counted January on to a 32nd day.
+{-| The values that carry a column on below its seeds. Two or more dates step by
+the days or the months between the last pair, one date steps by a day, two or
+more numbers continue the step between the last pair, one number counts up by
+one, text ending in digits counts those digits up, and anything else repeats the
+last seed.
+
+The calendar is `justinmimbs/date`, never arithmetic on the text: the trailing
+digits of "2026-01-31" counted January on to a 32nd day. What comes back is an
+ISO day, then whatever the last seed carried after its first ten characters, so
+a timestamp column keeps its time of day.
 
 Everything this writes is a value a float carries and a cell can hold. A step
 that overflowed, a counter past what a float counts exactly, and a seed written
@@ -6171,6 +6438,15 @@ fillSeries seeds count =
 
         numbers =
             List.filterMap (String.trim >> String.toFloat) seeds
+
+        -- `parseDay` is what says a seed is a date, here and in `countable`
+        -- both. It counts days from 1970-01-01 and `Date` counts them from
+        -- 0001-01-01, which is rata die 1: 1970-01-01 is rata die 719163.
+        days =
+            List.filterMap parseDay seeds
+
+        asDate epochDay =
+            Date.fromRataDie (epochDay + 719163)
 
         -- The seeds' own precision: 1, 2 counts in whole numbers and 0.5, 1.0
         -- in tenths. Bounded by the count a column may ask for, and for the
@@ -6213,25 +6489,62 @@ fillSeries seeds count =
             else
                 fixed decimals value
     in
-    -- Two numbers are what a step is, so two is what the pattern asks for. The
-    -- caller already refuses to come here with fewer, and a default step of one
-    -- for a shape that cannot arrive was a number this could not have known.
-    case ( List.length numbers == List.length seeds, List.reverse numbers ) of
-        ( True, latest :: previous :: _ ) ->
+    -- Every seed a date, or none of them: one date among numbers is a column
+    -- somebody is still typing into, and repeating is what that asks for.
+    case ( List.length days == List.length seeds, List.reverse days ) of
+        ( True, latest :: earlier ) ->
             let
-                step =
-                    latest - previous
+                start =
+                    asDate latest
+
+                -- Months when the later date is the earlier one plus whole
+                -- months landing on the same day of the month, which is the
+                -- only thing that tells a month step from a step of the days
+                -- between the two. One date steps by a day.
+                ( unit, step ) =
+                    case earlier of
+                        before :: _ ->
+                            let
+                                from =
+                                    asDate before
+
+                                months =
+                                    12 * (Date.year start - Date.year from) + (Date.monthNumber start - Date.monthNumber from)
+                            in
+                            iif (months /= 0 && Date.toRataDie (Date.add Date.Months months from) == Date.toRataDie start)
+                                ( Date.Months, months )
+                                ( Date.Days, latest - before )
+
+                        [] ->
+                            ( Date.Days, 1 )
             in
-            List.range 1 count |> List.map (\i -> written (latest + step * toFloat i))
+            -- Off the last seed every time, never off the value written before
+            -- it: a month past 2026-01-31 is 02-28, and a walk that carried the
+            -- 28th on clamped every row after it to the 28th too.
+            List.range 1 count
+                |> List.map (\i -> Date.toIsoString (Date.add unit (step * i) start) ++ String.dropLeft 10 (String.trim last))
 
         _ ->
-            case countable of
-                Just counted ->
-                    List.range 1 count
-                        |> List.map (\i -> String.dropRight (String.length tail) last ++ (String.fromInt (counted + i) |> String.padLeft (String.length tail) '0'))
+            -- Two numbers are what a step is, so two is what the pattern asks
+            -- for. The caller comes here with one seed only for a date, and a
+            -- default step of one for a shape that cannot arrive was a number
+            -- this could not have known.
+            case ( List.length numbers == List.length seeds, List.reverse numbers ) of
+                ( True, latest :: previous :: _ ) ->
+                    let
+                        step =
+                            latest - previous
+                    in
+                    List.range 1 count |> List.map (\i -> written (latest + step * toFloat i))
 
-                Nothing ->
-                    List.repeat count last
+                _ ->
+                    case countable of
+                        Just counted ->
+                            List.range 1 count
+                                |> List.map (\i -> String.dropRight (String.length tail) last ++ (String.fromInt (counted + i) |> String.padLeft (String.length tail) '0'))
+
+                        Nothing ->
+                            List.repeat count last
 
 
 rowSplices : (Int -> Maybe Row) -> Int -> List Int -> (Int -> Int) -> ( List Patch, List Patch )
@@ -6405,8 +6718,8 @@ cellClasses sheet i n =
         ]
 
 
-cellDecoder : Type -> Maybe Int -> Int -> Int -> D.Decoder (Maybe (Html Msg))
-cellDecoder typ decimals i n =
+cellDecoder : Type -> Maybe Int -> Maybe NumberFormat -> Int -> Int -> D.Decoder (Maybe (Html Msg))
+cellDecoder typ decimals format i n =
     D.maybe
         (case typ of
             Unknown ->
@@ -6428,13 +6741,13 @@ cellDecoder typ decimals i n =
                 boolean |> D.map (\c -> H.input [ A.type_ "checkbox", A.checked c, A.onCheck (DocMsg << CellCheck { x = i, y = n }) ] [])
 
             Number ->
-                D.oneOf [ D.map (text << formatNumber Number decimals) number, D.map text string ]
+                D.oneOf [ D.map (text << formatNumber Number decimals format) number, D.map text string ]
 
             Usd ->
-                D.oneOf [ D.map (text << formatNumber Usd decimals) number, D.map text string ]
+                D.oneOf [ D.map (text << formatNumber Usd decimals format) number, D.map text string ]
 
             Percentage ->
-                D.oneOf [ D.map (text << formatNumber Percentage decimals) number, D.map text string ]
+                D.oneOf [ D.map (text << formatNumber Percentage decimals format) number, D.map text string ]
 
             Date ->
                 D.map text string
@@ -6489,8 +6802,8 @@ viewThumb cols rows spark =
         text ""
 
 
-viewStatCell : Type -> Maybe Int -> Maybe Stat -> List (Html Msg)
-viewStatCell typ decimals maybeStat =
+viewStatCell : Type -> Maybe Int -> Maybe NumberFormat -> Maybe Stat -> List (Html Msg)
+viewStatCell typ decimals format maybeStat =
     let
         grid =
             H.div [ S.displayGrid, S.gridTemplateColumns "auto auto", S.gap "0 0.5rem", S.justifyContentFlexStart, S.fontSizeRem 0.75 ]
@@ -6501,9 +6814,9 @@ viewStatCell typ decimals maybeStat =
     case maybeStat of
         Just (Numeric stat) ->
             [ grid <|
-                kv "min" (Maybe.withDefault "" (Maybe.map (formatNumber typ decimals) stat.min))
-                    ++ kv "max" (Maybe.withDefault "" (Maybe.map (formatNumber typ decimals) stat.max))
-                    ++ kv "mean" (iif (stat.count == 0) "" (formatNumber typ decimals (stat.sum / toFloat stat.count)))
+                kv "min" (Maybe.withDefault "" (Maybe.map (formatNumber typ decimals format) stat.min))
+                    ++ kv "max" (Maybe.withDefault "" (Maybe.map (formatNumber typ decimals format) stat.max))
+                    ++ kv "mean" (iif (stat.count == 0) "" (formatNumber typ decimals format (stat.sum / toFloat stat.count)))
                     ++ kv "count" (String.fromInt stat.count)
             ]
 
@@ -6653,6 +6966,24 @@ viewHeaderCell sheet col =
                                 ]
                             )
                             (text "")
+                        , iif numeric
+                            (H.label [ A.class "format", S.displayFlex, S.alignItemsCenter, S.gapRem 0.25, S.marginTop "0.25rem" ]
+                                [ text "format"
+                                , H.select [ A.onInput (ColumnFormat col.key) ]
+                                    (H.option [ A.value "", A.selected (Dict.get col.key sheet.formats == Nothing) ] [ text "auto" ]
+                                        :: List.map
+                                            (\format ->
+                                                H.option
+                                                    [ A.value (formatSpec format).name
+                                                    , A.selected (Dict.get col.key sheet.formats == Just format)
+                                                    ]
+                                                    [ text (formatSpec format).label ]
+                                            )
+                                            numberFormats
+                                    )
+                                ]
+                            )
+                            (text "")
                         , if movable then
                             H.div [ S.displayFlex, S.flexWrapWrap, S.gapRem 0.25, S.marginTop "0.25rem" ]
                                 [ H.button [ A.onClick (DocMsg (SheetColumnTrim col.key)), A.title "drop the spaces around every value in this column" ] [ text "Trim" ]
@@ -6727,7 +7058,7 @@ viewCell sheet stats pins grab i n col row =
         else
             case String.fromInt n of
                 "-2" ->
-                    viewStatCell col.typ (Dict.get col.key sheet.decimals) (Maybe.andThen (Array.get i) (Result.toMaybe stats))
+                    viewStatCell col.typ (Dict.get col.key sheet.decimals) (Dict.get col.key sheet.formats) (Maybe.andThen (Array.get i) (Result.toMaybe stats))
 
                 "-1" ->
                     [ H.p [ S.displayBlock, S.textOverflowEllipsis, S.overflowHidden, S.whiteSpaceNowrap, S.fontSizeRem 0.75 ] [ text col.raw ] ]
@@ -6751,7 +7082,7 @@ viewCell sheet stats pins grab i n col row =
                     , row
                         |> Dict.get col.key
                         |> Maybe.withDefault (E.string "")
-                        |> D.decodeValue (cellDecoder col.typ (Dict.get col.key sheet.decimals) i n)
+                        |> D.decodeValue (cellDecoder col.typ (Dict.get col.key sheet.decimals) (Dict.get col.key sheet.formats) i n)
                         |> Result.map (Maybe.withDefault (text ""))
                         |> Result.mapError (D.errorToString >> text)
                         |> (\r ->
@@ -6954,7 +7285,7 @@ viewTableFooter trash sheet pins cols rows =
                     List.map
                         (\col ->
                             H.td ([ S.textAlignRight, S.fontWeight "600", iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) ] ++ pinAttrs pins col)
-                                [ text (Maybe.withDefault "" (Maybe.map (formatNumber col.typ (Dict.get col.key sheet.decimals)) (columnTotal rows col))) ]
+                                [ text (Maybe.withDefault "" (Maybe.map (formatNumber col.typ (Dict.get col.key sheet.decimals) (Dict.get col.key sheet.formats)) (columnTotal rows col))) ]
                         )
                         (Array.toList cols)
                         ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [] ]
@@ -7031,7 +7362,9 @@ viewToolbar model info =
             , [ H.button [ A.class "chip", A.onClick (ShortcutsToggle True), iif (sheet.id == "") S.marginLeftAuto (A.classList []) ] [ text "keys" ] ]
             , case sheet.doc of
                 Ok (Tab _) ->
-                    [ H.a [ A.class "chip", A.href (model.api ++ "/export/" ++ sheet.id ++ ".csv"), A.download (sheet.id ++ ".csv") ] [ text "export csv" ] ]
+                    List.map
+                        (\format -> H.a [ A.class "chip", A.href (model.api ++ "/export/" ++ sheet.id ++ "." ++ format), A.download (sheet.id ++ "." ++ format) ] [ text ("export " ++ format) ])
+                        [ "csv", "xlsx" ]
 
                 Ok (Chart _) ->
                     List.map
@@ -7128,8 +7461,12 @@ viewNetHook model =
         ]
 
 
-viewNetHttp : Model -> { url : String, interval : Int, headers : String, method : String, body : String } -> Html Msg
+viewNetHttp : Model -> { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String } -> Html Msg
 viewNetHttp model cfg =
+    let
+        paging =
+            pageForm cfg.pageBy
+    in
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ viewNetWarning model
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
@@ -7153,6 +7490,26 @@ viewNetHttp model cfg =
             [ text "body, sent with a POST or a PUT"
             , H.textarea [ A.class "mono", A.value cfg.body, A.placeholder "{\"since\": \"{{cursor}}\", \"key\": \"{{secret:name}}\"}", A.spellcheck False, A.onInput (InputChange NetBody) ] []
             ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "read every page"
+            , H.select [ A.value cfg.pageBy, A.onInput (InputChange NetPageBy) ] <|
+                List.map (\m -> H.option [ A.value m, A.selected (m == cfg.pageBy) ] [ text (iif (m == "") "no, one request" m) ]) ("" :: pageBy)
+            ]
+        , iif paging.param
+            (H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+                [ text "page parameter"
+                , H.input [ A.class "mono", A.type_ "text", A.value cfg.pageParam, A.placeholder "page", A.title "letters, digits, _ . and -, up to 64 of them: the poller refuses anything else", A.onInput (InputChange NetPageParam) ] []
+                ]
+            )
+            (text "")
+        , iif paging.path
+            (H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+                [ text "cursor path"
+                , H.input [ A.class "mono", A.type_ "text", A.value cfg.pagePath, A.placeholder "meta.next", A.title "names joined by dots, at most eight of them: the poller refuses anything else", A.onInput (InputChange NetPagePath) ] []
+                ]
+            )
+            (text "")
+        , H.span [ S.fontSizeRem 0.8125, S.color "#666" ] [ text paging.hint ]
         , H.div [ S.displayFlex, S.gapRem 0.5, S.alignItemsCenter ]
             [ H.button [ A.class "chip", A.onClick Preflight, A.title "fetch it once, now, and show what comes back" ] [ text "test the request" ]
             , H.span [ S.fontSizeRem 0.875, S.color "#666" ]

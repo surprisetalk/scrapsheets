@@ -490,18 +490,18 @@ suite =
              ]
             )
         , describe "docDecoder"
-            [ test "net-http decodes url and interval; headers, method and body default to a plain GET" <|
+            [ test "net-http decodes url and interval; headers, method, body and the paging fields default to one plain GET" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "" }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "" }))
             , test "net-http decodes a headers string" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"headers":"X-Key: abc"}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "X-Key: abc", method = "GET", body = "" }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "X-Key: abc", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "" }))
             , test "net-http decodes the method and body it posts with" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"method":"POST","body":"{}"}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "POST", body = "{}" }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "POST", body = "{}", pageBy = "", pageParam = "", pagePath = "" }))
             , test "net-http refuses a method the poller would not send" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"method":"PATCH"}]}"""
@@ -515,6 +515,15 @@ suite =
             , test "net-http with a body that is not a string is refused, the way the server refuses it" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"body":5}]}"""
+                        |> Result.toMaybe
+                        |> Expect.equal Nothing
+            , test "net-http decodes the paging fields the poller reads a whole feed with" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"page_by":"cursor","page_param":"after","page_path":"meta.next"}]}"""
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "cursor", pageParam = "after", pagePath = "meta.next" }))
+            , test "net-http refuses a paging mode the poller does not know" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"page_by":"scroll"}]}"""
                         |> Result.toMaybe
                         |> Expect.equal Nothing
             , test "net-http without interval is still rejected" <|
@@ -844,8 +853,25 @@ suite =
                 \_ -> fillSeries [ "red", "blue" ] 2 |> Expect.equal [ "blue", "blue" ]
             , test "no rows to fill writes nothing" <|
                 \_ -> fillSeries [ "1", "2" ] 0 |> Expect.equal []
-            , test "a date is not a series, so January never gains a 32nd day" <|
-                \_ -> fillSeries [ "2026-01-30", "2026-01-31" ] 2 |> Expect.equal [ "2026-01-31", "2026-01-31" ]
+            , test "two dates step by the days between them" <|
+                \_ -> fillSeries [ "2026-01-30", "2026-01-31" ] 2 |> Expect.equal [ "2026-02-01", "2026-02-02" ]
+            , test "a week between two dates carries on a week at a time" <|
+                \_ -> fillSeries [ "2026-01-05", "2026-01-12" ] 2 |> Expect.equal [ "2026-01-19", "2026-01-26" ]
+            , test "a month step lands on the end of every month it reaches" <|
+                \_ ->
+                    -- Every value off the last seed, never off the one written
+                    -- before it: a walk that carried 2026-02-28 on by a month
+                    -- clamped to the 28th and stayed there for good.
+                    fillSeries [ "2025-12-31", "2026-01-31" ] 3
+                        |> Expect.equal [ "2026-02-28", "2026-03-31", "2026-04-30" ]
+            , test "one date is a series of its own, a day at a time" <|
+                \_ -> fillSeries [ "2026-02-28" ] 2 |> Expect.equal [ "2026-03-01", "2026-03-02" ]
+            , test "a timestamp keeps whatever it carried after its day" <|
+                \_ ->
+                    fillSeries [ "2026-01-01T09:30:00Z" ] 2
+                        |> Expect.equal [ "2026-01-02T09:30:00Z", "2026-01-03T09:30:00Z" ]
+            , test "a date beside something that is not one repeats, the way any other pair this cannot read does" <|
+                \_ -> fillSeries [ "2026-01-01", "later" ] 2 |> Expect.equal [ "later", "later" ]
             , test "a counter past what a float counts exactly repeats rather than writing the same id twice" <|
                 \_ ->
                     -- String.toInt accumulates in a float and String.fromInt
@@ -875,29 +901,33 @@ suite =
                         |> Expect.equal [ [ "1e308" ], [ "Infinity" ] ]
             ]
         , describe "formatNumber"
-            [ test "a total that overflowed is not dressed up as money" <|
+            [ test "a total that overflowed is not dressed up as money, or as anything else" <|
                 \_ ->
                     -- `usd` groups the digits of the string form, so Infinity
                     -- came out "$In,fin,ity.00". Two 1e308 cells in a usd column
-                    -- is all the totals row needs, and a decimal count is no
-                    -- help to a value that is not a number either.
-                    [ reads "usd" Nothing (1.0e308 + 1.0e308), reads "usd" (Just 4) -(1.0e308 + 1.0e308) ]
-                        |> Expect.equal [ "Infinity", "-Infinity" ]
+                    -- is all the totals row needs, and neither a decimal count
+                    -- nor a format is any help to a value that is not a number.
+                    [ reads "usd" Nothing Nothing (1.0e308 + 1.0e308)
+                    , reads "usd" (Just 4) Nothing -(1.0e308 + 1.0e308)
+                    , reads "num" Nothing (Just Grouped) (1.0e308 + 1.0e308)
+                    , reads "num" Nothing (Just Scientific) (1.0e308 + 1.0e308)
+                    ]
+                        |> Expect.equal [ "Infinity", "-Infinity", "Infinity", "Infinity" ]
             , test "a usd column reads as money everywhere it is summed" <|
                 \_ ->
-                    [ reads "usd" Nothing 1234.5, reads "num" Nothing 1234.5, reads "percentage" Nothing 0.25 ]
+                    [ reads "usd" Nothing Nothing 1234.5, reads "num" Nothing Nothing 1234.5, reads "percentage" Nothing Nothing 0.25 ]
                         |> Expect.equal [ "$1,234.50", "1234.5", "25%" ]
             , test "a column's decimal count is what every number in it is rounded and padded to" <|
                 \_ ->
-                    [ reads "num" (Just 0) 1234.56, reads "num" (Just 3) 1.5, reads "num" (Just 2) -0.006 ]
+                    [ reads "num" (Just 0) Nothing 1234.56, reads "num" (Just 3) Nothing 1.5, reads "num" (Just 2) Nothing -0.006 ]
                         |> Expect.equal [ "1235", "1.500", "-0.01" ]
             , test "a usd column keeps its symbol and its grouping at any count" <|
                 \_ ->
-                    [ reads "usd" (Just 0) 1234.6, reads "usd" (Just 4) -1234.5 ]
+                    [ reads "usd" (Just 0) Nothing 1234.6, reads "usd" (Just 4) Nothing -1234.5 ]
                         |> Expect.equal [ "$1,235", "-$1,234.5000" ]
             , test "a percentage column counts the decimals of the percent, not of the fraction" <|
                 \_ ->
-                    [ reads "percentage" (Just 1) 0.12345, reads "percentage" (Just 0) 0.126 ]
+                    [ reads "percentage" (Just 1) Nothing 0.12345, reads "percentage" (Just 0) Nothing 0.126 ]
                         |> Expect.equal [ "12.3%", "13%" ]
             , test "a big number at a count the column is allowed to ask for is still a number" <|
                 \_ ->
@@ -905,8 +935,8 @@ suite =
                     -- writes as "1e+21" at 1e11 and ten places, and the digits
                     -- were then cut out of that: the cell read "0.000001e+21",
                     -- and a usd column with no count at all read "$1e+.21".
-                    ( [ reads "num" (Just 10) 1.0e11, reads "num" (Just 2) 1.0e19, reads "usd" Nothing 1.0e19 ]
-                    , String.contains "Infinity" (reads "num" (Just 10) 1.0e300)
+                    ( [ reads "num" (Just 10) Nothing 1.0e11, reads "num" (Just 2) Nothing 1.0e19, reads "usd" Nothing Nothing 1.0e19 ]
+                    , String.contains "Infinity" (reads "num" (Just 10) Nothing 1.0e300)
                     )
                         |> Expect.equal
                             ( [ "100000000000.0000000000", "10000000000000000000.00", "$10,000,000,000,000,000,000.00" ]
@@ -917,7 +947,7 @@ suite =
                     -- `round` sends a half to +Infinity, so the scaled -0.125
                     -- went down while `usd`, which scales the magnitude, sent
                     -- the same number up: one value, two readings, one column.
-                    [ reads "num" (Just 2) 0.125, reads "num" (Just 2) -0.125, reads "usd" (Just 2) -0.125 ]
+                    [ reads "num" (Just 2) Nothing 0.125, reads "num" (Just 2) Nothing -0.125, reads "usd" (Just 2) Nothing -0.125 ]
                         |> Expect.equal [ "0.13", "-0.13", "-$0.13" ]
             , test "a value that rounds to nothing is written without a minus" <|
                 \_ ->
@@ -925,8 +955,70 @@ suite =
                     -- magnitude, with nothing tying the two together: a column
                     -- of small values at no decimals drew "-0" beside "0",
                     -- which reads as two different numbers.
-                    [ reads "num" (Just 0) -0.4, reads "usd" (Just 0) -0.4, reads "num" (Just 2) -0.001 ]
+                    [ reads "num" (Just 0) Nothing -0.4, reads "usd" (Just 0) Nothing -0.4, reads "num" (Just 2) Nothing -0.001 ]
                         |> Expect.equal [ "0", "$0", "0.00" ]
+            , test "grouped separates the whole part and leaves the sign and the fraction alone" <|
+                \_ ->
+                    -- `commas` counts from the right over whatever it is handed,
+                    -- so it made "1234.5" into "1,23,4.5" and "-123" into
+                    -- "-,123": the fraction and the sign are held back from it.
+                    [ reads "num" Nothing (Just Grouped) 1234567.5
+                    , reads "num" (Just 2) (Just Grouped) -1234.5
+                    , reads "num" Nothing (Just Grouped) -123
+                    , reads "num" (Just 0) (Just Grouped) -0.4
+                    ]
+                        |> Expect.equal [ "1,234,567.5", "-1,234.50", "-123", "0" ]
+            , test "scientific writes a mantissa and a signed exponent" <|
+                \_ ->
+                    [ reads "num" Nothing (Just Scientific) 1234.5
+                    , reads "num" Nothing (Just Scientific) 0.00012
+                    , reads "num" Nothing (Just Scientific) -1234.5
+                    , reads "num" (Just 2) (Just Scientific) 0
+                    , reads "num" Nothing (Just Scientific) 0
+                    ]
+                        |> Expect.equal [ "1.2345e3", "1.2e-4", "-1.2345e3", "0.00e0", "0e0" ]
+            , test "a mantissa that reached ten is one written an exponent higher" <|
+                \_ ->
+                    -- Two ways to land on a mantissa of ten, one check for both:
+                    -- `fixed` rounds 9.99 at one place up to "10.0", and
+                    -- `logBase` divides two logs, so 1000 comes back at an
+                    -- exponent of 2 -- which read "10e2" and "1e2" before.
+                    [ reads "num" (Just 1) (Just Scientific) 999, reads "num" Nothing (Just Scientific) 1000 ]
+                        |> Expect.equal [ "1.0e3", "1e3" ]
+            , test "a format lands on top of what the column's type already reads as" <|
+                \_ ->
+                    -- Money keeps its symbol and a percentage keeps its sign:
+                    -- a format says how the digits are written and never what
+                    -- they mean. `usd` groups its own digits, so grouped money
+                    -- is money.
+                    [ reads "usd" Nothing (Just Grouped) 1234.5
+                    , reads "usd" Nothing (Just Scientific) 1234.5
+                    , reads "usd" (Just 0) (Just Scientific) -1234.5
+                    , reads "percentage" (Just 1) (Just Scientific) 0.00012
+                    , reads "percentage" Nothing (Just Grouped) 12.3456
+                    ]
+                        |> Expect.equal [ "$1,234.50", "$1.23e3", "-$1e3", "1.2e-2%", "1,234.56%" ]
+            , test "scientific with no decimal count drops the divide's own noise, not the digits a typed value carries" <|
+                \_ ->
+                    -- Dividing out the exponent lands the mantissa on a binary
+                    -- float the division does not write cleanly: 1234.56789
+                    -- read "1.2345678900000001e3", and 1/3 read
+                    -- "3.333333333333333e-1" rather than repeating forever.
+                    [ reads "num" Nothing (Just Scientific) 1234.56789
+                    , reads "num" Nothing (Just Scientific) (1 / 3)
+                    , reads "num" Nothing (Just Scientific) (2 / 3)
+                    ]
+                        |> Expect.equal [ "1.23456789e3", "3.333333333333e-1", "6.666666666667e-1" ]
+            , test "scientific of the smallest positive float divides out an exponent 10^x cannot hold as one number" <|
+                \_ ->
+                    -- 10 ^ -324 underflows to 0 in a double, so dividing the
+                    -- exponent out in one step turned the smallest positive
+                    -- float into positive/0 -- "Infinitye-324" -- and one
+                    -- exponent short of it read the mantissa as exactly 0.
+                    [ reads "num" Nothing (Just Scientific) 5.0e-324
+                    , reads "num" (Just 2) (Just Scientific) 5.0e-324
+                    ]
+                        |> Expect.equal [ "4.940656458412e-324", "4.94e-324" ]
             ]
         , describe "seriesEncoder"
             [ test "a numeric column gains numbers and a text column gains text" <|
@@ -942,8 +1034,12 @@ suite =
                     -- A bool column's seeds render "true" and a json column's
                     -- render "a: 1", and both used to be written straight back
                     -- as those strings, over an E.bool and over an object.
-                    [ fills "bool" "true", fills "json" "a: 3", fills "date" "2026-01-31" ]
-                        |> Expect.equal [ Nothing, Nothing, Nothing ]
+                    [ fills "bool" "true", fills "json" "a: 3" ]
+                        |> Expect.equal [ Nothing, Nothing ]
+            , test "a date column gains the day the series wrote, as the text a date cell holds" <|
+                \_ ->
+                    [ fills "date" "2026-02-28", fills "timestamp" "2026-01-01T09:30:00Z" ]
+                        |> Expect.equal [ Just "\"2026-02-28\"", Just "\"2026-01-01T09:30:00Z\"" ]
             ]
         , describe "paletteCommands"
             [ test "an empty query offers every runnable shortcut, in the order the sheet lists them" <|
@@ -1160,6 +1256,29 @@ suite =
                     , E.encode 0 (movePatch [] 1 3).value
                     )
                         |> Expect.equal ( ( "[]", "[3,1]" ), "[1,3]" )
+            , test "a format is read by name, and a name nobody wrote is no format" <|
+                \_ ->
+                    -- The way an unusable decimal count is no count: the format
+                    -- is how you were reading the numbers, and losing it must
+                    -- never cost you the numbers.
+                    """{"type":"table","data":[[{"name":"a","type":"num","key":"0","format":"scientific"},
+                        {"name":"b","type":"num","key":"1","format":"grouped"},
+                        {"name":"c","type":"num","key":"2","format":"engineering"}]]}"""
+                        |> D.decodeString viewDecoder
+                        |> Result.map .formats
+                        |> Expect.equal (Ok (Dict.fromList [ ( "0", Scientific ), ( "1", Grouped ) ]))
+            , test "a format is written as the word the document keeps, and deleted when it goes" <|
+                \_ ->
+                    let
+                        patches before after =
+                            viewPatches tableHome (namedCols [ "a" ]) before after
+                                |> List.map (\p -> ( p.action, E.encode 0 p.value ))
+
+                        scientific =
+                            { emptyView | formats = Dict.singleton "0" Scientific }
+                    in
+                    ( patches emptyView scientific, patches scientific emptyView )
+                        |> Expect.equal ( [ ( "set", "\"scientific\"" ) ], [ ( "del", "null" ) ] )
             , test "a width too narrow to grab is no width" <|
                 \_ ->
                     -- The drag clamps at the same floor. A document can carry any
@@ -1226,7 +1345,7 @@ count that column asks for. The type comes back through `docDecoder`, the way
 every other fixture here is built, so this needs no `Type` constructor exposed
 for one test.
 -}
-reads spelling decimals v =
+reads spelling decimals format v =
     D.decodeString docDecoder
         ("""{"type":"table","data":[[{"name":"a","type":\"""" ++ spelling ++ """","key":"0"}]]}""")
         |> Result.toMaybe
@@ -1239,7 +1358,7 @@ reads spelling decimals v =
                     _ ->
                         Nothing
             )
-        |> Maybe.map (\col -> formatNumber col.typ decimals v)
+        |> Maybe.map (\col -> formatNumber col.typ decimals format v)
         |> Maybe.withDefault "no such column"
 
 

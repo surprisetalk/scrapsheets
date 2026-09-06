@@ -92,19 +92,13 @@ The single biggest gap. Most of the Demo Gallery dies here first.
 
 The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
-- [ ] **You drag a date series down.** Fill-down continues numbers and numbered text; a date column still repeats its
-      last seed.
-  1. Add a date library to `elm.json`: calendar arithmetic is never hand-rolled.
-  2. Give `fillSeries` in `src/Main.elm` a date branch, before the numeric one: two dates set the step in days or
-     months, one date steps by a day, and the seeds' own format is what comes back.
-  3. Test it in `tests/MainTest.elm`, beside the other `fillSeries` tests.
-
-- [ ] **A number looks like the number it is.** A per-column decimal count ships, out of the column's own panel and
-      stored beside `width`. The rest of how a number reads is still whatever `formatNumber` decided.
-  1. Thousands separators, currency symbol, percent, scientific and a custom mask, each a per-column field beside
-     `decimals`: one line in `colViewFields`, `viewOf`, `pruneView` and `viewPatches` in `src/Main.elm`, and one
-     control in the column panel beside the decimals box.
-  2. Locale-aware, from a per-user setting rather than the browser's guess.
+- [ ] **A number reads the way your locale writes it.** A per-column `format` ships beside `decimals` — grouped and
+      scientific, out of the column's panel — and percent and currency are the `percentage` and `usd` types. The
+      separator is always `,` and the point always `.`.
+  1. Locale-aware separators from a per-user setting rather than the browser's guess: one more per-user field, read
+     where `formatNumber` reads the format, so the cell, the stats row and the totals row change together.
+  2. A custom mask only after a second real use asks for one: a mask is a parser, and `formatNumber` is the one place a
+     number becomes text.
 
 - [ ] **A cell can be coloured by a rule.** Nothing conditions on value today.
   1. Colour scales, data bars, icon sets and rule-based cell colour, per column.
@@ -165,11 +159,14 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
   3. PDF table extraction, because half of government data ships as PDF.
   4. Payload mapping is the same job on the `net-hook` side: JSON path to column, so a webhook lands as typed rows.
 
-- [ ] **A feed that answers in pages is read to the end.** Conditional requests and the since-last-run cursor ship; one
-      poll is still one request, so a paged API delivers its first page forever.
-  1. Pagination: page, offset, cursor and Link-header, each with a stop condition, and the page count bounded so a feed
-     that never says "last" is a failure row rather than a loop.
-  2. Write mode per sheet: append, replace, or upsert by key. Append is what every net sheet does today.
+- [ ] **A feed can replace or upsert rather than append.** Paging ships — `page_by` on the sheet, one body per run,
+      bounded by `PAGE_MAX` — and every net sheet still appends.
+  1. Write mode per sheet: append, replace, or upsert by key. A field beside `page_by` on the net-http document, read
+     where `pollNetOnce` writes its run row; replace is a `trimNet` to zero before the write, upsert a key column named
+     on the sheet.
+  2. A cursor or link feed whose envelope holds two arrays (JSON:API's `data` beside `included`) is refused by name,
+     because `pageRows` will not guess which one is the rows. Name the rows path the way `page_path` names the cursor,
+     one more field beside it, so such a feed can be read.
 
 ---
 
@@ -206,12 +203,6 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 - [ ] **A big table syncs by delta.** The whole table moves every time.
   1. Incremental sync with a watermark column.
   2. CDC or logical replication for sources that support it.
-
-- [ ] **A rotated credential does not break live sheets.** There is no rotation path.
-  1. Two DSNs during a rollover, tried in order — the `secret` table already has this shape.
-  2. The codex sheet itself already has freshness: `GET /codex/:id` writes a `method = 'CODEX'` run and
-     `library:freshness` grades it. The **downstream** half is what is missing — a query sheet selecting from
-     `@codex-db:x` says nothing about the connection under it, so a dead credential reads as an empty result.
 
 ---
 
@@ -357,8 +348,11 @@ The Excel add-in market lives here.
 
 ## Reports & export
 
-- [ ] **A report arrives looking like a report.** `csv`, `json`, `ndjson`, `md` and `ics` ship through one route.
-  1. XLSX with formatting, and Parquet.
+- [ ] **A report arrives looking like a report.** `csv`, `json`, `ndjson`, `md`, `ics` and `xlsx` ship through one
+      route; the workbook carries values, a number format per column and widths, and no cell styles, because the
+      SheetJS community edition drops them on write.
+  1. Parquet: one more row in `EXPORTS`, typed off `COLUMN_TYPES` the way `xlsxCell` is; pick the writer first
+     (`hyparquet-writer` or `parquet-wasm`, whichever runs on Deno Deploy) and say why beside the import.
   2. PDF with a print layout: headers, page breaks, title page.
   3. Prose plus live sheet embeds, so the narrative regenerates with the numbers.
   4. Scheduled delivery, emailed with the file attached — the runner in **Now** is what it rides.
@@ -446,13 +440,11 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
 
 ## Offline & mobile
 
-- [ ] **The app works on a phone and on a plane.** It installs now — `src/manifest.webmanifest` — and then still
-      assumes a mouse and a connection.
+- [ ] **The app works on a phone and on a plane.** It installs and its shell opens offline now — `src/manifest.webmanifest`
+      and `src/sw.js` — and then still assumes a mouse and a connection for the data.
   1. Responsive touch-friendly cell editing and swipe navigation.
-  2. Offline: a service worker that answers the app shell and the vendored bundles out of cache, so an installed app
-     opens with no network. `src/_redirects` is already the list of what it has to hold, and `deno task build` copies
-     `src/*` to `dist`, so the worker is one more file there. What it must not cache is the API.
-  3. IndexedDB-first sync — Automerge already uses it, so this is optimisation rather than new machinery.
+  2. IndexedDB-first sync — Automerge already uses it, so this is optimisation rather than new machinery. The shell
+     already opens offline out of `src/sw.js`; this is the data half.
 
 ---
 
@@ -469,19 +461,20 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
   3. A sandbox: fake webhook deliveries and dry-run schedules.
 
 - [ ] **The suite answers in under ten seconds on a machine that is doing something else.** `deno task test` fails past
-      ten, and on a loaded machine `page_test.ts` does worse than run slowly: "sorting a query result does not run its
-      SQL again" fails on `nothing to click`, because the query debounce is a real timer and a starved event loop loses
-      the race to it. A failing test on a busy machine is the worse half of this item.
-  1. Fix that flake first, and any other test that races a real timer rather than waiting for something to happen —
-     `until()` is the bounded poll already written for exactly that.
-  2. Sharing a booted page is done and is spent: `rendered()` in `page_test.ts` is the one library page the tests that
+      ten, and it sits at the gate: `page_test.ts` is the critical path, and `main_test.ts`'s steps have grown to
+      within a second or two of it. Every wait for something to happen is `until()` now, so a loaded machine makes the
+      suite slow rather than red; slow is still red at the gate.
+  1. Sharing a booted page is done and is spent: `rendered()` in `page_test.ts` is the one library page the tests that
      only read what it painted share, and nothing else in the file can join them — every other boot either opens a
      different url, which is a different paint, or writes to the model. It bought back two paints and no more.
-  3. What a `boot` costs is Elm's first paint into jsdom, not the harness around it: the jsdom, the hoisted bundle and
+  2. What a `boot` costs is Elm's first paint into jsdom, not the harness around it: the jsdom, the hoisted bundle and
      Elm's init together are a rounding error beside it, so there is nothing left to hoist and no per-test setup left
      to share. The lever left is fewer boots — merge tests that assert about the same page — or a cheaper paint.
-  4. `settle()` pays QUIET_FRAMES turns of the event loop every time it is called, and a test that clicks ten times
+  3. `settle()` pays QUIET_FRAMES turns of the event loop every time it is called, and a test that clicks ten times
      pays it ten times. Measure whether one fewer quiet frame survives `--shuffle` before touching anything else.
+  4. `main_test.ts` is one `Deno.test` of steps against one database, so it cannot run in parallel with itself. Time it
+     alone (`deno test --allow-all main_test.ts`) and merge steps that build the same fixture before it overtakes
+     `page_test.ts`.
   5. Dead ends, so nobody spends the afternoon again: `--optimize` shrinks `dist/index.js` by a few percent and moves
      nothing, and the flat `settle(ms)` sleeps left are the ones proving something did **not** happen, which cannot be
      shortened.
