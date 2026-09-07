@@ -7227,8 +7227,10 @@ app.get("/codex/:id", async (c) => {
         }
         // The loop returns on the first credential that answers and rethrows on
         // the last one that does not, so reaching here is this server's bug and
-        // not the far database's.
-        bad(500, `The connection behind ${sheet_id} was neither opened nor refused.`, {
+        // not the far database's. Returned rather than called: bad() never
+        // returns, but deno lint reads the case syntactically and a bare call
+        // is a fallthrough to it.
+        return bad(500, `The connection behind ${sheet_id} was neither opened nor refused.`, {
           Received: `${tried} of ${creds.length} stored credentials tried, and no answer either way`,
           Expected: "an answer or a refusal from each credential in turn",
           Source: "the credential loop in GET /codex/:id",

@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertRejects, assertThrows } from "@std/assert";
+import { assert, assertEquals, assertThrows } from "@std/assert";
 import { PGlite } from "@electric-sql/pglite";
 import { PostgresConnection } from "pg-gateway";
 import { citext } from "@electric-sql/pglite/contrib/citext";
