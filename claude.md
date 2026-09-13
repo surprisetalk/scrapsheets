@@ -67,7 +67,7 @@ does not have, so code-first refuses every codex read until `db:apply` lands, wh
 
 ## Tests
 
-Five files. Which one a failure belongs in is usually obvious.
+Six files. Which one a failure belongs in is usually obvious.
 
 - `main_test.ts` — the server. One `Deno.test` of named `t.step`s against in-process PGlite: auth, sync and roles, shop
   and Stripe, `POST /query`, the `src/sql.mjs` UDFs, net-http polling, socket reports, alerts and digests, MCP, export.
@@ -80,26 +80,32 @@ Five files. Which one a failure belongs in is usually obvious.
   on, never a hostname: the suite does no DNS.
 - `examples_test.ts` — every bundled sheet through **both** engines (`npm:alasql` and the vendored `src/alasql.mjs` the
   page loads), compared row for row.
-- `page_test.ts` — the page under jsdom, through two harnesses. `boot` runs the compiled Elm in `dist/index.js` with
-  every port answered by hand and the library fed in through `library()`; reach for it for anything about what the page
-  renders, and for `rendered()` — the one booted page shared across tests, the library, for the tests that only read
-  what it painted — when nothing in the test writes to the model. `glue` runs `src/index.html`'s own
-  `<script type="module">` over the same jsdom — its imports rewritten to a destructure, `initializeWasm` and the
-  storage stubbed, the websocket adapter genuine, `fetch` and `WebSocket` recorded and answered by the test — so
-  `changeDoc`, `arrangeDoc`, `applyPatches`, `Views`, the query re-run guard, the share requests, CSV import, `newDoc`,
-  fork and the socket-health report are the real ones; reach for it for anything about what the glue does. Both
-  harnesses count a settle off a mutation observer, not by serializing the body per frame, which was most of what a
-  settle cost. `docs` hands it a synced document, which is where a write is watched: the handle holds the test's own
-  object. `realRepo` swaps the stub repo for automerge itself — slower, and the only way to find out whether a patch
-  means the same thing to a real document as it does to a plain object. Both harnesses drive animation frames off the
-  event loop rather than jsdom's ~16ms clock: a settle waits for the page to go quiet, not for real time, and that clock
-  was most of this file's wall time. Anything that does wait on a real timer — the query debounce, a file being read —
-  asks `settle(ms)` for it by name, and `until()` is the bounded poll for the ones where the wait is for something to
-  happen; a flat `settle(ms)` is only for proving that something did **not**. Refuses a `dist` older than `src` rather
-  than building one: `deno task test` builds once before any file runs, so the files can run in parallel without a
-  compiler racing a reader of its output. deno-dom is not enough — it has no `replaceData` on a text node. It also runs
-  `src/sw.js` over a hand-made `self`, `caches` and `fetch`, which is the only way to take the network away from a
-  service worker.
+- `page_test.ts` and `glue_test.ts` — the page under jsdom, through two harnesses, one file each because `deno test
+  --parallel` runs files and not tests side by side, and one file of both was the whole critical path of the suite.
+  `page_harness.ts` is what they share — the compiled Elm, the window installed as globals, `boot`, `until`, the
+  page-side query engine — and is a module rather than a test file so that neither registers the other's tests by
+  importing it. `boot` runs the compiled Elm in `dist/index.js` with every port answered by hand and the library fed in
+  through `library()`; reach for it for anything about what the page renders, and for `rendered()` — the one booted page
+  shared across tests, the library, for the tests that only read what it painted — when nothing in the test writes to
+  the model. `glue` runs `src/index.html`'s own `<script type="module">` over the same jsdom — its imports rewritten to
+  a destructure, `initializeWasm` and the storage stubbed, the websocket adapter genuine, `fetch` and `WebSocket`
+  recorded and answered by the test — so `changeDoc`, `arrangeDoc`, `applyPatches`, `Views`, the query re-run guard, the
+  share requests, CSV import, `newDoc`, fork and the socket-health report are the real ones; reach for it for anything
+  about what the glue does. Both harnesses count a settle off a mutation observer, not by serializing the body per
+  frame, which was most of what a settle cost. `docs` hands it a synced document, which is where a write is watched: the
+  handle holds the test's own object. `realRepo` swaps the stub repo for automerge itself — slower, and the only way to
+  find out whether a patch means the same thing to a real document as it does to a plain object. Both harnesses drive
+  animation frames off the event loop rather than jsdom's ~16ms clock: a settle waits for the page to go quiet, not for
+  real time, and that clock was most of this file's wall time. Anything that does wait on a real timer — the query
+  debounce, a file being read — asks `settle(ms)` for it by name, and `until()` is the bounded poll for the ones where
+  the wait is for something to happen; a flat `settle(ms)` is only for proving that something did **not**. Refuses a
+  `dist` older than `src` rather than building one: `deno task test` builds once before any file runs, so the files can
+  run in parallel without a compiler racing a reader of its output. deno-dom is not enough — it has no `replaceData` on
+  a text node. It also runs `src/sw.js` over a hand-made `self`, `caches` and `fetch`, which is the only way to take the
+  network away from a service worker. Dead ends, measured, so nobody spends the afternoon again: `--optimize` shrinks
+  `dist/index.js` by a few percent and moves nothing; the flat `settle(ms)` sleeps left prove something did **not**
+  happen and cannot be shortened; what a `boot` costs is Elm's first paint into jsdom, so the levers are fewer boots or
+  another file.
 - `browser_test.ts` — no browser: dist is fresh, `index.html` wires the WASM and the import map, every root-absolute
   asset is in `_redirects`, every imported name is exported, nothing reaches a CDN. `index.html`'s
   `<script type="module">` body is piped to `deno lint` for real scope analysis. `BROWSER_GLOBALS` is the whole
@@ -164,6 +170,10 @@ A change that breaks one of these is a bug even if the suite is green.
   bounded by `KEY_SCAN_CELLS` and `KEY_SCAN_BYTES` both, because one synced cell may hold a megabyte. **A scan that
   could not run is not a scan that passed**: the sheets with no document of their own are named (the computed ids, and
   the `codex-` prefix), and a document that will not load refuses the publish by name rather than skipping it.
+  `PII_SHAPES` -- an email address, a phone number, a US social security number, and a run of digits `luhn()` says is a
+  card -- is scanned in the same pass under the same bounds, and refused by the same two routes unless the body carries
+  `personal: true`, a claim a credential has no equivalent of. `library:lineage` is in the skip list beside the other
+  computed ids.
 - **One spelling per fact.** `API_BASE` in `src/page.mjs` is the only API host, handed to Elm through flags and to
   `index.html` by import. `PORTALS` in `src/portals.mjs` is the only portal list. `Stored` in `index.html` is the only
   `localStorage` key prefix. `spec` in `Main.elm` is the only per-column-type table, and it has no wildcard, so a new
@@ -196,11 +206,13 @@ navigation, in file order:
 
 - **Sheet types** (the check constraint in `schema/db.sql` is the list): `template`, `table`, `net-hook`, `net-http`,
   `net-socket`, `query`, `portal`, `alert`, `chart`, `dashboard`, and `codex-*`. A sheet id is `type:doc_id`.
-- **Computed sheets**: `library:freshness`, `library:audit`, `net-hook:errors` and `net-hook:reports` answer through
-  `sheet()` without an automerge document, so they page, export and can be selected from a query like any other sheet.
-  The operator is `isOperator()`: whoever reads `net-hook:errors`, which `OPERATOR_EMAIL` is granted at seed time.
+- **Computed sheets**: `library:freshness`, `library:lineage`, `library:audit`, `net-hook:errors` and `net-hook:reports`
+  answer through `sheet()` without an automerge document, so they page, export and can be selected from a query like any
+  other sheet. The operator is `isOperator()`: whoever reads `net-hook:errors`, which `OPERATOR_EMAIL` is granted at
+  seed time.
 - **Auth**: JWT middleware; a per-sheet API key (`scrapsheets-key`) is scoped by a path check _before_ routing, so no
-  handler has to remember to ask. Email through Resend.
+  handler has to remember to ask. Email through Resend. A key is minted under one of `API_KEY_NAMES` -- `api` writes,
+  `api-read` reads -- and `/mcp/:id` is in its path scope; see **MCP**.
 - **Sync**: official automerge `NodeWSServerAdapter` behind a ws-shim over Hono's `upgradeWebSocket`. Per-document
   access is `syncRole` in the message path, not just `sharePolicy`; a viewer's frames are decoded and rejected if they
   carry changes.
@@ -218,8 +230,20 @@ navigation, in file order:
   matching `^https?://` is delivered by `sendAlertUrl` through `safeFetch` instead of mailed — `{text}` to
   hooks.slack.com, `{content}` to discord.com/api/webhooks, `{sheet, name, rows}` to anything else — refused posts
   recorded and retried like a refused email, `sendWithinQuota` counting one the same as the other, and a digest over a
-  url refused at config read. The run row keeps a url's **host** and never its path: the path is the whole of a webhook's
-  authorization, and every viewer of the sheet reads that row.
+  url refused at config read. The run row keeps a url's **host** and never its path: the path is the whole of a
+  webhook's authorization, and every viewer of the sheet reads that row. **An alert is silenced, not deleted, by
+  `snoozed_until`.** It is an ISO timestamp in the alert document's `data[0]`, read against the run's own clock, so one
+  in the past is over without anything clearing it, and one the regex and `Date.parse` cannot both read is an error run
+  naming the field rather than a quiet no-snooze. A run inside the snooze is decided and recorded as any other -- the
+  verdict in `status`, the rows in `matched`, so the baseline `added` and `removed` diff against still moves -- and its
+  `delivery` is `snoozed`, chosen below the no-destination line and above the digest branch: an alert nobody gave a
+  destination still reads as broken rather than silenced, and neither door mails a snoozed one. `sendWithinQuota` counts
+  only what was sent, `ALERT_OK` admits `snoozed` beside `sent` and the digest hold so a day of silence is not a day of
+  outage, and a snoozed run is `stuck`, so the run after it is not de-duped away as an answer somebody has already read.
+  `snoozedUntil` on `Main.elm`'s `Alert` is the page's copy and `isoStamp` is the one spelling of the stamp: the chip
+  asks `Time.now` at the click and writes now plus a day, and `viewAlert` decides whether the snooze still holds by
+  comparing the two stamps as text, because ISO sorts the way the calendar does -- so a cell the poller refuses draws as
+  whatever it says, with the `unsnooze` chip that clears it.
 - **Polling**: `pollNetOnce` and `pollAlertOnce` on a 15-second tick; a sheet's `method` is one of `NET_METHODS` and its
   `body` is templated where a header already was — `{{secret:name}}` out of the secret table and `{{cursor}}` the same
   watermark the cursor parameter carries, both kept as the sheet spells them in the failure row's repro, and a GET
@@ -245,14 +269,85 @@ navigation, in file order:
   envelope; two arrays is a guess and is refused naming both, because `{warnings: [], items: [...]}` read as no rows at
   all under a green run row) and `nextPage()` the one stop condition. A name before the last of `page_path` that page
   one does not hold is a wrong path and a failure row, not a one-page feed; a later page dropping the envelope is the
-  feed's own way of saying there is no next. Page one carries the number or the
-  offset, so the validators, the `{{cursor}}` watermark and the host holdoff still ride the first request alone; a
-  cursor and a Link header only arrive with an answer. The walk is bounded by `PAGE_MAX` and by `BODY_CAP` checked as
-  the pages sum, a `link` next page must be on the origin the sheet names (scheme and port included), and `page_param`
-  naming the sheet's own `cursor` is refused because paging overwrites it on every request. **The sheet keeps nothing
-  from a poll that failed part way**: a 429 or a 5xx on any page is the one `later()` retry path for the whole poll,
-  every other refusal throws into the catch, and the next scheduled poll starts at page one. The failure row names the
-  page that broke, so its repro replays that request. The pre-flight makes one request whatever `page_by` says.
+  feed's own way of saying there is no next. Page one carries the number or the offset, so the validators, the
+  `{{cursor}}` watermark and the host holdoff still ride the first request alone; a cursor and a Link header only arrive
+  with an answer. The walk is bounded by `PAGE_MAX` and by `BODY_CAP` checked as the pages sum, a `link` next page must
+  be on the origin the sheet names (scheme and port included), and `page_param` naming the sheet's own `cursor` is
+  refused because paging overwrites it on every request. **The sheet keeps nothing from a poll that failed part way**: a
+  429 or a 5xx on any page is the one `later()` retry path for the whole poll, every other refusal throws into the
+  catch, and the next scheduled poll starts at page one. The failure row names the page that broke, so its repro replays
+  that request. The pre-flight makes one request whatever `page_by` says. **A sheet's `mode` says what a good run does
+  to the runs before it.** It is one of `NET_MODES` (`append`, `replace`, `upsert`), a sheet without one appends the
+  whole log the way every feed did, and `storeConfig()` reads and refuses it beside `pageConfig()` off the same document
+  and before a request goes out -- with `key`, the dotted path into one row an `upsert` supersedes by, which that mode
+  needs and every other refuses, and `rows_path`, the dotted path to the array of rows in an envelope, which
+  `pageRows()` honours before its one-array guess so a feed answering `data` beside `included` names which one is the
+  answer. `NET_PATH` is the one spelling all three dotted paths are checked against, and `atNames()` the one walk along
+  them, answering nothing where the path runs out so each caller refuses in its own words. `netRow()` takes the
+  `Storing` beside the meta and does the insert and what it supersedes in one transaction: `replace` deletes the sheet's
+  earlier `POLL_OK` rows, `upsert` writes the sorted distinct key values as `meta.keys` (`rowKeys()`, reading the array
+  itself or the one at `rows_path`, refusing a row holding nothing at the key by its position rather than skipping it,
+  and refusing a number past `Number.MAX_SAFE_INTEGER` -- JSON has no integer past 2^53, so `JSON.parse` has already
+  folded two distinct ids into one float before this server sees them, which is the merge upsert exists to prevent) and
+  deletes the earlier rows whose `meta->'keys'` overlap them, guarded inside a `case` on `jsonb_typeof`. **Only a 2xx
+  supersedes anything**: a retry row and a caught refusal are handed `null`, so one bad poll cannot empty the sheet, and
+  the failure rows stay under `replace` because `POLL_OK` never counted them -- as does a run `POLL_OK` grades on
+  `shape_change`, which a query over the sheet does not read either. The run log stays the unit -- the key says which
+  earlier runs this one replaces, not which rows -- and `trimNet` and the digest dedupe are unchanged, so a repeated
+  body still moves its row to now and that moved row is the one `replace` keeps. **A 304 keeps every field the row it
+  moves already held**, `meta.sig` and `meta.keys` among them, and overwrites only the three a not-modified answer
+  changes: a quiet tick that rebuilt the row's meta out of the validators alone left a row that no longer said what it
+  had answered for, and the next real run superseded nothing.
+- **A body is parsed by the type it declares.** `BODY_PARSERS` is the list -- `text/csv`, `text/tab-separated-values`,
+  `application/x-ndjson`, `application/jsonl`, `application/gzip`, `application/x-gzip` -- and `readFeedBody` is the one
+  reader both doors call: `pollNetOnce` on every page it reads, and `POST /net/:id` after the signature and before the
+  NUL check, which asks the text that is stored rather than the bytes that arrived. A type on none of the list is stored
+  as the text it arrived as, which is what a JSON feed hands us already, and a body that did not answer 2xx is never
+  parsed. A CSV and a TSV go through `parseDelimited`, the text-to-`{cols, rows}` core lifted out of `readImport()` --
+  the importer is a thin wrapper over it, so a feed's digits are numbers, its blanks are nulls and its ragged line is
+  refused by number exactly as an uploaded file's are, and `source` is what every one of those refusals names the line
+  in: the uploaded file there, the url here. `assertRoom` stayed behind in `readImport`: the row quota is a sheet's, and
+  only that door makes a sheet, so a feed's rows are bounded by `BODY_CAP` alone the way a JSON feed's always were. The
+  rows are stored keyed by column name; `col.key` is the document's own spelling and stays with the importer, the one
+  door that writes a document. NDJSON is one JSON value a line, a blank line no record and a line that will not parse a
+  refusal naming it. A gzip is fed to `DecompressionStream` `GZIP_SLICE` bytes at a time and read back through
+  `readBody`, so a bomb is refused holding one slice's expansion past the cap rather than the gigabyte it writes; handed
+  the whole of a bomb at once the decompressor answers all of it in one chunk, which is the cap spent after the memory
+  is gone. What came out is read by its first character -- a bracket or a brace is JSON, everything else a CSV --
+  because nothing in an answer says what a gzip holds. **`BODY_CAP` is spent on three different numbers**, and no one of
+  them stands in for another: the bytes that arrived, what a gzip decompressed to, and what the body *means* -- a file
+  names its columns once and the rows it means name them on every row, so a few kilobytes on the wire is megabytes in
+  the column. The poller's cross-page sum counts that third number too, what `readFeedBody` answered and not the wire
+  bytes a page carried: three gzip pages each under the cap decompressed summed to twice it while their wire bytes
+  stayed at kilobytes. Every parsed body is stored as the JSON array text it means, so `shapeOf`, `meta.sig`,
+  `pageRows`, the export and every query downstream see exactly what a JSON feed hands them, and a body its own declared
+  type cannot parse is that poll's failure row or that delivery's 400, never a stored blob.
+- **Run it now, stop it, and see when it runs next.** `paused: true` in `data[0]` takes a net-http or an alert sheet out
+  of both tickers: `pollNetSheet` and `pollAlertSheet` -- the one-sheet halves the two 15-second ticks now loop over, so
+  the timer and the button are the same code -- return before the fetch and before the row, and put the due entry back
+  exactly as they found it, so a paused sheet is looked at on every tick and a started one is due when it always was.
+  `INTERVAL_MAX_S` is the far end of an `interval` field, clamped the way 60 seconds already clamped the near end: past
+  it, `now + interval * 1000` is a time `Date` cannot express, and one runaway sheet took the whole account's freshness
+  read down with a `RangeError`. `POST /library/:id/run` polls one sheet now through those same two functions -- owner
+  or editor through `assertSheetEditor`, one unit of the sheet's budget through `spend(sheet_id, "runs", ...)`, and
+  nothing cleared first, because the poll sets the due entry off the sheet's own interval as its first act and the tick
+  a second later steps over it. It answers the `net` row the run landed, found by asking for the newest row stamped at
+  or after a watermark taken off Postgres's own clock: an append, a 304's move, a repeated body's move and a quiet alert
+  tick all land that way, and comparing against the newest row before the poll misread a repeat, which moves whichever
+  row carried that body and not always the newest. The watermark is carried as seconds (`extract(epoch from
+  now()::timestamp)`) and compared with `extract(epoch from created_at)` -- `net.created_at` carries no timezone, and a
+  bound timestamp parameter comes back hours off the rows it was taken beside. Refused by name: a paused sheet (409), a
+  sheet that is neither net-http nor alert (400), and a run that recorded nothing (409 -- a feed with no url, an alert
+  with no query, or a host still inside its request gap). `library:freshness` and `GET /library/freshness` gained
+  `paused` (read with the same truthiness the pollers read it with, so the two cannot disagree about one document; null
+  for a type with no switch and for a document that will not load) and `next_run` (the due map's time as an ISO string;
+  null for a sheet the map has not reached, and null rather than a throw for a time `Date` cannot express). In the page
+  both documents decode `paused` through `optionalField "paused" D.bool False`, a checkbox beside the digest box writes
+  it as one patch, and a "run now" chip -- beside "test the request" on the feed, on its own on the alert -- goes out on
+  `runNow` and comes back on `runLoaded`, an answer for another sheet dropped the way a pre-flight's is. `runLine` reads
+  the row's own `method` to pick the shape, never the shape that happens to decode: a feed's fetched body may itself
+  hold `status` and `delivery` keys. Within an alert's body it reads the `status` the same way -- an error run never
+  reached a delivery and says why under `error`.
 - **Audit**: one log, the `audit` table, read as `library:audit`. `record()` is the one writer. HTTP reads and writes
   land through one middleware keyed on the route patterns in `AUDITED`, after the route succeeded; the sync socket
   records `open` and a first `edit` per peer per document; MCP records `mcp <tool>`; a query records `query` on every
@@ -313,8 +408,50 @@ navigation, in file order:
   `holdHost()` in `pollNetOnce` writes `hostDue` after each poll (a paged feed's pages within one poll go out back to
   back, the way any client reads a paged answer) and on every `Retry-After`, taking the later of the
   two, so two sheets on one host take turns across cycles and the proxy can neither hold a host nor evict a hold.
-- **MCP**: hand-rolled JSON-RPC 2.0 at `POST /mcp/:id` — `initialize`, `tools/list`, `tools/call` with `read_sheet`,
-  `write_cells`, `query_sheet`, `list_sheets`.
+- **MCP**: hand-rolled JSON-RPC 2.0 at `POST /mcp/:id` -- `initialize`, `ping`, `tools/list`, `tools/call` with
+  `read_sheet`, `query_sheet`, `list_sheets`, `write_cells`, and the reading half a client browses rather than calls:
+  `resources/list`, `resources/read`, `prompts/list`, `prompts/get`, which `initialize` advertises beside `tools`.
+  Reachable with a JWT **or with one sheet's `scrapsheets-key`**, which is what makes an agent something you hand a key
+  rather than an account. A key is minted by `POST /library/:id/secret` under one of `API_KEY_NAMES` -- `api`, or
+  `api-read` the same way, same rotation, same once-only answer, and the read-only key's repro block drops the POST line
+  it would be refused for. `apiKeyScope` reads both names and returns the scope beside the sheet; the middleware records
+  `key_sheet`/`key_scope` on the context (unset under a JWT, which is what every guard tests) and its path list is
+  `/sheet/:id`, `/openapi/:id`, `/mcp/:id`. `assertKeyWrites` is the one refusal a read-only key meets, asked wherever
+  the verb actually is: the path check for `POST /sheet/:id`, and the `write_cells` tool itself, because the MCP
+  endpoint is one verb in the path and many in the body. Under either key the borrowed authority stops at the one sheet:
+  `mcpSheets` is the caller's library narrowed to `key_sheet` and is what both `list_sheets` and `resources/list`
+  answer, `mcpSheetId` refuses a `sheet_id` argument naming another, and `query_sheet` refuses an `@ref` out of it by
+  name before the load -- `scanRefs` puts the sheet of a cell ref in `ids` too, so `@other:x.col` is refused like
+  `@other:x`. `resources/list` answers one `sheet://<sheet id>` per sheet it lists with mimeType `text/csv` (a sheet
+  nobody named is listed under its id); `resources/read` renders that sheet through `sheet()` and the `EXPORTS` csv
+  renderer, byte for byte what `GET /export/:id.csv` answers, spending the read budget; an unrecognised uri is a
+  JSON-RPC `-32002` carrying the `explain()` block, and an unknown prompt name a `-32602`. `prompts/list` and
+  `prompts/get` answer one prompt, `describe_sheet`, whose single user message names every column, its type and how much
+  of it is blank, built from `describeRows` -- the same read `describe @ref` answers with, so the prompt and the
+  statement cannot describe one sheet two ways -- and asks for a summary. **Both read the whole sheet, not a page**:
+  `MCP_WHOLE_SHEET` carries the same limit `GET /export/:id.csv` passes, because `sheet()` pages a net or query sheet
+  and one that stopped at the first page would answer a wrong csv and describe a wrong row count rather than a short
+  one; the two are the same number on purpose. Audit rows are `mcp <tool>` for a `tools/call` and `mcp <method>` for a
+  `resources/read` or a `prompts/get`, recorded against the sheet the uri or the argument named rather than the `:id` in
+  the path.
+- **`assertNoKeys()` scans two lists in the one pass.** `KEY_SHAPES` is refused as it always was, with no override, and
+  `PII_SHAPES` -- an email address, a phone number in E.164 or the North American spelling, a US social security number,
+  and a run of digits `luhn()` says is a payment card -- is refused by `POST /library/:id/public` and a priced `POST
+  /sell/:id` unless the body carries `personal: true`, which `claimsPersonal()` reads and refuses when it is not a
+  boolean, so a sheet does not go out on the word "no"; both refusals name the column and the 1-based row and never the
+  value, both run under the one `KEY_SCAN_CELLS`/`KEY_SCAN_BYTES` pair, and the card is the one shape carrying a
+  checksum rather than a spelling -- matched whole and checked once, which misses a card padded with a junk digit and
+  holds the false-positive rate that misses buys. In the page the claim is a second checkbox under the public one,
+  `SharePersonal` holding it in `model.share` and the next `SharePublic` sending it through `shareAction` as `personal`,
+  which `index.html`'s public branch forwards. **`library:lineage` is what feeds a sheet**: one row per (`sheet_id`,
+  `name`, `type`, `depends_on`, `depends_on_name`, `depends_on_type`) for every query, alert and chart sheet the caller
+  has a `sheet_usr` row on, the code read from the live automerge document (`data[0].code`, or `chartSql(data[0])` for a
+  chart) and never `sheet.row_0`, handed to `scanRefs` and deduped so a self-join is one edge, `depends_on_name` read
+  only off the sheets the caller holds a role on, and a document that will not load a row whose `depends_on` is null and
+  whose `name` carries the refusal. It answers whole rather than paged the way a dashboard's tiles do, bounded twice --
+  `USER_SHEETS_MAX` on the documents it opens and `MAX_QUERY_ROWS` on the edges they name, because nothing caps the refs
+  one sheet's code holds -- and it is registered where `library:freshness` is: the early return in `sheet()`,
+  `assertNoKeys`'s skip list, and `GET /library/lineage`.
 
 ## Query engine (`src/sql.mjs`)
 
@@ -352,6 +489,37 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   the fit wants to leave rather than crawling there, and refusing the fit it settled on — never a trial step — when it
   stops at `B_MAX` and still wants a flatter tail. Bounded by `HYPERBOLIC_POINTS` as well: the cost is points times
   steps, and only the steps were counted.
+- **Regression over more than one column.** `ols(array(y), array(x1), ...)` fits a plane by the normal equations and
+  answers the coefficient array `[b0, b1, ...]`; `ols_predict(coefs, at1, ...)` reads one row back off it, which is what
+  puts a residual on every row through the join in `query:yield-response`. Every predictor is scaled to a
+  root-mean-square of one and the equations are divided through by their total weight, so Cauchy-Schwarz holds every
+  entry in [-1, 1] and `OLS_SINGULAR` reads the same whatever units a sheet holds; a column's scale is taken off its
+  largest magnitude before anything is squared, because squaring a raw value overflows and underflows long before the
+  column does, and a column that overflowed reached the solve as zeros and was refused as a repeat. `gauss()` is the
+  Gaussian elimination with partial pivoting both fits solve through, and it carries back the column it stopped on, so a
+  zero pivot names the argument the columns before it already span and only a system with no column to name is refused
+  as singular. `design()` is the one validator: arrays of one length, finite numbers, `OLS_POINTS` points, `OLS_TERMS`
+  predictors, one point per coefficient. `logit(array(y), array(x1), ...)` is the same equations reweighted by p(1-p)
+  and solved again, bounded by `LOGIT_STEPS` with the counter in the refusal, and its `y` refused by value unless every
+  one is 0 or 1. Its first step weights every point the same -- the coefficients start at zero, so every fitted
+  probability is a half -- which makes that step's matrix the one `ols()` solves: a singular matrix there is a column
+  another column reproduces and is named, and a singular one after it is the fit running away. A boundary that separates
+  the two outcomes -- every residual under `LOGIT_FIT`, or the weights collapsing until the reweighted matrix goes
+  singular -- is one named refusal rather than coefficients that ran away. `logit_predict(coefs, at...)` is that fit as
+  a probability, and both predicts refuse a first argument that is not a fit's own array by name, because the array()
+  advice every other UDF gives is the wrong fix here. `SELECT_TYPES` types `ols` and `logit` `json` and both predicts
+  `num`.
+- **Samplers**: `sample_uniform`, `sample_normal` and `sample_triangular` put a distribution on an input, and
+  `percentile()` reads the spread back out. Nothing calls `Math.random`: each call builds its own mulberry32 stream,
+  seeded by an FNV-1a hash of the whole call with the function's own name in it, so the same call answers the same
+  number on the server and in the page, a different seed or a different distribution answers a different one, and one
+  `trial` column draws an independent value per distribution. Each refuses a non-number, a low bound above the high one,
+  a mode outside the range and a negative spread, and each refuses **the draw itself** when it is not finite: two finite
+  bounds far enough apart overflow a double before the fraction is applied, and zero times that Infinity is a NaN, which
+  a percentile and every number downstream would carry silently. Only the normal draw reads `Math.log` and `Math.cos`,
+  which ECMAScript leaves implementation-defined where it pins `sqrt`, so a normal draw is bit-equal wherever one
+  runtime runs both hosts and may differ in the last ulp between a browser and the server. `table:trials` is the column
+  of trial numbers they are demonstrated over, in `query:monte-carlo-margin`.
 - **Guards**: `checkQueryRows()` caps rows loaded across every `@sheet`; `checkJoinRows()` caps the product of the from
   clause's row counts at `MAX_JOIN_ROWS`, every occurrence counted so a self-join multiplies, because the engine walks
   every pair before a where clause and cannot be stopped once it starts — it is the pairs walked, not the rows kept, so
@@ -384,6 +552,21 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   `deleteDoc` stays the purge, which is the one that also calls `Views.drop`, so a restored sheet keeps the arrangement
   it had. A trashed sheet is out of the library table, the demo strip and `paletteCommands`; `model.trash` swaps the
   last library column between `Trash` and `Restore` + `Delete`, and hides the footer's new-sheet rows.
+- **The star and the trash are one kind of fact: this browser's, about somebody else's sheet.** `starred` joins `seen`
+  and `trashed` as the third stored field that survives a system entry in `library()` (`src/page.mjs`), so starring a
+  bundled demo outlives the next merge; the three are one list there, overlaid only when truthy, because a stored
+  `false` is the absence a bundled entry already carries. `updateLibrary` is still the one port that writes them --
+  `Library.set` in `index.html` drops a null field out of the patch, so a fourth field cost it nothing. `Star` is a
+  `Type` the way `Trash` is: a `spec` entry, a `seriesEncoder` branch and a `cellDecoder` branch, and nothing in
+  `columnTypes`, because no document declares it; its cell carries both halves (`{id, on}`), so the toggle never reads
+  its own state off the glyph on screen. `resolveTable`'s Library branch puts starred sheets first **only while
+  `sheet.sort` is empty**, and `paletteCommands` sorts its sheet entries the same way: Elm's sorts are stable, so a
+  pre-sort left in place under a chosen sort survives as that sort's tie-break -- a header click losing to an order
+  nobody asked it to keep. `TrashSelected` is a top-level `Msg` and not a `DocMsg`, because `updateDocMsg` refuses every
+  `DocMsg` on the library: it reads the sheet ids off the drawn rows through `libraryIdAtRow` per selected y -- which
+  answers `Nothing` for a header row or one past the end, so no y needs filtering out first -- and fans out one
+  `updateLibrary` per sheet through `Cmd.batch`. It refuses by name twice: a sheet that is not the library, and a
+  selection holding no library row.
 - **Cross-sheet queries in the browser**: `sheets(alasql, shelf, find)` in `src/page.mjs`. Only two things come from the
   browser and both are arguments: the library map and `repo.find`.
 - **One CSV import, whichever way the file arrives, in two steps.** The footer's file input goes through Elm's
@@ -413,6 +596,16 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   because each keystroke writes the document through `InputChange NetPageParam`/`NetPagePath` and a half-typed name
   would otherwise refuse to decode the sheet the typist is looking at; the poller's own regexes are the check, hinted at
   in each input's title. Pre-flight is unchanged and stays one request.
+- **What a feed keeps is set where the feed is, too.** `mode`, `key` and `rows_path` live in the net-http document's
+  `data[0]` beside `page_by`, decoded through `optionalField` the same way, and `viewNetHttp` draws a select over `"" ::
+  netModes` whose empty option is append, a `key` input under `upsert` alone, a rows-path input whatever the mode, and a
+  hint per mode. `storeForm` is the one table of what each mode takes, the way `pageForm` is; `netModes` is the copy of
+  `NET_MODES` the language boundary forces and `netModeDecoder` refuses a mode outside it exactly as `pageByDecoder`
+  does; `browser_test.ts` fails when the two lists drift. `key` and `rows_path` are plain strings the decoder does not
+  check, for the reason `page_param` and `page_path` are: each keystroke writes the document, and the poller's own
+  regexes are the check, hinted at in each input's title. The net-http branch of `docDecoder` is a `D.map2` over a
+  `D.map5` and a `D.map6` -- eleven fields are past `D.map8`, and the request is decoded beside what is done with its
+  answer.
 - **Feed health**: `library:freshness` is read by `index.html` and handed to Elm through `freshnessLoaded`. The
   `freshness` column appears only when the answer is non-empty — a blank column over a logged-out library would read as
   "nothing is wrong".
@@ -454,6 +647,22 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   every row the document holds, not the rows on screen, and reach a table only — the panel asks `movable`,
   `updateDocMsg` answers every other sheet with the computed-cell refusal, and the library, which is a listing and not a
   document, has a refusal of its own.
+- **A column is split where it is cleaned.** The panel's "split on" box and its Split button sit under the cleaning
+  verbs behind the same `movable` gate. The box writes `sheet.splitOn` through `ColumnSplitInput` on every keystroke and
+  never reaches the document at all -- unlike the filter box beside it, which is an arrangement and lands on the column
+  when the panel closes, this is an argument to a verb nobody has run yet, and a patch per keystroke would be a sync per
+  keystroke for everybody watching. `SheetColumnSplit key delimiter` is the `DocMsg` and `columnSplit()` is the patch
+  pair: one `push` on `data[0]` of a column per part position, named `<name> 1` .. `<name> n` off the widest split,
+  typed text and keyed past every number the sheet's own keys spell -- a sheet that has had a column deleted carries a
+  key at its own length, so the position the undo splices and the key the cells are written under are two different
+  numbers -- then one `set` per row per part, so a row with fewer parts leaves its later cells unwritten, a cell that is
+  not text has nothing to split, and the column split from stays where it is. `String.split` matches the characters it
+  is given, so a `.` is a dot and a `|` is a bar. The undo is the mirror `SheetColumnDelete`'s restore is: a `del` per
+  cell written, then one `splice` taking the pushed columns back off. Every way it cannot run is one refusal in
+  `model.error` through `updateDocMsg`'s `writeRefusal` with nothing written at all -- an empty delimiter, a key the
+  sheet does not carry, a column with no text cell, a delimiter no cell holds, a split past `maxSplitColumns`, and a
+  name `nameClash` says is taken, because half a split is exactly the two-columns-of-one-name shape every keyed read
+  refuses.
 - **`formatNumber` is the one place a number becomes text.** The cell, the stats row and the totals row all go through
   it; they used to format independently and a `usd` column's total came out without its `$`. A value `positional` says
   is not written as digits — not finite, or a magnitude JavaScript writes as `1e+21` — skips the currency, the grouping
@@ -540,11 +749,56 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   is a named refusal rather than a silent failure. Nothing cross-origin is answered at all — the API and the sync socket
   are another origin, and the handler returns without calling `respondWith`, which leaves the browser doing what it did
   before there was a worker. `browser_test.ts` fails when `SHELL` and `_redirects` drift in either direction and lints
-  `sw.js` through `unresolved()`, the same scope analysis `index.html`'s module script gets; `page_test.ts` runs the
+  `sw.js` through `unresolved()`, the same scope analysis `index.html`'s module script gets; `glue_test.ts` runs the
   worker over a hand-made `self`, `caches` and `fetch`, which is the only way to take the network away. Offline means
   the shell opens: the data still needs the network, and what a document already synced is in IndexedDB.
-- **Known gaps**: `@library:freshness` resolves on the server but not in the page. `describe` results carry no type in
-  the page, and `WINDOW_TYPES` is server-only, so a window alias there falls back to the sheet's stored `cols`.
+- **A chart may plot more than one thing.** `chartSql` takes `series` beside `x` and `y`: blank or absent is the
+  statement it always built (`select <x> as x, <y> as y from <source> order by 1`), and a named one appends `, <col> as
+  series` and orders `by 3, 1`, so each series arrives whole and in draw order. The name goes through the same
+  `chartIdent` the axes do, so a series held as a number -- or as a null somebody hand-wrote into the document -- is
+  refused by name, while an emptied box is simply no series. `Chart` in `main.ts` carries `series?: string`, so `GET
+  /sheet`, every export and every MCP read answer the split rows through the one `sheet()` path. In `src/Main.elm` the
+  `Chart` doc gained `series : String` (`D.map5`, blank when the field is absent), a `ChartSeries` `InputChange` writes
+  it from the "split by" input in `viewChartSettings`, and `chartPoints` answers `List ( String, List ( String, Float )
+  )` -- the rows grouped by their `series` cell in first-appearance order, a row whose y is not a number dropped from
+  its own series alone, and a sheet with no series column read as one series with no name. **Both the label and the
+  series cell go through the lenient `string` decoder, never `D.string`**: nothing coerces a chart's columns, so an
+  `int` column arrives as a JSON number (`chart:compa-ratio` plots one on x), and read as a blank every row of it shares
+  the one label and the whole chart stacks on a single point. `viewChart` plots against the distinct x labels rather
+  than the row positions, so a chart's source must answer **one row per (series, x)** -- `examples_test.ts` runs every
+  bundled chart's own statement in both engines and refuses a repeated pair, and the fix is a `group by` in the query --
+  and it draws one polyline, polygon or dot set per series coloured from `chartColours` cycled by index, stacks a bar's
+  series on each label so the axis spans the stacked sums, shows the first series in a kpi and says which one, and draws
+  a legend inside the same viewBox `downloadChart` clones whenever any series is named. `chartColours`'s first entry is
+  the `#468` every chart drew in and an unsplit chart draws no legend, so a chart with nothing to split by is the
+  picture it always was, rect for rect. `chart:cohort-curves` is the bundled multi-series chart:
+  `@query:cohort-retention`, a line per cohort over the months since its first order.
+- **A chart's x axis is time when every x is a day.** `chartRuns` is the one placement: `Nothing` when any x of any
+  series fails `parseDay`, which leaves the ordinal axis -- one place per distinct label, in the order the labels arrive
+  -- exactly as it was; otherwise every point sits at its own day between the earliest and the latest day any series
+  holds, and a step wider than twice that series' median step ends the run there, so line is one polyline and area one
+  polygon per unbroken run and a gap in the data is a gap in the picture. The scatter dots read the same runs. Bars are
+  ordinal on a day axis too, deliberately: one bar per day across a sparse year is unreadable. **Neither half trusts the
+  order the rows arrive in.** `chartSql` orders by the series and then by the x column, which is a string order: a day
+  column with inconsistent zero-padding parses as days and sorts wrong, and a second series' days all arrive after the
+  first's whatever days they are. So `chartRuns` sorts each series by day before it measures a step or cuts a run,
+  `chartFold` sorts before it buckets, and `viewChart` reads the x labels in day order whenever `chartRuns` answered --
+  which is what puts the earliest day under the left end, the latest under the right, and the bars in the order a reader
+  expects. `chartFold` is the other half: a series past `chartPointsMax` points is cut into equal buckets in day order
+  and each bucket drawn as the mean of its y values at the earliest day it holds, folded on a day axis only, and
+  `viewChartSettings` says how many points a fold swallowed beside the row count, so nothing is averaged silently.
+  `viewChart` reads `chartFold (chartPoints tbl)`, so the axis, the stacks, the totals and the kpi tile all see the same
+  folded points.
+- **The palette is where you subscribe to a sheet.** `paletteRows` is what the palette reads now: the `subscribe to this
+  sheet` command over a table, a query, a net-http or a net-hook, and then `paletteCommands`, whose signature stays the
+  library and the query so the shortcut sheet and the palette still cannot drift. The command is a plain `DocNew` -- the
+  footer's own new-alert door with `select * from @<sheet id>`, `when: added`, the default interval and
+  `model.auth.email` filled in -- and it is offered only while `auth.state` is `LoggedIn`, because what a visitor typed
+  into the login form is a string in that same field and not an account. `index.html` is what knows the address: it
+  stores the email beside the session at login and hands it back on `authResult`, because logging in reloads the page.
+- **Known gaps**: `@library:freshness` and `@library:lineage` resolve on the server but not in the page. `describe`
+  results carry no type in the page, and `WINDOW_TYPES` is server-only, so a window alias there falls back to the
+  sheet's stored `cols`.
 
 ## Schema (`schema/db.sql`)
 

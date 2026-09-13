@@ -1484,6 +1484,13 @@ const SELECT_TYPES = {
   round: null,
   min_text: "text",
   max_text: "text",
+  ols: "json",
+  logit: "json",
+  ols_predict: "num",
+  logit_predict: "num",
+  sample_uniform: "num",
+  sample_normal: "num",
+  sample_triangular: "num",
 };
 
 // A cast is the one expression whose type is stated rather than inferred — but
@@ -1747,9 +1754,10 @@ export const rewriteExtremes = (code, colsOf) => {
 
 // --- charts
 //
-// A chart is a sheet: a source ref, a kind, and the two columns to plot. Both
-// engines build the same query out of that, so the picture the page draws and
-// the rows the server exports are the same answer.
+// A chart is a sheet: a source ref, a kind, the two columns to plot, and
+// optionally the column that splits them into series. Both engines build the
+// same query out of that, so the picture the page draws and the rows the server
+// exports are the same answer.
 
 const chartIdent = (what, value) => {
   // Typed, not coerced: /^[A-Za-z_]\w*$/.test(NaN) reads the string "NaN" and
@@ -1770,7 +1778,7 @@ const chartIdent = (what, value) => {
 // line and say nothing, so a typo survived in the document forever.
 export const CHART_KINDS = ["line", "bar", "area", "scatter", "kpi"];
 
-export const chartSql = ({ source, kind = "line", x, y }) => {
+export const chartSql = ({ source, kind = "line", x, y, series = "" }) => {
   // Only what a query can reference: the page refuses any other prefix while
   // loading, and a chart that runs on the server but not in the page is worse
   // than one that is refused in both.
@@ -1797,9 +1805,19 @@ export const chartSql = ({ source, kind = "line", x, y }) => {
       Fix: meant ? `set the kind to ${meant}` : `set the kind to one of ${CHART_KINDS.join(", ")}`,
     }));
   }
+  const plot = `${chartIdent("x column", x)} as x, ${chartIdent("y column", y)} as y`;
   // Ordered by the x column, so the line is drawn in the order it is read and
-  // two runs of the same chart agree.
-  return `select ${chartIdent("x column", x)} as x, ${chartIdent("y column", y)} as y from ${source} order by 1`;
+  // two runs of the same chart agree; by the series first when there is one, so
+  // each series arrives whole and in that same order. Absent or blank is the one
+  // unnamed series every chart drew before there was more than one: clearing the
+  // box in the page writes "", and a chart that broke when you emptied a field
+  // you never filled is worse than one series. Anything else goes through
+  // chartIdent, so a series held as a number -- or as a null somebody hand-wrote
+  // into the document -- is refused by name the way an x column is rather than
+  // quietly drawing one series.
+  return series === ""
+    ? `select ${plot} from ${source} order by 1`
+    : `select ${plot}, ${chartIdent("series column", series)} as series from ${source} order by 3, 1`;
 };
 
 // --- resolving a query's sheet references
@@ -2178,6 +2196,358 @@ export const register = (alasql) => {
     }
     return answer;
   };
+
+  // A distribution on an input, sampled without Math.random: the same call has
+  // to answer the same number on the server and in the page, and a sheet whose
+  // numbers move on every reload is a sheet nobody can check. The seed is a
+  // hash of the whole call, the function's own name included, so one `trial`
+  // column draws an independent-looking value per distribution and per
+  // parameter set and still draws the same one tomorrow.
+  //
+  // Only sample_normal reads a transcendental. ECMAScript pins sqrt to IEEE 754
+  // and leaves log and cos implementation-defined, so a normal draw is bit-equal
+  // wherever one engine runs both hosts and may differ in the last ulp between a
+  // browser and the server; uniform and triangular are exact everywhere.
+  const seedOf = (name, args) => {
+    // FNV-1a, 32 bits: Math.imul is the multiply that wraps the way the hash is
+    // defined to, rather than the one that loses the low bits to a double.
+    let h = 0x811c9dc5;
+    for (const ch of `${name}(${args.join(",")})`) h = Math.imul(h ^ ch.codePointAt(0), 0x01000193) >>> 0;
+    return h;
+  };
+  // mulberry32: one multiply-xor round per draw, every step on a uint32.
+  const mulberry32 = (seed) => {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+  // A range whose bounds are the wrong way round is a typo, and a mode outside
+  // it is a triangle with no apex. Both are refused by name: a sampler that
+  // quietly answers NaN puts it in a percentile and every number downstream.
+  const range = (name, lo, hi) => {
+    if (lo > hi) {
+      throw fail(
+        `${name}() argument 2`,
+        `a low bound at or below the high bound ${hi}`,
+        show(lo),
+        "swap the two bounds",
+      );
+    }
+  };
+  // Two finite arguments a mulberry32 fraction is multiplied against or added
+  // to can still overflow a double -- (hi - lo) past 1.8e308, or (mu + sd *
+  // factor) past it the same way -- and 0 times that Infinity is a NaN, not an
+  // Infinity, on whichever draw lands on a fraction of exactly zero. Checked on
+  // the draw itself rather than the bounds, because a wide range and a seed
+  // that never overflows it is not this sampler's problem to refuse.
+  const drawn = (name, v, a, b) => {
+    if (!Number.isFinite(v)) {
+      throw fail(
+        `${name}()`,
+        "a draw that fits in a finite number",
+        `${a} and ${b} drew ${show(v)}`,
+        "scale the inputs down before sampling",
+      );
+    }
+    return v;
+  };
+  fn.sample_uniform = (seed, lo, hi) => {
+    const s = num("sample_uniform", 1, seed);
+    const a = num("sample_uniform", 2, lo), b = num("sample_uniform", 3, hi);
+    range("sample_uniform", a, b);
+    return drawn("sample_uniform", a + (b - a) * mulberry32(seedOf("sample_uniform", [s, a, b]))(), a, b);
+  };
+  fn.sample_normal = (seed, mu, sd) => {
+    const s = num("sample_normal", 1, seed);
+    const m = num("sample_normal", 2, mu), d = num("sample_normal", 3, sd);
+    if (d < 0) {
+      throw fail(
+        "sample_normal() argument 3",
+        "a standard deviation at or above zero",
+        show(d),
+        "a spread is a distance: use 0 for an input nobody is unsure about",
+      );
+    }
+    const draw = mulberry32(seedOf("sample_normal", [s, m, d]));
+    // Box-Muller, over 1 - u rather than u: mulberry32 answers [0, 1) and
+    // log(0) is -Infinity, which would write one Infinity per 4 billion draws.
+    const v = m + d * Math.sqrt(-2 * Math.log(1 - draw())) * Math.cos(2 * Math.PI * draw());
+    return drawn("sample_normal", v, m, d);
+  };
+  fn.sample_triangular = (seed, lo, mode, hi) => {
+    const s = num("sample_triangular", 1, seed);
+    const a = num("sample_triangular", 2, lo), c = num("sample_triangular", 3, mode);
+    const b = num("sample_triangular", 4, hi);
+    range("sample_triangular", a, b);
+    if (c < a || c > b) {
+      throw fail(
+        "sample_triangular() argument 3",
+        `a mode between ${a} and ${b}`,
+        show(c),
+        "the most likely value lies inside the range, not outside it",
+      );
+    }
+    // One value is the whole distribution, and the inverse CDF divides by the
+    // width to find it.
+    if (a === b) return a;
+    const u = mulberry32(seedOf("sample_triangular", [s, a, c, b]))();
+    const at = (c - a) / (b - a);
+    const v = u < at ? a + Math.sqrt(u * (b - a) * (c - a)) : b - Math.sqrt((1 - u) * (b - a) * (b - c));
+    return drawn("sample_triangular", v, a, b);
+  };
+
+  // Multiple regression: a plane rather than a line. AlaSQL's aggregate protocol
+  // takes one value, so the columns arrive as arrays the way corr() takes them --
+  // ols(array(y), array(x1), array(x2)) -- and the answer is the coefficient
+  // array [b0, b1, ...] that ols_predict() reads back one row at a time.
+  //
+  // One call walks the points once per pair of terms, and logit() pays that again
+  // on every step, so the points and the terms are both bounded here.
+  const OLS_POINTS = 5000;
+  const OLS_TERMS = 12;
+  // Every predictor is scaled to a root-mean-square of one and the normal
+  // equations are divided through by their own total weight, so Cauchy-Schwarz
+  // holds every entry in [-1, 1] and a pivot this small is a column the ones
+  // before it already span -- whatever units the sheet happens to hold.
+  const OLS_SINGULAR = 1e-10;
+  const design = (name, ys, xss) => {
+    const y = nums(name, 1, ys);
+    if (!xss.length) {
+      throw fail(
+        `${name}()`,
+        "at least one predictor column",
+        "only the response",
+        `add one, e.g. ${name}(array(y), array(x))`,
+      );
+    }
+    if (xss.length > OLS_TERMS) {
+      throw fail(
+        `${name}()`,
+        `at most ${OLS_TERMS} predictor columns`,
+        `${xss.length}`,
+        "fit the predictors that move the answer and drop the rest",
+      );
+    }
+    const cols = xss.map((xs, j) => nums(name, j + 2, xs));
+    for (const [j, x] of cols.entries()) {
+      if (x.length !== y.length) {
+        throw fail(
+          `${name}()`,
+          "every array the same length",
+          `${y.length} values in argument 1 and ${x.length} in argument ${j + 2}`,
+          "aggregate every column over the same rows",
+        );
+      }
+    }
+    if (y.length > OLS_POINTS) {
+      throw fail(
+        `${name}()`,
+        `at most ${OLS_POINTS} points`,
+        `${y.length}`,
+        "aggregate the rows to one point per period first, e.g. group by month",
+      );
+    }
+    // Fewer points than coefficients is a system with infinitely many answers,
+    // and the one that came back would be whichever the pivoting happened on.
+    if (y.length < cols.length + 1) {
+      throw fail(
+        `${name}()`,
+        `at least one point per coefficient: ${cols.length + 1}, one per predictor and one intercept`,
+        `${y.length} points`,
+        "widen the query so more rows match, or fit fewer predictors",
+      );
+    }
+    const scale = cols.map((x) => {
+      // Squaring a raw value first overflows past 1e154 and underflows past
+      // 1e-162, so a column of ordinary numbers in an extreme unit (nanoseconds
+      // since epoch, say) squared to Infinity or to 0 and then reached the
+      // divide as a zero column -- a real predictor refused as one the other
+      // columns already span. Dividing by the largest magnitude first keeps
+      // every squared term in [0, 1], so the sum cannot overflow, and multiplying
+      // the root back out by that same magnitude cannot overflow either.
+      let peak = 0;
+      for (const v of x) if (Math.abs(v) > peak) peak = Math.abs(v);
+      // A column of nothing but zeros has no scale to take out. It reaches the
+      // solve as it is and comes back named as the column nothing identifies.
+      if (peak === 0) return 1;
+      let sum = 0;
+      for (const v of x) sum += (v / peak) ** 2;
+      return peak * Math.sqrt(sum / x.length);
+    });
+    return { y, cols: cols.map((x, j) => x.map((v) => v / scale[j])), scale };
+  };
+  // Column 0 of the design matrix is the intercept, which is all ones.
+  const term = (cols, j, i) => (j === 0 ? 1 : cols[j - 1][i]);
+  // The normal equations X'WX b = X'v, both sides divided through by the total
+  // weight rather than by the point count: logit() reweights by p(1-p), and every
+  // weight shrinking together is a fit running away rather than a column going
+  // collinear, which is what an unweighted divisor turned the matrix into.
+  const equations = (cols, w, v) => {
+    const n = w.length, p = cols.length + 1, a = [], rhs = [];
+    let total = 0;
+    for (const x of w) total += x;
+    for (let r = 0; r < p; r++) {
+      const row = [];
+      for (let c = 0; c < p; c++) {
+        let s = 0;
+        for (let i = 0; i < n; i++) s += w[i] * term(cols, r, i) * term(cols, c, i);
+        row.push(s / total);
+      }
+      let s = 0;
+      for (let i = 0; i < n; i++) s += term(cols, r, i) * v[i];
+      a.push(row);
+      rhs.push(s / total);
+    }
+    return [a, rhs];
+  };
+  // Gaussian elimination with partial pivoting. A failure carries the column it
+  // stopped on, which is the predictor the columns before it reproduce.
+  const gauss = (a, rhs) => {
+    const p = rhs.length, m = a.map((row, i) => [...row, rhs[i]]);
+    for (let c = 0; c < p; c++) {
+      let piv = c;
+      for (let r = c + 1; r < p; r++) if (Math.abs(m[r][c]) > Math.abs(m[piv][c])) piv = r;
+      [m[c], m[piv]] = [m[piv], m[c]];
+      if (Math.abs(m[c][c]) <= OLS_SINGULAR) return { singular: c };
+      for (let r = c + 1; r < p; r++) {
+        const f = m[r][c] / m[c][c];
+        for (let k = c; k <= p; k++) m[r][k] -= f * m[c][k];
+      }
+    }
+    const out = new Array(p).fill(0);
+    for (let r = p - 1; r >= 0; r--) {
+      let s = m[r][p];
+      for (let k = r + 1; k < p; k++) s -= m[r][k] * out[k];
+      out[r] = s / m[r][r];
+    }
+    // Every pivot cleared the tolerance and the answer still overflowed: there is
+    // no column to name, and the refusal does not invent one.
+    return out.every(Number.isFinite) ? { out } : { singular: 0 };
+  };
+  const singular = (name, c) =>
+    c === 0
+      ? fail(
+        `${name}()`,
+        "a system with one answer",
+        "a singular one",
+        "vary the predictor columns, or fit fewer of them",
+      )
+      : fail(
+        `${name}()`,
+        "predictor columns no other column reproduces",
+        `argument ${c + 1}, which the columns before it already span`,
+        "drop that column, or the one it repeats",
+      );
+  fn.ols = (ys, ...xss) => {
+    const { y, cols, scale } = design("ols", ys, xss);
+    const solved = gauss(...equations(cols, y.map(() => 1), y));
+    if (!solved.out) throw singular("ols", solved.singular);
+    // The predictors were solved scaled, so their coefficients come back scaled.
+    // The intercept is in the units of y already.
+    return solved.out.map((b, j) => (j === 0 ? b : b / scale[j - 1]));
+  };
+  const linear = (name, coefs, ats) => {
+    // nums() reads a column somebody aggregated with array(), and its fix says
+    // so. These coefficients are a fit's own answer instead, so a value that is
+    // not one is refused here rather than sent off to wrap a number in array().
+    if (!Array.isArray(coefs)) {
+      throw fail(
+        `${name}() argument 1`,
+        "the coefficient array a fit answered",
+        show(coefs),
+        `fit in a subquery and read its column here, e.g. ${name}(m.coefs, x)`,
+      );
+    }
+    const b = nums(name, 1, coefs);
+    if (b.length !== ats.length + 1) {
+      throw fail(
+        `${name}()`,
+        `one more coefficient than predictor values: ${ats.length + 1} for ${ats.length}`,
+        `${b.length} coefficients`,
+        "hand it the whole array the fit answered, and one value per predictor in the order they were fit",
+      );
+    }
+    let sum = b[0];
+    for (const [j, a] of ats.entries()) sum += b[j + 1] * num(name, j + 2, a);
+    return sum;
+  };
+  fn.ols_predict = (coefs, ...ats) => linear("ols_predict", coefs, ats);
+
+  // Logistic regression, for an outcome that happened or did not. Iteratively
+  // reweighted least squares: the same normal equations, reweighted by p(1-p) and
+  // solved again until the step stops moving them.
+  const LOGIT_STEPS = 50;
+  // A step this small beside the coefficient it moves has stopped saying
+  // anything, the way LM_STOP reads for the decline fit.
+  const LOGIT_STOP = 1e-10;
+  // A residual under this on every point is a fit that has separated the two
+  // outcomes rather than one that has settled.
+  const LOGIT_FIT = 1e-8;
+  fn.logit = (ys, ...xss) => {
+    const { y, cols, scale } = design("logit", ys, xss);
+    for (const v of y) {
+      if (v !== 0 && v !== 1) {
+        throw fail(
+          "logit() argument 1",
+          "only 0 and 1",
+          show(v),
+          "write the outcome as a 0/1 column, e.g. case when status = 'won' then 1 else 0 end",
+        );
+      }
+    }
+    // A boundary the predictors draw exactly is a likelihood with no maximum:
+    // the coefficients run off to infinity and every further step still improves
+    // the fit. It arrives two ways -- every point fitted exactly, and the weights
+    // of every point but the tied ones collapsing until the reweighted matrix is
+    // singular -- and both are this one refusal, because the coefficients a
+    // bounded run hands back read as enormous effects rather than as a column
+    // that gives the answer away.
+    const separated = () =>
+      fail(
+        "logit()",
+        "two outcomes the predictors do not separate",
+        "a boundary that separates them exactly",
+        "drop the predictor that already decides the outcome, or fit the rows where the two outcomes overlap",
+      );
+    let b = new Array(cols.length + 1).fill(0);
+    for (let steps = 1;; steps++) {
+      if (steps > LOGIT_STEPS) {
+        throw new Error(explain(`logit() did not settle on a fit.`, {
+          Limit: `${LOGIT_STEPS} reweighted least-squares steps`,
+          Received: `${LOGIT_STEPS} steps, still moving`,
+          Source: "the points handed to logit()",
+          Fix: "fit fewer predictors, or check whether one of them already decides the outcome",
+        }));
+      }
+      const w = [], resid = [];
+      let exact = true;
+      for (let i = 0; i < y.length; i++) {
+        let eta = b[0];
+        for (let j = 0; j < cols.length; j++) eta += b[j + 1] * cols[j][i];
+        const p = 1 / (1 + Math.exp(-eta));
+        w.push(p * (1 - p));
+        resid.push(y[i] - p);
+        if (Math.abs(y[i] - p) > LOGIT_FIT) exact = false;
+      }
+      if (exact) throw separated();
+      const solved = gauss(...equations(cols, w, resid));
+      // b starts at zero, so every p is a half and the first step weighs every
+      // point the same: its matrix is the one ols() solves, and a singular one
+      // there is a column another column reproduces. A singular one after it is
+      // the weights collapsing, which is the fit running away.
+      if (!solved.out) throw steps === 1 ? singular("logit", solved.singular) : separated();
+      b = b.map((v, j) => v + solved.out[j]);
+      if (solved.out.every((d, j) => Math.abs(d) <= LOGIT_STOP * (Math.abs(b[j]) + LOGIT_STOP))) break;
+    }
+    return b.map((v, j) => (j === 0 ? v : v / scale[j - 1]));
+  };
+  // exp() of a large negative number is 0 and of a large positive one is
+  // Infinity, so both ends answer a probability rather than a NaN.
+  fn.logit_predict = (coefs, ...ats) => 1 / (1 + Math.exp(-linear("logit_predict", coefs, ats)));
 
   // Median absolute deviation, and the outlier score built on it. 1.4826 scales
   // a MAD to the standard deviation of a normal sample, so robust_z reads on the

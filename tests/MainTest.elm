@@ -493,15 +493,15 @@ suite =
             [ test "net-http decodes url and interval; headers, method, body and the paging fields default to one plain GET" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "" }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False }))
             , test "net-http decodes a headers string" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"headers":"X-Key: abc"}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "X-Key: abc", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "" }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "X-Key: abc", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False }))
             , test "net-http decodes the method and body it posts with" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"method":"POST","body":"{}"}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "POST", body = "{}", pageBy = "", pageParam = "", pagePath = "" }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "POST", body = "{}", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False }))
             , test "net-http refuses a method the poller would not send" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"method":"PATCH"}]}"""
@@ -520,10 +520,19 @@ suite =
             , test "net-http decodes the paging fields the poller reads a whole feed with" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"page_by":"cursor","page_param":"after","page_path":"meta.next"}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "cursor", pageParam = "after", pagePath = "meta.next" }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "cursor", pageParam = "after", pagePath = "meta.next", mode = "", key = "", rowsPath = "", paused = False }))
             , test "net-http refuses a paging mode the poller does not know" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"page_by":"scroll"}]}"""
+                        |> Result.toMaybe
+                        |> Expect.equal Nothing
+            , test "net-http decodes what a good run does to the runs before it" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"mode":"upsert","key":"id","rows_path":"data"}]}"""
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "upsert", key = "id", rowsPath = "data", paused = False }))
+            , test "net-http refuses a storage mode the poller does not know" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"mode":"merge"}]}"""
                         |> Result.toMaybe
                         |> Expect.equal Nothing
             , test "net-http without interval is still rejected" <|
@@ -534,11 +543,11 @@ suite =
             , test "alert without a when fires on rows, the way it did before there was one" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60}]}"""
-                        |> Expect.equal (Ok (Alert { code = "", to = "", interval = 60, digest = False, when = OnRows }))
+                        |> Expect.equal (Ok (Alert { code = "", to = "", interval = 60, digest = False, when = OnRows, paused = False, snoozedUntil = "" }))
             , test "alert decodes its when" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60,"when":"added"}]}"""
-                        |> Expect.equal (Ok (Alert { code = "", to = "", interval = 60, digest = False, when = OnAdded }))
+                        |> Expect.equal (Ok (Alert { code = "", to = "", interval = 60, digest = False, when = OnAdded, paused = False, snoozedUntil = "" }))
             , test "alert with an unknown when is refused rather than shown as rows" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60,"when":"bogus"}]}"""
@@ -577,11 +586,15 @@ suite =
             , test "chart decodes its source, kind and both axes" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:budget-burn","kind":"bar","x":"department","y":"burn_ratio"}]}"""
-                        |> Expect.equal (Ok (Chart { source = "@query:budget-burn", kind = Bar, x = "department", y = "burn_ratio" }))
+                        |> Expect.equal (Ok (Chart { source = "@query:budget-burn", kind = Bar, x = "department", y = "burn_ratio", series = "" }))
             , test "a chart with no kind is a line, and its axes default to empty" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:x"}]}"""
-                        |> Expect.equal (Ok (Chart { source = "@query:x", kind = Line, x = "", y = "" }))
+                        |> Expect.equal (Ok (Chart { source = "@query:x", kind = Line, x = "", y = "", series = "" }))
+            , test "chart decodes the column it splits its rows by" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:x","x":"day","y":"z","series":"line"}]}"""
+                        |> Expect.equal (Ok (Chart { source = "@query:x", kind = Line, x = "day", y = "z", series = "line" }))
             , test "every kind the engine admits decodes to one of its own" <|
                 \_ ->
                     chartKinds
@@ -590,7 +603,7 @@ suite =
                                 D.decodeString docDecoder
                                     ("""{"type":"chart","data":[{"source":"@query:x","kind":\"""" ++ (kindSpec k).name ++ "\"}]}")
                             )
-                        |> Expect.equal (List.map (\k -> Ok (Chart { source = "@query:x", kind = k, x = "", y = "" })) chartKinds)
+                        |> Expect.equal (List.map (\k -> Ok (Chart { source = "@query:x", kind = k, x = "", y = "", series = "" })) chartKinds)
             , test "a kind nobody draws is refused rather than drawn as a line" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:x","kind":"scater"}]}"""
@@ -630,20 +643,131 @@ suite =
         , describe "chartPoints"
             [ test "reads the x label and the y number, in the order given" <|
                 \_ ->
-                    chartPoints (chartTable [ ( "Jan", E.float 3 ), ( "Feb", E.float 1 ) ])
-                        |> Expect.equal [ ( "Jan", 3 ), ( "Feb", 1 ) ]
+                    chartPoints (chartTable [ ( "", "Jan", E.float 3 ), ( "", "Feb", E.float 1 ) ])
+                        |> Expect.equal [ ( "", [ ( "Jan", 3 ), ( "Feb", 1 ) ] ) ]
             , test "a y that is not a number is dropped, not read as zero" <|
                 \_ ->
-                    chartPoints (chartTable [ ( "Jan", E.float 3 ), ( "Feb", E.string "n/a" ), ( "Mar", E.float 2 ) ])
-                        |> Expect.equal [ ( "Jan", 3 ), ( "Mar", 2 ) ]
+                    chartPoints (chartTable [ ( "", "Jan", E.float 3 ), ( "", "Feb", E.string "n/a" ), ( "", "Mar", E.float 2 ) ])
+                        |> Expect.equal [ ( "", [ ( "Jan", 3 ), ( "Mar", 2 ) ] ) ]
             , test "a y held as a numeric string still counts" <|
                 \_ ->
-                    chartPoints (chartTable [ ( "Jan", E.string "4.5" ) ])
-                        |> Expect.equal [ ( "Jan", 4.5 ) ]
+                    chartPoints (chartTable [ ( "", "Jan", E.string "4.5" ) ])
+                        |> Expect.equal [ ( "", [ ( "Jan", 4.5 ) ] ) ]
             , test "no plottable rows is an empty chart, not a crash" <|
                 \_ ->
-                    chartPoints (chartTable [ ( "Jan", E.null ) ])
+                    chartPoints (chartTable [ ( "", "Jan", E.null ) ])
                         |> Expect.equal []
+            , test "a series column splits the rows, each series in the order it first arrives" <|
+                \_ ->
+                    chartPoints
+                        (chartTable
+                            [ ( "north", "Jan", E.float 3 )
+                            , ( "north", "Feb", E.float 1 )
+                            , ( "south", "Jan", E.float 2 )
+                            , ( "south", "Feb", E.float 4 )
+                            ]
+                        )
+                        |> Expect.equal
+                            [ ( "north", [ ( "Jan", 3 ), ( "Feb", 1 ) ] )
+                            , ( "south", [ ( "Jan", 2 ), ( "Feb", 4 ) ] )
+                            ]
+            , test "a y that is not a number is dropped from its own series only" <|
+                \_ ->
+                    chartPoints
+                        (chartTable
+                            [ ( "north", "Jan", E.string "n/a" )
+                            , ( "north", "Feb", E.float 1 )
+                            , ( "south", "Jan", E.float 2 )
+                            ]
+                        )
+                        |> Expect.equal
+                            [ ( "north", [ ( "Feb", 1 ) ] )
+                            , ( "south", [ ( "Jan", 2 ) ] )
+                            ]
+            , test "a series nothing names is the one unnamed series a chart always drew" <|
+                \_ ->
+                    chartPoints (chartTable [ ( "", "Jan", E.float 3 ), ( "north", "Jan", E.float 2 ) ])
+                        |> Expect.equal [ ( "", [ ( "Jan", 3 ) ] ), ( "north", [ ( "Jan", 2 ) ] ) ]
+            , test "a label or a series held as a number is read as its digits, not as one blank they all share" <|
+                \_ ->
+                    -- chart:compa-ratio plots an int column on x, and every series
+                    -- a report splits by is an id as often as it is a word.
+                    chartPoints
+                        { cols = Array.empty
+                        , rows =
+                            Array.fromList
+                                [ Dict.fromList [ ( "series", E.int 1 ), ( "x", E.int 4900 ), ( "y", E.float 3 ) ]
+                                , Dict.fromList [ ( "series", E.int 1 ), ( "x", E.int 4901 ), ( "y", E.float 4 ) ]
+                                , Dict.fromList [ ( "series", E.int 2 ), ( "x", E.int 4900 ), ( "y", E.float 5 ) ]
+                                ]
+                        }
+                        |> Expect.equal
+                            [ ( "1", [ ( "4900", 3 ), ( "4901", 4 ) ] )
+                            , ( "2", [ ( "4900", 5 ) ] )
+                            ]
+            ]
+        , describe "chartRuns"
+            [ test "a day axis puts each point at its own day between the ends" <|
+                \_ ->
+                    chartRuns [ ( "", [ ( "2024-01-01", 1 ), ( "2024-01-02", 2 ), ( "2024-01-05", 3 ) ] ) ]
+                        |> Expect.equal (Just [ ( "", [ [ ( 60, 1 ), ( 240, 2 ), ( 780, 3 ) ] ] ) ])
+            , test "a step past twice the median step breaks the series into two runs" <|
+                \_ ->
+                    chartRuns [ ( "", [ ( "2024-01-01", 1 ), ( "2024-01-02", 2 ), ( "2024-01-03", 3 ), ( "2024-01-09", 4 ) ] ) ]
+                        |> Expect.equal (Just [ ( "", [ [ ( 60, 1 ), ( 150, 2 ), ( 240, 3 ) ], [ ( 780, 4 ) ] ] ) ])
+            , test "one x that is not a day is an ordinal axis, which this does not place" <|
+                \_ ->
+                    chartRuns [ ( "", [ ( "2024-01-01", 1 ), ( "Jan", 2 ) ] ) ]
+                        |> Expect.equal Nothing
+            , test "a step exactly twice the median does not break the run" <|
+                \_ ->
+                    chartRuns [ ( "", [ ( "2024-01-01", 1 ), ( "2024-01-02", 2 ), ( "2024-01-03", 3 ), ( "2024-01-05", 4 ) ] ) ]
+                        |> Expect.equal (Just [ ( "", [ [ ( 60, 1 ), ( 240, 2 ), ( 420, 3 ), ( 780, 4 ) ] ] ) ])
+            , test "points that arrive out of day order are placed and broken by day, not by arrival" <|
+                \_ ->
+                    chartRuns [ ( "", [ ( "2024-01-05", 5 ), ( "2024-01-01", 1 ), ( "2024-01-02", 2 ) ] ) ]
+                        |> Expect.equal (Just [ ( "", [ [ ( 60, 1 ), ( 240, 2 ), ( 780, 5 ) ] ] ) ])
+            , test "two series sharing one chart share one time axis, not one each" <|
+                \_ ->
+                    chartRuns
+                        [ ( "a", [ ( "2024-01-01", 1 ), ( "2024-01-11", 2 ) ] )
+                        , ( "b", [ ( "2024-01-06", 3 ), ( "2024-01-11", 4 ) ] )
+                        ]
+                        |> Expect.equal
+                            (Just
+                                [ ( "a", [ [ ( 60, 1 ), ( 780, 2 ) ] ] )
+                                , ( "b", [ [ ( 420, 3 ), ( 780, 4 ) ] ] )
+                                ]
+                            )
+            ]
+        , describe "chartFold"
+            [ test "a series past chartPointsMax is averaged down to that many points" <|
+                \_ ->
+                    chartFold [ ( "", List.range 0 (2 * chartPointsMax - 1) |> List.map (\i -> ( String.fromInt (1000 + i) ++ "-01-01", toFloat i )) ) ]
+                        |> Expect.equal
+                            [ ( ""
+                              , List.range 0 (chartPointsMax - 1)
+                                    |> List.map (\b -> ( String.fromInt (1000 + 2 * b) ++ "-01-01", toFloat (4 * b + 1) / 2 ))
+                              )
+                            ]
+            , test "points that arrive out of day order are bucketed by day, not by arrival" <|
+                \_ ->
+                    chartFold [ ( "", List.range 0 (2 * chartPointsMax - 1) |> List.reverse |> List.map (\i -> ( String.fromInt (1000 + i) ++ "-01-01", toFloat i )) ) ]
+                        |> Expect.equal
+                            [ ( ""
+                              , List.range 0 (chartPointsMax - 1)
+                                    |> List.map (\b -> ( String.fromInt (1000 + 2 * b) ++ "-01-01", toFloat (4 * b + 1) / 2 ))
+                              )
+                            ]
+            , test "a series inside chartPointsMax is drawn point for point" <|
+                \_ ->
+                    chartFold [ ( "", [ ( "2024-01-01", 1 ), ( "2024-01-02", 2 ) ] ) ]
+                        |> Expect.equal [ ( "", [ ( "2024-01-01", 1 ), ( "2024-01-02", 2 ) ] ) ]
+            , test "an axis that is not days is never folded, however many points it holds" <|
+                \_ ->
+                    chartFold [ ( "", List.range 0 (2 * chartPointsMax - 1) |> List.map (\i -> ( "bucket " ++ String.fromInt i, toFloat i )) ) ]
+                        |> List.map (Tuple.second >> List.length)
+                        |> Expect.equal [ 2 * chartPointsMax ]
             ]
         , describe "Column stats"
             [ describe "civilDays"
@@ -722,14 +846,14 @@ suite =
         , describe "freshnessDecoder"
             [ test "keys each row by the sheet it is about" <|
                 \_ ->
-                    D.decodeString freshnessDecoder """[{"sheet_id":"net-http:a","last_run":"2026-08-23T14:02:11.000Z","failures_since_ok":"3"}]"""
+                    D.decodeString freshnessDecoder """[{"sheet_id":"net-http:a","last_run":"2026-08-23T14:02:11.000Z","failures_since_ok":"3","next_run":"2026-08-23T15:02:11.000Z"}]"""
                         |> Result.map (Dict.get "net-http:a")
-                        |> Expect.equal (Ok (Just (Freshness (Just "2026-08-23T14:02:11.000Z") 3)))
+                        |> Expect.equal (Ok (Just (Freshness (Just "2026-08-23T14:02:11.000Z") 3 (Just "2026-08-23T15:02:11.000Z"))))
             , test "a sheet that has never run carries no last run" <|
                 \_ ->
-                    D.decodeString freshnessDecoder """[{"sheet_id":"alert:b","last_run":null,"failures_since_ok":0}]"""
+                    D.decodeString freshnessDecoder """[{"sheet_id":"alert:b","last_run":null,"failures_since_ok":0,"next_run":null}]"""
                         |> Result.map (Dict.get "alert:b")
-                        |> Expect.equal (Ok (Just (Freshness Nothing 0)))
+                        |> Expect.equal (Ok (Just (Freshness Nothing 0 Nothing)))
             , test "a renamed field is an error, not a library where every feed is fine" <|
                 \_ ->
                     D.decodeString freshnessDecoder """[{"sheet_id":"net-http:a","last_run":null,"failures":2}]"""
@@ -740,14 +864,14 @@ suite =
             [ test "a sheet the read does not answer for shows nothing at all" <|
                 \_ -> freshnessCell Nothing |> Expect.equal ""
             , test "a sheet that has never run says so, rather than reading as fine" <|
-                \_ -> freshnessCell (Just (Freshness Nothing 0)) |> Expect.equal "never run"
+                \_ -> freshnessCell (Just (Freshness Nothing 0 Nothing)) |> Expect.equal "never run"
             , test "a good feed shows its last run to the minute" <|
                 \_ ->
-                    freshnessCell (Just (Freshness (Just "2026-08-23T14:02:11.000Z") 0))
+                    freshnessCell (Just (Freshness (Just "2026-08-23T14:02:11.000Z") 0 Nothing))
                         |> Expect.equal "2026-08-23 14:02"
             , test "a failing feed shows how many runs since its last good one" <|
                 \_ ->
-                    freshnessCell (Just (Freshness (Just "2026-08-23T14:02:11.000Z") 4))
+                    freshnessCell (Just (Freshness (Just "2026-08-23T14:02:11.000Z") 4 Nothing))
                         |> Expect.equal "2026-08-23 14:02 · 4 failed"
             ]
         , describe "Cleaning a column"
@@ -803,6 +927,70 @@ suite =
                     rowDeletions (cleanRows [ "a", "b" ]) [ 0, 9, -1, 2 ]
                         |> Tuple.mapBoth (List.map spliceOf) (List.map spliceOf)
                         |> Expect.equal ( [ "[2,1]" ], [ "[2,0,{\"0\":\"b\"}]" ] )
+            ]
+        , describe "Splitting a column"
+            [ test "every part becomes a column of its own, and the undo takes all of them back" <|
+                \_ ->
+                    splitOf [ "c" ] [ "a,b", "x,y" ] ","
+                        |> Expect.equal
+                            (Ok
+                                ( [ ( "push", "0", """[{"name":"c 1","type":"text","key":1},{"name":"c 2","type":"text","key":2}]""" )
+                                  , ( "set", "1/\"1\"", "\"a\"" )
+                                  , ( "set", "1/\"2\"", "\"b\"" )
+                                  , ( "set", "2/\"1\"", "\"x\"" )
+                                  , ( "set", "2/\"2\"", "\"y\"" )
+                                  ]
+                                , [ ( "del", "1/\"1\"", "null" )
+                                  , ( "del", "1/\"2\"", "null" )
+                                  , ( "del", "2/\"1\"", "null" )
+                                  , ( "del", "2/\"2\"", "null" )
+                                  , ( "splice", "0", "[1,2]" )
+                                  ]
+                                )
+                            )
+            , test "a row with fewer parts leaves its later cells unwritten" <|
+                \_ ->
+                    splitOf [ "c" ] [ "a,b", "x" ] ","
+                        |> Result.map Tuple.first
+                        |> Expect.equal
+                            (Ok
+                                [ ( "push", "0", """[{"name":"c 1","type":"text","key":1},{"name":"c 2","type":"text","key":2}]""" )
+                                , ( "set", "1/\"1\"", "\"a\"" )
+                                , ( "set", "1/\"2\"", "\"b\"" )
+                                , ( "set", "2/\"1\"", "\"x\"" )
+                                ]
+                            )
+            , test "the delimiter is the characters it is, never a pattern" <|
+                \_ ->
+                    [ partsOf [ "a.b" ] ".", partsOf [ "a|b" ] "|" ]
+                        |> Expect.equal [ Ok [ "\"a\"", "\"b\"" ], Ok [ "\"a\"", "\"b\"" ] ]
+            , test "a name one of the new columns would take refuses the whole split" <|
+                \_ ->
+                    -- Half a split -- the columns before the clash pushed and the
+                    -- one that collides left out -- is exactly what every read
+                    -- keyed by column name cannot have.
+                    splitOf [ "c", "c 2" ] [ "a,b" ] ","
+                        |> Result.map (\_ -> "wrote")
+                        |> Result.mapError (String.contains "already has a column called \"c 2\"")
+                        |> Expect.equal (Err True)
+            , test "an empty delimiter is a refusal, not a column per character" <|
+                \_ ->
+                    splitOf [ "c" ] [ "a,b" ] ""
+                        |> Result.map (\_ -> "wrote")
+                        |> Result.mapError (String.contains "empty box")
+                        |> Expect.equal (Err True)
+            , test "a column with no text in it is a refusal, not a column of blanks" <|
+                \_ ->
+                    columnSplit (namedCols [ "c" ]) (Array.fromList [ Dict.fromList [ ( "0", E.int 5 ) ] ]) "0" ","
+                        |> Result.map (\_ -> "wrote")
+                        |> Result.mapError (String.contains "no text cell")
+                        |> Expect.equal (Err True)
+            , test "a delimiter no value carries refuses rather than copying the column" <|
+                \_ ->
+                    splitOf [ "c" ] [ "a", "b" ] ","
+                        |> Result.map (\_ -> "wrote")
+                        |> Result.mapError (String.contains "not one of them holding it")
+                        |> Expect.equal (Err True)
             ]
         , describe "duplicateRows"
             [ test "the first of a repeat stays, the ones under it go, in document order" <|
@@ -1046,7 +1234,7 @@ suite =
                 \_ ->
                     paletteCommands Dict.empty ""
                         |> List.map .label
-                        |> Expect.equal [ "delete duplicate rows", "select all", "copy", "find", "replace", "undo", "redo", "shortcut sheet" ]
+                        |> Expect.equal [ "delete duplicate rows", "select all", "copy", "find", "replace", "undo", "redo", "trash selected sheets", "shortcut sheet" ]
             , test "a sheet is matched on its name" <|
                 \_ -> paletteCommands paletteShelf "countr" |> List.map .label |> Expect.equal [ "countries" ]
             , test "a sheet is matched on its id too, which is what you remember of a net sheet" <|
@@ -1062,6 +1250,13 @@ suite =
                         |> Expect.equal []
             , test "a trashed sheet is not a destination, or the palette still opens what you threw away" <|
                 \_ -> paletteCommands trashedShelf "gone" |> List.map .label |> Expect.equal []
+            , test "a starred sheet is offered before the sheets nobody starred" <|
+                \_ ->
+                    paletteShelf
+                        |> Dict.map (\k v -> { v | starred = k == "table:us-states" })
+                        |> (\shelf -> paletteCommands shelf "table:")
+                        |> List.map .label
+                        |> Expect.equal [ "us states", "countries" ]
             , test "the library itself is not a destination" <|
                 \_ ->
                     paletteCommands (libraryOf [ ( "", "library-root", False ) ]) "library-root"
@@ -1335,7 +1530,7 @@ libraryOf entries =
     entries
         |> List.map
             (\( id, name, scratch ) ->
-                ( id, { name = name, tags = [], scratch = scratch, system = False, thumb = E.null, seen = "", trashed = False } )
+                ( id, { name = name, tags = [], scratch = scratch, system = False, thumb = E.null, seen = "", trashed = False, starred = False } )
             )
         |> Dict.fromList
 
@@ -1401,6 +1596,29 @@ cleanRows values =
     values |> List.map (\v -> Dict.fromList [ ( "0", E.string v ) ]) |> Array.fromList
 
 
+{-| A split of the one text column `cleanRows` writes, as what each patch does,
+the JSON path it addresses and the JSON it writes: a cell reads as its document
+row and the key of the column it lands in.
+-}
+splitOf names values delimiter =
+    let
+        rendered patch =
+            ( patch.action
+            , patch.path |> List.map (E.encode 0) |> String.join "/"
+            , E.encode 0 patch.value
+            )
+    in
+    columnSplit (namedCols names) (cleanRows values) "0" delimiter
+        |> Result.map (Tuple.mapBoth (List.map rendered) (List.map rendered))
+
+
+{-| What one split writes into the cells, in the order it writes them.
+-}
+partsOf values delimiter =
+    splitOf [ "c" ] values delimiter
+        |> Result.map (Tuple.first >> List.filter (\( action, _, _ ) -> action == "set") >> List.map (\( _, _, value ) -> value))
+
+
 {-| One row per list, its cells keyed by position the way `namedCols` keys the
 columns it builds.
 -}
@@ -1457,17 +1675,31 @@ boolRows =
     List.map (Dict.singleton "b") >> Array.fromList
 
 
-{-| A chart sheet always resolves to two columns named x and y, whatever the
-query underneath it called them, so a test only has to supply the pairs.
+{-| A chart sheet always resolves to columns named x and y, and to a third named
+series when the chart splits its rows, whatever the query underneath it called
+them -- so a test only has to supply the values. A blank series is the column
+left out, which is the row a chart with nothing to split by reads.
 -}
-chartTable : List ( String, E.Value ) -> Table
+chartTable : List ( String, String, E.Value ) -> Table
 chartTable points =
     -- chartPoints reads the rows by key and never looks at the columns, so
     -- naming them here would only be a second place to keep them in step.
     { cols = Array.empty
     , rows =
         points
-            |> List.map (\( x, y ) -> Dict.fromList [ ( "x", E.string x ), ( "y", y ) ])
+            |> List.map
+                (\( series, x, y ) ->
+                    Dict.fromList
+                        (( "x", E.string x )
+                            :: ( "y", y )
+                            :: (if String.isEmpty series then
+                                    []
+
+                                else
+                                    [ ( "series", E.string series ) ]
+                               )
+                        )
+                )
             |> Array.fromList
     }
 

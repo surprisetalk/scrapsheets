@@ -21,10 +21,14 @@ port module Main exposing
     , blankRows
     , canonicalTypeNames
     , cellRewrites
+    , chartFold
     , chartKinds
     , chartPoints
+    , chartPointsMax
+    , chartRuns
     , civilDays
     , clampIndex
+    , columnSplit
     , computeBoolishStats
     , computeTemporalStats
     , cycleSort
@@ -96,6 +100,7 @@ import Set exposing (Set)
 import Svg
 import Svg.Attributes as SvgA
 import Task
+import Time
 import Url exposing (Url)
 import Url.Parser as UrlP exposing ((</>), (<?>))
 import Url.Parser.Query as UrlQ
@@ -767,7 +772,7 @@ port librarySynced : (D.Value -> msg) -> Sub msg
 left as it was — src/index.html drops a null out of the patch rather than out of
 the entry — so restoring writes `Just False` and never `Nothing`.
 -}
-port updateLibrary : Idd { name : Maybe String, tags : Maybe (List String), trashed : Maybe Bool } -> Cmd msg
+port updateLibrary : Idd { name : Maybe String, tags : Maybe (List String), trashed : Maybe Bool, starred : Maybe Bool } -> Cmd msg
 
 
 port changeId : Id -> Cmd msg
@@ -824,6 +829,15 @@ port preflight : Idd { url : String, headers : String, method : String, body : S
 
 
 port preflightLoaded : (Idd D.Value -> msg) -> Sub msg
+
+
+{-| The sheet's own poll, now rather than on its timer: the row it writes comes
+back on `runLoaded`, named by sheet the way a pre-flight is.
+-}
+port runNow : String -> Cmd msg
+
+
+port runLoaded : (Idd D.Value -> msg) -> Sub msg
 
 
 port signup : String -> Cmd msg
@@ -897,6 +911,7 @@ type alias ShareAsk =
     , email : String
     , role : String
     , public : Bool
+    , personal : Bool
     , days : Int
     , password : String
     }
@@ -904,7 +919,7 @@ type alias ShareAsk =
 
 shareAsk : ShareAsk
 shareAsk =
-    { id = "", action = "", email = "", role = "", public = False, days = 0, password = "" }
+    { id = "", action = "", email = "", role = "", public = False, personal = False, days = 0, password = "" }
 
 
 port shareLoaded : (D.Value -> msg) -> Sub msg
@@ -982,6 +997,12 @@ type alias Model =
     , freshness : Dict Id Freshness
     , tutorial : Maybe Int
     , embed : Bool
+
+    -- The page's own clock, in epoch milliseconds: taken at boot and again
+    -- whenever a snooze is set. Nothing renders it -- it is only ever compared
+    -- with a timestamp the document holds, which is a question no pure view can
+    -- answer on its own.
+    , now : Int
     }
 
 
@@ -991,7 +1012,7 @@ all, which is a different fact from zero failures -- a table or a query has no
 runs to be stale, and the read answers for nothing that has none.
 -}
 type alias Freshness =
-    { lastRun : Maybe String, failures : Int }
+    { lastRun : Maybe String, failures : Int, nextRun : Maybe String }
 
 
 {-| The command palette: what has been typed, and which match is selected.
@@ -1022,6 +1043,7 @@ type alias SheetInfo =
     , thumb : D.Value
     , seen : String -- ISO 8601, when this browser last opened it; "" if never
     , trashed : Bool -- whether this browser put it in the trash
+    , starred : Bool -- whether this browser keeps it at the top of the library
     }
 
 
@@ -1033,6 +1055,11 @@ on somebody's screen share.
 type alias Share =
     { members : List Member
     , public : Bool
+
+    -- What the publisher says about the personal data in the sheet. The server
+    -- refuses a publish over an email address, a phone number, an SSN or a card
+    -- number unless this rides with it, so it is a claim and never a guess.
+    , personal : Bool
     , link : Maybe String
     , hook : Maybe Hook
     , email : String
@@ -1058,6 +1085,7 @@ emptyShare : Share
 emptyShare =
     { members = []
     , public = False
+    , personal = False
     , link = Nothing
     , hook = Nothing
     , email = ""
@@ -1089,6 +1117,9 @@ type alias Sheet =
 
     -- What the feed's request answered when it was last tested, by sheet.
     , preflight : Maybe (Result String Preview)
+
+    -- What the sheet's last run-now landed, one line of it, by sheet.
+    , run : Maybe (Result String String)
     , widths : Dict String Int
 
     -- How many decimal places this browser writes a numeric column's values at,
@@ -1098,6 +1129,11 @@ type alias Sheet =
     -- How the digits of a numeric column read, where it asked for a reading
     -- other than the one its type has.
     , formats : Dict String NumberFormat
+
+    -- What the open column panel's split box holds. One box, because one panel
+    -- is open at a time, and this browser's own: it is the argument a split is
+    -- about to be run with, never anything the document keeps.
+    , splitOn : String
     , resizing : Maybe { key : String, startX : Int, startWidth : Int }
 
     -- The column or row being dragged to a new position, while the drag lasts.
@@ -1139,10 +1175,12 @@ emptySheet =
     , redoStack = []
     , netStatus = Nothing
     , preflight = Nothing
+    , run = Nothing
     , lineage = Nothing
     , widths = Dict.empty
     , decimals = Dict.empty
     , formats = Dict.empty
+    , splitOn = ""
     , resizing = Nothing
     , moving = Nothing
     , storedView = emptyView
@@ -1174,6 +1212,59 @@ previewDecoder =
                 (D.field "body" D.string)
             )
         ]
+
+
+{-| One line about the run that just happened, out of the `net` row the server
+answers with. A refusal arrives the way a pre-flight's does, as an `error` the
+page shows whole.
+-}
+runDecoder : D.Decoder (Result String String)
+runDecoder =
+    D.oneOf
+        [ D.map Err (D.field "error" D.string)
+        , D.map Ok
+            (D.field "method" D.string
+                |> D.andThen
+                    (\method ->
+                        D.map2 (\at line -> String.left 19 (String.replace "T" " " at) ++ " · " ++ method ++ " · " ++ line)
+                            (D.field "created_at" D.string)
+                            (runLine method)
+                    )
+            )
+        ]
+
+
+{-| What the run amounts to, in the words its own row already uses: an alert's
+body is the verdict and what was done about it, and a feed's meta is the status
+the poll came back with. Picked by `method` -- "ALERT" or an HTTP verb -- and
+never guessed by trying one shape and falling back, because a feed's own body
+is arbitrary JSON and may itself hold "status" and "delivery" keys, which read
+as the alert verdict those two words mean on an alert's row.
+
+An alert's row says what was delivered under `delivery`, except the one whose
+`status` is "error": that run never reached a delivery and carries the message
+instead. Dispatched on the status for the same reason the shape above is
+dispatched on the method.
+
+-}
+runLine : String -> D.Decoder String
+runLine method =
+    if method == "ALERT" then
+        D.field "body" D.string
+            |> D.andThen
+                (\raw ->
+                    case D.decodeString (D.field "status" D.string |> D.andThen (\status -> D.map (\rest -> status ++ " · " ++ rest) (D.field (iif (status == "error") "error" "delivery") D.string))) raw of
+                        Ok line ->
+                            D.succeed line
+
+                        Err err ->
+                            D.fail (D.errorToString err)
+                )
+
+    else
+        D.map2 (\status ms -> "HTTP " ++ String.fromInt status ++ " · " ++ String.fromInt ms ++ " ms")
+            (D.at [ "meta", "status" ] D.int)
+            (D.at [ "meta", "ms" ] D.int)
 
 
 type alias Importing =
@@ -1769,9 +1860,9 @@ type Doc
     | Tab Table
     | Query Query_
     | NetHook
-    | NetHttp { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String }
-    | Alert { code : String, to : String, interval : Int, digest : Bool, when : When }
-    | Chart { source : String, kind : ChartKind, x : String, y : String }
+    | NetHttp { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String, mode : String, key : String, rowsPath : String, paused : Bool }
+    | Alert { code : String, to : String, interval : Int, digest : Bool, when : When, paused : Bool, snoozedUntil : String }
+    | Chart { source : String, kind : ChartKind, x : String, y : String, series : String }
     | Dashboard (List String)
     | NetSocket { url : String }
     | Unviewable String
@@ -1832,6 +1923,7 @@ type Type
     | Delete
     | Trash
     | Restore
+    | Star
     | Create
     | Form
     | Enum (List String)
@@ -1966,6 +2058,46 @@ pageForm mode =
             { param = False, path = False, hint = "one request a poll: what comes back is what is stored." }
 
 
+{-| What a good run does to the runs before it. `NET_MODES` in `main.ts` is the
+same list on the other side of the wire, and `browser_test.ts` fails when the two
+disagree. Empty is not a fourth mode: it is the feed that says nothing about it,
+which appends the whole log, and it is what the select clears to.
+-}
+netModes : List String
+netModes =
+    [ "append", "replace", "upsert" ]
+
+
+netModeDecoder : String -> D.Decoder String
+netModeDecoder name =
+    if name == "" || List.member name netModes then
+        D.succeed name
+
+    else
+        D.fail ("not a way a feed's runs are stored: " ++ name ++ "; expected one of " ++ String.join ", " netModes ++ ", or nothing for a feed that keeps every run")
+
+
+{-| What a mode keeps, beside the field that identifies a row: `key` is the path
+into a row an upsert supersedes by, and no other mode takes one. One table rather
+than two, for the reason `pageForm` is one.
+
+`netModeDecoder` refuses a mode outside `netModes`, so the last branch is the
+empty select.
+
+-}
+storeForm : String -> { key : Bool, hint : String }
+storeForm mode =
+    case mode of
+        "replace" ->
+            { key = False, hint = "the newest good run is the sheet: the runs before it go, and the failed polls stay as the log of why." }
+
+        "upsert" ->
+            { key = True, hint = "a run supersedes the earlier runs that answered for a record it answered for again, read at the key below on every row." }
+
+        _ ->
+            { key = False, hint = "every run is kept, newest first, up to this sheet's retention." }
+
+
 {-| How a chart is drawn. One table with no wildcard, so a new constructor fails
 to compile in `viewChart` rather than falling through to a line; `CHART_KINDS` in
 `src/sql.mjs` is the same list on the other side of the wire, `chartSql` refuses
@@ -2074,6 +2206,9 @@ spec typ =
         Restore ->
             { name = "restore", align = S.textAlignCenter, width = Just 72 }
 
+        Star ->
+            { name = "star", align = S.textAlignCenter, width = Just 40 }
+
         Create ->
             { name = "create", align = S.textAlignRight, width = Just 160 }
 
@@ -2168,25 +2303,56 @@ docDecoder =
                                     (D.field "url" D.string)
 
                     "net-http" ->
+                        -- Eleven fields, and D.map8 is the ceiling: the request is
+                        -- decoded beside what is done with its answer, and the two
+                        -- halves are joined rather than one of them going through
+                        -- `andThen` for the sake of three more names.
                         D.field "data" <|
                             D.index 0 <|
-                                D.map8
-                                    (\url interval headers method body by param path ->
-                                        NetHttp { url = url, interval = interval, headers = headers, method = method, body = body, pageBy = by, pageParam = param, pagePath = path }
+                                D.map2
+                                    (\req keep ->
+                                        NetHttp
+                                            { url = req.url
+                                            , interval = req.interval
+                                            , headers = req.headers
+                                            , method = req.method
+                                            , body = req.body
+                                            , pageBy = keep.by
+                                            , pageParam = keep.param
+                                            , pagePath = keep.path
+                                            , mode = keep.mode
+                                            , key = keep.key
+                                            , rowsPath = keep.rowsPath
+                                            , paused = keep.paused
+                                            }
                                     )
-                                    (D.field "url" D.string)
-                                    (D.field "interval" D.int)
-                                    (D.oneOf [ D.field "headers" D.string, D.succeed "" ])
-                                    (optionalField "method" (D.string |> D.andThen methodDecoder) "GET")
-                                    (optionalField "body" D.string "")
-                                    (optionalField "page_by" (D.string |> D.andThen pageByDecoder) "")
-                                    (optionalField "page_param" D.string "")
-                                    (optionalField "page_path" D.string "")
+                                    (D.map5
+                                        (\url interval headers method body ->
+                                            { url = url, interval = interval, headers = headers, method = method, body = body }
+                                        )
+                                        (D.field "url" D.string)
+                                        (D.field "interval" D.int)
+                                        (D.oneOf [ D.field "headers" D.string, D.succeed "" ])
+                                        (optionalField "method" (D.string |> D.andThen methodDecoder) "GET")
+                                        (optionalField "body" D.string "")
+                                    )
+                                    (D.map7
+                                        (\by param path mode key rowsPath paused ->
+                                            { by = by, param = param, path = path, mode = mode, key = key, rowsPath = rowsPath, paused = paused }
+                                        )
+                                        (optionalField "page_by" (D.string |> D.andThen pageByDecoder) "")
+                                        (optionalField "page_param" D.string "")
+                                        (optionalField "page_path" D.string "")
+                                        (optionalField "mode" (D.string |> D.andThen netModeDecoder) "")
+                                        (optionalField "key" D.string "")
+                                        (optionalField "rows_path" D.string "")
+                                        (optionalField "paused" D.bool False)
+                                    )
 
                     "alert" ->
                         D.field "data" <|
                             D.index 0 <|
-                                D.map5 (\code to interval digest when -> Alert { code = code, to = to, interval = interval, digest = digest, when = when })
+                                D.map7 (\code to interval digest when paused snoozedUntil -> Alert { code = code, to = to, interval = interval, digest = digest, when = when, paused = paused, snoozedUntil = snoozedUntil })
                                     (D.oneOf [ D.field "code" D.string, D.succeed "" ])
                                     (D.oneOf [ D.field "to" D.string, D.succeed "" ])
                                     (D.oneOf [ D.field "interval" D.int, D.succeed 3600 ])
@@ -2197,15 +2363,26 @@ docDecoder =
                                     -- saying "rows" over a document that says otherwise is a lie the
                                     -- server would not tell.
                                     (optionalField "when" (D.string |> D.andThen whenDecoder) OnRows)
+                                    (optionalField "paused" D.bool False)
+                                    -- A plain string the decoder does not
+                                    -- check, the way `page_param` is: the
+                                    -- poller's own refusal is the check, and a
+                                    -- sheet the server has refused must still
+                                    -- draw so its owner can fix the cell.
+                                    (optionalField "snoozed_until" D.string "")
 
                     "chart" ->
                         D.field "data" <|
                             D.index 0 <|
-                                D.map4 (\source kind x y -> Chart { source = source, kind = kind, x = x, y = y })
+                                D.map5 (\source kind x y series -> Chart { source = source, kind = kind, x = x, y = y, series = series })
                                     (D.oneOf [ D.field "source" D.string, D.succeed "" ])
                                     (D.oneOf [ D.field "kind" D.string, D.succeed "line" ] |> D.andThen kindDecoder)
                                     (D.oneOf [ D.field "x" D.string, D.succeed "" ])
                                     (D.oneOf [ D.field "y" D.string, D.succeed "" ])
+                                    -- Blank is the chart every document written before
+                                    -- there was a series means: one series, nothing to
+                                    -- name it, drawn the way it always was.
+                                    (D.oneOf [ D.field "series" D.string, D.succeed "" ])
 
                     "dashboard" ->
                         D.field "data" <|
@@ -2356,10 +2533,11 @@ every feed is fine, which is the one answer this read must never invent.
 freshnessDecoder : D.Decoder (Dict Id Freshness)
 freshnessDecoder =
     D.list
-        (D.map3 (\id lastRun failures -> ( id, Freshness lastRun (round failures) ))
+        (D.map4 (\id lastRun failures nextRun -> ( id, Freshness lastRun (round failures) nextRun ))
             (D.field "sheet_id" D.string)
             (D.field "last_run" (D.nullable D.string))
             (D.field "failures_since_ok" number)
+            (D.field "next_run" (D.nullable D.string))
         )
         |> D.map Dict.fromList
 
@@ -2436,9 +2614,10 @@ init flags url nav =
                 , palette = Nothing
                 , freshness = Dict.empty
                 , tutorial = iif (tutorialStep < 0) Nothing (Just (clamp 0 4 tutorialStep))
+                , now = 0
                 }
     in
-    ( model, changeId model.id )
+    ( model, Cmd.batch [ changeId model.id, Task.perform Clock Time.now ] )
 
 
 route : Url -> Model -> Model
@@ -2491,6 +2670,9 @@ type Msg
     | DocTrash Id
     | DocRestore Id
     | TrashToggle
+    | DocStar Id Bool
+    | TrashSelected
+    | ColumnSplitInput String
     | DocDelete Id
     | DocDeleteConfirm Id
     | DocDeleteCancel
@@ -2498,6 +2680,11 @@ type Msg
     | ShareLoad D.Value
     | Preflight
     | PreflightLoad (Idd D.Value)
+    | Clock Time.Posix
+    | AlertSnooze
+    | AlertSnoozeAt Time.Posix
+    | RunNow
+    | RunLoad (Idd D.Value)
     | ShareEmailChange String
     | ShareRoleChange String
     | ShareDaysChange String
@@ -2505,6 +2692,7 @@ type Msg
     | ShareAdd
     | ShareRemove String
     | SharePublic Bool
+    | SharePersonal Bool
     | ShareLink
     | ShareHook
     | ShortcutsToggle Bool
@@ -2598,6 +2786,7 @@ type DocMsg
     | SheetColumnCase String Casing
     | SheetRowsDropBlank String
     | SheetRowsDedupe
+    | SheetColumnSplit String String
     | CellCheck Index Bool
 
 
@@ -2620,14 +2809,20 @@ type Input
     | NetPageBy
     | NetPageParam
     | NetPagePath
+    | NetMode
+    | NetKey
+    | NetRowsPath
+    | NetPaused
     | AlertCode
     | AlertTo
     | AlertDigest
     | AlertWhen
+    | AlertSnoozed
     | ChartSource
     | ChartKind
     | ChartX
     | ChartY
+    | ChartSeries
     | DashboardTiles
     | PaletteQuery
 
@@ -2652,6 +2847,7 @@ subs model =
         , queryEditorState QueryEditorUpdate
         , shareLoaded ShareLoad
         , preflightLoaded PreflightLoad
+        , runLoaded RunLoad
         , importPreviewed ImportPreviewed
         , freshnessLoaded FreshnessLoad
         , case model.sheet.resizing of
@@ -2867,7 +3063,7 @@ update msg ({ sheet, auth } as model) =
             case
                 D.decodeValue
                     (D.dict
-                        (D.map7 SheetInfo
+                        (D.map8 SheetInfo
                             (D.oneOf [ D.field "name" D.string, D.succeed "" ])
                             (D.oneOf [ D.field "tags" (D.list D.string), D.succeed [] ])
                             (D.oneOf [ D.field "scratch" D.bool, D.succeed False ])
@@ -2875,6 +3071,7 @@ update msg ({ sheet, auth } as model) =
                             (D.oneOf [ D.field "thumb" D.value, D.succeed E.null ])
                             (D.oneOf [ D.field "seen" D.string, D.succeed "" ])
                             (D.oneOf [ D.field "trashed" D.bool, D.succeed False ])
+                            (D.oneOf [ D.field "starred" D.bool, D.succeed False ])
                         )
                     )
                     data
@@ -2916,10 +3113,12 @@ update msg ({ sheet, auth } as model) =
                     , redoStack = []
                     , netStatus = Nothing
                     , preflight = Nothing
+                    , run = Nothing
                     , lineage = data.data.doc |> D.decodeValue (D.field "forked_from" D.string) |> Result.toMaybe
                     , widths = stored.widths
                     , decimals = stored.decimals
                     , formats = stored.formats
+                    , splitOn = ""
                     , resizing = Nothing
                     , moving = Nothing
                     , storedView = stored
@@ -3024,8 +3223,22 @@ update msg ({ sheet, auth } as model) =
 
                             _ ->
                                 identity
+
+                    -- `model.now` is set once at boot and again only on a
+                    -- snooze click, so a tab left open past a snooze's moment
+                    -- would read the clock as it stood at page load forever.
+                    -- index.html's fetchNet already polls an open alert's run
+                    -- log every ten seconds; riding that poll is what keeps
+                    -- the snooze line honest without a subscription of its own.
+                    tick =
+                        case sheet.doc of
+                            Ok (Alert _) ->
+                                Task.perform Clock Time.now
+
+                            _ ->
+                                Cmd.none
                 in
-                advance ( { model | error = "", sheet = { sheet | table = table } }, Cmd.none )
+                advance ( { model | error = "", sheet = { sheet | table = table } }, tick )
 
         DocError error ->
             ( { model | error = error }
@@ -3039,13 +3252,52 @@ update msg ({ sheet, auth } as model) =
             -- No confirmation: being undoable is the whole point of the trash,
             -- and a dialog in front of a reversible act only teaches people to
             -- click through the one in front of an irreversible one.
-            ( model, updateLibrary (Idd id { name = Nothing, tags = Nothing, trashed = Just True }) )
+            ( model, updateLibrary (Idd id { name = Nothing, tags = Nothing, trashed = Just True, starred = Nothing }) )
 
         DocRestore id ->
-            ( model, updateLibrary (Idd id { name = Nothing, tags = Nothing, trashed = Just False }) )
+            ( model, updateLibrary (Idd id { name = Nothing, tags = Nothing, trashed = Just False, starred = Nothing }) )
 
         TrashToggle ->
             ( { model | trash = not model.trash }, Cmd.none )
+
+        DocStar id on ->
+            ( model, updateLibrary (Idd id { name = Nothing, tags = Nothing, trashed = Nothing, starred = Just on }) )
+
+        TrashSelected ->
+            -- One `updateLibrary` per sheet rather than one carrying a list: the
+            -- port writes this browser's facts about *a* sheet, and a second
+            -- shape of message on it is a second thing `Library.set` has to know.
+            case model.sheet.doc of
+                Ok Library ->
+                    let
+                        norm =
+                            normalizeRect model.sheet.select
+
+                        -- Off the rows as drawn -- sorted, filtered, searched --
+                        -- the way every other library verb reads them. A y with
+                        -- no sheet behind it is a header row or past the end.
+                        ids =
+                            List.range norm.a.y norm.b.y
+                                |> List.filterMap (libraryIdAtRow model)
+                    in
+                    if List.isEmpty ids then
+                        ( { model | error = "Expected a selection over library rows, received one holding no sheet. Source: rows " ++ String.fromInt norm.a.y ++ " to " ++ String.fromInt norm.b.y ++ ". Fix: select the rows to trash in the library table." }, Cmd.none )
+
+                    else
+                        ( model
+                        , ids
+                            |> List.map (\id -> updateLibrary (Idd id { name = Nothing, tags = Nothing, trashed = Just True, starred = Nothing }))
+                            |> Cmd.batch
+                        )
+
+                _ ->
+                    ( { model | error = "Expected the library open, received the sheet " ++ model.sheet.id ++ ". Source: trash selected sheets. Fix: open the library, select the rows, and run it again." }, Cmd.none )
+
+        ColumnSplitInput delimiter ->
+            -- The model only, and never the document: the box is an argument to
+            -- a verb nobody has run yet, and a patch per keystroke is a sync per
+            -- keystroke for everybody watching the sheet.
+            ( { model | sheet = { sheet | splitOn = delimiter } }, Cmd.none )
 
         DocDelete id ->
             -- Show confirmation instead of immediately deleting
@@ -3086,6 +3338,48 @@ update msg ({ sheet, auth } as model) =
                 , Cmd.none
                 )
 
+        Clock at ->
+            ( { model | now = Time.posixToMillis at }, Cmd.none )
+
+        AlertSnooze ->
+            -- Asked for at the click and not read off `model.now`: a page left
+            -- open for three hours would otherwise snooze for twenty-one.
+            ( model, Task.perform AlertSnoozeAt Time.now )
+
+        AlertSnoozeAt at ->
+            let
+                ms : Int
+                ms =
+                    Time.posixToMillis at
+            in
+            ( { model | now = ms }
+            , changeDoc
+                { id = sheet.id
+
+                -- 86400000 is a day in milliseconds, which is what "snooze
+                -- a day" buys.
+                , data = [ { action = "set", path = [ E.int 0, E.string "snoozed_until" ], value = E.string (isoStamp (ms + 86400000)) } ]
+                }
+            )
+
+        RunNow ->
+            ( { model | sheet = { sheet | run = Nothing } }, runNow sheet.id )
+
+        RunLoad data ->
+            if data.id /= sheet.id then
+                ( model, Cmd.none )
+
+            else
+                ( { model
+                    | sheet =
+                        { sheet
+                            | run =
+                                Just (D.decodeValue runDecoder data.data |> Result.mapError D.errorToString |> Result.andThen identity)
+                        }
+                  }
+                , Cmd.none
+                )
+
         ShareEmailChange email ->
             ( { model | share = (\s -> { s | email = email }) model.share }, Cmd.none )
 
@@ -3111,7 +3405,21 @@ update msg ({ sheet, auth } as model) =
             ( model, shareAction { shareAsk | id = model.id, action = "remove", email = email } )
 
         SharePublic isPublic ->
-            ( model, shareAction { shareAsk | id = model.id, action = "public", public = isPublic } )
+            ( model
+            , shareAction
+                { shareAsk
+                    | id = model.id
+                    , action = "public"
+                    , public = isPublic
+                    , personal = model.share.personal
+                }
+            )
+
+        SharePersonal personal ->
+            -- The claim alone publishes nothing: it rides with the next
+            -- SharePublic, so ticking it is not a way to publish by one click
+            -- on the checkbox that says the sheet holds personal data.
+            ( { model | share = (\s -> { s | personal = personal }) model.share }, Cmd.none )
 
         ShareLink ->
             -- Blank is "not asked for", and zero days is what the port carries
@@ -3182,7 +3490,7 @@ update msg ({ sheet, auth } as model) =
                 Just p ->
                     let
                         shown =
-                            List.length (paletteCommands model.library p.query)
+                            List.length (paletteRows model p.query)
 
                         -- Nothing selected sits before the first row, so the
                         -- down arrow lands on that row and the up arrow wraps
@@ -3205,7 +3513,7 @@ update msg ({ sheet, auth } as model) =
                 ( model, Cmd.none )
 
             else
-                case model.palette |> Maybe.andThen (\p -> paletteCommands model.library p.query |> List.drop i |> List.head) of
+                case model.palette |> Maybe.andThen (\p -> paletteRows model p.query |> List.drop i |> List.head) of
                     Just command ->
                         -- Closed first, so a command that opens a dialog does not
                         -- open it behind the palette.
@@ -3215,7 +3523,7 @@ update msg ({ sheet, auth } as model) =
                         ( model, Cmd.none )
 
         SettingsNameChange newName ->
-            ( model, updateLibrary (Idd sheet.id { name = Just newName, tags = Nothing, trashed = Nothing }) )
+            ( model, updateLibrary (Idd sheet.id { name = Just newName, tags = Nothing, trashed = Nothing, starred = Nothing }) )
 
         SettingsTagsChange newTags ->
             let
@@ -3225,7 +3533,7 @@ update msg ({ sheet, auth } as model) =
                         |> List.map String.trim
                         |> List.filter (not << String.isEmpty)
             in
-            ( model, updateLibrary (Idd sheet.id { name = Nothing, tags = Just tags, trashed = Nothing }) )
+            ( model, updateLibrary (Idd sheet.id { name = Nothing, tags = Just tags, trashed = Nothing, starred = Nothing }) )
 
         DocNew x ->
             ( model, newDoc x )
@@ -3377,6 +3685,14 @@ update msg ({ sheet, auth } as model) =
                         , Cmd.none
                         )
 
+        InputChange NetPaused x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "paused" ], value = E.bool (x /= "") } ]
+                }
+            )
+
         InputChange AlertCode x ->
             ( model
             , changeDoc
@@ -3409,6 +3725,14 @@ update msg ({ sheet, auth } as model) =
                 }
             )
 
+        InputChange AlertSnoozed x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "snoozed_until" ], value = E.string x } ]
+                }
+            )
+
         InputChange ChartSource x ->
             ( model, chartSet sheet.id "source" x )
 
@@ -3420,6 +3744,9 @@ update msg ({ sheet, auth } as model) =
 
         InputChange ChartY x ->
             ( model, chartSet sheet.id "y" x )
+
+        InputChange ChartSeries x ->
+            ( model, chartSet sheet.id "series" x )
 
         InputChange DashboardTiles x ->
             ( model
@@ -3484,6 +3811,30 @@ update msg ({ sheet, auth } as model) =
             , changeDoc
                 { id = sheet.id
                 , data = [ { action = "set", path = [ E.int 0, E.string "page_path" ], value = E.string x } ]
+                }
+            )
+
+        InputChange NetMode x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "mode" ], value = E.string x } ]
+                }
+            )
+
+        InputChange NetKey x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "key" ], value = E.string x } ]
+                }
+            )
+
+        InputChange NetRowsPath x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "rows_path" ], value = E.string x } ]
                 }
             )
 
@@ -4060,10 +4411,17 @@ update msg ({ sheet, auth } as model) =
                             ]
                         )
                         data
+
+                -- The account's own address, which the page hands back with a
+                -- restored session: logging in reloads, so what the form knew
+                -- is gone. An answer that carries none leaves what was typed
+                -- where it is, rather than emptying the form on a refusal.
+                email =
+                    D.decodeValue (D.field "email" D.string) data |> Result.withDefault auth.email
             in
             case decoded of
                 Ok newState ->
-                    ( { model | auth = { auth | state = newState, password = "" } }, Cmd.none )
+                    ( { model | auth = { auth | state = newState, email = email, password = "" } }, Cmd.none )
 
                 Err _ ->
                     ( { model | auth = { auth | state = Anonymous } }, Cmd.none )
@@ -4126,10 +4484,10 @@ updateDocMsg edit ({ sheet } as model) =
                 SheetWrite { x, y } ->
                     case ( libraryIdAtRow model y, Maybe.map .name (Array.get x (libraryCols model)) ) of
                         ( Just id, Just "name" ) ->
-                            ( closed, updateLibrary (Idd id { name = sheet.write, tags = Nothing, trashed = Nothing }) )
+                            ( closed, updateLibrary (Idd id { name = sheet.write, tags = Nothing, trashed = Nothing, starred = Nothing }) )
 
                         ( Just id, Just "tags" ) ->
-                            ( closed, updateLibrary (Idd id { name = Nothing, tags = sheet.write |> Maybe.map (String.split ", " >> List.map String.trim), trashed = Nothing }) )
+                            ( closed, updateLibrary (Idd id { name = Nothing, tags = sheet.write |> Maybe.map (String.split ", " >> List.map String.trim), trashed = Nothing, starred = Nothing }) )
 
                         ( Nothing, _ ) ->
                             -- Written to a row the library does not draw. The empty
@@ -4172,6 +4530,17 @@ updateDocMsg edit ({ sheet } as model) =
                         |> List.head
                         |> Maybe.map make
                         |> Maybe.withDefault ( [], [] )
+
+                -- The split's patches, or why it cannot run. Computed once,
+                -- because the refusal below and the patches above are the two
+                -- halves of one answer.
+                split =
+                    case edit of
+                        SheetColumnSplit key delimiter ->
+                            columnSplit table.cols table.rows key delimiter
+
+                        _ ->
+                            Ok ( [], [] )
 
                 -- Compute forward and backward patches based on edit type
                 ( forwardPatches, backwardPatches ) =
@@ -4299,6 +4668,12 @@ updateDocMsg edit ({ sheet } as model) =
 
                         SheetRowsDedupe ->
                             rowDeletions table.rows (duplicateRows table.rows)
+
+                        SheetColumnSplit _ _ ->
+                            -- The empty pair is never what is written: every way
+                            -- `columnSplit` says no is a refusal below, and a
+                            -- refusal is answered before any patch is sent.
+                            Result.withDefault ( [], [] ) split
 
                         SheetColumnMove from to ->
                             -- Its own inverse, which is the whole reason a move
@@ -4554,11 +4929,19 @@ updateDocMsg edit ({ sheet } as model) =
                                 Nothing ->
                                     ( [], [] )
 
-                -- Why this write cannot be stored, if it cannot. Both refusals
-                -- are about the header cell: y is 0 for a rename and -1 for a
-                -- type, which is the same cell and not a name at all.
+                -- Why this edit cannot be stored, if it cannot. The two header
+                -- ones are about the same cell: y is 0 for a rename and -1 for a
+                -- type, which is not a name at all.
                 writeRefusal =
                     case ( edit, sheet.write ) of
+                        ( SheetColumnSplit _ _, _ ) ->
+                            case split of
+                                Err message ->
+                                    Just message
+
+                                Ok _ ->
+                                    Nothing
+
                         ( SheetWrite { x, y }, Just write ) ->
                             if y == 0 then
                                 nameClash table.cols x write
@@ -4667,6 +5050,12 @@ updateKeyDown event ({ sheet } as model) =
         -- palette rather than in a column's panel. Lowercased because a browser
         -- reports the shifted key as "D".
         update (DocMsg SheetRowsDedupe) model
+
+    else if (event.ctrl || event.meta) && event.key == "Backspace" && event.shift then
+        -- Here rather than beside Ctrl/⌘+Backspace in the navigation case: that
+        -- one deletes columns and this one is not an edit at all, so it must
+        -- reach the library, whose every DocMsg is refused.
+        update TrashSelected model
 
     else if (event.ctrl || event.meta) && event.key == "d" then
         update (DocMsg (SheetFillDown sheet.select)) model
@@ -5216,7 +5605,7 @@ libraryCols model =
               -- this browser's, so a demo it does not want is a demo it can put
               -- away. Purging is not, because a system entry has nothing of its
               -- own to purge -- dropping it would only un-trash it.
-              iif model.trash [ madeCol "restore" "" Restore, madeCol "delete" "" Delete ] [ madeCol "trash" "" Trash ]
+              iif model.trash [ madeCol "restore" "" Restore, madeCol "delete" "" Delete ] [ madeCol "star" "" Star, madeCol "trash" "" Trash ]
             ]
 
 
@@ -5312,6 +5701,17 @@ viewSettings show info share =
                         , text (iif share.public "public: anyone can read" "private")
                         ]
                     , H.button [ A.onClick ShareLink ] [ text "mint view-only link" ]
+                    ]
+
+                -- The server refuses a publish over an email address, a phone
+                -- number, an SSN or a card number, and this is the claim that
+                -- answers it. Under the public box because it is about what
+                -- publishing does, and never read back off the server: a
+                -- navigation empties the panel, so nothing claims this on a
+                -- publisher's behalf on a sheet they have not looked at.
+                , H.label [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.25, S.marginTop "0.25rem" ]
+                    [ H.input [ A.type_ "checkbox", A.checked share.personal, A.onCheck SharePersonal ] []
+                    , text "holds personal data, publish anyway"
                     ]
 
                 -- Both blank mint the link this button always minted: thirty
@@ -5498,7 +5898,9 @@ shortcutGroups =
         ]
       )
     , ( "Library"
-      , [ ( "Enter", "open selected sheet", Nothing ) ]
+      , [ ( "Enter", "open selected sheet", Nothing )
+        , ( "Ctrl/⌘+Shift+Backspace", "trash selected sheets", Just TrashSelected )
+        ]
       )
     , ( "Help"
       , [ ( "Ctrl/⌘+K", "command palette", Nothing )
@@ -5543,10 +5945,91 @@ paletteCommands shelf query =
             shelf
                 |> Dict.filter (\k v -> k /= "" && not v.scratch && not v.trashed && matches [ k, v.name ])
                 |> Dict.toList
+                -- Starred first, the way the library table draws them, and the
+                -- rest in the order the dictionary gave: `List.sortBy` is
+                -- stable, so this moves the starred ones and nothing else.
+                |> List.sortBy (\( _, v ) -> iif v.starred 0 1)
                 |> List.map
                     (\( k, v ) -> Command (iif (String.isEmpty (String.trim v.name)) k v.name) k (Goto k))
     in
     List.take 12 (commands ++ sheets)
+
+
+{-| The palette as it is drawn: what the app can do anywhere, plus the one verb
+that only means something over the sheet that is open. `paletteCommands` reads
+`shortcutGroups` and knows nothing but the library, which is what keeps the
+shortcut sheet and the palette from drifting; a verb with no key belongs to
+neither list and is added here instead.
+
+Subscribing is offered over a sheet whose rows are data -- a table, a query, a
+feed, a hook -- and not over a run log, a listing or a chart. It is the footer's
+own new-alert door with the query and the destination filled in, so it is
+offered to a signed-in reader alone: the address the alert is sent to is the
+account's own.
+
+-}
+paletteRows : Model -> String -> List Command
+paletteRows model query =
+    let
+        label : String
+        label =
+            "subscribe to this sheet"
+
+        watchable : Bool
+        watchable =
+            case model.sheet.doc of
+                Ok (Tab _) ->
+                    True
+
+                Ok (Query _) ->
+                    True
+
+                Ok (NetHttp _) ->
+                    True
+
+                Ok NetHook ->
+                    True
+
+                _ ->
+                    False
+
+        -- The state and not the address: what a visitor typed into the login
+        -- form is a string in the same field, and an alert addressed to it is
+        -- one the server would refuse to make.
+        addressed : Bool
+        addressed =
+            case model.auth.state of
+                LoggedIn _ ->
+                    model.auth.email /= ""
+
+                _ ->
+                    False
+
+        subscribe : List Command
+        subscribe =
+            if watchable && addressed && String.contains (String.toLower (String.trim query)) label then
+                [ Command label model.sheet.id <|
+                    DocNew <|
+                        E.object
+                            [ ( "type", E.string "alert" )
+                            , ( "data"
+                              , E.list identity
+                                    [ E.object
+                                        [ ( "code", E.string ("select * from @" ++ model.sheet.id) )
+                                        , ( "to", E.string model.auth.email )
+                                        , ( "interval", E.int 3600 )
+                                        , ( "digest", E.bool False )
+                                        , ( "when", E.string "added" )
+                                        ]
+                                    ]
+                              )
+                            ]
+                ]
+
+            else
+                []
+    in
+    List.take 12 (subscribe ++ paletteCommands model.library query)
 
 
 viewShortcuts : Bool -> Html Msg
@@ -5582,7 +6065,7 @@ viewPalette model =
         Just p ->
             let
                 commands =
-                    paletteCommands model.library p.query
+                    paletteRows model p.query
             in
             viewModal (PaletteToggle False)
                 [ H.input
@@ -5769,6 +6252,35 @@ parseDay s =
 
         _ ->
             Nothing
+
+
+{-| Epoch milliseconds as the UTC ISO timestamp the alert document holds. The
+calendar is `elm/time`'s, so no month arithmetic happens here; only the digits
+are written out.
+-}
+isoStamp : Int -> String
+isoStamp ms =
+    let
+        at : Time.Posix
+        at =
+            Time.millisToPosix ms
+
+        pad : Int -> String
+        pad n =
+            String.padLeft 2 '0' (String.fromInt n)
+    in
+    String.padLeft 4 '0' (String.fromInt (Time.toYear Time.utc at))
+        ++ "-"
+        ++ pad (Date.monthToNumber (Time.toMonth Time.utc at))
+        ++ "-"
+        ++ pad (Time.toDay Time.utc at)
+        ++ "T"
+        ++ pad (Time.toHour Time.utc at)
+        ++ ":"
+        ++ pad (Time.toMinute Time.utc at)
+        ++ ":"
+        ++ pad (Time.toSecond Time.utc at)
+        ++ "Z"
 
 
 computeTemporalStats : Array Row -> String -> Stat
@@ -5997,10 +6509,18 @@ resolveTable model =
                     model.library
                         |> Dict.filter (\k v -> k /= "" && not v.scratch && v.trashed == model.trash && List.any (String.contains model.search) (k :: v.name :: v.tags))
                         |> Dict.toList
+                        -- Starred first, and only while nobody has chosen a
+                        -- sort: `filterAndSortIndexed`'s own sort is stable, so
+                        -- leaving this pre-sort in place once a real sort is
+                        -- active would keep starred rows first among that
+                        -- sort's ties -- a header click choosing its own order
+                        -- and losing to one nobody asked it to keep.
+                        |> iif (List.isEmpty model.sheet.sort) (List.sortBy (\( _, v ) -> iif v.starred 0 1)) identity
                         |> List.map
                             (\( k, v ) ->
                                 Dict.fromList
                                     [ ( "sheet_id", E.string k )
+                                    , ( "star", E.object [ ( "id", E.string k ), ( "on", E.bool v.starred ) ] )
                                     , ( "thumb", v.thumb )
                                     , ( "type", E.string (Maybe.withDefault "" <| List.head <| String.split ":" k) )
                                     , ( "name", E.string (iif (String.isEmpty (String.trim v.name)) "(untitled)" v.name) )
@@ -6329,6 +6849,127 @@ duplicateRows rows =
         |> List.reverse
 
 
+{-| The most columns one split may push. A cell with more parts than this says
+the delimiter matches something the values are made of rather than something
+between them -- a space against a column of sentences -- and the sheet it would
+push is unreadable and no faster to undo than to rebuild.
+-}
+maxSplitColumns : Int
+maxSplitColumns =
+    64
+
+
+{-| One text column, split into columns of its own. Every row's cell is split on
+the delimiter as text -- `String.split` matches the characters it is given, so a
+"." is a dot and a "|" is a bar, never a pattern -- and the widest split says how
+many columns are pushed: `<name> 1` .. `<name> n`, each typed text and keyed the
+way `SheetColumnPush` keys a new one. A row with fewer parts than the widest
+leaves its later cells unwritten, a cell that is not text has nothing to split,
+and the column split from stays where it is.
+
+The undo is the mirror: one splice taking the pushed columns back off `data[0]`,
+and a `del` per cell written, the way `SheetColumnDelete` puts back exactly what
+it took.
+
+Nothing at all is written when the split cannot be one every reader can key: an
+empty delimiter, a key this sheet does not carry, a column with no text in it, a
+delimiter no cell holds, a split past `maxSplitColumns`, or a name one of the new
+columns would collide with. Half a split -- the columns before the clash pushed
+and the clashing one left out -- is the shape `nameClash` exists to refuse.
+
+-}
+columnSplit : Array Col -> Array Row -> String -> String -> Result String ( List Patch, List Patch )
+columnSplit cols rows key delimiter =
+    let
+        -- Where the pushed columns land, which is the end of the column list,
+        -- and what they are keyed. The key is a number the way `SheetColumnPush`
+        -- writes one, but past every number this sheet already uses: a sheet
+        -- that has had a column deleted carries a key at its own length, and a
+        -- second column of that key would take its cells over.
+        at =
+            Array.length cols
+
+        base =
+            cols
+                |> Array.toList
+                |> List.filterMap (.key >> String.toInt)
+                |> List.maximum
+                |> Maybe.map ((+) 1)
+                |> Maybe.withDefault 0
+                |> max at
+    in
+    case cols |> Array.filter (\c -> c.key == key) |> Array.get 0 of
+        Nothing ->
+            Err ("Expected a column of this sheet to split, received the key \"" ++ key ++ "\", which it does not carry. Source: the split button in a column panel. Fix: reopen the sheet and split the column again.")
+
+        Just col ->
+            if delimiter == "" then
+                Err ("Expected the text that separates the parts of \"" ++ col.name ++ "\", received an empty box. Source: the split button in that column's panel. Fix: type what its values are separated by -- a comma, a space, a word -- and split again.")
+
+            else
+                let
+                    -- Every row the document holds, not the rows on screen, the
+                    -- way the cleaning verbs beside this one read them.
+                    rowParts =
+                        rows
+                            |> Array.toIndexedList
+                            |> List.filterMap
+                                (\( i, row ) ->
+                                    Dict.get col.key row
+                                        |> Maybe.andThen (D.decodeValue D.string >> Result.toMaybe)
+                                        |> Maybe.map (\text -> ( i + 1, String.split delimiter text ))
+                                )
+
+                    widest =
+                        rowParts |> List.map (Tuple.second >> List.length) |> List.maximum |> Maybe.withDefault 0
+
+                    names =
+                        List.range 1 widest |> List.map (\n -> col.name ++ " " ++ String.fromInt n)
+                in
+                if List.isEmpty rowParts then
+                    Err ("Expected a column with text in it, received \"" ++ col.name ++ "\", whose " ++ String.fromInt (Array.length rows) ++ " rows hold no text cell at all. Source: the split button in that column's panel. Fix: split a column whose values are text -- a number, a date and a blank have no parts.")
+
+                else if widest < 2 then
+                    Err ("Expected a value of \"" ++ col.name ++ "\" carrying \"" ++ delimiter ++ "\", received " ++ String.fromInt (List.length rowParts) ++ " text cells and not one of them holding it. Source: the split button in that column's panel. Fix: type the separator these values actually use, then split again.")
+
+                else if widest > maxSplitColumns then
+                    Err ("Expected a split into at most " ++ String.fromInt maxSplitColumns ++ " columns, received one row of \"" ++ col.name ++ "\" that splits into " ++ String.fromInt widest ++ ". Source: the split button in that column's panel. Fix: split on a separator that stands between the values rather than inside them.")
+
+                else
+                    case names |> List.filterMap (nameClash cols at) |> List.head of
+                        Just taken ->
+                            Err ("Expected room for the columns \"" ++ col.name ++ " 1\" .. \"" ++ col.name ++ " " ++ String.fromInt widest ++ "\", received a sheet that already has a column called \"" ++ taken ++ "\". Source: the split button in that column's panel. Fix: rename that column, or rename \"" ++ col.name ++ "\", then split again.")
+
+                        Nothing ->
+                            let
+                                cells =
+                                    rowParts
+                                        |> List.concatMap
+                                            (\( y, values ) ->
+                                                values
+                                                    |> List.indexedMap
+                                                        (\n value ->
+                                                            { action = "set"
+                                                            , path = [ E.int y, E.string (String.fromInt (base + n)) ]
+                                                            , value = E.string value
+                                                            }
+                                                        )
+                                            )
+                            in
+                            Ok
+                                ( { action = "push"
+                                  , path = [ E.int 0 ]
+                                  , value =
+                                        names
+                                            |> List.indexedMap (\n name -> E.object [ ( "name", E.string name ), ( "type", E.string "text" ), ( "key", E.int (base + n) ) ])
+                                            |> E.list identity
+                                  }
+                                    :: cells
+                                , List.map (\cell -> { action = "del", path = cell.path, value = E.null }) cells
+                                    ++ [ { action = "splice", path = [ E.int 0 ], value = E.list E.int [ at, widest ] } ]
+                                )
+
+
 {-| How a filled-down series is written back, and Nothing for a column no series
 belongs in.
 
@@ -6404,6 +7045,9 @@ seriesEncoder typ =
             Nothing
 
         Restore ->
+            Nothing
+
+        Star ->
             Nothing
 
         Create ->
@@ -6764,6 +7408,22 @@ cellDecoder typ decimals format i n =
             Restore ->
                 D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocRestore sheet_id) ] [ text "restore" ])
 
+            Star ->
+                -- The cell carries both halves, because the button is a toggle:
+                -- which sheet, and what it is now. Reading the state off the
+                -- glyph on screen is how a star that failed to write kept
+                -- offering to unstar.
+                D.map2
+                    (\sheet_id on ->
+                        H.button
+                            [ A.onClick (DocStar sheet_id (not on))
+                            , A.title (iif on "unstar this sheet" "star this sheet, to keep it at the top of the library")
+                            ]
+                            [ text (iif on "★" "☆") ]
+                    )
+                    (D.field "id" D.string)
+                    (D.field "on" D.bool)
+
             Thumb ->
                 D.map3 viewThumb
                     (D.field "cols" D.int)
@@ -6990,6 +7650,17 @@ viewHeaderCell sheet col =
                                 , H.button [ A.onClick (DocMsg (SheetColumnCase col.key Upper)) ] [ text "UPPER" ]
                                 , H.button [ A.onClick (DocMsg (SheetColumnCase col.key Lower)) ] [ text "lower" ]
                                 , H.button [ A.onClick (DocMsg (SheetRowsDropBlank col.key)), A.title "delete every row with nothing in this column" ] [ text "Drop blank rows" ]
+                                , H.label [ A.class "split", S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ]
+                                    [ H.input
+                                        [ A.placeholder "split on"
+                                        , A.title "the text between the parts, matched as the characters it is -- a . is a dot and a | is a bar"
+                                        , A.value sheet.splitOn
+                                        , A.onInput ColumnSplitInput
+                                        , S.widthRem 4
+                                        ]
+                                        []
+                                    , H.button [ A.onClick (DocMsg (SheetColumnSplit col.key sheet.splitOn)), A.title "add a column per part, leaving this one where it is" ] [ text "Split" ]
+                                    ]
                                 ]
 
                           else
@@ -7461,11 +8132,14 @@ viewNetHook model =
         ]
 
 
-viewNetHttp : Model -> { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String } -> Html Msg
+viewNetHttp : Model -> { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String, mode : String, key : String, rowsPath : String, paused : Bool } -> Html Msg
 viewNetHttp model cfg =
     let
         paging =
             pageForm cfg.pageBy
+
+        storing =
+            storeForm cfg.mode
     in
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ viewNetWarning model
@@ -7510,8 +8184,31 @@ viewNetHttp model cfg =
             )
             (text "")
         , H.span [ S.fontSizeRem 0.8125, S.color "#666" ] [ text paging.hint ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "rows path"
+            , H.input [ A.class "mono", A.type_ "text", A.value cfg.rowsPath, A.placeholder "data", A.title "names joined by dots, at most eight of them: where in the answer the rows sit, for a feed that hands back more than one array", A.onInput (InputChange NetRowsPath) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "keep"
+            , H.select [ A.value cfg.mode, A.onInput (InputChange NetMode) ] <|
+                List.map (\m -> H.option [ A.value m, A.selected (m == cfg.mode) ] [ text (iif (m == "") "append, every run" m) ]) ("" :: netModes)
+            ]
+        , iif storing.key
+            (H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+                [ text "key"
+                , H.input [ A.class "mono", A.type_ "text", A.value cfg.key, A.placeholder "id", A.title "names joined by dots, at most eight of them: the poller refuses anything else, and a row holding nothing there is a failed poll", A.onInput (InputChange NetKey) ] []
+                ]
+            )
+            (text "")
+        , H.span [ S.fontSizeRem 0.8125, S.color "#666" ] [ text storing.hint ]
+        , H.label [ S.displayFlex, S.gapRem 0.5, S.alignItemsCenter, S.fontSizeRem 0.875 ]
+            [ H.input [ A.id "paused", A.type_ "checkbox", A.checked cfg.paused, A.onCheck (\on -> InputChange NetPaused (iif on "1" "")) ] []
+            , text "paused: the poller steps over this sheet and writes nothing"
+            ]
         , H.div [ S.displayFlex, S.gapRem 0.5, S.alignItemsCenter ]
             [ H.button [ A.class "chip", A.onClick Preflight, A.title "fetch it once, now, and show what comes back" ] [ text "test the request" ]
+            , H.button [ A.class "chip", A.onClick RunNow, A.title "poll it now: the row it writes lands in the rows beside this" ] [ text "run now" ]
+            , viewNextRun cfg.paused model
             , H.span [ S.fontSizeRem 0.875, S.color "#666" ]
                 [ text <|
                     case model.sheet.table of
@@ -7523,6 +8220,7 @@ viewNetHttp model cfg =
                 ]
             ]
         , viewPreflight model.sheet.preflight
+        , viewRun model.sheet.run
         ]
 
 
@@ -7554,7 +8252,45 @@ viewPreflight tested =
                 ]
 
 
-viewAlert : Model -> { code : String, to : String, interval : Int, digest : Bool, when : When } -> Html Msg
+{-| What the run just now landed, in one line off its own `net` row. A refusal
+is the server's own sentence about it.
+-}
+viewRun : Maybe (Result String String) -> Html Msg
+viewRun ran =
+    case ran of
+        Nothing ->
+            text ""
+
+        Just (Err error) ->
+            H.pre [ A.class "mono run", S.color "#b00", S.whiteSpacePreWrap, S.fontSizeRem 0.75 ] [ text error ]
+
+        Just (Ok line) ->
+            H.pre [ A.class "mono run", S.whiteSpacePreWrap, S.fontSizeRem 0.75 ] [ text line ]
+
+
+{-| When the poller takes this sheet next, off the freshness the library already
+reads. A sheet the due map has not reached yet says nothing rather than naming a
+time nobody has decided, and a paused sheet says that instead: its due entry is
+left where it was and means nothing until it runs again.
+-}
+viewNextRun : Bool -> Model -> Html Msg
+viewNextRun paused model =
+    H.span [ A.class "next-run", S.fontSizeRem 0.875, S.color "#666" ]
+        [ text <|
+            if paused then
+                "paused"
+
+            else
+                case model.freshness |> Dict.get model.sheet.id |> Maybe.andThen .nextRun of
+                    Nothing ->
+                        ""
+
+                    Just at ->
+                        "next run " ++ String.left 16 (String.replace "T" " " at)
+        ]
+
+
+viewAlert : Model -> { code : String, to : String, interval : Int, digest : Bool, when : When, paused : Bool, snoozedUntil : String } -> Html Msg
 viewAlert model cfg =
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
@@ -7578,6 +8314,32 @@ viewAlert model cfg =
             [ H.input [ A.type_ "checkbox", A.checked cfg.digest, A.onCheck (\on -> InputChange AlertDigest (iif on "1" "")) ] []
             , text "fold into the daily digest, sent to the account email"
             ]
+        , H.label [ S.displayFlex, S.gapRem 0.5, S.alignItemsCenter, S.fontSizeRem 0.875 ]
+            [ H.input [ A.id "paused", A.type_ "checkbox", A.checked cfg.paused, A.onCheck (\on -> InputChange NetPaused (iif on "1" "")) ] []
+            , text "paused: the poller steps over this sheet and writes nothing"
+            ]
+        , H.div [ S.displayFlex, S.gapRem 0.5, S.alignItemsCenter ]
+            [ H.button [ A.class "chip", A.onClick RunNow, A.title "run it now: the row it writes lands in the rows beside this" ] [ text "run now" ]
+            , viewNextRun cfg.paused model
+            ]
+
+        -- Silence is not pause: the runs go on, the verdicts go on being
+        -- recorded, and only the delivery is held. A snooze whose moment has
+        -- passed is over, so it is neither drawn nor offered a way out.
+        --
+        -- Compared as text, because both sides are the UTC ISO stamp the chip
+        -- writes and ISO sorts the way the calendar does. A cell the poller
+        -- refuses by name is drawn as whatever it says, with the unsnooze that
+        -- clears it: the refusal is the check, and this is the way out of it.
+        , if cfg.snoozedUntil > isoStamp model.now then
+            H.div [ S.displayFlex, S.gapRem 0.5, S.alignItemsCenter, S.fontSizeRem 0.875 ]
+                [ H.span [] [ text ("snoozed until " ++ String.left 16 (String.replace "T" " " cfg.snoozedUntil)) ]
+                , H.button [ A.class "chip", A.onClick (InputChange AlertSnoozed ""), A.title "send again from the next run on" ] [ text "unsnooze" ]
+                ]
+
+          else
+            H.button [ A.class "chip", A.onClick AlertSnooze, A.title "keep deciding, keep recording, send nothing for a day" ] [ text "snooze a day" ]
+        , viewRun model.sheet.run
         , H.p [ S.fontSizeRem 0.875, S.color "#666" ]
             [ text <|
                 case model.sheet.table of
@@ -7644,7 +8406,7 @@ chartSet id field value =
     changeDoc { id = id, data = [ { action = "set", path = [ E.int 0, E.string field ], value = E.string value } ] }
 
 
-viewChartSettings : Model -> { source : String, kind : ChartKind, x : String, y : String } -> Html Msg
+viewChartSettings : Model -> { source : String, kind : ChartKind, x : String, y : String, series : String } -> Html Msg
 viewChartSettings model cfg =
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
@@ -7669,11 +8431,28 @@ viewChartSettings model cfg =
             [ text "up"
             , H.input [ A.class "mono", A.value cfg.y, A.placeholder "spent", A.onInput (InputChange ChartY) ] []
             ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "split by"
+            , H.input [ A.class "mono", A.value cfg.series, A.placeholder "department", A.onInput (InputChange ChartSeries) ] []
+            ]
         , H.p [ S.fontSizeRem 0.875, S.color "#666" ]
             [ text <|
                 case model.sheet.table of
                     Ok tbl ->
-                        String.fromInt (Array.length tbl.rows) ++ " points"
+                        let
+                            drawn =
+                                chartPoints tbl
+
+                            -- What a fold cost, counted rather than left for the
+                            -- reader to notice: a chart quietly drawing averages
+                            -- of its rows is a chart lying about its rows.
+                            folded =
+                                List.length (List.concatMap Tuple.second drawn)
+                                    - List.length (List.concatMap Tuple.second (chartFold drawn))
+                        in
+                        String.fromInt (Array.length tbl.rows)
+                            ++ " points"
+                            ++ iif (folded == 0) "" (", " ++ String.fromInt folded ++ " folded into bucket averages")
 
                     Err _ ->
                         "no points yet"
@@ -7681,44 +8460,291 @@ viewChartSettings model cfg =
         ]
 
 
-{-| The plotted points, in the order the query returned them. A row whose y does
-not read as a number is dropped: a chart cannot draw "n/a", and pretending it is
-zero would be a lie about the shape.
+{-| The colours a chart cycles through, one per series. The first is the colour
+every chart drew in before a chart could draw more than one thing, so a chart
+with nothing to split by is the picture it always was.
 -}
-chartPoints : Table -> List ( String, Float )
+chartColours : List String
+chartColours =
+    [ "#468", "#c64", "#4a7", "#96c", "#ca3", "#877" ]
+
+
+{-| The plotted points, grouped into series in the order they arrive: the query
+orders by series and then by x, so each series arrives whole and in the order it
+is drawn. A chart with no series column is one series with no name.
+
+A row whose y does not read as a number is dropped: a chart cannot draw "n/a",
+and pretending it is zero would be a lie about the shape.
+
+-}
+chartPoints : Table -> List ( String, List ( String, Float ) )
 chartPoints tbl =
     tbl.rows
         |> Array.toList
         |> List.filterMap
             (\row ->
-                Maybe.map2 Tuple.pair
-                    (Dict.get "x" row |> Maybe.map (D.decodeValue D.string >> Result.withDefault ""))
+                -- The lenient `string` decoder, not D.string: chartSql casts both
+                -- columns as the sheet holds them, so an int id arrives as a JSON
+                -- number. Read as a blank, every row of a numeric x column shares
+                -- the one label and the chart stacks on a single point, and every
+                -- value of a numeric series column folds into the one unnamed
+                -- series.
+                Maybe.map2
+                    (\x y ->
+                        ( Dict.get "series" row
+                            |> Maybe.map (D.decodeValue string >> Result.withDefault "")
+                            |> Maybe.withDefault ""
+                        , ( x, y )
+                        )
+                    )
+                    (Dict.get "x" row |> Maybe.map (D.decodeValue string >> Result.withDefault ""))
                     (Dict.get "y" row |> Maybe.andThen (D.decodeValue number >> Result.toMaybe))
             )
+        |> List.foldl
+            (\( name, point ) acc ->
+                if List.any (\( n, _ ) -> n == name) acc then
+                    List.map (\( n, ps ) -> iif (n == name) ( n, point :: ps ) ( n, ps )) acc
+
+                else
+                    acc ++ [ ( name, [ point ] ) ]
+            )
+            []
+        |> List.map (\( name, ps ) -> ( name, List.reverse ps ))
 
 
-viewChart : { source : String, kind : ChartKind, x : String, y : String } -> Table -> Html Msg
-viewChart cfg tbl =
+{-| The most points one series is drawn with. The plot is 720 units wide, so
+past one point every other unit a line is drawing over itself and the browser is
+holding elements nobody can see.
+-}
+chartPointsMax : Int
+chartPointsMax =
+    360
+
+
+{-| A series past `chartPointsMax` points, averaged down to that many: the
+points are cut into equal buckets in day order, and each bucket is the mean of
+its y values at the earliest x it holds.
+
+Only a chart whose every x is a day folds. An ordinal axis is one place per
+distinct label, so a bucket's first label would be drawn where the labels it
+swallowed are still drawn by the other series -- on a day axis a bucket's first
+day is a place of its own.
+
+-}
+chartFold : List ( String, List ( String, Float ) ) -> List ( String, List ( String, Float ) )
+chartFold series =
+    if not (List.all (\( _, ps ) -> List.all (\( x, _ ) -> parseDay x /= Nothing) ps) series) then
+        series
+
+    else
+        series
+            |> List.map
+                (\( name, ps ) ->
+                    let
+                        size =
+                            (List.length ps + chartPointsMax - 1) // chartPointsMax
+                    in
+                    if List.length ps <= chartPointsMax then
+                        ( name, ps )
+
+                    else
+                        ( name
+                        , ps
+                            -- Sorted by day rather than left in arrival order,
+                            -- the way chartRuns places them: a bucket is a
+                            -- stretch of time, and the query's `order by x` is a
+                            -- string order, which a day column with inconsistent
+                            -- zero-padding ("2024-1-5" before "2024-01-10")
+                            -- still parses as days but does not sort as days.
+                            -- The guard above read every x, so no point falls
+                            -- back to day 0.
+                            |> List.sortBy (\( x, _ ) -> Maybe.withDefault 0 (parseDay x))
+                            |> List.indexedMap (\i point -> ( i // size, point ))
+                            |> List.foldr (\( b, point ) acc -> Dict.insert b (point :: Maybe.withDefault [] (Dict.get b acc)) acc) Dict.empty
+                            -- Dict.values is in key order, so the buckets come
+                            -- back in the order the days did; foldr is what
+                            -- leaves each one holding its own points that way
+                            -- too, earliest day first.
+                            |> Dict.values
+                            |> List.map
+                                (\held ->
+                                    -- A bucket holds the point that made it, so
+                                    -- the blank is never a label.
+                                    ( held |> List.head |> Maybe.map Tuple.first |> Maybe.withDefault ""
+                                    , List.sum (List.map Tuple.second held) / toFloat (List.length held)
+                                    )
+                                )
+                        )
+                )
+
+
+{-| Every series at its place across the plot, split into the runs that are
+drawn as one unbroken line. `Nothing` when any x of any series is not a day:
+the axis is then one place per distinct label, the way it always was.
+
+On a day axis the ends are the earliest and the latest day any series holds, a
+point sits at its own day between them, and a step wider than twice that
+series' median step is a gap in the data rather than a stretch of line nobody
+measured, so the run ends there and the next one starts after it.
+
+-}
+chartRuns : List ( String, List ( String, Float ) ) -> Maybe (List ( String, List (List ( Float, Float )) ))
+chartRuns series =
     let
         points =
-            chartPoints tbl
+            List.concatMap Tuple.second series
 
-        ys =
-            List.map Tuple.second points
+        days =
+            List.filterMap (Tuple.first >> parseDay) points
+    in
+    if List.isEmpty points || List.length days /= List.length points then
+        Nothing
+
+    else
+        let
+            -- The minimum and the maximum of a list this branch already knows
+            -- is not empty.
+            first =
+                Maybe.withDefault 0 (List.minimum days)
+
+            last =
+                Maybe.withDefault 0 (List.maximum days)
+
+            -- One day, or many days all the same: there is no span to sit in,
+            -- so the point sits where a lone point always sat.
+            plot day =
+                iif (last == first) 400 (60 + (toFloat (day - first) / toFloat (last - first)) * 720)
+        in
+        Just <|
+            List.map
+                (\( name, ps ) ->
+                    let
+                        -- Sorted by day and not left in arrival order: the query
+                        -- orders by x, but that is a string order, and a day
+                        -- column with inconsistent zero-padding ("2024-1-5"
+                        -- before "2024-01-10") still parses as a day while
+                        -- sorting wrong. Steps and runs mean the gaps between
+                        -- neighbouring days, and a day axis has no other
+                        -- neighbour to mean.
+                        dayed =
+                            List.filterMap (\( x, v ) -> Maybe.map (\day -> ( day, v )) (parseDay x)) ps
+                                |> List.sortBy Tuple.first
+
+                        steps =
+                            List.map2 (\( a, _ ) ( b, _ ) -> b - a) dayed (List.drop 1 dayed)
+
+                        sorted =
+                            List.sort steps
+
+                        -- The two middle steps averaged, which is one step when
+                        -- there is an odd number of them. No steps is a series
+                        -- of one point, and nothing to break.
+                        median =
+                            case ( List.drop ((List.length sorted - 1) // 2) sorted, List.drop (List.length sorted // 2) sorted ) of
+                                ( lo :: _, hi :: _ ) ->
+                                    toFloat (lo + hi) / 2
+
+                                _ ->
+                                    0
+
+                        ( _, open, closed ) =
+                            List.foldl
+                                (\( day, v ) ( previous, current, done ) ->
+                                    case previous of
+                                        Just was ->
+                                            if toFloat (day - was) > 2 * median then
+                                                ( Just day, [ ( plot day, v ) ], List.reverse current :: done )
+
+                                            else
+                                                ( Just day, ( plot day, v ) :: current, done )
+
+                                        Nothing ->
+                                            ( Just day, [ ( plot day, v ) ], done )
+                                )
+                                ( Nothing, [], [] )
+                                dayed
+                    in
+                    ( name, (List.reverse open :: closed) |> List.filter (not << List.isEmpty) |> List.reverse )
+                )
+                series
+
+
+viewChart : { source : String, kind : ChartKind, x : String, y : String, series : String } -> Table -> Html Msg
+viewChart cfg tbl =
+    let
+        series =
+            chartFold (chartPoints tbl)
+
+        points =
+            List.concatMap Tuple.second series
+
+        timed =
+            chartRuns series
+
+        -- The axis is the x labels and not the rows: two series are drawn
+        -- against the same one, and a bar stacks what shares a label.
+        xs =
+            let
+                arrived =
+                    points
+                        |> List.foldl
+                            (\( x, _ ) ( seen, out ) ->
+                                iif (Set.member x seen) ( seen, out ) ( Set.insert x seen, x :: out )
+                            )
+                            ( Set.empty, [] )
+                        |> Tuple.second
+                        |> List.reverse
+            in
+            case timed of
+                -- A day axis is read in day order, its two end labels and its
+                -- bars included: the query orders by the series first, so every
+                -- day of a second series arrives after every day of the first,
+                -- and the label that arrived last is not the one at the
+                -- right-hand end. `Just` is chartRuns saying it read every x as
+                -- a day, so nothing falls back to day 0.
+                Just _ ->
+                    List.sortBy (\x -> Maybe.withDefault 0 (parseDay x)) arrived
+
+                Nothing ->
+                    arrived
+
+        xAt =
+            xs |> List.indexedMap (\i x -> ( x, i )) |> Dict.fromList
+
+        -- Every point at its place on that axis. The lookup cannot miss: xAt is
+        -- built out of these same points.
+        placed =
+            series
+                |> List.map
+                    (\( name, ps ) ->
+                        ( name
+                        , ps |> List.filterMap (\( x, v ) -> Dict.get x xAt |> Maybe.map (\i -> ( i, v )))
+                        )
+                    )
+
+        -- A bar chart stacks its series, so its axis spans the sums on each
+        -- label; every other kind draws each series over the others.
+        stacked =
+            points
+                |> List.foldl (\( x, v ) acc -> Dict.insert x (v + Maybe.withDefault 0 (Dict.get x acc)) acc) Dict.empty
+                |> Dict.values
+
+        heights =
+            iif (cfg.kind == Bar) stacked (List.map Tuple.second points)
 
         -- The baseline is zero unless the data goes below it, because a bar
         -- chart that does not start at zero misstates every comparison on it.
         top =
-            Maybe.withDefault 1 (List.maximum ys) |> max 0
+            Maybe.withDefault 1 (List.maximum heights) |> max 0
 
         bottom =
-            Maybe.withDefault 0 (List.minimum ys) |> min 0
+            Maybe.withDefault 0 (List.minimum heights) |> min 0
 
         span =
             iif (top - bottom == 0) 1 (top - bottom)
 
         n =
-            List.length points
+            List.length xs
 
         plotY v =
             260 - ((v - bottom) / span) * 240
@@ -7729,89 +8755,185 @@ viewChart cfg tbl =
         num v =
             String.fromFloat (round2 v)
 
-        at i v =
-            String.fromFloat (plotX i) ++ "," ++ String.fromFloat (plotY v)
+        at px v =
+            String.fromFloat px ++ "," ++ String.fromFloat (plotY v)
 
-        path =
-            points |> List.indexedMap (\i ( _, v ) -> at i v) |> String.join " "
+        -- Where the line, the area and the dots are drawn: a run of points that
+        -- belong on one unbroken line. A day axis says where each point sits and
+        -- where the data has a hole; every other axis is one place per label, in
+        -- the order the labels arrive, and a series is the one run it always was.
+        runs =
+            case timed of
+                Just byDay ->
+                    byDay
+
+                Nothing ->
+                    placed |> List.map (\( name, ps ) -> ( name, [ List.map (\( i, v ) -> ( plotX i, v )) ps ] ))
+
+        -- chartColours is never empty, and modBy keeps the index inside it.
+        colourAt j =
+            chartColours |> List.drop (modBy (List.length chartColours) j) |> List.head |> Maybe.withDefault "#468"
+
+        path ps =
+            ps |> List.map (\( px, v ) -> at px v) |> String.join " "
 
         line =
-            [ Svg.polyline [ SvgA.fill "none", SvgA.stroke "#468", SvgA.strokeWidth "2", SvgA.points path ] [] ]
+            runs
+                |> List.indexedMap
+                    (\j ( _, rs ) ->
+                        rs
+                            |> List.map
+                                (\run ->
+                                    Svg.polyline [ SvgA.fill "none", SvgA.stroke (colourAt j), SvgA.strokeWidth "2", SvgA.points (path run) ] []
+                                )
+                    )
+                |> List.concat
 
-        -- The fill is drawn first and the line over it, so a value at the
+        -- Every fill is drawn first and the lines over them, so a value at the
         -- baseline still shows its stroke instead of being covered by its own
-        -- shading.
+        -- shading, and one series' shading cannot cover the series under it.
         area =
-            Svg.polygon
-                [ SvgA.fill "#468"
-                , SvgA.fillOpacity "0.25"
-                , SvgA.stroke "none"
-                , SvgA.points (String.join " " [ at 0 bottom, path, at (n - 1) bottom ])
-                ]
-                []
-                :: line
+            List.append
+                (runs
+                    |> List.indexedMap
+                        (\j ( _, rs ) ->
+                            rs
+                                |> List.map
+                                    (\run ->
+                                        let
+                                            -- A run holds at least one point:
+                                            -- chartRuns drops the empty ones and
+                                            -- chartPoints makes a series out of a
+                                            -- point.
+                                            first =
+                                                run |> List.head |> Maybe.map Tuple.first |> Maybe.withDefault 0
 
-        bars =
-            List.indexedMap
-                (\i ( _, v ) ->
-                    let
-                        w =
-                            iif (n == 0) 10 (720 / toFloat n * 0.7)
-                    in
-                    Svg.rect
-                        [ SvgA.x (String.fromFloat (60 + (toFloat i / toFloat (max 1 n)) * 720))
-                        , SvgA.y (String.fromFloat (min (plotY v) (plotY 0)))
-                        , SvgA.width (String.fromFloat w)
-                        , SvgA.height (String.fromFloat (abs (plotY v - plotY 0)))
-                        , SvgA.fill "#468"
-                        ]
-                        []
+                                            last =
+                                                run |> List.reverse |> List.head |> Maybe.map Tuple.first |> Maybe.withDefault 0
+                                        in
+                                        Svg.polygon
+                                            [ SvgA.fill (colourAt j)
+                                            , SvgA.fillOpacity "0.25"
+                                            , SvgA.stroke "none"
+                                            , SvgA.points (String.join " " [ at first bottom, path run, at last bottom ])
+                                            ]
+                                            []
+                                    )
+                        )
+                    |> List.concat
                 )
-                points
+                line
+
+        -- One rect per point, the series stacked per label in the order the
+        -- legend reads: each one starts where the ones before it left off, which
+        -- is what makes the top of the stack the sum. Bars are ordinal even on a
+        -- day axis, which every other kind reads as time: one bar per day across
+        -- a sparse year is a picture of hairlines nobody can read or click.
+        bars =
+            placed
+                |> List.indexedMap Tuple.pair
+                |> List.foldl
+                    (\( j, ( _, ps ) ) base ->
+                        List.foldl
+                            (\( i, v ) ( offsets, drawn ) ->
+                                let
+                                    from =
+                                        Maybe.withDefault 0 (Dict.get i offsets)
+
+                                    w =
+                                        iif (n == 0) 10 (720 / toFloat n * 0.7)
+                                in
+                                ( Dict.insert i (from + v) offsets
+                                , Svg.rect
+                                    [ SvgA.x (String.fromFloat (60 + (toFloat i / toFloat (max 1 n)) * 720))
+                                    , SvgA.y (String.fromFloat (min (plotY from) (plotY (from + v))))
+                                    , SvgA.width (String.fromFloat w)
+                                    , SvgA.height (String.fromFloat (abs (plotY (from + v) - plotY from)))
+                                    , SvgA.fill (colourAt j)
+                                    ]
+                                    []
+                                    :: drawn
+                                )
+                            )
+                            base
+                            ps
+                    )
+                    ( Dict.empty, [] )
+                |> Tuple.second
+                |> List.reverse
 
         dots =
-            List.indexedMap
-                (\i ( _, v ) ->
-                    Svg.circle
-                        [ SvgA.cx (String.fromFloat (plotX i))
-                        , SvgA.cy (String.fromFloat (plotY v))
-                        , SvgA.r "4"
-                        , SvgA.fill "#468"
-                        ]
-                        []
-                )
-                points
+            runs
+                |> List.indexedMap
+                    (\j ( _, rs ) ->
+                        List.concat rs
+                            |> List.map
+                                (\( px, v ) ->
+                                    Svg.circle
+                                        [ SvgA.cx (String.fromFloat px)
+                                        , SvgA.cy (String.fromFloat (plotY v))
+                                        , SvgA.r "4"
+                                        , SvgA.fill (colourAt j)
+                                        ]
+                                        []
+                                )
+                    )
+                |> List.concat
 
-        -- Every kind but the tile shares an axis and the two end labels, so the
-        -- series is the only thing each one of them decides.
-        plotted series =
+        -- A chart that splits its rows says which colour is which, in the same
+        -- viewBox, because downloadChart clones the one svg. A chart with
+        -- nothing to split by has nothing to name and draws no legend at all.
+        legend =
+            iif (List.all (\( name, _ ) -> name == "") series) [] <|
+                List.indexedMap
+                    (\j ( name, _ ) ->
+                        let
+                            lx =
+                                60 + toFloat j * (730 / toFloat (max 1 (List.length series)))
+                        in
+                        Svg.g []
+                            [ Svg.rect [ SvgA.x (String.fromFloat lx), SvgA.y "4", SvgA.width "10", SvgA.height "10", SvgA.fill (colourAt j) ] []
+                            , Svg.text_ [ SvgA.x (String.fromFloat (lx + 14)), SvgA.y "13", SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text name ]
+                            ]
+                    )
+                    series
+
+        -- Every kind but the tile shares an axis, the two end labels and the
+        -- legend, so the marks are the only thing each one of them decides.
+        plotted marks =
             List.concat
                 [ [ Svg.line [ SvgA.x1 "60", SvgA.y1 (String.fromFloat (plotY bottom)), SvgA.x2 "790", SvgA.y2 (String.fromFloat (plotY bottom)), SvgA.stroke "#aaa" ] []
                   , Svg.text_ [ SvgA.x "4", SvgA.y "24", SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (num top) ]
                   , Svg.text_ [ SvgA.x "4", SvgA.y (String.fromFloat (plotY bottom)), SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (num bottom) ]
                   ]
-                , series
+                , marks
                 , -- Only the ends are labelled: every tick would collide, and the
                   -- rows underneath are one click away in the source sheet.
-                  [ Svg.text_ [ SvgA.x "60", SvgA.y "290", SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (points |> List.head |> Maybe.map Tuple.first |> Maybe.withDefault "") ]
-                  , Svg.text_ [ SvgA.x "790", SvgA.y "290", SvgA.fontSize "12", SvgA.fill "#666", SvgA.textAnchor "end" ] [ Svg.text (points |> List.reverse |> List.head |> Maybe.map Tuple.first |> Maybe.withDefault "") ]
+                  [ Svg.text_ [ SvgA.x "60", SvgA.y "290", SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (xs |> List.head |> Maybe.withDefault "") ]
+                  , Svg.text_ [ SvgA.x "790", SvgA.y "290", SvgA.fontSize "12", SvgA.fill "#666", SvgA.textAnchor "end" ] [ Svg.text (xs |> List.reverse |> List.head |> Maybe.withDefault "") ]
                   ]
+                , legend
                 ]
 
-        -- The last point is the number, the one before it is what it is compared
-        -- against, and the whole series is the sparkline beside them. A tile
-        -- reads the same two columns every other kind does, so no chart document
-        -- gains a field to hold one.
+        -- The tile is the first series and says which one it is. The last point
+        -- is the number, the one before it is what it is compared against, and
+        -- that series is the sparkline beside them.
+        tilePoints =
+            series |> List.head |> Maybe.map Tuple.second |> Maybe.withDefault []
+
+        tileName =
+            series |> List.head |> Maybe.map Tuple.first |> Maybe.withDefault ""
+
         latest =
-            points |> List.reverse |> List.head
+            tilePoints |> List.reverse |> List.head
 
         previous =
-            points |> List.reverse |> List.drop 1 |> List.head
+            tilePoints |> List.reverse |> List.drop 1 |> List.head
 
         -- Its own scale rather than plotX/plotY: the sparkline lives in the
         -- right third of the same viewBox, and the value has the rest.
         sparkAt i v =
-            String.fromFloat (iif (n < 2) 600 (430 + (toFloat i / toFloat (n - 1)) * 350))
+            String.fromFloat (iif (List.length tilePoints < 2) 600 (430 + (toFloat i / toFloat (List.length tilePoints - 1)) * 350))
                 ++ ","
                 ++ String.fromFloat (230 - ((v - bottom) / span) * 160)
 
@@ -7823,7 +8945,8 @@ viewChart cfg tbl =
                 Just ( label, v ) ->
                     List.concat
                         [ [ Svg.text_ [ SvgA.x "40", SvgA.y "150", SvgA.fontSize "92", SvgA.fill "#1a1a1a" ] [ Svg.text (num v) ]
-                          , Svg.text_ [ SvgA.x "40", SvgA.y "230", SvgA.fontSize "20", SvgA.fill "#666" ] [ Svg.text label ]
+                          , Svg.text_ [ SvgA.x "40", SvgA.y "230", SvgA.fontSize "20", SvgA.fill "#666" ]
+                                [ Svg.text (label ++ iif (tileName == "") "" (" · " ++ tileName)) ]
                           ]
                         , -- No arrow colour: whether a rise is good is the
                           -- reader's question, not this chart's, and a green
@@ -7840,7 +8963,7 @@ viewChart cfg tbl =
                                 [ SvgA.fill "none"
                                 , SvgA.stroke "#468"
                                 , SvgA.strokeWidth "2"
-                                , SvgA.points (points |> List.indexedMap (\i ( _, v_ ) -> sparkAt i v_) |> String.join " ")
+                                , SvgA.points (tilePoints |> List.indexedMap (\i ( _, v_ ) -> sparkAt i v_) |> String.join " ")
                                 ]
                                 []
                           ]
@@ -7960,7 +9083,7 @@ view : Model -> Browser.Document Msg
 view ({ sheet } as model) =
     let
         info =
-            model.library |> Dict.get sheet.id |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = E.null, seen = "", trashed = False }
+            model.library |> Dict.get sheet.id |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = E.null, seen = "", trashed = False, starred = False }
 
         stats =
             sheet.stats

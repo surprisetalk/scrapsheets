@@ -3169,6 +3169,20 @@ const QUERIES = {
       "select f.field, f.zone, z.min_f, z.max_f, f.acres, f.hybrid, f.yield_bu, round(f.yield_bu * f.price_per_bu, 2) as revenue_per_acre, round(f.seed_per_acre + f.fert_per_acre, 2) as cost_per_acre, round(f.yield_bu * f.price_per_bu - f.seed_per_acre - f.fert_per_acre, 2) as margin_per_acre, round((f.yield_bu * f.price_per_bu - f.seed_per_acre - f.fert_per_acre) * f.acres, 2) as margin from @table:fields f join @table:hardiness-zones z on z.zone = f.zone order by margin_per_acre desc",
     ),
   },
+  // One plane through two input columns at once, and every field's distance from
+  // it. The fit is the subquery -- one regression over every field -- and the
+  // coefficients it answers ride back onto each row, so the residual is the
+  // field's own: what this ground yielded over what its inputs bought anywhere
+  // else, which no average of either column on its own can say.
+  "query:yield-response": {
+    name: "yield response to inputs",
+    tags: ["demo", "agriculture", "query"],
+    system: true,
+    doc: QuerySql(
+      { seed_per_acre: "usd", fert_per_acre: "usd", yield_bu: "num", fitted_bu: "num", residual_bu: "num" },
+      "select f.field, f.hybrid, f.seed_per_acre, f.fert_per_acre, f.yield_bu, round(ols_predict(m.coefs, f.seed_per_acre, f.fert_per_acre), 1) as fitted_bu, round(f.yield_bu - ols_predict(m.coefs, f.seed_per_acre, f.fert_per_acre), 1) as residual_bu from @table:fields f, (select ols(array(yield_bu), array(seed_per_acre), array(fert_per_acre)) as coefs from @table:fields) m order by residual_bu desc",
+    ),
+  },
   // A conflict check. Every name on the other side of one matter, scored against
   // every client on another: the firm cannot act against somebody it acts for,
   // and the intake form spells them differently every time.
@@ -4091,6 +4105,23 @@ const QUERIES = {
       data: [{ source: "@query:cost-per-mile", kind: "scatter", x: "vehicle", y: "cost_per_mile" }],
     },
   },
+  // The one bundled chart that plots more than one thing: a line per cohort over
+  // the months since its first order, which is the shape a retention curve is
+  // read in. Its source groups by the pair it is drawn on, because a chart draws
+  // one point per label per series and two rows for one land on each other. The
+  // youngest cohort is a single point and draws no line -- the same short corner
+  // query:cohort-grid keeps.
+  "chart:cohort-curves": {
+    name: "revenue per customer by cohort",
+    tags: ["demo", "retail", "chart"],
+    system: true,
+    doc: {
+      type: "chart",
+      data: [
+        { source: "@query:cohort-retention", kind: "line", x: "month_no", y: "revenue_per_customer", series: "cohort" },
+      ],
+    },
+  },
   "dashboard:budget-watch": {
     name: "budget watch",
     tags: ["demo", "government", "dashboard"],
@@ -4110,6 +4141,20 @@ const QUERIES = {
     doc: QuerySql(
       { starts: "date", attendance: "num" },
       "select event, city, state, starts, attendance from @query:events-by-state where starts >= '2026-06-01' and starts <= '2026-08-31' order by attendance desc",
+    ),
+  },
+  // A distribution on each input rather than a single number for it. Every row
+  // of @table:trials is one draw of a price and one of a volume, the trial
+  // number is the seed, and what comes back is the spread of the margin those
+  // two produce -- the answer a plan built on one guess per input cannot give.
+  // The samplers are seeded, so this sheet reads the same on every reload.
+  "query:monte-carlo-margin": {
+    name: "monte carlo margin",
+    tags: ["demo", "finance", "query"],
+    system: true,
+    doc: QuerySql(
+      { p10: "usd", p50: "usd", p90: "usd" },
+      "select round(percentile(array(margin), 0.1), 2) as p10, round(percentile(array(margin), 0.5), 2) as p50, round(percentile(array(margin), 0.9), 2) as p90 from (select sample_normal(trial, 24.5, 3.1) * sample_triangular(trial, 800, 1150, 2000) as margin from @table:trials)",
     ),
   },
 };
@@ -7433,6 +7478,13 @@ const fields = Table(
   ["F-17", "Hilltop", "5b", 184.0, "AG-3355", 120.04, 114.71, 207.0, 5.08],
 );
 
+// The seeds a simulation runs over: one row per trial and nothing else, because
+// what varies is what the sampler draws and not what the sheet holds.
+const trials = Table(
+  ["trial::int"].map(Col),
+  ...Array.from({ length: 500 }, (_, i) => [i + 1]),
+);
+
 export const DATASETS = [
   { doc_id: "countries", name: "countries", tags: ["example", "dataset"], doc: countries },
   { doc_id: "currencies", name: "iso 4217 currencies", tags: ["example", "reference"], doc: currencies },
@@ -7532,6 +7584,7 @@ export const DATASETS = [
   { doc_id: "colors", name: "css colors", tags: ["example", "dataset"], doc: colors },
   { doc_id: "events", name: "events 2026", tags: ["example", "dataset"], doc: events },
   { doc_id: "net-demo", name: "webhook demo", tags: ["example", "dataset"], doc: netDemo },
+  { doc_id: "trials", name: "monte carlo trials", tags: ["demo", "reference"], doc: trials },
 ];
 
 export const EXAMPLES = {

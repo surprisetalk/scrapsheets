@@ -608,6 +608,18 @@ Deno.test("the page offers exactly the paging modes the poller reads", async () 
   same(quoted(poller, /"([^"]+)"/g), quoted(page, /"([^"]+)"/g), "main.ts's PAGE_BY", "src/Main.elm's pageBy");
 });
 
+// And so is what a good run does to the runs before it: read by storeConfig in
+// main.ts and offered by the select in Main.elm. Same reason, same guard.
+Deno.test("the page offers exactly the storage modes the poller reads", async () => {
+  const ts = await Deno.readTextFile(dir + "main.ts");
+  const elm = await Deno.readTextFile(dir + "src/Main.elm");
+  const poller = ts.split("const NET_MODES = [")[1]?.split("]")[0] ?? "";
+  assert(poller.includes('"'), "NET_MODES should still be a list of spellings in main.ts");
+  const page = elm.split("netModes =")[1]?.split("]")[0] ?? "";
+  assert(page.includes('"'), "netModes should still be a list of spellings in src/Main.elm");
+  same(quoted(poller, /"([^"]+)"/g), quoted(page, /"([^"]+)"/g), "main.ts's NET_MODES", "src/Main.elm's netModes");
+});
+
 Deno.test("the server's union admits exactly the column types the engine knows", async () => {
   const ts = await Deno.readTextFile(dir + "main.ts");
   const union = ts.split("export type Type =")[1]?.split(";")[0] ?? "";

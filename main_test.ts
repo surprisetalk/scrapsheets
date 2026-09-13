@@ -40,7 +40,9 @@ import {
   PAGE_MAX,
   parseNetHeaders,
   pollAlertOnce,
+  pollAlertSheet,
   pollNetOnce,
+  pollNetSheet,
   RATE_LIMIT_KEYS_MAX,
   requireSecret,
   safeFetch,
@@ -123,6 +125,26 @@ const deliver = async (sheet_id: string, body: string, query = "") =>
     }),
     body,
   });
+
+// One feed, through the very function the tick hands each due sheet -- not
+// the tick itself, which walks every net-http sheet the earlier steps left
+// and would re-poll the whole pile for one sheet's assertion.
+const pollFeed = (sheet_id: string, fetcher?: Parameters<typeof pollNetSheet>[2], at?: number) =>
+  pollNetSheet(sheet_id, sheet_id.split(":")[1], fetcher, at);
+
+// One alert, through the same function, for the same reason: the tick walks
+// every alert sheet the earlier steps left.
+const pollAlert = async (
+  sheet_id: string,
+  send?: Parameters<typeof pollAlertSheet>[1],
+  at?: number,
+  fetcher?: Parameters<typeof pollAlertSheet>[3],
+) => {
+  const [alert] = await sql`
+    select sheet_id, doc_id, name, created_by from sheet where sheet_id = ${sheet_id}
+  `;
+  await pollAlertSheet(alert, send, at, fetcher);
+};
 
 const usr = async (email: string) => {
   const [{ usr_id }] = await sql`
@@ -760,7 +782,7 @@ Deno.test(async function allTests(t) {
       let clock = Date.now() + 86_400_000;
 
       // Nothing breaches yet, so the first run records "clear" and sends nothing.
-      await pollAlertOnce(send, clock);
+      await pollAlert(alert_id, send, clock);
       assertEquals(sent.length, 0, "a clear alert should not email anyone");
       assertEquals((await history())[0].status, "clear");
 
@@ -769,7 +791,7 @@ Deno.test(async function allTests(t) {
       // empty log otherwise, and nothing outside this log can tell them apart.
       const settled = (await history()).length;
       clock += 120_000;
-      await pollAlertOnce(send, clock);
+      await pollAlert(alert_id, send, clock);
       const quiet = await history();
       assertEquals(quiet.length, settled + 1, "every run is recorded, changed or not");
       // The sheet's own interval rides the run, which is what lets the status
@@ -787,7 +809,7 @@ Deno.test(async function allTests(t) {
         d.data[1][1] = 1.4;
       });
       clock += 120_000;
-      await pollAlertOnce(send, clock);
+      await pollAlert(alert_id, send, clock);
       assertEquals(sent.length, 1, "a breach should email once");
       assertEquals(sent[0].to, "ops@example.com");
       assertEquals(sent[0].rows.length, 1);
@@ -800,7 +822,7 @@ Deno.test(async function allTests(t) {
       // Still breaching, same rows: no second email, and the unchanged run
       // carries the matched rows forward so the next diff is still honest.
       clock += 120_000;
-      await pollAlertOnce(send, clock);
+      await pollAlert(alert_id, send, clock);
       assertEquals(sent.length, 1, "the same breach should not email twice");
       assertEquals((await history())[0].status, "unchanged");
 
@@ -809,7 +831,7 @@ Deno.test(async function allTests(t) {
       // pushes the held run the daily digest still has to find past NET_KEEP.
       const held = (await history()).length;
       clock += 120_000;
-      await pollAlertOnce(send, clock);
+      await pollAlert(alert_id, send, clock);
       assertEquals((await history()).length, held, "a repeated quiet tick is one row, not a row per tick");
 
       // A second region breaches and the first recovers: one row in, one out.
@@ -818,7 +840,7 @@ Deno.test(async function allTests(t) {
         d.data[2][1] = 1.9;
       });
       clock += 120_000;
-      await pollAlertOnce(send, clock);
+      await pollAlert(alert_id, send, clock);
       assertEquals(sent.length, 2, "a different breach should email again");
       assertEquals([sent[1].added, sent[1].removed], [1, 1]);
       const swapped = (await history())[0];
@@ -837,12 +859,12 @@ Deno.test(async function allTests(t) {
           d.data[1][1] = 2.5;
         });
         clock += 120_000;
-        await pollAlertOnce(refuse, clock);
+        await pollAlert(alert_id, refuse, clock);
         assertEquals(refusals.length, 1);
         assert(String((await history())[0].delivery).includes("resend refused"));
 
         clock += 120_000;
-        await pollAlertOnce(refuse, clock);
+        await pollAlert(alert_id, refuse, clock);
         assertEquals(refusals.length, 2, "the same rows must be sent again after a failed delivery");
         assertEquals((await history())[0].status, "firing", "a retry is a firing run, not an unchanged one");
       }
@@ -852,7 +874,7 @@ Deno.test(async function allTests(t) {
         d.data[0].code = "select * fromm nowhere";
       });
       clock += 120_000;
-      await pollAlertOnce(send, clock);
+      await pollAlert(alert_id, send, clock);
       const failed = (await history())[0];
       assertEquals(failed.status, "error");
       assert(String(failed.error).includes("fromm"), `expected the bad SQL named, got: ${failed.error}`);
@@ -869,7 +891,7 @@ Deno.test(async function allTests(t) {
           d.data[0].digest = true;
         });
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(alert_id, send, clock);
         assertEquals(sent.length, 2, "a digest alert should not email on its own");
         assertEquals((await history())[0].delivery, "held for the daily digest");
 
@@ -911,7 +933,7 @@ Deno.test(async function allTests(t) {
       {
         setWhen("added");
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(alert_id, send, clock);
         assertEquals((await history())[0].status, "unchanged");
         assertEquals(sent.length, 2);
       }
@@ -920,7 +942,7 @@ Deno.test(async function allTests(t) {
       {
         burn(2, 0);
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(alert_id, send, clock);
         const left = (await history())[0];
         assertEquals([left.status, left.rows, left.added, left.removed, left.when], ["clear", 1, 0, 1, "added"]);
         assertEquals(left.delivery, "no rows added since the run before, so nothing was sent");
@@ -931,7 +953,7 @@ Deno.test(async function allTests(t) {
       {
         burn(2, 1.1);
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(alert_id, send, clock);
         assertEquals((await history())[0].status, "firing");
         assertEquals(sent.length, 3, "a new row is what an added alert exists for");
         assertEquals(sent[2].added, 1);
@@ -943,7 +965,7 @@ Deno.test(async function allTests(t) {
         setWhen("added", true);
         burn(2, 1.3);
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(alert_id, send, clock);
         const held_ = (await history())[0];
         assertEquals([held_.status, held_.added, held_.delivery], ["firing", 1, "held for the daily digest"]);
         assertEquals(sent.length, 3, "held, not mailed");
@@ -955,14 +977,14 @@ Deno.test(async function allTests(t) {
         setWhen("removed");
         burn(2, 0);
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(alert_id, send, clock);
         assertEquals((await history())[0].status, "firing");
         assertEquals(sent.length, 4);
         assertEquals(sent[3].removed, 1);
 
         burn(1, 0);
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(alert_id, send, clock);
         const emptied = (await history())[0];
         assertEquals([emptied.status, emptied.rows, emptied.removed], ["firing", 0, 1]);
         assertEquals(sent.length, 5, "the last row leaving is a change worth sending");
@@ -980,10 +1002,10 @@ Deno.test(async function allTests(t) {
           return Promise.resolve("resend refused it with 500: down");
         };
         clock += 120_000;
-        await pollAlertOnce(refuse, clock);
+        await pollAlert(alert_id, refuse, clock);
         assertEquals(refusals.length, 1);
         clock += 120_000;
-        await pollAlertOnce(refuse, clock);
+        await pollAlert(alert_id, refuse, clock);
         assertEquals(refusals.length, 2, "the rows that never arrived are sent again");
         assertEquals((await history())[0].status, "firing");
       }
@@ -993,7 +1015,7 @@ Deno.test(async function allTests(t) {
       {
         setWhen("bogus");
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(alert_id, send, clock);
         const unknown = (await history())[0];
         assertEquals(unknown.status, "error");
         assert(String(unknown.error).includes("bogus"), String(unknown.error));
@@ -1009,7 +1031,7 @@ Deno.test(async function allTests(t) {
           d.data[0].code = `explain ${watching}`;
         });
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(alert_id, send, clock);
         const profiled = (await history())[0];
         assertEquals(profiled.status, "error");
         assert(String(profiled.error).includes("watches a profile"), String(profiled.error));
@@ -1046,7 +1068,7 @@ Deno.test(async function allTests(t) {
         };
 
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(`alert:${alert2.documentId}`, send, clock);
         const first = (await history2())[0];
         assertEquals(first.status, "clear");
         assert(String(first.diff_skipped).includes("first run"), String(first.diff_skipped));
@@ -1057,7 +1079,7 @@ Deno.test(async function allTests(t) {
           for (let i = 0; i < 198; i++) d.data.push({ 0: 10 + i });
         });
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(`alert:${alert2.documentId}`, send, clock);
         const over = (await history2())[0];
         assertEquals(over.status, "error");
         assert(String(over.error).includes("more than the 200 rows"), String(over.error));
@@ -1067,7 +1089,7 @@ Deno.test(async function allTests(t) {
           d.data.splice(4, 198);
         });
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(`alert:${alert2.documentId}`, send, clock);
         const after = (await history2())[0];
         assertEquals([after.status, after.added], ["clear", null]);
         assert(String(after.diff_skipped).includes("the run before failed"), String(after.diff_skipped));
@@ -1091,7 +1113,7 @@ Deno.test(async function allTests(t) {
         target("https://hooks.slack.com/services/T0/B0/zzz");
         burn(2, 1.4);
         clock += 120_000;
-        await pollAlertOnce(send, clock, fetcher);
+        await pollAlert(alert_id, send, clock, fetcher);
         assertEquals(posts.length, 1, "a url destination is posted to");
         assertEquals(posts[0].url, "https://hooks.slack.com/services/T0/B0/zzz");
         assertEquals(Object.keys(posts[0].body), ["text"], "slack reads one field and ignores the rest");
@@ -1111,7 +1133,7 @@ Deno.test(async function allTests(t) {
         target("https://example.com/hooks/alerts");
         burn(2, 1.6);
         clock += 120_000;
-        await pollAlertOnce(send, clock, fetcher);
+        await pollAlert(alert_id, send, clock, fetcher);
         assertEquals(posts.length, 2);
         assertEquals([posts[1].body.sheet, posts[1].body.name], [alert_id, "burn watch"]);
         assertEquals((posts[1].body.rows as unknown[]).length, 2);
@@ -1122,12 +1144,12 @@ Deno.test(async function allTests(t) {
         target("http://localhost:9/hooks/alerts");
         burn(2, 1.8);
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(alert_id, send, clock);
         const refused = (await history())[0];
         assertEquals(refused.status, "firing");
         assert(String(refused.delivery).includes("own network"), String(refused.delivery));
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(alert_id, send, clock);
         const retried = (await history())[0];
         assertEquals(retried.status, "firing", "a refused post is sent again next interval");
         assert(String(retried.delivery).includes("own network"), String(retried.delivery));
@@ -1138,7 +1160,7 @@ Deno.test(async function allTests(t) {
           d.data[0].digest = true;
         });
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(alert_id, send, clock);
         const both = (await history())[0];
         assertEquals(both.status, "error");
         assert(String(both.error).includes("digest"), String(both.error));
@@ -1150,9 +1172,9 @@ Deno.test(async function allTests(t) {
           d.data[0].to = "ops@example.com";
         });
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(alert_id, send, clock);
         clock += 120_000;
-        await pollAlertOnce(send, clock);
+        await pollAlert(alert_id, send, clock);
         assertEquals((await history())[0].status, "unchanged");
       }
 
@@ -1164,6 +1186,80 @@ Deno.test(async function allTests(t) {
       });
       assertEquals(Number(row.n), (await history()).length);
       assert(Number(row.n) >= 3, `expected the clear, the firing and the error, got ${row.n}`);
+
+      // Silence without deletion. A run inside the snooze is decided and
+      // recorded exactly as it would be, and delivered to nobody.
+      {
+        const snooze = (value: string) =>
+          alert.change((d: { data: [{ code: string; snoozed_until?: string }] }) => {
+            d.data[0].snoozed_until = value;
+          });
+        const before = sent.length;
+
+        snooze(new Date(clock + 86_400_000).toISOString());
+        burn(1, 2.5);
+        clock += 120_000;
+        await pollAlert(alert_id, send, clock);
+        const quieted = (await history())[0];
+        assertEquals([quieted.status, quieted.delivery], ["firing", "snoozed"]);
+        assertEquals(sent.length, before, "a snoozed alert mails nobody");
+        // The verdict is still the verdict: the rows it matched are what the
+        // next run diffs against, so a snooze does not cost the baseline.
+        assertEquals((quieted.matched as unknown[]).length, quieted.rows);
+
+        // A snooze in the past is over, and nothing had to clear it.
+        snooze(new Date(clock - 86_400_000).toISOString());
+        burn(1, 2.6);
+        clock += 120_000;
+        await pollAlert(alert_id, send, clock);
+        const woken = (await history())[0];
+        assertEquals([woken.status, woken.delivery], ["firing", "sent"]);
+        assertEquals(sent.length, before + 1, "the snooze is over, so the alert sends");
+
+        // A cell nobody can read is not the same as no snooze: it is an error
+        // run naming the field, rather than an alert that goes on sending
+        // while its owner believes it silenced.
+        snooze("next tuesday");
+        clock += 120_000;
+        await pollAlert(alert_id, send, clock);
+        const unreadable = (await history())[0];
+        assertEquals(unreadable.status, "error");
+        assert(String(unreadable.error).includes("snoozed_until"), String(unreadable.error));
+        assert(String(unreadable.error).includes("next tuesday"), String(unreadable.error));
+        assertEquals(sent.length, before + 1, "a refused snooze sends nothing either");
+
+        // A run with nowhere to send was never going to send regardless of the
+        // snooze, so its delivery must still name the real reason: calling it
+        // "snoozed" would tell library:freshness and GET /status a config with
+        // no destination is a deliberate silence rather than an alert stuck
+        // firing into the void.
+        snooze(new Date(clock + 86_400_000).toISOString());
+        alert.change((d: { data: [{ to: string }] }) => {
+          d.data[0].to = "";
+        });
+        burn(1, 3.0);
+        clock += 120_000;
+        await pollAlert(alert_id, send, clock);
+        const noDestination = (await history())[0];
+        assertEquals(noDestination.status, "firing");
+        assertEquals(
+          noDestination.delivery,
+          "no destination, so nothing was sent",
+          "a snooze on an alert with nowhere to send must not be reported as the reason nothing sent",
+        );
+        assertEquals(sent.length, before + 1, "still nobody to mail");
+        alert.change((d: { data: [{ to: string }] }) => {
+          d.data[0].to = "ops@example.com";
+        });
+
+        // Cleared, and left quiet: the steps after this one share one database.
+        snooze("");
+        clock += 120_000;
+        await pollAlert(alert_id, send, clock);
+        clock += 120_000;
+        await pollAlert(alert_id, send, clock);
+        assertEquals((await history())[0].status, "unchanged");
+      }
     }
 
     // A chart is a sheet: its settings describe a query, so it reads, pages and
@@ -1588,6 +1684,77 @@ Deno.test(async function allTests(t) {
       ).message;
       assert(!overflow.includes("Infinity"), overflow);
 
+      // A distribution on an input rather than one number for it. Every draw is
+      // seeded off a hash of the whole call, never Math.random, so the same call
+      // answers the same number on every run and in both engines -- which is
+      // what examples_test compares draw for draw.
+      const drawn = await run(
+        `select sample_uniform(7, 0, 10) u, sample_uniform(7, 0, 10) again, sample_uniform(8, 0, 10) other,
+                sample_normal(7, 0, 10) n, sample_triangular(7, 0, 5, 10) t`,
+      );
+      assertEquals(drawn.u, drawn.again);
+      assert(drawn.u !== drawn.other, `seed 8 drew ${drawn.other}, the same value seed 7 drew`);
+      // The function's own name is hashed in beside the arguments, so one seed
+      // column draws an independent value per distribution rather than the same
+      // quantile out of each.
+      assert(drawn.u !== drawn.n && drawn.u !== drawn.t, `one seed drew ${drawn.u} from every distribution`);
+      assert(Number(drawn.u) >= 0 && Number(drawn.u) < 10, `sample_uniform left its range at ${drawn.u}`);
+      assert(Number(drawn.t) >= 0 && Number(drawn.t) <= 10, `sample_triangular left its range at ${drawn.t}`);
+      // A thousand draws average out to the mean they were drawn around. The
+      // standard error of a thousand draws at sd = 15 is about 0.47, so a mean
+      // this far out is the sampler and not the sample.
+      const drift = await run(
+        `select count(*) n, avg(sample_normal(date_diff('day','2026-01-01',date), 100, 15)) m
+         from series('2026-01-01','2028-09-26')`,
+      );
+      assertEquals(drift.n, 1000);
+      assert(Math.abs(Number(drift.m) - 100) < 1.5, `a thousand draws around 100 averaged ${drift.m}`);
+      // Each refusal names the argument and the value. A sampler that answered
+      // NaN would put it in a percentile and in every number built on it.
+      // Both bounds finite and correctly ordered still overflows a double once
+      // they are 1e308 apart -- (hi - lo) alone clears Number.MAX_VALUE -- and a
+      // fraction of exactly zero on that Infinity draws NaN rather than a bound,
+      // so the check is on the draw itself and not on the bounds that produced it.
+      for (
+        const [code, said] of [
+          [`select sample_uniform('x', 0, 10) u`, "a finite number"],
+          [`select sample_uniform(1, 10, 0) u`, "at or below the high bound 0"],
+          [`select sample_normal(1, 0, -1) n`, "at or above zero"],
+          [`select sample_triangular(1, 0, 20, 10) t`, "a mode between 0 and 10"],
+          [`select sample_triangular(1, 10, 5, 0) t`, "at or below the high bound 0"],
+          // AlaSQL's parser reads a bare exponent as a name, so "1e308" -- and
+          // "1e3" with it -- throws out of its own compiler before the query
+          // runs. The decimal point in each literal here is what it parses.
+          [`select sample_uniform(0, -1.0e308, 1.0e308) u`, "a draw that fits in a finite number"],
+          [`select sample_normal(2, 1.0e308, 1.0e308) n`, "a draw that fits in a finite number"],
+          [`select sample_triangular(1, -1.0e300, 0, 1.0e300) t`, "a draw that fits in a finite number"],
+        ]
+      ) {
+        assert((await fails(code)).includes(said), `${code} should say ${said}`);
+      }
+
+      // Multiple regression. These points lie on the plane z = 2 + 3x - y
+      // exactly, so the coefficients are the plane's own and the prediction is
+      // arithmetic: 2 + 30 - 3.
+      const plane = await run(
+        `select g.c c, round(ols_predict(g.c, 10, 3), 6) p from
+           (select ols(array(z), array(x), array(y)) c from
+             (select 0 as x, 1 as y, 1 as z union all select 1, 0, 5 union all select 2, 3, 5
+              union all select 3, 2, 9 union all select 4, 5, 9)) g`,
+      );
+      assertEquals((plane.c as number[]).map((b) => round(b)), [2, 3, -1]);
+      assertEquals(plane.p, 29);
+      // Hours studied against a pass, with one student who passed early and one
+      // who failed late: the two outcomes overlap, so the likelihood has a
+      // maximum and the fit is a number rather than a runaway. The sign is the
+      // claim -- more hours, better odds -- and the ends of the range read as
+      // probabilities on either side of the boundary.
+      const hours = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+      const odds = ala.fn.logit([0, 0, 0, 1, 0, 1, 1, 1, 1, 1], hours) as number[];
+      assert(odds[1] > 0, `more hours should raise the odds, fit ${JSON.stringify(odds)}`);
+      const [low, high] = [ala.fn.logit_predict(odds, 1), ala.fn.logit_predict(odds, 10)] as number[];
+      assert(low < 0.05 && high > 0.95, `probabilities at the ends of the range were ${low} and ${high}`);
+
       // A robust score: one value at 100 among small ones cannot widen the ruler
       // it is measured against, which is what a plain z-score lets it do.
       const outlier = await run(
@@ -1675,6 +1842,37 @@ Deno.test(async function allTests(t) {
         Error,
         "at most 5000 pairs",
       );
+      // A predictor the columns before it already draw leaves the normal
+      // equations singular, and the refusal names which column it stopped on
+      // rather than answering a coefficient the pivoting happened to pick.
+      assertThrows(() => ala.fn.ols([1, 2, 4, 8], [1, 2, 3, 4], [2, 4, 6, 8]), Error, "argument 3");
+      assertThrows(() => ala.fn.ols([1, 2, 3], [1, 2]), Error, "the same length");
+      assertThrows(() => ala.fn.ols([1, 2, 3], [1, 2, "x"]), Error, "only finite numbers");
+      assertThrows(() => ala.fn.ols([1, 2, 3], [1, 2, 3], [3, 2, 1], [1, 1, 2]), Error, "one point per coefficient");
+      const wide = Array.from({ length: 14 }, (_, i) => i);
+      assertThrows(
+        () => ala.fn.ols(wide, ...Array.from({ length: 13 }, (_, j) => wide.map((i) => (i * (j + 2)) % 7))),
+        Error,
+        "at most 12 predictor columns",
+      );
+      assertThrows(() => ala.fn.ols(crowd, crowd), Error, "at most 5000 points");
+      assertThrows(() => ala.fn.ols_predict([1, 2], 1, 2), Error, "one more coefficient");
+      assertThrows(() => ala.fn.logit([0, 1, 2], [1, 2, 3]), Error, "only 0 and 1");
+      // A repeated column names itself here too, and says so rather than reading
+      // as the runaway below: the first reweighted step weighs every point the
+      // same, so the matrix it goes singular on is the one ols() solves.
+      assertThrows(() => ala.fn.logit([0, 1, 0, 1], [1, 2, 3, 4], [2, 4, 6, 8]), Error, "argument 3");
+      // Nothing overlaps here, so every step fits the points better than the one
+      // before it and the coefficients run off rather than settling.
+      assertThrows(() => ala.fn.logit([0, 0, 1, 1], [1, 2, 3, 4]), Error, "separates them exactly");
+      // y = x is the same line whichever unit x is read in. Building a column's
+      // scale squared the raw values, which overflows past 1e154 and underflows
+      // past 1e-162, so both ends reached the solve as a column of zeros -- a
+      // well-conditioned fit refused as a column the others already span.
+      for (const unit of [1e200, 1e-200]) {
+        const [b0, b1] = ala.fn.ols([1, 2, 3, 4], [1, 2, 3, 4].map((x) => x * unit)) as number[];
+        assert(Math.abs(b0) < 1e-6 && Math.abs(b1 * unit - 1) < 1e-6, `x in units of ${unit} fit ${b0} + ${b1}x`);
+      }
       // JSON.stringify() turns Infinity and NaN into "null", so these used to
       // read "received number null", which names neither the value nor the bug.
       assertThrows(() => ala.fn.width_bucket(Infinity, 0, 30, 6), Error, "received number Infinity");
@@ -2851,7 +3049,8 @@ Deno.test(async function allTests(t) {
       const httpId = `net-http:${httpHand.documentId}`;
       await put(jwt, `/library/${httpId}`, {});
       const blankHand = automerge.create<Sheet>({ type: "net-http", data: [{ url: "", interval: 120 }] });
-      await put(jwt, `/library/net-http:${blankHand.documentId}`, {});
+      const blankId = `net-http:${blankHand.documentId}`;
+      await put(jwt, `/library/${blankId}`, {});
 
       const calls: [string, Record<string, string>][] = [];
       // A body that differs per call: the same body twice is one row moved to
@@ -2861,6 +3060,11 @@ Deno.test(async function allTests(t) {
         return Promise.resolve(new Response(`{"ok":true,"poll":${calls.length}}`));
       };
       const t0 = Date.now();
+      // The tick itself: this block is about the due-map gating (an interval
+      // honored, a blank url skipped), which only the tick enforces --
+      // `pollNetSheet` always runs when called directly. Only Alice's one
+      // net-http sheet and this one's blank sibling are due yet, so the pile
+      // it walks is still small here.
       await pollNetOnce(fetcher, t0);
       const urls = calls.map(([u]) => u);
       assert(urls.includes("https://feeds.test/data"), urls.join());
@@ -2890,7 +3094,8 @@ Deno.test(async function allTests(t) {
       const keyedId = `net-http:${keyed.documentId}`;
       await put(jwt, `/library/${keyedId}`, {});
 
-      // Every due net-http sheet is polled, so only this one's calls count.
+      // The one sheet, so a call proves this feed's header and not some other
+      // due sheet's.
       const seen: Record<string, string>[] = [];
       const fetcher = (url: string, headers: Record<string, string> = {}) => {
         if (url === "https://keyed.test/keyed") seen.push(headers);
@@ -2902,7 +3107,7 @@ Deno.test(async function allTests(t) {
       // Before the secret exists: a failure row naming what is missing, and no
       // request at all -- sending it without the header would come back as
       // somebody else's 401 and read as the API's fault.
-      await pollNetOnce(fetcher, t1);
+      await pollFeed(keyedId, fetcher, t1);
       assertEquals(seen.length, 0, "a header that cannot be built must not be sent without it");
       const [failed] = await rowsOf();
       const failure = JSON.parse(String(failed.body));
@@ -2911,14 +3116,14 @@ Deno.test(async function allTests(t) {
       assert(failure.repro.includes("X-Api-Key: <value>"), "the repro still names keys and not values");
 
       await post(jwt, `/library/${keyedId}/secret`, { name: "weather", value: "sk-live-1" });
-      await pollNetOnce(fetcher, t1 + 200_000);
+      await pollFeed(keyedId, fetcher, t1 + 200_000);
       assertEquals(seen.length, 1, "with the secret stored, the request goes");
       assertEquals(seen[0], { "X-Api-Key": "sk-live-1", Authorization: "Bearer sk-live-1" });
 
       // Writing the secret again rotates it, and the feed picks the newest up
       // on its next poll rather than needing the sheet edited.
       await post(jwt, `/library/${keyedId}/secret`, { name: "weather", value: "sk-live-2" });
-      await pollNetOnce(fetcher, t1 + 400_000);
+      await pollFeed(keyedId, fetcher, t1 + 400_000);
       assertEquals(seen[1]["X-Api-Key"], "sk-live-2", "a rotated secret reaches the next poll");
 
       // The value must be nowhere a viewer can read: not in the log, and not in
@@ -3123,7 +3328,8 @@ Deno.test(async function allTests(t) {
     });
     const id = `net-http:${hand.documentId}`;
     await put(jwt, `/library/${id}`, {});
-    await pollNetOnce(
+    await pollFeed(
+      id,
       (url: string) =>
         Promise.resolve(url === "https://huge.test/feed" ? new Response("x".repeat(2_000_000)) : new Response(`{}`)),
       Date.now() + 40_000_000,
@@ -3158,9 +3364,9 @@ Deno.test(async function allTests(t) {
       return Promise.resolve(new Response(`{"n":1}`));
     };
     const t = Date.now() + 50_000_000;
-    await pollNetOnce(fetcher, t);
+    await pollFeed(id, fetcher, t);
     assertEquals(seen[0], "https://cursor.test/feed?kind=orders", "the first poll asks for everything");
-    await pollNetOnce(fetcher, t + 121_000);
+    await pollFeed(id, fetcher, t + 121_000);
     assertEquals(
       new URL(seen[1]).searchParams.get("since"),
       new Date(t).toISOString(),
@@ -3174,7 +3380,7 @@ Deno.test(async function allTests(t) {
     });
     const badId = `net-http:${bad.documentId}`;
     await put(jwt, `/library/${badId}`, {});
-    await pollNetOnce(fetcher, t + 300_000);
+    await pollFeed(badId, fetcher, t + 300_000);
     const [row] = (await get<Table>(jwt, `/net/${badId}`)).slice(1);
     assert(JSON.parse(String(row.body)).error.includes("query parameter"), String(row.body));
   });
@@ -3983,7 +4189,10 @@ Deno.test(async function allTests(t) {
     // against the run before -- never page one against page two, which is one
     // body and one shape.
     shapedAnswer = [`[{"a":"text now"}]`];
-    await pollNetOnce(fetcher, at + 65_000);
+    // This one sheet only: the rest of `ids` just answered above and are not
+    // due again, so the tick would find nothing to do but scan the pile of
+    // net-http sheets every earlier step left to confirm that.
+    await pollFeed(ids.shaped, fetcher, at + 65_000);
     assertEquals((await newest(ids.shaped)).meta.shape, { a: "string" });
     assertEquals((await newest(ids.shaped)).meta.shape_change, { added: [], dropped: ["b"], retyped: ["a"] });
 
@@ -3991,6 +4200,506 @@ Deno.test(async function allTests(t) {
     // own: a step that re-polls a hundred-page sheet it does not care about
     // spends the suite's ten seconds walking it.
     for (const id of Object.values(ids)) netDue.set(id, Number.MAX_SAFE_INTEGER);
+    hostDue.clear();
+  });
+
+  // Every run was a row, and a feed that answers its whole table every poll built a log of a hundred copies of one
+  // answer -- NET_KEEP rows deep, every reader downstream paging through the lot. A sheet now says what a good run
+  // does to the runs before it: `replace` keeps the newest good run alone, `upsert` supersedes only the earlier runs
+  // that answered for a record this one answered for again, and `rows_path` says which array in an envelope is the
+  // rows, for a feed that hands back two on purpose.
+  await t.step("A feed can replace or upsert its runs rather than append", async () => {
+    const { jwt } = await usr("nell@example.com");
+    const feed = async (data: NetHttp) => {
+      const hand = automerge.create<Sheet>({ type: "net-http", data: [data] });
+      const id = `net-http:${hand.documentId}`;
+      await put(jwt, `/library/${id}`, {});
+      return id;
+    };
+    const ids = {
+      replaced: await feed({ url: "https://replaced.keep.test/feed", interval: 3600, mode: "replace" }),
+      failing: await feed({ url: "https://failing.keep.test/feed", interval: 3600, mode: "replace" }),
+      upserted: await feed({ url: "https://upserted.keep.test/feed", interval: 3600, mode: "upsert", key: "id" }),
+      enveloped: await feed({
+        url: "https://enveloped.keep.test/feed",
+        interval: 3600,
+        page_by: "page",
+        page_param: "page",
+        rows_path: "data",
+      }),
+      wrapped: await feed({
+        url: "https://wrapped.keep.test/feed",
+        interval: 3600,
+        mode: "upsert",
+        key: "id",
+        rows_path: "data",
+      }),
+      // Refused off the document, before a request goes out.
+      badMode: await feed({ url: "https://badmode.keep.test/feed", interval: 3600, mode: "keep" as "replace" }),
+      keyKept: await feed({ url: "https://keykept.keep.test/feed", interval: 3600, mode: "replace", key: "id" }),
+      noKey: await feed({ url: "https://nokey.keep.test/feed", interval: 3600, mode: "upsert" }),
+      badPath: await feed({ url: "https://badpath.keep.test/feed", interval: 3600, rows_path: "a..b" }),
+      // Refused by what arrived, on the one request each makes.
+      noRows: await feed({
+        url: "https://norows.keep.test/feed",
+        interval: 3600,
+        page_by: "page",
+        page_param: "page",
+        rows_path: "items",
+      }),
+      noRowKey: await feed({ url: "https://norowkey.keep.test/feed", interval: 3600, mode: "upsert", key: "id" }),
+    };
+
+    let round = 0;
+    const asked = new Map<string, number>();
+    const calls: string[] = [];
+    const answer = (raw: string): Response => {
+      const url = new URL(raw);
+      const page = Number(url.searchParams.get("page") ?? 0);
+      switch (url.hostname) {
+        case "replaced.keep.test":
+          return new Response(JSON.stringify([{ n: round }]));
+        case "failing.keep.test":
+          return round === 1 ? new Response(JSON.stringify([{ n: 1 }])) : new Response("gone", { status: 404 });
+        case "upserted.keep.test":
+          return new Response(
+            JSON.stringify(round === 1 ? [{ id: "a" }, { id: "b" }] : round === 2 ? [{ id: "c" }] : [{ id: "b" }]),
+          );
+        case "enveloped.keep.test":
+          // Two arrays on purpose, the way JSON:API answers `data` beside
+          // `included`. Neither the first nor the only one: rows_path is what
+          // says which is the rows.
+          return new Response(
+            JSON.stringify(page === 1 ? { included: [{ x: 1 }], data: [{ n: round }] } : { data: [] }),
+          );
+        case "wrapped.keep.test":
+          return new Response(
+            JSON.stringify({ included: [], data: round === 1 ? [{ id: "w1" }] : [{ id: "w1" }, { id: "w2" }] }),
+          );
+        case "norows.keep.test":
+          return new Response(JSON.stringify({ data: [{ n: 1 }], count: 1 }));
+        case "norowkey.keep.test":
+          return new Response(JSON.stringify([{ id: "k1" }, { n: 2 }]));
+        default:
+          throw new Error(`no mock answer wired for ${raw}`);
+      }
+    };
+    const fetcher = (url: string) => {
+      if (!url.includes(".keep.test")) return Promise.resolve(new Response(`{"ok":true}`));
+      calls.push(url);
+      asked.set(new URL(url).hostname, round);
+      return Promise.resolve(answer(url));
+    };
+    // The feeds a round waits for. It shrinks as each says its last thing:
+    // a poll costs the round the same whether or not anything reads it.
+    let wired: readonly (keyof typeof ids)[] = ["replaced", "failing", "upserted", "enveloped", "wrapped"];
+
+    const rowsOf = async (id: string) => {
+      const got: { body: string; meta: Record<string, unknown> }[] = await sql`
+        select body, meta from net where sheet_id = ${id} order by net_id desc
+      `;
+      return got;
+    };
+    const bodyOf = async (id: string) => JSON.parse((await rowsOf(id))[0].body);
+    const sent = (host: string) => calls.filter((u) => new URL(u).hostname === host);
+    // A cycle stops starting sheets past POLL_CYCLE_MS, and by here the suite
+    // holds more net-http sheets than one cycle takes.
+    const pollRound = async (when: number) => {
+      round += 1;
+      for (let cycle = 0;; cycle++) {
+        if (cycle >= 10)
+          throw new Error(`${cycle} cycles at ${when} and round ${round} still had not polled ${wired.join(", ")}`);
+        await pollNetOnce(fetcher, when);
+        if (wired.every((name) => asked.get(new URL(`https://${name}.keep.test`).hostname) === round)) return;
+      }
+    };
+
+    const at = Date.now() + 92_000_000;
+    await pollRound(at);
+
+    // Every mode's first run is one row: there is nothing yet for it to
+    // supersede, and append is what a first poll always does.
+    for (const name of wired) assertEquals((await rowsOf(ids[name])).length, 1, `${name} landed its first run`);
+    // rows_path names which array is the rows. Without it this envelope is two
+    // arrays and a refusal; with it the rows are the ones the sheet named, not
+    // the first key that happened to hold an array.
+    assertEquals(await bodyOf(ids.enveloped), [{ n: 1 }], "rows_path picks the array the sheet named");
+    assertEquals((await rowsOf(ids.wrapped))[0].meta.keys, ["w1"], "an upsert run records what it answered for");
+
+    // Config a form should have refused, each named by its own field and each
+    // refused before a request goes out.
+    for (
+      const [id, host, headline, source] of [
+        [ids.badMode, "badmode", "That is not a way this server stores a feed's runs.", "the mode field"],
+        [ids.keyKept, "keykept", "A replace feed supersedes nothing by key.", "the mode and key fields"],
+        [ids.noKey, "nokey", "An upsert feed names the field its rows are identified by.", "the key field"],
+        [
+          ids.badPath,
+          "badpath",
+          "That is not where in an answer this server reads a feed's rows.",
+          "the rows_path field",
+        ],
+      ] as const
+    ) {
+      assertEquals(sent(`${host}.keep.test`).length, 0, `${host} asked the wire before its config was refused`);
+      const said = String((await bodyOf(id)).error);
+      assert(said.includes(headline), said);
+      assert(said.includes(`${source} on this net-http sheet`), said);
+    }
+
+    // rows_path aimed where this feed holds no array is a failure row, not a
+    // feed of no rows: a renamed envelope otherwise reads as an empty page and
+    // stops the walk under a green run row.
+    assertEquals(sent("norows.keep.test").length, 1);
+    const noRows = String((await bodyOf(ids.noRows)).error);
+    assert(noRows.includes("holds no rows where rows_path says they sit"), noRows);
+    assert(noRows.includes("items holds nothing"), noRows);
+
+    // A row with nothing at the key is refused by its position rather than
+    // skipped: a run that dropped half its keys supersedes half of what it
+    // should, and the sheet keeps two rows for the one record.
+    assertEquals(sent("norowkey.keep.test").length, 1);
+    const noRowKey = String((await bodyOf(ids.noRowKey)).error);
+    assert(noRowKey.includes("A row of this upsert feed holds no key."), noRowKey);
+    assert(noRowKey.includes("row 2 of 2"), noRowKey);
+
+    // Each refusal has said its one thing, and a refused poll costs the round
+    // what a good one does. Parked out of the rounds below.
+    const refused = ["badMode", "keyKept", "noKey", "badPath", "noRows", "noRowKey"] as const;
+    for (const name of refused) netDue.set(ids[name], Number.MAX_SAFE_INTEGER);
+
+    await pollRound(at + 3_600_001);
+
+    // The newest good run is the sheet.
+    assertEquals((await rowsOf(ids.replaced)).length, 1, "replace keeps the newest good run alone");
+    assertEquals(await bodyOf(ids.replaced), [{ n: 2 }], "and it is the newest one");
+
+    // A poll that answered nothing supersedes nothing: one bad poll must not
+    // empty the sheet, and the failure row is the log saying why.
+    const failing = await rowsOf(ids.failing);
+    assertEquals(failing.length, 2, `a failed run keeps what is here: ${JSON.stringify(failing.map((r) => r.meta))}`);
+    assertEquals(failing[0].meta.status, 404, "the newest row is the failure");
+    assertEquals(JSON.parse(failing[1].body), [{ n: 1 }], "and the good run before it is untouched");
+
+    // An upsert answering for a record nothing here holds supersedes nothing.
+    assertEquals((await rowsOf(ids.upserted)).length, 2, "an unrelated run is left alone");
+
+    // A feed whose rows sit in an envelope is read for its keys the same way:
+    // the array at rows_path, and never the envelope around it.
+    const wrapped = await rowsOf(ids.wrapped);
+    assertEquals(wrapped.length, 1, "the run before answered for w1, and this one answers for it again");
+    assertEquals(wrapped[0].meta.keys, ["w1", "w2"], "sorted and deduplicated");
+
+    // Append is still append: the mode is per sheet and this one names none.
+    assertEquals((await rowsOf(ids.enveloped)).length, 2, "a sheet with no mode keeps every run");
+
+    for (const name of ["replaced", "failing", "enveloped", "wrapped"] as const)
+      netDue.set(ids[name], Number.MAX_SAFE_INTEGER);
+    wired = ["upserted"];
+
+    await pollRound(at + 7_200_002);
+
+    // The run log stays the unit: this run answered for b, so the run that
+    // answered for a and b is superseded, and the one that answered for c is
+    // not.
+    const upserted = await rowsOf(ids.upserted);
+    assertEquals(upserted.length, 2, "the overlapping run goes and the unrelated one stays");
+    assertEquals(JSON.parse(upserted[0].body), [{ id: "b" }]);
+    assertEquals(JSON.parse(upserted[1].body), [{ id: "c" }]);
+
+    // Parked out of every later step's clock, the way the steps before park
+    // their own.
+    for (const id of Object.values(ids)) netDue.set(id, Number.MAX_SAFE_INTEGER);
+    hostDue.clear();
+  });
+
+  // A 304 moves the row it validated rather than appending, and that row keeps
+  // being the run it always was: `meta.keys` is what an upsert reads to know
+  // which earlier runs a later one supersedes, and a quiet tick between two
+  // real ones must not erase it. A 304 handler that rebuilt meta from scratch
+  // rather than keeping what the row already held would drop `keys` (and
+  // `sig`) on the floor, and the run after it would supersede nothing: the
+  // stale row survives beside the new one instead of being replaced.
+  await t.step("An upsert survives a quiet poll in between", async () => {
+    const { jwt } = await usr("odin@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://quiet.upsert.test/feed", interval: 3600, mode: "upsert", key: "id" } as NetHttp],
+    });
+    const id = `net-http:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+    let answer = () => new Response(JSON.stringify([{ id: "a" }]), { headers: { etag: `"v1"` } });
+    const fetcher = (url: string) => Promise.resolve(url.includes("quiet.upsert.test") ? answer() : new Response(`{}`));
+    const rows = async (): Promise<{ body: string; meta: Record<string, unknown> }[]> =>
+      await sql`select body, meta from net where sheet_id = ${id} order by net_id desc`;
+
+    const t0 = Date.now() + 93_000_000;
+    await pollFeed(id, fetcher, t0);
+    assertEquals((await rows()).length, 1, "the first run lands");
+    assertEquals((await rows())[0].meta.keys, ["a"], "and it is recorded as answering for a");
+
+    // A 304: the row moves, and nothing about what it was answering for is
+    // supposed to change.
+    answer = () => new Response(null, { status: 304 });
+    await pollFeed(id, fetcher, t0 + 3_600_001);
+    const quiet = await rows();
+    assertEquals(quiet.length, 1, "a 304 appends nothing");
+    assertEquals(quiet[0].meta.not_modified, true, "graded the healthy quiet tick it is");
+    assertEquals(quiet[0].meta.keys, ["a"], "and the row it moved is still the run that answered for a");
+
+    // A real run naming a and b again: it supersedes the run before it, which
+    // is the one the 304 moved, because that row still says it answered for a.
+    answer = () => new Response(JSON.stringify([{ id: "a" }, { id: "b" }]), { headers: { etag: `"v2"` } });
+    await pollFeed(id, fetcher, t0 + 7_200_002);
+    const after = await rows();
+    assertEquals(after.length, 1, "the quiet run's row is superseded, not left behind as a stale duplicate");
+    assertEquals(JSON.parse(after[0].body), [{ id: "a" }, { id: "b" }]);
+
+    netDue.set(id, Number.MAX_SAFE_INTEGER);
+    hostDue.clear();
+  });
+
+  // JSON has no integer past 2^53: two distinct ids past it can parse to the
+  // same float, and a key that trusted the parsed number would silently fold
+  // two different records into one -- the opposite of what upsert promises.
+  // Refused by name rather than merged, the same way a missing key is.
+  await t.step("An upsert key past safe integer precision is refused, not silently merged", async () => {
+    const { jwt } = await usr("perry@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://wide.upsert.test/feed", interval: 3600, mode: "upsert", key: "id" } as NetHttp],
+    });
+    const id = `net-http:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+    // Two ids that are distinct as written and identical once JSON.parse has
+    // rounded them -- the collision is in the parser, not in this server.
+    const fetcher = (url: string) =>
+      Promise.resolve(
+        url.includes("wide.upsert.test")
+          ? new Response(`[{"id": 9007199254740993}, {"id": 9007199254740992}]`)
+          : new Response(`{}`),
+      );
+    const rows = async (): Promise<{ body: string; meta: Record<string, unknown> }[]> =>
+      await sql`select body, meta from net where sheet_id = ${id} order by net_id desc`;
+
+    await pollFeed(id, fetcher, Date.now() + 94_000_000);
+    const said = String(JSON.parse((await rows())[0].body).error);
+    assert(said.includes("A row of this upsert feed holds a key past safe precision."), said);
+    assert(said.includes("row 1 of 2"), said);
+
+    netDue.set(id, Number.MAX_SAFE_INTEGER);
+    hostDue.clear();
+  });
+
+  // A response was decoded to text and the text was stored, so a feed answering anything but JSON built a sheet of
+  // one column holding the whole file: shapeOf saw no shape, pageRows refused every page, and a query over it read
+  // one string. What a body means is what its own content-type says it means. A CSV and a TSV go through the
+  // importer's parser, an NDJSON is one JSON value a line, and a gzip is decompressed and read by what comes out --
+  // each stored as the JSON array it means, so a feed in any of them is the sheet a JSON feed is.
+  await t.step("A feed's body is parsed by the type it declares", async () => {
+    const { jwt } = await usr("orla@example.com");
+    const feed = async (url: string) => {
+      const hand = automerge.create<Sheet>({ type: "net-http", data: [{ url, interval: 3600 }] });
+      const id = `net-http:${hand.documentId}`;
+      await put(jwt, `/library/${id}`, {});
+      return id;
+    };
+    const ids = {
+      csv: await feed("https://csv.body.test/feed"),
+      tsv: await feed("https://tsv.body.test/feed"),
+      ndjson: await feed("https://ndjson.body.test/feed"),
+      zipped: await feed("https://zipped.body.test/feed"),
+      zippedCsv: await feed("https://zippedcsv.body.test/feed"),
+      bomb: await feed("https://bomb.body.test/feed"),
+      inflated: await feed("https://inflated.body.test/feed"),
+      ragged: await feed("https://ragged.body.test/feed"),
+      plain: await feed("https://plain.body.test/feed"),
+    };
+    const gzip = async (text: string) =>
+      new Uint8Array(
+        await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer(),
+      );
+    const zippedJson = await gzip(`[{"n":1}]`);
+    const zippedCsv = await gzip("a,b\n1,2\n");
+    // Four times the cap out of a few hundred bytes. The refusal must name what
+    // it had read when it stopped, which is how a bomb is refused before the
+    // whole of it is in memory.
+    const bomb = await gzip("x".repeat(BODY_CAP * 4));
+    // A CSV names its columns once and the JSON it means names them on every
+    // row, so a few kilobytes on the wire is over a megabyte stored. Long names
+    // and short values is the whole of it -- no compression involved.
+    const wide = [1, 2, 3].map((n) => `${"c".repeat(300)}${n}`).join(",");
+    const inflating = `${wide}\n${"1,2,3\n".repeat(1300)}`;
+    const typed = (body: string | Uint8Array<ArrayBuffer>, type: string) =>
+      new Response(body, { headers: { "content-type": type } });
+    const fetcher = (url: string) => {
+      if (!url.includes(".body.test")) return Promise.resolve(new Response(`{"ok":true}`));
+      switch (new URL(url).hostname) {
+        case "csv.body.test":
+          // The importer's own typing: digits are a number, a blank is a null
+          // and not a zero, and true/false is a bool.
+          return Promise.resolve(typed("id,qty,ok\n1,10,true\n2,,false\n", "text/csv; charset=utf-8"));
+        case "tsv.body.test":
+          return Promise.resolve(typed("a\tb\n1\t2\n", "text/tab-separated-values"));
+        case "ndjson.body.test":
+          return Promise.resolve(typed(`{"n":1}\n\n{"n":2}\n`, "application/x-ndjson"));
+        case "zipped.body.test":
+          return Promise.resolve(typed(zippedJson, "application/gzip"));
+        case "zippedcsv.body.test":
+          return Promise.resolve(typed(zippedCsv, "application/x-gzip"));
+        case "bomb.body.test":
+          return Promise.resolve(typed(bomb, "application/gzip"));
+        case "inflated.body.test":
+          return Promise.resolve(typed(inflating, "text/csv"));
+        case "ragged.body.test":
+          return Promise.resolve(typed("a,b\n1\n", "text/csv"));
+        default:
+          // A type nothing on the list names is the text it arrived as, which
+          // is what every feed answered before any of them were parsed.
+          return Promise.resolve(typed(`{"n":1}`, "application/json"));
+      }
+    };
+
+    const at = Date.now() + 96_000_000;
+    for (let cycle = 0;; cycle++) {
+      if (cycle >= 10) throw new Error(`ten cycles at ${at} and a body sheet still had not been polled`);
+      await pollNetOnce(fetcher, at);
+      const [{ n }]: { n: number }[] = await sql`
+        select count(distinct sheet_id)::int as n from net where sheet_id = any(${Object.values(ids)})
+      `;
+      if (n === Object.values(ids).length) break;
+    }
+    const newest = async (id: string) => {
+      const [row]: { body: string; meta: Record<string, unknown> }[] = await sql`
+        select body, meta from net where sheet_id = ${id} order by net_id desc limit 1
+      `;
+      return row;
+    };
+    const bodyOf = async (id: string) => JSON.parse((await newest(id)).body);
+    const errorOf = async (id: string) => String((await bodyOf(id)).error ?? "");
+
+    // A CSV lands as the rows it holds, typed the way the importer types them.
+    assertEquals(await bodyOf(ids.csv), [{ id: 1, qty: 10, ok: true }, { id: 2, qty: null, ok: false }]);
+    // And every reader downstream sees what a JSON feed hands them: the shape
+    // is the columns the file answered with, not one string.
+    assertEquals((await newest(ids.csv)).meta.shape, { id: "number", ok: "boolean", qty: "number" });
+    assertEquals(await bodyOf(ids.tsv), [{ a: 1, b: 2 }], "a tab is the only thing a TSV disagrees about");
+    // One JSON value a line, and a blank line is no record.
+    assertEquals(await bodyOf(ids.ndjson), [{ n: 1 }, { n: 2 }]);
+    // A gzip says only that it is compressed, so what came out is read by its
+    // first character: a bracket is JSON and everything else is a CSV.
+    assertEquals(await bodyOf(ids.zipped), [{ n: 1 }]);
+    assertEquals(await bodyOf(ids.zippedCsv), [{ a: 1, b: 2 }]);
+    assertEquals(await bodyOf(ids.plain), { n: 1 }, "a type nothing parses is stored as it arrived");
+
+    // A bomb is the 413 an oversized body is, refused on what came out of the
+    // decompressor rather than on the few hundred bytes that carried it -- and
+    // refused holding a fraction of it.
+    const burst = await errorOf(ids.bomb);
+    assert(burst.includes("decompresses to more than can be stored"), burst);
+    const held = Number(burst.match(/at least (\d+)/)?.[1]);
+    assert(held > BODY_CAP, `the refusal must name what it had read: ${burst}`);
+    assert(held < BODY_CAP * 4, `and must stop before the whole body is in memory: ${burst}`);
+
+    // The cap is spent on what a body means, not on what it arrived as. The
+    // wire check passes a file this size and the rows it means are over the
+    // cap, which is the same hole a gzip page's wire bytes were.
+    const fat = await errorOf(ids.inflated);
+    assert(fat.includes("means more rows than can be stored"), fat);
+    assert(fat.includes(`${inflating.length} bytes holding`), `it must name both numbers: ${fat}`);
+
+    // A body its own declared type cannot parse is a failure row naming the
+    // line, never a blob stored under a green run.
+    const ragged = await errorOf(ids.ragged);
+    assert(ragged.includes("Line 2"), ragged);
+    assert(ragged.includes("does not match its header"), ragged);
+    assert(ragged.includes("https://ragged.body.test/feed"), `the refusal names where the line is: ${ragged}`);
+
+    // The same reader on the other door: a sender that posts a CSV lands the
+    // rows a feed answering one lands, and the signature still covers the bytes
+    // as they were sent.
+    const hookHand = automerge.create<Sheet>({ type: "net-hook", data: [] });
+    const hookId = `net-hook:${hookHand.documentId}`;
+    await put(jwt, `/library/${hookId}`, {});
+    const sent = "name,qty\nbolt,4\n";
+    const posted = await app.request(`/net/${hookId}`, {
+      method: "POST",
+      headers: new Headers({
+        "Content-Type": "text/csv",
+        "scrapsheets-signature": await hookSign(await hookSecret(hookId), `/net/${hookId}`, sent),
+      }),
+      body: sent,
+    });
+    assert(posted.ok, `a CSV delivery: ${posted.status} ${await posted.text()}`);
+    assertEquals(JSON.parse((await newest(hookId)).body), [{ name: "bolt", qty: 4 }]);
+
+    for (const id of Object.values(ids)) netDue.set(id, Number.MAX_SAFE_INTEGER);
+    hostDue.clear();
+  });
+
+  // The cross-page cap summed the wire bytes of each page, which for a gzip
+  // page is the compressed size and not what lands in `rows`. Pages each
+  // comfortably under BODY_CAP once decompressed, and each passing readFeedBody's
+  // own per-page check, summed past it with a compressed total of a few
+  // kilobytes: three of them stored twice the cap under a green run row.
+  await t.step("A paged gzip feed is capped by what its pages decompress to, not by the wire", async () => {
+    const { jwt } = await usr("ines@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "net-http",
+      data: [
+        {
+          url: "https://gzippages.body.test/feed",
+          interval: 3600,
+          page_by: "page",
+          page_param: "page",
+        } as NetHttp,
+      ],
+    });
+    const id = `net-http:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+
+    const gzip = async (text: string) =>
+      new Uint8Array(
+        await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer(),
+      );
+    const pad = (n: number) => `[{"pad":"${"x".repeat(n)}"}]`;
+    // Each page decompresses to 70% of BODY_CAP -- comfortably under it alone
+    // -- but two of them together are 40% over.
+    const pageSize = Math.floor(BODY_CAP * 0.7);
+    const pageGz = await gzip(pad(pageSize - 12));
+    const typed = (body: Uint8Array<ArrayBuffer>, type: string) =>
+      new Response(body, { headers: { "content-type": type } });
+    const fetcher = (url: string) => {
+      if (!url.includes(".body.test")) return Promise.resolve(new Response(`{"ok":true}`));
+      const page = new URL(url).searchParams.get("page");
+      // Three pages of it, then an empty one to stop -- the empty page's
+      // content-type does not matter, since a header-only CSV and a bare `[]`
+      // both answer zero rows.
+      return Promise.resolve(Number(page) <= 3 ? typed(pageGz, "application/gzip") : new Response("[]"));
+    };
+
+    const at = Date.now() + 99_000_000;
+    await pollFeed(id, fetcher, at);
+    const [{ body, meta }]: { body: string; meta: Record<string, unknown> }[] = await sql`
+      select body, meta from net where sheet_id = ${id} order by net_id desc limit 1
+    `;
+    // Three pages at 70% of BODY_CAP decompressed is 210% of it: this must be
+    // the same "too large to store" refusal a plain JSON feed gets for the
+    // same reason, not a stored body several times over the cap.
+    assert(
+      body.length < BODY_CAP,
+      `three gzip pages each under BODY_CAP decompressed, summing well over it, must be refused rather than stored at ${body.length} bytes: ${
+        JSON.stringify(meta).slice(0, 300)
+      }`,
+    );
+    const parsed = JSON.parse(body);
+    assert(
+      typeof parsed === "object" && parsed !== null && "error" in parsed,
+      `and the row must be the failure it is, not a payload of rows: ${body.slice(0, 200)}`,
+    );
+    assert(String(parsed.error).includes("too large to store"), String(parsed.error));
+
+    netDue.set(id, Number.MAX_SAFE_INTEGER);
     hostDue.clear();
   });
 
@@ -4122,6 +4831,179 @@ Deno.test(async function allTests(t) {
       assertEquals(got.status, 405);
       const unauthed = await mcp("", { jsonrpc: "2.0", id: 1, method: "ping" });
       assertEquals(unauthed.status, 401);
+    }
+  });
+
+  // An agent is something you hand a key to, not an account. The key reaches the MCP endpoint for its own sheet, an
+  // `api-read` key is that key with the writes taken away, and neither a tool argument nor an @ref is a way back out
+  // to the rest of the minter's library -- which is the one thing a borrowed identity must never buy.
+  await t.step("An MCP client carries one sheet's key, and api-read carries no writes", async () => {
+    const { jwt } = await usr("iris@example.com");
+    const sheetOf = async (name: string) => {
+      const hand = automerge.create<Sheet>({
+        type: "table",
+        data: [arrayify([{ name: "n", type: "int", key: "0" }]), { 0: 1 }],
+      });
+      const sheet_id = `table:${hand.documentId}`;
+      await put(jwt, `/library/${sheet_id}`, { name });
+      return sheet_id;
+    };
+    const a = await sheetOf("keyed");
+    const b = await sheetOf("elsewhere");
+    const mint = async (name: string) => (await post(jwt, `/library/${a}/secret`, { name })).data.key as string;
+    const write = await mint("api");
+    const read = await mint("api-read");
+
+    const call = async (key: string, name: string, args: unknown) => {
+      const res = await app.request(`/mcp/${a}`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", "scrapsheets-key": key }),
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+      });
+      const body = await res.text();
+      assert(res.ok, `mcp ${name} under a key answered ${res.status}: ${body}`);
+      return JSON.parse(body).result;
+    };
+
+    // Both keys reach the endpoint the JWT reached, for the one sheet they name.
+    {
+      const out = await call(write, "read_sheet", {});
+      assertEquals(out.isError, false, out.content?.[0]?.text);
+      assertEquals(out.structuredContent.rows, [{ n: 1 }]);
+      assertEquals((await call(read, "read_sheet", {})).structuredContent.rows, [{ n: 1 }]);
+    }
+
+    // One writes; the other is refused by the name it was minted under, on the tool and on the route it also opens.
+    {
+      assertEquals((await call(write, "write_cells", { cells: [{ row: 1, col: "n", value: 2 }] })).structuredContent, {
+        written: 1,
+        rows: 2,
+      });
+      const tool = await call(read, "write_cells", { cells: [{ row: 0, col: "n", value: 9 }] });
+      assertEquals(tool.isError, true);
+      assert(
+        tool.content[0].text.includes("api-read") && tool.content[0].text.includes("writes nothing"),
+        tool.content[0].text,
+      );
+      const route = await app.request(`/sheet/${a}`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", "scrapsheets-key": read }),
+        body: JSON.stringify({ rows: [{ n: 3 }] }),
+      });
+      assertEquals(route.status, 403);
+      const text = await route.text();
+      assert(text.includes("api-read") && text.includes("writes nothing"), text);
+      // Every refusal left the sheet exactly where the writing key put it.
+      assertEquals((await get<Table>(jwt, `/sheet/${a}`)).slice(1), [{ n: 1 }, { n: 2 }]);
+    }
+
+    // Under either key the library is that one sheet, and a second sheet is refused by name rather than answered
+    // with the authority the key borrows.
+    for (const key of [write, read]) {
+      const ls = await call(key, "list_sheets", {});
+      assertEquals(ls.structuredContent.sheets.map((s: { sheet_id: string }) => s.sheet_id), [a]);
+      const own = await call(key, "query_sheet", { code: `select sum(n) as tally from @${a}` });
+      assertEquals(own.isError, false, own.content?.[0]?.text);
+      assertEquals(own.structuredContent.rows, [{ tally: 3 }]);
+      const foreign = await call(key, "query_sheet", { code: `select n from @${b}` });
+      assertEquals(foreign.isError, true);
+      assert(
+        foreign.content[0].text.includes(`@${b}`) && foreign.content[0].text.includes(`@${a}`),
+        foreign.content[0].text,
+      );
+      const elsewhere = await call(key, "read_sheet", { sheet_id: b });
+      assertEquals(elsewhere.isError, true);
+      assert(elsewhere.content[0].text.includes(`opens ${a}`), elsewhere.content[0].text);
+    }
+  });
+
+  // The half of the protocol a client reads rather than calls: a resource per sheet it may list, whose body is the
+  // csv it would have exported, and one prompt built from the same read `describe @ref` answers with.
+  await t.step("MCP resources are sheets as csv, and its one prompt describes them", async () => {
+    const { jwt } = await usr("juno@example.com");
+    const hand = automerge.create<Sheet>({
+      type: "table",
+      data: [
+        arrayify([{ name: "item", type: "text", key: "0" }, { name: "price", type: "usd", key: "1" }]),
+        // Past one page of the default read, so a resource over a sheet the database pages has something to lose.
+        ...Array.from({ length: 60 }, (_, i) => ({ 0: `item ${i}`, 1: i === 0 ? null : i / 2 })),
+      ],
+    });
+    const sheet_id = `table:${hand.documentId}`;
+    await put(jwt, `/library/${sheet_id}`, {});
+    const rpc = async (method: string, params?: unknown) => {
+      const res = await app.request(`/mcp/${sheet_id}`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      });
+      const body = await res.text();
+      assert(res.ok, `mcp ${method} answered ${res.status}: ${body}`);
+      return JSON.parse(body);
+    };
+
+    // A client that cannot see them listed will never ask for them.
+    {
+      const { result } = await rpc("initialize", { protocolVersion: "2025-06-18" });
+      assert(result.capabilities.resources, JSON.stringify(result.capabilities));
+      assert(result.capabilities.prompts, JSON.stringify(result.capabilities));
+    }
+
+    // The resource is the sheet, and reading it is the csv export byte for byte.
+    {
+      const { result } = await rpc("resources/list");
+      const mine = result.resources.find((r: { uri: string }) => r.uri === `sheet://${sheet_id}`);
+      assert(mine, JSON.stringify(result.resources));
+      assertEquals(mine.mimeType, "text/csv");
+      const read = await rpc("resources/read", { uri: mine.uri });
+      assertEquals(read.result.contents[0].mimeType, "text/csv");
+      const exported = await app.request(`/export/${sheet_id}.csv`, {
+        headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+      });
+      assertEquals(read.result.contents[0].text, await exported.text());
+      // A uri nobody named is the one refusal here with no route to blame, so it says what a uri looks like.
+      const stray = await rpc("resources/read", { uri: "file:///etc/passwd" });
+      assertEquals(stray.error.code, -32002);
+      assert(stray.error.message.includes("sheet://"), stray.error.message);
+    }
+
+    // A table sheet answers whole whatever is asked; the database pages a query sheet, and a resource that took the
+    // default stopped at one page and answered a csv that was wrong rather than short.
+    {
+      const q = automerge.create<Sheet>({
+        type: "query",
+        data: [{ lang: "sql", code: `select item, price from @${sheet_id}`, args: [] }],
+      });
+      const query_id = `query:${q.documentId}`;
+      await put(jwt, `/library/${query_id}`, {});
+      const { result } = await rpc("resources/read", { uri: `sheet://${query_id}` });
+      assertEquals(result.contents[0].text.split("\n").length, 61);
+      const exported = await app.request(`/export/${query_id}.csv`, {
+        headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+      });
+      assertEquals(result.contents[0].text, await exported.text());
+      // The prompt describes the sheet, not the page: a row count off the first page is a wrong description.
+      const prompt = await rpc("prompts/get", { name: "describe_sheet", arguments: { sheet_id: query_id } });
+      const text = prompt.result.messages[0].content.text;
+      assert(text.includes("holds 60 rows") && text.includes("price (usd), 1 blank"), text);
+    }
+
+    // The prompt names every column, its type and how much of it is blank.
+    {
+      const { result } = await rpc("prompts/list");
+      assertEquals(result.prompts.map((p: { name: string }) => p.name), ["describe_sheet"]);
+      const got = await rpc("prompts/get", { name: "describe_sheet", arguments: {} });
+      const text = got.result.messages[0].content.text;
+      assert(text.includes(sheet_id), text);
+      assert(text.includes("item (text), 0 blank") && text.includes("price (usd), 1 blank"), text);
+      const stray = await rpc("prompts/get", { name: "nope" });
+      assertEquals(stray.error.code, -32602);
+    }
+
+    // A read is a row in the log, under the name the method has.
+    {
+      const rows = JSON.stringify(await get<Table>(jwt, `/sheet/library:audit`));
+      assert(rows.includes("mcp resources/read") && rows.includes("mcp prompts/get"), rows.slice(0, 500));
     }
   });
 
@@ -5289,6 +6171,224 @@ Deno.test(async function allTests(t) {
     assert((await mine.text()).includes("payments_token"), "naming the column");
   });
 
+  // A key has no override: the publish simply does not happen. Personal data
+  // has one, because a mailing list is a sheet somebody publishes on purpose.
+  await t.step("Personal data goes public only when the publisher says it belongs there", async () => {
+    const { jwt } = await usr("pia@example.com");
+    // A sheet holding one contact detail, which is the accident this is about.
+    const holding = async (value: string) => {
+      const hand = automerge.create<Sheet>({
+        type: "table",
+        data: [
+          arrayify([{ name: "who", type: "text", key: 0 }, { name: "contact", type: "text", key: 1 }]),
+          { 0: "a customer", 1: value },
+        ],
+      });
+      const id = `table:${hand.documentId}`;
+      await put(jwt, `/library/${id}`, {});
+      return id;
+    };
+    const publish = (id: string, body: unknown) =>
+      app.request(`/library/${id}/public`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        body: JSON.stringify(body),
+      });
+
+    for (
+      const [value, shape] of [
+        ["someone@example.com", "email address"],
+        // E.164, and then the way North America writes one.
+        ["+14155552671", "phone number"],
+        ["(415) 555-2671", "phone number"],
+        ["078-05-1120", "social security number"],
+        // The issuer's own test number: sixteen digits that pass Luhn.
+        ["4111 1111 1111 1111", "payment card number"],
+      ]
+    ) {
+      const id = await holding(value);
+      const refused = await publish(id, { public: true });
+      assertEquals(refused.status, 400, `a sheet holding ${shape} does not go public`);
+      const text = await refused.text();
+      assert(text.includes(shape), `the refusal names the shape it matched: ${text}`);
+      assert(text.includes("contact"), `and the column it is in: ${text}`);
+      assert(text.includes("row 1"), `and the row, 1-based: ${text}`);
+      assert(!text.includes(value), "no refusal is an oracle: the value never comes back");
+      assertEquals((await publish(id, { public: true, personal: true })).status, 200, `${shape}: a claim publishes it`);
+    }
+
+    // A run of digits is an order id at least as often as it is a card, and the
+    // checksum is the whole of what separates them.
+    const orders = await holding("4111 1111 1111 1112");
+    assertEquals((await publish(orders, { public: true })).status, 200, "digits that fail Luhn are not a card");
+
+    // A credential keeps its refusal whatever the publisher claims.
+    const keyed = await holding("sk_live_" + "0000EXAMPLEKEYNOTREAL0000");
+    const kept = await publish(keyed, { public: true, personal: true });
+    assertEquals(kept.status, 400, "a key is not personal data and has no override");
+    assert((await kept.text()).includes("Stripe"), "and the refusal is still about the key");
+
+    // A listing is the other door a stranger reads a sheet through.
+    const listed = await holding("someone@example.com");
+    await reject(jwt, `/sell/${listed}`, { method: "POST", body: JSON.stringify({ price: 0, license: "own" }) });
+    await post(jwt, `/sell/${listed}`, { price: 0, license: "own", personal: true });
+
+    // Not read for its truthiness: a sheet must not go out on the word "no".
+    const said = await publish(listed, { public: true, personal: "yes" });
+    assertEquals(said.status, 400, "a claim that is not a boolean is refused rather than believed");
+    assert((await said.text()).includes("personal"), "naming the field");
+
+    // An explicit null is not the field being absent: `??` reads both the same
+    // way, and would have let a sheet go out on a `personal` nobody set to
+    // anything -- exactly the "no" this function exists to never read from
+    // silence. `isPublic` two lines above this one in the route already
+    // refuses null with a plain `typeof`; `personal` must refuse it the same
+    // way rather than default through it.
+    const nulled = await publish(listed, { public: true, personal: null });
+    assertEquals(nulled.status, 400, "null is not a claim, the way absent is not a claim, but they are not each other");
+    assert((await nulled.text()).includes("personal"), "naming the field");
+  });
+
+  // The refs are in the documents and nowhere else, and nothing could read them
+  // without opening every query by hand.
+  await t.step("What feeds a sheet", async () => {
+    const { jwt, usr_id } = await usr("lina@example.com");
+    const table = automerge.create<Sheet>({
+      type: "table",
+      data: [arrayify([{ name: "n", type: "num", key: 0 }]), { 0: 1 }],
+    });
+    const tableId = `table:${table.documentId}`;
+    await put(jwt, `/library/${tableId}`, { name: "numbers" });
+
+    // A self-join names the same sheet twice, which is one dependency.
+    const query = automerge.create<{ data: Sheet["data"] }>({
+      data: [{ lang: "sql", code: `select a.n from @${tableId} a join @${tableId} b on a.n = b.n`, args: [] }],
+    });
+    const queryId = `query:${query.documentId}`;
+    await put(jwt, `/library/${queryId}`, { name: "joined" });
+
+    const alert = automerge.create<{ data: [{ code: string; to: string; interval: number }] }>({
+      // A condition that answers nothing: every later step's pollAlertOnce polls
+      // every due alert there is, and one that fires would be counted as a
+      // delivery by the step that counts deliveries.
+      data: [{ code: `select * from @${queryId} where n < 0`, to: "lina@example.com", interval: 3600 }],
+    });
+    const alertId = `alert:${alert.documentId}`;
+    await put(jwt, `/library/${alertId}`, { name: "watched" });
+
+    const chart = automerge.create<{ data: [{ source: string; kind: string; x: string; y: string }] }>({
+      data: [{ source: `@${tableId}`, kind: "line", x: "n", y: "n" }],
+    });
+    const chartId = `chart:${chart.documentId}`;
+    await put(jwt, `/library/${chartId}`, { name: "drawn" });
+
+    // A sheet whose document never arrived. Claimed by hand, because the claim
+    // is the one route that refuses an id with no document behind it.
+    const ghost_doc = `ghost-${crypto.randomUUID().replaceAll("-", "")}`;
+    const [ghost] = await sql`
+      insert into sheet (type, doc_id, name, created_by, row_0)
+      values ('query', ${ghost_doc}, 'lost', ${usr_id}, ${sql.json({})})
+      returning sheet_id
+    `;
+    await sql`insert into sheet_usr (sheet_id, usr_id, role) values (${ghost.sheet_id}, ${usr_id}, 'owner')`;
+
+    const [cols, ...rows] = await get<Table>(jwt, "/sheet/library:lineage");
+    assertEquals(
+      Object.values(cols).map((c) => (c as Col).name).join(),
+      "sheet_id,name,type,depends_on,depends_on_name,depends_on_type",
+      "the lineage sheet has a stable shape, because a query sheet selects from it",
+    );
+    const edges = (id: string) => rows.filter((r) => String(r.sheet_id) === id);
+    assertEquals(
+      edges(queryId).map((r) => String(r.depends_on)),
+      [tableId],
+      "a query names the sheets it selects from",
+    );
+    assertEquals(String(edges(queryId)[0].depends_on_name), "numbers", "and what they are called");
+    assertEquals(String(edges(queryId)[0].depends_on_type), "table");
+    assertEquals(edges(alertId).map((r) => String(r.depends_on)), [queryId], "an alert's condition is a dependency");
+    assertEquals(edges(chartId).map((r) => String(r.depends_on)), [tableId], "a chart's source is one too");
+    assertEquals(edges(tableId), [], "a table holds its own cells and depends on nothing");
+
+    const lost = edges(String(ghost.sheet_id));
+    assertEquals(lost.length, 1, "a sheet nobody can trace is still in the graph");
+    assertEquals(lost[0].depends_on, null, "with nothing it is known to depend on");
+    assert(
+      String(lost[0].name).includes("could not be read"),
+      `and the reason in its name: ${String(lost[0].name)}`,
+    );
+
+    // The refs the read answers with are the ones the engine loads: a query
+    // over the lineage sheet resolves the same way freshness does.
+    const { data: counted } = await post(jwt, "/query", {
+      lang: "sql",
+      code: `select count(*) as n from @library:lineage where depends_on = '${tableId}'`,
+    });
+    assertEquals(Number((counted as Table)[1].n), 2, "the query and the chart both read that table");
+    assertEquals(
+      (await get<Table>(jwt, "/library/lineage")).length,
+      rows.length + 1,
+      "GET /library/lineage is the same sheet",
+    );
+  });
+
+  // "A document that will not load" is only one of the ways a sheet's own code
+  // fails to become refs -- a chart with no source, or a query with no code at
+  // all, throws before scanRefs ever runs, and that throw sits outside the
+  // ghost-document test above. One bad sheet must still be a row and not a
+  // 500 that empties the whole account's graph, and a two-query cycle must
+  // still be two one-hop edges: lineage never chases a ref to the sheet it
+  // names, so there is no chain for a cycle to close.
+  await t.step("Lineage survives a sheet whose own code cannot become refs", async () => {
+    const { jwt } = await usr("bram@example.com");
+
+    // A chart with none of the settings chartSql requires.
+    const brokenChart = automerge.create<{ data: [Record<string, never>] }>({ data: [{}] });
+    const brokenChartId = `chart:${brokenChart.documentId}`;
+    await put(jwt, `/library/${brokenChartId}`, { name: "unset" });
+
+    // A query document holding no "code" field at all -- not a document that
+    // failed to load, but one that loaded and had nothing scanRefs could read.
+    const codeless = automerge.create<{ data: [{ args: unknown[] }] }>({ data: [{ args: [] }] });
+    const codelessId = `query:${codeless.documentId}`;
+    await put(jwt, `/library/${codelessId}`, { name: "silent" });
+
+    // Two queries naming each other. lineage reads one hop per sheet off its
+    // own code, so a cycle is two ordinary edges and never a chain to detect
+    // a cycle in.
+    const a = automerge.create<{ data: Sheet["data"] }>({ data: [{ lang: "sql", code: "", args: [] }] });
+    const aId = `query:${a.documentId}`;
+    const b = automerge.create<{ data: Sheet["data"] }>({
+      data: [{ lang: "sql", code: `select * from @${aId}`, args: [] }],
+    });
+    const bId = `query:${b.documentId}`;
+    await put(jwt, `/library/${aId}`, { name: "a" });
+    await put(jwt, `/library/${bId}`, { name: "b" });
+    const aHandle = await automerge.find<{ data: [{ code: string; args: unknown[] }] }>(a.documentId);
+    aHandle.change((doc) => {
+      doc.data[0].code = `select * from @${bId}`;
+    });
+
+    const rows = await get<Table>(jwt, "/library/lineage");
+    const edges = (id: string) => rows.filter((r) => String(r.sheet_id) === id);
+
+    const chartRow = edges(brokenChartId);
+    assertEquals(chartRow.length, 1, "a chart with no source is one row, not zero and not a crash");
+    assertEquals(chartRow[0].depends_on, null);
+    assert(
+      String(chartRow[0].name).includes("could not be read"),
+      `and the reason names what chartSql refused: ${String(chartRow[0].name)}`,
+    );
+
+    const codelessRow = edges(codelessId);
+    assertEquals(codelessRow.length, 1, "a query with no code field is also one row");
+    assertEquals(codelessRow[0].depends_on, null);
+    assert(String(codelessRow[0].name).includes("could not be read"));
+
+    assertEquals(edges(aId).map((r) => String(r.depends_on)), [bId], "a names b");
+    assertEquals(edges(bId).map((r) => String(r.depends_on)), [aId], "b names a, and the read still finished");
+  });
+
   // It must carry the path and the status, and it must never carry a header value: an Authorization in a log outlives
   // the request that sent it.
   await t.step('Every failure lands on one sheet, so "what is breaking, and where" is a query', async () => {
@@ -5459,7 +6559,7 @@ Deno.test(async function allTests(t) {
     const { names, body } = await rows(jwt);
     assertEquals(
       names.join(),
-      "sheet_id,name,type,last_run,last_ok,failures_since_ok,last_meta",
+      "sheet_id,name,type,last_run,last_ok,failures_since_ok,last_meta,paused,next_run",
       "the freshness sheet has a stable shape, because a query sheet selects from it",
     );
     const byId = Object.fromEntries(body.map((r) => [String(r.sheet_id), r]));
@@ -6007,7 +7107,7 @@ Deno.test(async function allTests(t) {
       const origFetch = globalThis.fetch;
       globalThis.fetch = (() => Promise.resolve(new Response(`{"polled":true}`))) as typeof fetch;
       try {
-        await pollNetOnce(undefined, Date.now() + 70_000_000);
+        await pollFeed(id, undefined, Date.now() + 70_000_000);
       } finally {
         globalThis.fetch = origFetch;
       }
@@ -6364,7 +7464,7 @@ Deno.test(async function allTests(t) {
       from generate_series(1, ${USER_ALERTS_PER_DAY}) g
     `;
     let sent = 0;
-    await pollAlertOnce(() => {
+    await pollAlert(alertId, () => {
       sent++;
       return Promise.resolve("sent");
     }, later);
@@ -6379,7 +7479,7 @@ Deno.test(async function allTests(t) {
       d.data[0].to = "https://hooks.slack.com/services/T0/B0/zzz";
     });
     let posted = 0;
-    await pollAlertOnce(() => Promise.resolve("sent"), later + 120_000, () => {
+    await pollAlert(alertId, () => Promise.resolve("sent"), later + 120_000, () => {
       posted++;
       return Promise.resolve(new Response("ok"));
     });
@@ -6715,7 +7815,7 @@ Deno.test(async function allTests(t) {
       );
     const at = Date.now() + 110_000_000;
 
-    await pollNetOnce(fetcher, at);
+    await pollFeed(feedId, fetcher, at);
     assertEquals(
       (await newest()).meta.shape,
       { id: "number", name: "string" },
@@ -6726,7 +7826,7 @@ Deno.test(async function allTests(t) {
     // A column added, one retyped: the data lands, and the run is a failure
     // naming what changed.
     answer = `[{"id":"1","name":"a","extra":true},{"id":"2","name":null}]`;
-    await pollNetOnce(fetcher, at + 61_000);
+    await pollFeed(feedId, fetcher, at + 61_000);
     const changed = await newest();
     assertEquals(changed.body, answer, "the rows that arrived are kept");
     assertEquals(changed.meta.shape, { extra: "boolean", id: "string", name: "string" });
@@ -6741,17 +7841,17 @@ Deno.test(async function allTests(t) {
     );
 
     // The same shape again is the new normal.
-    await pollNetOnce(fetcher, at + 122_000);
+    await pollFeed(feedId, fetcher, at + 122_000);
     assertEquals((await newest()).meta.shape_change, undefined, "the run after is not a change");
     assertEquals(await failures(), 0);
 
     // A feed that stops answering rows at all dropped every column, once.
     answer = "<html>maintenance</html>";
-    await pollNetOnce(fetcher, at + 183_000);
+    await pollFeed(feedId, fetcher, at + 183_000);
     const gone = await newest();
     assertEquals(gone.meta.shape, null, "a body that is not rows has no shape");
     assertEquals(gone.meta.shape_change, { added: [], dropped: ["extra", "id", "name"], retyped: [] });
-    await pollNetOnce(fetcher, at + 244_000);
+    await pollFeed(feedId, fetcher, at + 244_000);
     assertEquals((await newest()).meta.shape_change, undefined, "and nothing is compared against no shape");
   });
 
@@ -6781,8 +7881,8 @@ Deno.test(async function allTests(t) {
     };
     const at = Date.now() + 130_000_000;
 
-    await pollNetOnce(fetcher, at);
-    await pollNetOnce(fetcher, at + 61_000);
+    await pollFeed(feedId, fetcher, at);
+    await pollFeed(feedId, fetcher, at + 61_000);
     const [same] = await log();
     assertEquals((await log()).length, 1, "the same body twice is one row");
     const meta = JSON.parse(String(same.meta));
@@ -6790,10 +7890,10 @@ Deno.test(async function allTests(t) {
     assertEquals(meta.repeated, true, "and the row says it came again");
 
     answer = () => new Response(`[{"n":2}]`);
-    await pollNetOnce(fetcher, at + 122_000);
+    await pollFeed(feedId, fetcher, at + 122_000);
     assertEquals((await log()).length, 2, "a different body is a second row");
     answer = () => new Response(`[{"n":1}]`);
-    await pollNetOnce(fetcher, at + 183_000);
+    await pollFeed(feedId, fetcher, at + 183_000);
     const back = await log();
     assertEquals(back.length, 2, "a body this sheet already holds is not a third");
     assertEquals(String(back[0].body), `[{"n":1}]`, "the row it matches is the newest again");
@@ -6802,7 +7902,7 @@ Deno.test(async function allTests(t) {
     // sheet built downstream keeps what it had while freshness says why.
     assertEquals(await queried(), [`[{"n":1}]`, `[{"n":2}]`]);
     answer = () => new Response("boom", { status: 500 });
-    await pollNetOnce(fetcher, at + 244_000);
+    await pollFeed(feedId, fetcher, at + 244_000);
     assertEquals((await log()).length, 3, "the failed run is in the log");
     assertEquals(await queried(), [`[{"n":1}]`, `[{"n":2}]`], "and not in a query over the feed");
     const mine = (await get<Table>(jwt, `/sheet/library:freshness`)).slice(1).find((r) => r.sheet_id === feedId);
@@ -7136,7 +8236,7 @@ Deno.test(async function allTests(t) {
         ),
       );
     let clock = Date.now() + 200_000_000;
-    await pollAlertOnce(mail, clock, fetcher);
+    await pollAlert(endless, mail, clock, fetcher);
     assert((await delivery(endless)).includes("refused it with 500"), "the post was refused");
     const read = pulled * chunk.byteLength;
     // readBody stops one chunk past the cap, which is how it knows it is past it.
@@ -7151,7 +8251,7 @@ Deno.test(async function allTests(t) {
     const token = "T11111111/B11111111/zzzzZZZZzzzzZZZZzzzzZZZZ";
     const typo = await alertOn(`https://hooks.slack.com:99999/services/${token}`, "typo");
     clock += 120_000;
-    await pollAlertOnce(mail, clock, fetcher);
+    await pollAlert(typo, mail, clock, fetcher);
     const line = await delivery(typo);
     assert(!line.includes(token), `the delivery line quoted the whole url: ${line}`);
     for (const field of ["Expected", "Received", "Source", "Fix"])
@@ -7162,12 +8262,164 @@ Deno.test(async function allTests(t) {
     const path = "B22222222/yyyyYYYYyyyyYYYYyyyyYYYY";
     const unreachable = await alertOn(`http://127.0.0.1:9/services/${path}`, "unreachable");
     clock += 120_000;
-    await pollAlertOnce(mail, clock, (url: string) => {
+    await pollAlert(unreachable, mail, clock, (url: string) => {
       throw new Error(`error sending request for url (${url})`);
     });
     const failed = await delivery(unreachable);
     assert(!failed.includes(path), `the delivery line quoted the url the failure named: ${failed}`);
     assert(failed.includes("127.0.0.1"), `and it still names the host: ${failed}`);
+  });
+
+  await t.step("You run a sheet now, pause it, and see when it runs next", async () => {
+    const { jwt } = await usr("runner@example.com");
+    const watched = automerge.create<Sheet>({
+      type: "table",
+      data: [arrayify([{ name: "n", type: "num", key: 0 }]), { 0: 1 }],
+    });
+    const table_id = `table:${watched.documentId}`;
+    await put(jwt, `/library/${table_id}`, {});
+
+    // An alert is the runnable sheet with no wire in it: it runs a query and
+    // writes its row, so "now" is answerable without a fetch. `to` is empty, so
+    // the run decides and delivers nothing.
+    const alert = automerge.create<{ data: [{ code: string; to: string; interval: number; paused?: boolean }] }>({
+      data: [{ code: `select n from @${table_id}`, to: "", interval: 3600 }],
+    });
+    const alert_id = `alert:${alert.documentId}`;
+    await put(jwt, `/library/${alert_id}`, { name: "on demand" });
+    const runs = async () => (await get<Table>(jwt, `/sheet/${alert_id}`)).length - 1;
+
+    // Counted rather than assumed: the background tick runs on the same clock
+    // this sheet was made on, and may have taken it already.
+    const before = await runs();
+    const { data: ran } = await post(jwt, `/library/${alert_id}/run`, {});
+    const after = await runs();
+    assertEquals(after, before + 1, "running it now writes the run's row");
+    assertEquals(ran.method, "ALERT", "and answers the row it wrote");
+    assertEquals(JSON.parse(String(ran.body)).status, "firing");
+
+    // The due entry was cleared and then set from the sheet's own interval, so
+    // the tick a second later does not run again what a person just ran. On the
+    // real clock, because that is the one the run was taken on.
+    await pollAlertOnce(() => Promise.resolve("sent"), Date.now());
+    assertEquals(await runs(), after, "the tick does not repeat a run that just happened");
+
+    // From here on the clock is far enough ahead that this sheet is due
+    // whatever the background tick has done, the way every other poller test in
+    // this file does it.
+    const clock = Date.now() + 500_000_000;
+
+    // Paused: the tick steps over it without a fetch, without a row, and
+    // without touching when it was due -- which the unpause below proves, since
+    // the same clock still finds it due.
+    alert.change((d: { data: [{ paused?: boolean }] }) => {
+      d.data[0].paused = true;
+    });
+    await pollAlertOnce(() => Promise.resolve("sent"), clock);
+    assertEquals(await runs(), after, "a paused alert is not run and writes nothing");
+
+    const refused = await app.request(`/library/${alert_id}/run`, {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+      body: "{}",
+    });
+    assertEquals(refused.status, 409);
+    assert((await refused.text()).includes("is paused"), "a paused sheet is refused by name");
+
+    alert.change((d: { data: [{ paused?: boolean }] }) => {
+      d.data[0].paused = false;
+    });
+    await pollAlertOnce(() => Promise.resolve("sent"), clock);
+    assertEquals(
+      await runs(),
+      after + 1,
+      "a paused sheet keeps the due time it had, so unpausing costs it no interval",
+    );
+
+    // A sheet with no poll is refused by name rather than answering an empty
+    // run: a table has nothing to go and fetch.
+    const wrong = await app.request(`/library/${table_id}/run`, {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+      body: "{}",
+    });
+    assertEquals(wrong.status, 400);
+    assert((await wrong.text()).includes("no poll to run"), "a table is refused by name");
+
+    // A feed reads the same switch. Its url is inside our own network, so
+    // safeFetch refuses it before it leaves and the only thing this proves is
+    // whether a row was written at all.
+    const feed = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "http://127.0.0.1:9/feed.json", interval: 60, paused: true }],
+    });
+    const feed_id = `net-http:${feed.documentId}`;
+    await put(jwt, `/library/${feed_id}`, { name: "paused feed" });
+    const polls = async () => (await get<Table>(jwt, `/sheet/${feed_id}`)).length - 1;
+    // The one sheet, through the very function the tick hands each due sheet.
+    // Not the tick itself: a clock this far ahead makes every feed in this file
+    // due, and this step would poll the lot of them.
+    await pollNetSheet(feed_id, feed.documentId, safeFetch, clock);
+    assertEquals(await polls(), 0, "a paused feed is not polled and writes nothing");
+
+    // Freshness says both halves: the switch off the document, and when the
+    // poller takes it next off the map that decides. The paused feed has never
+    // been polled, so the map does not know it and the read says null rather
+    // than naming a time nobody decided.
+    const byId = Object.fromEntries(
+      (await get<Table>(jwt, "/sheet/library:freshness")).slice(1).map((r) => [String(r.sheet_id), r]),
+    );
+    assertEquals(byId[feed_id].paused, true, "freshness reads the switch off the document");
+    assertEquals(byId[feed_id].next_run, null, "a sheet the due map has not reached yet is null, never a guess");
+    assertEquals(byId[alert_id].paused, false);
+    assert(
+      String(byId[alert_id].next_run).includes("T"),
+      `an alert the poller has run knows when it runs next, got ${byId[alert_id].next_run}`,
+    );
+  });
+
+  await t.step("run now: a runaway interval must not break freshness for the whole account", async () => {
+    // Nothing bounds `interval` from above, and freshness turns the due map's
+    // number straight into `new Date(due).toISOString()`. An interval whose
+    // milliseconds overflow past Number.MAX_VALUE lands Infinity in the due
+    // map, and Date#toISOString throws RangeError on that -- which would take
+    // every other sheet's freshness row down with it, not just this one's.
+    const { jwt, usr_id } = await usr("runaway@example.com");
+    const alert = automerge.create<{ data: [{ code: string; to: string; interval: number }] }>({
+      data: [{ code: `select 1 as n`, to: "", interval: 3600 }],
+    });
+    const alert_id = `alert:${alert.documentId}`;
+    // Claimed with an ordinary interval -- row_0 is a snapshot taken at claim
+    // time, so this is where a number automerge cannot round-trip as a JS
+    // number (it comes back a BigInt) would break the claim itself, and that
+    // is a different bug in a route this lane does not own. The huge value is
+    // written after the claim, straight into the live document.
+    await put(jwt, `/library/${alert_id}`, { name: "runaway interval" });
+    alert.change((d: { data: [{ interval: number }] }) => {
+      d.data[0].interval = 1e307;
+    });
+    await pollAlertSheet(
+      { sheet_id: alert_id, doc_id: alert.documentId, name: "runaway interval", created_by: usr_id },
+      () => Promise.resolve("sent"),
+      Date.now(),
+    );
+    const res = await app.request(`/library/freshness`, {
+      headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+    });
+    assertEquals(
+      res.status,
+      200,
+      `one sheet's overflowed interval must not break freshness for the whole account: ${await res.text()}`,
+    );
+    const byId = Object.fromEntries(
+      (await get<Table>(jwt, "/sheet/library:freshness")).slice(1).map((r) => [String(r.sheet_id), r]),
+    );
+    assert(
+      byId[alert_id].next_run === null || String(byId[alert_id].next_run).includes("T"),
+      `next_run is either a real timestamp or null, never a value that crashes reading it, got ${
+        byId[alert_id].next_run
+      }`,
+    );
   });
 
   await sql.end();

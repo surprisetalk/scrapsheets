@@ -47,6 +47,15 @@ secret resolution and the same body cap, and shows the status, the time, the siz
 refusal by name, before the sheet has to wait for the poller to find out. `POST /library/<sheet_id>/preflight` with
 `{"url": "...", "headers": "...", "method": "POST", "body": "..."}` is the same thing over HTTP, and it writes nothing.
 
+A feed says what a good run does to the runs before it: `mode` on the sheet is `append` (the default, the whole log),
+`replace` (a good run deletes the earlier good runs, and a failed one deletes nothing) or `upsert` (a `key` names the
+field a row is identified by, and a run supersedes the earlier runs holding the same keys). A feed that answers an
+envelope holding two arrays names the one that is the rows with `rows_path`. A body is read by the type the answer
+declares: CSV, TSV, NDJSON and gzip land as the JSON array they mean, so a query over the feed reads one shape whatever
+the wire carried, and a body its own type cannot parse is a failed run naming the line. A paused sheet (the checkbox
+beside the interval) is stepped over by the poller, "run now" polls it this second and answers the row it wrote
+(`POST /library/<sheet_id>/run` over HTTP), and `library:freshness` says when each sheet runs next.
+
 A sheet can hold its own secrets instead. `POST /library/<sheet_id>/secret` with `{"name":"hook","value":"..."}` sets
 the signing key; writing it again rotates it, and the one before still verifies until a third write retires it. `GET`
 answers with the names and timestamps and never a value. Name it `hook:stripe`, `hook:github` or `hook:shopify` instead
@@ -66,6 +75,11 @@ is bounded too: requests per second across every address it sends from, sheets i
 and alert deliveries a day across every alert it owns, a post to a url costing what an email does. Each refusal names
 the count and the limit, and `deno task status` fails while any account has hit the sheets, rows or deliveries cap in
 the past day; a request past its rate is shed with a 429 and not counted.
+
+`{"name":"api-read"}` mints the read-only spelling of that key: it opens the same routes and is refused, by name, on
+every write. Either key opens `POST /mcp/<sheet_id>` too, so an agent is something you hand a key rather than an
+account: it lists, reads, queries and (with the writing key) writes that one sheet and nothing else, and browses it as
+an MCP resource (`sheet://<sheet_id>`, the same csv the export answers) and a `describe_sheet` prompt.
 
 ```sh
 curl -X POST "https://api.sheets.scrap.land/sheet/$sheet_id" -H "scrapsheets-key: $key" \
@@ -111,6 +125,12 @@ every webhook and every alert you can read: when it last ran, when it last succe
 nobody has delivered to in three days says so beside a poll that has been failing. It is a sheet, so
 `select * from @library:freshness` and `/export/library:freshness.csv` both work.
 
+`GET /library/lineage` is what feeds what: one row per query, alert or chart and the sheet it reads, off the live
+document rather than a stale copy, so `select * from @library:lineage where depends_on = '@table:x'` is the list of what
+breaks if that sheet goes. An alert is silenced without being deleted: "snooze a day" on the alert page records every
+run and delivers none until the day is up, and "subscribe to this sheet" in the palette makes an alert that mails you
+when a sheet you are looking at gains a row.
+
 The library table shows the same answer per row — last run, and failures since — and the demo strip marks a sheet whose
 feed is failing, so a dead feed is visible where you open it rather than only in the 15-minute alarm email. Ctrl/⌘+K
 opens a palette over every sheet and every shortcut; Ctrl/⌘+/ still lists the keys.
@@ -119,10 +139,16 @@ A sheet you are done with goes in the trash, and asks nothing first, because the
 the demo strip counts what is in it, and each row there offers restore, with the sort and the column widths you had
 still on it. Delete is still there, inside the trash, and now it means what its warning says.
 
+A star beside each row keeps a sheet at the top of the library and first in the palette, in this browser. A selection
+spanning several library rows and "trash selected sheets" (Ctrl/⌘+Shift+Backspace) trashes them all at once.
+
 A column is cleaned from its own panel, beside hide and pin: trim, UPPER, lower, and drop every row this column has
 nothing in. Each one is an ordinary edit, so Ctrl/⌘+Z takes it back and everyone else looking at the sheet sees it. The
 sheet's own verb is in the palette instead, because it reads every column rather than one: "delete duplicate rows"
 keeps the first of every repeat and deletes the ones under it.
+
+A column is split from the same panel: type the delimiter, and "split" pushes one new column per part -- `name 1`,
+`name 2`, ... -- beside the column it read, refusing by name when a new name is taken or the delimiter divides nothing.
 
 A column of numbers is written at the number of decimal places you ask it for, in the same panel: the cell, the column
 stats and the totals row all read the one count, and an empty box goes back to whatever the number needed. The count
@@ -132,11 +158,21 @@ A chart is drawn as a line, bars, an area, a scatter, or one big number — `kpi
 since the one before, and draws the whole series small beside it. A kind that is not one of those is refused by name
 rather than quietly drawn as a line, which is what a typo used to get you.
 
+A chart splits its rows by a `series` column: one line, area or dot set per series, bars stacked, and a legend, with
+the picture unchanged when nothing is named. When every x is a day the axis is time: a point sits at its day, a gap in
+the data is a gap in the line, and a long series is folded to a readable number of points with the count shown.
+
 `select min(code) from @table:countries` answers, and so does the earliest date in a column. The engine under the page
 compares numbers and real dates, and a cell is neither — it is the text the document holds — so it used to drop the
 column out of the answer without a word. The query is now rewritten to the two functions that can compare text before
 the engine sees it. Where it cannot tell what a name means — an expression like `min(upper(code))`, or a name a
 subquery invented — it says so and names `min_text()` rather than guess.
+
+`ols(array(y), array(x1), array(x2))` fits more than one predictor and answers the coefficients; `ols_predict` reads a
+value back off them, which is how a residual lands on every row. `logit` and `logit_predict` are the same over a 0/1
+outcome. `sample_uniform`, `sample_normal` and `sample_triangular` put a distribution on an input, seeded so the same
+query answers the same numbers on the server and in the page, and `percentile(array(out), 0.9)` reads the spread back;
+`table:trials` is the column to run them over.
 
 The share panel mints a view-only link, with a box for how many days it lives and a box for a password. Both are
 optional and blank means the link it always minted: thirty days, openable by anyone holding the url. The password is
@@ -145,6 +181,10 @@ buys nobody an offline guess, and you have to send the password some other way. 
 the sheet loads: the token says it is locked, and the refusal would otherwise land in a WebSocket handshake, where no
 browser can read it. `POST /library/<sheet_id>/link` is the same thing over HTTP, taking `{"days": 7}` and
 `{"password": "..."}`.
+
+Making a sheet public is refused, naming the column and row, while a cell holds an API key, and while one holds an
+email address, a phone number, a social security number or a card number -- unless the share panel's second box says
+the personal data belongs there, which the request carries as `personal: true`.
 
 # polite scraper
 

@@ -395,7 +395,27 @@
             app.ports.preflightLoaded.send({ id, data });
           }, 'preflight'));
 
-          app.ports.shareAction.subscribe(catchy(async ({ id, action, email, role, public: isPublic, days, password }) => {
+          // The sheet's own poll, now. The answer is the row it wrote, named by
+          // sheet for the same reason a pre-flight's is: a run started on one
+          // sheet must not land on another opened while it was in flight.
+          app.ports.runNow.subscribe(catchy(async (id) => {
+            const token = getAuthToken();
+            if (!token) return app.ports.docErrored.send("Log in to run a sheet.");
+            const res = await fetch(`${API_BASE}/library/${id}/run`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+              body: "{}",
+            });
+            if (!res.ok) {
+              const error = httpErrorDetail(await res.text(), res.headers.get("Content-Type") ?? "") ||
+                `The run failed (${res.status}).`;
+              return app.ports.runLoaded.send({ id, data: { error } });
+            }
+            const { data } = await res.json();
+            app.ports.runLoaded.send({ id, data });
+          }, 'runNow'));
+
+          app.ports.shareAction.subscribe(catchy(async ({ id, action, email, role, public: isPublic, personal, days, password }) => {
             const token = getAuthToken();
             if (!token) {
               return app.ports.docErrored.send("Log in to share a sheet.");
@@ -425,7 +445,10 @@
             let link;
             if (action === "add") await send("/share", "POST", { email, role });
             else if (action === "remove") await send("/share", "DELETE", { email });
-            else if (action === "public") await send("/public", "POST", { public: isPublic });
+            // `personal` rides with the publish: the server refuses one over
+            // an email address, a phone number, an SSN or a card number without
+            // it, and its refusal is what tells the publisher to tick the box.
+            else if (action === "public") await send("/public", "POST", { public: isPublic, personal });
             else if (action === "link") {
               // Zero days and an empty password are "not asked for", and an
               // empty body is what the server reads as the default link, so an
@@ -1272,8 +1295,19 @@
           );
 
           // Restore a logged-in session from a previous visit so the UI shows LoggedIn on load.
+          // The email rides the session because the palette's "subscribe to
+          // this sheet" addresses the alert it writes to the account, and
+          // logging in reloads the page: what the form knew is gone by the time
+          // Elm is running again. A session stored before this was written
+          // carries no email, and the command is not offered until the next
+          // login rather than writing an alert with nowhere to send.
           const restored = Stored.get("user");
-          if (restored.usr_id) app.ports.authResult.send({ usr_id: String(restored.usr_id) });
+          if (restored.usr_id) {
+            app.ports.authResult.send({
+              usr_id: String(restored.usr_id),
+              email: typeof restored.email === "string" ? restored.email : "",
+            });
+          }
 
           // Signup: request a verification email. Never leaves the form locked.
           app.ports.signup.subscribe(async (email) => {
@@ -1308,7 +1342,7 @@
                 return;
               }
               const { data } = await res.json();
-              Stored.set("user", { usr_id: data.usr_id, jwt: data.jwt });
+              Stored.set("user", { usr_id: data.usr_id, jwt: data.jwt, email });
               location.reload();
             } catch (err) {
               app.ports.authResult.send({ error: err?.message ?? 'Login failed.' });

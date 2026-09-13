@@ -108,14 +108,12 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
   1. Collapsible groups with subtotals over the rows on screen, the way the totals row already respects the filter.
   2. A pivot UI over the same machinery — AlaSQL's `pivot` is correct once `checkPivot()` has had its say.
 
-- [ ] **You dedupe on nearly-equal rows and split a column without writing SQL.** Exact dedupe ships as
-      `SheetRowsDedupe`, out of the palette. The two left are the two that need more than a row's own values.
-  1. Split column and text-to-columns, which make columns rather than change one, so the panel is the wrong home and
-     the column count changing is the whole difficulty.
-  2. Fuzzy dedupe: the same verb over a threshold rather than over equality. `similarity()`, `token_set_ratio()` and
+- [ ] **You dedupe on nearly-equal rows without writing SQL.** Exact dedupe ships as `SheetRowsDedupe`, out of the
+      palette, and splitting a column ships as `SheetColumnSplit`, in the column's own panel. The one left is the one
+      that needs more than a row's own values.
+  1. Fuzzy dedupe: the same verb over a threshold rather than over equality. `similarity()`, `token_set_ratio()` and
      `soundex()` already ship as UDFs, so this is the UI over them — which columns to compare, how close counts, and
      a preview of what would go, because unlike the exact verb nobody can see the answer before it runs.
-
 - [ ] **A very large sheet scrolls.** Every row renders.
   1. Virtualized rendering.
   2. Server-side pagination behind it, for sheets too big to send at all.
@@ -128,17 +126,29 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
 ## Charts & dashboards
 
-- [ ] **A chart can plot more than one thing.** `CHART_KINDS` ships line, bar, area, scatter and kpi, and every one of
-      them reads the one x and the one y a chart document holds. Everything left needs a second series, which is the
-      actual work: the document gains a field, `chartSql` selects it, and `chartPoints` stops being a list of pairs.
-  1. A `series` column, which is what stacked bar, heatmap and matrix all mean.
-  2. A second y with its own axis, which is what dual axis means.
-  3. Box plot, which needs five numbers per category rather than one.
-
-- [ ] **A time axis behaves like time.** The x axis is ordinal today, so a gap in the data is a gap in nothing.
-  1. Date axis with real spacing, explicit gap handling, and downsampling for a long series.
-  2. Annotations: mark a release, a price change, a storm on the axis.
-
+- [ ] **A chart can plot more than one thing.** A `series` column is in: `chartSql` selects it, `chartPoints` groups
+      on it, and line, area, scatter, bar and kpi each draw it. What is left is the two that need a second scale rather
+      than a second series.
+  1. A second y with its own axis, which is what dual axis means. The document gains a `y2`, validated through
+     `chartIdent` the way `series` is; `chartSql` selects it as `y2`; `chartPoints` cannot hold it, so the right-hand
+     series is its own list with its own `top`/`bottom`/`plotY`, and the axis labels at x 790 are the second scale's.
+     A kpi has one number, so `y2` is refused for that kind by name rather than ignored.
+  2. Box plot, which needs five numbers per category rather than one. `CHART_KINDS` gains `box`, `chartSql` selects
+     min, the two quartiles, the median and max per x (a different statement from every other kind and so its own
+     branch), `chartPoints` cannot hold five numbers per point, and `viewChart` draws a box and its whiskers per x.
+     `kindSpec` in `Main.elm` gains the row `browser_test.ts` checks.
+  3. The legend does not wrap: many series overlap their labels across the one viewBox.
+- [ ] **A time axis carries annotations.** A chart on a day axis places its points by time now; what it cannot do is
+      mark one.
+  1. Annotations: mark a release, a price change, a storm on the axis.
+  2. The document holds them beside `source`/`kind`/`x`/`y`/`series` in `data[0]`, one `{ at, label }` per entry,
+     decoded through `optionalField` the way `series` is, so a chart written before there were annotations keeps
+     decoding.
+  3. `viewChart` draws each one as a vertical rule at `chartRuns`' own placement of `at` (a day the chart's own axis
+     may not hold, so the placement is the span's, not a lookup), with the label at the top; an `at` that is not a day
+     on a chart whose axis is time is drawn nowhere rather than at the left edge.
+  4. `viewChartSettings` edits them as one textarea, `day  label` per line, the way `viewDashboard`'s tiles are one
+     per line.
 - [ ] **A geo column draws a map.** Nothing renders geometry.
   1. Point maps and choropleths from a geo column.
   2. Boundary datasets as sheets — counties, tracts, ZCTAs, districts — are the other half and live in **Inventory**.
@@ -153,21 +163,15 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
      like any other, and the access token is written back beside it rather than into the document.
   2. Static egress IP, which many enterprise sources require before they will talk at all.
 
-- [ ] **The response is parsed, not stored as a blob.** JSON lands as one cell.
-  1. Parsers: JSON path, CSV/TSV, NDJSON, XML, RSS/Atom, HTML with CSS selectors, XLSX, Parquet.
-  2. Archives: zip and gzip, including "the one CSV inside this daily zip".
+- [ ] **The response is parsed, not stored as a blob.** CSV, TSV, NDJSON and gzip land as the JSON array they mean,
+      read by the type the answer declares; every other format is still one cell.
+  1. Parsers: XML, RSS/Atom, HTML with CSS selectors, XLSX, Parquet. Each is one more entry in `BODY_PARSERS` and
+     one more branch in `readFeedBody` in `main.ts`, which both doors into a net sheet already call; each answers
+     the JSON array text the body means, the way the delimited and NDJSON branches do.
+  2. Archives: zip, including "the one CSV inside this daily zip". A zip names its members, so the branch has to
+     say which member it reads and refuse an archive holding more than one it can name, and `BODY_CAP` is spent on
+     the uncompressed member the way `GZIP_SLICE` spends it on a gzip.
   3. PDF table extraction, because half of government data ships as PDF.
-  4. Payload mapping is the same job on the `net-hook` side: JSON path to column, so a webhook lands as typed rows.
-
-- [ ] **A feed can replace or upsert rather than append.** Paging ships — `page_by` on the sheet, one body per run,
-      bounded by `PAGE_MAX` — and every net sheet still appends.
-  1. Write mode per sheet: append, replace, or upsert by key. A field beside `page_by` on the net-http document, read
-     where `pollNetOnce` writes its run row; replace is a `trimNet` to zero before the write, upsert a key column named
-     on the sheet.
-  2. A cursor or link feed whose envelope holds two arrays (JSON:API's `data` beside `included`) is refused by name,
-     because `pageRows` will not guess which one is the rows. Name the rows path the way `page_path` names the cursor,
-     one more field beside it, so such a feed can be read.
-
 ---
 
 ## Ingest — net-hook & forms
@@ -216,10 +220,11 @@ The runner is in **Now**. These are what the Demo Gallery needs on top of it.
   3. Business-day and fiscal-calendar triggers: third business day after month end. `business_days()` and
      `fiscal_period()` already do the arithmetic.
 
-- [ ] **You can run it now, pause it, and see when it runs next.** Nothing is visible or controllable.
-  1. Run now, pause, disable, with the next-run time on the sheet.
-  2. Backfill: run a schedule over a historical date range.
-
+- [ ] **You can backfill a schedule over a historical date range.** Running it now and pausing it are done; history is
+      not.
+  1. Backfill: run a schedule over a historical date range.
+  2. A paused sheet still ages in `library:freshness` and still drags the `GET /status` liveness conditions down;
+     decide whether `POLL_OK`/`ALERT_OK` should read `paused` before the backfill lands.
 - [ ] **Sheets run in dependency order.** Each runs on its own timer, so a downstream sheet can run before its source.
   1. A DAG derived from the `@sheet` refs `scanRefs()` already returns.
   2. A cycle is refused as the path that closes it, exactly as `checkRefPath` reports one.
@@ -242,10 +247,16 @@ The runner is in **Now**. These are what the Demo Gallery needs on top of it.
   2. Each one needs an account somewhere -- a carrier, a Teams app, a push service -- so each is its own item once one
      of them is picked.
 
-- [ ] **You can silence an alert without deleting it.** There is no acknowledgement of any kind.
-  1. Snooze, acknowledge, escalate.
-  2. Subscribe to a sheet: be told when a sheet you follow changes, without owning it.
-
+- [ ] **You can acknowledge an alert, and it escalates when nobody does.** Snooze ships (`snoozed_until`); a firing
+      alert nobody has read still looks exactly like one somebody has.
+  1. Acknowledge: `POST /library/:id/ack` writes the caller and the moment onto the newest `ALERT` run row's body, a
+     chip on the alert page sends it, and an unacknowledged firing run reads through `ALERT_OK` the way an undelivered
+     one does, so `library:freshness` and `GET /status` say it.
+  2. Escalate: a second destination on the alert document, delivered through the same `sendAlertUrl`/`sendAlertEmail`
+     pair when a firing run is still unacknowledged after the seconds the document names. Refuse a destination that is
+     the first one, and count the delivery against `sendWithinQuota` like any other.
+  3. Subscribe to a sheet: `subscribe to this sheet` in the palette makes the alert; a session stored before the page
+     kept the email offers it only after the next login.
 ---
 
 ## Actions & write-back
@@ -272,11 +283,11 @@ The missing other half: sheets that do something, not just show something.
 
 ## Lineage, tests & freshness
 
-- [ ] **You can see what feeds a sheet and what it feeds.** The refs are known and never shown.
-  1. A dependency graph view off `scanRefs()`.
-  2. Impact analysis: what breaks if this column is renamed or removed.
-  3. Warn dependents before a schema change lands.
-
+- [ ] **You can see what a change to a sheet will break.** `library:lineage` is the graph: one row per sheet and the
+      sheet it depends on, off the live document through `scanRefs()`.
+  1. Impact analysis: what breaks if this column is renamed or removed, which needs the column names a dependent
+     selects and not only the sheet ids it names.
+  2. Warn dependents before a schema change lands.
 - [ ] **A sheet states what must be true of it.** Nothing is asserted.
   1. Assertions: not-null, unique, accepted values, row-count range, freshness bound, referential integrity.
   2. Results land in the run log, and failing rows are quarantined rather than passed silently.
@@ -287,22 +298,19 @@ The missing other half: sheets that do something, not just show something.
 ## Stats & modeling
 
 The Excel add-in market lives here.
-
-- [ ] **A regression answers more than one shape.** `regr_slope()`, `regr_intercept()`, `r2()`, `corr()`,
-      `regr_predict()` and `regr_stderr()` ship.
-  1. Multiple regression, logistic regression, and per-row residuals.
-
 - [ ] **A seasonal series can be forecast.** `regr_predict()` is the straight line and `fit_exponential()` the
       log-linear one.
   1. Seasonal decomposition, which needs a series-to-series function — neither the aggregate protocol nor the window
      pass can express one today, so that is the actual work.
 
-- [ ] **You can put a distribution on an input and read percentiles out.** The @RISK slot, and nothing occupies it.
-  1. Monte Carlo: distributions on input cells, sampled outputs, percentile results.
-  2. Sensitivity and tornado analysis: which input moves the output most.
-  3. A scenario manager: named sets of assumptions compared side by side. `table:assumptions` is the one-row sheet the
+- [ ] **You can put a distribution on an input and read percentiles out.** Monte Carlo is done: `sample_uniform`,
+      `sample_normal` and `sample_triangular` in `src/sql.mjs`, `table:trials`, and `query:monte-carlo-margin`. What is
+      left is reading the answer back.
+  1. Sensitivity and tornado analysis: which input moves the output most. One row per sampled input, the output's
+     spread when that input alone varies, ordered by width. `corr(array(input), array(out))` over the trial rows is the
+     cheap first version and needs no new UDF.
+  2. A scenario manager: named sets of assumptions compared side by side. `table:assumptions` is the one-row sheet the
      demos already read parameters from, so this generalises it.
-
 - [ ] **You can solve for an input.** No goal seek, no solver.
   1. Goal seek over one cell, then constrained optimization over a sheet.
 
@@ -338,12 +346,6 @@ The Excel add-in market lives here.
   1. Schema-aware generation off the same read `describe` uses.
   2. The generated SQL is shown for review, never run unseen.
   3. A prompt eval sheet — test cases and scores — is a normal sheet, and is how this stays honest.
-
-- [ ] **An agent can be trusted with write access.** MCP writes carry the caller's whole authority.
-  1. Scoped tokens and per-tool permissions.
-  2. Agent writes go in the one audit log under **Permissions & governance**.
-  3. Sheets exposed as MCP resources and prompts, not only tools.
-
 ---
 
 ## Reports & export
@@ -370,11 +372,12 @@ The Excel add-in market lives here.
   2. SSO, SAML and SCIM, which is table stakes for any org-sized customer.
   3. Ownership transfer and offboarding: what happens to sheets when someone leaves.
 
-- [ ] **You cannot publish a secret by accident.** An API key is refused at both doors; nothing else is scanned.
-  1. Warn before a dataset with personal data goes public.
-  2. Retention policies, legal hold, whole-workspace backup and restore, and region pinning are the rest of this row,
-     and each is its own item once one customer asks.
-
+- [ ] **A workspace can be held, backed up and pinned to a region.** A credential is refused at both publish doors and
+      so is personal data, unless the publisher says it belongs there.
+  1. Retention policies: rows age out on a schedule the sheet carries.
+  2. Legal hold, which is retention refused: a held sheet keeps everything until the hold is lifted.
+  3. Whole-workspace backup and restore.
+  4. Region pinning: where the automerge documents and the database live.
 ---
 
 ## Search, shop & discovery
@@ -459,26 +462,6 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
   1. Staging copies: clone a sheet, change the query, review the diff, promote.
   2. Branch and merge a sheet — Automerge makes this genuinely possible and nobody else can offer it.
   3. A sandbox: fake webhook deliveries and dry-run schedules.
-
-- [ ] **The suite answers in under ten seconds on a machine that is doing something else.** `deno task test` fails past
-      ten, and it sits at the gate: `page_test.ts` is the critical path, and `main_test.ts`'s steps have grown to
-      within a second or two of it. Every wait for something to happen is `until()` now, so a loaded machine makes the
-      suite slow rather than red; slow is still red at the gate.
-  1. Sharing a booted page is done and is spent: `rendered()` in `page_test.ts` is the one library page the tests that
-     only read what it painted share, and nothing else in the file can join them — every other boot either opens a
-     different url, which is a different paint, or writes to the model. It bought back two paints and no more.
-  2. What a `boot` costs is Elm's first paint into jsdom, not the harness around it: the jsdom, the hoisted bundle and
-     Elm's init together are a rounding error beside it, so there is nothing left to hoist and no per-test setup left
-     to share. The lever left is fewer boots — merge tests that assert about the same page — or a cheaper paint.
-  3. `settle()` pays QUIET_FRAMES turns of the event loop every time it is called, and a test that clicks ten times
-     pays it ten times. Measure whether one fewer quiet frame survives `--shuffle` before touching anything else.
-  4. `main_test.ts` is one `Deno.test` of steps against one database, so it cannot run in parallel with itself. Time it
-     alone (`deno test --allow-all main_test.ts`) and merge steps that build the same fixture before it overtakes
-     `page_test.ts`.
-  5. Dead ends, so nobody spends the afternoon again: `--optimize` shrinks `dist/index.js` by a few percent and moves
-     nothing, and the flat `settle(ms)` sleeps left are the ones proving something did **not** happen, which cannot be
-     shortened.
-
 - [ ] **You can run it yourself.** There is no self-host path.
   1. A docker image, for the customers who cannot send data anywhere.
   2. Workspace export and import, stated loudly as a feature rather than buried.
@@ -487,10 +470,9 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
 
 ## Navigation & workspace UX
 
-- [ ] **A library of hundreds of sheets is navigable.** It is one flat list with an `opened` column.
-  1. Folders, workspaces and favourites.
-  2. Bulk operations: multi-select, move, tag, delete, share.
-
+- [ ] **A library of hundreds of sheets is navigable.** Favourites and bulk trash are in; it is still one flat list.
+  1. Folders and workspaces.
+  2. Bulk tag, move and share over the same selection `TrashSelected` already reads.
 - [ ] **Everything is reachable without a mouse or a screen.** Ctrl/⌘+K opens a palette over every sheet and every
       runnable shortcut; nothing below it is done.
   1. Full keyboard-only operation, screen reader support, contrast and focus order.

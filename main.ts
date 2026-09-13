@@ -392,6 +392,14 @@ export type Method = typeof NET_METHODS[number];
 // one forever and call the feed complete.
 export const PAGE_BY = ["page", "offset", "cursor", "link"] as const;
 export type PageBy = typeof PAGE_BY[number];
+// What a good run does to the runs before it, and the one list of them. A sheet
+// spelling anything else is refused by name where it is read, the way a page
+// mode outside PAGE_BY is: a mode this server does not know would append under
+// a sheet that says it replaces, and the sheet would read as a log of every
+// poll instead of the answer it asked to hold. `netModes` in `src/Main.elm` is
+// the copy the language boundary forces.
+export const NET_MODES = ["append", "replace", "upsert"] as const;
+export type NetMode = typeof NET_MODES[number];
 // `cursor` names the query parameter this feed takes a since-value in. The
 // watermark itself is not here: it is the poller's, not the user's. `body` is
 // templated the way a header is: `{{secret:name}}` out of the secret table, and
@@ -403,6 +411,16 @@ export type PageBy = typeof PAGE_BY[number];
 // `offset` and `cursor` each need and `link` does not: a link feed names the
 // whole url itself. `page_path` is the dotted path in the answer where the next
 // cursor sits, such as `meta.next`, and it is read under `cursor` alone.
+//
+// `mode` says what a good run does to the runs before it, and a sheet without
+// one appends the way it always did. `key` is the path into one row that says
+// which earlier runs a new one supersedes, which `upsert` needs and no other
+// mode takes. `rows_path` is where in an envelope the rows sit, for a feed that
+// hands back two arrays and names neither as the answer.
+//
+// `paused` is the sheet's own switch. A paused feed is stepped over by the
+// poller without a fetch and without a row, and POST /library/:id/run refuses
+// it by name, so nothing runs a sheet somebody asked to stop.
 export type NetHttp = {
   url: string;
   interval: number;
@@ -413,13 +431,31 @@ export type NetHttp = {
   page_by?: PageBy;
   page_param?: string;
   page_path?: string;
+  mode?: NetMode;
+  key?: string;
+  rows_path?: string;
+  paused?: boolean;
 };
 // An alert is a query plus somewhere to send it. The condition is the query's
 // own where clause: it fires when the query returns a row, which is the only
 // definition that needs no second language.
-export type Alert = { code: string; to: string; interval: number; digest?: boolean; when?: When };
-// A chart is a sheet: where the numbers come from, and which two columns to draw.
-export type Chart = { source: string; kind: string; x: string; y: string };
+// `snoozed_until` is the sheet's own silence: an ISO timestamp until which a
+// run is decided and recorded and delivered to nobody. It is not `paused` --
+// a paused sheet does not run at all, and a snoozed one still moves the
+// baseline the `added` and `removed` conditions diff against.
+export type Alert = {
+  code: string;
+  to: string;
+  interval: number;
+  digest?: boolean;
+  when?: When;
+  paused?: boolean;
+  snoozed_until?: string;
+};
+// A chart is a sheet: where the numbers come from, which two columns to draw,
+// and -- when the rows hold more than one thing -- the column that names which
+// series each row belongs to.
+export type Chart = { source: string; kind: string; x: string; y: string; series?: string };
 // A dashboard owns no data: it names the sheets to show, and each tile is that
 // sheet. Its own rows are therefore the list of what it names.
 export type Dashboard = { tiles: string[] };
@@ -517,6 +553,7 @@ const sheet = async (
   // lookup: they have no automerge document and no sheet row, and their own
   // where clause is the access rule.
   if (sheet_id === FRESHNESS_SHEET) return await freshness(c, { limit, offset });
+  if (sheet_id === LINEAGE_SHEET) return await lineage(c);
   if (sheet_id === AUDIT_SHEET) {
     const usr_id = c.get("usr_id");
     return await cselect({
@@ -1114,7 +1151,7 @@ const page = (c: Context) => ({ data, offset, count }: Page) => {
 // --- app & middleware
 
 export const app = new Hono<{
-  Variables: JwtVariables & { usr_id: string; via: Via };
+  Variables: JwtVariables & { usr_id: string; via: Via; key_sheet?: string; key_scope?: "read" | "write" };
 }>();
 
 app.use("*", logger());
@@ -1926,9 +1963,11 @@ app.onError((err, c) => {
 const POLL_OK = () =>
   sql`substring(n.meta->>'status' from '^[0-9]{1,9}$')::int between 200 and 299 and n.meta->>'shape_change' is null
       and n.meta->>'rolled_over' is distinct from 'true'`;
+// A snoozed run delivered nothing on purpose, so it is a good run: graded the
+// other way, silencing an alert for a day is an outage for a day.
 const ALERT_OK = () =>
   sql`(case when n.body is json then n.body::jsonb end)->>'status' <> 'error'
-      and ((case when n.body is json then n.body::jsonb end)->>'delivery' in ('sent', ${HELD})
+      and ((case when n.body is json then n.body::jsonb end)->>'delivery' in ('sent', 'snoozed', ${HELD})
            or (case when n.body is json then n.body::jsonb end)->>'status' in ('clear', 'unchanged', 'idle'))`;
 
 // Which rows of `net` are one sheet's runs, and which of those went well --
@@ -2860,20 +2899,6 @@ app.post("/net/:id", async (c) => {
   // Bounded by the body cap every route gets, before routing.
   const raw = new Uint8Array<ArrayBuffer>(await c.req.arrayBuffer());
   const size = raw.byteLength;
-  const body = new TextDecoder().decode(raw);
-  // Postgres text cannot hold a NUL, and the column is text because a body is
-  // a body. Verified bytes that cannot be stored used to reach the insert and
-  // come back as an unexplained 500 -- the one 500 a sheet's own owner can
-  // trigger by accident, by pointing a protobuf or a gzip sender at it.
-  const nul = raw.indexOf(0);
-  if (nul >= 0) {
-    bad(400, `This delivery to ${sheet_id} carries a byte that cannot be stored.`, {
-      Received: `a NUL byte at offset ${nul} of ${size}`,
-      Expected: "a body with no NUL bytes; every other byte, valid UTF-8 or not, is kept as sent",
-      Source: "the request body, against the text column it is stored in",
-      Fix: "send text or JSON; base64 the payload if it is binary",
-    });
-  }
   // Every delivery is signed. There is no per-sheet opt-out: without this,
   // anyone who learns a net sheet's id can append rows to it. Which scheme is
   // checked comes off the sheet's stored secrets, never off the request.
@@ -2890,6 +2915,26 @@ app.post("/net/:id", async (c) => {
   // body is read: the byte bound must spend the bytes actually sent rather
   // than the content-length a flooder declares.
   spend(sheet_id, "deliveries", 1, size, "batch the events into fewer deliveries");
+  // What the delivery means, off the type it declares: the reader a poll uses,
+  // so a sender that posts CSV and a feed that answers CSV land the same rows.
+  // After the signature, which covers the bytes as they were sent: decompressing
+  // an unverified body is work anyone holding a doc_id could ask us for.
+  const body = await readFeedBody(raw, c.req.header("content-type") ?? "", `POST /net/${sheet_id}`);
+  // Postgres text cannot hold a NUL, and the column is text because a body is
+  // a body. Verified bytes that cannot be stored used to reach the insert and
+  // come back as an unexplained 500 -- the one 500 a sheet's own owner can
+  // trigger by accident, by pointing a protobuf sender at it. Asked of what is
+  // stored rather than of what arrived: a gzip body is full of NULs and what
+  // is stored is the rows that came out of it.
+  const nul = body.indexOf("\0");
+  if (nul >= 0) {
+    bad(400, `This delivery to ${sheet_id} carries a byte that cannot be stored.`, {
+      Received: `a NUL byte at offset ${nul} of ${body.length}`,
+      Expected: "a body with no NUL bytes; every other byte, valid UTF-8 or not, is kept as sent",
+      Source: "the request body, against the text column it is stored in",
+      Fix: "send text or JSON; base64 the payload if it is binary",
+    });
+  }
   // The skew window bounds a replay to HOOK_SKEW seconds, which is not the same
   // as never: a delivery captured off the wire can be sent again, unchanged,
   // until its t goes stale. The unique index on (sheet_id, signature) is what
@@ -3265,6 +3310,12 @@ const RETRY_BACKOFF_MS = 30_000;
 // inside the 15s tick that drives it; the tick itself refuses to start a second
 // cycle while one is still running, which covers a database that hangs too.
 const POLL_CYCLE_MS = 3_000;
+// The far end of an interval field, net-http and alert alike. Past this, `now
+// + interval * 1000` risks a value `Date` cannot hold, and library:freshness
+// turning that into `next_run` would then throw for every sheet on the
+// account rather than just this one -- so both pollers clamp here the same
+// way they already clamp the near end at 60.
+const INTERVAL_MAX_S = 86_400 * 3650;
 // A body arrives in chunks, and a host that trickles empty ones is a loop the
 // byte cap alone cannot end.
 const BODY_CHUNKS_MAX = 10_000;
@@ -3296,7 +3347,7 @@ const validator = (raw: string | null): string | null => (raw && raw.length <= 2
 // The body, up to one byte past the cap. That byte is all it takes to know the
 // response is too large, and reading the rest of a runaway is the cost the cap
 // exists to refuse.
-const readBody = async (res: Response): Promise<Uint8Array> => {
+const readBody = async (res: Response): Promise<Uint8Array<ArrayBuffer>> => {
   const reader = res.body?.getReader();
   if (!reader) return new Uint8Array();
   const chunks: Uint8Array[] = [];
@@ -3327,6 +3378,126 @@ const readBody = async (res: Response): Promise<Uint8Array> => {
   return buf;
 };
 
+// What a body means, off the type it declares. A feed answers rows in more than
+// one language and every reader downstream speaks one -- shapeOf, the digest,
+// pageRows, the export, a query over the sheet -- so a body on this list is
+// parsed into the JSON array it means and stored as that, and a body on none of
+// it is stored as the text it arrived as, which is what a JSON feed hands us
+// already. The type read is the answer's own: nothing a sheet holds can know
+// what a host will answer with next week.
+const BODY_PARSERS: Record<string, "csv" | "tsv" | "ndjson" | "gzip"> = {
+  "text/csv": "csv",
+  "text/tab-separated-values": "tsv",
+  "application/x-ndjson": "ndjson",
+  "application/jsonl": "ndjson",
+  "application/gzip": "gzip",
+  "application/x-gzip": "gzip",
+};
+
+// Compressed bytes handed to the decompressor at a time. Small, because it is
+// what bounds how far past the cap one read can carry: deflate writes at most
+// about a thousand bytes for one, so this is half a cap of slack and not the
+// whole of whatever a bomb expands to.
+const GZIP_SLICE = 512;
+
+/** A body as the text a row stores: the JSON array it means. Both doors into a
+ * net sheet read through this one function, so a CSV a sender posts and a CSV a
+ * feed answers land as the same rows. `source` is what a refusal names -- the
+ * url a poll fetched, or the route a delivery arrived on. */
+const readFeedBody = async (raw: Uint8Array<ArrayBuffer>, contentType: string, source: string): Promise<string> => {
+  // The type alone: a charset or a boundary rides the same header, and a
+  // parameter is not part of the name.
+  const how = BODY_PARSERS[contentType.split(";")[0].trim().toLowerCase()];
+  if (how === undefined) return new TextDecoder().decode(raw);
+  let bytes = raw;
+  if (how === "gzip") {
+    // Fed a slice at a time, and read through the same bounded reader every
+    // response body takes. Both halves are the cap: handed the whole of a bomb
+    // at once the decompressor answers the whole of what it expands to in one
+    // chunk, and the cap is spent after a gigabyte is already in memory. A
+    // slice bounds one read to what one slice expands to, which deflate caps
+    // near a thousandfold, and the reader stops on the first read past the cap.
+    let fed = 0;
+    const slices = new ReadableStream<BufferSource>({
+      pull(feeding) {
+        if (fed >= raw.byteLength) return feeding.close();
+        feeding.enqueue(raw.subarray(fed, fed + GZIP_SLICE));
+        fed += GZIP_SLICE;
+      },
+    });
+    bytes = await readBody(new Response(slices.pipeThrough(new DecompressionStream("gzip"))))
+      .catch((err: unknown) => {
+        // readBody's own refusal is an Error it has already named. A TypeError
+        // is the decompressor saying these bytes are not a gzip stream.
+        if (!(err instanceof TypeError)) throw err;
+        return bad(400, `This body does not decompress as gzip.`, {
+          Received: `${raw.byteLength} bytes the gzip reader refused: ${reason(err)}`,
+          Expected: "the bytes gzip wrote, because this body declares itself gzip",
+          Source: source,
+          Fix: "send what gzip wrote, or declare the type the body actually is",
+        });
+      });
+    if (bytes.byteLength > BODY_CAP) {
+      bad(413, `This body decompresses to more than can be stored.`, {
+        Received: `${raw.byteLength} compressed bytes holding at least ${bytes.byteLength}`,
+        Limit: `${BODY_CAP} bytes per body, decompressed`,
+        Source: source,
+        Fix: "compress a paged or filtered answer, or give the sheet a cursor",
+      });
+    }
+  }
+  const text = new TextDecoder().decode(bytes);
+  // What a gzip holds is the one thing neither door can be told: one header
+  // says the body is compressed and nothing says what came out of it. The first
+  // character that is not whitespace is the whole of the sniff -- JSON opens
+  // with a bracket or a brace, and everything else is read as a delimited file.
+  const reading = how === "gzip" ? (/^\s*[[{]/.test(text) ? "json" : "csv") : how;
+  if (reading === "json") return text;
+  let meant: string;
+  if (reading === "ndjson") {
+    const rows: unknown[] = [];
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      // A blank line is no record. Every other one is a record or a refusal: a
+      // line skipped for not parsing is a row the sheet silently lost.
+      if (!line) continue;
+      try {
+        rows.push(JSON.parse(line));
+      } catch (err) {
+        bad(400, `Line ${i + 1} of this body is not JSON.`, {
+          Received: `${show(line.slice(0, 200))}, which the JSON parser refused: ${reason(err)}`,
+          Expected: "one JSON value a line, because this body declares itself NDJSON",
+          Source: source,
+          Fix: "fix that line, or declare the type the body actually is",
+        });
+      }
+    }
+    meant = JSON.stringify(rows);
+  } else {
+    // Keyed by column name, which is what every reader downstream keys on and
+    // what a JSON feed hands them. `col.key` is the document's own spelling and
+    // stays with the importer, the one door that writes a document.
+    const { cols, rows } = parseDelimited(text, {}, reading === "tsv" ? "\t" : ",", source);
+    meant = JSON.stringify(rows.map((row) => Object.fromEntries(cols.map((col) => [col.name, row[col.key]]))));
+  }
+  // The cap on what the body means, which is what lands in the column: a body
+  // arrives naming its columns once and is stored naming them on every row, so
+  // a few kilobytes on the wire is megabytes here. Neither door's own check can
+  // stand in for this one -- the poller's is on the bytes that arrived and
+  // bodyLimit's is on the request.
+  const stored = new TextEncoder().encode(meant).byteLength;
+  if (stored > BODY_CAP) {
+    bad(413, `This body means more rows than can be stored.`, {
+      Received: `${raw.byteLength} bytes holding ${stored} once every row is keyed by column name`,
+      Limit: `${BODY_CAP} bytes per body, as it is stored`,
+      Source: source,
+      Fix: "send a paged or filtered answer, or shorten the column names every row now carries",
+    });
+  }
+  return meant;
+};
+
 // The most pages one poll reads. A feed that still has a next page here is a
 // feed that never says "last", which is a loop and not a backlog: the row that
 // gives up carries the page it stopped on, the sheet keeps nothing from that
@@ -3334,6 +3505,23 @@ const readBody = async (res: Response): Promise<Uint8Array> => {
 export const PAGE_MAX = 100;
 
 type Paging = { by: PageBy; param: string; path: string };
+
+// A dotted path into an answer: at most eight names, each at most 64
+// characters. `page_path`, `rows_path` and `key` are all spelled this way, and
+// all three are refused against this one regex rather than three copies of it.
+const NET_PATH = /^\w[\w-]{0,63}(\.\w[\w-]{0,63}){0,7}$/;
+
+/** The value at a dotted path, or undefined where the path runs out or runs
+ * through something that holds no names. Which of the two it was is the
+ * caller's refusal to make: it is the one that knows what it was looking for. */
+const atNames = (value: unknown, path: string): unknown => {
+  let at: unknown = value;
+  for (const name of path.split(".")) {
+    if (typeof at !== "object" || at === null || Array.isArray(at)) return undefined;
+    at = (at as Record<string, unknown>)[name];
+  }
+  return at;
+};
 
 /** How this feed hands out its pages, or null for the one request a sheet with
  * no `page_by` makes. Refused here, off the document, the way netRequest
@@ -3369,7 +3557,7 @@ const pageConfig = (config: { page_by?: unknown; page_param?: unknown; page_path
       }),
     );
   }
-  if (by === "cursor" && !(typeof page_path === "string" && /^\w[\w-]{0,63}(\.\w[\w-]{0,63}){0,7}$/.test(page_path))) {
+  if (by === "cursor" && !(typeof page_path === "string" && NET_PATH.test(page_path))) {
     throw new Error(
       explain("A cursor-paged feed names where in its answer the next cursor sits.", {
         Received: show(page_path),
@@ -3384,6 +3572,65 @@ const pageConfig = (config: { page_by?: unknown; page_param?: unknown; page_path
     param: by === "link" ? "" : String(page_param),
     path: by === "cursor" ? String(page_path) : "",
   };
+};
+
+type Storing = { mode: NetMode; key: string; rowsPath: string };
+
+/** What a good run does to the runs before it, and where in an answer its rows
+ * sit. Refused here, off the document, the way pageConfig refuses a paging
+ * mode: a poll that cannot be built is this sheet's failure row rather than a
+ * request sent wrong. An empty box is what a sheet that was never given one
+ * means -- append, the whole log, which is what every feed did before there
+ * was a mode. */
+const storeConfig = (config: { mode?: unknown; key?: unknown; rows_path?: unknown }): Storing => {
+  const { mode, key, rows_path } = config;
+  const spelled = mode === undefined || mode === null || mode === "" ? "append" : mode;
+  if (typeof spelled !== "string" || !(NET_MODES as readonly string[]).includes(spelled)) {
+    throw new Error(
+      explain("That is not a way this server stores a feed's runs.", {
+        Received: show(mode),
+        Expected: `one of ${NET_MODES.join(", ")}, or nothing at all for a feed that keeps every run`,
+        Source: "the mode field on this net-http sheet",
+        Fix: `spell it ${NET_MODES.join(" or ")}`,
+      }),
+    );
+  }
+  const storing = spelled as NetMode;
+  const named = key === undefined || key === null ? "" : key;
+  if (storing === "upsert" && !(typeof named === "string" && NET_PATH.test(named))) {
+    throw new Error(
+      explain("An upsert feed names the field its rows are identified by.", {
+        Received: show(key),
+        Expected: "a dotted path of at most eight names, such as `id` or `attributes.id`",
+        Source: "the key field on this net-http sheet",
+        Fix: "write the path to the field every row of this feed holds its identity in",
+      }),
+    );
+  }
+  // A key under a mode that supersedes nothing is a sheet whose owner believes
+  // it is deduplicating. Refused rather than ignored: the belief is the bug.
+  if (storing !== "upsert" && named !== "") {
+    throw new Error(
+      explain(`A ${storing} feed supersedes nothing by key.`, {
+        Received: `mode ${storing} beside key ${show(key)}`,
+        Expected: "a key under upsert alone, which is the mode that reads one",
+        Source: "the mode and key fields on this net-http sheet",
+        Fix: "set the mode to upsert, or take the key out",
+      }),
+    );
+  }
+  const path_ = rows_path === undefined || rows_path === null ? "" : rows_path;
+  if (path_ !== "" && !(typeof path_ === "string" && NET_PATH.test(path_))) {
+    throw new Error(
+      explain("That is not where in an answer this server reads a feed's rows.", {
+        Received: show(rows_path),
+        Expected: "a dotted path of at most eight names, such as `data`, or nothing at all",
+        Source: "the rows_path field on this net-http sheet",
+        Fix: "name the field this feed holds its rows in, or take rows_path out",
+      }),
+    );
+  }
+  return { mode: storing, key: String(named), rowsPath: String(path_) };
 };
 
 const withParam = (url: string, param: string, value: string): string => {
@@ -3415,7 +3662,9 @@ const atPath = (parsed: unknown, path: string, url: string, number: number): str
         throw new Error(
           explain("This feed's first page holds nothing where page_path says the next cursor sits.", {
             Received: `nothing at ${names.slice(0, i).join(".")} on page 1`,
-            Expected: `an object at ${names.slice(0, i).join(".")}, on page 1 at least; a later page may drop it to say there is no next`,
+            Expected: `an object at ${
+              names.slice(0, i).join(".")
+            }, on page 1 at least; a later page may drop it to say there is no next`,
             Source: url,
             Fix: "point page_path at the field this feed holds its next-page cursor in",
           }),
@@ -3465,13 +3714,21 @@ const linkNext = (header: string | null): string | null => {
 };
 
 /** One page's rows, and what the whole page parsed to. Every page is JSON: the
- * array of rows itself, or -- under `cursor` and `link`, whose next page is
- * named in an envelope around the rows -- an object whose one array-valued key
- * holds them. Two arrays is a guess this refuses by name: `{warnings: [],
- * items: [...]}` read as no rows at all, every page, with a green run row. A
+ * array named by `rows_path`, or the array of rows itself, or -- under `cursor`
+ * and `link`, whose next page is named in an envelope around the rows -- an
+ * object whose one array-valued key holds them. Two arrays is a guess this
+ * refuses by name: `{warnings: [], items: [...]}` read as no rows at all, every
+ * page, with a green run row, and `rows_path` is how a feed that answers two on
+ * purpose (JSON:API's `data` beside `included`) says which one is the answer. A
  * page that is neither is this poll's failure row, naming the page it arrived
  * on and what arrived instead. */
-const pageRows = (paging: Paging, text: string, number: number, url: string): { rows: unknown[]; parsed: unknown } => {
+const pageRows = (
+  paging: Paging,
+  rowsPath: string,
+  text: string,
+  number: number,
+  url: string,
+): { rows: unknown[]; parsed: unknown } => {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -3484,6 +3741,25 @@ const pageRows = (paging: Paging, text: string, number: number, url: string): { 
         Fix: "point the sheet at an endpoint that answers JSON, or take its page_by out",
       }),
     );
+  }
+  // Named, so nothing is guessed: the sheet says where its rows are and every
+  // page answers there or the poll says so. Read before the array itself, since
+  // a feed whose envelope holds the rows under `data` may also answer a bare
+  // array on a page that is empty, and reading that as the rows would hide the
+  // page that dropped the envelope.
+  if (rowsPath) {
+    const at = atNames(parsed, rowsPath);
+    if (!Array.isArray(at)) {
+      throw new Error(
+        explain(`Page ${number} of this feed holds no rows where rows_path says they sit.`, {
+          Received: `${rowsPath} holds ${show(at)}`,
+          Expected: `an array of rows at ${rowsPath}, on every page`,
+          Source: url,
+          Fix: "point rows_path at the field this feed holds its rows in, or take rows_path out",
+        }),
+      );
+    }
+    return { rows: at, parsed };
   }
   if (Array.isArray(parsed)) return { rows: parsed, parsed };
   const envelope = typeof parsed === "object" && parsed !== null ? parsed as Record<string, unknown> : null;
@@ -3499,7 +3775,8 @@ const pageRows = (paging: Paging, text: string, number: number, url: string): { 
     throw new Error(
       explain(`Page ${number} of this feed holds more than one array.`, {
         Received: `arrays at ${arrays.map(([key]) => key).join(", ")}`,
-        Expected: "one array of rows in the envelope, or the array itself, so that no guess is made about which one is the rows",
+        Expected:
+          "one array of rows in the envelope, or the array itself, so that no guess is made about which one is the rows",
         Source: url,
         Fix: "point the sheet at the endpoint that answers the rows themselves",
       }),
@@ -3607,33 +3884,554 @@ const shapeChange = (
   return added.length || dropped.length || retyped.length ? { added, dropped, retyped } : null;
 };
 
+/** Which earlier runs one good run supersedes: the value at `key` on every row
+ * of the body, sorted and deduplicated. The body is the array itself -- what a
+ * paged poll concatenated, and what a one-page feed answers -- or the array at
+ * `rows_path` in the envelope around it. A row holding nothing at `key` is
+ * refused by its position rather than skipped: a run that quietly dropped half
+ * its keys supersedes half of what it should, and the sheet keeps two rows for
+ * the one record. The rows are bounded by BODY_CAP, which is what the whole
+ * body had to fit inside before it reached here. */
+const rowKeys = (storing: Storing, body: string): string[] => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch (err) {
+    throw new Error(
+      explain("An upsert feed answers JSON rows.", {
+        Received: `${body.length} characters the JSON parser refused: ${reason(err)}`,
+        Expected: "an array of rows, or an envelope holding one at rows_path",
+        Source: "the body this poll answered with",
+        Fix: "point the sheet at an endpoint that answers JSON rows, or set the mode back to append",
+      }),
+    );
+  }
+  const rows = Array.isArray(parsed) ? parsed : storing.rowsPath ? atNames(parsed, storing.rowsPath) : undefined;
+  if (!Array.isArray(rows)) {
+    throw new Error(
+      explain("An upsert feed answers an array of rows.", {
+        Received: storing.rowsPath ? `${storing.rowsPath} holds ${show(rows)}` : show(parsed),
+        Expected: "a JSON array of rows, or an envelope naming one in rows_path",
+        Source: "the body this poll answered with",
+        Fix: "name the field the rows sit in as rows_path, or set the mode back to append",
+      }),
+    );
+  }
+  const keys = new Set<string>();
+  for (const [i, row] of rows.entries()) {
+    const at = atNames(row, storing.key);
+    if (typeof at !== "string" && typeof at !== "number") {
+      throw new Error(
+        explain("A row of this upsert feed holds no key.", {
+          Received: `row ${i + 1} of ${rows.length} holds ${show(at)} at ${storing.key}`,
+          Expected: `text or a number at ${storing.key} on every row`,
+          Source: "the body this poll answered with",
+          Fix: "point key at the field every row of this feed is identified by",
+        }),
+      );
+    }
+    // JSON has no integer past 2^53: `JSON.parse` already rounded this one
+    // before this function saw it, so two distinct ids can arrive equal, and
+    // trusting the rounded value would silently fold two records into one --
+    // the opposite of what upsert promises. `Number.isSafeInteger` is the
+    // whole check: it is false exactly where a round trip through JSON may
+    // have moved the value.
+    if (typeof at === "number" && !Number.isSafeInteger(at)) {
+      throw new Error(
+        explain("A row of this upsert feed holds a key past safe precision.", {
+          Received: `row ${i + 1} of ${rows.length} holds ${at} at ${storing.key}, already rounded by JSON parsing`,
+          Expected: `an integer within ±${Number.MAX_SAFE_INTEGER} at ${storing.key}, or that field sent as a string`,
+          Source: "the body this poll answered with",
+          Fix: "ask the source to send this field as a JSON string, and point key at it the same",
+        }),
+      );
+    }
+    keys.add(String(at));
+  }
+  // Sorted, so two runs holding the same records hold the same list however
+  // the feed ordered them.
+  return [...keys].sort();
+};
+
 const netRow = async (
   sheet_id: string,
   method: Method,
   body: string,
   meta: Record<string, unknown>,
+  storing: Storing | null,
 ): Promise<void> => {
-  // A body this sheet already holds is not appended again. The digest of a
-  // good run's body rides `meta.sig`, the slot a delivery's signature takes,
-  // so the index that refuses a replayed delivery refuses the repeat; the row
-  // it matches moves to now, the way a 304 moves the row before it, and says
-  // it came again. A failure row carries no digest and is never a repeat.
-  const [stored] = await sql`
-    insert into net (sheet_id, method, body, meta) values (${sheet_id}, ${method}, ${body}, ${sql.json(meta)})
-    on conflict (sheet_id, (meta->>'sig')) do nothing returning net_id
-  `;
-  if (!stored) {
-    await sql`
-      update net set created_at = now(), meta = ${sql.json({ ...meta, repeated: true })}
-      where sheet_id = ${sheet_id} and meta->>'sig' = ${String(meta.sig)}
+  const status = Number(meta.status);
+  const good = status >= 200 && status < 300;
+  // Only a good run supersedes anything, and `storing` is null on every row
+  // that is the log's rather than the feed's: a retry and a caught refusal
+  // append whatever the sheet says, because a feed that emptied its sheet on
+  // one bad poll is the whole of what replace must never do.
+  const keys = storing?.mode === "upsert" && good ? rowKeys(storing, body) : null;
+  const wrote = keys ? { ...meta, keys } : meta;
+  await sql.begin(async (tx: Sql) => {
+    // A body this sheet already holds is not appended again. The digest of a
+    // good run's body rides `meta.sig`, the slot a delivery's signature takes,
+    // so the index that refuses a replayed delivery refuses the repeat; the row
+    // it matches moves to now, the way a 304 moves the row before it, and says
+    // it came again. A failure row carries no digest and is never a repeat.
+    const [stored] = await tx`
+      insert into net (sheet_id, method, body, meta) values (${sheet_id}, ${method}, ${body}, ${sql.json(wrote)})
+      on conflict (sheet_id, (meta->>'sig')) do nothing returning net_id
     `;
-  }
+    const [moved] = stored ? [stored] : await tx`
+      update net set created_at = now(), meta = ${sql.json({ ...wrote, repeated: true })}
+      where sheet_id = ${sheet_id} and meta->>'sig' = ${String(meta.sig)}
+      returning net_id
+    `;
+    if (!good || !storing || storing.mode === "append") return;
+    // The row this run is, whether it was inserted or was the repeat that moved
+    // to now. Nothing else can have happened: the insert is refused only by the
+    // digest index, and the row it matched is the one the update just took.
+    if (!moved) {
+      throw new Error(
+        explain("This run neither landed nor matched a row already here.", {
+          Received: `no row for sig ${show(meta.sig)}`,
+          Expected: "one row, inserted or moved, before earlier runs are superseded",
+          Source: `net rows for ${sheet_id}`,
+          Fix: "nothing supersedes anything until this is understood; the next poll appends again",
+        }),
+      );
+    }
+    if (storing.mode === "replace") {
+      // The sheet holds the newest good run alone. The failure rows stay: they
+      // are the log saying why a poll answered nothing, and taking them would
+      // take the evidence along with the data POLL_OK never counted.
+      await tx`
+        delete from net n where n.sheet_id = ${sheet_id} and n.net_id <> ${moved.net_id} and ${POLL_OK()}
+      `;
+      return;
+    }
+    // The runs this one supersedes are the ones that answered for a record it
+    // answered for again. A run holding none of them -- a failure row, a run
+    // from before the key was named -- is untouched: the run log stays the
+    // unit, and the key says which of them this one replaces. A run that
+    // answered no rows names no record and so supersedes nothing; asking
+    // Postgres `?| '{}'` would be the same answer at the cost of a round trip.
+    if (keys?.length) {
+      await tx`
+        delete from net n
+        where n.sheet_id = ${sheet_id} and n.net_id <> ${moved.net_id}
+          and (case when jsonb_typeof(n.meta->'keys') = 'array' then n.meta->'keys' end) ?| ${keys}
+      `;
+    }
+  });
   await trimNet(sheet_id);
   // A body that landed is a change to the feed. A failure row is the log's
   // and not the feed's: a receiver told about every failed poll would hear
   // one a minute about nothing arriving.
-  const status = Number(meta.status);
-  if (status >= 200 && status < 300) touch(sheet_id.split(":")[1]);
+  if (good) touch(sheet_id.split(":")[1]);
+};
+
+/** One feed, polled now: the request the sheet describes, the row it writes and
+ * the due time it earns. The tick below walks the due sheets over it and
+ * POST /library/:id/run hands it the one sheet a person asked for, so running
+ * on the timer and running on demand are the same code and cannot drift. */
+export const pollNetSheet = async (
+  sheet_id: string,
+  doc_id: string,
+  fetcher = safeFetch,
+  now = Date.now(),
+): Promise<void> => {
+  // Where this sheet was due before the poll, so a paused one can be put back
+  // exactly as it was: a paused feed is looked at on every tick, and a feed
+  // started again is due when it always was rather than an hour from now.
+  const wasDue = netDue.get(sheet_id);
+  netDue.set(sheet_id, now + 3600_000);
+  // The only set here that can introduce a key: every later one is this same
+  // sheet, and Map.set on a key it holds keeps its position.
+  bound(netDue, RATE_LIMIT_KEYS_MAX);
+  // Declared out here so the catch can name the request it failed on. The
+  // body is the sheet's own text and not what its templates resolve to: the
+  // failure row is built from these four, and a token must not reach the log.
+  let url = `sheet ${sheet_id}`;
+  let headers: Record<string, string> = {};
+  let method: Method = "GET";
+  let body: string | undefined;
+  // The watermark this feed had already reached, out here for the same
+  // reason: it rides every row this poll writes, the failures among them.
+  // The newest row is where this feed's state lives, and a failed poll that
+  // dropped the watermark asked the feed for all of history on the next one
+  // -- the single thing the cursor exists to prevent. The validators do not
+  // travel with it: a 304 moves the row the validator came with, and a
+  // failure row does not hold that body.
+  let carried: Record<string, string> = {};
+  try {
+    // The last row is where this feed's state lives: the validators the last
+    // good body carried, the watermark it was fetched at, and how many
+    // failures have happened in a row since. It lives in `net.meta` rather
+    // than in the automerge document because that document is what sync hands
+    // every viewer and what the user edits -- a poller writing to it every
+    // tick would fight those edits and mint a change for every open browser.
+    //
+    // Read before anything about the config can throw. A method the sheet
+    // spells DELETE, a url that will not parse and a document that will not
+    // load all land in the catch below, and a failure row written without the
+    // watermark in hand is a feed asked for all of history on the next poll.
+    const [prev]: {
+      net_id: string;
+      meta: {
+        etag?: string;
+        last_modified?: string;
+        cursor?: string;
+        attempt?: number;
+        shape?: Record<string, string> | null;
+      };
+    }[] = await sql`
+      select net_id, meta from net where sheet_id = ${sheet_id} order by net_id desc limit 1
+    `;
+    const was = prev?.meta ?? {};
+    if (was.cursor) carried = { cursor: String(was.cursor) };
+    const config = (await automerge.find<{ data: [NetHttp] }>(doc_id as AnyDocumentId)).doc()?.data?.[0];
+    if (!config) throw new Error("The document has no config in data[0].");
+    // Obeyed before anything else the document says: nothing is fetched and
+    // nothing is written down. The due time goes back to what it was rather
+    // than forward, so a feed started again is due when it always was and a
+    // paused one is looked at on every tick instead of once an hour.
+    if (config.paused) {
+      if (wasDue === undefined) netDue.delete(sheet_id);
+      else netDue.set(sheet_id, wasDue);
+      return;
+    }
+    netDue.set(sheet_id, now + Math.max(60, Math.min(INTERVAL_MAX_S, Number(config.interval) || 3600)) * 1000);
+    if (!config.url) return;
+    url = config.url;
+    headers = parseNetHeaders(config.headers);
+    ({ method, body } = netRequest(config));
+    const pointed = new URL(url);
+    const host = pointed.hostname;
+    // The identity a `link` page must stay on: scheme and host together, so
+    // a next page cannot downgrade to plain http on the same host either.
+    // `host` alone still keys the per-host request gap below, which cares
+    // about the wire and not the scheme.
+    const origin = pointed.origin;
+    const holdoff = hostDue.get(host) ?? 0;
+    // Waiting out what another sheet on this host was told. Nothing ran, so
+    // there is nothing to log.
+    if (holdoff > now) {
+      netDue.set(sheet_id, holdoff);
+      return;
+    }
+    // Resolved into a separate object. `headers` is what a failure row is
+    // built from, so a resolved token cannot reach the log even if curlFor
+    // one day prints more than the keys. The conditional headers are ours and
+    // not the sheet's, for that rule in reverse: the repro line's job is to
+    // fetch the body by hand, and a conditional request answers 304.
+    const sending = {
+      ...await resolveSecrets(sheet_id, headers),
+      ...(was.etag ? { "If-None-Match": was.etag } : {}),
+      ...(was.last_modified ? { "If-Modified-Since": was.last_modified } : {}),
+    };
+    // The body is templated where a header already was, and resolved into a
+    // second object for the same reason. `{{cursor}}` is the watermark the
+    // cursor parameter would have carried; the first poll has none, and asks
+    // for everything the way an unset parameter does.
+    const sendingBody = body === undefined ? undefined : (await resolveSecrets(sheet_id, {
+      body: body.replaceAll("{{cursor}}", was.cursor ? String(was.cursor) : ""),
+    }))
+      .body;
+    // The watermark is when the last good poll started, not when it finished:
+    // a row created while that request was in flight is asked for twice
+    // rather than missed once. It rides every good run, so a sheet that
+    // gains a cursor later resumes from its last poll instead of re-reading
+    // history it has already logged.
+    if (config.cursor) {
+      if (!/^[A-Za-z0-9_.-]{1,64}$/.test(config.cursor)) {
+        throw new Error(
+          explain("This sheet's cursor is not the name of a query parameter.", {
+            Received: show(config.cursor),
+            Expected: "letters, digits, dot, dash or underscore, at most 64 of them",
+            Source: "the cursor field on this net-http sheet",
+            Fix: "name the parameter this feed takes a since-value in, such as `since` or `updated_after`",
+          }),
+        );
+      }
+      if (was.cursor) url = withParam(url, config.cursor, was.cursor);
+    }
+    // How this feed hands out its pages, and where page one is: a page number
+    // and an offset ride the first request, a cursor and a Link header only
+    // arrive with an answer. A sheet with no `page_by` makes the one request
+    // it always made, and `url` is what it always was.
+    const paging = pageConfig(config);
+    // What this run does to the runs before it, and where in the answer its
+    // rows sit. Read here, beside the paging, so a sheet whose mode or key
+    // cannot be followed is a failure row before a request goes out rather
+    // than a good run that supersedes the wrong thing.
+    const storing = storeConfig(config);
+    // `pageStart` and `nextPage` overwrite `paging.param` on every request a
+    // paged mode sends, page one included. Naming it the same as `cursor`
+    // does not fail to parse -- both are lone parameter names -- so the two
+    // features would silently fight instead: the since-value `cursor` wrote
+    // onto the url a moment ago is gone before the request goes out, and
+    // every poll re-reads the feed from its start.
+    if (paging && config.cursor && paging.param === config.cursor) {
+      throw new Error(
+        explain("page_param is the same query parameter as this sheet's own cursor.", {
+          Received: `both page_param and cursor name ${show(paging.param)}`,
+          Expected: "two different parameter names -- paging overwrites this one on every request",
+          Source: "the page_param and cursor fields on this net-http sheet",
+          Fix: "name page_param something else, such as `page` or `after`",
+        }),
+      );
+    }
+    // Page one: a `page` feed counts from one and an `offset` feed from zero,
+    // each in the parameter the sheet names. A `cursor` feed is asked for
+    // nothing on its first request -- it has no cursor until an answer
+    // carries one -- and a `link` feed is asked exactly as the sheet writes it.
+    if (paging?.by === "page") url = withParam(url, paging.param, "1");
+    if (paging?.by === "offset") url = withParam(url, paging.param, "0");
+    const started = Date.now();
+    // A string instead of a response is a failure off the wire: a timeout, a
+    // reset. Everything safeFetch refuses on its own arrives as an
+    // HTTPException instead, because a private address or a redirect loop
+    // answers a retry exactly as it answered this one.
+    const request = (target: string) =>
+      fetcher(target, sending, method, sendingBody).catch((err) => {
+        if (err instanceof HTTPException) throw err;
+        return reason(err);
+      });
+    // A 5xx and a 429 are the host saying "later". A 404, a 401, an SSRF
+    // refusal are a "no", and retrying a "no" is noise on top of the failure
+    // row that already answered it. Said on page one or on page five, it is
+    // one answer about the whole poll: the pages already read are dropped and
+    // the retry starts at page one again, because a feed that ran out of
+    // patience halfway has no place to resume from.
+    const later = async (answer: Response | string, at: string): Promise<void> => {
+      const answered = typeof answer === "string" ? null : answer;
+      const detail = typeof answer === "string" ? answer : new TextDecoder().decode(await readBody(answer));
+      const after = answered?.headers.get("retry-after") ?? null;
+      // The wait is the host's and not this sheet's, so it holds every sheet
+      // pointed there. It is a floor and not a schedule: this sheet takes the
+      // later of it and its own backoff, which is what the host asked for.
+      if (after !== null) holdHost(host, now + retryAfterMs(after, now));
+      const attempt = Number(was.attempt ?? 0) + 1;
+      // Read back out of jsonb, so it is guarded like every other read out of
+      // jsonb: a count that is not a whole number lands as NaN in the next
+      // due time, and a sheet due at NaN is due on every tick forever.
+      if (!Number.isInteger(attempt) || attempt < 1) {
+        throw new Error(
+          explain("This feed's last run recorded a failure count that cannot be read.", {
+            Received: `attempt: ${JSON.stringify(was.attempt)}`,
+            Expected: "a whole number of failures in a row, or nothing at all",
+            Source: `meta on the newest row of ${sheet_id}`,
+            Fix: "delete that row; the next poll starts the count again",
+          }),
+        );
+      }
+      if (attempt >= RETRY_MAX) {
+        throw new Error(
+          explain(`This feed has failed ${attempt} polls in a row, which is the retry bound.`, {
+            Received: `${attempt} failures, the last of them: ${detail.slice(0, 200)}`,
+            Expected: `a 2xx within ${RETRY_MAX} attempts`,
+            Source: at,
+            Fix: "fix the feed or the sheet; the next scheduled poll starts the count again",
+          }),
+        );
+      }
+      const wait = Math.max(hostDue.get(host) ?? 0, now + RETRY_BACKOFF_MS * 2 ** (attempt - 1));
+      netDue.set(sheet_id, wait);
+      // `at` is the page this answer actually came from, page one or a
+      // later one: a reader who pastes the failure row's repro must reach
+      // the request that failed, not always the first one this poll sent.
+      await netRow(
+        sheet_id,
+        method,
+        JSON.stringify({
+          ...fetchFailure(at, headers, answered, detail, method, body),
+          attempt,
+          retry_at: new Date(wait).toISOString(),
+        }),
+        { status: answered?.status ?? 0, ms: Date.now() - started, bytes: detail.length, attempt, ...carried },
+        null,
+      );
+    };
+    const res = await request(url);
+    // Asked once; the next sheet on this host in the same cycle steps over it.
+    // The pages after this one go out back to back: the gap is between
+    // cycles, and one poll is one reader walking one feed to its end.
+    holdHost(host, now + HOST_GAP_MS);
+    if (typeof res === "string" || res.status === 429 || res.status >= 500) {
+      await later(res, url);
+      return;
+    }
+    const kept = {
+      etag: validator(res.headers.get("etag")) ?? was.etag ?? null,
+      last_modified: validator(res.headers.get("last-modified")) ?? was.last_modified ?? null,
+      cursor: new Date(now).toISOString(),
+    };
+    if (res.status === 304) {
+      // A 304 is a healthy poll that appended nothing: the feed answered, and
+      // what it answered is that the row already here is still current.
+      // POLL_OK and library:freshness both grade meta->>'status' between 200
+      // and 299, so the run is recorded as the 200 it semantically is and
+      // `not_modified` keeps the status that came off the wire -- otherwise a
+      // daily file polled hourly reads as a dead feed. Moving that row's
+      // created_at rather than appending an empty one is what a quiet alert
+      // tick does: liveness reads max(created_at), and 23 blank rows a day
+      // would push the feed's own data out past NET_KEEP.
+      if (!prev || !(was.etag || was.last_modified)) {
+        throw new Error(
+          explain("This feed answered 304 to a request that carried no validator.", {
+            Received: "HTTP 304 Not Modified",
+            Expected: "a 2xx, because this poll sent no If-None-Match and no If-Modified-Since",
+            Source: url,
+            Fix: "the host is answering a conditional request nobody made; point the sheet elsewhere",
+          }),
+        );
+      }
+      await sql`
+        update net
+        set created_at = now(),
+            meta = ${
+        sql.json({ ...prev.meta, ...kept, status: 200, not_modified: true, ms: Date.now() - started, bytes: 0 })
+      }
+        where net_id = ${prev.net_id}
+      `;
+      return;
+    }
+    const raw = await readBody(res);
+    // A body over the cap is a failure row naming both numbers. A truncated
+    // success is a parse error further downstream, blamed on the data.
+    if (res.ok && raw.byteLength > BODY_CAP) {
+      throw new Error(
+        explain("This feed's response is too large to store.", {
+          Received: `${res.headers.get("content-length") ?? `at least ${raw.byteLength}`} bytes`,
+          Limit: `${BODY_CAP} bytes per response`,
+          Source: url,
+          Fix: "point the sheet at a paged or filtered endpoint, or give it a cursor",
+        }),
+      );
+    }
+    // What the body means, off the type the answer declares: a CSV, a TSV, an
+    // NDJSON or a gzip arrives as the JSON array it holds, so the pages, the
+    // digest, the shape and every reader downstream see exactly what a JSON
+    // feed hands them. A body that did not answer 2xx is never parsed -- an
+    // error page is not this feed's data -- and is logged as the text it is.
+    const text = res.ok
+      ? await readFeedBody(raw, res.headers.get("content-type") ?? "", url)
+      : new TextDecoder().decode(raw);
+    // The pages after the first, and what the run stores: every page answers
+    // an array, and the arrays concatenated are one body, so shapeOf, the
+    // digest, the cap and everything downstream see exactly what a one-page
+    // feed hands them. The validators and the `{{cursor}}` watermark rode the
+    // first request alone -- they are about the feed, not about a page of it.
+    // A sheet with no `page_by` runs none of this and stores what arrived.
+    let payload = text;
+    // What the caps spend: what `text` holds, not the wire bytes `raw`
+    // carried. They are two numbers for every parsed body -- a gzip page's
+    // wire bytes bound nothing, and a CSV re-serialized as JSON repeats every
+    // column name on every row -- and the stored body is this one.
+    let bytes = res.ok ? new TextEncoder().encode(text).byteLength : raw.byteLength;
+    // The host said "later" on a page: `later` has written the row and this
+    // sheet is done until its backoff.
+    let retrying = false;
+    if (paging && res.ok) {
+      const first = pageRows(paging, storing.rowsPath, text, 1, url);
+      const rows = [...first.rows];
+      let target = nextPage(paging, url, origin, res, first, rows.length, 1);
+      for (let number = 2; target !== null; number++) {
+        if (number > PAGE_MAX) {
+          throw new Error(
+            explain(`This feed asked for page ${number}, and one poll reads ${PAGE_MAX}.`, {
+              Received: `${PAGE_MAX} pages holding ${rows.length} rows, and still a next page`,
+              Expected: `a feed that runs out of pages within ${PAGE_MAX} of them`,
+              Source: url,
+              Fix: "give the sheet a cursor so each poll asks for less, or point it at a filtered endpoint",
+            }),
+          );
+        }
+        // The page this poll is on, which is what the catch below builds its
+        // failure row from: a reader who pastes the row's curl must reach the
+        // request that broke, the way `later` is handed the page it answered.
+        url = target;
+        const answer = await request(target);
+        if (typeof answer === "string" || answer.status === 429 || answer.status >= 500) {
+          await later(answer, target);
+          retrying = true;
+          break;
+        }
+        if (!answer.ok) {
+          throw new Error(
+            explain(`This feed answered ${answer.status} on page ${number}.`, {
+              Received: `HTTP ${answer.status}${answer.statusText ? " " + answer.statusText : ""}`,
+              Expected: "a 2xx on every page a feed names, or no next page at all",
+              Source: target,
+              Fix: "page one answered, so the sheet is right and the feed is not; ask whoever runs it",
+            }),
+          );
+        }
+        const chunk = await readBody(answer);
+        // Decompressed (or parsed) before it is counted: a gzip page's wire
+        // bytes are not what lands in `rows`, and summing those instead of
+        // this would let a paged gzip feed's pages decompress to any amount
+        // between them without the cap below ever seeing it.
+        const pageText = await readFeedBody(chunk, answer.headers.get("content-type") ?? "", target);
+        bytes += new TextEncoder().encode(pageText).byteLength;
+        // Checked as it grows. A feed that never says "last" otherwise costs
+        // every page it has before one number past the cap refuses the lot.
+        if (bytes > BODY_CAP) {
+          throw new Error(
+            explain("This feed's pages are too large to store.", {
+              Received: `at least ${bytes} bytes over ${number} pages`,
+              Limit: `${BODY_CAP} bytes per run`,
+              Source: url,
+              Fix: "give the sheet a cursor so each poll asks for less, or point it at a filtered endpoint",
+            }),
+          );
+        }
+        const page = pageRows(paging, storing.rowsPath, pageText, number, target);
+        // Pushed one at a time: a spread of a hundred thousand rows is an
+        // argument list, and an argument list has a length the runtime caps.
+        for (const row of page.rows) rows.push(row);
+        target = nextPage(paging, target, origin, answer, page, rows.length, number);
+      }
+      // Nothing of what those pages held is kept: the retry starts at page one.
+      if (retrying) return;
+      payload = JSON.stringify(rows);
+    }
+    // Errors become log rows too: the user who typed the URL must see them, and
+    // must be able to run the same request by hand.
+    const logged = res.ok ? payload : JSON.stringify(fetchFailure(url, headers, res, text, method, body));
+    // The columns this run answered with, beside it, and against the run
+    // before: a dropped column read as a sheet of blanks and graded healthy.
+    // The rows still land -- they are what arrived -- and POLL_OK grades the
+    // run as failed on `shape_change`, so freshness and the status alarm hear
+    // it the way they hear every other failure, once: the run after compares
+    // against this one. A body that is not rows has no shape; going from rows
+    // to none dropped every column, and from none to rows is compared to
+    // nothing, since nothing was known.
+    const shape = res.ok ? shapeOf(payload) : undefined;
+    const change = res.ok && was.shape ? shapeChange(was.shape, shape ?? {}) : null;
+    // The run's idempotency key: what arrived, so the same answer twice is
+    // one row however many polls asked.
+    const sig = res.ok ? await digest(payload) : undefined;
+    // The run beside the payload: whether a feed is slow, or 200-ing an error
+    // page, is a question about the poll and not about the body it returned.
+    // The validators ride the good rows only, so the next poll asks its
+    // question about the body this sheet actually holds; the watermark is
+    // carried onto this one, because where the feed had been read to is true
+    // whether or not this poll answered.
+    await netRow(sheet_id, method, logged, {
+      status: res.status,
+      ms: Date.now() - started,
+      // What the run read off the wire, every page of it, which is what the
+      // cap refused a byte past and what a slow feed is measured by.
+      bytes,
+      ...(res.ok ? { ...kept, sig, shape, ...(change ? { shape_change: change } : {}) } : carried),
+    }, storing);
+  } catch (err) {
+    const message = reason(err);
+    console.error(`net-http poll ${sheet_id}:`, message);
+    const failure = fetchFailure(url, headers, null, message, method, body);
+    // No attempt count: giving up, a malformed Retry-After and a sheet that
+    // cannot be read all land here, and the next scheduled poll starts over.
+    await netRow(sheet_id, method, JSON.stringify(failure), { status: 0, ms: 0, bytes: 0, ...carried }, null)
+      .catch((dbErr: unknown) => console.error(`net-http poll ${sheet_id}: could not record the error:`, dbErr));
+  }
 };
 
 export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promise<void> => {
@@ -3645,364 +4443,7 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
     // running long. Nothing here has moved this sheet's due time yet, so the
     // next tick takes it.
     if (Date.now() - cycleStart > POLL_CYCLE_MS) break;
-    netDue.set(sheet_id, now + 3600_000);
-    // The only set here that can introduce a key: every later one this cycle is
-    // this same sheet, and Map.set on a key it holds keeps its position.
-    bound(netDue, RATE_LIMIT_KEYS_MAX);
-    // Declared out here so the catch can name the request it failed on. The
-    // body is the sheet's own text and not what its templates resolve to: the
-    // failure row is built from these four, and a token must not reach the log.
-    let url = `sheet ${sheet_id}`;
-    let headers: Record<string, string> = {};
-    let method: Method = "GET";
-    let body: string | undefined;
-    // The watermark this feed had already reached, out here for the same
-    // reason: it rides every row this poll writes, the failures among them.
-    // The newest row is where this feed's state lives, and a failed poll that
-    // dropped the watermark asked the feed for all of history on the next one
-    // -- the single thing the cursor exists to prevent. The validators do not
-    // travel with it: a 304 moves the row the validator came with, and a
-    // failure row does not hold that body.
-    let carried: Record<string, string> = {};
-    try {
-      // The last row is where this feed's state lives: the validators the last
-      // good body carried, the watermark it was fetched at, and how many
-      // failures have happened in a row since. It lives in `net.meta` rather
-      // than in the automerge document because that document is what sync hands
-      // every viewer and what the user edits -- a poller writing to it every
-      // tick would fight those edits and mint a change for every open browser.
-      //
-      // Read before anything about the config can throw. A method the sheet
-      // spells DELETE, a url that will not parse and a document that will not
-      // load all land in the catch below, and a failure row written without the
-      // watermark in hand is a feed asked for all of history on the next poll.
-      const [prev]: {
-        net_id: string;
-        meta: {
-          etag?: string;
-          last_modified?: string;
-          cursor?: string;
-          attempt?: number;
-          shape?: Record<string, string> | null;
-        };
-      }[] = await sql`
-        select net_id, meta from net where sheet_id = ${sheet_id} order by net_id desc limit 1
-      `;
-      const was = prev?.meta ?? {};
-      if (was.cursor) carried = { cursor: String(was.cursor) };
-      const config = (await automerge.find<{ data: [NetHttp] }>(doc_id)).doc()?.data?.[0];
-      if (!config) throw new Error("The document has no config in data[0].");
-      netDue.set(sheet_id, now + Math.max(60, Number(config.interval) || 3600) * 1000);
-      if (!config.url) continue;
-      url = config.url;
-      headers = parseNetHeaders(config.headers);
-      ({ method, body } = netRequest(config));
-      const pointed = new URL(url);
-      const host = pointed.hostname;
-      // The identity a `link` page must stay on: scheme and host together, so
-      // a next page cannot downgrade to plain http on the same host either.
-      // `host` alone still keys the per-host request gap below, which cares
-      // about the wire and not the scheme.
-      const origin = pointed.origin;
-      const holdoff = hostDue.get(host) ?? 0;
-      // Waiting out what another sheet on this host was told. Nothing ran, so
-      // there is nothing to log.
-      if (holdoff > now) {
-        netDue.set(sheet_id, holdoff);
-        continue;
-      }
-      // Resolved into a separate object. `headers` is what a failure row is
-      // built from, so a resolved token cannot reach the log even if curlFor
-      // one day prints more than the keys. The conditional headers are ours and
-      // not the sheet's, for that rule in reverse: the repro line's job is to
-      // fetch the body by hand, and a conditional request answers 304.
-      const sending = {
-        ...await resolveSecrets(sheet_id, headers),
-        ...(was.etag ? { "If-None-Match": was.etag } : {}),
-        ...(was.last_modified ? { "If-Modified-Since": was.last_modified } : {}),
-      };
-      // The body is templated where a header already was, and resolved into a
-      // second object for the same reason. `{{cursor}}` is the watermark the
-      // cursor parameter would have carried; the first poll has none, and asks
-      // for everything the way an unset parameter does.
-      const sendingBody = body === undefined ? undefined : (await resolveSecrets(sheet_id, {
-        body: body.replaceAll("{{cursor}}", was.cursor ? String(was.cursor) : ""),
-      }))
-        .body;
-      // The watermark is when the last good poll started, not when it finished:
-      // a row created while that request was in flight is asked for twice
-      // rather than missed once. It rides every good run, so a sheet that
-      // gains a cursor later resumes from its last poll instead of re-reading
-      // history it has already logged.
-      if (config.cursor) {
-        if (!/^[A-Za-z0-9_.-]{1,64}$/.test(config.cursor)) {
-          throw new Error(
-            explain("This sheet's cursor is not the name of a query parameter.", {
-              Received: show(config.cursor),
-              Expected: "letters, digits, dot, dash or underscore, at most 64 of them",
-              Source: "the cursor field on this net-http sheet",
-              Fix: "name the parameter this feed takes a since-value in, such as `since` or `updated_after`",
-            }),
-          );
-        }
-        if (was.cursor) url = withParam(url, config.cursor, was.cursor);
-      }
-      // How this feed hands out its pages, and where page one is: a page number
-      // and an offset ride the first request, a cursor and a Link header only
-      // arrive with an answer. A sheet with no `page_by` makes the one request
-      // it always made, and `url` is what it always was.
-      const paging = pageConfig(config);
-      // `pageStart` and `nextPage` overwrite `paging.param` on every request a
-      // paged mode sends, page one included. Naming it the same as `cursor`
-      // does not fail to parse -- both are lone parameter names -- so the two
-      // features would silently fight instead: the since-value `cursor` wrote
-      // onto the url a moment ago is gone before the request goes out, and
-      // every poll re-reads the feed from its start.
-      if (paging && config.cursor && paging.param === config.cursor) {
-        throw new Error(
-          explain("page_param is the same query parameter as this sheet's own cursor.", {
-            Received: `both page_param and cursor name ${show(paging.param)}`,
-            Expected: "two different parameter names -- paging overwrites this one on every request",
-            Source: "the page_param and cursor fields on this net-http sheet",
-            Fix: "name page_param something else, such as `page` or `after`",
-          }),
-        );
-      }
-      // Page one: a `page` feed counts from one and an `offset` feed from zero,
-      // each in the parameter the sheet names. A `cursor` feed is asked for
-      // nothing on its first request -- it has no cursor until an answer
-      // carries one -- and a `link` feed is asked exactly as the sheet writes it.
-      if (paging?.by === "page") url = withParam(url, paging.param, "1");
-      if (paging?.by === "offset") url = withParam(url, paging.param, "0");
-      const started = Date.now();
-      // A string instead of a response is a failure off the wire: a timeout, a
-      // reset. Everything safeFetch refuses on its own arrives as an
-      // HTTPException instead, because a private address or a redirect loop
-      // answers a retry exactly as it answered this one.
-      const request = (target: string) =>
-        fetcher(target, sending, method, sendingBody).catch((err) => {
-          if (err instanceof HTTPException) throw err;
-          return reason(err);
-        });
-      // A 5xx and a 429 are the host saying "later". A 404, a 401, an SSRF
-      // refusal are a "no", and retrying a "no" is noise on top of the failure
-      // row that already answered it. Said on page one or on page five, it is
-      // one answer about the whole poll: the pages already read are dropped and
-      // the retry starts at page one again, because a feed that ran out of
-      // patience halfway has no place to resume from.
-      const later = async (answer: Response | string, at: string): Promise<void> => {
-        const answered = typeof answer === "string" ? null : answer;
-        const detail = typeof answer === "string" ? answer : new TextDecoder().decode(await readBody(answer));
-        const after = answered?.headers.get("retry-after") ?? null;
-        // The wait is the host's and not this sheet's, so it holds every sheet
-        // pointed there. It is a floor and not a schedule: this sheet takes the
-        // later of it and its own backoff, which is what the host asked for.
-        if (after !== null) holdHost(host, now + retryAfterMs(after, now));
-        const attempt = Number(was.attempt ?? 0) + 1;
-        // Read back out of jsonb, so it is guarded like every other read out of
-        // jsonb: a count that is not a whole number lands as NaN in the next
-        // due time, and a sheet due at NaN is due on every tick forever.
-        if (!Number.isInteger(attempt) || attempt < 1) {
-          throw new Error(
-            explain("This feed's last run recorded a failure count that cannot be read.", {
-              Received: `attempt: ${JSON.stringify(was.attempt)}`,
-              Expected: "a whole number of failures in a row, or nothing at all",
-              Source: `meta on the newest row of ${sheet_id}`,
-              Fix: "delete that row; the next poll starts the count again",
-            }),
-          );
-        }
-        if (attempt >= RETRY_MAX) {
-          throw new Error(
-            explain(`This feed has failed ${attempt} polls in a row, which is the retry bound.`, {
-              Received: `${attempt} failures, the last of them: ${detail.slice(0, 200)}`,
-              Expected: `a 2xx within ${RETRY_MAX} attempts`,
-              Source: at,
-              Fix: "fix the feed or the sheet; the next scheduled poll starts the count again",
-            }),
-          );
-        }
-        const wait = Math.max(hostDue.get(host) ?? 0, now + RETRY_BACKOFF_MS * 2 ** (attempt - 1));
-        netDue.set(sheet_id, wait);
-        // `at` is the page this answer actually came from, page one or a
-        // later one: a reader who pastes the failure row's repro must reach
-        // the request that failed, not always the first one this poll sent.
-        await netRow(
-          sheet_id,
-          method,
-          JSON.stringify({
-            ...fetchFailure(at, headers, answered, detail, method, body),
-            attempt,
-            retry_at: new Date(wait).toISOString(),
-          }),
-          { status: answered?.status ?? 0, ms: Date.now() - started, bytes: detail.length, attempt, ...carried },
-        );
-      };
-      const res = await request(url);
-      // Asked once; the next sheet on this host in the same cycle steps over it.
-      // The pages after this one go out back to back: the gap is between
-      // cycles, and one poll is one reader walking one feed to its end.
-      holdHost(host, now + HOST_GAP_MS);
-      if (typeof res === "string" || res.status === 429 || res.status >= 500) {
-        await later(res, url);
-        continue;
-      }
-      const kept = {
-        etag: validator(res.headers.get("etag")) ?? was.etag ?? null,
-        last_modified: validator(res.headers.get("last-modified")) ?? was.last_modified ?? null,
-        cursor: new Date(now).toISOString(),
-      };
-      if (res.status === 304) {
-        // A 304 is a healthy poll that appended nothing: the feed answered, and
-        // what it answered is that the row already here is still current.
-        // POLL_OK and library:freshness both grade meta->>'status' between 200
-        // and 299, so the run is recorded as the 200 it semantically is and
-        // `not_modified` keeps the status that came off the wire -- otherwise a
-        // daily file polled hourly reads as a dead feed. Moving that row's
-        // created_at rather than appending an empty one is what a quiet alert
-        // tick does: liveness reads max(created_at), and 23 blank rows a day
-        // would push the feed's own data out past NET_KEEP.
-        if (!prev || !(was.etag || was.last_modified)) {
-          throw new Error(
-            explain("This feed answered 304 to a request that carried no validator.", {
-              Received: "HTTP 304 Not Modified",
-              Expected: "a 2xx, because this poll sent no If-None-Match and no If-Modified-Since",
-              Source: url,
-              Fix: "the host is answering a conditional request nobody made; point the sheet elsewhere",
-            }),
-          );
-        }
-        await sql`
-          update net
-          set created_at = now(),
-              meta = ${sql.json({ ...kept, status: 200, not_modified: true, ms: Date.now() - started, bytes: 0 })}
-          where net_id = ${prev.net_id}
-        `;
-        continue;
-      }
-      const raw = await readBody(res);
-      // A body over the cap is a failure row naming both numbers. A truncated
-      // success is a parse error further downstream, blamed on the data.
-      if (res.ok && raw.byteLength > BODY_CAP) {
-        throw new Error(
-          explain("This feed's response is too large to store.", {
-            Received: `${res.headers.get("content-length") ?? `at least ${raw.byteLength}`} bytes`,
-            Limit: `${BODY_CAP} bytes per response`,
-            Source: url,
-            Fix: "point the sheet at a paged or filtered endpoint, or give it a cursor",
-          }),
-        );
-      }
-      const text = new TextDecoder().decode(raw);
-      // The pages after the first, and what the run stores: every page answers
-      // an array, and the arrays concatenated are one body, so shapeOf, the
-      // digest, the cap and everything downstream see exactly what a one-page
-      // feed hands them. The validators and the `{{cursor}}` watermark rode the
-      // first request alone -- they are about the feed, not about a page of it.
-      // A sheet with no `page_by` runs none of this and stores what arrived.
-      let payload = text;
-      let bytes = raw.byteLength;
-      // The host said "later" on a page: `later` has written the row and this
-      // sheet is done until its backoff.
-      let retrying = false;
-      if (paging && res.ok) {
-        const first = pageRows(paging, text, 1, url);
-        const rows = [...first.rows];
-        let target = nextPage(paging, url, origin, res, first, rows.length, 1);
-        for (let number = 2; target !== null; number++) {
-          if (number > PAGE_MAX) {
-            throw new Error(
-              explain(`This feed asked for page ${number}, and one poll reads ${PAGE_MAX}.`, {
-                Received: `${PAGE_MAX} pages holding ${rows.length} rows, and still a next page`,
-                Expected: `a feed that runs out of pages within ${PAGE_MAX} of them`,
-                Source: url,
-                Fix: "give the sheet a cursor so each poll asks for less, or point it at a filtered endpoint",
-              }),
-            );
-          }
-          // The page this poll is on, which is what the catch below builds its
-          // failure row from: a reader who pastes the row's curl must reach the
-          // request that broke, the way `later` is handed the page it answered.
-          url = target;
-          const answer = await request(target);
-          if (typeof answer === "string" || answer.status === 429 || answer.status >= 500) {
-            await later(answer, target);
-            retrying = true;
-            break;
-          }
-          if (!answer.ok) {
-            throw new Error(
-              explain(`This feed answered ${answer.status} on page ${number}.`, {
-                Received: `HTTP ${answer.status}${answer.statusText ? " " + answer.statusText : ""}`,
-                Expected: "a 2xx on every page a feed names, or no next page at all",
-                Source: target,
-                Fix: "page one answered, so the sheet is right and the feed is not; ask whoever runs it",
-              }),
-            );
-          }
-          const chunk = await readBody(answer);
-          bytes += chunk.byteLength;
-          // Checked as it grows. A feed that never says "last" otherwise costs
-          // every page it has before one number past the cap refuses the lot.
-          if (bytes > BODY_CAP) {
-            throw new Error(
-              explain("This feed's pages are too large to store.", {
-                Received: `at least ${bytes} bytes over ${number} pages`,
-                Limit: `${BODY_CAP} bytes per run`,
-                Source: url,
-                Fix: "give the sheet a cursor so each poll asks for less, or point it at a filtered endpoint",
-              }),
-            );
-          }
-          const page = pageRows(paging, new TextDecoder().decode(chunk), number, target);
-          // Pushed one at a time: a spread of a hundred thousand rows is an
-          // argument list, and an argument list has a length the runtime caps.
-          for (const row of page.rows) rows.push(row);
-          target = nextPage(paging, target, origin, answer, page, rows.length, number);
-        }
-        // Nothing of what those pages held is kept: the retry starts at page one.
-        if (retrying) continue;
-        payload = JSON.stringify(rows);
-      }
-      // Errors become log rows too: the user who typed the URL must see them, and
-      // must be able to run the same request by hand.
-      const logged = res.ok ? payload : JSON.stringify(fetchFailure(url, headers, res, text, method, body));
-      // The columns this run answered with, beside it, and against the run
-      // before: a dropped column read as a sheet of blanks and graded healthy.
-      // The rows still land -- they are what arrived -- and POLL_OK grades the
-      // run as failed on `shape_change`, so freshness and the status alarm hear
-      // it the way they hear every other failure, once: the run after compares
-      // against this one. A body that is not rows has no shape; going from rows
-      // to none dropped every column, and from none to rows is compared to
-      // nothing, since nothing was known.
-      const shape = res.ok ? shapeOf(payload) : undefined;
-      const change = res.ok && was.shape ? shapeChange(was.shape, shape ?? {}) : null;
-      // The run's idempotency key: what arrived, so the same answer twice is
-      // one row however many polls asked.
-      const sig = res.ok ? await digest(payload) : undefined;
-      // The run beside the payload: whether a feed is slow, or 200-ing an error
-      // page, is a question about the poll and not about the body it returned.
-      // The validators ride the good rows only, so the next poll asks its
-      // question about the body this sheet actually holds; the watermark is
-      // carried onto this one, because where the feed had been read to is true
-      // whether or not this poll answered.
-      await netRow(sheet_id, method, logged, {
-        status: res.status,
-        ms: Date.now() - started,
-        // What the run read off the wire, every page of it, which is what the
-        // cap refused a byte past and what a slow feed is measured by.
-        bytes,
-        ...(res.ok ? { ...kept, sig, shape, ...(change ? { shape_change: change } : {}) } : carried),
-      });
-    } catch (err) {
-      const message = reason(err);
-      console.error(`net-http poll ${sheet_id}:`, message);
-      const failure = fetchFailure(url, headers, null, message, method, body);
-      // No attempt count: giving up, a malformed Retry-After and a sheet that
-      // cannot be read all land here, and the next scheduled poll starts over.
-      await netRow(sheet_id, method, JSON.stringify(failure), { status: 0, ms: 0, bytes: 0, ...carried })
-        .catch((dbErr: unknown) => console.error(`net-http poll ${sheet_id}: could not record the error:`, dbErr));
-    }
+    await pollNetSheet(sheet_id, doc_id, fetcher, now);
   }
 };
 
@@ -4306,233 +4747,281 @@ const sendWithinQuota = async (created_by: string, deliver: () => Promise<string
   return await deliver();
 };
 
+/** One alert, run now: the query, the verdict, the delivery and the row it
+ * lands. The tick below walks the due alerts over it and POST /library/:id/run
+ * hands it the one alert a person asked for. */
+export const pollAlertSheet = async (
+  alert: { sheet_id: string; doc_id: string; name: string; created_by: string },
+  send = sendAlertEmail,
+  now = Date.now(),
+  fetcher = safeFetch,
+): Promise<void> => {
+  const { sheet_id, doc_id, name, created_by } = alert;
+  // Where this alert was due before the run, so a paused one goes back exactly
+  // as it was: the same bargain a paused feed gets.
+  const wasDue = alertDue.get(sheet_id);
+  alertDue.set(sheet_id, now + 3600_000);
+  let record: Record<string, unknown>;
+  // Recorded beside the run so the status check can grade liveness in SQL,
+  // instead of opening an automerge document per alert. A run whose document
+  // would not open keeps the hour the due map just assumed.
+  let interval = 3600;
+  // The row a repeated unchanged tick updates instead of duplicating: set only
+  // when the previous run was itself unchanged, so the run that last said
+  // something different is never overwritten.
+  let quiet: string | null = null;
+  const started = Date.now();
+  try {
+    const config = (await automerge.find<{ data: [Alert] }>(doc_id as AnyDocumentId)).doc()?.data?.[0];
+    if (!config) throw new Error("The document has no config in data[0].");
+    // The same switch a feed has, obeyed the same way: no query, no delivery,
+    // no run row, and the due time left where the tick before it put it.
+    if (config.paused) {
+      if (wasDue === undefined) alertDue.delete(sheet_id);
+      else alertDue.set(sheet_id, wasDue);
+      return;
+    }
+    // The status check reads this number back out of the run and reports it as
+    // the alert's own interval, so a value nobody can parse has to be a crash
+    // rather than a silent hour. Rounded, because the guard the check reads it
+    // through is anchored on digits: a fractional interval would drop out and
+    // be graded against the default instead.
+    if (config.interval !== undefined && config.interval !== null && !(Number(config.interval) > 0)) {
+      throw new Error(explain(`The interval on ${sheet_id} is not a number of seconds.`, {
+        Received: show(config.interval),
+        Expected: "a positive number of seconds, or no interval at all for the default 3600",
+        Source: "data[0].interval on the alert document",
+        Fix: "put seconds in the interval cell, or clear it",
+      }));
+    }
+    interval = Math.max(60, Math.min(INTERVAL_MAX_S, Math.round(Number(config.interval) || 3600)));
+    alertDue.set(sheet_id, now + interval * 1000);
+    const when: When = config.when ?? "rows";
+    if (!(ALERT_WHEN as readonly string[]).includes(when)) {
+      throw new Error(explain(`The when on ${sheet_id} is not a condition an alert knows.`, {
+        Received: show(config.when),
+        Expected: `one of ${ALERT_WHEN.join(", ")}, or no when at all for rows`,
+        Source: "data[0].when on the alert document",
+        Fix: "pick one in the alert's settings",
+      }));
+    }
+    // The snooze is read against the run's own clock, which is what makes one
+    // in the past over rather than something somebody has to clear. Refused by
+    // name rather than treated as no snooze: a cell nobody can read is an alert
+    // that would go on sending while its owner believes it silenced.
+    const until = config.snoozed_until ?? "";
+    if (until !== "" && !(/^\d{4}-\d{2}-\d{2}([T ]|$)/.test(until) && Number.isFinite(Date.parse(until)))) {
+      throw new Error(explain(`The snooze on ${sheet_id} is not a timestamp.`, {
+        Received: show(config.snoozed_until),
+        Expected: "an ISO timestamp such as 2026-01-31T09:00:00Z, or no snooze at all",
+        Source: "data[0].snoozed_until on the alert document",
+        Fix: "press snooze a day on the alert, or clear the cell",
+      }));
+    }
+    const snoozed = until !== "" && Date.parse(until) > now;
+    const to = config.to ?? "";
+    // A digest is one email a day gathering many alerts, and there is nothing
+    // to post: refused by name, rather than held for a summary that will never
+    // carry it. The url itself stays out of the message -- it is a credential,
+    // and this line reaches the error log.
+    if (config.digest && alertUrl(to)) {
+      throw new Error(explain(`The alert on ${sheet_id} is held for the daily digest and sent to a url.`, {
+        Received: "a url, with the digest box ticked",
+        Expected: "an email address, because a digest is one email a day",
+        Source: "data[0].to and data[0].digest on the alert document",
+        Fix: "clear the digest box, or send this alert to an email address",
+      }));
+    }
+    const code = config.code?.trim() ?? "";
+    // A profile's rows carry the milliseconds each stage took, which is a
+    // different answer every run, so an alert watching one never settles
+    // and mails every interval. Refused by name rather than fingerprinted.
+    if (profileRef(code) !== undefined) {
+      throw new Error(explain(`The alert on ${sheet_id} watches a profile, and a profile is never the same twice.`, {
+        Received: show(code),
+        Expected: "a select, whose rows the alert can compare run to run",
+        Source: "data[0].code on the alert document",
+        Fix: "drop the explain and watch the query itself",
+      }));
+    }
+    let rows: Row[] = [];
+    if (code) {
+      // Run it as the owner would, through the same authenticated path, so an
+      // alert can never read a sheet its owner cannot.
+      const res = await app.request(`/query`, {
+        method: "POST",
+        headers: new Headers({
+          Authorization: `Bearer ${await createJwt(created_by)}`,
+          "Content-Type": "application/json",
+        }),
+        body: JSON.stringify({ lang: "sql", code, args: [] }),
+      });
+      const text = await res.text();
+      if (!res.ok) throw new Error(`the query failed with ${res.status}: ${text.slice(0, 400)}`);
+      rows = (JSON.parse(text) as { data: Row[] }).data.slice(1);
+    }
+    const fingerprint = await digest(rows);
+    const [last]: { net_id: string; body: string }[] = await sql`
+      select net_id, body from net where sheet_id = ${sheet_id} order by net_id desc limit 1
+    `;
+    const before = last
+      ? JSON.parse(last.body) as {
+        fingerprint?: string;
+        matched?: Row[];
+        truncated?: boolean;
+        status?: string;
+        delivery?: string;
+        to?: string;
+      }
+      : null;
+    // Same answer as last time means the same alert, and sending it again
+    // every interval is how people learn to filter alerts into a folder they
+    // never open. The run is still recorded: a healthy quiet alert and a
+    // poller that died both write nothing otherwise, and nothing outside this
+    // log can tell them apart. The row carries the same fingerprint, matched
+    // and truncated the next run reads back, so the de-dupe and the diff both
+    // keep working off "the last row" as they did.
+    // ...unless the last run never got through. A send that failed and is
+    // then de-duped away is an alert one Resend outage silences for good, so
+    // the same rows are sent again rather than counted as already delivered.
+    // A run with no destination is not stuck: retrying sends nothing, and
+    // recording that every interval would page on a sheet nobody finished.
+    // A snoozed run counts as stuck for the same reason a refused one does:
+    // the answer it decided on reached nobody, so the run after it is not
+    // de-duped away as the same answer somebody has already read.
+    quiet = before?.status === "unchanged" && last ? last.net_id : null;
+    const stuck = before?.status === "firing" && !!before?.to &&
+      before?.delivery !== "sent" && before?.delivery !== HELD;
+    const unchanged = before?.fingerprint === fingerprint && !stuck;
+    // The diff is over the rows the last run kept, so it is only honest when
+    // neither run had more rows than it keeps. Say so rather than guess.
+    const truncated = rows.length > ALERT_ROWS;
+    if (truncated && when !== "rows") {
+      throw new Error(
+        explain(
+          `This run matched more than the ${ALERT_ROWS} rows an alert keeps, so it cannot tell which are ${when}.`,
+          {
+            Received: `${rows.length} rows`,
+            Expected: `at most ${ALERT_ROWS} rows on this run and the run before`,
+            Source: `when = ${when} on ${sheet_id}`,
+            Fix: "narrow the query, or fire on rows",
+          },
+        ),
+      );
+    }
+    // An error run kept no rows, so a diff against it would call every row new.
+    const comparable = !truncated && before !== null && before.status !== "error" && !before.truncated;
+    const gone = new Set((before?.matched ?? []).map((row) => JSON.stringify(row)));
+    const here = new Set(rows.map((row) => JSON.stringify(row)));
+    const diff = comparable
+      ? {
+        added: rows.filter((row) => !gone.has(JSON.stringify(row))),
+        removed: [...gone].filter((row) => !here.has(row)).length,
+      }
+      : null;
+    // The verdict, per condition. `status` is the verdict and `delivery` is
+    // what was done about it, so no reader of either has to know `when`.
+    // The change conditions re-fire on `stuck`: the run they would diff
+    // against is the failed firing, which already holds the rows it never
+    // delivered, so the diff alone would lose the retry. `rows` does not:
+    // a firing that failed and has since gone empty has nothing to resend.
+    const hit = {
+      rows: rows.length > 0,
+      added: stuck || !!diff?.added.length,
+      removed: stuck || !!diff?.removed,
+    }[when];
+    // Why a miss missed, for the delivery line below: `rows` misses by being
+    // empty, and the other two conditions miss either against a real diff or
+    // against nothing to diff against at all.
+    const missed = when === "rows"
+      ? "cleared"
+      : diff
+      ? `no rows ${when} since the run before`
+      : "nothing to compare with";
+    // Where the destination decides how it is reached, once, so the quota
+    // above it counts a post and an email the same.
+    const deliver = () =>
+      alertUrl(to) ? sendAlertUrl(fetcher, to, sheet_id, name, rows, diff) : send(to, sheet_id, name, rows, diff);
+    record = {
+      status: !code ? "idle" : unchanged ? "unchanged" : hit ? "firing" : "clear",
+      when,
+      rows: rows.length,
+      fingerprint,
+      // The host and not the url. A webhook url is a credential -- its path
+      // is the whole of the authorization, which is why KEY_SHAPES knows a
+      // Slack one by sight -- and this row is read by everyone the sheet is
+      // shared with, viewers included, through GET /sheet, every export and
+      // the MCP read. sendAlertUrl already rewrites the url out of every
+      // failure it reports for that reason; writing it here in full undid
+      // that. The document still holds the real value, for whoever may edit
+      // it. Parsed without throwing: a TypeError from `new URL` quotes the
+      // whole input, and the catch below writes that message to this log.
+      to: alertUrl(to) ? URL.parse(to)?.hostname ?? "a url this server could not read" : to,
+      truncated,
+      matched: rows.slice(0, ALERT_ROWS),
+      added: diff ? diff.added.length : null,
+      removed: diff ? diff.removed : null,
+      ...(diff ? {} : {
+        diff_skipped: truncated
+          ? `this run matched more than ${ALERT_ROWS} rows`
+          : before === null
+          ? "this is the first run, so there is nothing to compare it with"
+          : before.status === "error"
+          ? "the run before failed, so there is nothing to compare it with"
+          : `the run before matched more than ${ALERT_ROWS} rows`,
+      }),
+      delivery: !code
+        ? "no query to run, so nothing was sent"
+        : unchanged
+        ? "the same answer as the run before, so nothing was sent"
+        : !hit
+        ? `${missed}, so nothing was sent`
+        // Ahead of both doors below: an alert with nowhere to send was never
+        // going to send regardless of the snooze, so the row must still name
+        // that, or an owner who forgot a destination reads as one who chose
+        // to silence it.
+        : !to
+        ? "no destination, so nothing was sent"
+        // Above the digest, because a held run is a run the digest still
+        // mails: a snoozed one is delivered to nobody by either door.
+        : snoozed
+        ? "snoozed"
+        : config.digest
+        ? HELD
+        : await sendWithinQuota(created_by, deliver),
+    };
+  } catch (err) {
+    const message = reason(err);
+    console.error(`alert ${sheet_id}:`, message);
+    record = { status: "error", rows: 0, fingerprint: await digest(message), error: message };
+  }
+  // A tick that says what the tick before it said moves that row's timestamp
+  // rather than adding another. Liveness reads max(created_at) and the
+  // de-dupe reads the last row, so both still work -- and a minute-interval
+  // alert stops writing 1440 rows a day, which would push the run the daily
+  // digest still has to find out past NET_KEEP in under 17 hours.
+  const repeat = record.status === "unchanged" && quiet;
+  await (repeat
+    ? sql`
+      update net set created_at = now(), meta = ${sql.json({ ms: Date.now() - started, interval })}
+      where net_id = ${quiet}
+    `
+    : sql`
+      insert into net (sheet_id, method, body, meta)
+      values (${sheet_id}, 'ALERT', ${JSON.stringify(record)}, ${sql.json({ ms: Date.now() - started, interval })})
+    `).catch((dbErr: unknown) => console.error(`alert ${sheet_id}: could not record the run:`, dbErr));
+  if (!repeat) await trimNet(sheet_id);
+};
+
 export const pollAlertOnce = async (
   send = sendAlertEmail,
   now = Date.now(),
   fetcher = safeFetch,
 ): Promise<void> => {
   const sheets = await sql`select sheet_id, doc_id, name, created_by from sheet where type = 'alert'`;
-  for (const { sheet_id, doc_id, name, created_by } of sheets) {
-    if ((alertDue.get(sheet_id) ?? 0) > now) continue;
-    alertDue.set(sheet_id, now + 3600_000);
-    let record: Record<string, unknown>;
-    // Recorded beside the run so the status check can grade liveness in SQL,
-    // instead of opening an automerge document per alert. A run whose document
-    // would not open keeps the hour the due map just assumed.
-    let interval = 3600;
-    // The row a repeated unchanged tick updates instead of duplicating: set only
-    // when the previous run was itself unchanged, so the run that last said
-    // something different is never overwritten.
-    let quiet: string | null = null;
-    const started = Date.now();
-    try {
-      const config = (await automerge.find<{ data: [Alert] }>(doc_id)).doc()?.data?.[0];
-      if (!config) throw new Error("The document has no config in data[0].");
-      // The status check reads this number back out of the run and reports it as
-      // the alert's own interval, so a value nobody can parse has to be a crash
-      // rather than a silent hour. Rounded, because the guard the check reads it
-      // through is anchored on digits: a fractional interval would drop out and
-      // be graded against the default instead.
-      if (config.interval !== undefined && config.interval !== null && !(Number(config.interval) > 0)) {
-        throw new Error(explain(`The interval on ${sheet_id} is not a number of seconds.`, {
-          Received: show(config.interval),
-          Expected: "a positive number of seconds, or no interval at all for the default 3600",
-          Source: "data[0].interval on the alert document",
-          Fix: "put seconds in the interval cell, or clear it",
-        }));
-      }
-      interval = Math.max(60, Math.round(Number(config.interval) || 3600));
-      alertDue.set(sheet_id, now + interval * 1000);
-      const when: When = config.when ?? "rows";
-      if (!(ALERT_WHEN as readonly string[]).includes(when)) {
-        throw new Error(explain(`The when on ${sheet_id} is not a condition an alert knows.`, {
-          Received: show(config.when),
-          Expected: `one of ${ALERT_WHEN.join(", ")}, or no when at all for rows`,
-          Source: "data[0].when on the alert document",
-          Fix: "pick one in the alert's settings",
-        }));
-      }
-      const to = config.to ?? "";
-      // A digest is one email a day gathering many alerts, and there is nothing
-      // to post: refused by name, rather than held for a summary that will never
-      // carry it. The url itself stays out of the message -- it is a credential,
-      // and this line reaches the error log.
-      if (config.digest && alertUrl(to)) {
-        throw new Error(explain(`The alert on ${sheet_id} is held for the daily digest and sent to a url.`, {
-          Received: "a url, with the digest box ticked",
-          Expected: "an email address, because a digest is one email a day",
-          Source: "data[0].to and data[0].digest on the alert document",
-          Fix: "clear the digest box, or send this alert to an email address",
-        }));
-      }
-      const code = config.code?.trim() ?? "";
-      // A profile's rows carry the milliseconds each stage took, which is a
-      // different answer every run, so an alert watching one never settles
-      // and mails every interval. Refused by name rather than fingerprinted.
-      if (profileRef(code) !== undefined) {
-        throw new Error(explain(`The alert on ${sheet_id} watches a profile, and a profile is never the same twice.`, {
-          Received: show(code),
-          Expected: "a select, whose rows the alert can compare run to run",
-          Source: "data[0].code on the alert document",
-          Fix: "drop the explain and watch the query itself",
-        }));
-      }
-      let rows: Row[] = [];
-      if (code) {
-        // Run it as the owner would, through the same authenticated path, so an
-        // alert can never read a sheet its owner cannot.
-        const res = await app.request(`/query`, {
-          method: "POST",
-          headers: new Headers({
-            Authorization: `Bearer ${await createJwt(created_by)}`,
-            "Content-Type": "application/json",
-          }),
-          body: JSON.stringify({ lang: "sql", code, args: [] }),
-        });
-        const text = await res.text();
-        if (!res.ok) throw new Error(`the query failed with ${res.status}: ${text.slice(0, 400)}`);
-        rows = (JSON.parse(text) as { data: Row[] }).data.slice(1);
-      }
-      const fingerprint = await digest(rows);
-      const [last]: { net_id: string; body: string }[] = await sql`
-        select net_id, body from net where sheet_id = ${sheet_id} order by net_id desc limit 1
-      `;
-      const before = last
-        ? JSON.parse(last.body) as {
-          fingerprint?: string;
-          matched?: Row[];
-          truncated?: boolean;
-          status?: string;
-          delivery?: string;
-          to?: string;
-        }
-        : null;
-      // Same answer as last time means the same alert, and sending it again
-      // every interval is how people learn to filter alerts into a folder they
-      // never open. The run is still recorded: a healthy quiet alert and a
-      // poller that died both write nothing otherwise, and nothing outside this
-      // log can tell them apart. The row carries the same fingerprint, matched
-      // and truncated the next run reads back, so the de-dupe and the diff both
-      // keep working off "the last row" as they did.
-      // ...unless the last run never got through. A send that failed and is
-      // then de-duped away is an alert one Resend outage silences for good, so
-      // the same rows are sent again rather than counted as already delivered.
-      // A run with no destination is not stuck: retrying sends nothing, and
-      // recording that every interval would page on a sheet nobody finished.
-      quiet = before?.status === "unchanged" && last ? last.net_id : null;
-      const stuck = before?.status === "firing" && !!before?.to &&
-        before?.delivery !== "sent" && before?.delivery !== HELD;
-      const unchanged = before?.fingerprint === fingerprint && !stuck;
-      // The diff is over the rows the last run kept, so it is only honest when
-      // neither run had more rows than it keeps. Say so rather than guess.
-      const truncated = rows.length > ALERT_ROWS;
-      if (truncated && when !== "rows") {
-        throw new Error(
-          explain(
-            `This run matched more than the ${ALERT_ROWS} rows an alert keeps, so it cannot tell which are ${when}.`,
-            {
-              Received: `${rows.length} rows`,
-              Expected: `at most ${ALERT_ROWS} rows on this run and the run before`,
-              Source: `when = ${when} on ${sheet_id}`,
-              Fix: "narrow the query, or fire on rows",
-            },
-          ),
-        );
-      }
-      // An error run kept no rows, so a diff against it would call every row new.
-      const comparable = !truncated && before !== null && before.status !== "error" && !before.truncated;
-      const gone = new Set((before?.matched ?? []).map((row) => JSON.stringify(row)));
-      const here = new Set(rows.map((row) => JSON.stringify(row)));
-      const diff = comparable
-        ? {
-          added: rows.filter((row) => !gone.has(JSON.stringify(row))),
-          removed: [...gone].filter((row) => !here.has(row)).length,
-        }
-        : null;
-      // The verdict, per condition. `status` is the verdict and `delivery` is
-      // what was done about it, so no reader of either has to know `when`.
-      // The change conditions re-fire on `stuck`: the run they would diff
-      // against is the failed firing, which already holds the rows it never
-      // delivered, so the diff alone would lose the retry. `rows` does not:
-      // a firing that failed and has since gone empty has nothing to resend.
-      const hit = {
-        rows: rows.length > 0,
-        added: stuck || !!diff?.added.length,
-        removed: stuck || !!diff?.removed,
-      }[when];
-      // Why a miss missed, for the delivery line below: `rows` misses by being
-      // empty, and the other two conditions miss either against a real diff or
-      // against nothing to diff against at all.
-      const missed = when === "rows"
-        ? "cleared"
-        : diff
-        ? `no rows ${when} since the run before`
-        : "nothing to compare with";
-      // Where the destination decides how it is reached, once, so the quota
-      // above it counts a post and an email the same.
-      const deliver = () =>
-        alertUrl(to) ? sendAlertUrl(fetcher, to, sheet_id, name, rows, diff) : send(to, sheet_id, name, rows, diff);
-      record = {
-        status: !code ? "idle" : unchanged ? "unchanged" : hit ? "firing" : "clear",
-        when,
-        rows: rows.length,
-        fingerprint,
-        // The host and not the url. A webhook url is a credential -- its path
-        // is the whole of the authorization, which is why KEY_SHAPES knows a
-        // Slack one by sight -- and this row is read by everyone the sheet is
-        // shared with, viewers included, through GET /sheet, every export and
-        // the MCP read. sendAlertUrl already rewrites the url out of every
-        // failure it reports for that reason; writing it here in full undid
-        // that. The document still holds the real value, for whoever may edit
-        // it. Parsed without throwing: a TypeError from `new URL` quotes the
-        // whole input, and the catch below writes that message to this log.
-        to: alertUrl(to) ? URL.parse(to)?.hostname ?? "a url this server could not read" : to,
-        truncated,
-        matched: rows.slice(0, ALERT_ROWS),
-        added: diff ? diff.added.length : null,
-        removed: diff ? diff.removed : null,
-        ...(diff ? {} : {
-          diff_skipped: truncated
-            ? `this run matched more than ${ALERT_ROWS} rows`
-            : before === null
-            ? "this is the first run, so there is nothing to compare it with"
-            : before.status === "error"
-            ? "the run before failed, so there is nothing to compare it with"
-            : `the run before matched more than ${ALERT_ROWS} rows`,
-        }),
-        delivery: !code
-          ? "no query to run, so nothing was sent"
-          : unchanged
-          ? "the same answer as the run before, so nothing was sent"
-          : !hit
-          ? `${missed}, so nothing was sent`
-          : config.digest
-          ? HELD
-          : to
-          ? await sendWithinQuota(created_by, deliver)
-          : "no destination, so nothing was sent",
-      };
-    } catch (err) {
-      const message = reason(err);
-      console.error(`alert ${sheet_id}:`, message);
-      record = { status: "error", rows: 0, fingerprint: await digest(message), error: message };
-    }
-    // A tick that says what the tick before it said moves that row's timestamp
-    // rather than adding another. Liveness reads max(created_at) and the
-    // de-dupe reads the last row, so both still work -- and a minute-interval
-    // alert stops writing 1440 rows a day, which would push the run the daily
-    // digest still has to find out past NET_KEEP in under 17 hours.
-    const repeat = record.status === "unchanged" && quiet;
-    await (repeat
-      ? sql`
-        update net set created_at = now(), meta = ${sql.json({ ms: Date.now() - started, interval })}
-        where net_id = ${quiet}
-      `
-      : sql`
-        insert into net (sheet_id, method, body, meta)
-        values (${sheet_id}, 'ALERT', ${JSON.stringify(record)}, ${sql.json({ ms: Date.now() - started, interval })})
-      `).catch((dbErr: unknown) => console.error(`alert ${sheet_id}: could not record the run:`, dbErr));
-    if (!repeat) await trimNet(sheet_id);
+  for (const alert of sheets) {
+    if ((alertDue.get(alert.sheet_id) ?? 0) > now) continue;
+    await pollAlertSheet(alert, send, now, fetcher);
   }
 };
 
@@ -4624,15 +5113,20 @@ app.get("/proxy", async (c) => {
 //
 // Two ways in. A person carries a JWT and reaches everything their account can.
 // A script carries a key for one sheet, minted by POST /library/:id/secret under
-// the name `api`: it is stored encrypted beside every other sheet secret, it
-// names its own sheet, and it opens that sheet and nothing else. A key that
-// carried the minter's whole authority is the thing this exists to prevent.
+// the name `api` or `api-read`: it is stored encrypted beside every other sheet
+// secret, it names its own sheet, and it opens that sheet and nothing else. A
+// key that carried the minter's whole authority is the thing this exists to
+// prevent, and `api-read` is the same key with the writes taken away -- which
+// is what an agent handed a key to read one sheet should be holding.
 const API_KEY_HEADER = "scrapsheets-key";
 const API_KEY_NAME = "api";
+const API_KEY_READ_NAME = "api-read";
+/** The two names a key is minted under, in the one place both are spelled. */
+const API_KEY_NAMES = [API_KEY_NAME, API_KEY_READ_NAME];
 
 /** A key for one sheet: the sheet id, a dot, then 32 random bytes. The sheet id
- * rides along so verifying reads at most SECRET_KEEP rows of one sheet rather
- * than decrypting the whole table looking for a match. */
+ * rides along so verifying reads that sheet's own key rows rather than
+ * decrypting the whole table looking for a match. */
 const apiKeyFor = (sheet_id: string): string => `${sheet_id}.${hex(crypto.getRandomValues(new Uint8Array(32)))}`;
 
 // crypto.subtle.verify does the comparison, so no key equality is written by
@@ -4646,9 +5140,12 @@ const sameKey = async (presented: string, stored: string): Promise<boolean> =>
     API_KEY_PROBE,
   );
 
-/** Who a presented key is, or a 401 that is not a key oracle: it never prints a
- * key, a digest, or how close the one it received was. */
-const apiKeyScope = async (presented: string): Promise<{ usr_id: string; sheet_id: string }> => {
+/** Who a presented key is and what it may do, or a 401 that is not a key
+ * oracle: it never prints a key, a digest, or how close the one it received
+ * was. */
+const apiKeyScope = async (
+  presented: string,
+): Promise<{ usr_id: string; sheet_id: string; scope: "read" | "write" }> => {
   const cut = presented.lastIndexOf(".");
   const sheet_id = cut < 0 ? "" : presented.slice(0, cut);
   const refuse = () =>
@@ -4661,24 +5158,39 @@ const apiKeyScope = async (presented: string): Promise<{ usr_id: string; sheet_i
           `key is replaced rather than recovered`,
       }),
     });
-  // Current and previous, the same rotation rule every other secret reads by.
+  // Current and previous, the same rotation rule every other secret reads by --
+  // for both names, since SECRET_KEEP is trimmed within one name.
   const rows = sheet_id
     ? await sql`
-      select value_encrypted from secret
-      where sheet_id = ${sheet_id} and name = ${API_KEY_NAME}
+      select name, value_encrypted from secret
+      where sheet_id = ${sheet_id} and name in ${sql(API_KEY_NAMES)}
       order by created_at desc, secret_id desc
-      limit ${SECRET_KEEP}
+      limit ${SECRET_KEEP * API_KEY_NAMES.length}
     `
     : [];
   for (const row of rows) {
-    if (!await sameKey(presented, await decrypt(`${API_KEY_NAME} key`, String(row.value_encrypted)))) continue;
+    const name = String(row.name);
+    if (!await sameKey(presented, await decrypt(`${name} key`, String(row.value_encrypted)))) continue;
     // The identity a key borrows is the sheet's creator: the key stands for one
     // sheet, and the path check below is what bounds it, not the account.
     const [owner] = await sql`select created_by from sheet where sheet_id = ${sheet_id}`;
     if (!owner?.created_by) throw refuse();
-    return { usr_id: String(owner.created_by), sheet_id };
+    return { usr_id: String(owner.created_by), sheet_id, scope: name === API_KEY_READ_NAME ? "read" : "write" };
   }
   throw refuse();
+};
+
+/** A read-only key cannot write, asked wherever the verb actually is: the path
+ * check below for POST /sheet/:id, and the MCP tool whose verb is its own name
+ * rather than the method it arrived under. */
+const assertKeyWrites = (c: Context, attempted: string): void => {
+  if (c.get("key_scope") !== "read") return;
+  bad(403, `This key reads ${c.get("key_sheet")} and writes nothing.`, {
+    Received: attempted,
+    Expected: `a read: GET /sheet/<id>, GET /openapi/<id>, or a reading tool over POST /mcp/<id>`,
+    Source: `the ${API_KEY_HEADER} request header, minted under the name ${API_KEY_READ_NAME}`,
+    Fix: `mint a key on the same sheet under the name ${API_KEY_NAME} and send that one instead`,
+  });
 };
 
 const jwtAuth = jwt({ secret: JWT_SECRET, alg: JWT_ALG });
@@ -4687,16 +5199,16 @@ app.use("*", async (c, next) => {
   const presented = c.req.header(API_KEY_HEADER);
   // No key header and the request takes exactly the path it always did.
   if (!presented) return await jwtAuth(c, next);
-  const { usr_id, sheet_id } = await apiKeyScope(presented);
+  const { usr_id, sheet_id, scope } = await apiKeyScope(presented);
   // A colon may arrive percent-encoded.
   const path = decodePath(c.req.path);
   // The scope is checked on the path, before routing, so no handler has to
   // remember to ask -- and a key that reached POST /library/:id/secret could
   // mint itself a key for a sheet it was never given.
-  if (path !== `/sheet/${sheet_id}` && path !== `/openapi/${sheet_id}`) {
+  if (![`/sheet/${sheet_id}`, `/openapi/${sheet_id}`, `/mcp/${sheet_id}`].includes(path)) {
     bad(403, `This key opens ${sheet_id} and nothing else.`, {
       Received: `${c.req.method} ${path}`,
-      Expected: `GET or POST /sheet/${sheet_id}, or GET /openapi/${sheet_id}`,
+      Expected: `GET or POST /sheet/${sheet_id}, GET /openapi/${sheet_id}, or POST /mcp/${sheet_id}`,
       Source: `the ${API_KEY_HEADER} request header, which names the one sheet it is for`,
       Fix: "mint a key on that sheet too, or call this route with the Authorization header of an account that " +
         "can reach it",
@@ -4704,6 +5216,11 @@ app.use("*", async (c, next) => {
   }
   c.set("usr_id", usr_id);
   c.set("via", "key");
+  c.set("key_sheet", sheet_id);
+  c.set("key_scope", scope);
+  // The write half of the sheet route. The MCP endpoint is one verb in the path
+  // and many in the body, so its writing tool asks the same question itself.
+  if (path === `/sheet/${sheet_id}` && c.req.method === "POST") assertKeyWrites(c, `POST ${path}`);
   await next();
 });
 
@@ -4938,6 +5455,52 @@ const KEY_SHAPES: [string, RegExp][] = [
   ["a Discord webhook url", /https:\/\/discord(?:app)?\.com\/api\/webhooks\/\S+/],
 ];
 
+// The issuer's own checksum over a card number, doubling every second digit
+// from the right. It is what separates a card from an order id of the same
+// length, and it is a checksum and not a secret: nothing here is compared
+// against anything, so there is nothing to leak by computing it in place.
+const luhn = (digits: string): boolean => {
+  let sum = 0;
+  for (let i = 0; i < digits.length; i++) {
+    const d = Number(digits[digits.length - 1 - i]);
+    const doubled = d * 2;
+    sum += i % 2 ? (doubled > 9 ? doubled - 9 : doubled) : d;
+  }
+  return sum % 10 === 0;
+};
+
+// The shapes a person is recognizable from, and the name each one is refused
+// under. Refused at the same two doors a credential is, with one difference:
+// a publisher who meant it says so with `personal: true`, because a mailing
+// list is a sheet somebody publishes on purpose and a key never is.
+//
+// Anchored on the punctuation a person writes rather than on "looks like
+// data": a bare run of ten digits is an order id at least as often as it is a
+// phone number, and a sheet of order ids that cannot be published without a
+// claim about personal data is a claim nobody reads. The card is the one shape
+// a spelling cannot settle, so it carries its own checksum.
+const PII_SHAPES: [string, RegExp, ((matched: string) => boolean)?][] = [
+  ["an email address", /[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,4}\.[A-Za-z]{2,24}/],
+  // E.164 first, then the way North America writes one: an area code that
+  // cannot start with 0 or 1, and a separator at both breaks.
+  ["a phone number", /\+[1-9][0-9]{7,14}|(?:\+?1[ .-])?\(?[2-9][0-9]{2}\)?[ .-][0-9]{3}[ .-][0-9]{4}/],
+  ["a US social security number", /[0-9]{3}-[0-9]{2}-[0-9]{4}/],
+  // Every candidate run in the cell and not the first: a cell holding an order
+  // id beside a card would otherwise be settled by the order id. The walk is
+  // bounded by KEY_SCAN_BYTES below -- every step eats thirteen digits of a
+  // cell whose bytes are already counted and refused past.
+  //
+  // The run is matched whole and checked once, which is a known miss: a card
+  // padded with a junk digit at either end reads as one longer run and fails.
+  // Checking every trimmed substring instead catches the padding and was
+  // measured -- over 200,000 random runs of this length it called one in three
+  // a card, against one in ten for the single check, because ten Luhn attempts
+  // per run are ten chances to land on a multiple of ten. The miss is the
+  // cheaper of the two: a sheet of order ids nobody can publish without
+  // claiming personal data is a claim nobody reads.
+  ["a payment card number", /[0-9](?:[ -]?[0-9]){12,18}/g, (matched) => luhn(matched.replace(/[^0-9]/g, ""))],
+];
+
 // What a scan will read. A sheet's rows are capped where this server writes
 // them -- an import, an append -- and not at all where a browser syncs them in.
 // Cells alone bound nothing: one synced cell may hold a megabyte, and the scan
@@ -4953,11 +5516,36 @@ const KEY_SHAPES: [string, RegExp][] = [
 const KEY_SCAN_CELLS = 500_000;
 const KEY_SCAN_BYTES = 256_000;
 
+/** Whether the publisher has said this sheet is meant to hold personal data.
+ * Absent is no claim; anything that is not a boolean is refused rather than
+ * read for its truthiness, so a sheet does not go out on the word "no". An
+ * explicit `null` is not absence -- `??` would have read it as one and
+ * silently believed "no" the one way `POST /library/:id/public`'s own
+ * `isPublic` check never would. */
+const claimsPersonal = (body: Record<string, unknown>): boolean => {
+  const personal = "personal" in body ? body.personal : false;
+  if (typeof personal !== "boolean") {
+    bad(400, `A sheet either holds personal data on purpose or it does not.`, {
+      Expected: "true or false",
+      Received: show(personal),
+      Source: `the "personal" field of the request body`,
+      Fix: `send {"personal": true} to publish a sheet that is meant to hold personal data`,
+    });
+  }
+  return personal;
+};
+
 // Publishing a sheet hands its whole document to strangers, which is where a
 // key pasted into a cell stops being the author's own business. A key a request
 // needs lives in the `secret` table and reaches a document only as a
 // {{secret:name}} reference, so a literal one in a cell is always the accident.
-const assertNoKeys = async (sheet_id: string): Promise<void> => {
+//
+// Both lists in the one pass, under the one pair of bounds: a second read of
+// the same cells costs the same seconds and can disagree about which cell the
+// refusal is about. A credential has no override -- the publish simply does not
+// happen. Personal data has one, `personal`, because unlike a key it is
+// sometimes the point of the sheet.
+const assertNoKeys = async (sheet_id: string, personal: boolean): Promise<void> => {
   // A computed sheet has no document and a codex sheet's doc_id names none;
   // neither holds a cell of its own to leak. Named here rather than caught off
   // a rejected find: a document that will not load is a scan that did not run,
@@ -4966,7 +5554,7 @@ const assertNoKeys = async (sheet_id: string): Promise<void> => {
   // this function exists to refuse to guess.
   const [type, doc_id] = sheet_id.split(":");
   if (type.startsWith("codex-")) return;
-  if ([FRESHNESS_SHEET, AUDIT_SHEET, ERROR_SHEET, REPORT_SHEET].includes(sheet_id)) return;
+  if ([FRESHNESS_SHEET, LINEAGE_SHEET, AUDIT_SHEET, ERROR_SHEET, REPORT_SHEET].includes(sheet_id)) return;
   const unscannable = (): never =>
     bad(404, `Sheet ${sheet_id} cannot be published: its document did not arrive.`, {
       Expected: "the automerge document behind this sheet, so it can be checked for credentials",
@@ -4997,18 +5585,38 @@ const assertNoKeys = async (sheet_id: string): Promise<void> => {
           Fix: "query a smaller answer out of the sheet and publish that instead",
         });
       }
-      const [shape] = KEY_SHAPES.find(([, look]) => look.test(text)) ?? [];
-      if (!shape) continue;
+      const [credential] = KEY_SHAPES.find(([, look]) => look.test(text)) ?? [];
+      // Skipped outright once the publisher has claimed the sheet holds personal
+      // data, and once a credential is already refusing this cell: the claim is
+      // the answer, and the cheapest scan is the one that does not run.
+      const [person] = credential || personal ? [] : PII_SHAPES.find(([, look, confirm]) => {
+        if (!confirm) return look.test(text);
+        // A /g regex carries its position between calls, so the next cell would
+        // start reading where this one stopped.
+        look.lastIndex = 0;
+        for (let found = look.exec(text); found; found = look.exec(text))
+          if (confirm(found[0])) return true;
+        return false;
+      }) ?? [];
+      if (!credential && !person) continue;
       const col = cols.find((col) => col && String(col.key) === key);
       // Where it is, never what it is, and never how much of it matched. Whoever
       // publishes reads this, and is not always whoever pasted the value.
       const place = row ? `column ${col?.name ?? key}, row ${row}` : `the sheet's settings, under ${key}`;
-      bad(400, `Sheet ${sheet_id} cannot be published: it holds ${shape}.`, {
-        Expected: "no credential in a sheet anybody can read",
-        Received: `${shape} in ${place}`,
+      if (credential) {
+        bad(400, `Sheet ${sheet_id} cannot be published: it holds ${credential}.`, {
+          Expected: "no credential in a sheet anybody can read",
+          Received: `${credential} in ${place}`,
+          Source: `the automerge document behind ${sheet_id}`,
+          Fix: `clear that cell, then publish again; a key a request needs is stored with ` +
+            `POST /library/${sheet_id}/secret and written into a header as {{secret:name}}`,
+        });
+      }
+      bad(400, `Sheet ${sheet_id} cannot be published: it holds ${person}.`, {
+        Expected: "no personal data in a sheet anybody can read, or a publisher who says it belongs there",
+        Received: `${person} in ${place}`,
         Source: `the automerge document behind ${sheet_id}`,
-        Fix: `clear that cell, then publish again; a key a request needs is stored with ` +
-          `POST /library/${sheet_id}/secret and written into a header as {{secret:name}}`,
+        Fix: `clear that cell, or send "personal": true with this request to publish it anyway`,
       });
     }
   }
@@ -5057,7 +5665,7 @@ app.post("/sell/:id", async (c) => {
   await assertSheetOwner(c, c.req.param("id"));
   // A listing is read by strangers the way a public sheet is. A null price
   // takes the listing down, and taking something down publishes nothing.
-  if (price !== null) await assertNoKeys(c.req.param("id"));
+  if (price !== null) await assertNoKeys(c.req.param("id"), claimsPersonal(body));
   const updated = await sql`
     update sheet set sell_price = ${price}${price === null ? sql`` : sql`, license = ${license as string}`}
     where true
@@ -5209,10 +5817,15 @@ app.post("/shop/:sell_id/review", async (c) => {
 // access rule.
 const FRESHNESS_SHEET = "library:freshness";
 
-const freshness = async (c: Context, { limit, offset }: Record<string, string>): Promise<Page> =>
-  await cselect({
+const freshness = async (c: Context, { limit, offset }: Record<string, string>): Promise<Page> => {
+  const answer = await cselect({
     cols: null,
-    select: sql`select f.*`,
+    // `paused` and `next_run` are declared here and filled in below. One lives
+    // in the sheet's own document and the other in the poller's due map, so
+    // neither is a column this query can compute -- and declaring them rather
+    // than appending them afterwards leaves the page's column list cselect's
+    // own, typed off the statement the way every other column is.
+    select: sql`select f.*, null::boolean as paused, null::text as next_run`,
     // The whole query is the from clause because cselect counts with
     // `select count(*) ${from} ${where}` and reuses neither the order nor a
     // group by -- so a grouped query written any other way pages against a
@@ -5287,8 +5900,145 @@ const freshness = async (c: Context, { limit, offset }: Record<string, string>):
     limit,
     offset,
   });
+  const [, ...rows] = answer.data as unknown as Record<string, unknown>[];
+  for (const row of rows) {
+    const sheet_id = String(row.sheet_id);
+    // When the poller takes this sheet next. A sheet the map has not reached
+    // yet -- a server that has just booted, a sheet made since the last tick --
+    // is null and not a guess at a time nobody has decided. The other types
+    // here have no timer at all: a webhook is pushed to, a socket is watched by
+    // a browser, and a codex connection is opened by whoever reads it.
+    const due = row.type === "net-http"
+      ? netDue.get(sheet_id)
+      : row.type === "alert"
+      ? alertDue.get(sheet_id)
+      : undefined;
+    // Not-a-number as well as absent: both pollers clamp what they store to
+    // INTERVAL_MAX_S, but this read must not trust that forever -- a due time
+    // Date cannot express would otherwise throw here and take every other
+    // sheet's row down with it, not just this one's.
+    row.next_run = due === undefined || !Number.isFinite(due) ? null : new Date(due).toISOString();
+    // Only the two types that carry the switch, and only when their document
+    // answers: a document that will not load is not an unpaused sheet, it is
+    // the failure the rest of this row is already about.
+    const config = row.type === "net-http" || row.type === "alert"
+      ? await automerge
+        .find<{ data: [{ paused?: boolean }] }>(sheet_id.split(":")[1] as AnyDocumentId)
+        .then((hand) => hand.doc()?.data?.[0])
+        .catch(() => undefined)
+      : undefined;
+    // The same truthiness the two pollers read the field with, so this read and
+    // the thing it reports on cannot say different things about one document:
+    // `paused: "yes"` stops the poller, and a strict === true here called it
+    // running.
+    row.paused = config === undefined ? null : !!config.paused;
+  }
+  return answer;
+};
 
 app.get("/library/freshness", async (c) => page(c)(await freshness(c, c.req.query())));
+
+// What feeds a sheet. The refs are already written down -- in the query's own
+// code, the alert's, and the chart's source -- and scanRefs is the scanner the
+// engine itself loads them with, so the graph cannot disagree with what a run
+// actually reads.
+//
+// The code is read from the live document and never from sheet.row_0, which is
+// frozen at claim: a query edited since would list the refs it was born with
+// and nothing about the ones it reads today.
+//
+// A sheet rather than a route, for the reasons FRESHNESS_SHEET is one, and it
+// answers whole rather than paged the way a dashboard's tiles do: what it holds
+// is the account's own sheets and their refs, and the sheets are quota'd.
+const LINEAGE_SHEET = "library:lineage";
+
+const lineage = async (c: Context): Promise<Page> => {
+  const mine: { sheet_id: string; name: string; type: string; doc_id: string }[] = await sql`
+    select s.sheet_id, s.name, s.type, s.doc_id
+    from sheet s inner join sheet_usr su using (sheet_id)
+    where su.usr_id = ${c.get("usr_id")}
+    order by s.sheet_id
+    limit ${USER_SHEETS_MAX + 1}
+  `;
+  // One document is loaded per traced sheet, so the loop below is the cost and
+  // the account's own sheet quota is what bounds it. A library past the cap is
+  // one shared into rather than one claimed, and this read says so rather than
+  // answering a graph with sheets quietly missing from it.
+  if (mine.length > USER_SHEETS_MAX) {
+    bad(413, `Your library is past what one trace can read.`, {
+      Received: `more than ${USER_SHEETS_MAX} sheets you hold a role on`,
+      Limit: `${USER_SHEETS_MAX} sheets, the quota an account's own sheets are capped at`,
+      Source: "sheet_usr, counted for this account",
+      Fix: "the cap is the operator's to raise; until then read one sheet's refs with `describe @<sheet id>`",
+    });
+  }
+  // A ref names a sheet by id, and an id is a fact the reader's own document
+  // already holds. The name is not: it is read out of the sheets this caller
+  // has a role on, and is null for a ref pointing anywhere else.
+  const named = new Map(mine.map((s) => [s.sheet_id, s.name]));
+  const rows: Row[] = [];
+  for (const s of mine) {
+    // The three types whose rows come from somewhere else. A table holds its
+    // own cells, a feed holds what it fetched, and neither depends on a sheet.
+    if (!["query", "alert", "chart"].includes(s.type)) continue;
+    const edge = (depends_on: string | null, name: string) => ({
+      sheet_id: s.sheet_id,
+      name,
+      type: s.type,
+      depends_on,
+      depends_on_name: depends_on === null ? null : named.get(depends_on) ?? null,
+      depends_on_type: depends_on === null ? null : depends_on.split(":")[0],
+    });
+    let code: string;
+    try {
+      const data = await automerge
+        .find<{ data: Sheet["data"] }>(s.doc_id as AnyDocumentId)
+        .then((hand) => hand.doc()?.data);
+      if (!Array.isArray(data)) throw new Error("its document arrived holding no rows");
+      const head = (data[0] ?? {}) as Record<string, unknown>;
+      // A chart names one sheet in its settings rather than in a query, and
+      // chartSql is where those settings become the query it runs.
+      if (s.type !== "chart" && typeof head.code !== "string")
+        throw new Error(`its data[0].code is ${show(head.code)}`);
+      code = s.type === "chart" ? chartSql(head as unknown as Chart) : head.code as string;
+    } catch (err) {
+      // A scan that could not run is not a scan that passed. The row stays, so
+      // a sheet whose document is gone is in the graph as a sheet nobody can
+      // trace rather than as a sheet that depends on nothing.
+      rows.push(edge(null, `${s.name} -- its refs could not be read: ${reason(err)}`));
+      continue;
+    }
+    // Deduped: a query joining one sheet to itself is one edge, and the same
+    // ref written twice is the same dependency.
+    const ids = [...new Set(scanRefs(code).ids)];
+    if (!ids.length) rows.push(edge(null, s.name));
+    for (const id of ids) rows.push(edge(id, s.name));
+    // Nothing caps the refs one sheet's code holds: it is text a browser syncs
+    // in, and the quota above bounds the documents read rather than the edges
+    // they name. The answer is a sheet, so it stops where a sheet stops.
+    if (rows.length > MAX_QUERY_ROWS) {
+      bad(413, `Your sheets name more refs than one sheet can hold.`, {
+        Received: `${rows.length} refs, counted through ${s.sheet_id}`,
+        Limit: `${MAX_QUERY_ROWS} rows per sheet, which is also the most a query reads`,
+        Source: "the @refs in the code of every query, alert and chart you hold a role on",
+        Fix: "split the sheet whose code names the most refs, or read one sheet's refs with `describe @<sheet id>`",
+      });
+    }
+  }
+  return {
+    data: [
+      arrayify(
+        ["sheet_id", "name", "type", "depends_on", "depends_on_name", "depends_on_type"]
+          .map((name) => ({ name, type: "text" as Type, key: name })),
+      ),
+      ...rows,
+    ],
+    count: rows.length,
+    offset: 0,
+  };
+};
+
+app.get("/library/lineage", async (c) => page(c)(await lineage(c)));
 
 app.get("/library", async (c) => {
   const { limit, offset, ...qs } = c.req.query();
@@ -5523,7 +6273,8 @@ app.delete("/library/:id/share", async (c) => {
 app.post("/library/:id/public", async (c) => {
   const sheet_id = c.req.param("id");
   await assertSheetOwner(c, sheet_id);
-  const { public: isPublic } = await jsonBody(c);
+  const body = await jsonBody(c);
+  const { public: isPublic } = body;
   if (typeof isPublic !== "boolean") {
     bad(400, `A sheet is either public or it is not.`, {
       Expected: "true or false",
@@ -5532,7 +6283,7 @@ app.post("/library/:id/public", async (c) => {
       Fix: `post {"public": true} or {"public": false}`,
     });
   }
-  if (isPublic) await assertNoKeys(sheet_id);
+  if (isPublic) await assertNoKeys(sheet_id, claimsPersonal(body));
   await sql`update sheet set public = ${isPublic} where sheet_id = ${sheet_id}`;
   invalidateSync(sheet_id.split(":")[1]);
   return c.json({ data: { public: isPublic } });
@@ -5759,6 +6510,92 @@ app.post("/library/:id/preflight", async (c) => {
   });
 });
 
+// --- run now
+//
+// Pre-flight above makes the request and writes nothing. This runs the sheet's
+// own poll -- the secrets, the paging, the cursor, the retry and the row it
+// lands -- through the very function the 15-second tick calls, so what comes
+// back is the run and not a preview of one. Those two functions set the sheet's
+// due entry off its own interval as their first act, so the tick a second later
+// steps over what a person has just run without anything here clearing it.
+app.post("/library/:id/run", async (c) => {
+  const sheet_id = c.req.param("id");
+  await assertSheetEditor(c, sheet_id, "run");
+  const [sheet] = await sql`
+    select sheet_id, type, doc_id, name, created_by from sheet where sheet_id = ${sheet_id}
+  `;
+  if (!sheet) {
+    bad(404, `There is no sheet ${sheet_id}.`, {
+      Expected: "a sheet this account can open",
+      Received: show(sheet_id),
+      Source: "the sheet table",
+      Fix: "check the id, then run it again",
+    });
+  }
+  if (sheet.type !== "net-http" && sheet.type !== "alert") {
+    bad(400, `A ${sheet.type} sheet has no poll to run.`, {
+      Received: `${sheet_id}, which is a ${sheet.type} sheet`,
+      Expected: "a net-http sheet or an alert sheet",
+      Source: "sheet.type, for this sheet",
+      Fix: "run the feed or the alert that reads this sheet instead",
+    });
+  }
+  const config = (await automerge.find<{ data: [NetHttp | Alert] }>(sheet.doc_id as AnyDocumentId))
+    .doc()?.data?.[0];
+  if (!config) {
+    bad(400, `Sheet ${sheet_id} has no settings to run.`, {
+      Expected: "a document whose data[0] holds this sheet's settings",
+      Received: show(config),
+      Source: `the automerge document behind ${sheet_id}`,
+      Fix: "open the sheet and fill its settings in, then run it",
+    });
+  }
+  if (config.paused) {
+    bad(409, `Sheet ${sheet_id} is paused.`, {
+      Received: "a sheet whose own document says paused",
+      Expected: "a sheet the poller is allowed to run",
+      Source: `data[0].paused on the document behind ${sheet_id}`,
+      Fix: "clear the paused box on the sheet, then run it",
+    });
+  }
+  // After every refusal above, so a refused run spends nothing, and before the
+  // poll, because the poll is the thing that costs.
+  spend(sheet_id, "runs", 1, 0, "let the sheet's own interval run it");
+  // Postgres's clock and not this process's: every row this run can land is
+  // stamped `now()` by the far server, and a few milliseconds of skew between
+  // the two machines would otherwise read a row that was written as one that
+  // was not. Carried out and back as a number of seconds, never as a timestamp
+  // parameter: `net.created_at` carries no timezone, and a bound timestamp
+  // makes the trip through the driver's own local-time conversion -- the
+  // watermark came back hours off the rows it was taken beside. `extract(epoch
+  // from ...)` reads both sides under the one convention, so whatever the
+  // session's timezone is, the two are the same clock.
+  const [{ started }] = await sql`select extract(epoch from now()::timestamp)::float8 as started`;
+  if (sheet.type === "net-http") await pollNetSheet(sheet_id, sheet.doc_id);
+  else await pollAlertSheet(sheet);
+  // Whatever this run stamped: a row it appended, or -- where a 304 or a
+  // repeated body or a quiet alert tick moves the row it matched rather than
+  // adding another -- the row it moved. Asked of the rows rather than compared
+  // against the newest one before, because a repeat moves whichever row carried
+  // that body and that is not always the newest.
+  const [row] = await sql`
+    select net_id, created_at, method, body, meta from net
+    where sheet_id = ${sheet_id} and extract(epoch from created_at) >= ${started}
+    order by created_at desc, net_id desc limit 1
+  `;
+  // Nothing stamped is a run that recorded nothing, which is a feed with no
+  // url, an alert with no query, or a host this server is still waiting out.
+  if (!row) {
+    bad(409, `Running ${sheet_id} now recorded nothing.`, {
+      Received: "a run that wrote no row",
+      Expected: "a feed with a url, or an alert with a query, on a host this server is not already waiting on",
+      Source: `data[0] on the document behind ${sheet_id}, and the request gap this feed's host asked for`,
+      Fix: "fill the url or the query in, or wait the gap out, then run it again",
+    });
+  }
+  return c.json({ data: row });
+});
+
 app.post("/library/:id/webhook", async (c) => {
   const sheet_id = c.req.param("id");
   await assertSheetEditor(c, sheet_id, "send changes from");
@@ -5946,25 +6783,26 @@ app.post("/library/:id/secret", async (c) => {
       } to have that provider verify deliveries instead`,
     });
   }
-  // `api` is this sheet's own API key, and nothing else in that space is a name
-  // the middleware knows. An unknown one is refused where it is typed, the same
-  // way an unknown hook scheme is: written happily and then useless is worse.
-  if (name.startsWith(`${API_KEY_NAME}:`)) {
+  // `api` and `api-read` are this sheet's own API keys, and nothing else in
+  // that space is a name the middleware knows. An unknown one is refused where
+  // it is typed, the same way an unknown hook scheme is: written happily and
+  // then useless is worse.
+  if (API_KEY_NAMES.some((key) => name.startsWith(`${key}:`))) {
     bad(400, `${JSON.stringify(name)} is not a key name this server knows.`, {
       Received: name,
-      Expected: API_KEY_NAME,
+      Expected: API_KEY_NAMES.join(" or "),
       Source: "the name field of the request body",
-      Fix: `use ${API_KEY_NAME}, or a name that does not start with ${API_KEY_NAME}:`,
+      Fix: `use one of those, or a name that does not start with ${API_KEY_NAMES.map((k) => `${k}:`).join(" or ")}`,
     });
   }
   // The server mints an API key rather than taking one: a key the owner chose is
   // a key the owner reused somewhere else, and there is no way to check that
   // from here. Writing one is rotating it, like every other secret on the sheet.
-  const minted = name === API_KEY_NAME ? apiKeyFor(sheet_id) : null;
+  const minted = API_KEY_NAMES.includes(name) ? apiKeyFor(sheet_id) : null;
   if (minted && value !== undefined) {
-    bad(400, `An ${API_KEY_NAME} key is minted here, not supplied.`, {
-      Received: `a value field alongside name ${API_KEY_NAME}`,
-      Expected: `just {"name":"${API_KEY_NAME}"}; the key comes back in the answer, once`,
+    bad(400, `An ${name} key is minted here, not supplied.`, {
+      Received: `a value field alongside name ${name}`,
+      Expected: `just {"name":"${name}"}; the key comes back in the answer, once`,
       Source: "the value field of the request body",
       Fix: "drop the value field, and store what this route answers with",
     });
@@ -6063,10 +6901,13 @@ app.post("/library/:id/secret", async (c) => {
       // quoting the way a hand-pasted provider secret can.
       repro: [
         `curl '${url}' -H '${API_KEY_HEADER}: ${minted}'`,
-        `# the columns a row must carry, and their types:`,
+        `# the columns a row carries, and their types:`,
         `curl '${new URL(c.req.url).origin}/openapi/${sheet_id}' -H '${API_KEY_HEADER}: ${minted}'`,
-        `curl -X POST '${url}' -H '${API_KEY_HEADER}: ${minted}' \\`,
-        `  -H 'Content-Type: application/json' -d '{"rows":[{"column":"value"}]}'`,
+        // A read-only key is never shown a write it would be refused for.
+        ...(name === API_KEY_READ_NAME ? [] : [
+          `curl -X POST '${url}' -H '${API_KEY_HEADER}: ${minted}' \\`,
+          `  -H 'Content-Type: application/json' -d '{"rows":[{"column":"value"}]}'`,
+        ]),
       ].join("\n"),
     },
   }, 201);
@@ -6156,9 +6997,190 @@ const importTypes = (raw: string | undefined): Record<string, string> => {
   return types as Record<string, string>;
 };
 
-/** The file as the sheet it would make: a name, the columns with a type each,
- * and the rows coerced to those types. Every refusal names the line in the
- * file, because that is what the person who can fix it is looking at. */
+/** The text of a delimited file as the sheet it means: the columns with a type
+ * each, and the rows coerced to those types and keyed by `col.key`. The
+ * delimiter is the whole of what a TSV and a CSV disagree about, and `source`
+ * is what every refusal names the line in -- an uploaded file for the importer,
+ * a url for a feed -- because both doors read their rows through this one
+ * parser. Every refusal names the line, because that is what the person who can
+ * fix it is looking at. */
+const parseDelimited = (
+  fileText: string,
+  types: Record<string, string>,
+  delimiter: string,
+  source: string,
+): { cols: Col[]; rows: Row[] } => {
+  if (!fileText.trim()) {
+    bad(400, `There is nothing in that file.`, {
+      Expected: "a header row, and a row under it for each record",
+      Received: `${fileText.length} characters of whitespace`,
+      Source: source,
+      Fix: "send at least a header row",
+    });
+  }
+
+  // Each row keeps the line it started on and its raw text, because a rejection
+  // has to point at the line in the file the user is looking at.
+  const parseCSV = (text: string): { fields: string[]; line: number; raw: string }[] => {
+    const rows: { fields: string[]; line: number; raw: string }[] = [];
+    let currentRow: string[] = [];
+    let currentField = "";
+    let inQuotes = false;
+    let start = 0;
+    let line = 1; // where the scanner is
+    let rowLine = 1; // where the row being built started
+
+    const push = (end: number) => {
+      currentRow.push(currentField);
+      rows.push({ fields: currentRow, line: rowLine, raw: text.slice(start, end) });
+      currentRow = [];
+      currentField = "";
+    };
+
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i];
+      const nextChar = text[i + 1];
+
+      if (inQuotes) {
+        if (char === '"' && nextChar === '"') {
+          currentField += '"';
+          i++; // Skip next quote
+        } else if (char === '"')
+          inQuotes = false;
+        else {
+          if (char === "\n") line++;
+          currentField += char;
+        }
+      } else {
+        if (char === '"')
+          inQuotes = true;
+        else if (char === delimiter) {
+          currentRow.push(currentField);
+          currentField = "";
+        } else if (char === "\n" || (char === "\r" && nextChar === "\n")) {
+          push(i);
+          if (char === "\r") i++; // Skip \n in \r\n
+          start = i + 1;
+          rowLine = ++line;
+        } else if (char !== "\r") {
+          currentField += char;
+        }
+      }
+    }
+
+    // Don't forget the last field/row
+    if (currentField || currentRow.length > 0) push(text.length);
+
+    return rows;
+  };
+
+  const parsed = parseCSV(fileText);
+  if (parsed.length < 1) {
+    bad(400, `Nothing in that file parsed as a row.`, {
+      Expected: "at least a header row",
+      Received: `${parsed.length} parsed rows from ${fileText.length} characters`,
+      Source: source,
+      Fix: "check the delimiter and the line endings",
+    });
+  }
+
+  const [headerRow, ...dataRows] = parsed;
+
+  // A short or long row is the single most common broken CSV, and coercing it
+  // loses data silently. Name the line, the counts, and the column it stops at.
+  const ragged = dataRows.find((row) => row.fields.length !== headerRow.fields.length);
+  if (ragged) {
+    const at = Math.min(ragged.fields.length, headerRow.fields.length);
+    bad(400, `Line ${ragged.line} of that file does not match its header.`, {
+      Expected: `${headerRow.fields.length} fields: ${headerRow.fields.join(", ")}`,
+      Received: `${ragged.fields.length} fields: ${ragged.raw.slice(0, 200)}`,
+      Column: ragged.fields.length < headerRow.fields.length
+        ? `nothing for "${headerRow.fields[at]}"`
+        : `an extra field after "${headerRow.fields[at - 1]}"`,
+      Source: `line ${ragged.line} of ${source}`,
+      Fix: "quote the field that holds the delimiter, or fill in the missing column",
+    });
+  }
+
+  // Every non-blank value must parse, not four in five. At 80% the other fifth
+  // became NaN or false silently, which is data loss dressed up as inference.
+  const inferType = (values: string[]): string => {
+    const filled = values.filter((val) => val.trim());
+    if (!filled.length) return "text";
+    if (filled.every((val) => !isNaN(Number(val)))) return "num";
+    if (filled.every((val) => ["true", "false", "t", "f", "1", "0", "yes", "no"].includes(val.toLowerCase())))
+      return "bool";
+    return "text";
+  };
+
+  // Two columns of one name have no name-keyed row, and every read is
+  // name-keyed -- so a file imported with a duplicate header would land as a
+  // sheet nothing can read back, refused by a message about the sheet rather
+  // than about the file. Refuse it here, where the header that has to change is
+  // in front of the person who can change it.
+  const headers = headerRow.fields.map((name, i) => name.trim() || `Column ${i + 1}`);
+  const twice = headers.filter((name, i) => headers.indexOf(name) !== i);
+  if (twice.length) {
+    bad(400, `That file's header names a column more than once.`, {
+      Received: `${[...new Set(twice)].map((name) => JSON.stringify(name)).join(", ")} appears more than once`,
+      Expected: `one column per name: ${headers.join(", ")}`,
+      Source: `line ${headerRow.line} of ${source}`,
+      Fix: "rename one of them in the file, because a row is keyed by column name",
+    });
+  }
+
+  for (const name of Object.keys(types)) {
+    if (!headers.includes(name)) {
+      bad(400, `The types name a column the file does not have.`, {
+        Received: `"${name}"`,
+        Expected: `one of ${headers.join(", ")}`,
+        Source: "the types query parameter, against the file's header",
+        Fix: "name a column from the header, exactly as spelled",
+      });
+    }
+  }
+  // The type the caller settled on, or the guess. Every non-blank value must
+  // parse under it: a settled type the values do not fit is refused on the
+  // line that does not, not stored as NaN.
+  const cols: Col[] = headers.map((name, i) => ({
+    name,
+    type: (types[name] ?? inferType(dataRows.map((row) => row.fields[i] || ""))) as Type,
+    key: String(i),
+  }));
+  const numeric = new Set(NUMERIC_TYPES as string[]);
+  const rows: Row[] = dataRows.map(({ fields, line }) => {
+    const obj: Row = {};
+    cols.forEach((col, i) => {
+      const val = fields[i] ?? "";
+      const refuse = (what: string) =>
+        bad(400, `Line ${line} of that file does not fit the type of "${col.name}".`, {
+          Received: `${show(val)} in "${col.name}"`,
+          Expected: `${what}, because "${col.name}" is imported as ${col.type}`,
+          Source: `line ${line} of ${source}`,
+          Fix: `fix the value in the file, or import "${col.name}" as text`,
+        });
+      // A blank is no value and stays one, except in text, where it is one.
+      // checkColumnTypes() in src/sql.mjs is the one place a blank becomes a
+      // null; an importer that disagrees with it makes the stored document
+      // and the query answer two different questions about one file.
+      if (col.type === "text") obj[col.key] = val;
+      else if (!val.trim()) obj[col.key] = null;
+      else if (numeric.has(String(col.type))) {
+        if (isNaN(Number(val))) refuse("a number");
+        obj[col.key] = Number(val);
+      } else if (col.type === "bool") {
+        const word = val.toLowerCase();
+        if (!["true", "false", "t", "f", "1", "0", "yes", "no"].includes(word)) refuse("true or false");
+        obj[col.key] = ["true", "t", "1", "yes"].includes(word);
+      } else { obj[col.key] = val; }
+    });
+    return obj;
+  });
+  return { cols, rows };
+};
+
+/** The uploaded file as the sheet it would make: the name off the file, and
+ * the columns and rows parseDelimited reads out of its text. */
 const readImport = async (
   c: Context,
   types: Record<string, string>,
@@ -6195,174 +7217,12 @@ const readImport = async (
     csvText = await c.req.text();
   }
 
-  if (!csvText.trim()) {
-    bad(400, `There is nothing in that file.`, {
-      Expected: "CSV text",
-      Received: `${csvText.length} characters of whitespace`,
-      Source: "the request body",
-      Fix: "send at least a header row",
-    });
-  }
-
-  // Parse CSV. Each row keeps the line it started on and its raw text, because a
-  // rejection has to point at the line in the file the user is looking at.
-  const parseCSV = (text: string): { fields: string[]; line: number; raw: string }[] => {
-    const rows: { fields: string[]; line: number; raw: string }[] = [];
-    let currentRow: string[] = [];
-    let currentField = "";
-    let inQuotes = false;
-    let start = 0;
-    let line = 1; // where the scanner is
-    let rowLine = 1; // where the row being built started
-
-    const push = (end: number) => {
-      currentRow.push(currentField);
-      rows.push({ fields: currentRow, line: rowLine, raw: text.slice(start, end) });
-      currentRow = [];
-      currentField = "";
-    };
-
-    for (let i = 0; i < text.length; i++) {
-      const char = text[i];
-      const nextChar = text[i + 1];
-
-      if (inQuotes) {
-        if (char === '"' && nextChar === '"') {
-          currentField += '"';
-          i++; // Skip next quote
-        } else if (char === '"')
-          inQuotes = false;
-        else {
-          if (char === "\n") line++;
-          currentField += char;
-        }
-      } else {
-        if (char === '"')
-          inQuotes = true;
-        else if (char === ",") {
-          currentRow.push(currentField);
-          currentField = "";
-        } else if (char === "\n" || (char === "\r" && nextChar === "\n")) {
-          push(i);
-          if (char === "\r") i++; // Skip \n in \r\n
-          start = i + 1;
-          rowLine = ++line;
-        } else if (char !== "\r") {
-          currentField += char;
-        }
-      }
-    }
-
-    // Don't forget the last field/row
-    if (currentField || currentRow.length > 0) push(text.length);
-
-    return rows;
-  };
-
-  const parsed = parseCSV(csvText);
-  if (parsed.length < 1) {
-    bad(400, `Nothing in that file parsed as a row.`, {
-      Expected: "at least a header row",
-      Received: `${parsed.length} parsed rows from ${csvText.length} characters`,
-      Source: "the request body",
-      Fix: "check the delimiter and the line endings",
-    });
-  }
-
-  const [headerRow, ...dataRows] = parsed;
-  assertRoom("the imported sheet", 0, dataRows.length);
-
-  // A short or long row is the single most common broken CSV, and coercing it
-  // loses data silently. Name the line, the counts, and the column it stops at.
-  const ragged = dataRows.find((row) => row.fields.length !== headerRow.fields.length);
-  if (ragged) {
-    const at = Math.min(ragged.fields.length, headerRow.fields.length);
-    bad(400, `Line ${ragged.line} of the CSV does not match its header.`, {
-      Expected: `${headerRow.fields.length} fields: ${headerRow.fields.join(", ")}`,
-      Received: `${ragged.fields.length} fields: ${ragged.raw.slice(0, 200)}`,
-      Column: ragged.fields.length < headerRow.fields.length
-        ? `nothing for "${headerRow.fields[at]}"`
-        : `an extra field after "${headerRow.fields[at - 1]}"`,
-      Source: `line ${ragged.line} of the uploaded file`,
-      Fix: "quote the field that contains a comma, or fill in the missing column",
-    });
-  }
-
-  // Every non-blank value must parse, not four in five. At 80% the other fifth
-  // became NaN or false silently, which is data loss dressed up as inference.
-  const inferType = (values: string[]): string => {
-    const filled = values.filter((val) => val.trim());
-    if (!filled.length) return "text";
-    if (filled.every((val) => !isNaN(Number(val)))) return "num";
-    if (filled.every((val) => ["true", "false", "t", "f", "1", "0", "yes", "no"].includes(val.toLowerCase())))
-      return "bool";
-    return "text";
-  };
-
-  // Two columns of one name have no name-keyed row, and every read is
-  // name-keyed -- so a file imported with a duplicate header would land as a
-  // sheet nothing can read back, refused by a message about the sheet rather
-  // than about the file. Refuse it here, where the header that has to change is
-  // in front of the person who can change it.
-  const headers = headerRow.fields.map((name, i) => name.trim() || `Column ${i + 1}`);
-  const twice = headers.filter((name, i) => headers.indexOf(name) !== i);
-  if (twice.length) {
-    bad(400, `The CSV header names a column more than once.`, {
-      Received: `${[...new Set(twice)].map((name) => JSON.stringify(name)).join(", ")} appears more than once`,
-      Expected: `one column per name: ${headers.join(", ")}`,
-      Source: `line ${headerRow.line} of the uploaded file`,
-      Fix: "rename one of them in the file, because a row is keyed by column name",
-    });
-  }
-
-  for (const name of Object.keys(types)) {
-    if (!headers.includes(name)) {
-      bad(400, `The types name a column the file does not have.`, {
-        Received: `"${name}"`,
-        Expected: `one of ${headers.join(", ")}`,
-        Source: "the types query parameter, against the file's header",
-        Fix: "name a column from the header, exactly as spelled",
-      });
-    }
-  }
-  // The type the caller settled on, or the guess. Every non-blank value must
-  // parse under it: a settled type the values do not fit is refused on the
-  // line that does not, not stored as NaN.
-  const cols: Col[] = headers.map((name, i) => ({
-    name,
-    type: (types[name] ?? inferType(dataRows.map((row) => row.fields[i] || ""))) as Type,
-    key: String(i),
-  }));
-  const numeric = new Set(NUMERIC_TYPES as string[]);
-  const rows: Row[] = dataRows.map(({ fields, line }) => {
-    const obj: Row = {};
-    cols.forEach((col, i) => {
-      const val = fields[i] ?? "";
-      const refuse = (what: string) =>
-        bad(400, `Line ${line} of the CSV does not fit the type of "${col.name}".`, {
-          Received: `${show(val)} in "${col.name}"`,
-          Expected: `${what}, because "${col.name}" is imported as ${col.type}`,
-          Source: `line ${line} of the uploaded file`,
-          Fix: `fix the value in the file, or import "${col.name}" as text`,
-        });
-      // A blank is no value and stays one, except in text, where it is one.
-      // checkColumnTypes() in src/sql.mjs is the one place a blank becomes a
-      // null; an importer that disagrees with it makes the stored document
-      // and the query answer two different questions about one file.
-      if (col.type === "text") obj[col.key] = val;
-      else if (!val.trim()) obj[col.key] = null;
-      else if (numeric.has(String(col.type))) {
-        if (isNaN(Number(val))) refuse("a number");
-        obj[col.key] = Number(val);
-      } else if (col.type === "bool") {
-        const word = val.toLowerCase();
-        if (!["true", "false", "t", "f", "1", "0", "yes", "no"].includes(word)) refuse("true or false");
-        obj[col.key] = ["true", "t", "1", "yes"].includes(word);
-      } else { obj[col.key] = val; }
-    });
-    return obj;
-  });
-  return { name: sheetName, cols, rows };
+  const sheet = parseDelimited(csvText, types, ",", "the uploaded file");
+  // The row quota belongs to the sheet, so it is asked by the one door that
+  // makes one: a feed reading the same parser lands its rows in a net row,
+  // which BODY_CAP bounds and no sheet holds.
+  assertRoom("the imported sheet", 0, sheet.rows.length);
+  return { name: sheetName, ...sheet };
 };
 
 app.post("/import/preview", async (c) => {
@@ -7118,7 +7978,8 @@ const canonicalHost = (hostname: string, port: string): string | null => {
 const checkCodexDsn = async (dsn: string, sheet_id: string): Promise<void> => {
   const appDbUrl = Deno.env.get("DATABASE_URL") ?? "postgresql://postgres@127.0.0.1:5434/postgres";
   const app_ = URL.parse(appDbUrl);
-  if (!app_) throw new Error(`Expected DATABASE_URL to parse as a url, received ${appDbUrl.length} characters that did not.`);
+  if (!app_)
+    throw new Error(`Expected DATABASE_URL to parse as a url, received ${appDbUrl.length} characters that did not.`);
   const ext = URL.parse(dsn);
   const source = `the dsn stored for ${sheet_id}`;
   if (!ext) {
@@ -7461,6 +8322,8 @@ app.get("/portal/:id", async (c) => {
 // --- mcp
 // Hand-rolled Model Context Protocol server (JSON-RPC 2.0 over POST, no
 // streaming). :id is the default sheet scope; tools may override via sheet_id.
+// Reachable with a JWT or with one sheet's `scrapsheets-key`, which is what
+// makes an agent something you hand a key rather than an account.
 
 type McpTool = {
   description: string;
@@ -7468,8 +8331,56 @@ type McpTool = {
   handler: (c: Context, args: Record<string, unknown>) => Promise<unknown>;
 };
 
-const mcpSheetId = (c: Context, args: Record<string, unknown>): string =>
-  typeof args.sheet_id === "string" ? args.sheet_id : c.req.param("id") ?? "";
+/** The uri every resource this server answers is named by. */
+const MCP_RESOURCE = "sheet://";
+
+/** A resource and a prompt are about the whole sheet, the way an export is:
+ * sheet() pages a net or a query sheet, and one that stopped at the first page
+ * would answer a wrong csv and describe a wrong row count rather than a short
+ * one. `GET /export/:id.csv` passes this same limit, and the two are the same
+ * number on purpose. */
+const MCP_WHOLE_SHEET = { limit: "100000" };
+
+/** The one prompt, listed and fetched from one place so its name and its
+ * description cannot drift between the two. */
+const MCP_PROMPT = {
+  name: "describe_sheet",
+  description: "Summarise a sheet from its columns, their types and how much of each is filled.",
+  arguments: [{ name: "sheet_id", description: "type:doc_id; defaults to the sheet in the URL", required: false }],
+};
+
+/** The sheet a call names. A key opens one sheet, and an argument is not a way
+ * around the path check the middleware already made: naming another one is
+ * refused here rather than answered with the sheet creator's authority. */
+const mcpSheetId = (c: Context, args: Record<string, unknown>): string => {
+  const sheet_id = typeof args.sheet_id === "string" ? args.sheet_id : c.req.param("id") ?? "";
+  const key_sheet = c.get("key_sheet");
+  if (key_sheet && sheet_id !== key_sheet) {
+    bad(403, `This key opens ${key_sheet} and nothing else.`, {
+      Received: sheet_id || "no sheet at all",
+      Expected: key_sheet,
+      Source: `the ${API_KEY_HEADER} request header, which names the one sheet it is for`,
+      Fix: `name ${key_sheet}, or call this with the Authorization header of an account that can reach the other`,
+    });
+  }
+  return sheet_id;
+};
+
+/** The sheets a caller may name: their library under a token, and the one sheet
+ * a key opens under a key. list_sheets and resources/list are the same list. */
+const mcpSheets = async (c: Context): Promise<
+  { sheet_id: string; type: string; doc_id: string; name: string | null; tags: string[] | null; created_at: Date }[]
+> => {
+  const key_sheet = c.get("key_sheet");
+  return await sql`
+    select s.sheet_id, s.type, s.doc_id, s.name, s.tags, s.created_at
+    from sheet_usr su
+    inner join sheet s using (sheet_id)
+    where su.usr_id = ${c.get("usr_id")}
+      ${key_sheet ? sql`and s.sheet_id = ${key_sheet}` : sql``}
+    order by s.created_at
+  `;
+};
 
 const mcpTools: Record<string, McpTool> = {
   read_sheet: {
@@ -7509,6 +8420,19 @@ const mcpTools: Record<string, McpTool> = {
           Fix: `pass {"code": "select 1"}`,
         });
       }
+      // A ref is not a way around the one sheet a key opens either. Refused on
+      // the text, before the load, where the answer would be the creator's.
+      const key_sheet = c.get("key_sheet");
+      const foreign = key_sheet ? scanRefs(args.code).ids.find((id: string) => id !== key_sheet) : undefined;
+      if (foreign !== undefined) {
+        bad(403, `This key opens ${key_sheet} and nothing else.`, {
+          Received: `a query referencing @${foreign}`,
+          Expected: `@${key_sheet} alone`,
+          Source: `the ${API_KEY_HEADER} request header, which names the one sheet it is for`,
+          Fix: `select from @${key_sheet}, or run this with the Authorization header of an account that can ` +
+            `reach @${foreign}`,
+        });
+      }
       const { data, count } = await querify(c, { lang: "sql", code: args.code, args: [] }, {});
       const [cols, ...rows] = data;
       return { cols: Object.values(cols), rows, count };
@@ -7517,16 +8441,7 @@ const mcpTools: Record<string, McpTool> = {
   list_sheets: {
     description: "List the sheets in the caller's library.",
     inputSchema: { type: "object", properties: {} },
-    handler: async (c) => {
-      const sheets = await sql`
-        select s.sheet_id, s.type, s.doc_id, s.name, s.tags, s.created_at
-        from sheet_usr su
-        inner join sheet s using (sheet_id)
-        where su.usr_id = ${c.get("usr_id")}
-        order by s.created_at
-      `;
-      return { sheets: [...sheets] };
-    },
+    handler: async (c) => ({ sheets: [...await mcpSheets(c)] }),
   },
   write_cells: {
     description:
@@ -7555,6 +8470,7 @@ const mcpTools: Record<string, McpTool> = {
       },
     },
     handler: async (c, args) => {
+      assertKeyWrites(c, "the write_cells tool");
       const sheet_id = mcpSheetId(c, args);
       const [type, doc_id] = sheet_id.split(":");
       if (type !== "table") {
@@ -7664,7 +8580,7 @@ app.post("/mcp/:id", async (c) => {
     jsonrpc?: string;
     id?: unknown;
     method?: string;
-    params?: { name?: string; arguments?: Record<string, unknown>; protocolVersion?: string };
+    params?: { name?: string; arguments?: Record<string, unknown>; protocolVersion?: string; uri?: unknown };
   } = await c.req.json().catch(() => {
     bad(400, `That is not a request this endpoint can read.`, {
       Expected: "a JSON body",
@@ -7690,7 +8606,7 @@ app.post("/mcp/:id", async (c) => {
         protocolVersion: ["2025-06-18", "2025-03-26"].includes(msg.params?.protocolVersion ?? "")
           ? msg.params?.protocolVersion
           : "2025-06-18",
-        capabilities: { tools: {} },
+        capabilities: { tools: {}, resources: {}, prompts: {} },
         serverInfo: { name: "scrapsheets", version: "0" },
       });
     case "ping":
@@ -7722,6 +8638,99 @@ app.post("/mcp/:id", async (c) => {
       // not land, and a row that cannot land is a 500 like everywhere else.
       await record(c.req.param("id"), c.get("usr_id"), `mcp ${msg.params?.name}`, "mcp");
       return rpc({ content: [{ type: "text", text: JSON.stringify(out) }], structuredContent: out, isError: false });
+    }
+    // One resource per sheet the caller may list, and reading one is the csv
+    // export of it: same access, same pagination, same renderer, same budget.
+    // sheet.name is nullable, so a sheet nobody has named is listed under its
+    // id, which is what the library strip shows for one too.
+    case "resources/list":
+      return rpc({
+        resources: (await mcpSheets(c)).map((s) => ({
+          uri: `${MCP_RESOURCE}${s.sheet_id}`,
+          name: String(s.name ?? s.sheet_id),
+          description: `The ${s.type} sheet ${s.sheet_id}, as CSV.`,
+          mimeType: "text/csv",
+        })),
+      });
+    case "resources/read": {
+      const uri = msg.params?.uri;
+      // The only refusal here that is not a bad(): a uri this server does not
+      // name is a protocol mistake and has no route to blame.
+      if (typeof uri !== "string" || !uri.startsWith(MCP_RESOURCE) || !uri.slice(MCP_RESOURCE.length)) {
+        return rpcErr(
+          -32002,
+          explain(`That is not a resource this server holds.`, {
+            Received: show(uri),
+            Expected: `${MCP_RESOURCE}<sheet id>, the way resources/list spells them`,
+            Source: `the "uri" field of the request params`,
+            Fix: "call resources/list and read one of the uris it answers with",
+          }),
+        );
+      }
+      c.set("via", "mcp");
+      const sheet_id = mcpSheetId(c, { sheet_id: uri.slice(MCP_RESOURCE.length) });
+      const { data } = await sheet(c, sheet_id, MCP_WHOLE_SHEET);
+      const [colsRow, ...rows] = data;
+      if (!colsRow) {
+        bad(400, `That sheet has no columns to read.`, {
+          Expected: `sheet ${sheet_id} to have a column row`,
+          Received: "a document with no rows at all",
+          Source: "data[0] of the automerge document",
+          Fix: "add a column to the sheet, then read the resource again",
+        });
+      }
+      await record(sheet_id, c.get("usr_id"), `mcp ${msg.method}`, "mcp");
+      return rpc({
+        contents: [{
+          uri,
+          mimeType: "text/csv",
+          // EXPORTS is typed for the one format that answers bytes; csv is a
+          // text renderer and always has been.
+          text: EXPORTS.csv.render(sheet_id, Object.values(colsRow) as Col[], rows) as string,
+        }],
+      });
+    }
+    case "prompts/list":
+      return rpc({ prompts: [MCP_PROMPT] });
+    case "prompts/get": {
+      if (msg.params?.name !== MCP_PROMPT.name)
+        return rpcErr(-32602, `Unknown prompt: ${msg.params?.name}. Available: ${MCP_PROMPT.name}`);
+      c.set("via", "mcp");
+      const sheet_id = mcpSheetId(c, msg.params?.arguments ?? {});
+      const { data } = await sheet(c, sheet_id, MCP_WHOLE_SHEET);
+      const [colsRow, ...rows] = data;
+      const cols = Object.values(colsRow ?? {}) as Col[];
+      const byName = named(sheet_id, cols, rows);
+      // describeRows is what `describe @ref` answers with, so the prompt and
+      // the statement cannot describe one sheet two ways -- a document with no
+      // column row lands there too and is refused by name rather than described
+      // as empty. Its refusal is an explain() block already: re-wrapping it
+      // would replace a message about the sheet with one about the request.
+      const described = ((): Record<string, unknown>[] => {
+        try {
+          return describeRows(sheet_id, cols, byName);
+        } catch (err) {
+          throw new HTTPException(400, { message: reason(err) });
+        }
+      })();
+      // A prompt is a read of the sheet like any other door into it, and a read
+      // that left no row is a read its owner never sees.
+      await record(sheet_id, c.get("usr_id"), `mcp ${msg.method}`, "mcp");
+      return rpc({
+        description: MCP_PROMPT.description,
+        messages: [{
+          role: "user",
+          content: {
+            type: "text",
+            text: [
+              `Sheet ${sheet_id} holds ${rows.length} rows in these columns:`,
+              ...described.map((col) => `- ${String(col.column)} (${String(col.type)}), ${String(col.nulls)} blank`),
+              "",
+              "Summarise what this sheet holds and what it is for, in a short paragraph.",
+            ].join("\n"),
+          },
+        }],
+      });
     }
     default:
       return rpcErr(-32601, `Method not found: ${msg.method}`);

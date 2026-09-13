@@ -25,8 +25,8 @@ import {
   describeRef,
   describeRows,
   knownType,
-  NUMERIC_TYPES,
   MAX_EXTREMES,
+  NUMERIC_TYPES,
   planQuery,
   register,
   rewriteExtremes,
@@ -190,14 +190,51 @@ const replay = (engine: Engine) => {
   // dashboard tile names a sheet somebody bundled. A chart that only fails when
   // it is opened is a broken storefront too.
   for (const [id, ex] of Object.entries(byId)) {
-    const doc = ex.doc.data[0] as unknown as { source: string; x: string; y: string; tiles: string[] };
+    const doc = ex.doc.data[0] as unknown as {
+      source: string;
+      x: string;
+      y: string;
+      series: string | undefined;
+      tiles: string[];
+    };
     if (ex.doc.type === "chart") {
       const source = run(doc.source.slice(1));
-      for (const axis of [doc.x, doc.y])
+      // The series column is read from the same sheet the axes are, so it is
+      // checked with them; a chart that plots one thing names none.
+      for (const axis of [doc.x, doc.y, ...(doc.series ? [doc.series] : [])])
         assert(Object.hasOwn(source[0], axis), `${id} plots "${axis}", which ${doc.source} does not have`);
       // The same SQL both engines build for a chart, so the drawn chart and the
       // exported CSV cannot disagree.
       assert(chartSql(doc).includes(doc.y), `${id} should plot ${doc.y}`);
+      // And the statement itself is run, in whichever engine this pass is: a
+      // chart is the one sheet whose query nobody wrote, so the only place it
+      // is read is here.
+      const { sql, cells } = scanRefs(chartSql(doc));
+      const colsOf = Object.fromEntries(
+        Object.entries(loaded).map(([ref, rows_]) => [ref, Object.keys(rows_[0] ?? {}).map((name) => ({ name }))]),
+      );
+      const drawn = engine(planQuery(sql, cells, loaded, colsOf).sql, [loaded]).data as Row[];
+      assert(drawn.length > 0, `${id} draws no points`);
+      // A chart that splits its rows carries the series on every point it
+      // draws: chartPoints in src/Main.elm groups on that column, and a blank
+      // one is the unnamed series a chart with nothing to split by draws, in
+      // among the named ones.
+      if (doc.series) {
+        assert(
+          drawn.every((row) => row.series !== null && row.series !== undefined && row.series !== ""),
+          `${id} should name a series on every point`,
+        );
+      }
+      // And one point per label per series: chartPoints reads the distinct x
+      // labels, so two rows for one pair land on each other -- a line that
+      // doubles back, a bar drawn twice in the same place. The fix is a group by
+      // in the source query, never here.
+      const seen = new Set<string>();
+      for (const row of drawn) {
+        const at = JSON.stringify([row.series, row.x]);
+        assert(!seen.has(at), `${id} draws two points at ${at}; group its source by the pair it plots`);
+        seen.add(at);
+      }
     }
     if (ex.doc.type === "dashboard") {
       for (const tile of doc.tiles) assert(byId[tile.slice(1)], `${id} names the missing tile ${tile}`);
@@ -264,6 +301,52 @@ Deno.test("the page engine still needs min_text(), and still has the UDFs", () =
       hi: "c",
     }, `${name}: src/sql.mjs should be registered on this engine`);
   }
+  // A logistic fit is an iteration with no closed form, and no bundled example
+  // runs one, so the two engines are held to the same answer here instead: the
+  // same ten points through each engine's own compiler, compared coefficient for
+  // coefficient.
+  const pass = [0, 0, 0, 1, 0, 1, 1, 1, 1, 1];
+  const points = pass.map((p, i) => ({ hours: i + 1, pass: p }));
+  const fits = engines.map(([, engine]) =>
+    engine("select logit(array(pass), array(hours)) b, ols(array(pass), array(hours)) o from ?", [points]).data[0]
+  );
+  assertEquals(fits[0], fits[1], "the two engines fit different coefficients");
+  // A seeded sampler earns its place only if the same call answers the same
+  // number wherever it runs, so the three are compared draw for draw rather
+  // than pinned to a literal neither engine promises.
+  const draws = engines.map(([, engine]) =>
+    engine(
+      `select sample_uniform(7, 0, 10) u, sample_normal(7, 100, 15) n,
+              sample_triangular(7, 800, 1150, 2000) t from ?`,
+      [[{ x: 1 }]],
+    ).data[0]
+  );
+  assertEquals(draws[0], draws[1], "the two engines draw different samples from the same seed");
+  // Bounds this far apart overflow a double before the fraction is even
+  // applied, and the refusal is shared code, so both engines must name the
+  // same overflowed draw rather than one of them answering Infinity quietly.
+  const overflows = engines.map(([, engine]) => {
+    try {
+      engine(`select sample_uniform(0, -1.0e308, 1.0e308) u from ?`, [[{ x: 1 }]]);
+      return null;
+    } catch (e) {
+      return (e as Error).message;
+    }
+  });
+  assert(overflows[0] && overflows[0].includes("a draw that fits in a finite number"), overflows[0] ?? "no error");
+  assertEquals(overflows[0], overflows[1], "the two engines disagree about an overflowed draw");
+  // Both hosts read a result column's type off SELECT_TYPES, so a fit's
+  // coefficient array is json wherever it runs and a prediction is a number.
+  assertEquals(
+    selectTypes(
+      `select ols(array(y), array(x)) as coefs, logit(array(y), array(x)) as odds,
+              round(ols_predict(c, 1), 2) as fitted, logit_predict(c, 1) as chance,
+              sample_uniform(s, 0, 1) as u, sample_normal(s, 0, 1) as n,
+              sample_triangular(s, 0, 1, 2) as t from @table:t`,
+      {},
+    ),
+    { coefs: "json", odds: "json", fitted: "num", chance: "num", u: "num", n: "num", t: "num" },
+  );
 });
 
 Deno.test("min() and max() over a text column answer, in both engines", () => {
