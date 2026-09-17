@@ -112,16 +112,16 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
 ## Charts & dashboards
 
-- [ ] **A column named `total` can be charted.** `chartIdent` checks that a chart's x, y, y2 and series are plain
-      column names, and a SQL reserved word is one — so it passes, gets spliced in bare, and AlaSQL answers a raw
-      parse error with a caret into SQL the reader never wrote. Measured: `total`, `store`, `class`, `select` and
-      `order` all break as the **x** column on every kind (`select order as x, v as y …` has always failed, so this
-      is not new); as the y column they are fine. `line` and `box` are safe.
+- [ ] **A column named `total` can be charted.** `chartIdent` checks that a chart's x, y, y2 and series are plain column
+      names, and a SQL reserved word is one — so it passes, gets spliced in bare, and AlaSQL answers a raw parse error
+      with a caret into SQL the reader never wrote. Measured: `total`, `store`, `class`, `select` and `order` all break
+      as the **x** column on every kind (`select order as x, v as y …` has always failed, so this is not new); as the y
+      column they are fine. `line` and `box` are safe.
   1. `chartIdent` refuses a reserved word by name, saying to rename the column — the cheap half, and it turns a parse
      error into a sentence.
   2. Quoting the identifier is the real fix and is one character, but `rewriteExtremes`, `selectTypes` and
-     `checkResultColumns` read the select list as text, so decide what a quoted name does to all three before
-     changing what `chartIdent` emits.
+     `checkResultColumns` read the select list as text, so decide what a quoted name does to all three before changing
+     what `chartIdent` emits.
   3. The same hole is in `unpivot`'s in-list and anywhere else a column name is spliced into generated SQL; fix it in
      one place or not at all.
 
@@ -133,21 +133,22 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
 ## Ingest — net-http
 
-- [ ] **A feed behind OAuth works.** A feed is polled with a GET, a POST or a PUT and a templated body, and a static
-      key out of the secret store is the only credential it can carry.
+- [ ] **A feed behind OAuth works.** A feed is polled with a GET, a POST or a PUT and a templated body, and a static key
+      out of the secret store is the only credential it can carry.
   1. OAuth authorization code flow plus automatic refresh, on top of the secret store: the refresh token is a secret
      like any other, and the access token is written back beside it rather than into the document.
   2. Static egress IP, which many enterprise sources require before they will talk at all.
 
-- [ ] **The response is parsed, not stored as a blob.** CSV, TSV, NDJSON and gzip land as the JSON array they mean,
-      read by the type the answer declares; every other format is still one cell.
-  1. Parsers: XML, RSS/Atom, HTML with CSS selectors, XLSX, Parquet. Each is one more entry in `BODY_PARSERS` and
-     one more branch in `readFeedBody` in `main.ts`, which both doors into a net sheet already call; each answers
-     the JSON array text the body means, the way the delimited and NDJSON branches do.
-  2. Archives: zip, including "the one CSV inside this daily zip". A zip names its members, so the branch has to
-     say which member it reads and refuse an archive holding more than one it can name, and `BODY_CAP` is spent on
-     the uncompressed member the way `GZIP_SLICE` spends it on a gzip.
+- [ ] **The response is parsed, not stored as a blob.** CSV, TSV, NDJSON and gzip land as the JSON array they mean, read
+      by the type the answer declares; every other format is still one cell.
+  1. Parsers: XML, RSS/Atom, HTML with CSS selectors, XLSX, Parquet. Each is one more entry in `BODY_PARSERS` and one
+     more branch in `readFeedBody` in `main.ts`, which both doors into a net sheet already call; each answers the JSON
+     array text the body means, the way the delimited and NDJSON branches do.
+  2. Archives: zip, including "the one CSV inside this daily zip". A zip names its members, so the branch has to say
+     which member it reads and refuse an archive holding more than one it can name, and `BODY_CAP` is spent on the
+     uncompressed member the way `GZIP_SLICE` spends it on a gzip.
   3. PDF table extraction, because half of government data ships as PDF.
+
 ---
 
 ## Ingest — net-hook & forms
@@ -199,8 +200,8 @@ The runner is in **Now**. These are what the Demo Gallery needs on top of it.
 - [ ] **You can backfill a schedule over a historical date range.** Running it now and pausing it are done; history is
       not.
   1. Backfill: run a schedule over a historical date range.
-  2. A paused sheet still ages in `library:freshness` and still drags the `GET /status` liveness conditions down;
-     decide whether `POLL_OK`/`ALERT_OK` should read `paused` before the backfill lands.
+  2. A paused sheet still ages in `library:freshness` and still drags the `GET /status` liveness conditions down; decide
+     whether `POLL_OK`/`ALERT_OK` should read `paused` before the backfill lands.
 - [ ] **Sheets run in dependency order.** Each runs on its own timer, so a downstream sheet can run before its source.
   1. A DAG derived from the `@sheet` refs `scanRefs()` already returns.
   2. A cycle is refused as the path that closes it, exactly as `checkRefPath` reports one.
@@ -213,8 +214,8 @@ The runner is in **Now**. These are what the Demo Gallery needs on top of it.
 
 ## Alerts & notifications
 
-- [ ] **An alert can fire on "outside its usual band".** The condition is the query's where clause, or a row added
-      or removed since the run before; a band is neither.
+- [ ] **An alert can fire on "outside its usual band".** The condition is the query's where clause, or a row added or
+      removed since the run before; a band is neither.
   1. An anomaly band needs the forecasting work under **Stats & modeling**, and waits for it.
 
 - [ ] **An alert reaches you on a phone.** Email and a webhook url ship; nothing reaches a device that is not reading
@@ -242,8 +243,8 @@ The missing other half: sheets that do something, not just show something.
 - [ ] **A failed action is retried and then kept.** Nothing survives a failure.
   1. An action queue with retries, backoff and idempotency keys, sharing the dead-letter sheet from **Types &
      validation**.
-  2. Who ran what, against which rows, with which payload, goes in the one audit log under **Permissions &
-     governance** rather than a second one beside it.
+  2. Who ran what, against which rows, with which payload, goes in the one audit log under **Permissions & governance**
+     rather than a second one beside it.
 
 ---
 
@@ -251,8 +252,8 @@ The missing other half: sheets that do something, not just show something.
 
 - [ ] **You can see what a change to a sheet will break.** `library:lineage` is the graph: one row per sheet and the
       sheet it depends on, off the live document through `scanRefs()`.
-  1. Impact analysis: what breaks if this column is renamed or removed, which needs the column names a dependent
-     selects and not only the sheet ids it names.
+  1. Impact analysis: what breaks if this column is renamed or removed, which needs the column names a dependent selects
+     and not only the sheet ids it names.
   2. Warn dependents before a schema change lands.
 - [ ] **A sheet states what must be true of it.** Nothing is asserted.
   1. Assertions: not-null, unique, accepted values, row-count range, freshness bound, referential integrity.
@@ -264,6 +265,7 @@ The missing other half: sheets that do something, not just show something.
 ## Stats & modeling
 
 The Excel add-in market lives here.
+
 - [ ] **A seasonal series can be forecast.** `regr_predict()` is the straight line and `fit_exponential()` the
       log-linear one.
   1. Seasonal decomposition, which needs a series-to-series function — neither the aggregate protocol nor the window
@@ -304,13 +306,14 @@ The Excel add-in market lives here.
   1. Schema-aware generation off the same read `describe` uses.
   2. The generated SQL is shown for review, never run unseen.
   3. A prompt eval sheet — test cases and scores — is a normal sheet, and is how this stays honest.
+
 ---
 
 ## Reports & export
 
 - [ ] **A report arrives looking like a report.** `csv`, `json`, `ndjson`, `md`, `ics` and `xlsx` ship through one
-      route; the workbook carries values, a number format per column and widths, and no cell styles, because the
-      SheetJS community edition drops them on write.
+      route; the workbook carries values, a number format per column and widths, and no cell styles, because the SheetJS
+      community edition drops them on write.
   1. Parquet: one more row in `EXPORTS`, typed off `COLUMN_TYPES` the way `xlsxCell` is; pick the writer first
      (`hyparquet-writer` or `parquet-wasm`, whichever runs on Deno Deploy) and say why beside the import.
   2. PDF with a print layout: headers, page breaks, title page.
@@ -387,8 +390,8 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
 
 ## Offline & mobile
 
-- [ ] **The app works on a phone and on a plane.** It installs and its shell opens offline now — `src/manifest.webmanifest`
-      and `src/sw.js` — and then still assumes a mouse and a connection for the data.
+- [ ] **The app works on a phone and on a plane.** It installs and its shell opens offline now —
+      `src/manifest.webmanifest` and `src/sw.js` — and then still assumes a mouse and a connection for the data.
   1. Responsive touch-friendly cell editing and swipe navigation.
   2. IndexedDB-first sync — Automerge already uses it, so this is optimisation rather than new machinery. The shell
      already opens offline out of `src/sw.js`; this is the data half.

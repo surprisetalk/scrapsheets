@@ -44,15 +44,15 @@ is a shareable table, every sheet is an API.
   before a feature is added. It type checks **once, for every test file at a time, alongside the run** rather than
   letting `deno test` do it: that checks in each worker it starts, and eight of those at once cost more than the
   checking does — measured at about a second of the ten. The check and the run are awaited together and either one
-  failing fails the task, so nothing is traded away for it. Time one file with `deno test --allow-all <file>`, and
-  check `top` first: a build job on the same machine makes every number here a lie
+  failing fails the task, so nothing is traded away for it. Time one file with `deno test --allow-all <file>`, and check
+  `top` first: a build job on the same machine makes every number here a lie
 - `deno task review` — elm-review. Runs clean with zero suppressions; keep it that way
 - `deno task status` — print every graded condition from the deployed `GET /status`, exit nonzero if any is below 1.0.
   `.github/workflows/status.yml` runs it on a 15-minute cron; the failure email is the alarm
 - `deno task vendor` — re-vendor the browser bundles after bumping the versions at the top of `vendor.ts`
 - `deno task db:plan` / `db:apply` — read the generated migration, then run it. **Check `.env` first: `DATABASE_URL` may
-  point at production**, and `db:apply` no longer prompts. Its allow list is `INDEX_BUILD,INDEX_DROPPED`, so a
-  migration that drops a constraint (a primary key move) is refused for `ACQUIRES_ACCESS_EXCLUSIVE_LOCK`; run the same
+  point at production**, and `db:apply` no longer prompts. Its allow list is `INDEX_BUILD,INDEX_DROPPED`, so a migration
+  that drops a constraint (a primary key move) is refused for `ACQUIRES_ACCESS_EXCLUSIVE_LOCK`; run the same
   `pg-schema-diff apply` by hand with that hazard added for the one migration rather than widening the task
 - `deno run -A npm:elm-format --yes src/Main.elm` — format Elm
 - Watch: `watch src { try { cp -vu src/* dist ; elm make src/Main.elm --debug --output=dist/index.js } }`
@@ -74,20 +74,20 @@ Eight files, and two harness modules beside them. Which one a failure belongs in
 
 **Why there are eight.** `deno test --parallel` runs files side by side and not tests, so the suite costs whatever its
 slowest file costs — every split below was made because one file had become that. The two jsdom harnesses were split
-apart first, then each was split again, and the halves are kept **even in the thing that is actually expensive**: a
-boot or a `glue()`, which is Elm's first paint into a jsdom. Counted rather than eyeballed, with
+apart first, then each was split again, and the halves are kept **even in the thing that is actually expensive**: a boot
+or a `glue()`, which is Elm's first paint into a jsdom. Counted rather than eyeballed, with
 `grep -c "await boot(" page_test.ts library_test.ts` and the same for `glue_test.ts` and `sync_test.ts`. Adding a file
-is not free — each one is another process, another module graph — so split only when one file is the critical path,
-and rebalance rather than pile onto whichever file the test seems to belong to.
+is not free — each one is another process, another module graph — so split only when one file is the critical path, and
+rebalance rather than pile onto whichever file the test seems to belong to.
 
 - `main_test.ts` — the server. One `Deno.test` of named `t.step`s against in-process PGlite: auth, sync and roles, shop
   and Stripe, `POST /query`, the `src/sql.mjs` UDFs, net-http polling, socket reports, alerts and digests, MCP, export.
   Steps run in order against one database, so a step still depends on what ran before it. What steps buy is a name in
   the failure and every later step still running — **not** isolation, and not `--filter`, which matches test names and
-  not step names. A **second** PGlite behind a second gateway on `127.0.0.1:5435` is the codex sheets' external
-  database — a second instance and not a second address onto the first, because the gateway hands every connection onto
-  one PGlite session and the codex connection sets that session read only, which refused the next insert anywhere in
-  the suite. It is **cloned from the first rather than booted**: `dumpDataDir` on the main instance before the schema is
+  not step names. A **second** PGlite behind a second gateway on `127.0.0.1:5435` is the codex sheets' external database
+  — a second instance and not a second address onto the first, because the gateway hands every connection onto one
+  PGlite session and the codex connection sets that session read only, which refused the next insert anywhere in the
+  suite. It is **cloned from the first rather than booted**: `dumpDataDir` on the main instance before the schema is
   applied is a few tens of milliseconds and `loadDataDir` is a quarter of a second, where booting a second Postgres from
   nothing is another second and a half of WebAssembly competing with the first for cores. Taken before the schema on
   purpose — a codex database holding our own tables would have `codexTables()` listing them — and built on the first
@@ -95,55 +95,67 @@ and rebalance rather than pile onto whichever file the test seems to belong to.
   names a loopback port nobody listens on, never a hostname: the suite does no DNS.
 
   `request()` — the helper for calls that are meant to succeed — clears `rateLimitBuckets` first. Every request here
-  arrives from one address, which no real client does, so that bucket is shared by the whole run and empties over it;
-  it refills on the wall clock, so whether a step passed depended on how slow the suite had been up to that point, and
+  arrives from one address, which no real client does, so that bucket is shared by the whole run and empties over it; it
+  refills on the wall clock, so whether a step passed depended on how slow the suite had been up to that point, and
   making the suite faster is what surfaced it. The limiter has its own steps, which set the bucket they are about by
   hand and go straight to `app.request`, so clearing here cannot hide what they assert.
 
-  **This file is the suite's critical path** and the one that has not been split. Its later half is already independent
-  — the last thirty-four steps pass with the first thirty-four skipped — but two files would need two databases, and
-  the ports are not free: `5434` and `5435` are written into the codex steps, which exist to prove a DSN aimed at this
-  server's own database is refused, and setting `DATABASE_URL` to move them also takes the pool from one connection to
-  ten.
+  **This file is the suite's critical path** and the one that stays whole. Splitting it was built and measured on
+  2026-09-17 and thrown away; what follows is so nobody spends the afternoon again. Its later half really is independent
+  — the last thirty-four steps pass with the first thirty-four skipped — and two files of thirty-four ran green on their
+  own. Three things killed it:
+
+  - `deno test --parallel` runs test files as **workers of one process**, so `Deno.env` is shared between them. A second
+    file naming its own database in `DATABASE_URL` names it for every other file too, both halves open the one PGlite,
+    and their protocol frames interleave until a parse fails. Giving it a `deno test` process of its own fixes that and
+    costs the process.
+  - Both processes then share `data/automerge` on disk, which `main.ts` puts beside `Deno.mainModule`. The sync step
+    fails with a 404 perhaps one run in five.
+  - And it bought about half a second. The second process pays its own PGlite (~1.6s) and module load (~0.7s), which is
+    most of the ~3.5s of steps it took off the first.
+
+  The pool is not the blocker it looks like: `max: Deno.env.get("DATABASE_URL") ? 10 : 1` reads the presence of that
+  variable as "a real Postgres", so a second file setting it would get ten connections onto one PGlite session — but a
+  `DATABASE_POSTGRES_POOL` escape hatch fixed that in one line, and was reverted with the rest. The codex steps'
+  `5434`/`5435` literals move mechanically; what does not move is the storage directory or the cost.
 - `examples_test.ts` — every bundled sheet through **both** engines (`npm:alasql` and the vendored `src/alasql.mjs` the
   page loads), compared row for row.
 - `page_test.ts`, `library_test.ts`, `glue_test.ts` and `sync_test.ts` — the page under jsdom, through two harnesses,
-  two files each. `page_test.ts` is the table and the query sheet: how they render, sort, arrange and take the
-  keyboard. `library_test.ts` is the library itself, the sheets opened from it (a feed, an alert, a chart, a
-  dashboard), the palette over them, and the parts of `src/page.mjs` that need no page at all. `glue_test.ts` is what
-  the glue does to a document; `sync_test.ts` is what arrives from outside it — a CSV chosen or dropped, a socket
-  report, a fork, a real automerge document taking every patch shape, the row and column verbs, and `src/sw.js`.
-  `glue_harness.ts` holds the `glue()` the last two share.
-  `page_harness.ts` is what all four share — the compiled Elm, the window installed as globals, `boot`, `until`, the
-  page-side query engine — and is a module rather than a test file so that neither registers the other's tests by
-  importing it. `boot` runs the compiled Elm in `dist/index.js` with every port answered by hand and the library fed in
-  through `library()`; reach for it for anything about what the page renders, and for `rendered()` — the one booted page
-  shared across tests, the library, for the tests that only read what it painted — when nothing in the test writes to
-  the model. `glue` runs `src/index.html`'s own `<script type="module">` over the same jsdom — its imports rewritten to
-  a destructure, `initializeWasm` and the storage stubbed, the websocket adapter genuine, `fetch` and `WebSocket`
-  recorded and answered by the test — so `changeDoc`, `arrangeDoc`, `applyPatches`, `Views`, the query re-run guard, the
-  share requests, CSV import, `newDoc`, fork and the socket-health report are the real ones; reach for it for anything
-  about what the glue does. Both harnesses count a settle off a mutation observer, not by serializing the body per
-  frame, which was most of what a settle cost. `docs` hands it a synced document, which is where a write is watched: the
-  handle holds the test's own object. `realRepo` swaps the stub repo for automerge itself — slower, and the only way to
-  find out whether a patch means the same thing to a real document as it does to a plain object. Both harnesses drive
-  animation frames off the event loop rather than jsdom's ~16ms clock: a settle waits for the page to go quiet, not for
-  real time, and that clock was most of this file's wall time. Anything that does wait on a real timer — the query
-  debounce, a file being read — asks `settle(ms)` for it by name, and `until()` is the bounded poll for the ones where
-  the wait is for something to happen; a flat `settle(ms)` is only for proving that something did **not**. Refuses a
-  `dist` older than `src` rather than building one: `deno task test` builds once before any file runs, so the files can
-  run in parallel without a compiler racing a reader of its output. deno-dom is not enough — it has no `replaceData` on
-  a text node. It also runs `src/sw.js` over a hand-made `self`, `caches` and `fetch`, which is the only way to take the
-  network away from a service worker. Dead ends, measured, so nobody spends the afternoon again: `--optimize` shrinks
-  `dist/index.js` by a few percent and moves nothing; the flat `settle(ms)` sleeps left prove something did **not**
-  happen and cannot be shortened; what a `boot` costs is Elm's first paint into jsdom, so the levers are fewer boots or
-  another file.
+  two files each. `page_test.ts` is the table and the query sheet: how they render, sort, arrange and take the keyboard.
+  `library_test.ts` is the library itself, the sheets opened from it (a feed, an alert, a chart, a dashboard), the
+  palette over them, and the parts of `src/page.mjs` that need no page at all. `glue_test.ts` is what the glue does to a
+  document; `sync_test.ts` is what arrives from outside it — a CSV chosen or dropped, a socket report, a fork, a real
+  automerge document taking every patch shape, the row and column verbs, and `src/sw.js`. `glue_harness.ts` holds the
+  `glue()` the last two share. `page_harness.ts` is what all four share — the compiled Elm, the window installed as
+  globals, `boot`, `until`, the page-side query engine — and is a module rather than a test file so that neither
+  registers the other's tests by importing it. `boot` runs the compiled Elm in `dist/index.js` with every port answered
+  by hand and the library fed in through `library()`; reach for it for anything about what the page renders, and for
+  `rendered()` — the one booted page shared across tests, the library, for the tests that only read what it painted —
+  when nothing in the test writes to the model. `glue` runs `src/index.html`'s own `<script type="module">` over the
+  same jsdom — its imports rewritten to a destructure, `initializeWasm` and the storage stubbed, the websocket adapter
+  genuine, `fetch` and `WebSocket` recorded and answered by the test — so `changeDoc`, `arrangeDoc`, `applyPatches`,
+  `Views`, the query re-run guard, the share requests, CSV import, `newDoc`, fork and the socket-health report are the
+  real ones; reach for it for anything about what the glue does. Both harnesses count a settle off a mutation observer,
+  not by serializing the body per frame, which was most of what a settle cost. `docs` hands it a synced document, which
+  is where a write is watched: the handle holds the test's own object. `realRepo` swaps the stub repo for automerge
+  itself — slower, and the only way to find out whether a patch means the same thing to a real document as it does to a
+  plain object. Both harnesses drive animation frames off the event loop rather than jsdom's ~16ms clock: a settle waits
+  for the page to go quiet, not for real time, and that clock was most of this file's wall time. Anything that does wait
+  on a real timer — the query debounce, a file being read — asks `settle(ms)` for it by name, and `until()` is the
+  bounded poll for the ones where the wait is for something to happen; a flat `settle(ms)` is only for proving that
+  something did **not**. Refuses a `dist` older than `src` rather than building one: `deno task test` builds once before
+  any file runs, so the files can run in parallel without a compiler racing a reader of its output. deno-dom is not
+  enough — it has no `replaceData` on a text node. It also runs `src/sw.js` over a hand-made `self`, `caches` and
+  `fetch`, which is the only way to take the network away from a service worker. Dead ends, measured, so nobody spends
+  the afternoon again: `--optimize` shrinks `dist/index.js` by a few percent and moves nothing; the flat `settle(ms)`
+  sleeps left prove something did **not** happen and cannot be shortened; what a `boot` costs is Elm's first paint into
+  jsdom, so the levers are fewer boots or another file.
 - `browser_test.ts` — no browser: dist is fresh, `index.html` wires the WASM and the import map, every root-absolute
   asset is in `_redirects`, every imported name is exported, nothing reaches a CDN. `index.html`'s
   `<script type="module">` body is piped to `deno lint` for real scope analysis. `BROWSER_GLOBALS` is the whole
   allowlist of names Deno's global scope lacks. `src/sw.js` is linted the same way, its `SHELL` list is held equal to
-  `_redirects` in both directions, and `PAGE_BY`/`pageBy` is one more of the language-boundary copies it reads as
-  source text.
+  `_redirects` in both directions, and `PAGE_BY`/`pageBy` is one more of the language-boundary copies it reads as source
+  text.
 - `tests/MainTest.elm` via `elm_test.ts` — pure Elm: selection and navigation, sort and filter, clipboard parsing,
   column stats, `docDecoder`, `chartPoints`, `chartBoxes`, `chartSpan`, `legendLayout`, and the `similarity`/`soundex`
   pair `main_test.ts` asserts the same pairs against.
@@ -189,8 +201,7 @@ A change that breaks one of these is a bug even if the suite is green.
   `sendWithinQuota()` caps an account's alert deliveries a day, email and url alike, counted off the run log. Fetches
   need no count: a feed polls at most once a minute and a poll reads at most `PAGE_MAX` pages, so the sheets cap bounds
   them. A refusal that changed what an account keeps or sends says "quota" where `GET /status` reads it, the error log's
-  413s and the alert run's delivery
-  line; a 429 is shed unlogged and is not counted, by design.
+  413s and the alert run's delivery line; a 429 is shed unlogged and is not counted, by design.
 - **`POLL_OK` / `ALERT_OK` / `RUN_OF` / `RUN_OK` have one definition each.** `GET /status` and `library:freshness` both
   read them from there. Two hand-copied copies had already drifted.
 - **The status check grades, never maximizes.** 1.0 is the minimum pass, `grade()` floors, and a condition that cannot
@@ -212,8 +223,9 @@ A change that breaks one of these is a bug even if the suite is green.
   `localStorage` key prefix. `spec` in `Main.elm` is the only per-column-type table, and it has no wildcard, so a new
   type fails to compile. `CHART_KINDS` in `src/sql.mjs` is the only list of ways a chart is drawn: `chartSql` refuses
   one that is not on it, `kindSpec` in `Main.elm` is the copy the language boundary forces, and `browser_test.ts` fails
-  when the two disagree — it compares the two as sets, so a kind added to both needs no edit there. `NET_METHODS` in `main.ts` is the only list of verbs a feed is polled with, `netMethods` in
-  `Main.elm` is its copy, and the same test fails on the same drift.
+  when the two disagree — it compares the two as sets, so a kind added to both needs no edit there. `NET_METHODS` in
+  `main.ts` is the only list of verbs a feed is polled with, `netMethods` in `Main.elm` is its copy, and the same test
+  fails on the same drift.
 - **A column type is one word everywhere.** `COLUMN_TYPES` in `src/sql.mjs` is the list. Its entries are either a type
   or an `as` alias of one; `CANONICAL_TYPES` is the half anything may write, `NUMERIC_TYPES` and `JSON_TYPES` derive
   through `canonicalType()`, and `main.ts`'s `Type` union plus `columnTypes`/`typeAliases` in `Main.elm` are the copies
@@ -348,7 +360,7 @@ navigation, in file order:
   the whole of a bomb at once the decompressor answers all of it in one chunk, which is the cap spent after the memory
   is gone. What came out is read by its first character -- a bracket or a brace is JSON, everything else a CSV --
   because nothing in an answer says what a gzip holds. **`BODY_CAP` is spent on three different numbers**, and no one of
-  them stands in for another: the bytes that arrived, what a gzip decompressed to, and what the body *means* -- a file
+  them stands in for another: the bytes that arrived, what a gzip decompressed to, and what the body _means_ -- a file
   names its columns once and the rows it means name them on every row, so a few kilobytes on the wire is megabytes in
   the column. The poller's cross-page sum counts that third number too, what `readFeedBody` answered and not the wire
   bytes a page carried: three gzip pages each under the cap decompressed summed to twice it while their wire bytes
@@ -367,20 +379,21 @@ navigation, in file order:
   a second later steps over it. It answers the `net` row the run landed, found by asking for the newest row stamped at
   or after a watermark taken off Postgres's own clock: an append, a 304's move, a repeated body's move and a quiet alert
   tick all land that way, and comparing against the newest row before the poll misread a repeat, which moves whichever
-  row carried that body and not always the newest. The watermark is carried as seconds (`extract(epoch from
-  now()::timestamp)`) and compared with `extract(epoch from created_at)` -- `net.created_at` carries no timezone, and a
-  bound timestamp parameter comes back hours off the rows it was taken beside. Refused by name: a paused sheet (409), a
-  sheet that is neither net-http nor alert (400), and a run that recorded nothing (409 -- a feed with no url, an alert
-  with no query, or a host still inside its request gap). `library:freshness` and `GET /library/freshness` gained
-  `paused` (read with the same truthiness the pollers read it with, so the two cannot disagree about one document; null
-  for a type with no switch and for a document that will not load) and `next_run` (the due map's time as an ISO string;
-  null for a sheet the map has not reached, and null rather than a throw for a time `Date` cannot express). In the page
-  both documents decode `paused` through `optionalField "paused" D.bool False`, a checkbox beside the digest box writes
-  it as one patch, and a "run now" chip -- beside "test the request" on the feed, on its own on the alert -- goes out on
-  `runNow` and comes back on `runLoaded`, an answer for another sheet dropped the way a pre-flight's is. `runLine` reads
-  the row's own `method` to pick the shape, never the shape that happens to decode: a feed's fetched body may itself
-  hold `status` and `delivery` keys. Within an alert's body it reads the `status` the same way -- an error run never
-  reached a delivery and says why under `error`.
+  row carried that body and not always the newest. The watermark is carried as seconds
+  (`extract(epoch from
+  now()::timestamp)`) and compared with `extract(epoch from created_at)` -- `net.created_at`
+  carries no timezone, and a bound timestamp parameter comes back hours off the rows it was taken beside. Refused by
+  name: a paused sheet (409), a sheet that is neither net-http nor alert (400), and a run that recorded nothing (409 --
+  a feed with no url, an alert with no query, or a host still inside its request gap). `library:freshness` and
+  `GET /library/freshness` gained `paused` (read with the same truthiness the pollers read it with, so the two cannot
+  disagree about one document; null for a type with no switch and for a document that will not load) and `next_run` (the
+  due map's time as an ISO string; null for a sheet the map has not reached, and null rather than a throw for a time
+  `Date` cannot express). In the page both documents decode `paused` through `optionalField "paused" D.bool False`, a
+  checkbox beside the digest box writes it as one patch, and a "run now" chip -- beside "test the request" on the feed,
+  on its own on the alert -- goes out on `runNow` and comes back on `runLoaded`, an answer for another sheet dropped the
+  way a pre-flight's is. `runLine` reads the row's own `method` to pick the shape, never the shape that happens to
+  decode: a feed's fetched body may itself hold `status` and `delivery` keys. Within an alert's body it reads the
+  `status` the same way -- an error run never reached a delivery and says why under `error`.
 - **Audit**: one log, the `audit` table, read as `library:audit`. `record()` is the one writer. HTTP reads and writes
   land through one middleware keyed on the route patterns in `AUDITED`, after the route succeeded; the sync socket
   records `open` and a first `edit` per peer per document; MCP records `mcp <tool>`; a query records `query` on every
@@ -401,14 +414,15 @@ navigation, in file order:
   (unparseable, aimed at this server's own database) are never a rollover — a self-aimed DSN quietly held up by an older
   one is a credential nobody remembers writing. `canonicalHost()` reparses the host as an `http:` host because
   `postgres:` is a non-special scheme whose host the URL parser leaves as opaque text, so `127.1`, `2130706433` and
-  `[::1]` fold to the one spelling the block list holds. Every attempt lands on one `codexRun()` row whose `meta.rolled_over` says which credential answered and whose body is why
-  the newer one could not connect; `POLL_OK` grades a rolled-over run failed although it answered, so
-  `library:freshness` and `GET /status` say the newest credential is dead while the read still works. A read that
-  spent both is the 502 it always was, its `Source` counting the credentials tried and naming none of them, and no
-  refusal quotes the string, because a DSN carries its password. The host is checked by `assertPublicHost()`, the same
-  literal-and-resolved check `safeFetch` runs on every hop, on a server whose own database is somewhere else: a server
-  whose database is on loopback is a developer's machine, and there the only refusal is its own database. A query over
-  `@codex-db:x` whose connection is dead is that refusal, never an empty result.
+  `[::1]` fold to the one spelling the block list holds. Every attempt lands on one `codexRun()` row whose
+  `meta.rolled_over` says which credential answered and whose body is why the newer one could not connect; `POLL_OK`
+  grades a rolled-over run failed although it answered, so `library:freshness` and `GET /status` say the newest
+  credential is dead while the read still works. A read that spent both is the 502 it always was, its `Source` counting
+  the credentials tried and naming none of them, and no refusal quotes the string, because a DSN carries its password.
+  The host is checked by `assertPublicHost()`, the same literal-and-resolved check `safeFetch` runs on every hop, on a
+  server whose own database is somewhere else: a server whose database is on loopback is a developer's machine, and
+  there the only refusal is its own database. A query over `@codex-db:x` whose connection is dead is that refusal, never
+  an empty result.
 - **Exports**: `GET /export/:id.{csv,json,ndjson,md,ics,xlsx}` is one route over `EXPORTS`, so access, pagination and
   query recursion are `sheet()`'s, and a format is added by adding a row. `xlsx` is the one entry that answers bytes
   rather than text (`npm:xlsx@0.18.5`, SheetJS — a zip of XML parts is well past what we write ourselves; **written with
@@ -433,14 +447,14 @@ navigation, in file order:
   in a row take a hook out until its owner sets it again, a dead hook fails `GET /status` until then, the flush is
   bounded by `WEBHOOK_FLUSH_MAX`, and the url list is owner or editor only.
 - **Outbound fetches**: `safeFetch` is the one door out and sends `USER_AGENT`; `assertPublicHost()` is its host check,
-  by literal address and by every address the name resolves to, and the codex guard asks it the same question. It takes the method beside the body,
-  and only a GET is followed through a redirect. A GET carrying a body is refused in `netRequest` and nowhere else --
-  the one place that can name the size without measuring the resolved secret. Its DNS answers are read one at a time:
-  only a not-found is a fact about the host, and a resolver that failed some other way is a 502 that says so rather
-  than a 400 telling the caller to check a spelling that was right. The per-host gap is the poller's alone:
-  `holdHost()` in `pollNetOnce` writes `hostDue` after each poll (a paged feed's pages within one poll go out back to
-  back, the way any client reads a paged answer) and on every `Retry-After`, taking the later of the
-  two, so two sheets on one host take turns across cycles and the proxy can neither hold a host nor evict a hold.
+  by literal address and by every address the name resolves to, and the codex guard asks it the same question. It takes
+  the method beside the body, and only a GET is followed through a redirect. A GET carrying a body is refused in
+  `netRequest` and nowhere else -- the one place that can name the size without measuring the resolved secret. Its DNS
+  answers are read one at a time: only a not-found is a fact about the host, and a resolver that failed some other way
+  is a 502 that says so rather than a 400 telling the caller to check a spelling that was right. The per-host gap is the
+  poller's alone: `holdHost()` in `pollNetOnce` writes `hostDue` after each poll (a paged feed's pages within one poll
+  go out back to back, the way any client reads a paged answer) and on every `Retry-After`, taking the later of the two,
+  so two sheets on one host take turns across cycles and the proxy can neither hold a host nor evict a hold.
 - **MCP**: hand-rolled JSON-RPC 2.0 at `POST /mcp/:id` -- `initialize`, `ping`, `tools/list`, `tools/call` with
   `read_sheet`, `query_sheet`, `list_sheets`, `write_cells`, and the reading half a client browses rather than calls:
   `resources/list`, `resources/read`, `prompts/list`, `prompts/get`, which `initialize` advertises beside `tools`.
@@ -469,10 +483,11 @@ navigation, in file order:
   the path.
 - **`assertNoKeys()` scans two lists in the one pass.** `KEY_SHAPES` is refused as it always was, with no override, and
   `PII_SHAPES` -- an email address, a phone number in E.164 or the North American spelling, a US social security number,
-  and a run of digits `luhn()` says is a payment card -- is refused by `POST /library/:id/public` and a priced `POST
-  /sell/:id` unless the body carries `personal: true`, which `claimsPersonal()` reads and refuses when it is not a
-  boolean, so a sheet does not go out on the word "no"; both refusals name the column and the 1-based row and never the
-  value, both run under the one `KEY_SCAN_CELLS`/`KEY_SCAN_BYTES` pair, and the card is the one shape carrying a
+  and a run of digits `luhn()` says is a payment card -- is refused by `POST /library/:id/public` and a priced
+  `POST
+  /sell/:id` unless the body carries `personal: true`, which `claimsPersonal()` reads and refuses when it is not
+  a boolean, so a sheet does not go out on the word "no"; both refusals name the column and the 1-based row and never
+  the value, both run under the one `KEY_SCAN_CELLS`/`KEY_SCAN_BYTES` pair, and the card is the one shape carrying a
   checksum rather than a spelling -- matched whole and checked once, which misses a card padded with a junk digit and
   holds the false-positive rate that misses buys. In the page the claim is a second checkbox under the public one,
   `SharePersonal` holding it in `model.share` and the next `SharePublic` sending it through `shareAction` as `personal`,
@@ -605,19 +620,18 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
 - **The editor completes a sheet id off the library and a column name off the sheet.** `completionTrigger` is the `@…`
   the cursor sits in, `completionRef` is what a dot after the ref says -- that the question has moved from which sheet
   to which of its columns, and only for the two prefixes a query may reference at all -- and `completionAt` answers
-  both. A sheet id needs nothing from the glue; a column name
-  needs everything, because the columns live behind the automerge repo in the `sheets()` closure, which is why
-  `columnsFor`/`columnsLoaded` is a port. It is answered by running **`describe @<ref>` through the page's own engine**:
-  the statement the typist would have run themselves, so a suggestion cannot name a column the query is then refused
-  for. A ref that will not read answers no columns rather than an error, and the empty answer is cached too, or the
-  editor asks again on every keystroke -- but it is **logged by name** first, because `describe` on a query ref *runs*
-  that query, so a ref cycle, a join over the row cap and a sheet nobody has synced all land in one catch and only the
-  console can say which. `ColumnsLoad` **recomputes the open list**, because the columns are asked for by
-  the very keystroke that would have shown them and waiting would put every completion one character late; that is what
-  makes a `QueryAutocomplete` holding nothing legal, so the view draws nothing for one and `AutocompleteNav` guards its
-  `modBy`, which is a runtime error at zero. The dropdown carries `id="complete"` and `src/index.html`'s keydown finds
-  it by that: it used to look for `[style*="z-index: 100"]`, which is also the column filter panel, so a panel left open
-  anywhere swallowed the editor's arrow keys.
+  both. A sheet id needs nothing from the glue; a column name needs everything, because the columns live behind the
+  automerge repo in the `sheets()` closure, which is why `columnsFor`/`columnsLoaded` is a port. It is answered by
+  running **`describe @<ref>` through the page's own engine**: the statement the typist would have run themselves, so a
+  suggestion cannot name a column the query is then refused for. A ref that will not read answers no columns rather than
+  an error, and the empty answer is cached too, or the editor asks again on every keystroke -- but it is **logged by
+  name** first, because `describe` on a query ref _runs_ that query, so a ref cycle, a join over the row cap and a sheet
+  nobody has synced all land in one catch and only the console can say which. `ColumnsLoad` **recomputes the open
+  list**, because the columns are asked for by the very keystroke that would have shown them and waiting would put every
+  completion one character late; that is what makes a `QueryAutocomplete` holding nothing legal, so the view draws
+  nothing for one and `AutocompleteNav` guards its `modBy`, which is a runtime error at zero. The dropdown carries
+  `id="complete"` and `src/index.html`'s keydown finds it by that: it used to look for `[style*="z-index: 100"]`, which
+  is also the column filter panel, so a panel left open anywhere swallowed the editor's arrow keys.
 - **One CSV import, whichever way the file arrives, in two steps.** The footer's file input goes through Elm's
   `CsvImportFile` and the `importCsv` port; a file dropped on the page is read by `setupDragDrop` and handed to the same
   `uploadCsv`. That posts the file to `POST /import/preview`, lays the types this browser settled on for the same header
@@ -630,10 +644,10 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
 - **Import**: `readImport()` is the one CSV reader; `POST /import/preview` answers its columns, types and first rows
   without a sheet, and `POST /import/csv` makes one. `?types=` is a JSON object keyed by column name, checked against
   `CANONICAL_TYPES` and the file's header before the file is read.
-- **Pre-flight**: the "test the request" button on a net-http sheet sends `preflight { id, url, headers, method, body }`;
-  the page posts it to `POST /library/:id/preflight`, which runs the poller's own request once and writes nothing, and
-  the answer or the refusal comes back on `preflightLoaded` by sheet id, held in `sheet.preflight` and drawn by
-  `viewPreflight`. An answer for another sheet is dropped by id.
+- **Pre-flight**: the "test the request" button on a net-http sheet sends
+  `preflight { id, url, headers, method, body }`; the page posts it to `POST /library/:id/preflight`, which runs the
+  poller's own request once and writes nothing, and the answer or the refusal comes back on `preflightLoaded` by sheet
+  id, held in `sheet.preflight` and drawn by `viewPreflight`. An answer for another sheet is dropped by id.
 - **A feed's paging is set where the feed is.** `page_by`, `page_param` and `page_path` live in the net-http document's
   `data[0]` beside `url`, `method` and `body`, decoded through `optionalField` the way `body` is, and `viewNetHttp` is
   where they are chosen: a select over `"" :: pageBy` whose empty option is one request a poll, a page parameter for
@@ -646,15 +660,16 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   would otherwise refuse to decode the sheet the typist is looking at; the poller's own regexes are the check, hinted at
   in each input's title. Pre-flight is unchanged and stays one request.
 - **What a feed keeps is set where the feed is, too.** `mode`, `key` and `rows_path` live in the net-http document's
-  `data[0]` beside `page_by`, decoded through `optionalField` the same way, and `viewNetHttp` draws a select over `"" ::
-  netModes` whose empty option is append, a `key` input under `upsert` alone, a rows-path input whatever the mode, and a
-  hint per mode. `storeForm` is the one table of what each mode takes, the way `pageForm` is; `netModes` is the copy of
-  `NET_MODES` the language boundary forces and `netModeDecoder` refuses a mode outside it exactly as `pageByDecoder`
-  does; `browser_test.ts` fails when the two lists drift. `key` and `rows_path` are plain strings the decoder does not
-  check, for the reason `page_param` and `page_path` are: each keystroke writes the document, and the poller's own
-  regexes are the check, hinted at in each input's title. The net-http branch of `docDecoder` is a `D.map2` over a
-  `D.map5` and a `D.map6` -- eleven fields are past `D.map8`, and the request is decoded beside what is done with its
-  answer.
+  `data[0]` beside `page_by`, decoded through `optionalField` the same way, and `viewNetHttp` draws a select over
+  `"" ::
+  netModes` whose empty option is append, a `key` input under `upsert` alone, a rows-path input whatever the
+  mode, and a hint per mode. `storeForm` is the one table of what each mode takes, the way `pageForm` is; `netModes` is
+  the copy of `NET_MODES` the language boundary forces and `netModeDecoder` refuses a mode outside it exactly as
+  `pageByDecoder` does; `browser_test.ts` fails when the two lists drift. `key` and `rows_path` are plain strings the
+  decoder does not check, for the reason `page_param` and `page_path` are: each keystroke writes the document, and the
+  poller's own regexes are the check, hinted at in each input's title. The net-http branch of `docDecoder` is a `D.map2`
+  over a `D.map5` and a `D.map6` -- eleven fields are past `D.map8`, and the request is decoded beside what is done with
+  its answer.
 - **Feed health**: `library:freshness` is read by `index.html` and handed to Elm through `freshnessLoaded`. The
   `freshness` column appears only when the answer is non-empty — a blank column over a logged-out library would read as
   "nothing is wrong".
@@ -728,15 +743,16 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   one bucket -- which is the commonest column anybody points this at. Five thousand such rows is twelve million
   comparisons and tens of seconds of a frozen tab, and since the preview is drawn from `view` it is tens of seconds
   **per keystroke** in the closeness box. So the comparisons are counted, nothing more is compared once the bound is
-  passed, and the refusal names the count and says what makes a column sound alike on every row. It answers a `Result`, because the panel draws its refusal as the sentence `updateDocMsg` would answer with --
-  a closeness outside 1 to 100, a sheet past `maxFuzzyRows` with the count in the message, a column with no text, and
-  nothing near enough, which is a verb with nothing to do rather than a button that deletes nothing and says nothing.
-  The preview reads `sheet.doc` and not `sheet.table`: a table sheet's rows are its document, which is where
-  `updateDocMsg` reads them, so the preview and the verb cannot be looking at two different sheets. It also **counts
-  the rows it could not read** -- a cell holding something that is not text, which a column retyped to `text` keeps --
-  the way `viewChartSettings` counts what a fold swallowed: a preview saying one row would go while it never looked at
-  half the sheet is a preview lying about the sheet. The delete itself is
-  `rowDeletions`, so undo, the viewer refusal and the sync path are the ones already written.
+  passed, and the refusal names the count and says what makes a column sound alike on every row. It answers a `Result`,
+  because the panel draws its refusal as the sentence `updateDocMsg` would answer with -- a closeness outside 1 to 100,
+  a sheet past `maxFuzzyRows` with the count in the message, a column with no text, and nothing near enough, which is a
+  verb with nothing to do rather than a button that deletes nothing and says nothing. The preview reads `sheet.doc` and
+  not `sheet.table`: a table sheet's rows are its document, which is where `updateDocMsg` reads them, so the preview and
+  the verb cannot be looking at two different sheets. It also **counts the rows it could not read** -- a cell holding
+  something that is not text, which a column retyped to `text` keeps -- the way `viewChartSettings` counts what a fold
+  swallowed: a preview saying one row would go while it never looked at half the sheet is a preview lying about the
+  sheet. The delete itself is `rowDeletions`, so undo, the viewer refusal and the sync path are the ones already
+  written.
 - **`formatNumber` is the one place a number becomes text.** The cell, the stats row and the totals row all go through
   it; they used to format independently and a `usd` column's total came out without its `$`. A value `positional` says
   is not written as digits — not finite, or a magnitude JavaScript writes as `1e+21` — skips the currency, the grouping
@@ -746,13 +762,14 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   separator every three digits of the whole part, holding the sign and the fraction back from `commas`, which counts
   from the right over whatever it is handed and made `-123` into `-,123` — `usd` asks it too, because money is the
   column that always asked for it; and `scientific` writes a mantissa and a signed exponent, because Elm has no
-  `toExponential`: the exponent is `floor (logBase 10 (abs v))`, `descaled` divides it out in two halves because `10 ^
-  -324` underflows to 0 in one, zero is answered by name, a mantissa with no count is rounded to twelve significant
-  digits so the division's own noise is not written, and two digits before the point mean the exponent was one too low —
-  `fixed` rounds 9.99 at one place up to "10.0", and `logBase` divides two logs, so 1000 comes back at an exponent of 2
-  and a mantissa of exactly ten. A format lands **on top of** the type and never instead of it: `grouped` on a usd
-  column asks for what `usd` already writes, `scientific` on one keeps the symbol with the sign outside it, and a
-  percentage keeps its sign whichever way its digits read. `NumberFormat` is the list of ways digits are written —
+  `toExponential`: the exponent is `floor (logBase 10 (abs v))`, `descaled` divides it out in two halves because
+  `10 ^
+  -324` underflows to 0 in one, zero is answered by name, a mantissa with no count is rounded to twelve
+  significant digits so the division's own noise is not written, and two digits before the point mean the exponent was
+  one too low — `fixed` rounds 9.99 at one place up to "10.0", and `logBase` divides two logs, so 1000 comes back at an
+  exponent of 2 and a mantissa of exactly ten. A format lands **on top of** the type and never instead of it: `grouped`
+  on a usd column asks for what `usd` already writes, `scientific` on one keeps the symbol with the sign outside it, and
+  a percentage keeps its sign whichever way its digits read. `NumberFormat` is the list of ways digits are written —
   `formatSpec` is the one table of name and label and `numberFormat` the only reader of the word a document stores — the
   way `spec` is the list of column types; a word outside the list is a column nobody formatted rather than an error,
   because losing the reading must never cost the numbers. `fixed` scales the magnitude's fraction and not the whole
@@ -766,17 +783,17 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
 - **The arrangement is stored on the columns, in two homes.** Sort, filter, hidden, pinned, width, decimals and format
   live in `data[0]` as `sort`/`rank`, `filter`, `hidden`, `pinned`, `width`, `decimals`, `format`, so they survive a
   reload and travel with a share. `viewDecoder` reads them on `DocSelect` and `arrange` writes them, diffed against
-  `sheet.storedView` so
-  closing an untouched filter panel writes nothing. The panel's two typed fields — the filter box and the decimal
-  count — write the model on every keystroke and reach the document when the panel closes: a patch per character is a
-  sync per character for everybody watching, and typing "10" meant a 1 nobody chose. The format select has no keystrokes
-  to hold back, so one click is one `arrange`. A format spelled in a way nobody wrote is no format, the way an
-  out-of-range count is no count and an unusable width is no width — the arrangement is how you were reading the rows,
-  and losing it must never cost you the rows. `colViewFields` is at `D.map8` now, which is the ceiling: a ninth view
-  field needs `andThen` rather than another `map`. It goes around `updateDocMsg`: a resize is not data and does not
-  belong on the undo stack. `tableHome` and `queryHome` are the two addresses — a table's `data[0]` is the column list,
-  so the address is the position; a query's is one object, so the fields live under `view`, keyed by column name the way
-  its `cols` overrides are. `arrangeable` is the one `case` that picks, and `pruneView` is a table only, deliberately.
+  `sheet.storedView` so closing an untouched filter panel writes nothing. The panel's two typed fields — the filter box
+  and the decimal count — write the model on every keystroke and reach the document when the panel closes: a patch per
+  character is a sync per character for everybody watching, and typing "10" meant a 1 nobody chose. The format select
+  has no keystrokes to hold back, so one click is one `arrange`. A format spelled in a way nobody wrote is no format,
+  the way an out-of-range count is no count and an unusable width is no width — the arrangement is how you were reading
+  the rows, and losing it must never cost you the rows. `colViewFields` is at `D.map8` now, which is the ceiling: a
+  ninth view field needs `andThen` rather than another `map`. It goes around `updateDocMsg`: a resize is not data and
+  does not belong on the undo stack. `tableHome` and `queryHome` are the two addresses — a table's `data[0]` is the
+  column list, so the address is the position; a query's is one object, so the fields live under `view`, keyed by column
+  name the way its `cols` overrides are. `arrangeable` is the one `case` that picks, and `pruneView` is a table only,
+  deliberately.
 - **Reorder is a splice, pin is a sum.** A move is one `move` patch — on `data[0]` for a column, on `data` for a row —
   applied by `applyPatches` in `index.html` to the value the document already holds — rows are keyed by `col.key`, so no
   cell moves and the display index stays the document index. It is a `DocMsg` and not an arrangement: everyone looking
@@ -809,46 +826,48 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
 - **Installable**: `src/manifest.webmanifest` and the `src/icon.svg` it names are copied to `dist` like any other `src`
   file and listed in `src/_redirects`; the icon is named by the manifest rather than by `index.html`, so
   `browser_test.ts` checks it by hand.
-- **Offline**: `src/sw.js` is the service worker, copied to `dist` like any other `src` file, listed in `src/_redirects`,
-  and registered at the end of boot in `index.html` by `navigator.serviceWorker?.register("/sw.js")` — a page with no
-  `serviceWorker` (jsdom, plain http) takes the short circuit and a refused registration is logged by name rather than
-  taking the boot down, because the app works without one. It answers same-origin GETs network first and the cache
-  second: no filename here carries a build hash, so there is nothing for a cache name to key on and nothing but the
-  network that knows a copy is still the deployed one; a 200 for a `SHELL` path is written back, so a deploy replaces
-  the shell on the next online open and no cache name is ever bumped. `SHELL` is every path `_redirects` serves as
-  itself plus `/`, pre-cached by `addAll` on install — which refuses the whole install on one 404, deliberately — and it
-  is also the whole of what is cached: `answer()` reads and writes by pathname and never by url, so a share link's query
-  string is not a second entry and the cache cannot grow past the list. Offline a cached path answers itself, a
-  navigation with nothing cached answers the cached `/` the way the `/*` catch-all does online, and a path with neither
-  is a named refusal rather than a silent failure. Nothing cross-origin is answered at all — the API and the sync socket
-  are another origin, and the handler returns without calling `respondWith`, which leaves the browser doing what it did
-  before there was a worker. `browser_test.ts` fails when `SHELL` and `_redirects` drift in either direction and lints
-  `sw.js` through `unresolved()`, the same scope analysis `index.html`'s module script gets; `glue_test.ts` runs the
-  worker over a hand-made `self`, `caches` and `fetch`, which is the only way to take the network away. Offline means
-  the shell opens: the data still needs the network, and what a document already synced is in IndexedDB.
+- **Offline**: `src/sw.js` is the service worker, copied to `dist` like any other `src` file, listed in
+  `src/_redirects`, and registered at the end of boot in `index.html` by `navigator.serviceWorker?.register("/sw.js")` —
+  a page with no `serviceWorker` (jsdom, plain http) takes the short circuit and a refused registration is logged by
+  name rather than taking the boot down, because the app works without one. It answers same-origin GETs network first
+  and the cache second: no filename here carries a build hash, so there is nothing for a cache name to key on and
+  nothing but the network that knows a copy is still the deployed one; a 200 for a `SHELL` path is written back, so a
+  deploy replaces the shell on the next online open and no cache name is ever bumped. `SHELL` is every path `_redirects`
+  serves as itself plus `/`, pre-cached by `addAll` on install — which refuses the whole install on one 404,
+  deliberately — and it is also the whole of what is cached: `answer()` reads and writes by pathname and never by url,
+  so a share link's query string is not a second entry and the cache cannot grow past the list. Offline a cached path
+  answers itself, a navigation with nothing cached answers the cached `/` the way the `/*` catch-all does online, and a
+  path with neither is a named refusal rather than a silent failure. Nothing cross-origin is answered at all — the API
+  and the sync socket are another origin, and the handler returns without calling `respondWith`, which leaves the
+  browser doing what it did before there was a worker. `browser_test.ts` fails when `SHELL` and `_redirects` drift in
+  either direction and lints `sw.js` through `unresolved()`, the same scope analysis `index.html`'s module script gets;
+  `glue_test.ts` runs the worker over a hand-made `self`, `caches` and `fetch`, which is the only way to take the
+  network away. Offline means the shell opens: the data still needs the network, and what a document already synced is
+  in IndexedDB.
 - **A chart may plot more than one thing.** `chartSql` takes `series` beside `x` and `y`: blank or absent is the
-  statement it always built (`select <x> as x, <y> as y from <source> order by 1`), and a named one appends `, <col> as
-  series` and orders `by 3, 1`, so each series arrives whole and in draw order. The name goes through the same
-  `chartIdent` the axes do, so a series held as a number -- or as a null somebody hand-wrote into the document -- is
-  refused by name, while an emptied box is simply no series. `Chart` in `main.ts` carries `series?: string` beside
+  statement it always built (`select <x> as x, <y> as y from <source> order by 1`), and a named one appends
+  `, <col> as
+  series` and orders `by 3, 1`, so each series arrives whole and in draw order. The name goes through the
+  same `chartIdent` the axes do, so a series held as a number -- or as a null somebody hand-wrote into the document --
+  is refused by name, while an emptied box is simply no series. `Chart` in `main.ts` carries `series?: string` beside
   `y2?: string` and `annotations?`, so `GET /sheet`, every export and every MCP read answer the split rows through the
-  one `sheet()` path. In `src/Main.elm` the
-  `Chart` doc's settings are `Chart_`, named the way `Query_` is because four readers spell them; a `ChartSeries`
-  `InputChange` writes the series from the "split by" input in `viewChartSettings`, and `chartPoints` -- which takes the
-  row key to read, `"y"` or `"y2"` -- answers `List ( String, List ( String, Float )
-  )` -- the rows grouped by their `series` cell in first-appearance order, a row whose y is not a number dropped from
-  its own series alone, and a sheet with no series column read as one series with no name. **Both the label and the
-  series cell go through the lenient `string` decoder, never `D.string`**: nothing coerces a chart's columns, so an
-  `int` column arrives as a JSON number (`chart:compa-ratio` plots one on x), and read as a blank every row of it shares
-  the one label and the whole chart stacks on a single point. `viewChart` plots against the distinct x labels rather
-  than the row positions, so a chart's source must answer **one row per (series, x)** -- `examples_test.ts` runs every
-  bundled chart's own statement in both engines and refuses a repeated pair, and the fix is a `group by` in the query --
-  and it draws one polyline, polygon or dot set per series coloured from `chartColours` cycled by index, stacks a bar's
-  series on each label so the axis spans the stacked sums, shows the first series in a kpi and says which one, and draws
-  a legend inside the same viewBox `downloadChart` clones whenever any series is named. `chartColours`'s first entry is
-  the `#468` every chart drew in and an unsplit chart draws no legend, so a chart with nothing to split by is the
-  picture it always was, rect for rect. `chart:cohort-curves` is the bundled multi-series chart:
-  `@query:cohort-retention`, a line per cohort over the months since its first order.
+  one `sheet()` path. In `src/Main.elm` the `Chart` doc's settings are `Chart_`, named the way `Query_` is because four
+  readers spell them; a `ChartSeries` `InputChange` writes the series from the "split by" input in `viewChartSettings`,
+  and `chartPoints` -- which takes the row key to read, `"y"` or `"y2"` -- answers
+  `List ( String, List ( String, Float )
+  )` -- the rows grouped by their `series` cell in first-appearance order, a
+  row whose y is not a number dropped from its own series alone, and a sheet with no series column read as one series
+  with no name. **Both the label and the series cell go through the lenient `string` decoder, never `D.string`**:
+  nothing coerces a chart's columns, so an `int` column arrives as a JSON number (`chart:compa-ratio` plots one on x),
+  and read as a blank every row of it shares the one label and the whole chart stacks on a single point. `viewChart`
+  plots against the distinct x labels rather than the row positions, so a chart's source must answer **one row per
+  (series, x)** -- `examples_test.ts` runs every bundled chart's own statement in both engines and refuses a repeated
+  pair, and the fix is a `group by` in the query -- and it draws one polyline, polygon or dot set per series coloured
+  from `chartColours` cycled by index, stacks a bar's series on each label so the axis spans the stacked sums, shows the
+  first series in a kpi and says which one, and draws a legend inside the same viewBox `downloadChart` clones whenever
+  any series is named. `chartColours`'s first entry is the `#468` every chart drew in and an unsplit chart draws no
+  legend, so a chart with nothing to split by is the picture it always was, rect for rect. `chart:cohort-curves` is the
+  bundled multi-series chart: `@query:cohort-retention`, a line per cohort over the months since its first order.
 - **A second column may have a scale of its own.** `y2` rides beside `y` through the same `chartIdent`, selected as one
   more column of the same statement (`order by` counts the series' position rather than typing it, because a series is
   the third column of a one-scale chart and the fourth of a two-scale one). It is refused by name on a `kpi`, which
@@ -857,9 +876,9 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   second axis exists to avoid, and it is **always drawn as a dashed line whatever the kind**, so a reader never has to
   ask which shape belongs to which axis. Its labels sit at x 796 anchored end, its colours carry on from where the first
   scale's left off so the legend index and the colour on screen are one number, and with two scales every legend entry
-  names its column through `legendName` -- the column alone with nothing to split by, and "north · margin" beside
-  "north · margin_pct" with a series, since the same series is on both scales and naming it twice identically says
-  nothing about which swatch is which. `chart:pair-ratio-z` is the bundled one.
+  names its column through `legendName` -- the column alone with nothing to split by, and "north · margin" beside "north
+  · margin_pct" with a series, since the same series is on both scales and naming it twice identically says nothing
+  about which swatch is which. `chart:pair-ratio-z` is the bundled one.
 - **A box is the one kind that aggregates in its own query.** Every other chart reads one row per point; a box is five
   numbers about the rows that share an x, and no point can carry five. So `chartSql`'s box branch selects `min`, the
   three `percentile(array(...))` quartiles and `max` grouped by x -- `BOX_QUANTILES` is the one list of them -- and the
@@ -867,19 +886,19 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   box with no whisker is not a box. **The box query filters its own blanks** (`where <y> is not null`): `percentile`
   refuses a null outright, so one blank cell anywhere in the column refused the whole chart, every group of it, and a
   blank cell is the normal state of a spreadsheet rather than an error in one. A group whose cells are all blank simply
-  does not appear, the way a row with no y does on every other kind. A `series` or a `y2` on a box is refused by name: the five numbers are already the
-  split. It is placed ordinally, the way bars are and for the same reason, and its scale spans the whiskers.
-  `chart:dim-spread` and `chart:scenario-spread` are the bundled ones.
+  does not appear, the way a row with no y does on every other kind. A `series` or a `y2` on a box is refused by name:
+  the five numbers are already the split. It is placed ordinally, the way bars are and for the same reason, and its
+  scale spans the whiskers. `chart:dim-spread` and `chart:scenario-spread` are the bundled ones.
 - **The legend wraps, and the plot starts under it.** `legendLayout` flows the entries left to right at an estimated
   width each (SVG cannot be asked how wide a string draws before it draws it, and a measured legend is a second layout
-  pass per keystroke), wraps at the width of the plot, and answers how many rows it took. It wraps *before* the entry
+  pass per keystroke), wraps at the width of the plot, and answers how many rows it took. It wraps _before_ the entry
   that would overhang, and never on the first entry of a row, so one name wider than the whole plot overhangs once
-  rather than wrapping forever. `plotTop` is `20` plus 14 a row past the first, so **a chart with no legend or a
-  one-row legend is drawn in exactly the 240 units every chart always was** -- which is what keeps `chartRuns`'
-  placements and the bundled bar chart's rect count unchanged. It is bounded at `legendMax` entries and the rest are
-  counted in a final "+N more", and `plotTop` is clamped besides: nothing caps how many distinct values a series column
-  holds, and an unbounded legend pushed the top of the plot below its own baseline and drew the chart upside down.
-  `chartColours` cycles at six, so past a dozen the swatches have stopped telling the series apart anyway.
+  rather than wrapping forever. `plotTop` is `20` plus 14 a row past the first, so **a chart with no legend or a one-row
+  legend is drawn in exactly the 240 units every chart always was** -- which is what keeps `chartRuns`' placements and
+  the bundled bar chart's rect count unchanged. It is bounded at `legendMax` entries and the rest are counted in a final
+  "+N more", and `plotTop` is clamped besides: nothing caps how many distinct values a series column holds, and an
+  unbounded legend pushed the top of the plot below its own baseline and drew the chart upside down. `chartColours`
+  cycles at six, so past a dozen the swatches have stopped telling the series apart anyway.
 - **A day axis can carry marks.** `annotations` in `data[0]` is `{ at, label }` per entry, read through `optionalField`
   so a chart written before there were marks still decodes and one spelled wrong is refused rather than painted as no
   marks. `chartSpan` and `chartAt` are `chartRuns`' own placement lifted out, so a mark and a point are placed by one
@@ -903,15 +922,17 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   expects. `chartFold` is the other half: a series past `chartPointsMax` points is cut into equal buckets in day order
   and each bucket drawn as the mean of its y values at the earliest day it holds, folded on a day axis only, and
   `viewChartSettings` says how many points a fold swallowed beside the row count, so nothing is averaged silently.
-  `viewChart` reads `chartFold (chartPoints "y" tbl)`, so the axis, the stacks, the totals and the kpi tile all see the same
-  folded points.
-- **The palette is where you subscribe to a sheet.** `paletteRows` is what the palette reads now: the `subscribe to this
-  sheet` command over a table, a query, a net-http or a net-hook, and then `paletteCommands`, whose signature stays the
-  library and the query so the shortcut sheet and the palette still cannot drift. The command is a plain `DocNew` -- the
-  footer's own new-alert door with `select * from @<sheet id>`, `when: added`, the default interval and
-  `model.auth.email` filled in -- and it is offered only while `auth.state` is `LoggedIn`, because what a visitor typed
-  into the login form is a string in that same field and not an account. `index.html` is what knows the address: it
-  stores the email beside the session at login and hands it back on `authResult`, because logging in reloads the page.
+  `viewChart` reads `chartFold (chartPoints "y" tbl)`, so the axis, the stacks, the totals and the kpi tile all see the
+  same folded points.
+- **The palette is where you subscribe to a sheet.** `paletteRows` is what the palette reads now: the
+  `subscribe to this
+  sheet` command over a table, a query, a net-http or a net-hook, and then `paletteCommands`, whose
+  signature stays the library and the query so the shortcut sheet and the palette still cannot drift. The command is a
+  plain `DocNew` -- the footer's own new-alert door with `select * from @<sheet id>`, `when: added`, the default
+  interval and `model.auth.email` filled in -- and it is offered only while `auth.state` is `LoggedIn`, because what a
+  visitor typed into the login form is a string in that same field and not an account. `index.html` is what knows the
+  address: it stores the email beside the session at login and hands it back on `authResult`, because logging in reloads
+  the page.
 - **Known gaps**: `@library:freshness` and `@library:lineage` resolve on the server but not in the page. `describe`
   results carry no type in the page, and `WINDOW_TYPES` is server-only, so a window alias there falls back to the
   sheet's stored `cols`.
@@ -924,9 +945,9 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   document data (`row_0`, `name`, `tags`), and `public boolean` for anonymous read through `syncRole`
 - **sheet_usr** — membership, with `role` in owner/editor/viewer
 - **db** — external database connections (DSNs for codex sheets, encrypted under `DSN_ENCRYPTION_KEY`). `db_id` identity
-  PK and an index on `(sheet_id, created_at desc)`. **No unique key on `sheet_id` on purpose**, the way `secret` has none
-  on `(sheet_id, name)`: the newest row is the current credential and the one before it still opens, which is what lets
-  an owner rotate. `POST /codex-db/:id` inserts beside the row it had and trims to the newest `DSN_KEEP`
+  PK and an index on `(sheet_id, created_at desc)`. **No unique key on `sheet_id` on purpose**, the way `secret` has
+  none on `(sheet_id, name)`: the newest row is the current credential and the one before it still opens, which is what
+  lets an owner rotate. `POST /codex-db/:id` inserts beside the row it had and trims to the newest `DSN_KEEP`
 - **secret** — a sheet's own secrets, encrypted. **No unique key on `(sheet_id, name)` on purpose**: the newest row for
   a name is current and the one before it still verifies, which is what lets a sender roll over
 - **net** — rows for `net-*` sheets and the run log for `alert` and `codex-*`. `meta` is what the run cost. `net_id`

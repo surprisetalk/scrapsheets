@@ -69,12 +69,12 @@ thing: a sheet with two columns of the same name has no name-keyed row to give, 
 one. A script carries a key for one sheet rather than your login: `POST /library/<sheet_id>/secret` with
 `{"name":"api"}` and no value mints one, answers it once, and it opens that sheet and nothing else.
 `GET /openapi/<sheet_id>` describes the read and the write, generated from the sheet's own columns, so it cannot drift
-from them. A sheet's API spends the same per-sheet budget a webhook sender spends: a read is one row of it and an
-append is the rows it carries, and past the limit the answer is a 429 that names the limit and the window. An account
-is bounded too: requests per second across every address it sends from, sheets it may own, rows one sheet may hold,
-and alert deliveries a day across every alert it owns, a post to a url costing what an email does. Each refusal names
-the count and the limit, and `deno task status` fails while any account has hit the sheets, rows or deliveries cap in
-the past day; a request past its rate is shed with a 429 and not counted.
+from them. A sheet's API spends the same per-sheet budget a webhook sender spends: a read is one row of it and an append
+is the rows it carries, and past the limit the answer is a 429 that names the limit and the window. An account is
+bounded too: requests per second across every address it sends from, sheets it may own, rows one sheet may hold, and
+alert deliveries a day across every alert it owns, a post to a url costing what an email does. Each refusal names the
+count and the limit, and `deno task status` fails while any account has hit the sheets, rows or deliveries cap in the
+past day; a request past its rate is shed with a 429 and not counted.
 
 `{"name":"api-read"}` mints the read-only spelling of that key: it opens the same routes and is refused, by name, on
 every write. Either key opens `POST /mcp/<sheet_id>` too, so an agent is something you hand a key rather than an
@@ -87,38 +87,36 @@ curl -X POST "https://api.sheets.scrap.land/sheet/$sheet_id" -H "scrapsheets-key
 ```
 
 A sheet tells somebody when it changes. `POST /library/<sheet_id>/webhook` with `{"url": "https://..."}` names where.
-The receiver is sent a signed POST carrying `"event": "ping"` first and is registered only if it answers 2xx, so
-nothing is ever posted to a url that did not ask. From then on every change to the sheet is posted there a few
-seconds later, whoever made it and however: one delivery per flush, a JSON body naming the sheet, and a
-`scrapsheets-signature` header signed exactly the way an inbound delivery to that sheet is verified, with the secret
-`GET /library/<sheet_id>/hook` answers, over the receiver's path and the body. Each delivery spends the sheet's own
-budget. `GET` lists each url with its last outcome, for owners and editors, since a receiver's url is often a
-credential; a receiver that fails ten times in a row is left alone until you set it again with the same `POST`, and
-`DELETE` with the url stops it.
+The receiver is sent a signed POST carrying `"event": "ping"` first and is registered only if it answers 2xx, so nothing
+is ever posted to a url that did not ask. From then on every change to the sheet is posted there a few seconds later,
+whoever made it and however: one delivery per flush, a JSON body naming the sheet, and a `scrapsheets-signature` header
+signed exactly the way an inbound delivery to that sheet is verified, with the secret `GET /library/<sheet_id>/hook`
+answers, over the receiver's path and the body. Each delivery spends the sheet's own budget. `GET` lists each url with
+its last outcome, for owners and editors, since a receiver's url is often a credential; a receiver that fails ten times
+in a row is left alone until you set it again with the same `POST`, and `DELETE` with the url stops it.
 
 A CSV is imported in two steps. Choosing or dropping a file asks the server how it reads it, and what comes back is
 shown before anything is made: each column with the type it was guessed to carry, the first rows under them, and a
-select per column to correct a guess. The sheet is made with the types you settled on, and a settled type the values
-do not fit is refused on the line that does not fit it. The types are remembered by header in this browser, so the
-next file shaped the same opens already corrected. `POST /import/preview` and `POST /import/csv?types={"col":"num"}`
-are the two steps over HTTP.
+select per column to correct a guess. The sheet is made with the types you settled on, and a settled type the values do
+not fit is refused on the line that does not fit it. The types are remembered by header in this browser, so the next
+file shaped the same opens already corrected. `POST /import/preview` and `POST /import/csv?types={"col":"num"}` are the
+two steps over HTTP.
 
 `GET /sheet/library:audit` is who did what to which sheet: every read and write of a sheet over HTTP, every sheet a
 query selects from, every open and first edit over the sync socket, and every MCP tool call, with `via` saying which
-door. A webhook delivery is not in it, because it is already its own row on that sheet's log. An owner or editor reads every row about
-their sheet; everybody reads the rows they made. It is a sheet, so `select * from @library:audit` and
+door. A webhook delivery is not in it, because it is already its own row on that sheet's log. An owner or editor reads
+every row about their sheet; everybody reads the rows they made. It is a sheet, so `select * from @library:audit` and
 `/export/library:audit.csv` both work, and a refused request is not in it because it did nothing.
 
-A feed that changes shape is a failed run, once: every poll records the columns the body answered with and the type
-of each in `meta.shape`, and a run whose columns differ from the run before keeps its rows and carries
-`meta.shape_change` naming the columns added, dropped and retyped. It grades as a failure through the same path every
-other failure takes, so `library:freshness` counts it and the status check pages, and the run after it is the new
-normal.
+A feed that changes shape is a failed run, once: every poll records the columns the body answered with and the type of
+each in `meta.shape`, and a run whose columns differ from the run before keeps its rows and carries `meta.shape_change`
+naming the columns added, dropped and retyped. It grades as a failure through the same path every other failure takes,
+so `library:freshness` counts it and the status check pages, and the run after it is the new normal.
 
 A feed that answers the same body twice is one row: a good run's body is its idempotency key, in the same slot a
-delivery's signature takes, so the row it matches moves to now instead of being appended again. And a failed poll is
-in the feed's log, where you read it, but not in a query over the feed, so a sheet built downstream keeps what it had
-while `library:freshness` says why.
+delivery's signature takes, so the row it matches moves to now instead of being appended again. And a failed poll is in
+the feed's log, where you read it, but not in a query over the feed, so a sheet built downstream keeps what it had while
+`library:freshness` says why.
 
 `GET /library/freshness` names the feeds that stopped. One row per sheet whose runs are recorded — every polled feed,
 every webhook and every alert you can read: when it last ran, when it last succeeded, and how many runs since. A webhook
@@ -144,8 +142,8 @@ spanning several library rows and "trash selected sheets" (Ctrl/⌘+Shift+Backsp
 
 A column is cleaned from its own panel, beside hide and pin: trim, UPPER, lower, and drop every row this column has
 nothing in. Each one is an ordinary edit, so Ctrl/⌘+Z takes it back and everyone else looking at the sheet sees it. The
-sheet's own verb is in the palette instead, because it reads every column rather than one: "delete duplicate rows"
-keeps the first of every repeat and deletes the ones under it.
+sheet's own verb is in the palette instead, because it reads every column rather than one: "delete duplicate rows" keeps
+the first of every repeat and deletes the ones under it.
 
 A column is split from the same panel: type the delimiter, and "split" pushes one new column per part -- `name 1`,
 `name 2`, ... -- beside the column it read, refusing by name when a new name is taken or the delimiter divides nothing.
@@ -185,8 +183,8 @@ Typing `@table:countries.` in the query editor completes the columns that sheet 
 `select min(code) from @table:countries` answers, and so does the earliest date in a column. The engine under the page
 compares numbers and real dates, and a cell is neither — it is the text the document holds — so it used to drop the
 column out of the answer without a word. The query is now rewritten to the two functions that can compare text before
-the engine sees it. Where it cannot tell what a name means — an expression like `min(upper(code))`, or a name a
-subquery invented — it says so and names `min_text()` rather than guess.
+the engine sees it. Where it cannot tell what a name means — an expression like `min(upper(code))`, or a name a subquery
+invented — it says so and names `min_text()` rather than guess.
 
 `ols(array(y), array(x1), array(x2))` fits more than one predictor and answers the coefficients; `ols_predict` reads a
 value back off them, which is how a residual lands on every row. `logit` and `logit_predict` are the same over a 0/1
@@ -202,25 +200,25 @@ the sheet loads: the token says it is locked, and the refusal would otherwise la
 browser can read it. `POST /library/<sheet_id>/link` is the same thing over HTTP, taking `{"days": 7}` and
 `{"password": "..."}`.
 
-Making a sheet public is refused, naming the column and row, while a cell holds an API key, and while one holds an
-email address, a phone number, a social security number or a card number -- unless the share panel's second box says
-the personal data belongs there, which the request carries as `personal: true`.
+Making a sheet public is refused, naming the column and row, while a cell holds an API key, and while one holds an email
+address, a phone number, a social security number or a card number -- unless the share panel's second box says the
+personal data belongs there, which the request carries as `personal: true`.
 
 # polite scraper
 
-Every request this server makes to somebody else's host carries the user agent `Scrapsheets/1.0 (+this page)`. It is
-the poller behind net-http sheets and the page's `/proxy`, and nothing else. The poller asks one host at most once per
+Every request this server makes to somebody else's host carries the user agent `Scrapsheets/1.0 (+this page)`. It is the
+poller behind net-http sheets and the page's `/proxy`, and nothing else. The poller asks one host at most once per
 `HOST_GAP_MS` (`main.ts` names the number) however many sheets point there -- a feed that answers in pages is read to
-its end within that one poll, page after page, bounded by `PAGE_MAX` -- it honours `Retry-After` for every sheet on
-that host, it follows at most five redirects, and it stops retrying a feed after three failures in a row. To keep it
-off a host, block that user agent; to ask about it, open an issue here.
+its end within that one poll, page after page, bounded by `PAGE_MAX` -- it honours `Retry-After` for every sheet on that
+host, it follows at most five redirects, and it stops retrying a feed after three failures in a row. To keep it off a
+host, block that user agent; to ask about it, open an issue here.
 
 A listing in the shop says what lets it be sold: `POST /sell/<sheet_id>` takes `{"price": 0, "license": "own"}`, where
 `license` is one of the values `LICENSES` in `main.ts` lists, and the shop shows it beside the price. Anyone signed in
 may report a listing, once, with `POST /shop/<sell_id>/report` and `{"reason": "..."}`; the reports are the sheet
 `net-hook:reports`, where a reporter reads their own and the operator reads them all. The operator closes them with
-`POST /shop/<sell_id>/review` and `{"action": "keep"}` or `{"action": "takedown"}`, and `deno task status` fails while
-a report is waiting.
+`POST /shop/<sell_id>/review` and `{"action": "keep"}` or `{"action": "takedown"}`, and `deno task status` fails while a
+report is waiting.
 
 ```nu
 # watch mode

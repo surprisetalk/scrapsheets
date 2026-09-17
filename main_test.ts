@@ -467,6 +467,13 @@ Deno.test(async function allTests(t) {
         type: "table",
         data: [arrayify([{ name: "z", type: "num", key: 0 }]), { 0: 7 }],
       });
+      // `create` is local and returns at once, so the document exists here
+      // before the socket carrying it does. The block above synchronises by
+      // awaiting a `find`; this one has nothing to find, so it waits for the
+      // network itself -- without it the PUT asks the server to fetch a document
+      // no peer has announced yet and is answered 404, which is the right answer
+      // to the wrong question and made this step fail about one run in five.
+      await clientRepo.networkSubsystem.whenReady();
       await put(jwt, `/library/table:${clientHand.documentId}`, {});
       const serverDoc = (await automerge.find<Sheet>(clientHand.documentId)).doc();
       assertEquals(JSON.parse(JSON.stringify(serverDoc.data[1])), { 0: 7 });

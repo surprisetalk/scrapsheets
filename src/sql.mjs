@@ -519,7 +519,12 @@ export const profileRows = (stages, docs, started) => {
   if (!stages.length) throw new Error("profileRows: a profile with no stages; the plan and engine stages always run");
   return [
     ...stages,
-    { stage: "total", rows_in: loadedOf(docs), rows_out: stages.at(-1).rows_out, ms: tenths(performance.now() - started) },
+    {
+      stage: "total",
+      rows_in: loadedOf(docs),
+      rows_out: stages.at(-1).rows_out,
+      ms: tenths(performance.now() - started),
+    },
   ];
 };
 
@@ -592,8 +597,11 @@ for (const [type, spec] of Object.entries(COLUMN_TYPES)) {
   const named = spec.as === undefined ? undefined : COLUMN_TYPES[spec.as];
   if (spec.as !== undefined && !named)
     throw new Error(`COLUMN_TYPES: "${type}" is an alias of "${spec.as}", which is not in this table.`);
-  if (named?.as !== undefined)
-    throw new Error(`COLUMN_TYPES: "${type}" is an alias of "${spec.as}", which is itself an alias. An alias names a type.`);
+  if (named?.as !== undefined) {
+    throw new Error(
+      `COLUMN_TYPES: "${type}" is an alias of "${spec.as}", which is itself an alias. An alias names a type.`,
+    );
+  }
   if (spec.as === undefined && !spec.json)
     throw new Error(`COLUMN_TYPES: "${type}" is a type and states no JSON shape.`);
 }
@@ -796,7 +804,9 @@ export const checkResultColumns = (cols, rows, known = [], code = "") => {
   // column too and an argument-shaped hole in this scan is a silent wrong answer
   // wearing the guard as a disguise.
   const extremes = new Set(
-    [...code.matchAll(/\b(min|max)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)(?:\s+(?:as\s+)?["'`[]?([A-Za-z_][A-Za-z0-9_]*))?/gi)]
+    [...code.matchAll(
+      /\b(min|max)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)(?:\s+(?:as\s+)?["'`[]?([A-Za-z_][A-Za-z0-9_]*))?/gi,
+    )]
       .flatMap(([, fn, arg, as]) => [
         `${fn.toUpperCase()}(${arg.trim()})`,
         ...(as && !KEYWORD.test(as) ? [as] : []),
@@ -1877,7 +1887,9 @@ export const chartSql = ({ source, kind = "line", x, y, y2 = "", series = "" }) 
   // the second of those sorts by the second scale's values.
   return series === ""
     ? `select ${plot} from ${source} order by 1`
-    : `select ${plot}, ${chartIdent("series column", series)} as series from ${source} order by ${y2 === "" ? 3 : 4}, 1`;
+    : `select ${plot}, ${chartIdent("series column", series)} as series from ${source} order by ${
+      y2 === "" ? 3 : 4
+    }, 1`;
 };
 
 // --- resolving a query's sheet references
@@ -2107,9 +2119,8 @@ export const register = (alasql) => {
   fn.fit_hyperbolic = (xs, ys, at) => {
     const [x0, y0] = pair("fit_hyperbolic", xs, ys);
     // Three parameters need three points: two of them are fit exactly by every b.
-    if (x0.length < 3) {
+    if (x0.length < 3)
       throw fail("fit_hyperbolic()", "at least 3 pairs", `${x0.length}`, "widen the query so more rows match");
-    }
     if (x0.length > HYPERBOLIC_POINTS) {
       throw fail(
         "fit_hyperbolic()",
@@ -2219,7 +2230,7 @@ export const register = (alasql) => {
         p = next;
         best = s;
         lambda = Math.max(lambda / 10, 1e-12);
-      } else lambda *= 10;
+      } else { lambda *= 10; }
     }
     if (climbing) {
       // What actually happened, and not "these points do not decline": a fit
