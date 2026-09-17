@@ -440,31 +440,6 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
 
 ---
 
-## Scrapscript
-
-The moat, and the reason the formula work below is shaped the way it is.
-
-- [ ] **A formula is a content-addressed program.** Nothing exists. The `Lang` union that named `Scrapscript` and
-      `Formula` was deleted — it decoded five strings and read none of them, and a constructor is not a plan. A query
-      sheet's `lang` is now a plain string, and `querify()` refuses anything but `"sql"` by name, which is the one place
-      a second language has to be admitted.
-  1. Compile the Scrapscript interpreter to WASM for browser execution.
-  2. Admit `"scrapscript"` in `querify()` and in `queryDoc`'s switch in `src/index.html`, and run programs against sheet
-     data. Both engines have to learn it together or a sheet means two things.
-  3. `=#` in a cell triggers Scrapscript evaluation; `=` triggers the formula mode below.
-  4. Cross-sheet references by hash rather than by the fragile `@sheet_id` string.
-  5. Sell and share self-contained Scrapscript functions as composable sheet utilities — the saved-snippets item under
-     **Query engine** is the seam this replaces.
-
-- [ ] **`=A1 + B1` works.** There is no formula evaluation at all.
-  1. A parser behind a `"formula"` lang, admitted in both engines the way the item above admits Scrapscript: arithmetic,
-     `SUM`, `AVERAGE`, `COUNT`, `MIN`, `MAX`.
-  2. Cross-sheet references: `=@table:abc123.A1`. The cell-reference rewrite in `scanRefs()` is the same idea in SQL.
-  3. Dependency tracking with a topological sort and cycle detection, reported as the path that closes it.
-  4. Reactive recalculation when a referenced cell changes.
-
----
-
 ## Go-to-market
 
 - [ ] **Somebody outside this repo has used it.** No launch has happened.
