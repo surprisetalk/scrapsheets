@@ -4621,6 +4621,24 @@ Deno.test(async function allTests(t) {
       inflated: await feed("https://inflated.body.test/feed"),
       ragged: await feed("https://ragged.body.test/feed"),
       plain: await feed("https://plain.body.test/feed"),
+      rss: await feed("https://rss.body.test/feed"),
+      atom: await feed("https://atom.body.test/feed"),
+      xml: await feed("https://xml.body.test/feed"),
+      badxml: await feed("https://badxml.body.test/feed"),
+      zip: await feed("https://zip.body.test/feed"),
+      zipTwo: await feed("https://ziptwo.body.test/feed"),
+      zipNone: await feed("https://zipnone.body.test/feed"),
+      zipBomb: await feed("https://zipbomb.body.test/feed"),
+      nsAtom: await feed("https://nsatom.body.test/feed"),
+      htmlRss: await feed("https://htmlrss.body.test/feed"),
+      emptyXml: await feed("https://emptyxml.body.test/feed"),
+      latin1: await feed("https://latin1.body.test/feed"),
+      utf16: await feed("https://utf16.body.test/feed"),
+      itemText: await feed("https://itemtext.body.test/feed"),
+      zipJson: await feed("https://zipjson.body.test/feed"),
+      zipCrc: await feed("https://zipcrc.body.test/feed"),
+      zipComment: await feed("https://zipcomment.body.test/feed"),
+      zipForge: await feed("https://zipforge.body.test/feed"),
     };
     const gzip = async (text: string) =>
       new Uint8Array(
@@ -4637,6 +4655,84 @@ Deno.test(async function allTests(t) {
     // and short values is the whole of it -- no compression involved.
     const wide = [1, 2, 3].map((n) => `${"c".repeat(300)}${n}`).join(",");
     const inflating = `${wide}\n${"1,2,3\n".repeat(1300)}`;
+    // A real archive, deflated and with a correct CRC, rather than bytes shaped
+    // like one: the reader under test is the only thing that should be able to
+    // be wrong about a zip.
+    const crcTable = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+      crcTable[i] = c >>> 0;
+    }
+    const crc32 = (bytes: Uint8Array) => {
+      let c = 0xFFFFFFFF;
+      for (const byte of bytes) c = crcTable[(c ^ byte) & 0xFF] ^ (c >>> 8);
+      return (c ^ 0xFFFFFFFF) >>> 0;
+    };
+    const zipOf = async (members: Record<string, string>): Promise<Uint8Array<ArrayBuffer>> => {
+      const parts: Uint8Array[] = [];
+      const dir: Uint8Array[] = [];
+      let at = 0;
+      for (const [name, text] of Object.entries(members)) {
+        const raw = new TextEncoder().encode(text);
+        const packed = new Uint8Array(
+          await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream("deflate-raw"))).arrayBuffer(),
+        );
+        const named = new TextEncoder().encode(name);
+        const local = new Uint8Array(30 + named.length);
+        const lv = new DataView(local.buffer);
+        lv.setUint32(0, 0x04034b50, true), lv.setUint16(4, 20, true), lv.setUint16(8, 8, true);
+        lv.setUint32(14, crc32(raw), true), lv.setUint32(18, packed.length, true), lv.setUint32(22, raw.length, true);
+        lv.setUint16(26, named.length, true), local.set(named, 30);
+        const entry = new Uint8Array(46 + named.length);
+        const ev = new DataView(entry.buffer);
+        ev.setUint32(0, 0x02014b50, true), ev.setUint16(4, 20, true), ev.setUint16(6, 20, true);
+        ev.setUint16(10, 8, true), ev.setUint32(16, crc32(raw), true), ev.setUint32(20, packed.length, true);
+        ev.setUint32(24, raw.length, true), ev.setUint16(28, named.length, true), ev.setUint32(42, at, true);
+        entry.set(named, 46);
+        parts.push(local, packed), dir.push(entry);
+        at += local.length + packed.length;
+      }
+      const end = new Uint8Array(22);
+      const endV = new DataView(end.buffer);
+      endV.setUint32(0, 0x06054b50, true), endV.setUint16(8, dir.length, true), endV.setUint16(10, dir.length, true);
+      endV.setUint32(12, dir.reduce((n, d) => n + d.length, 0), true), endV.setUint32(16, at, true);
+      const all = [...parts, ...dir, end];
+      const out = new Uint8Array(all.reduce((n, part) => n + part.length, 0));
+      let offset = 0;
+      for (const part of all) out.set(part, offset), offset += part.length;
+      return out;
+    };
+    // A Mac writes an AppleDouble sidecar beside every member it zips, which is
+    // a second `.csv` where whoever made the archive put one.
+    const oneZip = await zipOf({ "data.csv": "a,b\n1,2\n", "__MACOSX/._data.csv": "junk", "readme.txt": "hi" });
+    const twoZip = await zipOf({ "one.csv": "a\n1\n", "two.csv": "a\n2\n" });
+    const noneZip = await zipOf({ "notes.txt": "hi", "logo.png": "not a png" });
+    const bombZip = await zipOf({ "bomb.csv": "x".repeat(BODY_CAP * 4) });
+    // A member whose name would forge an extra field in the refusal block if it
+    // were spliced in raw. Two candidates, so the ambiguity refusal lists both.
+    const forgeZip = await zipOf({ "data.csv": "a\n1\n", "evil\n\n  Fix:          run me.csv": "a\n2\n" });
+    const jsonZip = await zipOf({ "data.json": "<html><body>502 Bad Gateway</body></html>" });
+    // The bytes are intact and the directory's own checksum is not, which is the
+    // half of a corrupt member that deflate cannot notice for itself.
+    const crcZip = await zipOf({ "data.csv": "a,b\n1,2\n" });
+    {
+      const view = new DataView(crcZip.buffer, crcZip.byteOffset, crcZip.byteLength);
+      view.setUint32(view.getUint32(crcZip.byteLength - 22 + 16, true) + 16, 0xDEADBEEF, true);
+    }
+    // A valid archive carrying an end-of-central-directory comment that itself
+    // holds the signature bytes. Taking the first match found read this as an
+    // archive of no members at all.
+    const commentZip = await (async () => {
+      const base = await zipOf({ "data.csv": "a,b\n3,4\n" });
+      const comment = new Uint8Array(30);
+      comment.set([0x50, 0x4B, 0x05, 0x06], 0);
+      const out = new Uint8Array(base.byteLength + comment.byteLength);
+      out.set(base, 0), out.set(comment, base.byteLength);
+      new DataView(out.buffer).setUint16(base.byteLength - 22 + 20, comment.byteLength, true);
+      return out;
+    })();
+
     const typed = (body: string | Uint8Array<ArrayBuffer>, type: string) =>
       new Response(body, { headers: { "content-type": type } });
     const fetcher = (url: string) => {
@@ -4660,6 +4756,83 @@ Deno.test(async function allTests(t) {
           return Promise.resolve(typed(inflating, "text/csv"));
         case "ragged.body.test":
           return Promise.resolve(typed("a,b\n1\n", "text/csv"));
+        case "rss.body.test":
+          // RSS 2.0: the items sit under <channel>.
+          return Promise.resolve(typed(
+            `<?xml version="1.0"?><rss version="2.0"><channel><title>Feed</title>` +
+              `<item><title>A</title><link>https://a.test</link></item>` +
+              `<item><title>B</title><link>https://b.test</link></item></channel></rss>`,
+            "application/rss+xml",
+          ));
+        case "atom.body.test":
+          // One entry, and its url is an attribute rather than a text node.
+          return Promise.resolve(typed(
+            `<feed xmlns="http://www.w3.org/2005/Atom"><title>Feed</title>` +
+              `<entry><title>A</title><link href="https://a.test" rel="alternate"/></entry></feed>`,
+            "application/atom+xml",
+          ));
+        case "xml.body.test":
+          return Promise.resolve(typed(
+            `<data><meta><n>2</n></meta><row><id>007</id></row><row><id>8</id></row></data>`,
+            "text/xml; charset=utf-8",
+          ));
+        case "badxml.body.test":
+          return Promise.resolve(typed(`<a><b></a>`, "application/xml"));
+        case "zip.body.test":
+          return Promise.resolve(typed(oneZip, "application/zip"));
+        case "ziptwo.body.test":
+          return Promise.resolve(typed(twoZip, "application/zip"));
+        case "zipnone.body.test":
+          return Promise.resolve(typed(noneZip, "application/x-zip-compressed"));
+        case "zipbomb.body.test":
+          return Promise.resolve(typed(bombZip, "application/zip"));
+        case "zipjson.body.test":
+          return Promise.resolve(typed(jsonZip, "application/zip"));
+        case "zipcrc.body.test":
+          return Promise.resolve(typed(crcZip, "application/zip"));
+        case "zipcomment.body.test":
+          return Promise.resolve(typed(commentZip, "application/zip"));
+        case "zipforge.body.test":
+          return Promise.resolve(typed(forgeZip, "application/zip"));
+        case "nsatom.body.test":
+          // Prefixed Atom, which is most of the Atom on the internet.
+          return Promise.resolve(typed(
+            `<a:feed xmlns:a="http://www.w3.org/2005/Atom"><a:title>Feed</a:title>` +
+              `<a:entry><a:title>A</a:title></a:entry></a:feed>`,
+            "application/atom+xml",
+          ));
+        case "htmlrss.body.test":
+          // What a provider behind a 200-ing proxy answers. It is well-formed
+          // XML, so only its root says it is not a feed.
+          return Promise.resolve(typed(
+            `<html><head><title>502 Bad Gateway</title></head><body><h1>502</h1></body></html>`,
+            "application/rss+xml",
+          ));
+        case "emptyxml.body.test":
+          return Promise.resolve(typed("", "application/xml"));
+        case "itemtext.body.test":
+          return Promise.resolve(typed(
+            `<rss><channel><item>hello</item></channel></rss>`,
+            "application/rss+xml",
+          ));
+        case "latin1.body.test":
+          // 0xE9 is é in Latin-1 and is not valid UTF-8 at all.
+          return Promise.resolve(typed(
+            Uint8Array.from([
+              ...new TextEncoder().encode(`<?xml version="1.0" encoding="ISO-8859-1"?><rss><channel><item><t>caf`),
+              0xE9,
+              ...new TextEncoder().encode(`</t></item></channel></rss>`),
+            ]),
+            "application/rss+xml",
+          ));
+        case "utf16.body.test": {
+          const text = `<?xml version="1.0" encoding="UTF-16"?><rss><channel><item><t>wide</t></item></channel></rss>`;
+          const wide = new Uint8Array(2 + text.length * 2);
+          new DataView(wide.buffer).setUint16(0, 0xFEFF, true);
+          for (let i = 0; i < text.length; i++)
+            new DataView(wide.buffer).setUint16(2 + i * 2, text.charCodeAt(i), true);
+          return Promise.resolve(typed(wide, "application/rss+xml"));
+        }
         default:
           // A type nothing on the list names is the text it arrived as, which
           // is what every feed answered before any of them were parsed.
@@ -4668,13 +4841,28 @@ Deno.test(async function allTests(t) {
     };
 
     const at = Date.now() + 96_000_000;
+    const wanted = Object.values(ids);
+    // One cycle per sheet plus slack, and not a flat ten: pollNetOnce stops
+    // starting sheets once a cycle has spent POLL_CYCLE_MS, so how many of these
+    // it gets through per cycle is a function of how loaded the machine is. A
+    // flat ten fitted nine feeds and became a flake at seventeen, under
+    // `deno task test` alone -- eight files in parallel is when that budget
+    // bites. The refusal names the sheets still unpolled, because "a body sheet"
+    // named none of them and left nothing to look at.
     for (let cycle = 0;; cycle++) {
-      if (cycle >= 10) throw new Error(`ten cycles at ${at} and a body sheet still had not been polled`);
-      await pollNetOnce(fetcher, at);
-      const [{ n }]: { n: number }[] = await sql`
-        select count(distinct sheet_id)::int as n from net where sheet_id = any(${Object.values(ids)})
+      const polled: { sheet_id: string }[] = await sql`
+        select distinct sheet_id from net where sheet_id = any(${wanted})
       `;
-      if (n === Object.values(ids).length) break;
+      if (polled.length === wanted.length) break;
+      if (cycle >= wanted.length + 10) {
+        const missing = wanted.filter((id) => !polled.some((row) => row.sheet_id === id));
+        throw new Error(
+          `${cycle} cycles at ${at} and ${missing.length} of ${wanted.length} body sheets had not been polled: ${
+            missing.join(", ")
+          }`,
+        );
+      }
+      await pollNetOnce(fetcher, at);
     }
     const newest = async (id: string) => {
       const [row]: { body: string; meta: Record<string, unknown> }[] = await sql`
@@ -4698,6 +4886,97 @@ Deno.test(async function allTests(t) {
     assertEquals(await bodyOf(ids.zipped), [{ n: 1 }]);
     assertEquals(await bodyOf(ids.zippedCsv), [{ a: 1, b: 2 }]);
     assertEquals(await bodyOf(ids.plain), { n: 1 }, "a type nothing parses is stored as it arrived");
+
+    // RSS and Atom are the two formats that name the element a row sits in, so
+    // their rows need no guess: every <item> and every <entry> in the document,
+    // wherever the version of the format puts it.
+    assertEquals(await bodyOf(ids.rss), [
+      { title: "A", link: "https://a.test" },
+      { title: "B", link: "https://b.test" },
+    ]);
+    assertEquals((await newest(ids.rss)).meta.shape, { link: "string", title: "string" });
+    // One entry is still a list of one -- a reader that collapsed it to an
+    // object would answer a different shape on the feed's quiet day -- and an
+    // attribute is kept, because half of Atom's payload lives in them.
+    assertEquals(await bodyOf(ids.atom), [{
+      title: "A",
+      link: { "@href": "https://a.test", "@rel": "alternate" },
+    }]);
+    // Generic XML names no row element, so what it means is the whole document
+    // and rows_path is how a sheet says where the rows sit -- the same field a
+    // JSON feed answering an envelope already uses. Text stays text: an id of
+    // `007` read as a number is 7, which is a different id.
+    assertEquals(await bodyOf(ids.xml), { data: { meta: { n: "2" }, row: [{ id: "007" }, { id: "8" }] } });
+    // Half-read XML is a failure row naming where it stopped being XML. This
+    // reader takes `<a><b></a>` as `{a:{b:""}}` without raising, so the
+    // validator runs first or the sheet stores a document nobody wrote.
+    const broken = await errorOf(ids.badxml);
+    assert(broken.includes("is not XML"), broken);
+    assert(broken.includes("line 1"), broken);
+
+    // An archive is a container, and the file inside it is the body: one member
+    // this reader can name, read as the type its name declares. The Mac sidecar
+    // beside it is not a second candidate.
+    assertEquals(await bodyOf(ids.zip), [{ a: 1, b: 2 }]);
+    // Two is a guess about which one is the rows, refused naming both, for the
+    // reason pageRows refuses a page holding two arrays.
+    const two = await errorOf(ids.zipTwo);
+    assert(two.includes("holds 2 files this reader can take"), two);
+    assert(two.includes("one.csv") && two.includes("two.csv"), two);
+    // And an archive holding nothing it can name says what it found instead.
+    const none = await errorOf(ids.zipNone);
+    assert(none.includes("holds nothing this reader can take"), none);
+    assert(none.includes("notes.txt"), none);
+    // A deflate bomb is bounded by the slice-fed reader a gzip bomb is, which
+    // is the whole reason both come through the one function.
+    const zbomb = await errorOf(ids.zipBomb);
+    assert(zbomb.includes("decompresses to more than can be stored"), zbomb);
+    // A member name is up to 64k of sender text that may hold newlines, so it is
+    // quoted rather than spliced: raw, it forged a `Fix:` line of its own in the
+    // refusal block that a reader could not tell from the real one.
+    const forged = await errorOf(ids.zipForge);
+    assert(forged.includes("2 files this reader can take"), forged);
+    assert(!/\n\s*Fix:\s+run me/.test(forged), `a member name must not forge a field: ${forged}`);
+    assert(forged.includes("run me.csv"), `and must still be named: ${forged}`);
+    // The member's name says JSON, and this server derived that type itself off a
+    // filename, so it is a claim to check: unchecked, an HTML error page inside
+    // `data.json` was stored verbatim under a green run row.
+    const zjson = await errorOf(ids.zipJson);
+    assert(zjson.includes("is not JSON"), zjson);
+    assert(zjson.includes("data.json in https://zipjson.body.test/feed"), `the member is the source: ${zjson}`);
+    // Raw deflate carries no checksum and a stored member carries nothing at all,
+    // so the directory's CRC is the only thing that says a member arrived whole.
+    const zcrc = await errorOf(ids.zipCrc);
+    assert(zcrc.includes("does not match its own checksum"), zcrc);
+    // The signature bytes inside a comment are not a record. Taking the first
+    // match found read a one-member archive as an archive of none, and told the
+    // owner to zip the file they had already zipped.
+    assertEquals(await bodyOf(ids.zipComment), [{ a: 3, b: 4 }]);
+
+    // A prefixed feed is a feed. Matching the literal element name answered `[]`
+    // under a green run row, which is a sheet that is empty forever.
+    assertEquals(await bodyOf(ids.nsAtom), [{ title: "A" }]);
+    // And a well-formed document that is not a feed at all is refused by its
+    // root, rather than parsed, found to hold no <item>, and stored as `[]` --
+    // which had no shape, so no shape_change, so nothing ever graded it failed.
+    const notFeed = await errorOf(ids.htmlRss);
+    assert(notFeed.includes("is not an RSS feed"), notFeed);
+    assert(notFeed.includes("<html>"), `it names the root it found: ${notFeed}`);
+    // An <item> holding text rather than fields is not a row. Stored as one it
+    // made shapeOf answer null for the whole run.
+    const bare = await errorOf(ids.itemText);
+    assert(bare.includes("holds no named fields"), bare);
+    // An empty body answers a line and no column, and `column undefined` reads as
+    // a place in the document that is not one.
+    const blank = await errorOf(ids.emptyXml);
+    assert(blank.includes("is not XML") && blank.includes("line 1"), blank);
+    assert(!blank.includes("undefined"), `a missing column is left unnamed: ${blank}`);
+    // An XML body declares its own encoding, and decoding it as UTF-8 anyway
+    // stored every accented character as U+FFFD under a green run row.
+    assertEquals(await bodyOf(ids.latin1), [{ t: "caf\u00E9" }]);
+    // A sixteen-bit document cannot be sniffed for its prolog as UTF-8, so the
+    // byte-order mark is what says how wide it is. This was refused forever.
+    assertEquals(await bodyOf(ids.utf16), [{ t: "wide" }]);
 
     // A bomb is the 413 an oversized body is, refused on what came out of the
     // decompressor rather than on the few hundred bytes that carried it -- and
@@ -5651,7 +5930,12 @@ Deno.test(async function allTests(t) {
     // Signed correctly, but for a moment outside the replay window.
     const stale = Math.floor(Date.now() / 1000) - 3600;
     const staleText = await refused(await hookSign(secret, target, body, stale), "outside the replay window");
-    assert(staleText.includes("3600 seconds old"), `it must name the skew, got: ${staleText}`);
+    // The age is this test's clock read against the server's, so a loaded
+    // machine puts a second between them and an exact match is a race. What
+    // must hold is that the refusal names the skew it measured, and that the
+    // skew is the one this signature carries.
+    const aged = Number(staleText.match(/which is (\d+) seconds old/)?.[1]);
+    assert(aged >= 3600 && aged < 3610, `it must name the skew, got: ${staleText}`);
     // The right shape over the wrong bytes: the one failure a sender misreads as
     // a wrong secret.
     await refused(await hookSign(secret, target, body + " "), "does not match its body");

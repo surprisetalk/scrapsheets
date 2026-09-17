@@ -344,29 +344,108 @@ navigation, in file order:
   changes: a quiet tick that rebuilt the row's meta out of the validators alone left a row that no longer said what it
   had answered for, and the next real run superseded nothing.
 - **A body is parsed by the type it declares.** `BODY_PARSERS` is the list -- `text/csv`, `text/tab-separated-values`,
-  `application/x-ndjson`, `application/jsonl`, `application/gzip`, `application/x-gzip` -- and `readFeedBody` is the one
-  reader both doors call: `pollNetOnce` on every page it reads, and `POST /net/:id` after the signature and before the
-  NUL check, which asks the text that is stored rather than the bytes that arrived. A type on none of the list is stored
-  as the text it arrived as, which is what a JSON feed hands us already, and a body that did not answer 2xx is never
-  parsed. A CSV and a TSV go through `parseDelimited`, the text-to-`{cols, rows}` core lifted out of `readImport()` --
-  the importer is a thin wrapper over it, so a feed's digits are numbers, its blanks are nulls and its ragged line is
-  refused by number exactly as an uploaded file's are, and `source` is what every one of those refusals names the line
-  in: the uploaded file there, the url here. `assertRoom` stayed behind in `readImport`: the row quota is a sheet's, and
-  only that door makes a sheet, so a feed's rows are bounded by `BODY_CAP` alone the way a JSON feed's always were. The
-  rows are stored keyed by column name; `col.key` is the document's own spelling and stays with the importer, the one
-  door that writes a document. NDJSON is one JSON value a line, a blank line no record and a line that will not parse a
-  refusal naming it. A gzip is fed to `DecompressionStream` `GZIP_SLICE` bytes at a time and read back through
-  `readBody`, so a bomb is refused holding one slice's expansion past the cap rather than the gigabyte it writes; handed
-  the whole of a bomb at once the decompressor answers all of it in one chunk, which is the cap spent after the memory
-  is gone. What came out is read by its first character -- a bracket or a brace is JSON, everything else a CSV --
-  because nothing in an answer says what a gzip holds. **`BODY_CAP` is spent on three different numbers**, and no one of
-  them stands in for another: the bytes that arrived, what a gzip decompressed to, and what the body _means_ -- a file
-  names its columns once and the rows it means name them on every row, so a few kilobytes on the wire is megabytes in
-  the column. The poller's cross-page sum counts that third number too, what `readFeedBody` answered and not the wire
-  bytes a page carried: three gzip pages each under the cap decompressed summed to twice it while their wire bytes
-  stayed at kilobytes. Every parsed body is stored as the JSON array text it means, so `shapeOf`, `meta.sig`,
-  `pageRows`, the export and every query downstream see exactly what a JSON feed hands them, and a body its own declared
-  type cannot parse is that poll's failure row or that delivery's 400, never a stored blob.
+  `application/x-ndjson`, `application/jsonl`, `application/gzip`, `application/x-gzip`, `application/zip`,
+  `application/x-zip-compressed`, `application/xml`, `text/xml`, `application/rss+xml`, `application/atom+xml` -- and
+  `readFeedBody` is the one reader both doors call: `pollNetOnce` on every page it reads, and `POST /net/:id` after the
+  signature and before the NUL check, which asks the text that is stored rather than the bytes that arrived. A type on
+  none of the list is stored as the text it arrived as, which is what a JSON feed hands us already, and a body that did
+  not answer 2xx is never parsed. A CSV and a TSV go through `parseDelimited`, the text-to-`{cols, rows}` core lifted
+  out of `readImport()` -- the importer is a thin wrapper over it, so a feed's digits are numbers, its blanks are nulls
+  and its ragged line is refused by number exactly as an uploaded file's are, and `source` is what every one of those
+  refusals names the line in: the uploaded file there, the url here. `assertRoom` stayed behind in `readImport`: the row
+  quota is a sheet's, and only that door makes a sheet, so a feed's rows are bounded by `BODY_CAP` alone the way a JSON
+  feed's always were. The rows are stored keyed by column name; `col.key` is the document's own spelling and stays with
+  the importer, the one door that writes a document. NDJSON is one JSON value a line, a blank line no record and a line
+  that will not parse a refusal naming it. `expand()` is the one bounded decompressor and both compressed doors go
+  through it: bytes are fed to `DecompressionStream` `EXPAND_SLICE` at a time and read back through `readBody`, so a
+  bomb is refused holding one slice's expansion past the cap rather than the gigabyte it writes; handed the whole of a
+  bomb at once the decompressor answers all of it in one chunk, which is the cap spent after the memory is gone. It has
+  one home rather than two copies because it is a subtlety that only shows up under attack; it slices **before** the
+  stream exists so `pull` cannot throw, and it refuses a non-`Uint8Array` argument as ours -- a `TypeError` raised
+  inside `pull` was caught by the decompressor's own catch and reported as the host having sent a bad body. What came
+  out of a gzip is read by its first character -- a bracket or a brace is JSON, everything else a CSV -- because nothing
+  in an answer says what a gzip holds. **`BODY_CAP` is spent on three different numbers**, and no one of them stands in
+  for another: the bytes that arrived, what a gzip decompressed to, and what the body _means_ -- a file names its
+  columns once and the rows it means name them on every row, so a few kilobytes on the wire is megabytes in the column.
+  The poller's cross-page sum counts that third number too, what `readFeedBody` answered and not the wire bytes a page
+  carried: three gzip pages each under the cap decompressed summed to twice it while their wire bytes stayed at
+  kilobytes. Every parsed body is stored as the JSON text it means -- the array of rows for every format that holds one,
+  and the document itself for a generic XML body -- so `shapeOf`, `meta.sig`, `pageRows`, the export and every query
+  downstream see exactly what a JSON feed hands them, and a body its own declared type cannot parse is that poll's
+  failure row or that delivery's 400, never a stored blob. `BODY_DEPTH_MAX` bounds how many containers one body nests,
+  because the only other thing stopping a zip quine is a table two screens away holding no `zip` row.
+- **A type this server guessed is checked; a type the sender declared is not.** `jsonMeant()` is the line between them.
+  A body that declares `application/json` is taken at its word and stored as it arrived -- the NUL check downstream has
+  a better refusal for the one byte Postgres cannot hold than "not JSON" does, and it is the sender's claim either way
+  -- but what came out of a gzip and what a zip member's _name_ says are this server's own guesses, and an unchecked
+  guess stored an HTML error page verbatim under a green run row. So both go through `JSON.parse` and the text that
+  arrived is what is stored: re-serialising it would move the digest on `meta.sig` and a repeated body would stop being
+  recognised as one.
+- **XML is read by a library, and read twice.** `npm:fast-xml-parser` is the tokenizer: an XML reader is what "never
+  hand-roll anything that parses" is about, and this one expands no custom entity and refuses an external one, so the
+  billion-laughs body is stored as the text `&lol2;` rather than as a gigabyte and an XXE never reaches the filesystem.
+  It also refuses `__proto__`, `constructor` and `prototype` as element names itself. `xmlDoc()` runs `XMLValidator`
+  **before** `XMLParser`, because the reader takes `<a><b></a>` as `{a:{b:""}}` without raising and a half-read document
+  stored under a green run is the blob this whole list exists to stop; the refusal carries the line, and the column only
+  where there is one, since an empty body answers no column and a stringified `undefined` reads as a place in the
+  document. The parser's own bounds -- a nesting depth, a declared external entity -- are a throw it raises after the
+  validator has called the document well formed, and its own words are the message: naming one of those causes sent the
+  owner flattening a document one level deep. Text stays text (`parseTagValue: false`): `checkColumnTypes()` is the one
+  place a cell becomes what its column says, and coercing here reads an id of `007` as 7 and one past 2^53 as a number
+  the feed never sent. Attributes are kept under an `@` prefix, because half of Atom's payload lives in them --
+  `<link href=...>` carries the url. A namespace prefix is dropped (`removeNSPrefix`), which is what makes `<a:entry>`
+  an entry and a prefixed element addressable at all, since `rows_path` is checked against `NET_PATH` and a colon is not
+  in it.
+- **An XML body is decoded the way it says to decode it.** `xmlText()` is the only place a body's own encoding is read,
+  because XML is the only format that states it: the width comes off a byte-order mark or off the NUL beside the opening
+  `<` (a sixteen-bit document cannot be sniffed for its own prolog as UTF-8, and one was refused as "not XML" on every
+  poll forever), and otherwise `encoding="..."` out of the prolog, which is ASCII by definition and so readable before
+  the first byte that is not. The decode is **fatal**: Latin-1 RSS is still common, and a bare UTF-8 decode turned every
+  accented character in one into U+FFFD and stored that as a cell, which nothing downstream can tell from a character
+  the feed actually sent. A label this runtime has no decoder for is its own refusal.
+- **RSS and Atom answer their rows; generic XML answers its document.** The two feed formats name the element a row sits
+  in, so there is nothing to guess: `xmlRows()` walks the parsed document depth-first with each node's children pushed
+  reversed -- which is what makes a stack hand them back in document order, where breadth-first returned a nested feed's
+  rows before the ones written above them -- and collects every `<item>` (RSS) or `<entry>` (Atom) wherever it sits, RSS
+  2.0 putting them under `<channel>` and RSS 1.0 directly under the root. A row is taken whole and never walked into, so
+  an `<item>` inside an `<item>` is that row's data and not a second row; a row that is not an object is refused by its
+  position, because a text-only `<item>hello</item>` stored as a row made `shapeOf` answer null for the whole run and
+  left the run after it with no shape to be compared against. `isArray` holds both names to a list whatever the count,
+  so a feed answering one row and a feed answering ten answer the same shape: collapsing the single one to an object is
+  how a reader breaks on the quiet day rather than on the day it was written. The walk is bounded by `XML_NODES_MAX`,
+  which counts nodes and says so -- it pushes no scalar, since spending the budget on every string in the document made
+  the counter mean something other than its own refusal. **`xmlFeedRoot()` refuses a body that is not the feed it says
+  it is**, against `XML_FEED_ROOTS`: a well-formed HTML holding page served with a feed content-type -- what a provider
+  behind a 200-ing proxy answers -- parsed, held no `<item>`, and stored `[]` under a green run row with no shape and so
+  no `shape_change` either, which is a sheet empty forever and a status check that never said why, and under
+  `mode: replace` the one run that did get graded took every earlier row with it. A generic `application/xml` body names
+  no row element, so what it means is the whole document; a paged or an upsert sheet says where the rows sit with
+  `rows_path`, and on any other sheet the document is what is stored and a query over it is what reads the rows out --
+  which is exactly what a JSON feed answering an envelope already does.
+- **A zip is a container, and the file inside it is the body.** `zipMembers()` reads the central directory rather than
+  walking local headers, because a member written with a data descriptor carries zeroes for its sizes in the local
+  header and the directory is the copy that is always right; every offset is checked against the bytes in hand, so a
+  truncated or lying archive is a named refusal and never a read past the end. The end-of-central-directory scan walks
+  back from the end and takes only a record whose own comment length accounts for every byte after it -- taking the
+  first signature found read a one-member archive as an archive of none, because those four bytes occur inside
+  compressed data and inside comments. **`zipData()` checks the member against what the directory said it would be**,
+  its length and its CRC-32 (`crc32()`, ten lines rather than a dependency): raw deflate carries no checksum and a
+  stored member carries nothing at all, so without it a member corrupted on the wire is rows in the sheet under a green
+  run row -- while the same payload gzipped is refused, because `DecompressionStream` checks gzip's own trailer. It is
+  also what catches a local header whose name and extra lengths disagree with the directory's, which shifted the read
+  window and spliced the archive's own filename bytes onto the front of the value. `ZIP_MEMBERS` is the
+  extension-to-type table and **names no archive**, which is the table's half of the `BODY_DEPTH_MAX` bound. Exactly one
+  member it can name, for the reason `pageRows` refuses a page holding two arrays: which member is the rows is the sheet
+  owner's answer to give, and a reader that picked the first would pick a different one next week -- a directory entry
+  and a Mac's `__MACOSX/._data.csv` sidecar are not candidates, since a Mac writes one beside every member it zips, and
+  the resolved type travels with the member it was read off rather than being computed twice. Refused by name: zip64
+  (either the directory's own counts or any member's size, since 65,535 members fits in a small archive where 0xffffffff
+  is four gigabytes), an encrypted member (there is nowhere to keep a passphrase), and a compression method that is
+  neither stored nor deflate. A deflated member goes through `expand()` with `deflate-raw`, so a zip bomb is bounded
+  where a gzip bomb is. **A member name never reaches a headline and always goes through `show()`**: it is up to 64k of
+  sender text that may hold newlines, and spliced raw it forged a `Fix:` line of its own in the refusal block and put
+  64k of somebody else's text into a failure row and the error log. `ZIP_NAMES_MAX` bounds how many names one refusal
+  spells out before it counts the rest.
 - **Run it now, stop it, and see when it runs next.** `paused: true` in `data[0]` takes a net-http or an alert sheet out
   of both tickers: `pollNetSheet` and `pollAlertSheet` -- the one-sheet halves the two 15-second ticks now loop over, so
   the timer and the button are the same code -- return before the fetch and before the row, and put the due entry back

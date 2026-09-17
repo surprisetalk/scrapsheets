@@ -139,15 +139,44 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
      like any other, and the access token is written back beside it rather than into the document.
   2. Static egress IP, which many enterprise sources require before they will talk at all.
 
-- [ ] **The response is parsed, not stored as a blob.** CSV, TSV, NDJSON and gzip land as the JSON array they mean, read
-      by the type the answer declares; every other format is still one cell.
-  1. Parsers: XML, RSS/Atom, HTML with CSS selectors, XLSX, Parquet. Each is one more entry in `BODY_PARSERS` and one
-     more branch in `readFeedBody` in `main.ts`, which both doors into a net sheet already call; each answers the JSON
-     array text the body means, the way the delimited and NDJSON branches do.
-  2. Archives: zip, including "the one CSV inside this daily zip". A zip names its members, so the branch has to say
-     which member it reads and refuse an archive holding more than one it can name, and `BODY_CAP` is spent on the
-     uncompressed member the way `GZIP_SLICE` spends it on a gzip.
-  3. PDF table extraction, because half of government data ships as PDF.
+- [ ] **A connector is added without a code change.** Every SaaS source under **Inventory** is otherwise a pull request.
+  1. Most of a connector definition already exists on a net-http sheet: `url`, `method`, `body`, headers,
+     `page_by`/`page_param`/`page_path`, `mode`/`key`/`rows_path`, and a secret per header. What a definition adds is a
+     name, one set of those fields per endpoint, and auth.
+  2. So it waits on the OAuth item above: auth is the only part a net-http sheet cannot already express, and a
+     definition written before it has a hole exactly where every real connector needs a token.
+  3. Then a `connector` sheet holding the definition, applied by writing the net-http documents it describes — nothing
+     new polls, and `pollNetOnce` stays the one poller.
+  4. Google Sheets, Airtable and Notion by hand first: they are the migration path in and the OAuth shape everything
+     else reuses.
+  5. Bidirectional sync is the same definition read the other way, and waits on **Actions & write-back**.
+
+- [ ] **`rows_path` works on a feed that answers one page.** It is read by `pageRows()` and `rowKeys()` only, so a sheet
+      with no `page_by` and `mode: append` — the default shape, and the one a generic XML or a JSON envelope feed lands
+      in — stores the whole envelope, and `rows_path` set on it does nothing at all.
+  1. Read `storeConfig().rowsPath` on the one-request path in `pollNetSheet` the way the paged path already reads it, so
+     what is stored is the rows the sheet named whatever its paging is.
+  2. `isArray` in `readFeedBody`'s XML reader is the other half of the same gap: it holds `item` and `entry` to a list
+     so a one-row feed and a ten-row feed answer the same shape, and a generic XML feed gets no such protection —
+     `rows_path: "data.row"` over a day that answers one `<row>` silently becomes an object where every other day is an
+     array, and `shapeOf` reports `{data: "object"}` either way, so nothing grades it. Closing `isArray` over the
+     sheet's own `rows_path` leaf fixes both, and needs the config threaded into `readFeedBody`.
+  3. Do both together: they are one fact about where a sheet says its rows are, and half of it is worse than neither.
+
+- [ ] **The response is parsed, not stored as a blob.** CSV, TSV, NDJSON, gzip, zip, XML, RSS and Atom land as the JSON
+      they mean, read by the type the answer declares. XLSX, Parquet, HTML and PDF are still one cell. Each is one more
+      entry in `BODY_PARSERS` and one more branch in `readFeedBody`.
+  1. HTML: the one `<table>` in the document becomes the rows, and a document holding more than one is refused naming
+     them — the rule the zip branch already applies to an archive's members, so this needs no CSS selector, no per-sheet
+     field and no new noun. It needs an HTML parser, which is what "never hand-roll anything that parses HTML" is about:
+     check `jsr:@b-fuze/deno-dom` runs on Deno Deploy before writing the branch, and pick another if it does not.
+  2. XLSX: blocked, and the blocker is the pin. `npm:xlsx@0.18.5` is the last version SheetJS published to npm — check
+     with `npm view xlsx dist-tags` — and its read path is exactly what `claude.md` means by "written with and never
+     read with". Decide first: a newer SheetJS from the vendor's own registry, or a different reader. Do not call
+     `XLSX.read` on the pinned one.
+  3. Parquet: pick the reader before writing the branch — `hyparquet` reads, `hyparquet-writer` writes — and make the
+     choice once, beside the Parquet export under **Reports & export**, which needs the same decision.
+  4. PDF table extraction, because half of government data ships as PDF.
 
 ---
 
@@ -559,11 +588,6 @@ Ordered roughly by how many demos each unblocks. Each is the same work; the item
 - [ ] HR and payroll (Gusto, Rippling, ADP, Workday, BambooHR, Greenhouse, Lever, Ashby); comms and calendar (Slack,
       Discord, Gmail, Outlook, Google Calendar, Zoom, Calendly, Twilio, DocuSign); vertical systems (Procore,
       ServiceTitan, Toast, Lightspeed, Epic/FHIR, Availity, Clio, MINDBODY, Shipstation).
-- [ ] **A connector is added without a code change.** Every one above is otherwise a pull request.
-  1. A declarative connector definition — auth, endpoints, pagination, schema — that users and sellers write.
-  2. Google Sheets, Airtable and Notion are the three to build by hand first, because they are the migration path in and
-     the OAuth shape everything else reuses.
-  3. Bidirectional sync — writing Scrapsheets data back — is the same definition read the other way.
 
 ---
 

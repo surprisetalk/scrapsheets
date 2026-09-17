@@ -51,10 +51,14 @@ A feed says what a good run does to the runs before it: `mode` on the sheet is `
 `replace` (a good run deletes the earlier good runs, and a failed one deletes nothing) or `upsert` (a `key` names the
 field a row is identified by, and a run supersedes the earlier runs holding the same keys). A feed that answers an
 envelope holding two arrays names the one that is the rows with `rows_path`. A body is read by the type the answer
-declares: CSV, TSV, NDJSON and gzip land as the JSON array they mean, so a query over the feed reads one shape whatever
-the wire carried, and a body its own type cannot parse is a failed run naming the line. A paused sheet (the checkbox
-beside the interval) is stepped over by the poller, "run now" polls it this second and answers the row it wrote
-(`POST /library/<sheet_id>/run` over HTTP), and `library:freshness` says when each sheet runs next.
+declares: CSV, TSV, NDJSON, gzip, RSS and Atom land as the JSON array they mean, so a query over the feed reads one
+shape whatever the wire carried, and a body its own type cannot parse is a failed run naming the line. A zip is the one
+member inside it this server can read, checked against its own checksum, and an archive holding two of them says so
+rather than guessing. Generic XML lands as the document it means, decoded the way its own prolog says to decode it; a
+paged or an upsert sheet names the rows in it with `rows_path`, and on any other sheet a query over the feed reads them
+out. A paused sheet (the checkbox beside the interval) is stepped over by the poller, "run now" polls it this second and
+answers the row it wrote (`POST /library/<sheet_id>/run` over HTTP), and `library:freshness` says when each sheet runs
+next.
 
 A sheet can hold its own secrets instead. `POST /library/<sheet_id>/secret` with `{"name":"hook","value":"..."}` sets
 the signing key; writing it again rotates it, and the one before still verifies until a third write retires it. `GET`

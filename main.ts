@@ -23,6 +23,7 @@ import type { AnyDocumentId } from "@automerge/automerge-repo";
 import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import ala from "alasql";
+import { XMLParser, XMLValidator } from "fast-xml-parser";
 import * as path from "@std/path";
 import examplesSql from "./examples.sql" with { type: "text" };
 import { DATASETS } from "./src/examples.mjs";
@@ -3391,80 +3392,623 @@ const readBody = async (res: Response): Promise<Uint8Array<ArrayBuffer>> => {
 // What a body means, off the type it declares. A feed answers rows in more than
 // one language and every reader downstream speaks one -- shapeOf, the digest,
 // pageRows, the export, a query over the sheet -- so a body on this list is
-// parsed into the JSON array it means and stored as that, and a body on none of
-// it is stored as the text it arrived as, which is what a JSON feed hands us
-// already. The type read is the answer's own: nothing a sheet holds can know
-// what a host will answer with next week.
-const BODY_PARSERS: Record<string, "csv" | "tsv" | "ndjson" | "gzip"> = {
+// parsed into the JSON it means and stored as that, and a body on none of it is
+// stored as the text it arrived as. The type read is the answer's own: nothing a
+// sheet holds can know what a host will answer with next week.
+const BODY_PARSERS: Record<string, "csv" | "tsv" | "ndjson" | "gzip" | "zip" | "xml" | "rss" | "atom"> = {
   "text/csv": "csv",
   "text/tab-separated-values": "tsv",
   "application/x-ndjson": "ndjson",
   "application/jsonl": "ndjson",
   "application/gzip": "gzip",
   "application/x-gzip": "gzip",
+  "application/zip": "zip",
+  "application/x-zip-compressed": "zip",
+  "application/xml": "xml",
+  "text/xml": "xml",
+  "application/rss+xml": "rss",
+  "application/atom+xml": "atom",
 };
 
 // Compressed bytes handed to the decompressor at a time. Small, because it is
 // what bounds how far past the cap one read can carry: deflate writes at most
 // about a thousand bytes for one, so this is half a cap of slack and not the
 // whole of whatever a bomb expands to.
-const GZIP_SLICE = 512;
+const EXPAND_SLICE = 512;
 
-/** A body as the text a row stores: the JSON array it means. Both doors into a
- * net sheet read through this one function, so a CSV a sender posts and a CSV a
- * feed answers land as the same rows. `source` is what a refusal names -- the
- * url a poll fetched, or the route a delivery arrived on. */
-const readFeedBody = async (raw: Uint8Array<ArrayBuffer>, contentType: string, source: string): Promise<string> => {
+/** What compressed bytes expand to, bounded. Fed a slice at a time, and read
+ * through the same bounded reader every response body takes. Both halves are
+ * the cap: handed the whole of a bomb at once the decompressor answers the whole
+ * of what it expands to in one chunk, and the cap is spent after a gigabyte is
+ * already in memory. A slice bounds one read to what one slice expands to, which
+ * deflate caps near a thousandfold, and the reader stops on the first read past
+ * the cap. A gzip body and the one member of a zip both come through here, so
+ * the bomb bound has one home rather than two copies of a subtlety that only
+ * shows up under attack. */
+const expand = async (
+  raw: Uint8Array<ArrayBuffer>,
+  format: "gzip" | "deflate-raw",
+  source: string,
+): Promise<Uint8Array<ArrayBuffer>> => {
+  // Handed something that is not bytes, this would throw a TypeError inside the
+  // stream and be caught below as "the host sent a bad body", which blames a
+  // sender for a bug in here. A wrong argument is ours and crashes as ours.
+  if (!(raw instanceof Uint8Array)) {
+    throw new Error(explain("expand() was handed something that is not bytes.", {
+      Received: show(raw),
+      Expected: "a Uint8Array of the compressed body",
+      Source: `an internal call about ${source}`,
+      Fix: "pass the bytes rather than the response or the text",
+    }));
+  }
+  // Sliced before the stream exists, so `pull` can only dequeue and the catch
+  // below can only be about the decompressor.
+  const slices: Uint8Array<ArrayBuffer>[] = [];
+  for (let at = 0; at < raw.byteLength; at += EXPAND_SLICE) slices.push(raw.subarray(at, at + EXPAND_SLICE));
+  let fed = 0;
+  const feeding = new ReadableStream<BufferSource>({
+    pull(into) {
+      if (fed >= slices.length) return into.close();
+      into.enqueue(slices[fed++]);
+    },
+  });
+  const bytes = await readBody(new Response(feeding.pipeThrough(new DecompressionStream(format))))
+    .catch((err: unknown) => {
+      // readBody's own refusal is an Error it has already named. A TypeError is
+      // the decompressor saying these bytes are not the stream it reads.
+      if (!(err instanceof TypeError)) throw err;
+      return bad(400, `This body does not decompress as ${format === "gzip" ? "gzip" : "deflate"}.`, {
+        Received: `${raw.byteLength} bytes the ${format} reader refused: ${reason(err)}`,
+        Expected: `the bytes ${
+          format === "gzip" ? "gzip" : "a zip writer"
+        } wrote, because this body declares itself so`,
+        Source: source,
+        Fix: "send what the compressor wrote, or declare the type the body actually is",
+      });
+    });
+  if (bytes.byteLength > BODY_CAP) {
+    bad(413, `This body decompresses to more than can be stored.`, {
+      Received: `${raw.byteLength} compressed bytes holding at least ${bytes.byteLength}`,
+      Limit: `${BODY_CAP} bytes per body, decompressed`,
+      Source: source,
+      Fix: "compress a paged or filtered answer, or give the sheet a cursor",
+    });
+  }
+  return bytes;
+};
+
+// One reader for every XML body. Text stays text: XML says nothing about types,
+// and checkColumnTypes is the one place a cell becomes what its column says --
+// coercing here reads an id of `007` as 7 and one past 2^53 as a number the feed
+// never sent. Attributes are kept under an `@` prefix because half of Atom's
+// payload lives in them (`<link href=...>` carries the url). A namespace prefix
+// is dropped: `<a:entry>` is an entry, and a reader matching the literal name
+// answered nothing at all for a prefixed feed -- which is most of them. It also
+// makes a prefixed element addressable at all, since `rows_path` is checked
+// against NET_PATH and a colon is not in it. `item` and `entry` are always an
+// array, so a feed answering one row and a feed answering ten answer the same
+// shape: collapsing the single one to an object is how a reader breaks on the
+// quiet day rather than on the day it was written.
+const xmlReader = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "@",
+  parseTagValue: false,
+  parseAttributeValue: false,
+  ignoreDeclaration: true,
+  ignorePiTags: true,
+  removeNSPrefix: true,
+  isArray: (name: string) => name === "item" || name === "entry",
+});
+
+// How much of a body is read looking for its declared encoding. The prolog must
+// be the first thing in the document and is ASCII by definition, so it is in
+// hand well before this.
+const XML_PROLOG_BYTES = 256;
+const XML_ENCODING = /^\s*<\?xml\s[^?>]*encoding\s*=\s*["']([\w.:-]{1,40})["']/;
+
+/** An XML body as text, decoded the way the document says to decode it. Latin-1
+ * RSS is still common, and a bare UTF-8 decode turns every accented character in
+ * one into U+FFFD and stores that as data -- a guess made against evidence
+ * sitting in the first line of the body. Fatal, because a replacement character
+ * kept as a cell cannot be told from a character the feed actually sent. */
+const xmlText = (bytes: Uint8Array<ArrayBuffer>, source: string): string => {
+  // A sixteen-bit document cannot be sniffed for its own prolog as UTF-8 -- every
+  // other byte of `<?xml` is a NUL and the regex never matches -- so the width is
+  // read off the first bytes the way the XML spec says to: a byte-order mark, or
+  // failing that the NUL beside the `<` that opens every XML document. Without
+  // this a genuine UTF-16 feed was refused as "not XML" on every poll forever,
+  // with a refusal naming the wrong cause.
+  const wide = bytes[0] === 0xFF && bytes[1] === 0xFE
+    ? "utf-16le"
+    : bytes[0] === 0xFE && bytes[1] === 0xFF
+    ? "utf-16be"
+    : bytes[0] === 0x3C && bytes[1] === 0x00
+    ? "utf-16le"
+    : bytes[0] === 0x00 && bytes[1] === 0x3C
+    ? "utf-16be"
+    : null;
+  const head = new TextDecoder(wide ?? "utf-8").decode(bytes.subarray(0, XML_PROLOG_BYTES)).replace(/^﻿/, "");
+  // A sixteen-bit document's declared label is the width it is already being read
+  // at, so the mark wins: the two cannot disagree about a document that parsed.
+  const label = wide ?? head.match(XML_ENCODING)?.[1] ?? "utf-8";
+  let decoder: TextDecoder;
+  try {
+    decoder = new TextDecoder(label, { fatal: true });
+  } catch {
+    return bad(400, `This body declares an encoding this server cannot read.`, {
+      Received: show(label),
+      Expected: "an encoding label this runtime has, such as utf-8, iso-8859-1 or windows-1252",
+      Source: source,
+      Fix: "serve the feed as UTF-8, or declare the encoding it is actually in",
+    });
+  }
+  try {
+    return decoder.decode(bytes).replace(/^﻿/, "");
+  } catch (err) {
+    return bad(400, `This body is not ${label} text.`, {
+      Received: `${bytes.byteLength} bytes the ${label} decoder refused: ${reason(err)}`,
+      Expected: `bytes this document's own prolog says are ${label}`,
+      Source: source,
+      Fix: "serve the feed as UTF-8, or declare the encoding it is actually in",
+    });
+  }
+};
+
+/** The document an XML body means, or the refusal saying where it stopped being
+ * XML. Validated before it is read: this reader takes `<a><b></a>` as
+ * `{a:{b:""}}` rather than raising, and a body silently half-read is the blob
+ * this whole list exists to stop. Custom entities are never expanded, so the
+ * billion-laughs body is stored as the text `&lol2;` and not as a gigabyte. */
+const xmlDoc = (text: string, source: string): unknown => {
+  const checked = XMLValidator.validate(text);
+  if (checked !== true) {
+    // An empty body answers a line and no column, so the column is named only
+    // where there is one: a stringified `undefined` reads as a place in the
+    // document and is not one.
+    const at = checked.err.col === undefined
+      ? `line ${checked.err.line}`
+      : `line ${checked.err.line}, column ${checked.err.col}`;
+    bad(400, `This body is not XML.`, {
+      Received: `${text.length} characters refused at ${at}: ${checked.err.msg}`,
+      Expected: "a well-formed XML document, because this body declares itself XML",
+      Source: source,
+      Fix: "fix the document at that line, or declare the type the body actually is",
+    });
+  }
+  try {
+    return xmlReader.parse(text);
+  } catch (err) {
+    // The reader's own bounds, raised after the validator has already called the
+    // document well formed: a nesting depth, and a declared external entity this
+    // server never fetches. Its own words are the message -- naming one of those
+    // causes sent the owner flattening a document one level deep.
+    return bad(400, `This body is XML this reader will not take.`, {
+      Received: `${text.length} characters: ${reason(err)}`,
+      Expected: "an XML document this reader reads",
+      Source: source,
+      Fix: "the reader's own words are above: flatten the document, drop the entity declaration, or point the sheet" +
+        " at an endpoint that answers rows",
+    });
+  }
+};
+
+// What each feed format roots its document at, prefixes already dropped. RSS 2.0
+// is `<rss>`, RSS 1.0 is `<rdf:RDF>` and RSS 0.91 may be a bare `<channel>`.
+const XML_FEED_ROOTS: Record<"rss" | "atom", string[]> = { rss: ["rss", "RDF", "channel"], atom: ["feed"] };
+
+/** Refuses a body that is not the feed it says it is. Without this, a well-formed
+ * HTML holding page served with a feed content-type -- which is what a provider
+ * behind a 200-ing proxy answers -- parsed, found no `<item>`, and stored `[]`
+ * under a green run row, with no shape and so no shape_change either: a sheet
+ * empty forever and a status check that never said why. Worse under
+ * `mode: replace`, where the one run that does get graded takes every earlier
+ * row with it. An empty answer from a format that names its own row element is
+ * not something to guess about. */
+const xmlFeedRoot = (parsed: unknown, reading: "rss" | "atom", source: string): void => {
+  const named = typeof parsed === "object" && parsed !== null
+    ? Object.keys(parsed).filter((key) => !key.startsWith("@"))
+    : [];
+  if (named.some((key) => XML_FEED_ROOTS[reading].includes(key))) return;
+  bad(400, `This body is not ${reading === "rss" ? "an RSS" : "an Atom"} feed.`, {
+    Received: named.length ? `a document rooted at ${named.map((key) => `<${key}>`).join(", ")}` : "no element at all",
+    Expected: `${XML_FEED_ROOTS[reading].map((key) => `<${key}>`).join(" or ")}, because this body declares itself ${
+      reading === "rss" ? "application/rss+xml" : "application/atom+xml"
+    }`,
+    Source: source,
+    Fix: "point the sheet at the feed itself, or declare the type the body actually is",
+  });
+};
+
+// The most nodes one XML body may be walked through looking for its rows. A
+// document wide enough to exhaust this is past what BODY_CAP carries; the walk
+// is bounded like every other loop here and its refusal carries the counter.
+const XML_NODES_MAX = 100_000;
+
+/** Every `<item>` (RSS) or `<entry>` (Atom) in the document, in the order the
+ * document wrote them. RSS 2.0 puts them under `<channel>` and RSS 1.0 directly
+ * under the root, so a reader that knew one of those addresses answered nothing
+ * at all for the other. Depth-first with the children pushed reversed, which is
+ * what makes a stack hand them back in document order -- breadth-first returned
+ * a nested feed's rows before the ones written above them. A row is taken whole
+ * and never walked into, so an `<item>` inside an `<item>` is that row's data
+ * rather than a second row. This is the one guess neither format needs: the
+ * element that holds a row is named by the standard, which is why rss and atom
+ * answer their rows where a generic XML body answers its whole document. */
+const xmlRows = (parsed: unknown, name: string, source: string): unknown[] => {
+  const rows: unknown[] = [];
+  const stack: { value: unknown; row: boolean }[] = [{ value: parsed, row: false }];
+  for (let walked = 0; stack.length;) {
+    if (walked++ >= XML_NODES_MAX) {
+      bad(413, `This body holds more XML nodes than one body may.`, {
+        Received: `${walked} nodes walked looking for <${name}>`,
+        Limit: `${XML_NODES_MAX} nodes per body`,
+        Source: source,
+        Fix: "point the sheet at a paged or filtered endpoint",
+      });
+    }
+    const { value, row } = stack.pop()!;
+    if (row) {
+      // A text-only `<item>hello</item>` and a self-closed `<item/>` parse to a
+      // string. A row keyed by nothing is not a row, and stored as one it made
+      // shapeOf answer null for the whole run -- which also left the run after
+      // it with no shape to be compared against.
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        bad(400, `A <${name}> in this feed holds no named fields.`, {
+          Received: `${show(value)} as <${name}> number ${rows.length + 1}`,
+          Expected: `every <${name}> to hold named fields, because a row keyed by nothing is not a row`,
+          Source: source,
+          Fix: "point the sheet at the feed itself, or declare the type the body actually is",
+        });
+      }
+      rows.push(value);
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (let i = value.length - 1; i >= 0; i--) stack.push({ value: value[i], row: false });
+      continue;
+    }
+    if (typeof value !== "object" || value === null) continue;
+    const entries = Object.entries(value);
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const [key, child] = entries[i];
+      if (key === name && Array.isArray(child)) {
+        for (let j = child.length - 1; j >= 0; j--) stack.push({ value: child[j], row: true });
+        // A scalar child is a leaf and holds no rows. Pushing it spent the node
+        // budget on every string in the document and made the counter mean
+        // something other than what its refusal says.
+      } else if (typeof child === "object" && child !== null) { stack.push({ value: child, row: false }); }
+    }
+  }
+  return rows;
+};
+
+/** JSON this server decided was JSON, checked. A body that declares its own
+ * content type is taken at its word: the NUL check downstream has a better
+ * refusal for the one byte Postgres cannot hold than "not JSON" does, and it is
+ * the sender's own claim either way. A gzip's contents and a zip member's name
+ * are this server's own guess at a type, and an unchecked guess stored an HTML
+ * error page verbatim under a green run row. */
+const jsonMeant = (text: string, source: string, why: string): string => {
+  try {
+    JSON.parse(text);
+  } catch (err) {
+    bad(400, `This body is not JSON.`, {
+      Received: `${text.length} characters the JSON parser refused: ${reason(err)}`,
+      Expected: `JSON, because ${why}`,
+      Source: source,
+      Fix: "fix the body, or say what it actually holds",
+    });
+  }
+  return text;
+};
+
+// What this reader takes out of an archive, by the extension its member is named
+// with: a zip names its members and nothing else in it says what any of them
+// holds, so the name is the only thing there is to read a type off -- a claim to
+// check and never one to trust, which is what `jsonMeant` is for. `zip` is
+// deliberately absent, which is the table's half of the recursion bound below.
+const ZIP_MEMBERS: Record<string, string> = {
+  csv: "text/csv",
+  tsv: "text/tab-separated-values",
+  json: "application/json",
+  ndjson: "application/x-ndjson",
+  jsonl: "application/jsonl",
+  xml: "application/xml",
+};
+
+// The end-of-central-directory record is the only fixed point in a zip -- every
+// member is found through it -- and it sits at the very end behind a comment of
+// up to 64k, so it is found by scanning back for its signature.
+const ZIP_EOCD = 0x06054b50;
+const ZIP_ENTRY = 0x02014b50;
+const ZIP_LOCAL = 0x04034b50;
+const ZIP_COMMENT_MAX = 65_535;
+// How many member names a refusal spells out before it counts the rest: an
+// archive may hold thousands, and a refusal nobody can read says nothing.
+const ZIP_NAMES_MAX = 10;
+// The one value a 32-bit zip field takes to say "read this from the zip64 record
+// instead", which this reader does not read.
+const ZIP64 = 0xffffffff;
+
+// CRC-32, which is the only thing a zip carries that says its bytes arrived
+// whole: raw deflate has no checksum of its own, and a stored member has nothing
+// at all. Ten lines rather than a dependency, and without it a member corrupted
+// on the wire lands in the sheet under a green run row -- while the same payload
+// gzipped is refused, because DecompressionStream checks gzip's own trailer.
+const CRC_TABLE = new Uint32Array(256);
+for (let i = 0; i < 256; i++) {
+  let c = i;
+  for (let bit = 0; bit < 8; bit++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+  CRC_TABLE[i] = c >>> 0;
+}
+const crc32 = (bytes: Uint8Array): number => {
+  let c = 0xFFFFFFFF;
+  for (const byte of bytes) c = CRC_TABLE[(c ^ byte) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+};
+
+type ZipMember = {
+  name: string;
+  method: number;
+  local: number;
+  stored: number;
+  size: number;
+  crc: number;
+  encrypted: boolean;
+};
+
+/** One refusal shape for every way an archive is not one. A member name is
+ * sender-supplied text of up to 64k that may hold newlines, so it goes through
+ * `show()` -- which quotes and bounds it -- and never into a headline: spliced
+ * raw it forged an extra `Fix:` line in the block and put 64k of somebody else's
+ * text into a failure row and the error log. */
+const zipBad = (source: string, headline: string, received: string, fix: string): never =>
+  bad(400, headline, {
+    Received: received,
+    Expected: "the bytes a zip writer wrote, because this body declares itself a zip",
+    Source: source,
+    Fix: fix,
+  });
+
+/** What a zip says it holds, read from its central directory rather than by
+ * walking local headers: a member written with a data descriptor carries zeroes
+ * for its sizes in the local header, and the directory is the copy that is
+ * always right. Every offset is checked against the bytes actually in hand, so a
+ * truncated or lying archive is a named refusal and never a read past the end. */
+const zipMembers = (raw: Uint8Array<ArrayBuffer>, source: string): ZipMember[] => {
+  const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  const names = new TextDecoder();
+  let end = -1;
+  let scanned = 0;
+  for (let at = raw.byteLength - 22; at >= 0 && at >= raw.byteLength - 22 - ZIP_COMMENT_MAX; at--, scanned++) {
+    // The comment length must account for every byte after the record, which is
+    // how a real record is told from the same four bytes sitting inside a
+    // member's compressed data or inside the comment itself. Taking the first
+    // signature found read a one-member archive as an archive of none.
+    if (view.getUint32(at, true) === ZIP_EOCD && at + 22 + view.getUint16(at + 20, true) === raw.byteLength) {
+      end = at;
+      break;
+    }
+  }
+  if (end < 0) {
+    zipBad(
+      source,
+      `This body is not a zip.`,
+      `${raw.byteLength} bytes whose last ${scanned} hold no end-of-central-directory record`,
+      "send what a zip writer wrote, or declare the type the body actually is",
+    );
+  }
+  const count = view.getUint16(end + 10, true);
+  let at = view.getUint32(end + 16, true);
+  // A zip64 archive names its real counts and sizes in an extra record this does
+  // not read. Either field saying so is enough: 0xffff members is 65,535 of them
+  // and fits in a small archive, while 0xffffffff is four gigabytes of one.
+  if (count === 0xffff || at === ZIP64) {
+    zipBad(
+      source,
+      `This zip is a zip64 archive.`,
+      `a central directory of ${count} members at offset ${at}`,
+      `send a plain zip of fewer than 65535 members under ${BODY_CAP} bytes, which is the cap a body carries anyway`,
+    );
+  }
+  const members: ZipMember[] = [];
+  for (let i = 0; i < count; i++) {
+    if (at + 46 > raw.byteLength || view.getUint32(at, true) !== ZIP_ENTRY) {
+      zipBad(
+        source,
+        `A member of this zip is not where its directory says.`,
+        `no directory entry for member ${i + 1} of ${count} at offset ${at} of ${raw.byteLength} bytes`,
+        "send an archive whose central directory is intact",
+      );
+    }
+    const nameLen = view.getUint16(at + 28, true);
+    if (at + 46 + nameLen > raw.byteLength) {
+      zipBad(
+        source,
+        `A member of this zip names itself past the end of the archive.`,
+        `a ${nameLen}-byte name for member ${i + 1} of ${count} at offset ${at + 46} of ${raw.byteLength} bytes`,
+        "send an archive whose central directory is intact",
+      );
+    }
+    const member = {
+      name: names.decode(raw.subarray(at + 46, at + 46 + nameLen)),
+      method: view.getUint16(at + 10, true),
+      local: view.getUint32(at + 42, true),
+      stored: view.getUint32(at + 20, true),
+      size: view.getUint32(at + 24, true),
+      crc: view.getUint32(at + 16, true),
+      // Bit 0 of the general purpose flags. An encrypted member is refused by
+      // name: there is nowhere to put a passphrase, and reading it as text would
+      // store the ciphertext under a green run.
+      encrypted: (view.getUint16(at + 8, true) & 1) === 1,
+    };
+    // A per-member size marked zip64 escaped the check above and was refused as
+    // a truncated archive, which told the owner to resend a complete one.
+    if (member.stored === ZIP64 || member.size === ZIP64 || member.local === ZIP64) {
+      zipBad(
+        source,
+        `This zip is a zip64 archive.`,
+        `member ${i + 1} of ${count} names a zip64 size or offset`,
+        `send a plain zip under ${BODY_CAP} bytes, which is the cap a body carries anyway`,
+      );
+    }
+    members.push(member);
+    at += 46 + nameLen + view.getUint16(at + 30, true) + view.getUint16(at + 32, true);
+  }
+  return members;
+};
+
+/** One member's bytes, checked against what the directory said they would be.
+ * The local header is read for its own name and extra lengths only -- the data
+ * begins past them, and they are the two fields a writer is free to spell
+ * differently there than in the directory. */
+const zipData = async (
+  raw: Uint8Array<ArrayBuffer>,
+  member: ZipMember,
+  source: string,
+): Promise<Uint8Array<ArrayBuffer>> => {
+  const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  const named = `member ${show(member.name)}`;
+  if (member.local + 30 > raw.byteLength || view.getUint32(member.local, true) !== ZIP_LOCAL) {
+    zipBad(
+      source,
+      `A member of this zip is not where its directory says.`,
+      `no local header for ${named} at offset ${member.local} of ${raw.byteLength} bytes`,
+      "send an archive whose central directory is intact",
+    );
+  }
+  const from = member.local + 30 + view.getUint16(member.local + 26, true) + view.getUint16(member.local + 28, true);
+  if (from + member.stored > raw.byteLength) {
+    zipBad(
+      source,
+      `A member of this zip runs past the end of the archive.`,
+      `${named}, ${member.stored} bytes at offset ${from} of ${raw.byteLength} bytes`,
+      "send the whole archive; this one is truncated",
+    );
+  }
+  const body = raw.slice(from, from + member.stored);
+  if (member.method !== 0 && member.method !== 8) {
+    zipBad(
+      source,
+      `A member of this zip is compressed a way this reader does not take.`,
+      `${named}, compression method ${member.method}`,
+      "store the member or deflate it, which is what every zip writer does by default",
+    );
+  }
+  const bytes = member.method === 0 ? body : await expand(body, "deflate-raw", `${member.name} in ${source}`);
+  // The directory says how long the member is and what it checksums to. Neither
+  // deflate nor a stored member carries a checksum of its own, so without this a
+  // member corrupted in transit is rows in the sheet under a green run row.
+  if (bytes.byteLength !== member.size) {
+    zipBad(
+      source,
+      `A member of this zip is not the length its directory says.`,
+      `${named} read as ${bytes.byteLength} bytes where the directory says ${member.size}`,
+      "send the whole archive; this one is truncated or was rewritten after it was indexed",
+    );
+  }
+  const summed = crc32(bytes);
+  if (summed !== member.crc) {
+    zipBad(
+      source,
+      `A member of this zip does not match its own checksum.`,
+      `${named} sums to ${summed.toString(16)} where the directory says ${member.crc.toString(16)}`,
+      "send the archive again; these bytes were corrupted in transit or at the origin",
+    );
+  }
+  return bytes;
+};
+
+// How many containers deep a body may nest. ZIP_MEMBERS names no archive, so
+// this is one already -- but that is a fact about a table two screens up, and a
+// row added to it is exactly what this table is shaped to make easy.
+const BODY_DEPTH_MAX = 2;
+
+/** A body as the text a row stores: the JSON it means. Both doors into a net
+ * sheet read through this one function, so a CSV a sender posts and a CSV a feed
+ * answers land as the same rows. `source` is what a refusal names -- the url a
+ * poll fetched, or the route a delivery arrived on. */
+const readFeedBody = async (
+  raw: Uint8Array<ArrayBuffer>,
+  contentType: string,
+  source: string,
+  depth = 0,
+): Promise<string> => {
+  if (depth >= BODY_DEPTH_MAX) {
+    bad(400, `This body nests containers deeper than one may.`, {
+      Received: `${depth} containers opened before ${show(contentType)}`,
+      Limit: `${BODY_DEPTH_MAX} containers per body`,
+      Source: source,
+      Fix: "send the file itself rather than an archive of an archive",
+    });
+  }
   // The type alone: a charset or a boundary rides the same header, and a
   // parameter is not part of the name.
   const how = BODY_PARSERS[contentType.split(";")[0].trim().toLowerCase()];
   if (how === undefined) return new TextDecoder().decode(raw);
-  let bytes = raw;
-  if (how === "gzip") {
-    // Fed a slice at a time, and read through the same bounded reader every
-    // response body takes. Both halves are the cap: handed the whole of a bomb
-    // at once the decompressor answers the whole of what it expands to in one
-    // chunk, and the cap is spent after a gigabyte is already in memory. A
-    // slice bounds one read to what one slice expands to, which deflate caps
-    // near a thousandfold, and the reader stops on the first read past the cap.
-    let fed = 0;
-    const slices = new ReadableStream<BufferSource>({
-      pull(feeding) {
-        if (fed >= raw.byteLength) return feeding.close();
-        feeding.enqueue(raw.subarray(fed, fed + GZIP_SLICE));
-        fed += GZIP_SLICE;
-      },
+  if (how === "zip") {
+    const members = zipMembers(raw, source);
+    const named = members.flatMap((member) => {
+      // A directory entry holds no bytes, and a Mac writes an AppleDouble
+      // sidecar beside every member it zips -- `__MACOSX/._data.csv` next to
+      // `data.csv` -- which is two members this can name where whoever made the
+      // archive put one.
+      const leaf = member.name.slice(member.name.lastIndexOf("/") + 1);
+      if (member.name.endsWith("/") || member.name.startsWith("__MACOSX/") || leaf.startsWith("._")) return [];
+      const dot = leaf.lastIndexOf(".");
+      const type = dot < 0 ? undefined : ZIP_MEMBERS[leaf.slice(dot + 1).toLowerCase()];
+      // The type travels with the member it was read off, because computing it
+      // twice is how the filter and the read come to disagree -- and a
+      // disagreement here is `undefined` handed on as a content type.
+      return type === undefined ? [] : [{ member, type }];
     });
-    bytes = await readBody(new Response(slices.pipeThrough(new DecompressionStream("gzip"))))
-      .catch((err: unknown) => {
-        // readBody's own refusal is an Error it has already named. A TypeError
-        // is the decompressor saying these bytes are not a gzip stream.
-        if (!(err instanceof TypeError)) throw err;
-        return bad(400, `This body does not decompress as gzip.`, {
-          Received: `${raw.byteLength} bytes the gzip reader refused: ${reason(err)}`,
-          Expected: "the bytes gzip wrote, because this body declares itself gzip",
-          Source: source,
-          Fix: "send what gzip wrote, or declare the type the body actually is",
-        });
-      });
-    if (bytes.byteLength > BODY_CAP) {
-      bad(413, `This body decompresses to more than can be stored.`, {
-        Received: `${raw.byteLength} compressed bytes holding at least ${bytes.byteLength}`,
-        Limit: `${BODY_CAP} bytes per body, decompressed`,
+    if (named.length !== 1) {
+      const held = named.length ? named.map(({ member }) => member) : members;
+      const listed = held.slice(0, ZIP_NAMES_MAX).map((member) => show(member.name)).join(", ");
+      bad(400, `This zip holds ${named.length === 0 ? "nothing" : `${named.length} files`} this reader can take.`, {
+        Received: `an archive of ${members.length} members${listed ? `: ${listed}` : ""}${
+          held.length > ZIP_NAMES_MAX ? `, and ${held.length - ZIP_NAMES_MAX} more` : ""
+        }`,
+        Expected: `exactly one member named .${Object.keys(ZIP_MEMBERS).join(", .")}`,
         Source: source,
-        Fix: "compress a paged or filtered answer, or give the sheet a cursor",
+        Fix: "zip the one file this sheet is for, or point the sheet at that file itself",
       });
     }
+    const { member, type } = named[0];
+    if (member.encrypted) {
+      bad(400, `A member of this zip is encrypted.`, {
+        Received: `member ${show(member.name)}, with its encryption flag set`,
+        Expected: "an archive this server can open, because there is nowhere to keep a passphrase",
+        Source: source,
+        Fix: "zip the file without a password",
+      });
+    }
+    const inside = await zipData(raw, member, source);
+    const where = `${member.name} in ${source}`;
+    // Nothing but the member's name said this is JSON, and this server read that
+    // name itself, so the claim is checked here rather than handed on: there is
+    // no parser for `application/json` to hand it to.
+    if (type === "application/json")
+      return jsonMeant(new TextDecoder().decode(inside), where, "the member is named .json");
+    return await readFeedBody(inside, type, where, depth + 1);
   }
-  const text = new TextDecoder().decode(bytes);
-  // What a gzip holds is the one thing neither door can be told: one header
-  // says the body is compressed and nothing says what came out of it. The first
-  // character that is not whitespace is the whole of the sniff -- JSON opens
-  // with a bracket or a brace, and everything else is read as a delimited file.
+  const bytes = how === "gzip" ? await expand(raw, "gzip", source) : raw;
+  // An XML body is the one that says what encoding it is in, and the one where
+  // guessing wrong is stored as data rather than refused.
+  const xmlish = how === "xml" || how === "rss" || how === "atom";
+  const text = xmlish ? xmlText(bytes, source) : new TextDecoder().decode(bytes);
+  // What a gzip holds is the one thing neither door can be told: one header says
+  // the body is compressed and nothing says what came out of it. The first
+  // character that is not whitespace is the whole of the sniff -- JSON opens with
+  // a bracket or a brace, and everything else is read as a delimited file.
   const reading = how === "gzip" ? (/^\s*[[{]/.test(text) ? "json" : "csv") : how;
-  if (reading === "json") return text;
   let meant: string;
-  if (reading === "ndjson") {
+  if (reading === "json") {
+    // Checked, and then the text that arrived is what is stored: re-serialising
+    // it would change the digest that rides `meta.sig`, and a repeated body would
+    // stop being recognised as one.
+    meant = jsonMeant(text, source, "what came out of the gzip opens a JSON value");
+  } else if (reading === "ndjson") {
     const rows: unknown[] = [];
     const lines = text.split("\n");
     for (let i = 0; i < lines.length; i++) {
@@ -3484,6 +4028,16 @@ const readFeedBody = async (raw: Uint8Array<ArrayBuffer>, contentType: string, s
       }
     }
     meant = JSON.stringify(rows);
+  } else if (reading === "rss" || reading === "atom") {
+    const parsed = xmlDoc(text, source);
+    xmlFeedRoot(parsed, reading, source);
+    meant = JSON.stringify(xmlRows(parsed, reading === "rss" ? "item" : "entry", source));
+  } else if (reading === "xml") {
+    // The whole document, not a guess at which element is the rows: generic XML
+    // names no row element the way RSS and Atom do. A paged or upsert sheet says
+    // where they sit with `rows_path`; on any other sheet the document is what is
+    // stored and a query over it is what reads the rows out.
+    meant = JSON.stringify(xmlDoc(text, source));
   } else {
     // Keyed by column name, which is what every reader downstream keys on and
     // what a JSON feed hands them. `col.key` is the document's own spelling and
@@ -3492,8 +4046,8 @@ const readFeedBody = async (raw: Uint8Array<ArrayBuffer>, contentType: string, s
     meant = JSON.stringify(rows.map((row) => Object.fromEntries(cols.map((col) => [col.name, row[col.key]]))));
   }
   // The cap on what the body means, which is what lands in the column: a body
-  // arrives naming its columns once and is stored naming them on every row, so
-  // a few kilobytes on the wire is megabytes here. Neither door's own check can
+  // arrives naming its columns once and is stored naming them on every row, so a
+  // few kilobytes on the wire is megabytes here. Neither door's own check can
   // stand in for this one -- the poller's is on the bytes that arrived and
   // bodyLimit's is on the request.
   const stored = new TextEncoder().encode(meant).byteLength;
