@@ -586,15 +586,15 @@ suite =
             , test "chart decodes its source, kind and both axes" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:budget-burn","kind":"bar","x":"department","y":"burn_ratio"}]}"""
-                        |> Expect.equal (Ok (Chart { source = "@query:budget-burn", kind = Bar, x = "department", y = "burn_ratio", series = "" }))
+                        |> Expect.equal (Ok (Chart { source = "@query:budget-burn", kind = Bar, x = "department", y = "burn_ratio", y2 = "", series = "", annotations = [] }))
             , test "a chart with no kind is a line, and its axes default to empty" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:x"}]}"""
-                        |> Expect.equal (Ok (Chart { source = "@query:x", kind = Line, x = "", y = "", series = "" }))
+                        |> Expect.equal (Ok (Chart { source = "@query:x", kind = Line, x = "", y = "", y2 = "", series = "", annotations = [] }))
             , test "chart decodes the column it splits its rows by" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:x","x":"day","y":"z","series":"line"}]}"""
-                        |> Expect.equal (Ok (Chart { source = "@query:x", kind = Line, x = "day", y = "z", series = "line" }))
+                        |> Expect.equal (Ok (Chart { source = "@query:x", kind = Line, x = "day", y = "z", y2 = "", series = "line", annotations = [] }))
             , test "every kind the engine admits decodes to one of its own" <|
                 \_ ->
                     chartKinds
@@ -603,10 +603,31 @@ suite =
                                 D.decodeString docDecoder
                                     ("""{"type":"chart","data":[{"source":"@query:x","kind":\"""" ++ (kindSpec k).name ++ "\"}]}")
                             )
-                        |> Expect.equal (List.map (\k -> Ok (Chart { source = "@query:x", kind = k, x = "", y = "", series = "" })) chartKinds)
+                        |> Expect.equal (List.map (\k -> Ok (Chart { source = "@query:x", kind = k, x = "", y = "", y2 = "", series = "", annotations = [] })) chartKinds)
             , test "a kind nobody draws is refused rather than drawn as a line" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:x","kind":"scater"}]}"""
+                        |> Result.mapError (always "refused")
+                        |> Expect.equal (Err "refused")
+            , test "chart decodes the second column and the days it marks" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:x","x":"day","y":"ratio","y2":"z","annotations":[{"at":"2026-02-02","label":"earnings"}]}]}"""
+                        |> Expect.equal
+                            (Ok
+                                (Chart
+                                    { source = "@query:x"
+                                    , kind = Line
+                                    , x = "day"
+                                    , y = "ratio"
+                                    , y2 = "z"
+                                    , series = ""
+                                    , annotations = [ ( "2026-02-02", "earnings" ) ]
+                                    }
+                                )
+                            )
+            , test "an annotation list that is not one is refused rather than read as no marks" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"chart","data":[{"source":"@query:x","annotations":"2026-02-02 earnings"}]}"""
                         |> Result.mapError (always "refused")
                         |> Expect.equal (Err "refused")
             , test "dashboard decodes its tiles in order" <|
@@ -643,23 +664,23 @@ suite =
         , describe "chartPoints"
             [ test "reads the x label and the y number, in the order given" <|
                 \_ ->
-                    chartPoints (chartTable [ ( "", "Jan", E.float 3 ), ( "", "Feb", E.float 1 ) ])
+                    chartPoints "y" (chartTable [ ( "", "Jan", E.float 3 ), ( "", "Feb", E.float 1 ) ])
                         |> Expect.equal [ ( "", [ ( "Jan", 3 ), ( "Feb", 1 ) ] ) ]
             , test "a y that is not a number is dropped, not read as zero" <|
                 \_ ->
-                    chartPoints (chartTable [ ( "", "Jan", E.float 3 ), ( "", "Feb", E.string "n/a" ), ( "", "Mar", E.float 2 ) ])
+                    chartPoints "y" (chartTable [ ( "", "Jan", E.float 3 ), ( "", "Feb", E.string "n/a" ), ( "", "Mar", E.float 2 ) ])
                         |> Expect.equal [ ( "", [ ( "Jan", 3 ), ( "Mar", 2 ) ] ) ]
             , test "a y held as a numeric string still counts" <|
                 \_ ->
-                    chartPoints (chartTable [ ( "", "Jan", E.string "4.5" ) ])
+                    chartPoints "y" (chartTable [ ( "", "Jan", E.string "4.5" ) ])
                         |> Expect.equal [ ( "", [ ( "Jan", 4.5 ) ] ) ]
             , test "no plottable rows is an empty chart, not a crash" <|
                 \_ ->
-                    chartPoints (chartTable [ ( "", "Jan", E.null ) ])
+                    chartPoints "y" (chartTable [ ( "", "Jan", E.null ) ])
                         |> Expect.equal []
             , test "a series column splits the rows, each series in the order it first arrives" <|
                 \_ ->
-                    chartPoints
+                    chartPoints "y"
                         (chartTable
                             [ ( "north", "Jan", E.float 3 )
                             , ( "north", "Feb", E.float 1 )
@@ -673,7 +694,7 @@ suite =
                             ]
             , test "a y that is not a number is dropped from its own series only" <|
                 \_ ->
-                    chartPoints
+                    chartPoints "y"
                         (chartTable
                             [ ( "north", "Jan", E.string "n/a" )
                             , ( "north", "Feb", E.float 1 )
@@ -686,13 +707,13 @@ suite =
                             ]
             , test "a series nothing names is the one unnamed series a chart always drew" <|
                 \_ ->
-                    chartPoints (chartTable [ ( "", "Jan", E.float 3 ), ( "north", "Jan", E.float 2 ) ])
+                    chartPoints "y" (chartTable [ ( "", "Jan", E.float 3 ), ( "north", "Jan", E.float 2 ) ])
                         |> Expect.equal [ ( "", [ ( "Jan", 3 ) ] ), ( "north", [ ( "Jan", 2 ) ] ) ]
             , test "a label or a series held as a number is read as its digits, not as one blank they all share" <|
                 \_ ->
                     -- chart:compa-ratio plots an int column on x, and every series
                     -- a report splits by is an id as often as it is a word.
-                    chartPoints
+                    chartPoints "y"
                         { cols = Array.empty
                         , rows =
                             Array.fromList
@@ -768,6 +789,164 @@ suite =
                     chartFold [ ( "", List.range 0 (2 * chartPointsMax - 1) |> List.map (\i -> ( "bucket " ++ String.fromInt i, toFloat i )) ) ]
                         |> List.map (Tuple.second >> List.length)
                         |> Expect.equal [ 2 * chartPointsMax ]
+            ]
+        , describe "a second scale"
+            [ test "the second column is read off the same rows as the first" <|
+                \_ ->
+                    chartPoints "y2" (chartTwoScales [ ( "Jan", 3, 0.5 ), ( "Feb", 1, 0.25 ) ])
+                        |> Expect.equal [ ( "", [ ( "Jan", 0.5 ), ( "Feb", 0.25 ) ] ) ]
+            , test "a chart with no second column has no second series at all" <|
+                \_ ->
+                    chartPoints "y2" (chartTable [ ( "", "Jan", E.float 3 ) ])
+                        |> Expect.equal []
+            , test "a row whose second value is not a number is dropped from the second scale alone" <|
+                \_ ->
+                    ( chartPoints "y" (chartTwoScalesRaw [ ( "Jan", E.float 3, E.string "n/a" ) ])
+                    , chartPoints "y2" (chartTwoScalesRaw [ ( "Jan", E.float 3, E.string "n/a" ) ])
+                    )
+                        |> Expect.equal ( [ ( "", [ ( "Jan", 3 ) ] ) ], [] )
+            ]
+        , describe "chartBoxes"
+            [ test "one box per x, in the order the rows arrive" <|
+                \_ ->
+                    chartBoxes (boxTable [ ( "b", { lo = 1, q1 = 2, med = 3, q3 = 4, hi = 5 } ), ( "a", { lo = 0, q1 = 1, med = 2, q3 = 3, hi = 4 } ) ])
+                        |> List.map Tuple.first
+                        |> Expect.equal [ "b", "a" ]
+            , test "the five numbers come back as they were answered" <|
+                \_ ->
+                    chartBoxes (boxTable [ ( "a", { lo = 1, q1 = 2, med = 3, q3 = 4, hi = 5 } ) ])
+                        |> Expect.equal [ ( "a", { lo = 1, q1 = 2, med = 3, q3 = 4, hi = 5 } ) ]
+            , test "a row missing one of the five is dropped whole" <|
+                \_ ->
+                    chartBoxes
+                        { cols = Array.empty
+                        , rows = Array.fromList [ Dict.fromList [ ( "x", E.string "a" ), ( "lo", E.float 1 ), ( "q1", E.float 2 ), ( "med", E.float 3 ), ( "q3", E.float 4 ) ] ]
+                        }
+                        |> Expect.equal []
+            , test "a numeric label reads as its digits rather than as a blank" <|
+                \_ ->
+                    chartBoxes
+                        { cols = Array.empty
+                        , rows = Array.fromList [ Dict.fromList [ ( "x", E.int 7 ), ( "lo", E.float 1 ), ( "q1", E.float 2 ), ( "med", E.float 3 ), ( "q3", E.float 4 ), ( "hi", E.float 5 ) ] ]
+                        }
+                        |> List.map Tuple.first
+                        |> Expect.equal [ "7" ]
+            ]
+        , describe "chartSpan and chartAt"
+            [ test "the span is the earliest and the latest day any series holds" <|
+                \_ ->
+                    chartSpan [ ( "a", [ ( "2024-01-05", 1 ) ] ), ( "b", [ ( "2024-01-01", 2 ), ( "2024-01-09", 3 ) ] ) ]
+                        |> Expect.equal (Just ( civilDays 2024 1 1, civilDays 2024 1 9 ))
+            , test "one x that is not a day is no span at all" <|
+                \_ ->
+                    chartSpan [ ( "", [ ( "2024-01-01", 1 ), ( "Jan", 2 ) ] ) ]
+                        |> Expect.equal Nothing
+            , test "the ends of the span sit at the ends of the plot" <|
+                \_ ->
+                    ( chartAt ( 0, 10 ) 0, chartAt ( 0, 10 ) 10, chartAt ( 0, 10 ) 5 )
+                        |> Expect.equal ( 60, 780, 420 )
+            , test "a day outside the span is placed outside the plot, never clamped into it" <|
+                \_ ->
+                    -- An annotation may name a day the data does not hold, and a
+                    -- mark dragged to the edge would date it wrong.
+                    chartAt ( 0, 10 ) 15 |> Expect.equal 1140
+            , test "a span of one day sits where a lone point sits" <|
+                \_ ->
+                    chartAt ( 5, 5 ) 5 |> Expect.equal 400
+            ]
+        , describe "parseAnnotation"
+            [ test "a day and the rest of the line" <|
+                \_ -> parseAnnotation "2026-02-02 earnings call" |> Expect.equal (Just ( "2026-02-02", "earnings call" ))
+            , test "a day on its own is a mark with no label" <|
+                \_ -> parseAnnotation "2026-02-02" |> Expect.equal (Just ( "2026-02-02", "" ))
+            , test "a blank line is no mark" <|
+                \_ -> parseAnnotation "   " |> Expect.equal Nothing
+            ]
+        , describe "legendLayout"
+            [ test "entries that fit take one row" <|
+                \_ ->
+                    legendLayout [ "north", "south" ] |> Tuple.second |> Expect.equal 1
+            , test "the first entry starts at the left edge of the plot" <|
+                \_ ->
+                    legendLayout [ "north" ] |> Tuple.first |> Expect.equal [ ( 60, 8 ) ]
+            , test "entries past the width wrap to a row of their own" <|
+                \_ ->
+                    legendLayout (List.repeat 12 "a long series name") |> Tuple.second |> Expect.greaterThan 1
+            , test "every entry is placed, however many rows it took" <|
+                \_ ->
+                    legendLayout (List.repeat 12 "a long series name") |> Tuple.first |> List.length |> Expect.equal 12
+            , test "a wrapped entry starts the next row at the left edge" <|
+                \_ ->
+                    legendLayout (List.repeat 12 "a long series name")
+                        |> Tuple.first
+                        |> List.filter (\( x, _ ) -> x == 60)
+                        |> List.length
+                        |> Expect.greaterThan 1
+            , test "no names is no legend and no row" <|
+                \_ -> legendLayout [] |> Expect.equal ( [], 0 )
+            , test "a name wider than the whole plot is placed once, not wrapped forever" <|
+                \_ ->
+                    legendLayout [ String.repeat 400 "a" ] |> Expect.equal ( [ ( 60, 8 ) ], 1 )
+            ]
+        , describe "near duplicates"
+            [ -- The same pairs main_test.ts asserts the UDFs against. The panel's
+              -- verb and a query have to call two rows the same distance apart,
+              -- and this half and that half are what say so.
+              test "similarity is the trigram overlap the UDF answers" <|
+                \_ ->
+                    [ similarity "Acme Corp" "Acme Corp.", similarity "Acme" "Zebra", similarity "" "" ]
+                        |> Expect.equal [ 0.75, 0, 1 ]
+            , test "soundex is the code the UDF answers" <|
+                \_ ->
+                    List.map soundex [ "Robert", "Rupert", "Tymczak", "" ]
+                        |> Expect.equal [ "R163", "R163", "T522", "" ]
+            , test "a near spelling under a row above it is the row that goes" <|
+                \_ ->
+                    nearIn 70 [ "Acme Corp", "Zebra Ltd", "Acme Corp." ]
+                        |> Expect.equal (Ok [ ( 3, 1, 75 ) ])
+            , test "an exact repeat is the other verb's, not this one's" <|
+                \_ ->
+                    nearIn 70 [ "Acme Corp", "Acme Corp" ]
+                        |> Expect.equal (Ok [])
+            , test "three spellings of one name all collapse to the first" <|
+                \_ ->
+                    nearIn 60 [ "Acme Corp", "Acme Corp.", "Acme Corps" ]
+                        |> Result.map (List.map (\( goes, kept, _ ) -> ( goes, kept )))
+                        |> Expect.equal (Ok [ ( 2, 1 ), ( 3, 1 ) ])
+            , test "two names that do not sound alike are never compared" <|
+                \_ ->
+                    nearIn 1 [ "Acme", "Zebra" ]
+                        |> Expect.equal (Ok [])
+            , test "a closeness outside 1 to 100 is refused by name" <|
+                \_ ->
+                    nearIn 0 [ "Acme" ]
+                        |> Result.mapError (String.contains "between 1 and 100")
+                        |> Expect.equal (Err True)
+            , test "a sheet past the row bound is refused, and the refusal carries the count" <|
+                \_ ->
+                    nearIn 80 (List.repeat (maxFuzzyRows + 1) "Acme")
+                        |> Result.mapError (String.contains (String.fromInt (maxFuzzyRows + 1)))
+                        |> Expect.equal (Err True)
+            , -- The bound that actually matters: a column of numbers held as
+              -- text codes to "" on every row, so soundex buckets nothing and
+              -- the comparison is the quadratic case the buckets exist to
+              -- avoid. Every value is distinct, so nothing matches and every
+              -- pair is walked.
+              test "rows that all sound alike are refused on the comparisons, not the rows" <|
+                \_ ->
+                    nearIn 90 (List.range 1 1000 |> List.map String.fromInt)
+                        |> Result.mapError (String.contains (String.fromInt maxFuzzyPairs))
+                        |> Expect.equal (Err True)
+            , test "a sheet inside the comparison bound still answers" <|
+                \_ ->
+                    nearIn 90 (List.range 1 100 |> List.map String.fromInt)
+                        |> Result.map (always "answered")
+                        |> Expect.equal (Ok "answered")
+            , test "a column with no text in it is refused rather than answering nothing" <|
+                \_ ->
+                    nearIn 80 [ "", "  " ]
+                        |> Result.mapError (String.contains "received none")
+                        |> Expect.equal (Err True)
             ]
         , describe "Column stats"
             [ describe "civilDays"
@@ -1673,6 +1852,67 @@ dateRows =
 boolRows : List E.Value -> Array.Array (Dict.Dict String D.Value)
 boolRows =
     List.map (Dict.singleton "b") >> Array.fromList
+
+
+{-| The near-duplicate rows of one text column, over a sheet of the given names.
+The column is read out of a document the way the page reads one, so the test
+never has to name a `Type` the module does not expose.
+-}
+nearIn : Int -> List String -> Result String (List ( Int, Int, Int ))
+nearIn closeness names =
+    case Array.get 0 (namedCols [ "name" ]) of
+        Just col ->
+            nearDuplicates col closeness (nameRows names)
+
+        Nothing ->
+            Err "namedCols answered no column"
+
+
+{-| One text column, keyed the way a table document keys its cells.
+-}
+nameRows : List String -> Array.Array (Dict.Dict String D.Value)
+nameRows names =
+    names |> List.map (\name -> Dict.fromList [ ( "0", E.string name ) ]) |> Array.fromList
+
+
+{-| The rows a chart with two scales receives: an x, a y and a y2 on each.
+-}
+chartTwoScales : List ( String, Float, Float ) -> Table
+chartTwoScales points =
+    chartTwoScalesRaw (List.map (\( x, y, y2 ) -> ( x, E.float y, E.float y2 )) points)
+
+
+chartTwoScalesRaw : List ( String, E.Value, E.Value ) -> Table
+chartTwoScalesRaw points =
+    { cols = Array.empty
+    , rows =
+        points
+            |> List.map (\( x, y, y2 ) -> Dict.fromList [ ( "x", E.string x ), ( "y", y ), ( "y2", y2 ) ])
+            |> Array.fromList
+    }
+
+
+{-| The rows chartSql's box branch answers with: five numbers per x, already
+grouped by the query.
+-}
+boxTable : List ( String, { lo : Float, q1 : Float, med : Float, q3 : Float, hi : Float } ) -> Table
+boxTable boxes =
+    { cols = Array.empty
+    , rows =
+        boxes
+            |> List.map
+                (\( x, b ) ->
+                    Dict.fromList
+                        [ ( "x", E.string x )
+                        , ( "lo", E.float b.lo )
+                        , ( "q1", E.float b.q1 )
+                        , ( "med", E.float b.med )
+                        , ( "q3", E.float b.q3 )
+                        , ( "hi", E.float b.hi )
+                        ]
+                )
+            |> Array.fromList
+    }
 
 
 {-| A chart sheet always resolves to columns named x and y, and to a third named

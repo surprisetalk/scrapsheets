@@ -192,17 +192,28 @@ const replay = (engine: Engine) => {
   for (const [id, ex] of Object.entries(byId)) {
     const doc = ex.doc.data[0] as unknown as {
       source: string;
+      kind: string | undefined;
       x: string;
       y: string;
+      y2: string | undefined;
       series: string | undefined;
+      annotations: { at: string; label: string }[] | undefined;
       tiles: string[];
     };
     if (ex.doc.type === "chart") {
       const source = run(doc.source.slice(1));
-      // The series column is read from the same sheet the axes are, so it is
-      // checked with them; a chart that plots one thing names none.
-      for (const axis of [doc.x, doc.y, ...(doc.series ? [doc.series] : [])])
+      // The series column and the second y are read from the same sheet the
+      // axes are, so they are checked with them; a chart that plots one thing
+      // names neither.
+      for (const axis of [doc.x, doc.y, ...(doc.series ? [doc.series] : []), ...(doc.y2 ? [doc.y2] : [])])
         assert(Object.hasOwn(source[0], axis), `${id} plots "${axis}", which ${doc.source} does not have`);
+      // A mark is placed by parseDay in src/Main.elm and drawn nowhere at all
+      // when it does not read as one, so a bundled chart with an undated mark is
+      // a feature that silently does nothing.
+      for (const mark of doc.annotations ?? []) {
+        assert(/^\d{4}-\d{2}-\d{2}/.test(mark.at), `${id} marks "${mark.at}", which is not a day`);
+        assert(mark.label !== "", `${id} draws a mark on ${mark.at} with no label`);
+      }
       // The same SQL both engines build for a chart, so the drawn chart and the
       // exported CSV cannot disagree.
       assert(chartSql(doc).includes(doc.y), `${id} should plot ${doc.y}`);
@@ -234,6 +245,20 @@ const replay = (engine: Engine) => {
         const at = JSON.stringify([row.series, row.x]);
         assert(!seen.has(at), `${id} draws two points at ${at}; group its source by the pair it plots`);
         seen.add(at);
+      }
+      // A box answers five numbers per x rather than a y, and chartBoxes in
+      // src/Main.elm drops a row missing any of them -- so a box whose source
+      // cannot be aggregated draws nothing rather than a short picture.
+      if (doc.kind === "box") {
+        for (const row of drawn) {
+          for (const name of ["lo", "q1", "med", "q3", "hi"])
+            assert(typeof row[name] === "number", `${id} answers ${name} = ${JSON.stringify(row[name])}, not a number`);
+          assert(
+            (row.lo as number) <= (row.q1 as number) && (row.q1 as number) <= (row.med as number) &&
+              (row.med as number) <= (row.q3 as number) && (row.q3 as number) <= (row.hi as number),
+            `${id} answers a box at ${JSON.stringify(row.x)} whose five numbers are out of order`,
+          );
+        }
       }
     }
     if (ex.doc.type === "dashboard") {

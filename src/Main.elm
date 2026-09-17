@@ -21,11 +21,14 @@ port module Main exposing
     , blankRows
     , canonicalTypeNames
     , cellRewrites
+    , chartAt
+    , chartBoxes
     , chartFold
     , chartKinds
     , chartPoints
     , chartPointsMax
     , chartRuns
+    , chartSpan
     , civilDays
     , clampIndex
     , columnSplit
@@ -47,13 +50,18 @@ port module Main exposing
     , freshnessDecoder
     , kindSpec
     , knownTypeName
+    , legendLayout
     , main
+    , maxFuzzyPairs
+    , maxFuzzyRows
     , movePatch
     , moveSelection
     , nameClash
+    , nearDuplicates
     , nextSortOrder
     , normalizeRect
     , paletteCommands
+    , parseAnnotation
     , parseCsv
     , parseDay
     , parseJson
@@ -69,8 +77,10 @@ port module Main exposing
     , serializeToTsv
     , seriesEncoder
     , shortcutGroups
+    , similarity
     , skipHidden
     , sortRankOf
+    , soundex
     , tableHome
     , typeName
     , usd
@@ -878,6 +888,21 @@ port requestCopy : (() -> msg) -> Sub msg
 port queryEditorState : ({ cursorPos : Int, textBeforeCursor : String } -> msg) -> Sub msg
 
 
+{-| What columns one referenced sheet has. Asked for when the editor sees a dot
+after a ref, answered by `describe @<ref>` through the page's own engine -- the
+same read the statement answers with, so a suggestion cannot disagree with the
+schema the query will then be checked against.
+
+The columns cannot be read in Elm: the sheets live in the `sheets()` closure in
+src/page.mjs behind the automerge repo, which is the whole reason this is a port.
+
+-}
+port columnsFor : String -> Cmd msg
+
+
+port columnsLoaded : (Idd (List String) -> msg) -> Sub msg
+
+
 port insertAtCursor : String -> Cmd msg
 
 
@@ -1111,6 +1136,7 @@ type alias Sheet =
     , filterOpen : Maybe String
     , findReplace : Maybe FindReplace
     , queryAutocomplete : Maybe QueryAutocomplete
+    , queryColumns : Dict String (List String)
     , undoStack : List UndoEntry
     , redoStack : List UndoEntry
     , netStatus : Maybe String
@@ -1134,6 +1160,7 @@ type alias Sheet =
     -- is open at a time, and this browser's own: it is the argument a split is
     -- about to be run with, never anything the document keeps.
     , splitOn : String
+    , near : String
     , resizing : Maybe { key : String, startX : Int, startWidth : Int }
 
     -- The column or row being dragged to a new position, while the drag lasts.
@@ -1171,6 +1198,7 @@ emptySheet =
     , filterOpen = Nothing
     , findReplace = Nothing
     , queryAutocomplete = Nothing
+    , queryColumns = Dict.empty
     , undoStack = []
     , redoStack = []
     , netStatus = Nothing
@@ -1181,6 +1209,7 @@ emptySheet =
     , decimals = Dict.empty
     , formats = Dict.empty
     , splitOn = ""
+    , near = ""
     , resizing = Nothing
     , moving = Nothing
     , storedView = emptyView
@@ -1862,7 +1891,7 @@ type Doc
     | NetHook
     | NetHttp { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String, mode : String, key : String, rowsPath : String, paused : Bool }
     | Alert { code : String, to : String, interval : Int, digest : Bool, when : When, paused : Bool, snoozedUntil : String }
-    | Chart { source : String, kind : ChartKind, x : String, y : String, series : String }
+    | Chart Chart_
     | Dashboard (List String)
     | NetSocket { url : String }
     | Unviewable String
@@ -1880,6 +1909,26 @@ type alias Query_ =
     , args : Args
     , examples : List String
     , cols : D.Value
+    }
+
+
+{-| A chart's settings, named the way `Query_` is because four readers spell
+them -- the doc, the decoder, `viewChart` and `viewChartSettings` -- and seven
+fields written out four times is four places a new one can be forgotten.
+
+`y2` is a second column drawn against a scale of its own; blank is the one scale
+every chart had before there were two. `annotations` are the moments marked on
+the axis, `( at, label )` each, and they are drawn only where the axis is time.
+
+-}
+type alias Chart_ =
+    { source : String
+    , kind : ChartKind
+    , x : String
+    , y : String
+    , y2 : String
+    , series : String
+    , annotations : List ( String, String )
     }
 
 
@@ -2113,6 +2162,7 @@ type ChartKind
     | Area
     | Scatter
     | Kpi
+    | Box
 
 
 kindSpec : ChartKind -> { name : String, label : String }
@@ -2133,10 +2183,49 @@ kindSpec kind =
         Kpi ->
             { name = "kpi", label = "the last value, its change, and a sparkline" }
 
+        Box ->
+            { name = "box", label = "the spread of the rows at each x" }
+
 
 chartKinds : List ChartKind
 chartKinds =
-    [ Line, Bar, Area, Scatter, Kpi ]
+    [ Line, Bar, Area, Scatter, Kpi, Box ]
+
+
+{-| A chart's seven settings. Grouped into three decoders rather than reached
+for one at a time, because `D.map7` is the ceiling and the next field after that
+is an `andThen` nobody can read: the axes go together, what is drawn beside them
+goes together, and the source and the kind say where and how.
+
+Every string field falls back to blank and `kind` to a line, so a chart written
+before any of them existed still decodes. `annotations` goes through
+`optionalField`, which refuses a field that is present and spelled wrong rather
+than painting it as the empty list -- a chart quietly drawing no marks is a chart
+lying about its document.
+
+-}
+chartDecoder : D.Decoder Doc
+chartDecoder =
+    let
+        str name =
+            D.oneOf [ D.field name D.string, D.succeed "" ]
+    in
+    D.map3
+        (\( source, kind ) ( x, y, y2 ) ( series, annotations ) ->
+            Chart (Chart_ source kind x y y2 series annotations)
+        )
+        (D.map2 Tuple.pair
+            (str "source")
+            (D.oneOf [ D.field "kind" D.string, D.succeed "line" ] |> D.andThen kindDecoder)
+        )
+        (D.map3 (\x y y2 -> ( x, y, y2 )) (str "x") (str "y") (str "y2"))
+        (D.map2 Tuple.pair
+            (str "series")
+            (optionalField "annotations"
+                (D.list (D.map2 Tuple.pair (D.field "at" D.string) (D.field "label" D.string)))
+                []
+            )
+        )
 
 
 kindDecoder : String -> D.Decoder ChartKind
@@ -2372,17 +2461,7 @@ docDecoder =
                                     (optionalField "snoozed_until" D.string "")
 
                     "chart" ->
-                        D.field "data" <|
-                            D.index 0 <|
-                                D.map5 (\source kind x y series -> Chart { source = source, kind = kind, x = x, y = y, series = series })
-                                    (D.oneOf [ D.field "source" D.string, D.succeed "" ])
-                                    (D.oneOf [ D.field "kind" D.string, D.succeed "line" ] |> D.andThen kindDecoder)
-                                    (D.oneOf [ D.field "x" D.string, D.succeed "" ])
-                                    (D.oneOf [ D.field "y" D.string, D.succeed "" ])
-                                    -- Blank is the chart every document written before
-                                    -- there was a series means: one series, nothing to
-                                    -- name it, drawn the way it always was.
-                                    (D.oneOf [ D.field "series" D.string, D.succeed "" ])
+                        D.field "data" (D.index 0 chartDecoder)
 
                     "dashboard" ->
                         D.field "data" <|
@@ -2673,6 +2752,7 @@ type Msg
     | DocStar Id Bool
     | TrashSelected
     | ColumnSplitInput String
+    | ColumnNearInput String
     | DocDelete Id
     | DocDeleteConfirm Id
     | DocDeleteCancel
@@ -2752,6 +2832,7 @@ type Msg
     | TutorialDismiss
     | SelectAll
     | QueryEditorUpdate { cursorPos : Int, textBeforeCursor : String }
+    | ColumnsLoad (Idd (List String))
     | AutocompleteSelect String
     | AutocompleteNav Int
     | AutocompleteClose
@@ -2786,6 +2867,7 @@ type DocMsg
     | SheetColumnCase String Casing
     | SheetRowsDropBlank String
     | SheetRowsDedupe
+    | SheetRowsDedupeNear String Int
     | SheetColumnSplit String String
     | CellCheck Index Bool
 
@@ -2822,7 +2904,9 @@ type Input
     | ChartKind
     | ChartX
     | ChartY
+    | ChartY2
     | ChartSeries
+    | ChartAnnotations
     | DashboardTiles
     | PaletteQuery
 
@@ -2845,6 +2929,7 @@ subs model =
         , pasteFromClipboard ClipboardPaste
         , requestCopy (always ClipboardCopy)
         , queryEditorState QueryEditorUpdate
+        , columnsLoaded ColumnsLoad
         , shareLoaded ShareLoad
         , preflightLoaded PreflightLoad
         , runLoaded RunLoad
@@ -3109,6 +3194,7 @@ update msg ({ sheet, auth } as model) =
                     , filterOpen = Nothing
                     , findReplace = Nothing
                     , queryAutocomplete = Nothing
+                    , queryColumns = Dict.empty
                     , undoStack = []
                     , redoStack = []
                     , netStatus = Nothing
@@ -3119,6 +3205,7 @@ update msg ({ sheet, auth } as model) =
                     , decimals = stored.decimals
                     , formats = stored.formats
                     , splitOn = ""
+                    , near = ""
                     , resizing = Nothing
                     , moving = Nothing
                     , storedView = stored
@@ -3298,6 +3385,10 @@ update msg ({ sheet, auth } as model) =
             -- a verb nobody has run yet, and a patch per keystroke is a sync per
             -- keystroke for everybody watching the sheet.
             ( { model | sheet = { sheet | splitOn = delimiter } }, Cmd.none )
+
+        ColumnNearInput closeness ->
+            -- The model only, for the reason the delimiter above is.
+            ( { model | sheet = { sheet | near = closeness } }, Cmd.none )
 
         DocDelete id ->
             -- Show confirmation instead of immediately deleting
@@ -3745,8 +3836,35 @@ update msg ({ sheet, auth } as model) =
         InputChange ChartY x ->
             ( model, chartSet sheet.id "y" x )
 
+        InputChange ChartY2 x ->
+            ( model, chartSet sheet.id "y2" x )
+
         InputChange ChartSeries x ->
             ( model, chartSet sheet.id "series" x )
+
+        -- A list, so it cannot go through chartSet, which writes strings. One
+        -- line is a day, whitespace, and whatever is left over as the label; a
+        -- line with nothing after the day is a mark with no name, and a blank
+        -- line is no mark, the way a dashboard's tiles read.
+        InputChange ChartAnnotations x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data =
+                    [ { action = "set"
+                      , path = [ E.int 0, E.string "annotations" ]
+                      , value =
+                            x
+                                |> String.lines
+                                |> List.filterMap (String.trim >> parseAnnotation)
+                                |> E.list
+                                    (\( at, label ) ->
+                                        E.object [ ( "at", E.string at ), ( "label", E.string label ) ]
+                                    )
+                      }
+                    ]
+                }
+            )
 
         InputChange DashboardTiles x ->
             ( model
@@ -4298,54 +4416,45 @@ update msg ({ sheet, auth } as model) =
                     update AutocompleteClose model
 
                 _ ->
-                    -- Normal cursor position update - check for autocomplete trigger
                     let
-                        -- Find the last @ and get text after it
-                        maybeAtIndex =
-                            String.indices "@" textBeforeCursor
-                                |> List.reverse
-                                |> List.head
+                        trigger =
+                            completionTrigger textBeforeCursor
 
-                        autocomplete =
-                            case maybeAtIndex of
-                                Just atIdx ->
-                                    let
-                                        trigger =
-                                            String.dropLeft atIdx textBeforeCursor
-
-                                        -- Filter matching sheet IDs
-                                        searchTerm =
-                                            String.dropLeft 1 trigger
-                                                |> String.toLower
-
-                                        matches =
-                                            model.library
-                                                |> Dict.keys
-                                                |> List.filter
-                                                    (\k ->
-                                                        (String.startsWith "table:" k || String.startsWith "query:" k)
-                                                            && String.contains searchTerm (String.toLower k)
-                                                    )
-                                                |> List.take 8
-                                    in
-                                    if String.contains " " trigger || String.contains "\n" trigger then
-                                        -- Space or newline after @ cancels autocomplete
-                                        Nothing
-
-                                    else if List.isEmpty matches then
-                                        Nothing
-
-                                    else
-                                        Just
-                                            { trigger = trigger
-                                            , suggestions = matches
-                                            , selectedIndex = 0
-                                            }
+                        -- Asked for once per ref and kept: the answer runs a
+                        -- describe through the page's engine, and asking again
+                        -- on every keystroke would run it per character typed.
+                        ask =
+                            case Maybe.andThen completionRef trigger of
+                                Just ref ->
+                                    iif (Dict.member ref sheet.queryColumns) Cmd.none (columnsFor ref)
 
                                 Nothing ->
-                                    Nothing
+                                    Cmd.none
                     in
-                    ( { model | sheet = { sheet | queryAutocomplete = autocomplete } }, Cmd.none )
+                    ( { model | sheet = { sheet | queryAutocomplete = Maybe.map (completionAt model.library sheet.queryColumns) trigger } }, ask )
+
+        ColumnsLoad { id, data } ->
+            -- Held even when it is empty: a ref whose columns could not be read
+            -- is a ref this editor must not ask about again on the next
+            -- keystroke, and an empty list is exactly "nothing to suggest".
+            --
+            -- The open list is recomputed rather than left for the next
+            -- keystroke to refresh: the columns are asked for by the very
+            -- keystroke that would have shown them, so waiting would mean every
+            -- completion appeared one character late.
+            let
+                known =
+                    Dict.insert id data sheet.queryColumns
+            in
+            ( { model
+                | sheet =
+                    { sheet
+                        | queryColumns = known
+                        , queryAutocomplete = Maybe.map (completionAt model.library known << .trigger) sheet.queryAutocomplete
+                    }
+              }
+            , Cmd.none
+            )
 
         AutocompleteSelect ref ->
             -- Insert the selected reference and close autocomplete
@@ -4365,10 +4474,13 @@ update msg ({ sheet, auth } as model) =
 
         AutocompleteNav delta ->
             case sheet.queryAutocomplete of
+                -- modBy 0 is a runtime error in Elm, and a list with nothing in
+                -- it is drawn as no dropdown at all, so there is nothing to move
+                -- through either.
                 Just ac ->
                     let
                         newIndex =
-                            modBy (List.length ac.suggestions) (ac.selectedIndex + delta)
+                            modBy (max 1 (List.length ac.suggestions)) (ac.selectedIndex + delta)
                     in
                     ( { model | sheet = { sheet | queryAutocomplete = Just { ac | selectedIndex = newIndex } } }
                     , Cmd.none
@@ -4542,6 +4654,34 @@ updateDocMsg edit ({ sheet } as model) =
                         _ ->
                             Ok ( [], [] )
 
+                -- The near-duplicate rows, or why they could not be looked for.
+                -- Computed once, for the reason the split above is: the refusal
+                -- and the patches are two halves of one answer. `Ok []` is not a
+                -- refusal here, it is a verb with nothing to do -- so it is
+                -- turned into one by name, since a button that deletes nothing
+                -- and says nothing reads as a button that is broken.
+                near =
+                    case edit of
+                        SheetRowsDedupeNear key closeness ->
+                            Array.filter (\col -> col.key == key) table.cols
+                                |> Array.get 0
+                                |> Result.fromMaybe ("This sheet has no column keyed " ++ key ++ ".")
+                                |> Result.andThen (\col -> nearDuplicates col closeness table.rows)
+                                |> Result.andThen
+                                    (\found ->
+                                        iif (List.isEmpty found)
+                                            (Err
+                                                ("No two rows are within "
+                                                    ++ String.fromInt closeness
+                                                    ++ "% of each other in this column. Source: the near box. Fix: lower the percentage, or leave the sheet as it is."
+                                                )
+                                            )
+                                            (Ok (rowDeletions table.rows (List.map (\( goes, _, _ ) -> goes) found)))
+                                    )
+
+                        _ ->
+                            Ok ( [], [] )
+
                 -- Compute forward and backward patches based on edit type
                 ( forwardPatches, backwardPatches ) =
                     case edit of
@@ -4668,6 +4808,12 @@ updateDocMsg edit ({ sheet } as model) =
 
                         SheetRowsDedupe ->
                             rowDeletions table.rows (duplicateRows table.rows)
+
+                        SheetRowsDedupeNear _ _ ->
+                            -- The empty pair is never what is written, for the
+                            -- reason the split's is not: every way this says no
+                            -- is a refusal answered before a patch goes out.
+                            Result.withDefault ( [], [] ) near
 
                         SheetColumnSplit _ _ ->
                             -- The empty pair is never what is written: every way
@@ -4936,6 +5082,14 @@ updateDocMsg edit ({ sheet } as model) =
                     case ( edit, sheet.write ) of
                         ( SheetColumnSplit _ _, _ ) ->
                             case split of
+                                Err message ->
+                                    Just message
+
+                                Ok _ ->
+                                    Nothing
+
+                        ( SheetRowsDedupeNear _ _, _ ) ->
+                            case near of
                                 Err message ->
                                     Just message
 
@@ -6551,7 +6705,7 @@ resolveTable model =
             Ok emptyNetTable
 
         ( Ok (Chart _), Err "" ) ->
-            Ok { cols = Array.fromList [ madeCol "x" "x" Text, madeCol "y" "y" Number ], rows = Array.empty }
+            Ok { cols = Array.fromList [ madeCol "x" "x" Text, madeCol "y" "y" Number, madeCol "y2" "y2" Number ], rows = Array.empty }
 
         ( Ok (Dashboard tiles), _ ) ->
             Ok
@@ -6847,6 +7001,247 @@ duplicateRows rows =
             ( Set.empty, [] )
         |> Tuple.second
         |> List.reverse
+
+
+{-| Two strings' trigram overlap, 0 to 1. The same rule `similarity()` is in
+src/sql.mjs -- padded, lower-cased, three characters at a time, and the Jaccard
+of the two sets -- because the verb in the column's panel and the UDF in a query
+must call the same two rows the same distance apart. `MainTest.elm` and
+`main_test.ts` assert the same pairs, so the two cannot drift quietly.
+-}
+similarity : String -> String -> Float
+similarity a b =
+    let
+        shared =
+            Set.size (Set.intersect (trigrams a) (trigrams b))
+
+        total =
+            Set.size (trigrams a) + Set.size (trigrams b) - shared
+    in
+    -- Two empty strings are the same string; anything against an empty one
+    -- shares nothing.
+    iif (total == 0) 1 (toFloat shared / toFloat total)
+
+
+trigrams : String -> Set.Set String
+trigrams s =
+    let
+        padded =
+            "  " ++ String.toLower s ++ " "
+    in
+    List.range 0 (String.length padded - 3)
+        |> List.map (\i -> String.slice i (i + 3) padded)
+        |> Set.fromList
+
+
+{-| The soundex code of a word, the same four characters `soundex()` answers in
+src/sql.mjs. It is what buckets the rows before anything is compared: comparing
+every pair of a sheet is quadratic, and a browser cannot do that to a real sheet.
+-}
+soundex : String -> String
+soundex word =
+    case String.toList (String.filter Char.isAlpha (String.toUpper word)) of
+        [] ->
+            ""
+
+        first :: rest ->
+            let
+                -- H and W are transparent: they do not break a run of
+                -- same-coded letters.
+                step ch ( out, last ) =
+                    let
+                        c =
+                            soundexCode ch
+                    in
+                    if String.length out == 4 then
+                        ( out, last )
+
+                    else
+                        ( iif (c /= "" && c /= last) (out ++ c) out, iif (ch == 'H' || ch == 'W') last c )
+            in
+            List.foldl step ( String.fromChar first, soundexCode first ) rest
+                |> Tuple.first
+                |> String.padRight 4 '0'
+
+
+soundexCode : Char -> String
+soundexCode ch =
+    if String.any ((==) ch) "BFPV" then
+        "1"
+
+    else if String.any ((==) ch) "CGJKQSXZ" then
+        "2"
+
+    else if String.any ((==) ch) "DT" then
+        "3"
+
+    else if ch == 'L' then
+        "4"
+
+    else if String.any ((==) ch) "MN" then
+        "5"
+
+    else if ch == 'R' then
+        "6"
+
+    else
+        ""
+
+
+{-| The most rows a near-duplicate search reads.
+-}
+maxFuzzyRows : Int
+maxFuzzyRows =
+    5000
+
+
+{-| The most comparisons it makes, which is the bound that actually matters.
+
+Bucketing by soundex is what keeps this out of the quadratic case, and the row
+count alone assumed it works. It does not always: `soundex` keeps only letters,
+so a column of invoice numbers, zip codes or phone numbers held as text codes to
+`""` on every row and the whole sheet is one bucket -- which is the commonest
+column anybody would point this verb at. Five thousand such rows is twelve
+million comparisons and tens of seconds of a frozen tab, and since the preview is
+drawn from `view` it is tens of seconds **per keystroke** in the closeness box.
+
+So the work is bounded rather than the input, and exceeding it is a refusal
+carrying the counter. The number is what keeps one keystroke's worth of
+comparing under a tenth of a second.
+
+-}
+maxFuzzyPairs : Int
+maxFuzzyPairs =
+    50000
+
+
+{-| The document rows whose cell in this column is nearly, but not exactly, the
+cell of a row above them: the row that would go, the row it matched, and how
+close the two are as a percentage.
+
+The first of a near-group stays and the ones under it go, the way the exact verb
+already works -- and against the rows that stay, not against the ones already
+going, so three spellings of one name collapse to the first rather than to a
+chain of pairs.
+
+Rows are bucketed by `soundex` first and compared only inside a bucket. That is
+what makes this runnable in a browser, and it is also a rule: two strings whose
+first consonants differ are not near each other however many trigrams they share.
+
+Every way it cannot run is an `Err` rather than an empty answer, because the
+panel draws this as a preview and "nothing to do" and "this cannot be done" are
+not the same sentence.
+
+-}
+nearDuplicates : Col -> Int -> Array Row -> Result String (List ( Int, Int, Int ))
+nearDuplicates col closeness rows =
+    let
+        texts =
+            rows
+                |> Array.toIndexedList
+                |> List.filterMap
+                    (\( i, row ) ->
+                        Dict.get col.key row
+                            |> Maybe.andThen (D.decodeValue D.string >> Result.toMaybe)
+                            |> Maybe.andThen (\v -> iif (String.trim v == "") Nothing (Just ( i + 1, v )))
+                    )
+    in
+    if closeness < 1 || closeness > 100 then
+        Err
+            ("Expected how close counts as a percentage between 1 and 100, received "
+                ++ String.fromInt closeness
+                ++ ". Source: the near box on this column. Fix: type a number between 1 and 100, e.g. 85."
+            )
+
+    else if Array.length rows > maxFuzzyRows then
+        Err
+            ("Expected at most "
+                ++ String.fromInt maxFuzzyRows
+                ++ " rows to compare, received "
+                ++ String.fromInt (Array.length rows)
+                ++ ". Source: the near box on "
+                ++ col.name
+                ++ ". Fix: filter the sheet down, or dedupe it with a query."
+            )
+
+    else if List.isEmpty texts then
+        Err
+            ("Expected text to compare in "
+                ++ col.name
+                ++ ", received none. Source: every row's cell in this column is blank or is not text. Fix: run this on a column of names."
+            )
+
+    else
+        let
+            ( _, found, compared ) =
+                List.foldl
+                    (\( i, value ) ( kept, going, pairs ) ->
+                        -- Past the bound nothing more is compared, so the cost
+                        -- stops where the bound is rather than after it.
+                        if pairs > maxFuzzyPairs then
+                            ( kept, going, pairs )
+
+                        else
+                            let
+                                bucket =
+                                    soundex value
+
+                                held =
+                                    Dict.get bucket kept |> Maybe.withDefault []
+
+                                spent =
+                                    pairs + List.length held
+                            in
+                            case firstNear closeness value held of
+                                Just ( j, pct ) ->
+                                    ( kept, ( i, j, pct ) :: going, spent )
+
+                                Nothing ->
+                                    ( Dict.update bucket (\was -> Just (Maybe.withDefault [] was ++ [ ( i, value ) ])) kept, going, spent )
+                    )
+                    ( Dict.empty, [], 0 )
+                    texts
+        in
+        if compared > maxFuzzyPairs then
+            Err
+                ("Expected at most "
+                    ++ String.fromInt maxFuzzyPairs
+                    ++ " comparisons, received more than that from "
+                    ++ String.fromInt (List.length texts)
+                    ++ " rows of "
+                    ++ col.name
+                    ++ ". Source: too many of these values sound alike to compare them pair by pair -- a column of numbers held as text sounds alike on every row. Fix: filter the sheet down, or dedupe it with a query."
+                )
+
+        else
+            Ok (List.reverse found)
+
+
+{-| The first row already kept that this value is near enough to, or nothing.
+
+Recursive rather than a filter and a head, because only the first match is used
+and a filter reads the whole bucket to find it -- which is the quadratic half of
+this verb, paid in full on every row even when the answer was the first one.
+
+An exact repeat is the other verb's: this one is for the rows it misses.
+
+-}
+firstNear : Int -> String -> List ( Int, String ) -> Maybe ( Int, Int )
+firstNear closeness value held =
+    case held of
+        [] ->
+            Nothing
+
+        ( j, other ) :: rest ->
+            let
+                pct =
+                    round (100 * similarity value other)
+            in
+            if pct >= closeness && other /= value then
+                Just ( j, pct )
+
+            else
+                firstNear closeness value rest
 
 
 {-| The most columns one split may push. A cell with more parts than this says
@@ -7515,6 +7910,69 @@ viewStatCell typ decimals format maybeStat =
             []
 
 
+{-| The rows the near box would delete, named one by one, and the button that
+does it. A refusal is drawn as the sentence it is: the same sentence
+`updateDocMsg` would answer with, out of the same call, so the panel cannot
+promise what the verb refuses.
+-}
+viewNearPreview : Col -> Int -> Array Row -> Html Msg
+viewNearPreview col closeness rows =
+    case nearDuplicates col closeness rows of
+        Err message ->
+            H.p [ S.fontSizeRem 0.8125, S.color "#c00", S.marginTop "0.25rem" ] [ text message ]
+
+        Ok found ->
+            let
+                -- Rows this could not look at: the cell holds something, but not
+                -- text, so there is nothing to compare. Counted rather than left
+                -- for the reader to notice, the way a chart says how many points
+                -- a fold swallowed -- a preview that says "1 row would go" while
+                -- it never read half the sheet is a preview lying about the
+                -- sheet.
+                unread =
+                    rows
+                        |> Array.toList
+                        |> List.filter
+                            (\row ->
+                                not (blankCell col.key row)
+                                    && (Dict.get col.key row |> Maybe.andThen (D.decodeValue D.string >> Result.toMaybe))
+                                    == Nothing
+                            )
+                        |> List.length
+            in
+            H.div [ S.marginTop "0.25rem", S.fontSizeRem 0.8125 ]
+                [ H.button
+                    [ A.onClick (DocMsg (SheetRowsDedupeNear col.key closeness))
+                    , A.title "delete the rows listed below, keeping the first of each group"
+                    ]
+                    [ text ("Delete " ++ String.fromInt (List.length found) ++ " near-duplicate rows") ]
+                , iif (unread == 0)
+                    (text "")
+                    (H.p [ S.color "#666", S.marginTop "0.25rem" ]
+                        [ text
+                            (iif (unread == 1)
+                                "1 row holds no text in this column and was not compared"
+                                (String.fromInt unread ++ " rows hold no text in this column and were not compared")
+                            )
+                        ]
+                    )
+                , H.ul [ S.color "#666", S.marginTop "0.25rem" ]
+                    (found
+                        |> List.take 6
+                        |> List.map
+                            (\( goes, kept, pct ) ->
+                                H.li []
+                                    [ text
+                                        ("row " ++ String.fromInt goes ++ " matches row " ++ String.fromInt kept ++ " (" ++ String.fromInt pct ++ "%)")
+                                    ]
+                            )
+                    )
+                , iif (List.length found > 6)
+                    (H.p [ S.color "#666" ] [ text ("and " ++ String.fromInt (List.length found - 6) ++ " more") ])
+                    (text "")
+                ]
+
+
 viewHeaderCell : Sheet -> Col -> List (Html Msg)
 viewHeaderCell sheet col =
     case col.name of
@@ -7661,10 +8119,40 @@ viewHeaderCell sheet col =
                                         []
                                     , H.button [ A.onClick (DocMsg (SheetColumnSplit col.key sheet.splitOn)), A.title "add a column per part, leaving this one where it is" ] [ text "Split" ]
                                     ]
+                                , H.label [ A.class "near", S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ]
+                                    [ text "near %"
+                                    , H.input
+                                        [ A.type_ "number"
+                                        , A.min "1"
+                                        , A.max "100"
+                                        , A.placeholder "85"
+                                        , A.title "how close two spellings count as the same row; 100 is the exact repeat the palette already deletes"
+                                        , A.value sheet.near
+                                        , A.onInput ColumnNearInput
+                                        , S.widthRem 4
+                                        ]
+                                        []
+                                    ]
                                 ]
 
                           else
                             text ""
+                        , -- What the near box would do, before it is done.
+                          -- Unlike every other verb in this panel, nobody can
+                          -- see the answer by looking at the sheet: the rows it
+                          -- deletes are the ones that do not look alike enough
+                          -- to spot. So it is drawn rather than described, and
+                          -- the button carries the count it would take.
+                          -- Off `sheet.doc` and not `sheet.table`: a table
+                          -- sheet's rows are its document, which is also where
+                          -- `updateDocMsg` reads them, so the preview and the
+                          -- verb cannot be looking at two different sheets.
+                          case ( movable, String.toInt sheet.near, sheet.doc ) of
+                            ( True, Just closeness, Ok (Tab tbl) ) ->
+                                viewNearPreview col closeness tbl.rows
+
+                            _ ->
+                                text ""
                         , if hasFilter then
                             H.button [ A.onClick (FilterClear col.key), S.marginTop "0.25rem" ] [ text "Clear" ]
 
@@ -8406,7 +8894,7 @@ chartSet id field value =
     changeDoc { id = id, data = [ { action = "set", path = [ E.int 0, E.string field ], value = E.string value } ] }
 
 
-viewChartSettings : Model -> { source : String, kind : ChartKind, x : String, y : String, series : String } -> Html Msg
+viewChartSettings : Model -> Chart_ -> Html Msg
 viewChartSettings model cfg =
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
@@ -8432,8 +8920,25 @@ viewChartSettings model cfg =
             , H.input [ A.class "mono", A.value cfg.y, A.placeholder "spent", A.onInput (InputChange ChartY) ] []
             ]
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "and up, on its own scale"
+            , H.input [ A.class "mono", A.value cfg.y2, A.placeholder "margin_pct", A.title "a second column, drawn as a dashed line against the axis on the right", A.onInput (InputChange ChartY2) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "split by"
             , H.input [ A.class "mono", A.value cfg.series, A.placeholder "department", A.onInput (InputChange ChartSeries) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "mark these days"
+            , H.textarea
+                [ A.class "mono"
+                , A.rows 3
+                , A.value (cfg.annotations |> List.map (\( on, label ) -> String.trim (on ++ " " ++ label)) |> String.join "\n")
+                , A.placeholder "2026-03-01 price change\n2026-06-14 storm"
+                , A.title "one day and its label per line; marks are drawn only where the across column reads as a day"
+                , A.spellcheck False
+                , A.onInput (InputChange ChartAnnotations)
+                ]
+                []
             ]
         , H.p [ S.fontSizeRem 0.875, S.color "#666" ]
             [ text <|
@@ -8441,7 +8946,7 @@ viewChartSettings model cfg =
                     Ok tbl ->
                         let
                             drawn =
-                                chartPoints tbl
+                                chartPoints "y" tbl
 
                             -- What a fold cost, counted rather than left for the
                             -- reader to notice: a chart quietly drawing averages
@@ -8469,16 +8974,21 @@ chartColours =
     [ "#468", "#c64", "#4a7", "#96c", "#ca3", "#877" ]
 
 
-{-| The plotted points, grouped into series in the order they arrive: the query
-orders by series and then by x, so each series arrives whole and in the order it
-is drawn. A chart with no series column is one series with no name.
+{-| The plotted points of one column, grouped into series in the order they
+arrive: the query orders by series and then by x, so each series arrives whole
+and in the order it is drawn. A chart with no series column is one series with
+no name.
+
+The column is an argument because a chart may carry two of them: `"y"` is the
+scale on the left and `"y2"` the one on the right, read off the same rows by the
+same rule, so the two scales cannot disagree about which row is which.
 
 A row whose y does not read as a number is dropped: a chart cannot draw "n/a",
 and pretending it is zero would be a lie about the shape.
 
 -}
-chartPoints : Table -> List ( String, List ( String, Float ) )
-chartPoints tbl =
+chartPoints : String -> Table -> List ( String, List ( String, Float ) )
+chartPoints up tbl =
     tbl.rows
         |> Array.toList
         |> List.filterMap
@@ -8498,7 +9008,7 @@ chartPoints tbl =
                         )
                     )
                     (Dict.get "x" row |> Maybe.map (D.decodeValue string >> Result.withDefault ""))
-                    (Dict.get "y" row |> Maybe.andThen (D.decodeValue number >> Result.toMaybe))
+                    (Dict.get up row |> Maybe.andThen (D.decodeValue number >> Result.toMaybe))
             )
         |> List.foldl
             (\( name, point ) acc ->
@@ -8510,6 +9020,133 @@ chartPoints tbl =
             )
             []
         |> List.map (\( name, ps ) -> ( name, List.reverse ps ))
+
+
+{-| The five numbers a box is drawn from, per x, in the order the rows arrive.
+
+`chartSql`'s box branch already grouped them: one row per x carrying `lo`, `q1`,
+`med`, `q3` and `hi`, which is why this reads a row rather than a column of
+rows. A row missing any of the five, or holding one that is not a number, is
+dropped whole -- a box with no whisker is not a box, and drawing four of the five
+would be a picture of a spread nobody computed.
+
+-}
+chartBoxes : Table -> List ( String, { lo : Float, q1 : Float, med : Float, q3 : Float, hi : Float } )
+chartBoxes tbl =
+    let
+        at key row =
+            Dict.get key row |> Maybe.andThen (D.decodeValue number >> Result.toMaybe)
+    in
+    tbl.rows
+        |> Array.toList
+        |> List.filterMap
+            (\row ->
+                Maybe.map2 Tuple.pair
+                    -- The same lenient decoder the points read their label with:
+                    -- a box over an int column arrives as a number.
+                    (Dict.get "x" row |> Maybe.map (D.decodeValue string >> Result.withDefault ""))
+                    (Maybe.map5 (\lo q1 med q3 hi -> { lo = lo, q1 = q1, med = med, q3 = q3, hi = hi })
+                        (at "lo" row)
+                        (at "q1" row)
+                        (at "med" row)
+                        (at "q3" row)
+                        (at "hi" row)
+                    )
+            )
+
+
+{-| The `@…` the cursor is sitting in, or nothing. A space or a newline after the
+`@` is a ref that has ended, so there is nothing left to complete.
+-}
+completionTrigger : String -> Maybe String
+completionTrigger textBeforeCursor =
+    String.indices "@" textBeforeCursor
+        |> List.reverse
+        |> List.head
+        |> Maybe.map (\at -> String.dropLeft at textBeforeCursor)
+        |> Maybe.andThen (\t -> iif (String.contains " " t || String.contains "\n" t) Nothing (Just t))
+
+
+{-| The sheet a trigger is asking about the columns of, which is what a dot after
+the ref says: `@table:x.co` is `co` against the columns of `table:x`. No dot is
+somebody still naming the sheet, and there is nothing to ask.
+
+Only the two prefixes a query may reference at all, which is what the resolver
+refuses anything else for: the answer is a `describe` run through the page's own
+engine, and half a ref somebody is still typing is not a question worth asking
+it.
+
+-}
+completionRef : String -> Maybe String
+completionRef trigger =
+    case String.split "." (String.dropLeft 1 trigger) of
+        ref :: _ :: _ ->
+            iif (String.startsWith "table:" ref || String.startsWith "query:" ref) (Just ref) Nothing
+
+        _ ->
+            Nothing
+
+
+{-| What the editor offers for what has been typed: the columns of the named
+sheet once there is a dot, and the sheets themselves before there is one.
+
+It may answer nothing, and a `QueryAutocomplete` holding nothing draws nothing --
+which is what lets the list be recomputed when a sheet's columns arrive, rather
+than held back until the next keystroke rebuilds it.
+
+-}
+completionAt : Library -> Dict String (List String) -> String -> QueryAutocomplete
+completionAt shelf known trigger =
+    let
+        matching typed =
+            List.filter (String.toLower >> String.contains (String.toLower typed))
+    in
+    { trigger = trigger
+    , selectedIndex = 0
+    , suggestions =
+        case String.split "." (String.dropLeft 1 trigger) of
+            ref :: rest ->
+                if List.isEmpty rest then
+                    shelf
+                        |> Dict.keys
+                        |> List.filter (\k -> String.startsWith "table:" k || String.startsWith "query:" k)
+                        |> matching ref
+                        |> List.take 8
+
+                else
+                    Dict.get ref known
+                        |> Maybe.withDefault []
+                        |> matching (String.join "." rest)
+                        |> List.take 8
+                        |> List.map (\col -> ref ++ "." ++ col)
+
+            [] ->
+                []
+    }
+
+
+{-| One line of the annotations box: a day, whitespace, and whatever is left over
+as the label. Nothing before the whitespace is no annotation, so a blank line and
+a stray tab both fall out rather than marking day "".
+
+The day itself is not checked here. `viewChart` places a mark only where
+`parseDay` reads it, so a half-typed date is a mark nobody draws rather than a
+line the editor refuses to keep -- the box writes the document on every keystroke,
+the way the dashboard's tiles do.
+
+-}
+parseAnnotation : String -> Maybe ( String, String )
+parseAnnotation line =
+    case String.words line of
+        -- A line of nothing but spaces answers one empty word rather than no
+        -- words, so the day is checked and not the list: a blank line was
+        -- marking the day "", which parseDay reads as no day and viewChart then
+        -- draws nowhere -- a mark in the document that nothing on screen says.
+        at :: rest ->
+            iif (String.isEmpty at) Nothing (Just ( at, String.join " " rest ))
+
+        [] ->
+            Nothing
 
 
 {-| The most points one series is drawn with. The plot is 720 units wide, so
@@ -8578,6 +9215,46 @@ chartFold series =
                 )
 
 
+{-| The earliest and the latest day the chart holds, or `Nothing` when any x of
+any series is not a day.
+
+Lifted out of `chartRuns` because an annotation is placed against the same span
+and by the same rule, and a mark half a pixel off the point it is about is a
+picture that argues with itself. It is also the one question "is this axis time?"
+is asked as.
+
+-}
+chartSpan : List ( String, List ( String, Float ) ) -> Maybe ( Int, Int )
+chartSpan series =
+    let
+        points =
+            List.concatMap Tuple.second series
+
+        days =
+            List.filterMap (Tuple.first >> parseDay) points
+    in
+    if List.isEmpty points || List.length days /= List.length points then
+        Nothing
+
+    else
+        -- The minimum and the maximum of a list this branch already knows is not
+        -- empty.
+        Just ( Maybe.withDefault 0 (List.minimum days), Maybe.withDefault 0 (List.maximum days) )
+
+
+{-| Where one day sits across the plot. One day, or many days all the same: there
+is no span to sit in, so it sits where a lone point always sat.
+
+A day outside the span is not clamped -- an annotation may name one, and a mark
+dragged to the edge would say the release happened on a day it did not. The
+caller is what decides whether to draw it.
+
+-}
+chartAt : ( Int, Int ) -> Int -> Float
+chartAt ( first, last ) day =
+    iif (last == first) 400 (60 + (toFloat (day - first) / toFloat (last - first)) * 720)
+
+
 {-| Every series at its place across the plot, split into the runs that are
 drawn as one unbroken line. `Nothing` when any x of any series is not a day:
 the axis is then one place per distinct label, the way it always was.
@@ -8590,105 +9267,171 @@ measured, so the run ends there and the next one starts after it.
 -}
 chartRuns : List ( String, List ( String, Float ) ) -> Maybe (List ( String, List (List ( Float, Float )) ))
 chartRuns series =
+    chartSpan series
+        |> Maybe.map
+            (\span ->
+                let
+                    plot =
+                        chartAt span
+                in
+                List.map
+                    (\( name, ps ) ->
+                        let
+                            -- Sorted by day and not left in arrival order: the query
+                            -- orders by x, but that is a string order, and a day
+                            -- column with inconsistent zero-padding ("2024-1-5"
+                            -- before "2024-01-10") still parses as a day while
+                            -- sorting wrong. Steps and runs mean the gaps between
+                            -- neighbouring days, and a day axis has no other
+                            -- neighbour to mean.
+                            dayed =
+                                List.filterMap (\( x, v ) -> Maybe.map (\day -> ( day, v )) (parseDay x)) ps
+                                    |> List.sortBy Tuple.first
+
+                            steps =
+                                List.map2 (\( a, _ ) ( b, _ ) -> b - a) dayed (List.drop 1 dayed)
+
+                            sorted =
+                                List.sort steps
+
+                            -- The two middle steps averaged, which is one step when
+                            -- there is an odd number of them. No steps is a series
+                            -- of one point, and nothing to break.
+                            median =
+                                case ( List.drop ((List.length sorted - 1) // 2) sorted, List.drop (List.length sorted // 2) sorted ) of
+                                    ( lo :: _, hi :: _ ) ->
+                                        toFloat (lo + hi) / 2
+
+                                    _ ->
+                                        0
+
+                            ( _, open, closed ) =
+                                List.foldl
+                                    (\( day, v ) ( previous, current, done ) ->
+                                        case previous of
+                                            Just was ->
+                                                if toFloat (day - was) > 2 * median then
+                                                    ( Just day, [ ( plot day, v ) ], List.reverse current :: done )
+
+                                                else
+                                                    ( Just day, ( plot day, v ) :: current, done )
+
+                                            Nothing ->
+                                                ( Just day, [ ( plot day, v ) ], done )
+                                    )
+                                    ( Nothing, [], [] )
+                                    dayed
+                        in
+                        ( name, (List.reverse open :: closed) |> List.filter (not << List.isEmpty) |> List.reverse )
+                    )
+                    series
+            )
+
+
+{-| The most series a legend names before it says how many more there are.
+`chartColours` cycles at six, so past a dozen the swatches have stopped telling
+the series apart and the list is a wall of text over the picture.
+-}
+legendMax : Int
+legendMax =
+    12
+
+
+{-| Where each legend entry sits, and how many rows it took. Entries flow left to
+right and wrap at the width of the plot, because a chart with eight series used
+to spread them across the one viewBox until the labels sat on top of each other
+and none of them could be read.
+
+The width of an entry is estimated from its length rather than measured: SVG
+cannot be asked how wide a string will be before it is drawn, and a legend laid
+out a little generously reads correctly while a measured one costs a second
+layout pass on every keystroke.
+
+-}
+legendLayout : List String -> ( List ( Float, Float ), Int )
+legendLayout names =
     let
-        points =
-            List.concatMap Tuple.second series
+        step ( x, y, rows ) name =
+            let
+                w =
+                    legendItemWidth name
+            in
+            -- Wrap before the entry rather than after it, so the entry that
+            -- would have overhung starts the next row instead.
+            if x > 60 && x + w > 790 then
+                ( 60 + w, y + 14, rows + 1 )
 
-        days =
-            List.filterMap (Tuple.first >> parseDay) points
+            else
+                ( x + w, y, rows )
     in
-    if List.isEmpty points || List.length days /= List.length points then
-        Nothing
+    names
+        |> List.foldl
+            (\name ( placed, at ) ->
+                let
+                    ( x, y, rows ) =
+                        step at name
 
-    else
-        let
-            -- The minimum and the maximum of a list this branch already knows
-            -- is not empty.
-            first =
-                Maybe.withDefault 0 (List.minimum days)
-
-            last =
-                Maybe.withDefault 0 (List.maximum days)
-
-            -- One day, or many days all the same: there is no span to sit in,
-            -- so the point sits where a lone point always sat.
-            plot day =
-                iif (last == first) 400 (60 + (toFloat (day - first) / toFloat (last - first)) * 720)
-        in
-        Just <|
-            List.map
-                (\( name, ps ) ->
-                    let
-                        -- Sorted by day and not left in arrival order: the query
-                        -- orders by x, but that is a string order, and a day
-                        -- column with inconsistent zero-padding ("2024-1-5"
-                        -- before "2024-01-10") still parses as a day while
-                        -- sorting wrong. Steps and runs mean the gaps between
-                        -- neighbouring days, and a day axis has no other
-                        -- neighbour to mean.
-                        dayed =
-                            List.filterMap (\( x, v ) -> Maybe.map (\day -> ( day, v )) (parseDay x)) ps
-                                |> List.sortBy Tuple.first
-
-                        steps =
-                            List.map2 (\( a, _ ) ( b, _ ) -> b - a) dayed (List.drop 1 dayed)
-
-                        sorted =
-                            List.sort steps
-
-                        -- The two middle steps averaged, which is one step when
-                        -- there is an odd number of them. No steps is a series
-                        -- of one point, and nothing to break.
-                        median =
-                            case ( List.drop ((List.length sorted - 1) // 2) sorted, List.drop (List.length sorted // 2) sorted ) of
-                                ( lo :: _, hi :: _ ) ->
-                                    toFloat (lo + hi) / 2
-
-                                _ ->
-                                    0
-
-                        ( _, open, closed ) =
-                            List.foldl
-                                (\( day, v ) ( previous, current, done ) ->
-                                    case previous of
-                                        Just was ->
-                                            if toFloat (day - was) > 2 * median then
-                                                ( Just day, [ ( plot day, v ) ], List.reverse current :: done )
-
-                                            else
-                                                ( Just day, ( plot day, v ) :: current, done )
-
-                                        Nothing ->
-                                            ( Just day, [ ( plot day, v ) ], done )
-                                )
-                                ( Nothing, [], [] )
-                                dayed
-                    in
-                    ( name, (List.reverse open :: closed) |> List.filter (not << List.isEmpty) |> List.reverse )
-                )
-                series
+                    ( wasX, wasY, _ ) =
+                        at
+                in
+                ( placed ++ [ iif (y == wasY) ( wasX, wasY ) ( 60, y ) ], ( x, y, rows ) )
+            )
+            ( [], ( 60, 8, 1 ) )
+        |> (\( placed, ( _, _, rows ) ) -> ( placed, iif (List.isEmpty names) 0 rows ))
 
 
-viewChart : { source : String, kind : ChartKind, x : String, y : String, series : String } -> Table -> Html Msg
+{-| What one entry of a two-scale legend is called: the column on its own when
+there is nothing to split by, and the series and the column together when there
+is.
+-}
+legendName : String -> String -> String
+legendName series column =
+    iif (series == "") column (series ++ " · " ++ column)
+
+
+{-| How wide one legend entry is drawn: the swatch, the gap, and the label at
+roughly the width of the 12px font's average glyph.
+-}
+legendItemWidth : String -> Float
+legendItemWidth name =
+    28 + 6.6 * toFloat (String.length name)
+
+
+viewChart : Chart_ -> Table -> Html Msg
 viewChart cfg tbl =
     let
         series =
-            chartFold (chartPoints tbl)
+            chartFold (chartPoints "y" tbl)
 
         points =
             List.concatMap Tuple.second series
+
+        -- The second scale is read off the same rows by the same rule and kept
+        -- apart from the first all the way down: its own extent, its own plotY
+        -- and its own labels. A y2 folded into `series` would be averaged into
+        -- the first scale's extent, which is the whole reason a chart has two.
+        second =
+            chartFold (chartPoints "y2" tbl)
+
+        -- A box carries five numbers per x, which no point can hold, so it is
+        -- read whole rather than through `chartPoints`. Only a box asks: every
+        -- other kind's source has no such columns and reading them would be a
+        -- table scan for nothing.
+        boxes =
+            iif (cfg.kind == Box) (chartBoxes tbl) []
 
         timed =
             chartRuns series
 
         -- The axis is the x labels and not the rows: two series are drawn
-        -- against the same one, and a bar stacks what shares a label.
+        -- against the same one, and a bar stacks what shares a label. A box
+        -- names its own labels, one per group its query already made.
         xs =
             let
                 arrived =
-                    points
+                    iif (cfg.kind == Box) (List.map Tuple.first boxes) (List.map Tuple.first points)
                         |> List.foldl
-                            (\( x, _ ) ( seen, out ) ->
+                            (\x ( seen, out ) ->
                                 iif (Set.member x seen) ( seen, out ) ( Set.insert x seen, x :: out )
                             )
                             ( Set.empty, [] )
@@ -8713,8 +9456,8 @@ viewChart cfg tbl =
 
         -- Every point at its place on that axis. The lookup cannot miss: xAt is
         -- built out of these same points.
-        placed =
-            series
+        place ss =
+            ss
                 |> List.map
                     (\( name, ps ) ->
                         ( name
@@ -8722,35 +9465,102 @@ viewChart cfg tbl =
                         )
                     )
 
+        placed =
+            place series
+
         -- A bar chart stacks its series, so its axis spans the sums on each
-        -- label; every other kind draws each series over the others.
+        -- label; every other kind draws each series over the others. A box
+        -- spans its whiskers, which is the widest of the five and the only pair
+        -- that must be inside the picture.
         stacked =
             points
                 |> List.foldl (\( x, v ) acc -> Dict.insert x (v + Maybe.withDefault 0 (Dict.get x acc)) acc) Dict.empty
                 |> Dict.values
 
         heights =
-            iif (cfg.kind == Bar) stacked (List.map Tuple.second points)
+            case cfg.kind of
+                Bar ->
+                    stacked
+
+                Box ->
+                    List.concatMap (\( _, b ) -> [ b.lo, b.hi ]) boxes
+
+                _ ->
+                    List.map Tuple.second points
 
         -- The baseline is zero unless the data goes below it, because a bar
         -- chart that does not start at zero misstates every comparison on it.
-        top =
-            Maybe.withDefault 1 (List.maximum heights) |> max 0
+        extent vs =
+            let
+                top_ =
+                    Maybe.withDefault 1 (List.maximum vs) |> max 0
 
-        bottom =
-            Maybe.withDefault 0 (List.minimum heights) |> min 0
+                bottom_ =
+                    Maybe.withDefault 0 (List.minimum vs) |> min 0
+            in
+            ( top_, bottom_, iif (top_ - bottom_ == 0) 1 (top_ - bottom_) )
 
-        span =
-            iif (top - bottom == 0) 1 (top - bottom)
+        ( top, bottom, span ) =
+            extent heights
+
+        ( top2, bottom2, span2 ) =
+            extent (List.map Tuple.second (List.concatMap Tuple.second second))
 
         n =
             List.length xs
 
+        -- The legend is drawn above the plot, so the plot starts under whatever
+        -- the legend took. One row -- or none -- leaves the 240 units every
+        -- chart has always been drawn in, unchanged.
+        legendNames =
+            if cfg.y2 == "" then
+                List.map Tuple.first series
+
+            else
+                -- Two scales, so every entry names its column: with nothing to
+                -- split by the two lines are the two column names, and with a
+                -- series they are "north · margin" and "north · margin_pct" --
+                -- the same series appears on both scales, and naming it twice
+                -- and identically is a legend that says nothing about which
+                -- swatch is which.
+                List.map (\( name, _ ) -> legendName name cfg.y) series
+                    ++ List.map (\( name, _ ) -> legendName name cfg.y2) second
+
+        -- Bounded, and it says what it did not name. Nothing caps how many
+        -- distinct values a series column holds, and every entry now takes a row
+        -- of its own to wrap into -- so without this a sheet with a thousand
+        -- series pushed the top of the plot below its baseline and drew the
+        -- whole chart upside down. `chartColours` cycles at six anyway, so past
+        -- a dozen the swatches have stopped telling the series apart.
+        legendShown =
+            iif (List.length legendNames > legendMax)
+                (List.take legendMax legendNames
+                    ++ [ "+" ++ String.fromInt (List.length legendNames - legendMax) ++ " more" ]
+                )
+                legendNames
+
+        ( legendSpots, legendRows ) =
+            iif (List.all String.isEmpty legendNames) ( [], 0 ) (legendLayout legendShown)
+
+        -- Clamped as well as bounded: one name long enough to take a row of its
+        -- own, a dozen times over, is still a plot and not an inverted one.
+        plotTop =
+            min 140 (20 + 14 * toFloat (max 0 (legendRows - 1)))
+
         plotY v =
-            260 - ((v - bottom) / span) * 240
+            260 - ((v - bottom) / span) * (260 - plotTop)
+
+        plotY2 v =
+            260 - ((v - bottom2) / span2) * (260 - plotTop)
 
         plotX i =
             iif (n < 2) 400 (60 + (toFloat i / toFloat (n - 1)) * 720)
+
+        -- Where a bar and a box sit: one slot per label, the slot's left edge
+        -- and its width, which is the ordinal placement neither can share with
+        -- plotX.
+        slot i =
+            ( 60 + (toFloat i / toFloat (max 1 n)) * 720, iif (n == 0) 10 (720 / toFloat n * 0.7) )
 
         num v =
             String.fromFloat (round2 v)
@@ -8770,7 +9580,19 @@ viewChart cfg tbl =
                 Nothing ->
                     placed |> List.map (\( name, ps ) -> ( name, [ List.map (\( i, v ) -> ( plotX i, v )) ps ] ))
 
-        -- chartColours is never empty, and modBy keeps the index inside it.
+        -- The second scale's runs, placed the same way but never folded into the
+        -- first: they are drawn through plotY2.
+        runs2 =
+            case chartRuns second of
+                Just byDay ->
+                    byDay
+
+                Nothing ->
+                    place second |> List.map (\( name, ps ) -> ( name, [ List.map (\( i, v ) -> ( plotX i, v )) ps ] ))
+
+        -- chartColours is never empty, and modBy keeps the index inside it. The
+        -- second scale carries on from where the first left off, so the legend
+        -- index and the colour on screen are the same number.
         colourAt j =
             chartColours |> List.drop (modBy (List.length chartColours) j) |> List.head |> Maybe.withDefault "#468"
 
@@ -8785,6 +9607,29 @@ viewChart cfg tbl =
                             |> List.map
                                 (\run ->
                                     Svg.polyline [ SvgA.fill "none", SvgA.stroke (colourAt j), SvgA.strokeWidth "2", SvgA.points (path run) ] []
+                                )
+                    )
+                |> List.concat
+
+        -- The second y, always as a line whatever the kind. One rule rather than
+        -- one per kind: a bar chart with a second scale is the bars with the
+        -- line everybody draws that as, and a reader never has to ask which of
+        -- the two shapes on screen belongs to which axis.
+        secondLine =
+            runs2
+                |> List.indexedMap
+                    (\j ( _, rs ) ->
+                        rs
+                            |> List.map
+                                (\run ->
+                                    Svg.polyline
+                                        [ SvgA.fill "none"
+                                        , SvgA.stroke (colourAt (List.length series + j))
+                                        , SvgA.strokeWidth "2"
+                                        , SvgA.strokeDasharray "6 3"
+                                        , SvgA.points (run |> List.map (\( px, v ) -> String.fromFloat px ++ "," ++ String.fromFloat (plotY2 v)) |> String.join " ")
+                                        ]
+                                        []
                                 )
                     )
                 |> List.concat
@@ -8840,12 +9685,12 @@ viewChart cfg tbl =
                                     from =
                                         Maybe.withDefault 0 (Dict.get i offsets)
 
-                                    w =
-                                        iif (n == 0) 10 (720 / toFloat n * 0.7)
+                                    ( x, w ) =
+                                        slot i
                                 in
                                 ( Dict.insert i (from + v) offsets
                                 , Svg.rect
-                                    [ SvgA.x (String.fromFloat (60 + (toFloat i / toFloat (max 1 n)) * 720))
+                                    [ SvgA.x (String.fromFloat x)
                                     , SvgA.y (String.fromFloat (min (plotY from) (plotY (from + v))))
                                     , SvgA.width (String.fromFloat w)
                                     , SvgA.height (String.fromFloat (abs (plotY (from + v) - plotY from)))
@@ -8861,6 +9706,50 @@ viewChart cfg tbl =
                     ( Dict.empty, [] )
                 |> Tuple.second
                 |> List.reverse
+
+        -- A box and its whiskers per label: the quartile rect, the median across
+        -- it, and a whisker to each extreme with a cap on it. Ordinal, the way
+        -- bars are and for the same reason.
+        boxMarks =
+            boxes
+                |> List.filterMap (\( label, b ) -> Dict.get label xAt |> Maybe.map (\i -> ( i, b )))
+                |> List.map
+                    (\( i, b ) ->
+                        let
+                            ( x, w ) =
+                                slot i
+
+                            mid =
+                                x + w / 2
+
+                            rule y1 y2 x1 x2 =
+                                Svg.line
+                                    [ SvgA.x1 (String.fromFloat x1)
+                                    , SvgA.x2 (String.fromFloat x2)
+                                    , SvgA.y1 (String.fromFloat y1)
+                                    , SvgA.y2 (String.fromFloat y2)
+                                    , SvgA.stroke (colourAt 0)
+                                    , SvgA.strokeWidth "2"
+                                    ]
+                                    []
+                        in
+                        Svg.g []
+                            [ rule (plotY b.hi) (plotY b.lo) mid mid
+                            , rule (plotY b.hi) (plotY b.hi) (mid - w / 4) (mid + w / 4)
+                            , rule (plotY b.lo) (plotY b.lo) (mid - w / 4) (mid + w / 4)
+                            , Svg.rect
+                                [ SvgA.x (String.fromFloat x)
+                                , SvgA.y (String.fromFloat (min (plotY b.q3) (plotY b.q1)))
+                                , SvgA.width (String.fromFloat w)
+                                , SvgA.height (String.fromFloat (abs (plotY b.q1 - plotY b.q3)))
+                                , SvgA.fill (colourAt 0)
+                                , SvgA.fillOpacity "0.25"
+                                , SvgA.stroke (colourAt 0)
+                                ]
+                                []
+                            , rule (plotY b.med) (plotY b.med) x (x + w)
+                            ]
+                    )
 
         dots =
             runs
@@ -8880,33 +9769,75 @@ viewChart cfg tbl =
                     )
                 |> List.concat
 
+        -- A moment marked on the axis. Only where the axis is time, and only for
+        -- an `at` that reads as a day: everything else is drawn nowhere rather
+        -- than at the left edge, which is where a placement that fell back to
+        -- zero would have put a release nobody dated. The placement is the
+        -- span's and not a lookup, so a day the data itself does not hold still
+        -- lands between the days that surround it.
+        marks =
+            case chartSpan series of
+                Nothing ->
+                    []
+
+                Just span_ ->
+                    cfg.annotations
+                        |> List.filterMap (\( on, label ) -> parseDay on |> Maybe.map (\day -> ( chartAt span_ day, label )))
+                        |> List.map
+                            (\( px, label ) ->
+                                Svg.g []
+                                    [ Svg.line
+                                        [ SvgA.x1 (String.fromFloat px)
+                                        , SvgA.x2 (String.fromFloat px)
+                                        , SvgA.y1 (String.fromFloat plotTop)
+                                        , SvgA.y2 (String.fromFloat (plotY bottom))
+                                        , SvgA.stroke "#999"
+                                        , SvgA.strokeDasharray "4 3"
+                                        ]
+                                        []
+                                    , Svg.text_
+                                        [ SvgA.x (String.fromFloat (px + 3))
+                                        , SvgA.y (String.fromFloat (plotTop + 10))
+                                        , SvgA.fontSize "11"
+                                        , SvgA.fill "#666"
+                                        ]
+                                        [ Svg.text label ]
+                                    ]
+                            )
+
         -- A chart that splits its rows says which colour is which, in the same
         -- viewBox, because downloadChart clones the one svg. A chart with
-        -- nothing to split by has nothing to name and draws no legend at all.
+        -- nothing to split by and one scale has nothing to name and draws no
+        -- legend at all.
         legend =
-            iif (List.all (\( name, _ ) -> name == "") series) [] <|
-                List.indexedMap
-                    (\j ( name, _ ) ->
-                        let
-                            lx =
-                                60 + toFloat j * (730 / toFloat (max 1 (List.length series)))
-                        in
-                        Svg.g []
-                            [ Svg.rect [ SvgA.x (String.fromFloat lx), SvgA.y "4", SvgA.width "10", SvgA.height "10", SvgA.fill (colourAt j) ] []
-                            , Svg.text_ [ SvgA.x (String.fromFloat (lx + 14)), SvgA.y "13", SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text name ]
-                            ]
-                    )
-                    series
+            List.map2
+                (\( lx, ly ) ( j, name ) ->
+                    Svg.g []
+                        [ Svg.rect [ SvgA.x (String.fromFloat lx), SvgA.y (String.fromFloat (ly - 9)), SvgA.width "10", SvgA.height "10", SvgA.fill (colourAt j) ] []
+                        , Svg.text_ [ SvgA.x (String.fromFloat (lx + 14)), SvgA.y (String.fromFloat ly), SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text name ]
+                        ]
+                )
+                legendSpots
+                (List.indexedMap Tuple.pair legendShown)
 
         -- Every kind but the tile shares an axis, the two end labels and the
-        -- legend, so the marks are the only thing each one of them decides.
-        plotted marks =
+        -- legend, so the marks are the only thing each one of them decides. A
+        -- second scale puts its own two labels at the right-hand end, which is
+        -- the side the reader reads it from.
+        plotted drawn =
             List.concat
                 [ [ Svg.line [ SvgA.x1 "60", SvgA.y1 (String.fromFloat (plotY bottom)), SvgA.x2 "790", SvgA.y2 (String.fromFloat (plotY bottom)), SvgA.stroke "#aaa" ] []
-                  , Svg.text_ [ SvgA.x "4", SvgA.y "24", SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (num top) ]
+                  , Svg.text_ [ SvgA.x "4", SvgA.y (String.fromFloat (plotTop + 4)), SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (num top) ]
                   , Svg.text_ [ SvgA.x "4", SvgA.y (String.fromFloat (plotY bottom)), SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (num bottom) ]
                   ]
+                , iif (List.isEmpty second)
+                    []
+                    [ Svg.text_ [ SvgA.x "796", SvgA.y (String.fromFloat (plotTop + 4)), SvgA.fontSize "12", SvgA.fill "#666", SvgA.textAnchor "end" ] [ Svg.text (num top2) ]
+                    , Svg.text_ [ SvgA.x "796", SvgA.y (String.fromFloat (plotY2 bottom2)), SvgA.fontSize "12", SvgA.fill "#666", SvgA.textAnchor "end" ] [ Svg.text (num bottom2) ]
+                    ]
                 , marks
+                , drawn
+                , secondLine
                 , -- Only the ends are labelled: every tick would collide, and the
                   -- rows underneath are one click away in the source sheet.
                   [ Svg.text_ [ SvgA.x "60", SvgA.y "290", SvgA.fontSize "12", SvgA.fill "#666" ] [ Svg.text (xs |> List.head |> Maybe.withDefault "") ]
@@ -8969,7 +9900,7 @@ viewChart cfg tbl =
                           ]
                         ]
     in
-    if List.isEmpty points then
+    if List.isEmpty points && List.isEmpty boxes then
         H.p [ S.paddingRem 2, S.color "#666" ]
             [ text (iif (String.isEmpty cfg.source) "Set what this chart reads, and the two columns to draw." "No points to draw: check that the y column holds numbers.") ]
 
@@ -8991,6 +9922,9 @@ viewChart cfg tbl =
 
                     Scatter ->
                         plotted dots
+
+                    Box ->
+                        plotted boxMarks
 
                     Kpi ->
                         tile
@@ -9033,15 +9967,27 @@ viewQueryEditor model query =
                     Nothing ->
                         text ""
 
+                    -- Nothing to suggest draws no dropdown: the list is held
+                    -- open while a sheet's columns are on their way, and an
+                    -- empty panel over the editor is worse than none. The div is
+                    -- named, because src/index.html's keydown handler has to
+                    -- find it to know whether the arrow keys belong to the
+                    -- editor or to this list; it used to look for
+                    -- [style*="z-index: 100"], which is also the column filter
+                    -- panel.
                     Just ac ->
-                        H.div [ A.class "panel mono", S.positionAbsolute, S.top "2rem", S.left "0.5rem", S.zIndex "100", S.maxHeightRem 12, S.overflowYAuto, S.minWidthRem 15, S.fontSizeRem 0.8125 ]
-                            (ac.suggestions
-                                |> List.indexedMap
-                                    (\i ref ->
-                                        H.div [ A.onClick (AutocompleteSelect ref), S.padding "0.5rem 0.75rem", S.cursorPointer, S.backgroundColor (iif (i == ac.selectedIndex) "#dce7f7" "transparent"), S.borderBottom "1px solid #eee" ]
-                                            [ H.span [ S.color "#666" ] [ text "@" ], text ref ]
-                                    )
-                            )
+                        if List.isEmpty ac.suggestions then
+                            text ""
+
+                        else
+                            H.div [ A.id "complete", A.class "panel mono", S.positionAbsolute, S.top "2rem", S.left "0.5rem", S.zIndex "100", S.maxHeightRem 12, S.overflowYAuto, S.minWidthRem 15, S.fontSizeRem 0.8125 ]
+                                (ac.suggestions
+                                    |> List.indexedMap
+                                        (\i ref ->
+                                            H.div [ A.onClick (AutocompleteSelect ref), S.padding "0.5rem 0.75rem", S.cursorPointer, S.backgroundColor (iif (i == ac.selectedIndex) "#dce7f7" "transparent"), S.borderBottom "1px solid #eee" ]
+                                                [ H.span [ S.color "#666" ] [ text "@" ], text ref ]
+                                        )
+                                )
                 ]
             ]
         , case model.error of

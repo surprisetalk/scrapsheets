@@ -41,14 +41,6 @@ The single biggest gap. Most of the Demo Gallery dies here first.
   1. Push the where clause into the DSN query for `codex-db`, and only what is provably safe to push.
   2. `describe` already reads the remote schema; the pushdown uses the same read.
 
-- [ ] **The editor suggests the columns you actually have.** `@type:doc_id` completes from the library today; a column
-      name does not, and `nearest()` names the typo only after the fact.
-  1. Complete columns from the sheet once the ref resolves, off the same read `describe` uses, so a suggestion cannot
-     disagree with the schema. The page has no column source Elm can reach: the map lives in the `sheets()` closure
-     in `src/page.mjs`, so this needs a port.
-  2. The dropdown's keyboard path finds itself with `[style*="z-index: 100"]`, which also matches the filter panel;
-     give it an id first.
-
 - [ ] **You name an expression once and use it in five sheets.** Every demo repeats the same case statement.
   1. A `snippet` sheet holding named expressions; `planQuery()` expands them before the engine runs.
   2. Expansion is textual and bounded like `MAX_REF_DEPTH`, and a cycle is reported as the path that closes it.
@@ -108,12 +100,6 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
   1. Collapsible groups with subtotals over the rows on screen, the way the totals row already respects the filter.
   2. A pivot UI over the same machinery — AlaSQL's `pivot` is correct once `checkPivot()` has had its say.
 
-- [ ] **You dedupe on nearly-equal rows without writing SQL.** Exact dedupe ships as `SheetRowsDedupe`, out of the
-      palette, and splitting a column ships as `SheetColumnSplit`, in the column's own panel. The one left is the one
-      that needs more than a row's own values.
-  1. Fuzzy dedupe: the same verb over a threshold rather than over equality. `similarity()`, `token_set_ratio()` and
-     `soundex()` already ship as UDFs, so this is the UI over them — which columns to compare, how close counts, and
-     a preview of what would go, because unlike the exact verb nobody can see the answer before it runs.
 - [ ] **A very large sheet scrolls.** Every row renders.
   1. Virtualized rendering.
   2. Server-side pagination behind it, for sheets too big to send at all.
@@ -126,29 +112,19 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
 ## Charts & dashboards
 
-- [ ] **A chart can plot more than one thing.** A `series` column is in: `chartSql` selects it, `chartPoints` groups
-      on it, and line, area, scatter, bar and kpi each draw it. What is left is the two that need a second scale rather
-      than a second series.
-  1. A second y with its own axis, which is what dual axis means. The document gains a `y2`, validated through
-     `chartIdent` the way `series` is; `chartSql` selects it as `y2`; `chartPoints` cannot hold it, so the right-hand
-     series is its own list with its own `top`/`bottom`/`plotY`, and the axis labels at x 790 are the second scale's.
-     A kpi has one number, so `y2` is refused for that kind by name rather than ignored.
-  2. Box plot, which needs five numbers per category rather than one. `CHART_KINDS` gains `box`, `chartSql` selects
-     min, the two quartiles, the median and max per x (a different statement from every other kind and so its own
-     branch), `chartPoints` cannot hold five numbers per point, and `viewChart` draws a box and its whiskers per x.
-     `kindSpec` in `Main.elm` gains the row `browser_test.ts` checks.
-  3. The legend does not wrap: many series overlap their labels across the one viewBox.
-- [ ] **A time axis carries annotations.** A chart on a day axis places its points by time now; what it cannot do is
-      mark one.
-  1. Annotations: mark a release, a price change, a storm on the axis.
-  2. The document holds them beside `source`/`kind`/`x`/`y`/`series` in `data[0]`, one `{ at, label }` per entry,
-     decoded through `optionalField` the way `series` is, so a chart written before there were annotations keeps
-     decoding.
-  3. `viewChart` draws each one as a vertical rule at `chartRuns`' own placement of `at` (a day the chart's own axis
-     may not hold, so the placement is the span's, not a lookup), with the label at the top; an `at` that is not a day
-     on a chart whose axis is time is drawn nowhere rather than at the left edge.
-  4. `viewChartSettings` edits them as one textarea, `day  label` per line, the way `viewDashboard`'s tiles are one
-     per line.
+- [ ] **A column named `total` can be charted.** `chartIdent` checks that a chart's x, y, y2 and series are plain
+      column names, and a SQL reserved word is one — so it passes, gets spliced in bare, and AlaSQL answers a raw
+      parse error with a caret into SQL the reader never wrote. Measured: `total`, `store`, `class`, `select` and
+      `order` all break as the **x** column on every kind (`select order as x, v as y …` has always failed, so this
+      is not new); as the y column they are fine. `line` and `box` are safe.
+  1. `chartIdent` refuses a reserved word by name, saying to rename the column — the cheap half, and it turns a parse
+     error into a sentence.
+  2. Quoting the identifier is the real fix and is one character, but `rewriteExtremes`, `selectTypes` and
+     `checkResultColumns` read the select list as text, so decide what a quoted name does to all three before
+     changing what `chartIdent` emits.
+  3. The same hole is in `unpivot`'s in-list and anywhere else a column name is spliced into generated SQL; fix it in
+     one place or not at all.
+
 - [ ] **A geo column draws a map.** Nothing renders geometry.
   1. Point maps and choropleths from a geo column.
   2. Boundary datasets as sheets — counties, tracts, ZCTAs, districts — are the other half and live in **Inventory**.
@@ -247,16 +223,6 @@ The runner is in **Now**. These are what the Demo Gallery needs on top of it.
   2. Each one needs an account somewhere -- a carrier, a Teams app, a push service -- so each is its own item once one
      of them is picked.
 
-- [ ] **You can acknowledge an alert, and it escalates when nobody does.** Snooze ships (`snoozed_until`); a firing
-      alert nobody has read still looks exactly like one somebody has.
-  1. Acknowledge: `POST /library/:id/ack` writes the caller and the moment onto the newest `ALERT` run row's body, a
-     chip on the alert page sends it, and an unacknowledged firing run reads through `ALERT_OK` the way an undelivered
-     one does, so `library:freshness` and `GET /status` say it.
-  2. Escalate: a second destination on the alert document, delivered through the same `sendAlertUrl`/`sendAlertEmail`
-     pair when a firing run is still unacknowledged after the seconds the document names. Refuse a destination that is
-     the first one, and count the delivery against `sendWithinQuota` like any other.
-  3. Subscribe to a sheet: `subscribe to this sheet` in the palette makes the alert; a session stored before the page
-     kept the email offers it only after the next login.
 ---
 
 ## Actions & write-back
@@ -303,14 +269,6 @@ The Excel add-in market lives here.
   1. Seasonal decomposition, which needs a series-to-series function — neither the aggregate protocol nor the window
      pass can express one today, so that is the actual work.
 
-- [ ] **You can put a distribution on an input and read percentiles out.** Monte Carlo is done: `sample_uniform`,
-      `sample_normal` and `sample_triangular` in `src/sql.mjs`, `table:trials`, and `query:monte-carlo-margin`. What is
-      left is reading the answer back.
-  1. Sensitivity and tornado analysis: which input moves the output most. One row per sampled input, the output's
-     spread when that input alone varies, ordered by width. `corr(array(input), array(out))` over the trial rows is the
-     cheap first version and needs no new UDF.
-  2. A scenario manager: named sets of assumptions compared side by side. `table:assumptions` is the one-row sheet the
-     demos already read parameters from, so this generalises it.
 - [ ] **You can solve for an input.** No goal seek, no solver.
   1. Goal seek over one cell, then constrained optimization over a sheet.
 
@@ -363,21 +321,11 @@ The Excel add-in market lives here.
 
 ## Permissions & governance
 
-- [ ] **A column can be hidden from someone who can read the sheet.** Access is per sheet.
-  1. Row-level and column-level permissions.
-  2. PII tagging: mark a column sensitive, masked by default in shares and embeds.
-
 - [ ] **You grant access to a group, not to twelve addresses.** `sheet_usr` is per user.
   1. Teams, groups and org accounts.
   2. SSO, SAML and SCIM, which is table stakes for any org-sized customer.
   3. Ownership transfer and offboarding: what happens to sheets when someone leaves.
 
-- [ ] **A workspace can be held, backed up and pinned to a region.** A credential is refused at both publish doors and
-      so is personal data, unless the publisher says it belongs there.
-  1. Retention policies: rows age out on a schedule the sheet carries.
-  2. Legal hold, which is retention refused: a held sheet keeps everything until the hold is lifted.
-  3. Whole-workspace backup and restore.
-  4. Region pinning: where the automerge documents and the database live.
 ---
 
 ## Search, shop & discovery
@@ -417,10 +365,6 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
   1. Revenue, subscribers, churn and per-sheet analytics.
   2. License enforcement: what a buyer may do with a purchased dataset, and what happens on cancellation.
   3. Private and org-only listings, bundles, and referral credit.
-
----
-
-## Sheet as an API
 
 ---
 
@@ -490,10 +434,6 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
       `MAX_QUERY_ROWS` is the real guard.
   1. Background computation with progress.
   2. Per-sheet resource metering — rows, bytes, compute, fetches — visible before the limit hits.
-
----
-
-## Trust, safety & abuse
 
 ---
 

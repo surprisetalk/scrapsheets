@@ -154,13 +154,33 @@ A column of numbers is written at the number of decimal places you ask it for, i
 stats and the totals row all read the one count, and an empty box goes back to whatever the number needed. The count
 travels with the sheet, the way the sort and the column widths do.
 
-A chart is drawn as a line, bars, an area, a scatter, or one big number — `kpi` reads the last point, how far it moved
-since the one before, and draws the whole series small beside it. A kind that is not one of those is refused by name
-rather than quietly drawn as a line, which is what a typo used to get you.
+A chart is drawn as a line, bars, an area, a scatter, a box plot, or one big number — `kpi` reads the last point, how
+far it moved since the one before, and draws the whole series small beside it. A kind that is not one of those is
+refused by name rather than quietly drawn as a line, which is what a typo used to get you.
 
-A chart splits its rows by a `series` column: one line, area or dot set per series, bars stacked, and a legend, with
-the picture unchanged when nothing is named. When every x is a day the axis is time: a point sits at its day, a gap in
-the data is a gap in the line, and a long series is folded to a readable number of points with the count shown.
+A chart splits its rows by a `series` column: one line, area or dot set per series, bars stacked, and a legend that
+wraps rather than writing its labels over each other, with the picture unchanged when nothing is named. When every x is
+a day the axis is time: a point sits at its day, a gap in the data is a gap in the line, and a long series is folded to
+a readable number of points with the count shown.
+
+A second column can be drawn against its own axis on the right — a ratio and its z-score, say, which on one scale is a
+flat line along the bottom. It is always drawn as a dashed line, whatever the rest of the chart is, so it is never
+unclear which shape belongs to which axis.
+
+A box plot is the one chart that summarises rather than plots: the median, the middle half and the two extremes of the
+rows at each x, which is how you see that one production line is looser than the others rather than which single
+measurement broke a limit.
+
+A chart on a day axis can mark a day — a release, a price change, a storm — with a label on the axis. A day the data
+itself does not hold still lands between the days that surround it, and a mark you have not finished typing is drawn
+nowhere rather than at the left edge.
+
+A column of near-duplicate rows is found and shown before anything is deleted: type how close counts, and the panel
+names the rows that would go and what each one matched, because these are exactly the rows you cannot spot by looking.
+"Acme Corp" and "Acme Corp." are one row at 70%; the exact repeats are the palette's verb.
+
+Typing `@table:countries.` in the query editor completes the columns that sheet actually has, read the same way
+`describe` reads them, so a suggestion can never name a column the query would then be refused for.
 
 `select min(code) from @table:countries` answers, and so does the earliest date in a column. The engine under the page
 compares numbers and real dates, and a cell is neither — it is the text the document holds — so it used to drop the

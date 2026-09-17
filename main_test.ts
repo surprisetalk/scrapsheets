@@ -44,6 +44,7 @@ import {
   pollNetOnce,
   pollNetSheet,
   RATE_LIMIT_KEYS_MAX,
+  rateLimitBuckets,
   requireSecret,
   safeFetch,
   seed,
@@ -66,6 +67,15 @@ import dbSql from "./schema/db.sql" with { type: "text" };
 import examplesSql from "./examples.sql" with { type: "text" };
 
 const request = async (jwt: string, route: string, options?: object) => {
+  // Every request this suite makes arrives from one address, which no real
+  // client does, so the address bucket is shared by the whole run and empties
+  // over the course of it. It refills on the wall clock, so whether a step
+  // passed depended on how slow the suite had been up to that point -- making
+  // the suite faster is what surfaced it. This helper is the one for requests
+  // that are meant to succeed; the limiter itself is exercised in its own steps,
+  // which set the bucket they are about by hand and go straight to
+  // `app.request`, so clearing here cannot hide what they assert.
+  rateLimitBuckets.clear();
   const res = await app.request(route, {
     headers: new Headers({
       "Content-Type": "application/json",
@@ -157,26 +167,43 @@ const usr = async (email: string) => {
 
 Deno.test(async function allTests(t) {
   const pglite = new PGlite({ extensions: { citext } });
+  await pglite.waitReady;
+  // The empty cluster, taken before our own schema is applied. Booting a PGlite
+  // is about a second and a half of WebAssembly bringing up a Postgres data
+  // directory from nothing, and this suite needs two of them -- so the second is
+  // loaded from the first's bytes instead of doing that work again, which is a
+  // quarter of a second rather than another second and a half, and two of them
+  // are no longer contending for the same cores while they do it.
+  //
+  // Taken before `exec(dbSql)` deliberately: the codex database is a *foreign*
+  // one, and a clone holding our own tables would have `codexTables()` listing
+  // them.
+  const bare = await pglite.dumpDataDir("none");
   // The database a codex sheet points at: its own PGlite, behind its own
   // address, because the gateway hands every connection onto one PGlite
   // session -- a codex connection setting its session read only would set it
   // for main.ts's own connection too, and the next insert anywhere in the
-  // suite would be refused. Started here and awaited on connect, so its boot
+  // suite would be refused. Started here and awaited on connect, so its load
   // overlaps the run rather than adding to it. 5435 and not 5434 is also what
   // makes it external at all: GET /codex/:id refuses a dsn on this server's
   // own host and port.
-  const external = (async () => {
-    const db = new PGlite();
-    await db.waitReady;
-    await db.exec(`create table widget (widget_id int, name text)`);
-    return db;
-  })();
+  // Built on the first connection to it and not before: most of this suite never
+  // opens a codex sheet, and a second Postgres coming up in the background is
+  // cores the steps that are running want.
+  let started: Promise<PGlite> | undefined;
+  const external = () =>
+    started ??= (async () => {
+      const db = new PGlite({ loadDataDir: bare });
+      await db.waitReady;
+      await db.exec(`create table widget (widget_id int, name text)`);
+      return db;
+    })();
 
-  const serve = (port: number, of: PGlite | Promise<PGlite>) => {
+  const serve = (port: number, of: PGlite | (() => Promise<PGlite>)) => {
     const listener = Deno.listen({ hostname: "127.0.0.1", port });
     (async () => {
       for await (const conn of listener) {
-        const db = await of;
+        const db = await (typeof of === "function" ? of() : of);
         new PostgresConnection(conn, {
           async onStartup() {
             await db.waitReady;
@@ -192,7 +219,6 @@ Deno.test(async function allTests(t) {
   };
   const listeners = [serve(5434, pglite), serve(5435, external)];
 
-  await pglite.waitReady;
   await pglite.exec(dbSql);
   // seed() grants the error log to this address. It is set before seed() runs
   // because that is the only moment the grant is written.
@@ -1292,6 +1318,49 @@ Deno.test(async function allTests(t) {
       assert(csv.ok, `chart export failed: ${csv.status}`);
       assert((await csv.text()).includes("2026-02-01"), "a chart should export the rows it draws");
 
+      // A second scale and a box read, page and export through the same one
+      // path: `chartSql` is the only thing either changes, so what the picture
+      // draws and what the API answers cannot come apart.
+      const second = automerge.create<{ data: [{ source: string; kind: string; x: string; y: string; y2: string }] }>({
+        data: [{ source: `@table:${source.documentId}`, kind: "line", x: "month", y: "spent", y2: "spent" }],
+      });
+      await put(jwt, `/library/chart:${second.documentId}`, { name: "two scales" });
+      const [twoCols] = await get<Table>(jwt, `/sheet/chart:${second.documentId}`);
+      assertEquals(Object.values(twoCols).map((col) => col.name).join(), "x,y,y2");
+
+      // Every month is its own group here, so each box is one measurement: the
+      // five numbers are equal, which is exactly what a one-row group means.
+      const box = automerge.create<{ data: [{ source: string; kind: string; x: string; y: string }] }>({
+        data: [{ source: `@table:${source.documentId}`, kind: "box", x: "month", y: "spent" }],
+      });
+      await put(jwt, `/library/chart:${box.documentId}`, { name: "spread" });
+      const [boxCols, ...boxes] = await get<Table>(jwt, `/sheet/chart:${box.documentId}`);
+      assertEquals(Object.values(boxCols).map((col) => col.name).join(), "x,lo,q1,med,q3,hi");
+      assertEquals(boxes.length, 3, "a box chart answers one row per group, not one per source row");
+      assertEquals(boxes.map((row) => row.med).join(), "120,150,90");
+
+      // A blank cell is the normal state of a spreadsheet. Every other kind of
+      // chart drops the row and draws the rest; a box aggregates, and one null
+      // reaching `percentile` used to refuse the whole chart -- every group of
+      // it, including the groups with nothing wrong with them.
+      const gappy = automerge.create<{ data: Sheet["data"] }>({
+        data: [
+          arrayify([{ name: "month", type: "date", key: 0 }, { name: "spent", type: "usd", key: 1 }]),
+          { 0: "2026-01-01", 1: 120 },
+          { 0: "2026-01-01", 1: null },
+          { 0: "2026-01-01", 1: 160 },
+          { 0: "2026-02-01", 1: 90 },
+        ],
+      });
+      await put(jwt, `/library/table:${gappy.documentId}`, {});
+      const overGaps = automerge.create<{ data: [{ source: string; kind: string; x: string; y: string }] }>({
+        data: [{ source: `@table:${gappy.documentId}`, kind: "box", x: "month", y: "spent" }],
+      });
+      await put(jwt, `/library/chart:${overGaps.documentId}`, { name: "spread over gaps" });
+      const [, ...gapBoxes] = await get<Table>(jwt, `/sheet/chart:${overGaps.documentId}`);
+      assertEquals(gapBoxes.length, 2, "a blank cell drops its row, and both groups are still drawn");
+      assertEquals(gapBoxes.map((row) => `${row.lo}-${row.hi}`).join(), "120-160,90-90");
+
       // A column name is the only thing that goes into the SQL, so anything else
       // is refused by name rather than concatenated in. A kind is refused for a
       // different reason: it changes no query, but one nobody draws used to
@@ -1302,6 +1371,25 @@ Deno.test(async function allTests(t) {
           [{ source: "@chart:abc", kind: "line", x: "month", y: "spent" }, "one table or query sheet"],
           [{ source: `@table:${source.documentId}`, kind: "line", x: "month", y: "spent; drop table" }, "column name"],
           [{ source: `@table:${source.documentId}`, kind: "scater", x: "month", y: "spent" }, "not a kind of chart"],
+          // A second scale and a box are the two settings that mean nothing on
+          // some kinds, and a setting a chart holds but nobody draws is a
+          // document that lies about the picture.
+          [
+            { source: `@table:${source.documentId}`, kind: "kpi", x: "month", y: "spent", y2: "budget" },
+            "no second scale",
+          ],
+          [
+            { source: `@table:${source.documentId}`, kind: "box", x: "month", y: "spent", series: "team" },
+            "takes no series column",
+          ],
+          [
+            { source: `@table:${source.documentId}`, kind: "box", x: "month", y: "spent", y2: "budget" },
+            "takes no second y column",
+          ],
+          [
+            { source: `@table:${source.documentId}`, kind: "line", x: "month", y: "spent", y2: "budget; drop table" },
+            "second y column has to be a column name",
+          ],
         ] as const
       ) {
         const bad = automerge.create<{ data: [typeof cfg] }>({ data: [cfg] });
@@ -1569,6 +1657,18 @@ Deno.test(async function allTests(t) {
         `select levenshtein('kitten','sitting') l, soundex('Robert') s, token_set_ratio('acme corp','corp acme') t`,
       );
       assertEquals([fuzzy.l, fuzzy.s, fuzzy.t], [3, "R163", 1]);
+
+      // The same pairs `similarity` and `soundex` in src/Main.elm are asserted
+      // against, because the near-duplicate verb in the column's panel is a copy
+      // of these two rules on the other side of the language boundary: the panel
+      // and a query have to call the same two rows the same distance apart.
+      // tests/MainTest.elm holds the other half.
+      const near = await run(
+        `select round(similarity('Acme Corp','Acme Corp.'), 4) a, round(similarity('Acme','Zebra'), 4) b,
+                round(similarity('', ''), 4) c, soundex('Rupert') r, soundex('Tymczak') t, soundex('') e`,
+      );
+      assertEquals([near.a, near.b, near.c], [0.75, 0, 1]);
+      assertEquals([near.r, near.t, near.e], ["R163", "T522", ""]);
 
       const dates = await run(
         `select date_trunc('month','2026-08-16T12:00:00Z') m, date_add('day',7,'2026-08-16') a,
@@ -8425,5 +8525,7 @@ Deno.test(async function allTests(t) {
   await sql.end();
   for (const listener of listeners) listener.close();
   await pglite.close();
-  await (await external).close();
+  // Only if something opened it: a run that never touched a codex sheet never
+  // built it, and there is nothing to close.
+  if (started) await (await started).close();
 });

@@ -41,8 +41,11 @@ is a shareable table, every sheet is an API.
 - `deno task test` — the whole suite. **Not** `deno test --allow-all`: the task is the one place `JWT_SECRET`,
   `TOKEN_SECRET` and `DSN_ENCRYPTION_KEY` are set, and `main.ts` refuses to load without all three. It builds `dist`
   once, runs the files in parallel, and fails past ten seconds of wall time, which is the rule that the suite gets fixed
-  before a feature is added. Time one file with `deno test --allow-all <file>`, and check `top` first: a build job on
-  the same machine makes every number here a lie
+  before a feature is added. It type checks **once, for every test file at a time, alongside the run** rather than
+  letting `deno test` do it: that checks in each worker it starts, and eight of those at once cost more than the
+  checking does — measured at about a second of the ten. The check and the run are awaited together and either one
+  failing fails the task, so nothing is traded away for it. Time one file with `deno test --allow-all <file>`, and
+  check `top` first: a build job on the same machine makes every number here a lie
 - `deno task review` — elm-review. Runs clean with zero suppressions; keep it that way
 - `deno task status` — print every graded condition from the deployed `GET /status`, exit nonzero if any is below 1.0.
   `.github/workflows/status.yml` runs it on a 15-minute cron; the failure email is the alarm
@@ -67,7 +70,15 @@ does not have, so code-first refuses every codex read until `db:apply` lands, wh
 
 ## Tests
 
-Six files. Which one a failure belongs in is usually obvious.
+Eight files, and two harness modules beside them. Which one a failure belongs in is usually obvious.
+
+**Why there are eight.** `deno test --parallel` runs files side by side and not tests, so the suite costs whatever its
+slowest file costs — every split below was made because one file had become that. The two jsdom harnesses were split
+apart first, then each was split again, and the halves are kept **even in the thing that is actually expensive**: a
+boot or a `glue()`, which is Elm's first paint into a jsdom. Counted rather than eyeballed, with
+`grep -c "await boot(" page_test.ts library_test.ts` and the same for `glue_test.ts` and `sync_test.ts`. Adding a file
+is not free — each one is another process, another module graph — so split only when one file is the critical path,
+and rebalance rather than pile onto whichever file the test seems to belong to.
 
 - `main_test.ts` — the server. One `Deno.test` of named `t.step`s against in-process PGlite: auth, sync and roles, shop
   and Stripe, `POST /query`, the `src/sql.mjs` UDFs, net-http polling, socket reports, alerts and digests, MCP, export.
@@ -76,13 +87,34 @@ Six files. Which one a failure belongs in is usually obvious.
   not step names. A **second** PGlite behind a second gateway on `127.0.0.1:5435` is the codex sheets' external
   database — a second instance and not a second address onto the first, because the gateway hands every connection onto
   one PGlite session and the codex connection sets that session read only, which refused the next insert anywhere in
-  the suite; it boots in parallel and is awaited on connect. A DSN that must fail names a loopback port nobody listens
-  on, never a hostname: the suite does no DNS.
+  the suite. It is **cloned from the first rather than booted**: `dumpDataDir` on the main instance before the schema is
+  applied is a few tens of milliseconds and `loadDataDir` is a quarter of a second, where booting a second Postgres from
+  nothing is another second and a half of WebAssembly competing with the first for cores. Taken before the schema on
+  purpose — a codex database holding our own tables would have `codexTables()` listing them — and built on the first
+  connection to it rather than at startup, since most of this suite never opens a codex sheet. A DSN that must fail
+  names a loopback port nobody listens on, never a hostname: the suite does no DNS.
+
+  `request()` — the helper for calls that are meant to succeed — clears `rateLimitBuckets` first. Every request here
+  arrives from one address, which no real client does, so that bucket is shared by the whole run and empties over it;
+  it refills on the wall clock, so whether a step passed depended on how slow the suite had been up to that point, and
+  making the suite faster is what surfaced it. The limiter has its own steps, which set the bucket they are about by
+  hand and go straight to `app.request`, so clearing here cannot hide what they assert.
+
+  **This file is the suite's critical path** and the one that has not been split. Its later half is already independent
+  — the last thirty-four steps pass with the first thirty-four skipped — but two files would need two databases, and
+  the ports are not free: `5434` and `5435` are written into the codex steps, which exist to prove a DSN aimed at this
+  server's own database is refused, and setting `DATABASE_URL` to move them also takes the pool from one connection to
+  ten.
 - `examples_test.ts` — every bundled sheet through **both** engines (`npm:alasql` and the vendored `src/alasql.mjs` the
   page loads), compared row for row.
-- `page_test.ts` and `glue_test.ts` — the page under jsdom, through two harnesses, one file each because `deno test
-  --parallel` runs files and not tests side by side, and one file of both was the whole critical path of the suite.
-  `page_harness.ts` is what they share — the compiled Elm, the window installed as globals, `boot`, `until`, the
+- `page_test.ts`, `library_test.ts`, `glue_test.ts` and `sync_test.ts` — the page under jsdom, through two harnesses,
+  two files each. `page_test.ts` is the table and the query sheet: how they render, sort, arrange and take the
+  keyboard. `library_test.ts` is the library itself, the sheets opened from it (a feed, an alert, a chart, a
+  dashboard), the palette over them, and the parts of `src/page.mjs` that need no page at all. `glue_test.ts` is what
+  the glue does to a document; `sync_test.ts` is what arrives from outside it — a CSV chosen or dropped, a socket
+  report, a fork, a real automerge document taking every patch shape, the row and column verbs, and `src/sw.js`.
+  `glue_harness.ts` holds the `glue()` the last two share.
+  `page_harness.ts` is what all four share — the compiled Elm, the window installed as globals, `boot`, `until`, the
   page-side query engine — and is a module rather than a test file so that neither registers the other's tests by
   importing it. `boot` runs the compiled Elm in `dist/index.js` with every port answered by hand and the library fed in
   through `library()`; reach for it for anything about what the page renders, and for `rendered()` — the one booted page
@@ -113,7 +145,8 @@ Six files. Which one a failure belongs in is usually obvious.
   `_redirects` in both directions, and `PAGE_BY`/`pageBy` is one more of the language-boundary copies it reads as
   source text.
 - `tests/MainTest.elm` via `elm_test.ts` — pure Elm: selection and navigation, sort and filter, clipboard parsing,
-  column stats, `docDecoder`, `chartPoints`.
+  column stats, `docDecoder`, `chartPoints`, `chartBoxes`, `chartSpan`, `legendLayout`, and the `similarity`/`soundex`
+  pair `main_test.ts` asserts the same pairs against.
 
 ## Invariants
 
@@ -179,7 +212,7 @@ A change that breaks one of these is a bug even if the suite is green.
   `localStorage` key prefix. `spec` in `Main.elm` is the only per-column-type table, and it has no wildcard, so a new
   type fails to compile. `CHART_KINDS` in `src/sql.mjs` is the only list of ways a chart is drawn: `chartSql` refuses
   one that is not on it, `kindSpec` in `Main.elm` is the copy the language boundary forces, and `browser_test.ts` fails
-  when the two disagree. `NET_METHODS` in `main.ts` is the only list of verbs a feed is polled with, `netMethods` in
+  when the two disagree — it compares the two as sets, so a kind added to both needs no edit there. `NET_METHODS` in `main.ts` is the only list of verbs a feed is polled with, `netMethods` in
   `Main.elm` is its copy, and the same test fails on the same drift.
 - **A column type is one word everywhere.** `COLUMN_TYPES` in `src/sql.mjs` is the list. Its entries are either a type
   or an `as` alias of one; `CANONICAL_TYPES` is the half anything may write, `NUMERIC_TYPES` and `JSON_TYPES` derive
@@ -569,6 +602,22 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   selection holding no library row.
 - **Cross-sheet queries in the browser**: `sheets(alasql, shelf, find)` in `src/page.mjs`. Only two things come from the
   browser and both are arguments: the library map and `repo.find`.
+- **The editor completes a sheet id off the library and a column name off the sheet.** `completionTrigger` is the `@…`
+  the cursor sits in, `completionRef` is what a dot after the ref says -- that the question has moved from which sheet
+  to which of its columns, and only for the two prefixes a query may reference at all -- and `completionAt` answers
+  both. A sheet id needs nothing from the glue; a column name
+  needs everything, because the columns live behind the automerge repo in the `sheets()` closure, which is why
+  `columnsFor`/`columnsLoaded` is a port. It is answered by running **`describe @<ref>` through the page's own engine**:
+  the statement the typist would have run themselves, so a suggestion cannot name a column the query is then refused
+  for. A ref that will not read answers no columns rather than an error, and the empty answer is cached too, or the
+  editor asks again on every keystroke -- but it is **logged by name** first, because `describe` on a query ref *runs*
+  that query, so a ref cycle, a join over the row cap and a sheet nobody has synced all land in one catch and only the
+  console can say which. `ColumnsLoad` **recomputes the open list**, because the columns are asked for by
+  the very keystroke that would have shown them and waiting would put every completion one character late; that is what
+  makes a `QueryAutocomplete` holding nothing legal, so the view draws nothing for one and `AutocompleteNav` guards its
+  `modBy`, which is a runtime error at zero. The dropdown carries `id="complete"` and `src/index.html`'s keydown finds
+  it by that: it used to look for `[style*="z-index: 100"]`, which is also the column filter panel, so a panel left open
+  anywhere swallowed the editor's arrow keys.
 - **One CSV import, whichever way the file arrives, in two steps.** The footer's file input goes through Elm's
   `CsvImportFile` and the `importCsv` port; a file dropped on the page is read by `setupDragDrop` and handed to the same
   `uploadCsv`. That posts the file to `POST /import/preview`, lays the types this browser settled on for the same header
@@ -663,6 +712,31 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   sheet does not carry, a column with no text cell, a delimiter no cell holds, a split past `maxSplitColumns`, and a
   name `nameClash` says is taken, because half a split is exactly the two-columns-of-one-name shape every keyed read
   refuses.
+- **A near-duplicate row is found where the column is cleaned, and previewed before it is taken.** Exact dedupe is
+  `SheetRowsDedupe` over every cell of every row, so it lives in the palette; this one compares text, so it lives in the
+  column's own panel behind the same `movable` gate, with a "near %" box holding `sheet.near` through `ColumnNearInput`
+  the way `splitOn` is held. `similarity` and `soundex` in `src/Main.elm` are the language-boundary copies of the two
+  UDFs of those names in `src/sql.mjs`; `main_test.ts` and `tests/MainTest.elm` assert the **same pairs**, so a drift
+  fails a test rather than quietly putting two rows a different distance apart in the panel than in a query. `soundex`
+  buckets and `similarity` scores: comparing every pair is quadratic and no browser can do that to a real sheet, and it
+  is also a rule -- two names whose consonants differ are not near each other however many trigrams they share.
+  `nearDuplicates` answers the row that goes, the row it matched and how close, compared against the rows that **stay**
+  so three spellings of one name collapse to the first rather than to a chain; an exact repeat is left to the other
+  verb, and `firstNear` walks a bucket rather than filtering it, because only the first match is used and a filter reads
+  the whole bucket to find it. **`maxFuzzyPairs` is the bound that matters, not `maxFuzzyRows`**: `soundex` keeps only
+  letters, so a column of invoice numbers or zip codes held as text codes to `""` on every row and the whole sheet is
+  one bucket -- which is the commonest column anybody points this at. Five thousand such rows is twelve million
+  comparisons and tens of seconds of a frozen tab, and since the preview is drawn from `view` it is tens of seconds
+  **per keystroke** in the closeness box. So the comparisons are counted, nothing more is compared once the bound is
+  passed, and the refusal names the count and says what makes a column sound alike on every row. It answers a `Result`, because the panel draws its refusal as the sentence `updateDocMsg` would answer with --
+  a closeness outside 1 to 100, a sheet past `maxFuzzyRows` with the count in the message, a column with no text, and
+  nothing near enough, which is a verb with nothing to do rather than a button that deletes nothing and says nothing.
+  The preview reads `sheet.doc` and not `sheet.table`: a table sheet's rows are its document, which is where
+  `updateDocMsg` reads them, so the preview and the verb cannot be looking at two different sheets. It also **counts
+  the rows it could not read** -- a cell holding something that is not text, which a column retyped to `text` keeps --
+  the way `viewChartSettings` counts what a fold swallowed: a preview saying one row would go while it never looked at
+  half the sheet is a preview lying about the sheet. The delete itself is
+  `rowDeletions`, so undo, the viewer refusal and the sync path are the ones already written.
 - **`formatNumber` is the one place a number becomes text.** The cell, the stats row and the totals row all go through
   it; they used to format independently and a `usd` column's total came out without its `$`. A value `positional` says
   is not written as digits — not finite, or a magnitude JavaScript writes as `1e+21` — skips the currency, the grouping
@@ -756,10 +830,12 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   statement it always built (`select <x> as x, <y> as y from <source> order by 1`), and a named one appends `, <col> as
   series` and orders `by 3, 1`, so each series arrives whole and in draw order. The name goes through the same
   `chartIdent` the axes do, so a series held as a number -- or as a null somebody hand-wrote into the document -- is
-  refused by name, while an emptied box is simply no series. `Chart` in `main.ts` carries `series?: string`, so `GET
-  /sheet`, every export and every MCP read answer the split rows through the one `sheet()` path. In `src/Main.elm` the
-  `Chart` doc gained `series : String` (`D.map5`, blank when the field is absent), a `ChartSeries` `InputChange` writes
-  it from the "split by" input in `viewChartSettings`, and `chartPoints` answers `List ( String, List ( String, Float )
+  refused by name, while an emptied box is simply no series. `Chart` in `main.ts` carries `series?: string` beside
+  `y2?: string` and `annotations?`, so `GET /sheet`, every export and every MCP read answer the split rows through the
+  one `sheet()` path. In `src/Main.elm` the
+  `Chart` doc's settings are `Chart_`, named the way `Query_` is because four readers spell them; a `ChartSeries`
+  `InputChange` writes the series from the "split by" input in `viewChartSettings`, and `chartPoints` -- which takes the
+  row key to read, `"y"` or `"y2"` -- answers `List ( String, List ( String, Float )
   )` -- the rows grouped by their `series` cell in first-appearance order, a row whose y is not a number dropped from
   its own series alone, and a sheet with no series column read as one series with no name. **Both the label and the
   series cell go through the lenient `string` decoder, never `D.string`**: nothing coerces a chart's columns, so an
@@ -773,6 +849,46 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   the `#468` every chart drew in and an unsplit chart draws no legend, so a chart with nothing to split by is the
   picture it always was, rect for rect. `chart:cohort-curves` is the bundled multi-series chart:
   `@query:cohort-retention`, a line per cohort over the months since its first order.
+- **A second column may have a scale of its own.** `y2` rides beside `y` through the same `chartIdent`, selected as one
+  more column of the same statement (`order by` counts the series' position rather than typing it, because a series is
+  the third column of a one-scale chart and the fourth of a two-scale one). It is refused by name on a `kpi`, which
+  draws one number. In the page it is its own list all the way down -- `chartPoints "y2" tbl`, its own
+  `top`/`bottom`/`span`/`plotY2`, its own `chartRuns` -- because folding it into the first scale's extent is what a
+  second axis exists to avoid, and it is **always drawn as a dashed line whatever the kind**, so a reader never has to
+  ask which shape belongs to which axis. Its labels sit at x 796 anchored end, its colours carry on from where the first
+  scale's left off so the legend index and the colour on screen are one number, and with two scales every legend entry
+  names its column through `legendName` -- the column alone with nothing to split by, and "north · margin" beside
+  "north · margin_pct" with a series, since the same series is on both scales and naming it twice identically says
+  nothing about which swatch is which. `chart:pair-ratio-z` is the bundled one.
+- **A box is the one kind that aggregates in its own query.** Every other chart reads one row per point; a box is five
+  numbers about the rows that share an x, and no point can carry five. So `chartSql`'s box branch selects `min`, the
+  three `percentile(array(...))` quartiles and `max` grouped by x -- `BOX_QUANTILES` is the one list of them -- and the
+  page reads them with `chartBoxes` rather than `chartPoints`, dropping a row missing any of the five whole, because a
+  box with no whisker is not a box. **The box query filters its own blanks** (`where <y> is not null`): `percentile`
+  refuses a null outright, so one blank cell anywhere in the column refused the whole chart, every group of it, and a
+  blank cell is the normal state of a spreadsheet rather than an error in one. A group whose cells are all blank simply
+  does not appear, the way a row with no y does on every other kind. A `series` or a `y2` on a box is refused by name: the five numbers are already the
+  split. It is placed ordinally, the way bars are and for the same reason, and its scale spans the whiskers.
+  `chart:dim-spread` and `chart:scenario-spread` are the bundled ones.
+- **The legend wraps, and the plot starts under it.** `legendLayout` flows the entries left to right at an estimated
+  width each (SVG cannot be asked how wide a string draws before it draws it, and a measured legend is a second layout
+  pass per keystroke), wraps at the width of the plot, and answers how many rows it took. It wraps *before* the entry
+  that would overhang, and never on the first entry of a row, so one name wider than the whole plot overhangs once
+  rather than wrapping forever. `plotTop` is `20` plus 14 a row past the first, so **a chart with no legend or a
+  one-row legend is drawn in exactly the 240 units every chart always was** -- which is what keeps `chartRuns`'
+  placements and the bundled bar chart's rect count unchanged. It is bounded at `legendMax` entries and the rest are
+  counted in a final "+N more", and `plotTop` is clamped besides: nothing caps how many distinct values a series column
+  holds, and an unbounded legend pushed the top of the plot below its own baseline and drew the chart upside down.
+  `chartColours` cycles at six, so past a dozen the swatches have stopped telling the series apart anyway.
+- **A day axis can carry marks.** `annotations` in `data[0]` is `{ at, label }` per entry, read through `optionalField`
+  so a chart written before there were marks still decodes and one spelled wrong is refused rather than painted as no
+  marks. `chartSpan` and `chartAt` are `chartRuns`' own placement lifted out, so a mark and a point are placed by one
+  rule; a mark is drawn only where `chartSpan` answered and only for an `at` `parseDay` reads, and **nowhere at all**
+  otherwise rather than at the left edge. `chartAt` does not clamp: an annotation may name a day outside the span, and a
+  mark dragged to the edge would date it wrong. `viewChartSettings` edits them as one textarea, a day and its label per
+  line the way a dashboard's tiles are, through `parseAnnotation` -- which refuses a blank line, since `String.words`
+  answers one empty word for a line of spaces and that was marking the day `""`. `InputChange ChartAnnotations` writes a
+  list, so it goes through `changeDoc` and not `chartSet`, which writes strings.
 - **A chart's x axis is time when every x is a day.** `chartRuns` is the one placement: `Nothing` when any x of any
   series fails `parseDay`, which leaves the ordinal axis -- one place per distinct label, in the order the labels arrive
   -- exactly as it was; otherwise every point sits at its own day between the earliest and the latest day any series
@@ -787,7 +903,7 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   expects. `chartFold` is the other half: a series past `chartPointsMax` points is cut into equal buckets in day order
   and each bucket drawn as the mean of its y values at the earliest day it holds, folded on a day axis only, and
   `viewChartSettings` says how many points a fold swallowed beside the row count, so nothing is averaged silently.
-  `viewChart` reads `chartFold (chartPoints tbl)`, so the axis, the stacks, the totals and the kpi tile all see the same
+  `viewChart` reads `chartFold (chartPoints "y" tbl)`, so the axis, the stacks, the totals and the kpi tile all see the same
   folded points.
 - **The palette is where you subscribe to a sheet.** `paletteRows` is what the palette reads now: the `subscribe to this
   sheet` command over a table, a query, a net-http or a net-hook, and then `paletteCommands`, whose signature stays the

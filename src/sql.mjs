@@ -1773,12 +1773,24 @@ const chartIdent = (what, value) => {
 
 // Every way a chart may be drawn, and the one list of them: `kindSpec` in
 // src/Main.elm is this list on the other side of the wire, and browser_test.ts
-// fails when the two stop agreeing. None of them changes the query -- every
-// chart reads one x and one y -- but a kind nobody draws used to render as a
+// fails when the two stop agreeing. A kind nobody draws used to render as a
 // line and say nothing, so a typo survived in the document forever.
-export const CHART_KINDS = ["line", "bar", "area", "scatter", "kpi"];
+//
+// `box` is the one kind that changes the query. Every other chart reads one row
+// per point and asks the page to draw it; a box is five numbers about the rows
+// that share an x, and there is no way to carry five numbers on a point whose
+// whole shape is one. So it aggregates here, where the sheet's own rows still
+// are, rather than in a second reader on the page that the server's export and
+// the MCP read would not have.
+export const CHART_KINDS = ["line", "bar", "area", "scatter", "kpi", "box"];
 
-export const chartSql = ({ source, kind = "line", x, y, series = "" }) => {
+// The quartiles a box is drawn from, in the order it draws them. Written down
+// once because the select list and the page's reader have to name the same five
+// columns, and a sixth would otherwise mean editing two lists that look
+// unrelated.
+const BOX_QUANTILES = [["q1", 0.25], ["med", 0.5], ["q3", 0.75]];
+
+export const chartSql = ({ source, kind = "line", x, y, y2 = "", series = "" }) => {
   // Only what a query can reference: the page refuses any other prefix while
   // loading, and a chart that runs on the server but not in the page is worse
   // than one that is refused in both.
@@ -1805,7 +1817,51 @@ export const chartSql = ({ source, kind = "line", x, y, series = "" }) => {
       Fix: meant ? `set the kind to ${meant}` : `set the kind to one of ${CHART_KINDS.join(", ")}`,
     }));
   }
-  const plot = `${chartIdent("x column", x)} as x, ${chartIdent("y column", y)} as y`;
+  const across = chartIdent("x column", x);
+  const up = chartIdent("y column", y);
+  // A box already splits its rows -- the five numbers per x are the split -- so
+  // a second way to split them is a question with two answers. Refused by name
+  // rather than ignored: a series box drawn as a plain one is a picture of rows
+  // somebody thinks are separate.
+  if (kind === "box") {
+    for (const [what, value] of [["series column", series], ["second y column", y2]]) {
+      if (value !== "") {
+        throw new Error(explain(`A box chart is already the spread of its rows, so it takes no ${what}.`, {
+          Expected: "a box chart with an x column and a y column and nothing else",
+          Received: `${what} ${show(value)}`,
+          Source: "this chart sheet's settings",
+          Fix: `clear the ${what}, or pick a kind that draws one`,
+        }));
+      }
+    }
+    const spread = BOX_QUANTILES.map(([name, at]) => `percentile(array(${up}), ${at}) as ${name}`).join(", ");
+    // A blank cell is dropped, the way every other kind of chart drops a row
+    // whose y does not read as a number. It is filtered here and not left to the
+    // aggregate because `percentile` refuses a null outright: one blank cell
+    // anywhere in the column took down the whole chart, every group of it,
+    // including the groups that had nothing wrong with them -- and a blank cell
+    // is the normal state of a spreadsheet, not an error in one. A group whose
+    // every cell is blank has no rows left and simply does not appear, which is
+    // what "nothing to draw here" looks like on every other kind.
+    return `select ${across} as x, min(${up}) as lo, ${spread}, max(${up}) as hi from ${source} where ${up} is not null group by ${across} order by 1`;
+  }
+  // A tile is one number and its change, so there is no second scale to put a
+  // second column on. Refused rather than dropped, for the reason every other
+  // unread field here is: a document holding a y2 nobody draws is a chart whose
+  // settings lie about what is on screen.
+  if (y2 !== "" && kind === "kpi") {
+    throw new Error(explain(`A kpi tile draws one number, so it has no second scale.`, {
+      Expected: "a kpi with one y column",
+      Received: `second y column ${show(y2)}`,
+      Source: "this chart sheet's settings",
+      Fix: "clear the second y column, or draw this as a line",
+    }));
+  }
+  // The second scale rides the same row as the first: one statement, one pass
+  // over the source, and two columns the page gives two axes to.
+  const plot = y2 === ""
+    ? `${across} as x, ${up} as y`
+    : `${across} as x, ${up} as y, ${chartIdent("second y column", y2)} as y2`;
   // Ordered by the x column, so the line is drawn in the order it is read and
   // two runs of the same chart agree; by the series first when there is one, so
   // each series arrives whole and in that same order. Absent or blank is the one
@@ -1815,9 +1871,13 @@ export const chartSql = ({ source, kind = "line", x, y, series = "" }) => {
   // chartIdent, so a series held as a number -- or as a null somebody hand-wrote
   // into the document -- is refused by name the way an x column is rather than
   // quietly drawing one series.
+  //
+  // The series' position is counted and not typed: it is the third column of a
+  // chart with one scale and the fourth of a chart with two, and `order by 3` on
+  // the second of those sorts by the second scale's values.
   return series === ""
     ? `select ${plot} from ${source} order by 1`
-    : `select ${plot}, ${chartIdent("series column", series)} as series from ${source} order by 3, 1`;
+    : `select ${plot}, ${chartIdent("series column", series)} as series from ${source} order by ${y2 === "" ? 3 : 4}, 1`;
 };
 
 // --- resolving a query's sheet references

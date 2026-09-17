@@ -4081,6 +4081,30 @@ const QUERIES = {
     system: true,
     doc: { type: "chart", data: [{ source: "@query:pair-zscore", kind: "line", x: "day", y: "z" }] },
   },
+  // The one bundled chart with a second scale, and the shape a second scale is
+  // for: a ratio in the units it is quoted in, and its z-score -- a number
+  // between -3 and 3 -- against an axis of its own. On one scale the z-score is
+  // a flat line along the bottom. The days it marks are the two the desk cares
+  // about, which is also what an annotation is for: a moment that is not in the
+  // data, said on the axis the data is drawn against.
+  "chart:pair-ratio-z": {
+    name: "pair ratio against its z-score",
+    tags: ["demo", "markets", "chart"],
+    system: true,
+    doc: {
+      type: "chart",
+      data: [
+        {
+          source: "@query:pair-zscore",
+          kind: "line",
+          x: "day",
+          y: "ratio",
+          y2: "z",
+          annotations: [{ at: "2026-02-02", label: "earnings" }],
+        },
+      ],
+    },
+  },
   "chart:pair-latest-z": {
     name: "pair z-score, latest",
     tags: ["demo", "markets", "chart"],
@@ -4122,6 +4146,15 @@ const QUERIES = {
       ],
     },
   },
+  // A box per production line: the median dimension, the middle half of the
+  // measurements around it, and the two extremes. The control chart beside it
+  // says which single points broke a limit; this says which line is loose.
+  "chart:dim-spread": {
+    name: "measurement spread per line",
+    tags: ["demo", "manufacturing", "chart"],
+    system: true,
+    doc: { type: "chart", data: [{ source: "@query:spc-chart", kind: "box", x: "line", y: "dim_mm" }] },
+  },
   "dashboard:budget-watch": {
     name: "budget watch",
     tags: ["demo", "government", "dashboard"],
@@ -4156,6 +4189,53 @@ const QUERIES = {
       { p10: "usd", p50: "usd", p90: "usd" },
       "select round(percentile(array(margin), 0.1), 2) as p10, round(percentile(array(margin), 0.5), 2) as p50, round(percentile(array(margin), 0.9), 2) as p90 from (select sample_normal(trial, 24.5, 3.1) * sample_triangular(trial, 800, 1150, 2000) as margin from @table:trials)",
     ),
+  },
+  // ...and which of the two inputs the spread is actually made of, which is the
+  // question a simulation is run to answer and a percentile cannot say. The
+  // correlation of one input against the output over the same trials is the
+  // cheap reading of it: every row draws both inputs and the margin they make,
+  // and `drawn` is whichever input this row's name says, so one statement ranks
+  // them and no UDF had to be written. Ordered widest first, which is what makes
+  // it a tornado.
+  "query:margin-tornado": {
+    name: "what moves the margin",
+    tags: ["demo", "finance", "query"],
+    system: true,
+    doc: QuerySql(
+      { moves: "num" },
+      "select input, what, round(abs(corr(array(drawn), array(margin))), 3) as moves from (select i.input, i.what, case when i.input = 'price' then sample_normal(t.trial, 24.5, 3.1) else sample_triangular(t.trial, 800, 1150, 2000) end as drawn, sample_normal(t.trial, 24.5, 3.1) * sample_triangular(t.trial, 800, 1150, 2000) as margin from @table:trials t, @table:margin-inputs i) group by input, what order by moves desc",
+    ),
+  },
+  // The same simulation under each named set of assumptions, one row per
+  // scenario per trial. The samplers seed off the values they are handed, not
+  // off where they are written, so three scenarios draw three independent
+  // streams and the sheet still reads the same on every reload.
+  "query:scenario-draws": {
+    name: "scenario draws",
+    tags: ["demo", "finance", "query"],
+    system: true,
+    doc: QuerySql(
+      { margin: "usd" },
+      "select s.scenario, t.trial, round(sample_normal(t.trial, s.price_mu, s.price_sd) * sample_triangular(t.trial, s.vol_low, s.vol_mode, s.vol_high), 2) as margin from @table:trials t, @table:scenarios s order by s.scenario, t.trial",
+    ),
+  },
+  "query:scenario-margins": {
+    name: "scenarios side by side",
+    tags: ["demo", "finance", "query"],
+    system: true,
+    doc: QuerySql(
+      { p10: "usd", p50: "usd", p90: "usd" },
+      "select scenario, round(percentile(array(margin), 0.1), 2) as p10, round(percentile(array(margin), 0.5), 2) as p50, round(percentile(array(margin), 0.9), 2) as p90 from @query:scenario-draws group by scenario order by scenario",
+    ),
+  },
+  // Three percentiles read as a table; the whole spread read as a picture. A box
+  // is the one kind that aggregates in its own query, so this plots the draws
+  // themselves rather than a sheet that has already summarised them.
+  "chart:scenario-spread": {
+    name: "margin spread per scenario",
+    tags: ["demo", "finance", "chart"],
+    system: true,
+    doc: { type: "chart", data: [{ source: "@query:scenario-draws", kind: "box", x: "scenario", y: "margin" }] },
   },
 };
 
@@ -7485,6 +7565,29 @@ const trials = Table(
   ...Array.from({ length: 500 }, (_, i) => [i + 1]),
 );
 
+// The inputs a simulation draws, one row each. A tornado reads one row per
+// sampled input and the trials are one row per draw, so the two have to be
+// crossed to get there -- and a cross join needs something to cross with.
+// `what` is here because a tornado nobody can read the axis of is a ranking of
+// two words.
+const marginInputs = Table(
+  ["input::text", "what::text"].map(Col),
+  ["price", "unit price, normal(24.5, 3.1)"],
+  ["volume", "units sold, triangular(800, 1150, 2000)"],
+);
+
+// @table:assumptions with more than one row: the same idea -- the numbers a
+// model rests on, in a sheet rather than buried in a query -- for the case where
+// you want to see three sets of them beside each other rather than change one.
+// Each row is a whole set, so a scenario is added by adding a row and nothing
+// downstream of it is touched.
+const scenarios = Table(
+  ["scenario::text", "price_mu::usd", "price_sd::num", "vol_low::int", "vol_mode::int", "vol_high::int"].map(Col),
+  ["base", 24.5, 3.1, 800, 1150, 2000],
+  ["upside", 26, 2.4, 1000, 1400, 2400],
+  ["downside", 22, 4, 600, 900, 1600],
+);
+
 export const DATASETS = [
   { doc_id: "countries", name: "countries", tags: ["example", "dataset"], doc: countries },
   { doc_id: "currencies", name: "iso 4217 currencies", tags: ["example", "reference"], doc: currencies },
@@ -7585,6 +7688,8 @@ export const DATASETS = [
   { doc_id: "events", name: "events 2026", tags: ["example", "dataset"], doc: events },
   { doc_id: "net-demo", name: "webhook demo", tags: ["example", "dataset"], doc: netDemo },
   { doc_id: "trials", name: "monte carlo trials", tags: ["demo", "reference"], doc: trials },
+  { doc_id: "margin-inputs", name: "margin model inputs", tags: ["demo", "reference"], doc: marginInputs },
+  { doc_id: "scenarios", name: "named scenarios", tags: ["demo", "reference"], doc: scenarios },
 ];
 
 export const EXAMPLES = {

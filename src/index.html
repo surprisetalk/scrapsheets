@@ -252,8 +252,10 @@
 
           // Handle autocomplete keyboard navigation
           codeEditor.addEventListener('keydown', (e) => {
-            // Check if autocomplete is showing (hacky but works)
-            const dropdown = document.querySelector('[style*="z-index: 100"]');
+            // By id, not by style: the column filter panel is also at z-index
+            // 100, so a panel left open anywhere on the page used to swallow the
+            // editor's own arrow keys.
+            const dropdown = document.getElementById('complete');
             if (!dropdown) return;
 
             if (e.key === 'ArrowDown') {
@@ -803,6 +805,32 @@
           );
           app.ports.queryDoc.subscribe(({ id, data }) => queryDoc(id, data));
 
+          // What columns one sheet has, for the editor's completion. `describe`
+          // is the statement, not a second reader written for this: it is what
+          // the typist would have run to ask the same question, and a suggestion
+          // built any other way could name a column the query is then refused
+          // for.
+          //
+          // A ref that cannot be read answers no columns rather than an error --
+          // a completion is a convenience, and an error banner over the editor
+          // because a sheet has not synced yet is worse than suggesting nothing.
+          // But `describe @query:x` *runs* that query to get its column types,
+          // so what is caught here is not only "no data yet": a ref cycle, a
+          // join over the row cap, a column whose cells contradict its type all
+          // land in the same catch, each with an explain() block nobody would
+          // otherwise see. So it is logged by name, the way a refused service
+          // worker registration is, rather than swallowed: the dropdown stays
+          // quiet either way, and the console says which of the two happened.
+          app.ports.columnsFor.subscribe(catchy(async (ref) => {
+            const columns = await runSql(`describe @${ref}`, { "": null })
+              .then(({ data }) => data.map((row) => String(row.column)))
+              .catch((error) => {
+                debug.error(`columnsFor: @${ref} has no columns to complete from:`, error?.message ?? error);
+                return [];
+              });
+            app.ports.columnsLoaded.send({ id: ref, data: columns });
+          }, 'columnsFor'));
+
           // A sort, a filter or a dragged width lands on the same document as
           // the query, and every change to that document used to start the SQL
           // again. Only these three decide what a run answers. One slot is
@@ -864,8 +892,19 @@
             if (libraryEntry) Library.set(id, { seen: new Date().toISOString() });
             // A chart is a query whose SQL its settings describe, built by the
             // same chartSql the server uses, so the picture matches the export.
+            // Every column any kind of chart answers with, declared numeric in
+            // one object rather than per kind: the override is read per column
+            // the result actually carries, so a name a given chart does not
+            // answer with is never looked up, and a kind added to CHART_KINDS
+            // cannot arrive with its numbers typed as text.
             const chartQuery = (cfg) =>
-              cfg?.source ? { lang: "sql", code: chartSql(cfg), cols: { y: "num" } } : null;
+              cfg?.source
+                ? {
+                  lang: "sql",
+                  code: chartSql(cfg),
+                  cols: { y: "num", y2: "num", lo: "num", q1: "num", med: "num", q3: "num", hi: "num" },
+                }
+                : null;
             if (type === "query") runQuery(id, doc.data[0]);
             if (type === "chart" && chartQuery(doc.data?.[0])) runQuery(id, chartQuery(doc.data[0]));
             watched?.handle.off("change", watched.onChange);

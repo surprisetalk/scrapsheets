@@ -452,10 +452,20 @@ export type Alert = {
   paused?: boolean;
   snoozed_until?: string;
 };
-// A chart is a sheet: where the numbers come from, which two columns to draw,
-// and -- when the rows hold more than one thing -- the column that names which
-// series each row belongs to.
-export type Chart = { source: string; kind: string; x: string; y: string; series?: string };
+// A chart is a sheet: where the numbers come from, which columns to draw, and
+// -- when the rows hold more than one thing -- the column that names which
+// series each row belongs to. `y2` is a second column on a scale of its own, and
+// `annotations` are the moments marked on a time axis; both are the page's to
+// draw, and both are here so a document carrying them still types.
+export type Chart = {
+  source: string;
+  kind: string;
+  x: string;
+  y: string;
+  y2?: string;
+  series?: string;
+  annotations?: { at: string; label: string }[];
+};
 // A dashboard owns no data: it names the sheets to show, and each tile is that
 // sheet. Its own rows are therefore the list of what it names.
 export type Dashboard = { tiles: string[] };
