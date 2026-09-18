@@ -151,32 +151,32 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
      else reuses.
   5. Bidirectional sync is the same definition read the other way, and waits on **Actions & write-back**.
 
-- [ ] **`rows_path` works on a feed that answers one page.** It is read by `pageRows()` and `rowKeys()` only, so a sheet
-      with no `page_by` and `mode: append` — the default shape, and the one a generic XML or a JSON envelope feed lands
-      in — stores the whole envelope, and `rows_path` set on it does nothing at all.
-  1. Read `storeConfig().rowsPath` on the one-request path in `pollNetSheet` the way the paged path already reads it, so
-     what is stored is the rows the sheet named whatever its paging is.
-  2. `isArray` in `readFeedBody`'s XML reader is the other half of the same gap: it holds `item` and `entry` to a list
-     so a one-row feed and a ten-row feed answer the same shape, and a generic XML feed gets no such protection —
-     `rows_path: "data.row"` over a day that answers one `<row>` silently becomes an object where every other day is an
-     array, and `shapeOf` reports `{data: "object"}` either way, so nothing grades it. Closing `isArray` over the
-     sheet's own `rows_path` leaf fixes both, and needs the config threaded into `readFeedBody`.
-  3. Do both together: they are one fact about where a sheet says its rows are, and half of it is worse than neither.
+- [ ] **A NUL byte in a polled body is a named refusal, not an unexplained failure row.** `POST /net/:id` refuses one by
+      offset (Postgres text cannot hold a NUL); the poller has no such check, and an HTML cell carrying one reaches the
+      insert — verified: a `<td>` holding a NUL round-trips through `markupCell` with the byte intact.
+  1. The trap that makes this more than a one-line guard: `netRow()` is the poller's one writer, but a refusal thrown
+     there re-enters. `pollNetSheet`'s catch writes its own failure row through `netRow`, and that row's body is
+     `fetchFailure(...)`, whose `detail` is a slice of the same response text — so the same NUL throws again, this time
+     with nothing to catch it.
+  2. So the check belongs where a body becomes text that will be stored, before either path builds a row, and
+     `fetchFailure`'s `detail` needs the same treatment rather than a second copy of the rule.
+  3. Pre-existing: a JSON feed answering `"\u0000"` has always had it. HTML and XML only made it easy to hit.
 
-- [ ] **The response is parsed, not stored as a blob.** CSV, TSV, NDJSON, gzip, zip, XML, RSS and Atom land as the JSON
-      they mean, read by the type the answer declares. XLSX, Parquet, HTML and PDF are still one cell. Each is one more
+- [ ] **The response is parsed, not stored as a blob.** CSV, TSV, NDJSON, gzip, zip, XML, RSS, Atom and HTML land as the
+      JSON they mean, read by the type the answer declares. XLSX, Parquet and PDF are still one cell. Each is one more
       entry in `BODY_PARSERS` and one more branch in `readFeedBody`.
-  1. HTML: the one `<table>` in the document becomes the rows, and a document holding more than one is refused naming
-     them — the rule the zip branch already applies to an archive's members, so this needs no CSS selector, no per-sheet
-     field and no new noun. It needs an HTML parser, which is what "never hand-roll anything that parses HTML" is about:
-     check `jsr:@b-fuze/deno-dom` runs on Deno Deploy before writing the branch, and pick another if it does not.
-  2. XLSX: blocked, and the blocker is the pin. `npm:xlsx@0.18.5` is the last version SheetJS published to npm — check
+  1. XLSX: blocked, and the blocker is the pin. `npm:xlsx@0.18.5` is the last version SheetJS published to npm — check
      with `npm view xlsx dist-tags` — and its read path is exactly what `claude.md` means by "written with and never
      read with". Decide first: a newer SheetJS from the vendor's own registry, or a different reader. Do not call
      `XLSX.read` on the pinned one.
-  3. Parquet: pick the reader before writing the branch — `hyparquet` reads, `hyparquet-writer` writes — and make the
+  2. Parquet: pick the reader before writing the branch — `hyparquet` reads, `hyparquet-writer` writes — and make the
      choice once, beside the Parquet export under **Reports & export**, which needs the same decision.
-  4. PDF table extraction, because half of government data ships as PDF.
+  3. PDF table extraction, because half of government data ships as PDF. An HTML table already reads, so a PDF whose
+     tables a converter can turn into HTML is the cheap half; a scanned one is not.
+  4. A CSV, a TSV and an NDJSON body are still decoded as UTF-8 whatever their answer's `charset` said, and non-fatally,
+     so a Latin-1 export lands as U+FFFD in a cell. `markupText` already reads a charset and refuses a label it cannot
+     use; the work is deciding whether making the other formats fatal is safe for feeds already running, and that
+     decision is the whole item.
 
 ---
 

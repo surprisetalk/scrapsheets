@@ -4496,6 +4496,14 @@ Deno.test(async function allTests(t) {
     const wrapped = await rowsOf(ids.wrapped);
     assertEquals(wrapped.length, 1, "the run before answered for w1, and this one answers for it again");
     assertEquals(wrapped[0].meta.keys, ["w1", "w2"], "sorted and deduplicated");
+    // And what it stores is those rows, not the envelope holding them. This sheet
+    // makes one request, and rows_path used to be read on the paged path alone --
+    // so the setting found the keys and the body kept the `included` beside them.
+    assertEquals(
+      JSON.parse(wrapped[0].body),
+      [{ id: "w1" }, { id: "w2" }],
+      "rows_path is read on a feed that answers in one request too",
+    );
 
     // Append is still append: the mode is per sheet and this one names none.
     assertEquals((await rowsOf(ids.enveloped)).length, 2, "a sheet with no mode keeps every run");
@@ -4605,8 +4613,8 @@ Deno.test(async function allTests(t) {
   // each stored as the JSON array it means, so a feed in any of them is the sheet a JSON feed is.
   await t.step("A feed's body is parsed by the type it declares", async () => {
     const { jwt } = await usr("orla@example.com");
-    const feed = async (url: string) => {
-      const hand = automerge.create<Sheet>({ type: "net-http", data: [{ url, interval: 3600 }] });
+    const feed = async (url: string, extra: Record<string, unknown> = {}) => {
+      const hand = automerge.create<Sheet>({ type: "net-http", data: [{ url, interval: 3600, ...extra }] });
       const id = `net-http:${hand.documentId}`;
       await put(jwt, `/library/${id}`, {});
       return id;
@@ -4639,6 +4647,20 @@ Deno.test(async function allTests(t) {
       zipCrc: await feed("https://zipcrc.body.test/feed"),
       zipComment: await feed("https://zipcomment.body.test/feed"),
       zipForge: await feed("https://zipforge.body.test/feed"),
+      html: await feed("https://html.body.test/feed"),
+      htmlTwo: await feed("https://htmltwo.body.test/feed"),
+      htmlNone: await feed("https://htmlnone.body.test/feed"),
+      htmlRagged: await feed("https://htmlragged.body.test/feed"),
+      htmlLatin1: await feed("https://htmllatin1.body.test/feed"),
+      htmlHeader: await feed("https://htmlheader.body.test/feed"),
+      rowsJson: await feed("https://rowsjson.body.test/feed", { rows_path: "data" }),
+      rowsOne: await feed("https://rowsone.body.test/feed", { rows_path: "data.row" }),
+      rowsMiss: await feed("https://rowsmiss.body.test/feed", { rows_path: "data" }),
+      rowsScalar: await feed("https://rowsscalar.body.test/feed", { rows_path: "data" }),
+      rowsArray: await feed("https://rowsarray.body.test/feed", { rows_path: "data" }),
+      htmlFoot: await feed("https://htmlfoot.body.test/feed"),
+      htmlBreak: await feed("https://htmlbreak.body.test/feed"),
+      htmlHidden: await feed("https://htmlhidden.body.test/feed"),
     };
     const gzip = async (text: string) =>
       new Uint8Array(
@@ -4794,6 +4816,93 @@ Deno.test(async function allTests(t) {
           return Promise.resolve(typed(commentZip, "application/zip"));
         case "zipforge.body.test":
           return Promise.resolve(typed(forgeZip, "application/zip"));
+        case "html.body.test":
+          // A caption, a <thead>, an entity, and a stray table written inside a
+          // <script> that must not count as one.
+          return Promise.resolve(typed(
+            `<html><body><h1>Stock</h1><script>var s = "<table><tr><td>fake</td></tr></table>";</script>` +
+              `<table><caption>Stock</caption><thead><tr><th>name</th><th>qty</th></tr></thead>` +
+              `<tbody><tr><td>nut &amp; bolt</td><td>4</td></tr><tr><td>washer</td><td></td></tr></tbody>` +
+              `</table></body></html>`,
+            "text/html; charset=utf-8",
+          ));
+        case "htmltwo.body.test":
+          return Promise.resolve(typed(
+            `<table id="nav"><tr><td>menu</td></tr></table><table><caption>Data</caption><tr><td>a</td></tr></table>`,
+            "text/html",
+          ));
+        case "htmlnone.body.test":
+          return Promise.resolve(typed(`<html><body><p>Nothing here.</p></body></html>`, "text/html"));
+        case "htmlragged.body.test":
+          return Promise.resolve(typed(
+            `<table><tr><th>a</th><th>b</th></tr><tr><td>1</td><td>2</td></tr><tr><td>3</td></tr></table>`,
+            "text/html",
+          ));
+        case "htmllatin1.body.test":
+          return Promise.resolve(typed(
+            Uint8Array.from([
+              ...new TextEncoder().encode(`<html><head><meta charset="iso-8859-1"></head><body><table>`),
+              ...new TextEncoder().encode(`<tr><th>t</th></tr><tr><td>caf`),
+              0xE9,
+              ...new TextEncoder().encode(`</td></tr></table></body></html>`),
+            ]),
+            "text/html",
+          ));
+        case "htmlheader.body.test":
+          // The answer names the charset and the document does not, which is the
+          // page that was refused on its first accented character.
+          return Promise.resolve(typed(
+            Uint8Array.from([
+              ...new TextEncoder().encode(`<table><tr><th>t</th></tr><tr><td>na`),
+              0xEF,
+              ...new TextEncoder().encode(`ve</td></tr></table>`),
+            ]),
+            "text/html; charset=iso-8859-1",
+          ));
+        case "rowsjson.body.test":
+          return Promise.resolve(typed(`{"meta":{"n":2},"data":[{"id":1},{"id":2}]}`, "application/json"));
+        case "rowsone.body.test":
+          // One <row>, which is the day a reader that let it collapse to an object
+          // broke on. rows_path names the element, so isArray holds it to a list.
+          return Promise.resolve(typed(
+            `<data><meta><n>1</n></meta><row><id>7</id></row></data>`,
+            "application/xml",
+          ));
+        case "rowsmiss.body.test":
+          return Promise.resolve(typed(`{"meta":1}`, "application/json"));
+        case "rowsscalar.body.test":
+          return Promise.resolve(typed(`{"data":[10,20]}`, "application/json"));
+        case "rowsarray.body.test":
+          // An RSS feed under a sheet that also names a rows_path: readFeedBody
+          // already answered the items, so there is no envelope left to name.
+          return Promise.resolve(typed(
+            `<rss><channel><item><t>A</t></item></channel></rss>`,
+            "application/rss+xml",
+          ));
+        case "htmlfoot.body.test":
+          // HTML 4.01 told authors to write <tfoot> before <tbody>, and plenty of
+          // pages still do. Read in tree order the footer is the header.
+          return Promise.resolve(typed(
+            `<table><tfoot><tr><td>Total</td><td>100</td></tr></tfoot>` +
+              `<thead><tr><th>name</th><th>amount</th></tr></thead>` +
+              `<tbody><tr><td>Alice</td><td>50</td></tr><tr><td>Bob</td><td>50</td></tr></tbody></table>`,
+            "text/html",
+          ));
+        case "htmlbreak.body.test":
+          return Promise.resolve(typed(
+            `<table><tr><th>n</th><th>note</th></tr><tr><td>10<br>20</td><td><p>a</p><p>b</p></td></tr></table>`,
+            "text/html",
+          ));
+        case "htmlhidden.body.test":
+          // A charset that only looks like a declaration, written before the real
+          // one, with nothing in the answer's own header to outrank it.
+          return Promise.resolve(typed(
+            new TextEncoder().encode(
+              `<script>var s = '<meta charset="windows-1252">';</script><meta charset="utf-8">` +
+                `<table><tr><th>t</th></tr><tr><td>caf\u00E9</td></tr></table>`,
+            ),
+            "text/html",
+          ));
         case "nsatom.body.test":
           // Prefixed Atom, which is most of the Atom on the internet.
           return Promise.resolve(typed(
@@ -4977,6 +5086,68 @@ Deno.test(async function allTests(t) {
     // A sixteen-bit document cannot be sniffed for its prolog as UTF-8, so the
     // byte-order mark is what says how wide it is. This was refused forever.
     assertEquals(await bodyOf(ids.utf16), [{ t: "wide" }]);
+
+    // An HTML table is a header and a grid, so it goes through the reader every
+    // delimited body takes: the digits are numbers and the blank is a null, the
+    // way a CSV feed's are. The <table> written inside a <script> is not a table.
+    assertEquals(await bodyOf(ids.html), [{ name: "nut & bolt", qty: 4 }, { name: "washer", qty: null }]);
+    assertEquals((await newest(ids.html)).meta.shape, { name: "string", qty: "number" });
+    // Two is a guess about which one holds the rows, refused naming both -- the
+    // rule a zip's members already take.
+    const twoTables = await errorOf(ids.htmlTwo);
+    assert(twoTables.includes("holds 2 tables"), twoTables);
+    assert(twoTables.includes(`"nav"`) && twoTables.includes(`"Data"`), `each is named: ${twoTables}`);
+    const noTable = await errorOf(ids.htmlNone);
+    assert(noTable.includes("holds no table"), noTable);
+    // A row that does not match its header is refused by number, in the same
+    // words a ragged CSV is, because it is the same reader.
+    const ragged2 = await errorOf(ids.htmlRagged);
+    assert(ragged2.includes("Line 3") && ragged2.includes("does not match its header"), ragged2);
+    // HTML declares its encoding too, in a <meta> rather than a prolog.
+    assertEquals(await bodyOf(ids.htmlLatin1), [{ t: "caf\u00E9" }]);
+    // And the answer's own charset outranks the document's, which is the order the
+    // web reads them in and what lets a page carrying no <meta> be read at all.
+    assertEquals(await bodyOf(ids.htmlHeader), [{ t: "na\u00EFve" }]);
+
+    // `rows_path` is read on the feed that answers in one request, not only on a
+    // paged one: set on a sheet with no page_by it did nothing at all, and the
+    // envelope was stored whole under a green run.
+    assertEquals(await bodyOf(ids.rowsJson), [{ id: 1 }, { id: 2 }]);
+    // And the other half of the same fact: a generic XML feed names no row element
+    // of its own, so rows_path is what holds one `<row>` to a list. Without it
+    // this is an object on the day a feed answers once and an array every other
+    // day, and shapeOf reports `{data: "object"}` either way.
+    assertEquals(await bodyOf(ids.rowsOne), [{ id: "7" }]);
+    // An answer that holds something else where the sheet said its rows are is
+    // this poll's failure row, never a guess at the envelope.
+    const missed = await errorOf(ids.rowsMiss);
+    assert(missed.includes("holds no rows where rows_path says they sit"), missed);
+    assert(missed.includes("data holds nothing"), `it names what sits there: ${missed}`);
+    // A row keyed by nothing is not a row -- the guard xmlRows puts on an <item>,
+    // for the same reason: stored, it makes shapeOf answer null for the whole run,
+    // so there is never a shape to change and POLL_OK grades it healthy forever.
+    const scalars = await errorOf(ids.rowsScalar);
+    assert(scalars.includes("holds no named fields"), scalars);
+    assert(scalars.includes("row 1 of 2"), `it names which row: ${scalars}`);
+    // And an answer that is already the rows has no envelope to name. Reading the
+    // setting as satisfied would hide a sheet that is wrong about its own feed.
+    const already = await errorOf(ids.rowsArray);
+    assert(already.includes("already answers an array of rows"), already);
+    assert(already.includes("take rows_path out"), `the fix is the one to make: ${already}`);
+
+    // A <tfoot> written before <tbody> is an HTML 4.01 idiom, and reading rows in
+    // tree order made that footer the header and the header a row.
+    assertEquals(await bodyOf(ids.htmlFoot), [
+      { name: "Alice", amount: 50 },
+      { name: "Bob", amount: 50 },
+      { name: "Total", amount: 100 },
+    ]);
+    // A <br> and a block element are a break with no width of their own, so
+    // `10<br>20` read as the single number 1020 -- in neither cell.
+    assertEquals(await bodyOf(ids.htmlBreak), [{ n: "10 20", note: "a b" }]);
+    // A <meta charset> inside a script string is not a declaration, and this scan
+    // runs before there is a parser that could know it.
+    assertEquals(await bodyOf(ids.htmlHidden), [{ t: "caf\u00E9" }]);
 
     // A bomb is the 413 an oversized body is, refused on what came out of the
     // decompressor rather than on the few hundred bytes that carried it -- and

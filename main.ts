@@ -24,6 +24,11 @@ import { NodeWSServerAdapter } from "@automerge/automerge-repo-network-websocket
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import ala from "alasql";
 import { XMLParser, XMLValidator } from "fast-xml-parser";
+// Pure JS, so there is no WASM to instantiate on a cold start, and it matched
+// html5ever on every malformed table tried -- an implicitly closed `<tr>`, a
+// nested table, a `<table>` written inside a `<script>`. Parsing HTML is what
+// "never hand-roll anything that parses" is about.
+import { parseHTML } from "linkedom";
 import * as path from "@std/path";
 import examplesSql from "./examples.sql" with { type: "text" };
 import { DATASETS } from "./src/examples.mjs";
@@ -3395,7 +3400,7 @@ const readBody = async (res: Response): Promise<Uint8Array<ArrayBuffer>> => {
 // parsed into the JSON it means and stored as that, and a body on none of it is
 // stored as the text it arrived as. The type read is the answer's own: nothing a
 // sheet holds can know what a host will answer with next week.
-const BODY_PARSERS: Record<string, "csv" | "tsv" | "ndjson" | "gzip" | "zip" | "xml" | "rss" | "atom"> = {
+const BODY_PARSERS: Record<string, "csv" | "tsv" | "ndjson" | "gzip" | "zip" | "xml" | "rss" | "atom" | "html"> = {
   "text/csv": "csv",
   "text/tab-separated-values": "tsv",
   "application/x-ndjson": "ndjson",
@@ -3408,6 +3413,8 @@ const BODY_PARSERS: Record<string, "csv" | "tsv" | "ndjson" | "gzip" | "zip" | "
   "text/xml": "xml",
   "application/rss+xml": "rss",
   "application/atom+xml": "atom",
+  "text/html": "html",
+  "application/xhtml+xml": "html",
 };
 
 // Compressed bytes handed to the decompressor at a time. Small, because it is
@@ -3489,29 +3496,48 @@ const expand = async (
 // array, so a feed answering one row and a feed answering ten answer the same
 // shape: collapsing the single one to an object is how a reader breaks on the
 // quiet day rather than on the day it was written.
-const xmlReader = new XMLParser({
-  ignoreAttributes: false,
-  attributeNamePrefix: "@",
-  parseTagValue: false,
-  parseAttributeValue: false,
-  ignoreDeclaration: true,
-  ignorePiTags: true,
-  removeNSPrefix: true,
-  isArray: (name: string) => name === "item" || name === "entry",
-});
+// `rows_path` closes over the same list: a generic XML feed names no row element
+// of its own, so the sheet's own path is the only thing that says which element
+// is a row -- and without it `rows_path: "data.row"` over a day that answers one
+// `<row>` is an object where every other day is an array, with `shapeOf`
+// reporting `{data: "object"}` either way, so nothing ever grades it. `jpath` is
+// the dotted path of the element being read, which is the spelling `rows_path`
+// is already written in. Building one per body costs under two microseconds.
+const xmlReaderFor = (rowsPath: string) =>
+  new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: "@",
+    parseTagValue: false,
+    parseAttributeValue: false,
+    ignoreDeclaration: true,
+    ignorePiTags: true,
+    removeNSPrefix: true,
+    // The reader types its second argument as a string or a matcher view. It
+    // hands a string for every element; the check says so rather than casting,
+    // because a cast here would silently stop matching if that ever changed.
+    isArray: (name: string, jpath: unknown) =>
+      name === "item" || name === "entry" || (typeof jpath === "string" && jpath === rowsPath),
+  });
 
-// How much of a body is read looking for its declared encoding. The prolog must
-// be the first thing in the document and is ASCII by definition, so it is in
-// hand well before this.
-const XML_PROLOG_BYTES = 256;
+// How much of a body is read looking for its declared encoding. Both
+// declarations belong near the top of the document and are ASCII by definition,
+// so both are in hand well before this. HTML's may sit after a `<title>`, which
+// is why it is the longer read of the two.
+const MARKUP_HEAD_BYTES = 1024;
 const XML_ENCODING = /^\s*<\?xml\s[^?>]*encoding\s*=\s*["']([\w.:-]{1,40})["']/;
+const HTML_CHARSET = /<meta[^>]+charset\s*=\s*["']?([\w.:-]{1,40})/i;
+// The `charset` parameter of the answer's own content-type header, which outranks
+// what the document says about itself.
+const CHARSET_PARAM = /;\s*charset\s*=\s*"?([\w.:-]{1,40})/i;
 
-/** An XML body as text, decoded the way the document says to decode it. Latin-1
- * RSS is still common, and a bare UTF-8 decode turns every accented character in
- * one into U+FFFD and stores that as data -- a guess made against evidence
- * sitting in the first line of the body. Fatal, because a replacement character
- * kept as a cell cannot be told from a character the feed actually sent. */
-const xmlText = (bytes: Uint8Array<ArrayBuffer>, source: string): string => {
+/** A markup body as text, decoded the way the document says to decode it. XML
+ * and HTML are the two formats here that state their own encoding, and Latin-1
+ * feeds of both are still common: a bare UTF-8 decode turns every accented
+ * character in one into U+FFFD and stores that as data, which is a guess made
+ * against evidence sitting in the first line of the body. Fatal, because a
+ * replacement character kept as a cell cannot be told from a character the feed
+ * actually sent. */
+const markupText = (bytes: Uint8Array<ArrayBuffer>, source: string, declaring: RegExp, answered: string): string => {
   // A sixteen-bit document cannot be sniffed for its own prolog as UTF-8 -- every
   // other byte of `<?xml` is a NUL and the regex never matches -- so the width is
   // read off the first bytes the way the XML spec says to: a byte-order mark, or
@@ -3527,10 +3553,20 @@ const xmlText = (bytes: Uint8Array<ArrayBuffer>, source: string): string => {
     : bytes[0] === 0x00 && bytes[1] === 0x3C
     ? "utf-16be"
     : null;
-  const head = new TextDecoder(wide ?? "utf-8").decode(bytes.subarray(0, XML_PROLOG_BYTES)).replace(/^﻿/, "");
+  const head = new TextDecoder(wide ?? "utf-8").decode(bytes.subarray(0, MARKUP_HEAD_BYTES)).replace(/^﻿/, "")
+    // A `<meta charset>` written inside a comment or a script string is not a
+    // declaration, and this scan runs before there is a parser that could know
+    // that -- so the two places one can hide are cut out first. An unclosed one
+    // cuts to the end of what was read, because the rest of it is inside
+    // whatever did not close.
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, "")
+    .replace(/<script\b[\s\S]*?(?:<\/script>|$)/gi, "");
   // A sixteen-bit document's declared label is the width it is already being read
   // at, so the mark wins: the two cannot disagree about a document that parsed.
-  const label = wide ?? head.match(XML_ENCODING)?.[1] ?? "utf-8";
+  // Then the answer's own `charset`, which outranks the document's declaration --
+  // the order the web reads these in, and what lets a Latin-1 page carrying no
+  // `<meta charset>` be read at all rather than refused on its first accent.
+  const label = wide ?? (answered || head.match(declaring)?.[1] || "utf-8");
   let decoder: TextDecoder;
   try {
     decoder = new TextDecoder(label, { fatal: true });
@@ -3547,7 +3583,7 @@ const xmlText = (bytes: Uint8Array<ArrayBuffer>, source: string): string => {
   } catch (err) {
     return bad(400, `This body is not ${label} text.`, {
       Received: `${bytes.byteLength} bytes the ${label} decoder refused: ${reason(err)}`,
-      Expected: `bytes this document's own prolog says are ${label}`,
+      Expected: `bytes this answer says are ${label}`,
       Source: source,
       Fix: "serve the feed as UTF-8, or declare the encoding it is actually in",
     });
@@ -3559,7 +3595,7 @@ const xmlText = (bytes: Uint8Array<ArrayBuffer>, source: string): string => {
  * `{a:{b:""}}` rather than raising, and a body silently half-read is the blob
  * this whole list exists to stop. Custom entities are never expanded, so the
  * billion-laughs body is stored as the text `&lol2;` and not as a gigabyte. */
-const xmlDoc = (text: string, source: string): unknown => {
+const xmlDoc = (text: string, source: string, rowsPath: string): unknown => {
   const checked = XMLValidator.validate(text);
   if (checked !== true) {
     // An empty body answers a line and no column, so the column is named only
@@ -3576,7 +3612,7 @@ const xmlDoc = (text: string, source: string): unknown => {
     });
   }
   try {
-    return xmlReader.parse(text);
+    return xmlReaderFor(rowsPath).parse(text);
   } catch (err) {
     // The reader's own bounds, raised after the validator has already called the
     // document well formed: a nesting depth, and a declared external entity this
@@ -3702,6 +3738,104 @@ const jsonMeant = (text: string, source: string, why: string): string => {
   return text;
 };
 
+// What this reader reaches for in a parsed document. linkedom types `parseHTML`
+// as a whole Window, which is neither true of what comes back nor useful, so the
+// shape is declared here and cast once: types at the boundary, inference inside.
+type Markup = {
+  getAttribute: (name: string) => string | null;
+  querySelector: (query: string) => Markup | null;
+  querySelectorAll: (query: string) => Markup[];
+  replaceWith: (text: string) => void;
+  before: (text: string) => void;
+  parentNode: { tagName?: string } | null;
+  textContent: string | null;
+};
+
+// In HTML, whitespace is layout and not content. Collapsing it is also what keeps
+// a newline out of the delimited file built below.
+//
+// A `<br>` and a block element are a break in the text and `textContent` gives
+// neither any width of its own, so `10<br>20` read as the single number 1020 --
+// two numbers silently merged into a third that was in neither cell -- and
+// `<p>a</p><p>b</p>` read as `ab`. Each becomes a space before the text is taken.
+const markupCell = (node: Markup | null): string => {
+  if (node) {
+    for (const br of node.querySelectorAll("br")) br.replaceWith(" ");
+    for (const block of node.querySelectorAll("p,div,li")) block.before(" ");
+  }
+  return String(node?.textContent ?? "").replace(/\s+/g, " ").trim();
+};
+
+// Where a row sits decides its order, not where it was written. HTML 4.01 told
+// authors to write `<tfoot>` before `<tbody>` so a browser could paint the foot
+// before the rows arrived, and plenty of pages still do: read in tree order, that
+// footer becomes the header and the real header becomes a row. Anything outside a
+// section keeps the middle rank, so a table written without one is untouched.
+const SECTION_RANK: Record<string, number> = { THEAD: 0, TFOOT: 2 };
+
+/** The one table in an HTML document, written back out as a delimited file. HTML
+ * is the one format here whose rows already are a header and a grid, so they go
+ * through `parseDelimited` -- the reader a CSV feed and an uploaded file both
+ * take -- and a table's digits are numbers, its blanks are nulls and a row that
+ * does not match its header is refused by number, all of it worded the way a
+ * CSV's is. Every field is quoted, so a cell holding the delimiter needs no
+ * thought. The first row is the header, which is the rule a CSV already has. */
+const htmlDelimited = (text: string, source: string): string => {
+  const doc = (parseHTML(text) as unknown as { document: Markup }).document;
+  const tables = doc.querySelectorAll("table");
+  // Exactly one, for the reason a zip takes exactly one member it can name:
+  // which table is the rows is the sheet owner's answer to give, and a reader
+  // that picked the first would pick a different one the week a page gains a
+  // layout table above it.
+  if (tables.length !== 1) {
+    const named = tables.slice(0, NAMES_MAX).map((table, at) => {
+      const id = table.getAttribute("id");
+      const caption = markupCell(table.querySelector("caption"));
+      const first = markupCell(table.querySelector("th,td"));
+      const how = id ? `id ${show(id)}` : caption ? show(caption) : first ? `starting ${show(first)}` : "";
+      return `table ${at + 1}${how ? ` (${how})` : ""}`;
+    });
+    bad(400, `This HTML body holds ${tables.length === 0 ? "no table" : `${tables.length} tables`}.`, {
+      Received: tables.length === 0
+        ? "a document holding no <table> at all"
+        : `${named.join(", ")}${tables.length > NAMES_MAX ? `, and ${tables.length - NAMES_MAX} more` : ""}`,
+      Expected: "exactly one <table>, so that no guess is made about which one holds the rows",
+      Source: source,
+      Fix: "point the sheet at a page or a fragment whose only table is the data",
+    });
+  }
+  // Sorted by section and then by where it was written, so the header is the
+  // header whatever order the sections came in, and a footer row lands last
+  // rather than first. Nothing is dropped: a `<tfoot>` total is a row of the
+  // table, and skipping it would be this reader deciding what the data means.
+  const rows = tables[0].querySelectorAll("tr")
+    .map((row, at) => ({ row, at, rank: SECTION_RANK[String(row.parentNode?.tagName ?? "")] ?? 1 }))
+    .sort((a, b) => a.rank - b.rank || a.at - b.at)
+    .map(({ row }) => row);
+  if (!rows.length) {
+    bad(400, `The table in this HTML body holds no rows.`, {
+      Received: "a <table> holding no <tr>",
+      Expected: "a header row, and a row under it for each record",
+      Source: source,
+      Fix: "point the sheet at a page whose table is the data",
+    });
+  }
+  return rows.map((row, at) => {
+    const fields = row.querySelectorAll("th,td");
+    // A `<tr>` holding no cells writes an empty line, which the delimited reader
+    // passes over -- and a row silently passed over is a row the sheet lost.
+    if (!fields.length) {
+      bad(400, `Row ${at + 1} of the table in this HTML body holds no cells.`, {
+        Received: "a <tr> holding no <th> or <td>",
+        Expected: "every row to hold the cells its header names",
+        Source: source,
+        Fix: "point the sheet at a page whose table is the data",
+      });
+    }
+    return fields.map((cell) => `"${markupCell(cell).replace(/"/g, '""')}"`).join(",");
+  }).join("\n");
+};
+
 // What this reader takes out of an archive, by the extension its member is named
 // with: a zip names its members and nothing else in it says what any of them
 // holds, so the name is the only thing there is to read a type off -- a claim to
@@ -3716,6 +3850,11 @@ const ZIP_MEMBERS: Record<string, string> = {
   xml: "application/xml",
 };
 
+// How many names a refusal spells out before it counts the rest: an archive may
+// hold thousands of members and a page may hold hundreds of tables, and a refusal
+// nobody can read says nothing.
+const NAMES_MAX = 10;
+
 // The end-of-central-directory record is the only fixed point in a zip -- every
 // member is found through it -- and it sits at the very end behind a comment of
 // up to 64k, so it is found by scanning back for its signature.
@@ -3723,9 +3862,7 @@ const ZIP_EOCD = 0x06054b50;
 const ZIP_ENTRY = 0x02014b50;
 const ZIP_LOCAL = 0x04034b50;
 const ZIP_COMMENT_MAX = 65_535;
-// How many member names a refusal spells out before it counts the rest: an
-// archive may hold thousands, and a refusal nobody can read says nothing.
-const ZIP_NAMES_MAX = 10;
+
 // The one value a 32-bit zip field takes to say "read this from the zip64 record
 // instead", which this reader does not read.
 const ZIP64 = 0xffffffff;
@@ -3932,6 +4069,7 @@ const readFeedBody = async (
   raw: Uint8Array<ArrayBuffer>,
   contentType: string,
   source: string,
+  rowsPath = "",
   depth = 0,
 ): Promise<string> => {
   if (depth >= BODY_DEPTH_MAX) {
@@ -3964,10 +4102,10 @@ const readFeedBody = async (
     });
     if (named.length !== 1) {
       const held = named.length ? named.map(({ member }) => member) : members;
-      const listed = held.slice(0, ZIP_NAMES_MAX).map((member) => show(member.name)).join(", ");
+      const listed = held.slice(0, NAMES_MAX).map((member) => show(member.name)).join(", ");
       bad(400, `This zip holds ${named.length === 0 ? "nothing" : `${named.length} files`} this reader can take.`, {
         Received: `an archive of ${members.length} members${listed ? `: ${listed}` : ""}${
-          held.length > ZIP_NAMES_MAX ? `, and ${held.length - ZIP_NAMES_MAX} more` : ""
+          held.length > NAMES_MAX ? `, and ${held.length - NAMES_MAX} more` : ""
         }`,
         Expected: `exactly one member named .${Object.keys(ZIP_MEMBERS).join(", .")}`,
         Source: source,
@@ -3990,13 +4128,20 @@ const readFeedBody = async (
     // no parser for `application/json` to hand it to.
     if (type === "application/json")
       return jsonMeant(new TextDecoder().decode(inside), where, "the member is named .json");
-    return await readFeedBody(inside, type, where, depth + 1);
+    return await readFeedBody(inside, type, where, rowsPath, depth + 1);
   }
   const bytes = how === "gzip" ? await expand(raw, "gzip", source) : raw;
   // An XML body is the one that says what encoding it is in, and the one where
   // guessing wrong is stored as data rather than refused.
   const xmlish = how === "xml" || how === "rss" || how === "atom";
-  const text = xmlish ? xmlText(bytes, source) : new TextDecoder().decode(bytes);
+  // Only the markup formats read it, which is where the encoding work is: a CSV
+  // or an NDJSON body is still decoded as UTF-8 whatever its answer said.
+  const answered = xmlish || how === "html" ? contentType.match(CHARSET_PARAM)?.[1] ?? "" : "";
+  const text = xmlish
+    ? markupText(bytes, source, XML_ENCODING, answered)
+    : how === "html"
+    ? markupText(bytes, source, HTML_CHARSET, answered)
+    : new TextDecoder().decode(bytes);
   // What a gzip holds is the one thing neither door can be told: one header says
   // the body is compressed and nothing says what came out of it. The first
   // character that is not whitespace is the whole of the sniff -- JSON opens with
@@ -4029,7 +4174,7 @@ const readFeedBody = async (
     }
     meant = JSON.stringify(rows);
   } else if (reading === "rss" || reading === "atom") {
-    const parsed = xmlDoc(text, source);
+    const parsed = xmlDoc(text, source, rowsPath);
     xmlFeedRoot(parsed, reading, source);
     meant = JSON.stringify(xmlRows(parsed, reading === "rss" ? "item" : "entry", source));
   } else if (reading === "xml") {
@@ -4037,12 +4182,15 @@ const readFeedBody = async (
     // names no row element the way RSS and Atom do. A paged or upsert sheet says
     // where they sit with `rows_path`; on any other sheet the document is what is
     // stored and a query over it is what reads the rows out.
-    meant = JSON.stringify(xmlDoc(text, source));
+    meant = JSON.stringify(xmlDoc(text, source, rowsPath));
   } else {
     // Keyed by column name, which is what every reader downstream keys on and
     // what a JSON feed hands them. `col.key` is the document's own spelling and
     // stays with the importer, the one door that writes a document.
-    const { cols, rows } = parseDelimited(text, {}, reading === "tsv" ? "\t" : ",", source);
+    // An HTML table is a header and a grid already, so it is written back out as
+    // a delimited file and read by the one reader every delimited body takes.
+    const delimited = reading === "html" ? htmlDelimited(text, source) : text;
+    const { cols, rows } = parseDelimited(delimited, {}, reading === "tsv" ? "\t" : ",", source);
     meant = JSON.stringify(rows.map((row) => Object.fromEntries(cols.map((col) => [col.name, row[col.key]]))));
   }
   // The cap on what the body means, which is what lands in the column: a body
@@ -4275,6 +4423,73 @@ const linkNext = (header: string | null): string | null => {
     if (rels.includes("next")) return target.trim();
   }
   return null;
+};
+
+/** The rows a feed that makes one request named with `rows_path`. The paged path
+ * reads the same field through `pageRows`, and a sheet with no `page_by` read it
+ * nowhere at all: the envelope was stored whole and a `rows_path` set on it did
+ * nothing, which is the shape a generic XML feed and a JSON feed answering an
+ * envelope both land in. There is no guess here and none in `pageRows` either --
+ * the sheet said where its rows are, and an answer that holds something else
+ * there is this poll's failure row. */
+const namedRows = (text: string, rowsPath: string, url: string): unknown[] => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(
+      explain("This feed names where its rows sit, and its answer is not JSON.", {
+        Received: `${text.length} characters the JSON parser refused: ${reason(err)}`,
+        Expected: `an answer holding an array of rows at ${rowsPath}`,
+        Source: url,
+        Fix: "take rows_path out, or point the sheet at an endpoint whose answer holds its rows in a field",
+      }),
+    );
+  }
+  // An answer that is already the rows has no envelope for rows_path to name, and
+  // reading the setting as satisfied would hide the sheet that is wrong about its
+  // own feed. An RSS or Atom body arrives here as the items, a CSV as its rows,
+  // so this is the sheet saying something its feed cannot mean.
+  if (Array.isArray(parsed)) {
+    throw new Error(
+      explain("This feed already answers an array of rows, and rows_path names a field around one.", {
+        Received: `${parsed.length} rows, under a sheet whose rows_path is ${rowsPath}`,
+        Expected: "an answer holding its rows in a named field, or no rows_path at all",
+        Source: url,
+        Fix: "take rows_path out: an RSS or Atom feed, a CSV and a bare JSON array each answer their rows already",
+      }),
+    );
+  }
+  const at = atNames(parsed, rowsPath);
+  if (!Array.isArray(at)) {
+    throw new Error(
+      explain("This feed's answer holds no rows where rows_path says they sit.", {
+        Received: `${rowsPath} holds ${show(at)}`,
+        Expected: `an array of rows at ${rowsPath}`,
+        Source: url,
+        Fix: "point rows_path at the field this feed holds its rows in, or take rows_path out",
+      }),
+    );
+  }
+  // The guard `xmlRows` puts on an `<item>`, for the same reason: a row keyed by
+  // nothing is not a row, and an array of scalars stored as rows makes `shapeOf`
+  // answer null for the whole run -- so there is never a shape, never a
+  // `shape_change`, and POLL_OK grades the sheet healthy at zero usable rows for
+  // as long as it exists.
+  for (let i = 0; i < at.length; i++) {
+    const row = at[i];
+    if (typeof row !== "object" || row === null || Array.isArray(row)) {
+      throw new Error(
+        explain("A row this feed names holds no named fields.", {
+          Received: `${show(row)} as row ${i + 1} of ${at.length} at ${rowsPath}`,
+          Expected: `every row at ${rowsPath} to hold named fields, because a row keyed by nothing is not a row`,
+          Source: url,
+          Fix: "point rows_path at the field this feed holds its records in, or take rows_path out",
+        }),
+      );
+    }
+  }
+  return at;
 };
 
 /** One page's rows, and what the whole page parsed to. Every page is JSON: the
@@ -4876,7 +5091,7 @@ export const pollNetSheet = async (
     // feed hands them. A body that did not answer 2xx is never parsed -- an
     // error page is not this feed's data -- and is logged as the text it is.
     const text = res.ok
-      ? await readFeedBody(raw, res.headers.get("content-type") ?? "", url)
+      ? await readFeedBody(raw, res.headers.get("content-type") ?? "", url, storing.rowsPath)
       : new TextDecoder().decode(raw);
     // The pages after the first, and what the run stores: every page answers
     // an array, and the arrays concatenated are one body, so shapeOf, the
@@ -4933,7 +5148,7 @@ export const pollNetSheet = async (
         // bytes are not what lands in `rows`, and summing those instead of
         // this would let a paged gzip feed's pages decompress to any amount
         // between them without the cap below ever seeing it.
-        const pageText = await readFeedBody(chunk, answer.headers.get("content-type") ?? "", target);
+        const pageText = await readFeedBody(chunk, answer.headers.get("content-type") ?? "", target, storing.rowsPath);
         bytes += new TextEncoder().encode(pageText).byteLength;
         // Checked as it grows. A feed that never says "last" otherwise costs
         // every page it has before one number past the cap refuses the lot.
@@ -4956,6 +5171,12 @@ export const pollNetSheet = async (
       // Nothing of what those pages held is kept: the retry starts at page one.
       if (retrying) return;
       payload = JSON.stringify(rows);
+    } else if (res.ok && storing.rowsPath) {
+      // The same field, on the feed that answers in one request. Read only on the
+      // paged path, a sheet that named its rows and had no `page_by` stored the
+      // whole envelope under a green run and the setting did nothing.
+      payload = JSON.stringify(namedRows(text, storing.rowsPath, url));
+      bytes = new TextEncoder().encode(payload).byteLength;
     }
     // Errors become log rows too: the user who typed the URL must see them, and
     // must be able to run the same request by hand.
