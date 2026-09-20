@@ -42,6 +42,7 @@ import {
   checkQueryRows,
   checkResultColumns,
   COLUMN_TYPES,
+  DECOMPOSE,
   DESCRIBE_COLUMNS,
   describeRef,
   describeRows,
@@ -50,6 +51,7 @@ import {
   loadRefs,
   MAX_QUERY_MS,
   MAX_QUERY_ROWS,
+  namesIn,
   nearest,
   NUMERIC_TYPES,
   planQuery,
@@ -67,6 +69,13 @@ import Stripe from "stripe";
 // Written with, never read with: every advisory SheetJS carries is in its
 // parsers, and no route here calls one.
 import * as XLSX from "xlsx";
+// Parquet both ways, out of one pair: hyparquet-writer depends on exactly this
+// hyparquet, so one copy loads. Pure JS with snappy built in, so there is no
+// WASM to instantiate on a cold start -- the reason linkedom is here. Both are
+// imported by the `/src/index.js` path because that is the browser export
+// condition: the default one pulls node:fs.
+import { parquetReadObjects } from "hyparquet";
+import { parquetWriteBuffer } from "hyparquet-writer";
 
 // --- refusals
 //
@@ -900,10 +909,12 @@ const executeSql = async (
   for (const w of plan.windows) {
     const declared = (WINDOW_TYPES as Record<string, Type | null>)[w.fn];
     const followed = nameToType[w.args[0]] ?? "num";
-    // An average of whole numbers is not a whole number. The one demotion
-    // itemType() makes for a select item, made here too, because a window and a
-    // select item spelling one name have to mean one type.
-    nameToType[w.alias] = declared ?? (w.fn === "avg" && followed === "int" ? "num" : followed);
+    // An average of whole numbers is not a whole number, and neither is a moving
+    // average or a seasonal index of them. The one demotion itemType() makes for
+    // a select item, made here too, because a window and a select item spelling
+    // one name have to mean one type.
+    const fractional = w.fn === "avg" || DECOMPOSE.includes(w.fn);
+    nameToType[w.alias] = declared ?? (fractional && followed === "int" ? "num" : followed);
   }
 
   let result: { columns: { columnid: string }[]; data: Record<string, unknown>[] };
@@ -2630,15 +2641,21 @@ app.get("/shop", async (c) => {
         { name: "name", type: "text", key: "name" },
         { name: "price", type: "usd", key: "sell_price" },
         { name: "license", type: "text", key: "license" },
+        // The two facets the shop is browsed by. They are columns rather than a
+        // second filter UI: the column panel is what filters a table here, and
+        // the page asks for the whole catalogue so it filters over all of it.
+        { name: "type", type: "text", key: "sell_type" },
+        { name: "tags", type: "text", key: "tags" },
         { name: "", type: "create", key: "row_0" },
       ],
-      select: sql`select created_at, sell_id, sell_type, sell_price, license, name, row_0`,
+      select: sql`select created_at, sell_id, sell_type, sell_price, license, name, tags, row_0`,
       from: sql`from sheet s`,
       where: [
         sql`sell_price >= 0`,
         sql`sell_type is not null`,
         qs.name && sql`name ilike ${qs.name + "%"}`,
         qs.sell_type && sql`sell_type = ${qs.sell_type}`,
+        qs.tags && sql`${qs.tags}::text = any(tags)`,
         range && sql`sell_price between ${range[1]}::numeric and ${range[2]}::numeric`,
       ],
       // name is not unique, so it cannot decide the order on its own.
@@ -3443,11 +3460,16 @@ const RETRY_MAX = 3;
 // slept: a cycle that waited here would still be waiting when the next tick
 // arrived, and a Retry-After of an hour would hold every other sheet with it.
 const RETRY_BACKOFF_MS = 30_000;
-// A cycle starts no further sheets past this. That budget, plus the single
-// request a sheet makes and safeFetch's 10s timeout, is how one cycle stays
-// inside the 15s tick that drives it; the tick itself refuses to start a second
-// cycle while one is still running, which covers a database that hangs too.
+// A cycle's feed half starts no further sheets past this. That budget, plus the
+// single request a sheet makes and safeFetch's 10s timeout, is how the half
+// stays inside the 15s tick that drives it; the tick itself refuses to start a
+// second cycle while one is still running, which covers a database that hangs
+// too.
 const POLL_CYCLE_MS = 3_000;
+// The alert half's own budget, spent the same way. Its own number and not a
+// share of the feed half's: the two halves run one after the other, so a pile
+// of slow feeds would otherwise leave every alert on the server unrun.
+const ALERT_CYCLE_MS = 3_000;
 // The far end of an interval field, net-http and alert alike. Past this, `now
 // + interval * 1000` risks a value `Date` cannot hold, and library:freshness
 // turning that into `next_run` would then throw for every sheet on the
@@ -3522,7 +3544,10 @@ const readBody = async (res: Response): Promise<Uint8Array<ArrayBuffer>> => {
 // parsed into the JSON it means and stored as that, and a body on none of it is
 // stored as the text it arrived as. The type read is the answer's own: nothing a
 // sheet holds can know what a host will answer with next week.
-const BODY_PARSERS: Record<string, "csv" | "tsv" | "ndjson" | "gzip" | "zip" | "xml" | "rss" | "atom" | "html"> = {
+const BODY_PARSERS: Record<
+  string,
+  "csv" | "tsv" | "ndjson" | "gzip" | "zip" | "xml" | "rss" | "atom" | "html" | "parquet"
+> = {
   "text/csv": "csv",
   "text/tab-separated-values": "tsv",
   "application/x-ndjson": "ndjson",
@@ -3537,6 +3562,13 @@ const BODY_PARSERS: Record<string, "csv" | "tsv" | "ndjson" | "gzip" | "zip" | "
   "application/atom+xml": "atom",
   "text/html": "html",
   "application/xhtml+xml": "html",
+  // The three spellings parquet is served under. `application/octet-stream` is
+  // deliberately absent although most parquet on the web arrives as one: the
+  // type read is the answer's own, and naming it here would hand every unknown
+  // binary body to a parquet reader that has to refuse it.
+  "application/vnd.apache.parquet": "parquet",
+  "application/x-parquet": "parquet",
+  "application/parquet": "parquet",
 };
 
 // Compressed bytes handed to the decompressor at a time. Small, because it is
@@ -3652,13 +3684,45 @@ const HTML_CHARSET = /<meta[^>]+charset\s*=\s*["']?([\w.:-]{1,40})/i;
 // what the document says about itself.
 const CHARSET_PARAM = /;\s*charset\s*=\s*"?([\w.:-]{1,40})/i;
 
+/** Bytes as the text an encoding label says they are, or the refusal naming
+ * which of the two is wrong. Fatal, because a replacement character kept as a
+ * cell cannot be told from a character the feed actually sent. Every label this
+ * server reads is one of the three regexes above, so it is at most forty
+ * characters of `[\w.:-]` and carries no newline into a headline the way a zip
+ * member's name does. */
+const decodeAs = (bytes: Uint8Array<ArrayBuffer>, label: string, source: string): string => {
+  let decoder: TextDecoder;
+  try {
+    decoder = new TextDecoder(label, { fatal: true });
+  } catch {
+    return bad(400, `This body declares an encoding this server cannot read.`, {
+      Received: show(label),
+      Expected: "an encoding label this runtime has, such as utf-8, iso-8859-1 or windows-1252",
+      Source: source,
+      Fix: "serve the feed as UTF-8, or declare the encoding it is actually in",
+    });
+  }
+  try {
+    // A decoder takes a byte-order mark off the front itself, for every encoding
+    // that has one, so nothing here strips one: a U+FEFF that survives is a
+    // second mark, which is a character the feed sent.
+    return decoder.decode(bytes);
+  } catch (err) {
+    return bad(400, `This body is not ${label} text.`, {
+      Received: `${bytes.byteLength} bytes the ${label} decoder refused: ${reason(err)}`,
+      Expected: `bytes in the ${label} this body says it is in`,
+      Source: source,
+      Fix: "serve the feed as UTF-8, or declare the encoding it is actually in",
+    });
+  }
+};
+
 /** A markup body as text, decoded the way the document says to decode it. XML
- * and HTML are the two formats here that state their own encoding, and Latin-1
- * feeds of both are still common: a bare UTF-8 decode turns every accented
- * character in one into U+FFFD and stores that as data, which is a guess made
- * against evidence sitting in the first line of the body. Fatal, because a
- * replacement character kept as a cell cannot be told from a character the feed
- * actually sent. */
+ * and HTML are the two formats here that state their own encoding inside
+ * themselves, and Latin-1 feeds of both are still common: a bare UTF-8 decode
+ * turns every accented character in one into U+FFFD and stores that as data,
+ * which is a guess made against evidence sitting in the first line of the
+ * body. */
 const markupText = (bytes: Uint8Array<ArrayBuffer>, source: string, declaring: RegExp, answered: string): string => {
   // A sixteen-bit document cannot be sniffed for its own prolog as UTF-8 -- every
   // other byte of `<?xml` is a NUL and the regex never matches -- so the width is
@@ -3675,7 +3739,7 @@ const markupText = (bytes: Uint8Array<ArrayBuffer>, source: string, declaring: R
     : bytes[0] === 0x00 && bytes[1] === 0x3C
     ? "utf-16be"
     : null;
-  const head = new TextDecoder(wide ?? "utf-8").decode(bytes.subarray(0, MARKUP_HEAD_BYTES)).replace(/^﻿/, "")
+  const head = new TextDecoder(wide ?? "utf-8").decode(bytes.subarray(0, MARKUP_HEAD_BYTES))
     // A `<meta charset>` written inside a comment or a script string is not a
     // declaration, and this scan runs before there is a parser that could know
     // that -- so the two places one can hide are cut out first. An unclosed one
@@ -3688,28 +3752,7 @@ const markupText = (bytes: Uint8Array<ArrayBuffer>, source: string, declaring: R
   // Then the answer's own `charset`, which outranks the document's declaration --
   // the order the web reads these in, and what lets a Latin-1 page carrying no
   // `<meta charset>` be read at all rather than refused on its first accent.
-  const label = wide ?? (answered || head.match(declaring)?.[1] || "utf-8");
-  let decoder: TextDecoder;
-  try {
-    decoder = new TextDecoder(label, { fatal: true });
-  } catch {
-    return bad(400, `This body declares an encoding this server cannot read.`, {
-      Received: show(label),
-      Expected: "an encoding label this runtime has, such as utf-8, iso-8859-1 or windows-1252",
-      Source: source,
-      Fix: "serve the feed as UTF-8, or declare the encoding it is actually in",
-    });
-  }
-  try {
-    return decoder.decode(bytes).replace(/^﻿/, "");
-  } catch (err) {
-    return bad(400, `This body is not ${label} text.`, {
-      Received: `${bytes.byteLength} bytes the ${label} decoder refused: ${reason(err)}`,
-      Expected: `bytes this answer says are ${label}`,
-      Source: source,
-      Fix: "serve the feed as UTF-8, or declare the encoding it is actually in",
-    });
-  }
+  return decodeAs(bytes, wide ?? (answered || head.match(declaring)?.[1] || "utf-8"), source);
 };
 
 /** The document an XML body means, or the refusal saying where it stopped being
@@ -3970,6 +4013,7 @@ const ZIP_MEMBERS: Record<string, string> = {
   ndjson: "application/x-ndjson",
   jsonl: "application/jsonl",
   xml: "application/xml",
+  parquet: "application/vnd.apache.parquet",
 };
 
 // How many names a refusal spells out before it counts the rest: an archive may
@@ -4178,6 +4222,76 @@ const zipData = async (
   return bytes;
 };
 
+// The four bytes every parquet file opens and closes with. The footer is found
+// by reading back from the end, so a body missing either copy is refused here
+// rather than read past what arrived.
+const PARQUET_MAGIC = "PAR1";
+
+/** The rows of a parquet body. A body that declares parquet and is not one is a
+ * refusal, the way xmlFeedRoot refuses a document that is not the feed it says
+ * it is: an empty green run row says nothing and is never corrected. */
+const parquetRows = async (bytes: Uint8Array<ArrayBuffer>, source: string): Promise<Record<string, unknown>[]> => {
+  const magic = new TextEncoder().encode(PARQUET_MAGIC);
+  const carries = (start: number) => magic.every((byte, i) => bytes[start + i] === byte);
+  if (bytes.byteLength < magic.length * 2 || !carries(0) || !carries(bytes.byteLength - magic.length)) {
+    // Hex, because whatever is there instead is arbitrary bytes and a refusal is
+    // read by a person.
+    const hex = (start: number) =>
+      [...bytes.subarray(start, start + magic.length)].map((byte) => byte.toString(16).padStart(2, "0")).join(" ");
+    bad(400, `This body is not a parquet file.`, {
+      Received: `${bytes.byteLength} bytes opening ${hex(0)} and ending ${
+        hex(Math.max(0, bytes.byteLength - magic.length))
+      }`,
+      Expected: `${PARQUET_MAGIC} at byte 0 and at the last four bytes, which every parquet file carries`,
+      Source: source,
+      Fix: "point the sheet at the parquet file itself, or declare the type this body actually is",
+    });
+  }
+  let rows: Record<string, unknown>[];
+  try {
+    // An AsyncBuffer over the bytes already in hand: the reader takes the footer
+    // off the end and then the pages the footer names, and every one of those
+    // reads is a slice of these.
+    rows = await parquetReadObjects({
+      file: { byteLength: bytes.byteLength, slice: (start, end) => bytes.slice(start, end).buffer },
+    });
+  } catch (err) {
+    // The codecs this reader has are snappy and none. gzip, zstd and brotli need
+    // hyparquet-compressors, which is a second dependency for files this server
+    // never writes, so the codec is named and the poll fails rather than 500ing.
+    const codec = /compression codec:?\s*(\S+)/.exec(reason(err))?.[1];
+    bad(400, codec ? `This parquet body uses a codec this server cannot read.` : `This parquet body will not open.`, {
+      Received: reason(err),
+      Expected: codec ? "snappy, or no compression at all" : "a parquet file this reader can open",
+      Source: source,
+      Fix: codec
+        ? `write the file with snappy rather than ${codec}`
+        : "send the file to whoever wrote it; these bytes carry the magic but not the structure",
+    });
+  }
+  // JSON.stringify throws on a BigInt, and one arrives from an INT64 column at
+  // any depth a schema nests it -- a list or a struct field carries one exactly
+  // as a top-level column does, and a value read out of one and left untouched
+  // crashed this door with no refusal at all rather than the 400 a bad body
+  // gets everywhere else. So this walks the whole value rather than mapping
+  // `Object.entries` once. Inside the safe range a BigInt is the number it is;
+  // outside it, its decimal text and never a rounded number -- the worry
+  // rowKeys() has about 2^53, since two distinct ids that round together are
+  // one id downstream. A Uint8Array is left alone: it is a BYTE_ARRAY read with
+  // no UTF8 logical type, out of scope here the way a gzipped parquet body is.
+  const parquetValue = (val: unknown): unknown =>
+    typeof val === "bigint"
+      ? (Number.isSafeInteger(Number(val)) ? Number(val) : val.toString())
+      : val instanceof Date
+      ? val.toISOString()
+      : Array.isArray(val)
+      ? val.map(parquetValue)
+      : val !== null && typeof val === "object" && !ArrayBuffer.isView(val)
+      ? Object.fromEntries(Object.entries(val as Record<string, unknown>).map(([k, v]) => [k, parquetValue(v)]))
+      : val;
+  return rows.map((row) => parquetValue(row) as Record<string, unknown>);
+};
+
 // How many containers deep a body may nest. ZIP_MEMBERS names no archive, so
 // this is one already -- but that is a fact about a table two screens up, and a
 // row added to it is exactly what this table is shaped to make easy.
@@ -4246,22 +4360,33 @@ const readFeedBody = async (
     const where = `${member.name} in ${source}`;
     // Nothing but the member's name said this is JSON, and this server read that
     // name itself, so the claim is checked here rather than handed on: there is
-    // no parser for `application/json` to hand it to.
+    // no parser for `application/json` to hand it to. A zip member carries no
+    // content type of its own, so neither this decode nor the recursive read
+    // below has a declared encoding to honour: what is handed on is a
+    // `ZIP_MEMBERS` name with no parameter on it.
     if (type === "application/json")
       return jsonMeant(new TextDecoder().decode(inside), where, "the member is named .json");
     return await readFeedBody(inside, type, where, rowsPath, depth + 1);
   }
   const bytes = how === "gzip" ? await expand(raw, "gzip", source) : raw;
-  // An XML body is the one that says what encoding it is in, and the one where
-  // guessing wrong is stored as data rather than refused.
   const xmlish = how === "xml" || how === "rss" || how === "atom";
-  // Only the markup formats read it, which is where the encoding work is: a CSV
-  // or an NDJSON body is still decoded as UTF-8 whatever its answer said.
-  const answered = xmlish || how === "html" ? contentType.match(CHARSET_PARAM)?.[1] ?? "" : "";
-  const text = xmlish
+  // The answer's own `charset`, read whatever the type is: a Latin-1 CSV served
+  // as one landed as U+FFFD in a cell, which nothing downstream can tell from a
+  // character the feed sent. A body that declares nothing is not sniffed -- it
+  // takes the non-fatal UTF-8 decode it always took -- so the only feed this
+  // moves is one whose stated label is wrong, and that one is storing the
+  // replacement character today.
+  const answered = contentType.match(CHARSET_PARAM)?.[1] ?? "";
+  const text = how === "parquet"
+    // There is no text in a parquet body to decode: it is read as bytes by the
+    // arm below, and a fatal decode here would refuse every file there is.
+    ? ""
+    : xmlish
     ? markupText(bytes, source, XML_ENCODING, answered)
     : how === "html"
     ? markupText(bytes, source, HTML_CHARSET, answered)
+    : answered
+    ? decodeAs(bytes, answered, source)
     : new TextDecoder().decode(bytes);
   // What a gzip holds is the one thing neither door can be told: one header says
   // the body is compressed and nothing says what came out of it. The first
@@ -4310,6 +4435,11 @@ const readFeedBody = async (
     // where they sit with `rows_path`; on any other sheet the document is what is
     // stored and a query over it is what reads the rows out.
     meant = JSON.stringify(xmlDoc(text, source, rowsPath));
+  } else if (reading === "parquet") {
+    // The bytes, never `text`: parquet is the one body on this list with no text
+    // in it. A gzip answers only `json` or `csv` off its first character, so a
+    // gzipped parquet body is a sheet that stays one cell.
+    meant = JSON.stringify(await parquetRows(bytes, source));
   } else {
     // Keyed by column name, which is what every reader downstream keys on and
     // what a JSON feed hands them. `col.key` is the document's own spelling and
@@ -5375,17 +5505,6 @@ export const pollNetOnce = async (fetcher = safeFetch, now = Date.now()): Promis
   }
 };
 
-let polling = false;
-setInterval(() => {
-  // A tick that finds the cycle before it still running does nothing rather
-  // than starting a second one over the same due sheets.
-  if (polling) return;
-  polling = true;
-  pollNetOnce()
-    .catch((err) => console.error("net-http poll:", err))
-    .finally(() => polling = false);
-}, 15_000);
-
 // --- outbound webhooks
 //
 // Change flowed in and never out. A sheet's owner names a url, and a change to
@@ -5598,9 +5717,9 @@ export const sendAlertEmail = async (
   return `resend refused it with ${res.status}: ${detail.slice(0, 200)}`;
 };
 
-// A destination that is a url is posted to rather than mailed. Slack and
-// Discord each read one field of the body and ignore the rest, so those two get
-// the shape they document and every other url gets the alert itself.
+// A destination that is a url is posted to rather than mailed. Slack, Discord
+// and Teams each read a shape they document and ignore the rest, so those three
+// get that shape and every other url gets the alert itself.
 const alertUrl = (to: string) => /^https?:\/\//i.test(to);
 
 /** Posts the alert to its url. Nothing here throws: an SSRF refusal, a url that
@@ -5637,6 +5756,12 @@ const sendAlertUrl = async (
       ? { text: line }
       : host === "discord.com" && u.pathname.startsWith("/api/webhooks")
       ? { content: line }
+      // A Teams Incoming Webhook reads a MessageCard and nothing else. A Power
+      // Automate Workflows url (logic.azure.com) is on the branch below: its
+      // body schema is whatever the customer's own flow declares, so there is
+      // no one shape to send it.
+      : host === "webhook.office.com" || host.endsWith(".webhook.office.com")
+      ? { "@type": "MessageCard", "@context": "https://schema.org/extensions", text: line }
       // The rows the run itself keeps, which is the most it can say about a run
       // anyway: past that the run is marked truncated and says so.
       : { sheet: sheet_id, name, rows: rows.slice(0, ALERT_ROWS) };
@@ -5947,13 +6072,45 @@ export const pollAlertOnce = async (
   fetcher = safeFetch,
 ): Promise<void> => {
   const sheets = await sql`select sheet_id, doc_id, name, created_by from sheet where type = 'alert'`;
+  const cycleStart = Date.now();
   for (const alert of sheets) {
     if ((alertDue.get(alert.sheet_id) ?? 0) > now) continue;
+    // Spent the way the feed half spends its own: nothing here has moved this
+    // alert's due time yet, so the next tick takes it.
+    if (Date.now() - cycleStart > ALERT_CYCLE_MS) break;
     await pollAlertSheet(alert, send, now, fetcher);
   }
 };
 
-setInterval(() => pollAlertOnce().catch((err) => console.error("alert poll:", err)), 15_000);
+/** One cycle of the timer: the feeds, then the alerts that read them. The only
+ * edge between two sheets that run on a timer is net-http to alert -- a query,
+ * a chart and a dashboard compute when they are read, and a feed reads a url
+ * and never an @ref -- so running the two halves in this order is the whole of
+ * the dependency order there is to run in. Two intervals of their own put an
+ * alert a cycle behind the rows it asks about. Nothing here throws, which is
+ * what lets the tick below hand it to `finally` alone: an unhandled rejection
+ * off a timer takes the whole server down, and a cycle that could not read the
+ * sheet table is a line in the log and the next tick. */
+export const pollOnce = async (
+  fetcher = safeFetch,
+  send = sendAlertEmail,
+  now = Date.now(),
+): Promise<void> => {
+  // Each half is awaited and reported on its own: a feed half that threw has
+  // left its alerts due, and skipping them would hold every alert on the
+  // server behind one fault in the half before.
+  await pollNetOnce(fetcher, now).catch((err) => console.error("net-http poll:", err));
+  await pollAlertOnce(send, now, fetcher).catch((err) => console.error("alert poll:", err));
+};
+
+let polling = false;
+setInterval(() => {
+  // A tick that finds the cycle before it still running does nothing rather
+  // than starting a second one over the same due sheets.
+  if (polling) return;
+  polling = true;
+  pollOnce().finally(() => polling = false);
+}, 15_000);
 
 export const sendDigestEmail = async (
   to: string,
@@ -6381,6 +6538,9 @@ const KEY_SHAPES: [string, RegExp][] = [
   // a cell, since an alert's destination is a cell.
   ["a Slack webhook url", /https:\/\/hooks\.slack\.com\/services\/\S+/],
   ["a Discord webhook url", /https:\/\/discord(?:app)?\.com\/api\/webhooks\/\S+/],
+  // Every label sendAlertUrl's own `.webhook.office.com` arm delivers to: a
+  // shape this scan calls safe and that door posts to is a credential out.
+  ["a Teams webhook url", /https:\/\/(?:[A-Za-z0-9-]+\.)*webhook\.office\.com\/webhookb2\/\S+/],
 ];
 
 // The issuer's own checksum over a card number, doubling every second digit
@@ -6872,6 +7032,35 @@ app.get("/library/freshness", async (c) => page(c)(await freshness(c, c.req.quer
 // is the account's own sheets and their refs, and the sheets are quota'd.
 const LINEAGE_SHEET = "library:lineage";
 
+// A `select *` reads every column of everything the statement names, so every
+// one of them is a column a rename breaks. A star a `(` sits before is the
+// `count(*)` that names nothing, and a star behind a name and a dot is `t.*`,
+// which no multiplication is written as.
+const SELECT_STAR = /\bselect\s+(?:distinct\s+)?\*|[\p{L}_][\p{L}\p{N}_]*\s*\.\s*\*/iu;
+
+// The column names a ref's own document spells, or null wherever they cannot be
+// read: a sheet outside this caller's library, a type whose data[0] holds
+// settings rather than a column row, a document that will not load, a document
+// holding no column row at all, and a column row naming something that is not a
+// name. A guess in any of those is a row saying a rename is safe when nothing
+// looked -- and an empty list is a guess here, because it is also the honest
+// answer for a ref this statement happens to name no column of.
+const readColumns = async (
+  s: { type: string; doc_id: string } | undefined,
+): Promise<string[] | null> => {
+  if (s?.type !== "table") return null;
+  try {
+    const data = await automerge
+      .find<{ data: Sheet["data"] }>(s.doc_id as AnyDocumentId)
+      .then((hand) => hand.doc()?.data);
+    if (!Array.isArray(data) || typeof data[0] !== "object" || data[0] === null) return null;
+    const names = Object.values(data[0] as Row<Col>).map((col) => col?.name);
+    return names.every((name): name is string => typeof name === "string") ? names : null;
+  } catch {
+    return null;
+  }
+};
+
 const lineage = async (c: Context): Promise<Page> => {
   const mine: { sheet_id: string; name: string; type: string; doc_id: string }[] = await sql`
     select s.sheet_id, s.name, s.type, s.doc_id
@@ -6893,21 +7082,37 @@ const lineage = async (c: Context): Promise<Page> => {
     });
   }
   // A ref names a sheet by id, and an id is a fact the reader's own document
-  // already holds. The name is not: it is read out of the sheets this caller
-  // has a role on, and is null for a ref pointing anywhere else.
-  const named = new Map(mine.map((s) => [s.sheet_id, s.name]));
+  // already holds. The name is not, and neither are its columns: both are read
+  // out of the sheets this caller has a role on, and are null for a ref
+  // pointing anywhere else.
+  const byId = new Map(mine.map((s) => [s.sheet_id, s]));
+  // A ref's columns are its document's own column row, which only a table sheet
+  // holds: a query's columns are whatever running it answers and lineage never
+  // runs one, a chart's are its query's, and a feed's rows come out of the net
+  // log rather than the document. null is "could not be read" whatever the
+  // reason, and the map is the call's own, so a sheet ten queries name is
+  // opened once and only sheets already in `mine` are opened at all.
+  const columns = new Map<string, string[] | null>();
+  const columnsOf = async (id: string): Promise<string[] | null> => {
+    const known = columns.get(id);
+    if (known !== undefined) return known;
+    const read = await readColumns(byId.get(id));
+    columns.set(id, read);
+    return read;
+  };
   const rows: Row[] = [];
   for (const s of mine) {
     // The three types whose rows come from somewhere else. A table holds its
     // own cells, a feed holds what it fetched, and neither depends on a sheet.
     if (!["query", "alert", "chart"].includes(s.type)) continue;
-    const edge = (depends_on: string | null, name: string) => ({
+    const edge = (depends_on: string | null, name: string, cols: string | null) => ({
       sheet_id: s.sheet_id,
       name,
       type: s.type,
       depends_on,
-      depends_on_name: depends_on === null ? null : named.get(depends_on) ?? null,
+      depends_on_name: depends_on === null ? null : byId.get(depends_on)?.name ?? null,
       depends_on_type: depends_on === null ? null : depends_on.split(":")[0],
+      columns: cols,
     });
     let code: string;
     try {
@@ -6925,14 +7130,52 @@ const lineage = async (c: Context): Promise<Page> => {
       // A scan that could not run is not a scan that passed. The row stays, so
       // a sheet whose document is gone is in the graph as a sheet nobody can
       // trace rather than as a sheet that depends on nothing.
-      rows.push(edge(null, `${s.name} -- its refs could not be read: ${reason(err)}`));
+      rows.push(edge(null, `${s.name} -- its refs could not be read: ${reason(err)}`, null));
       continue;
     }
     // Deduped: a query joining one sheet to itself is one edge, and the same
     // ref written twice is the same dependency.
     const ids = [...new Set(scanRefs(code).ids)];
-    if (!ids.length) rows.push(edge(null, s.name));
-    for (const id of ids) rows.push(edge(id, s.name));
+    // Which columns of the ref this edge is about, in one of the three honest
+    // states. A star reads every column of everything the statement names,
+    // which is knowable off the statement alone and so outranks a ref whose own
+    // columns could not be read -- and opens no document either. Otherwise a
+    // name the statement mentions is claimed by the one ref that holds it, and
+    // by neither where two do: which of two joined sheets an unqualified name
+    // came out of is scope, and scope is not something a regex can see.
+    const star = SELECT_STAR.test(code);
+    const claimed = new Map<string, string[]>();
+    // A statement this pass could not read the names of -- past namesIn's own
+    // MAX_NAMES, the one refusal it raises -- is not a sheet whose refs could
+    // not be read: its ids stay in the graph, each with an honest "?", rather
+    // than one oversized query failing the whole account's lineage read.
+    let overflowed = false;
+    if (!star) {
+      // A ref nothing could read holds no name here, so an unreadable sibling
+      // neither claims a name nor takes one off the ref that does. Its own edge
+      // is the "?" below, whatever this counts.
+      const holders = new Map<string, Set<string>>();
+      for (const id of ids)
+        for (const name of (await columnsOf(id)) ?? []) holders.set(name, (holders.get(name) ?? new Set()).add(id));
+      try {
+        for (const name of namesIn(code)) {
+          const on = holders.get(name);
+          if (on?.size !== 1) continue;
+          const [id] = on;
+          claimed.set(id, [...(claimed.get(id) ?? []), name]);
+        }
+      } catch {
+        overflowed = true;
+      }
+    }
+    if (!ids.length) rows.push(edge(null, s.name, null));
+    for (const id of ids) {
+      rows.push(edge(
+        id,
+        s.name,
+        star ? "*" : overflowed || (await columnsOf(id)) === null ? "?" : (claimed.get(id) ?? []).sort().join(", "),
+      ));
+    }
     // Nothing caps the refs one sheet's code holds: it is text a browser syncs
     // in, and the quota above bounds the documents read rather than the edges
     // they name. The answer is a sheet, so it stops where a sheet stops.
@@ -6948,7 +7191,7 @@ const lineage = async (c: Context): Promise<Page> => {
   return {
     data: [
       arrayify(
-        ["sheet_id", "name", "type", "depends_on", "depends_on_name", "depends_on_type"]
+        ["sheet_id", "name", "type", "depends_on", "depends_on_name", "depends_on_type", "columns"]
           .map((name) => ({ name, type: "text" as Type, key: name })),
       ),
       ...rows,
@@ -8339,6 +8582,57 @@ const xlsxCell = (type: string, val: unknown, text: string): XLSX.CellObject => 
   return { t: "s", v: text };
 };
 
+// The parquet half of the exports. A parquet column holds one type where a
+// workbook cell is typed one at a time, so the type is decided once per column
+// off canonicalType -- the same read .xlsx makes, so a `pct` column is a number
+// here too. A number format has no home in the file format: `decimals` and
+// `format` are how a reader was shown the column, not what it holds.
+const PARQUET_TYPES: Record<string, "INT64" | "BOOLEAN" | "TIMESTAMP" | "JSON" | undefined> = {
+  int: "INT64",
+  bool: "BOOLEAN",
+  date: "TIMESTAMP",
+  timestamp: "TIMESTAMP",
+  json: "JSON",
+};
+
+/** One column, typed once. `values` are the cells as named() keyed them, so a
+ * blank is already null and stays one -- parquet has a null of its own. */
+const parquetColumn = (type: string, values: unknown[]) => {
+  const want = PARQUET_TYPES[type] ??
+    ((NUMERIC_TYPES as string[]).includes(type) ? "DOUBLE" as const : "STRING" as const);
+  const data: unknown[] = [];
+  for (const val of values) {
+    if (val === null || val === undefined) {
+      data.push(null);
+      continue;
+    }
+    const held: unknown = want === "INT64"
+      ? (typeof val === "number" && Number.isSafeInteger(val) ? BigInt(val) : undefined)
+      : want === "DOUBLE"
+      ? (typeof val === "number" && Number.isFinite(val) ? val : undefined)
+      : want === "BOOLEAN"
+      ? (typeof val === "boolean" ? val : undefined)
+      : want === "TIMESTAMP"
+      // Epoch millis off the one spelling .xlsx and .ics already read, so a
+      // date-only cell and a zoneless timestamp are both UTC.
+      ? (Number.isNaN(dateMs(String(val))) ? undefined : BigInt(dateMs(String(val))))
+      : want === "JSON"
+      ? val
+      : String(val);
+    // One value the column's own type cannot hold and the whole column is the
+    // text each value is: nothing is coerced into a wrong number and no row is
+    // dropped, the way xlsxCell falls back a cell at a time.
+    if (held === undefined) {
+      return {
+        type: "STRING" as const,
+        data: values.map((v) => (v === null || v === undefined ? null : String(v))),
+      };
+    }
+    data.push(held);
+  }
+  return { type: want, data };
+};
+
 const EXPORTS: Record<
   string,
   { mime: string; render: (id: string, cols: Col[], rows: Row[]) => string | Uint8Array<ArrayBuffer> }
@@ -8456,6 +8750,22 @@ const EXPORTS: Record<
       XLSX.utils.book_append_sheet(wb, ws, id.replace(XLSX_NAME_BAD, "").slice(0, XLSX_NAME_MAX));
       const file: ArrayBuffer = XLSX.write(wb, { type: "array", bookType: "xlsx" });
       return new Uint8Array(file);
+    },
+  },
+  parquet: {
+    // Not registered with IANA. This is the spelling Arrow writes and reads.
+    mime: "application/vnd.apache.parquet",
+    render: (id, cols, rows) => {
+      // Built off named(), so a sheet with two columns of one name is refused
+      // here exactly as .csv refuses it: a parquet file keyed by name would
+      // answer one of the two.
+      const byName = named(id, cols, rows);
+      return new Uint8Array(parquetWriteBuffer({
+        columnData: cols.map((col) => {
+          const name = String(col.name);
+          return { name, ...parquetColumn(canonicalType(String(col.type)), byName.map((row) => row[name])) };
+        }),
+      }));
     },
   },
 };
@@ -9604,8 +9914,8 @@ app.post("/mcp/:id", async (c) => {
         contents: [{
           uri,
           mimeType: "text/csv",
-          // EXPORTS is typed for the one format that answers bytes; csv is a
-          // text renderer and always has been.
+          // EXPORTS is typed for the formats that answer bytes; csv is a text
+          // renderer and always has been.
           text: EXPORTS.csv.render(sheet_id, Object.values(colsRow) as Col[], rows) as string,
         }],
       });

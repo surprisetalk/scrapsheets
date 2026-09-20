@@ -3,11 +3,14 @@ module MainTest exposing (..)
 import Array
 import Dict
 import Expect
+import Html
 import Json.Decode as D
 import Json.Encode as E
 import Main exposing (..)
 import Set
 import Test exposing (..)
+import Test.Html.Query as Query
+import Test.Html.Selector as Selector
 
 
 suite : Test
@@ -1664,8 +1667,193 @@ suite =
                         |> D.decodeString viewDecoder
                         |> Result.map .widths
                         |> Expect.equal (Ok (Dict.singleton "3" 32))
+            , test "a shade is read by name, and a word nobody wrote is no shade" <|
+                \_ ->
+                    -- The way a format nobody wrote is no format -- and the
+                    -- column keeps the rest of its arrangement, which is the
+                    -- half a ninth view field read through `andThen` could
+                    -- have lost.
+                    let
+                        read =
+                            """{"type":"table","data":[[{"name":"a","type":"num","key":"0","shade":"scale"},
+                                {"name":"b","type":"num","key":"1","shade":"bar"},
+                                {"name":"c","type":"num","key":"2","shade":"icons","width":220,"hidden":true}]]}"""
+                                |> D.decodeString viewDecoder
+                                |> Result.withDefault emptyView
+                    in
+                    ( Dict.toList read.shades, ( read.widths, read.hidden ) )
+                        |> Expect.equal
+                            ( [ ( "0", Scale ), ( "1", Bars ) ]
+                            , ( Dict.singleton "2" 220, Set.singleton "2" )
+                            )
+            , test "a shade that is not a string is no shade, not a decode failure" <|
+                \_ ->
+                    -- `D.field "shade" (D.map shade D.string)` fails outright on
+                    -- the wrong JSON type rather than answering an unknown word,
+                    -- and `D.oneOf` is what turns that failure into `Nothing`
+                    -- rather than losing the whole sheet to a decode error.
+                    [ """{"type":"table","data":[[{"name":"a","type":"num","key":"0","shade":3}]]}"""
+                    , """{"type":"table","data":[[{"name":"a","type":"num","key":"0","shade":null}]]}"""
+                    ]
+                        |> List.map (D.decodeString viewDecoder >> Result.map .shades)
+                        |> Expect.equal (List.repeat 2 (Ok Dict.empty))
+            , test "a query's shade lives beside its code, keyed by column name" <|
+                \_ ->
+                    """{"type":"query","data":[{"lang":"sql","code":"select 1","cols":{},
+                        "view":{"a":{"shade":"bar"}}}]}"""
+                        |> D.decodeString viewDecoder
+                        |> Result.map .shades
+                        |> Expect.equal (Ok (Dict.singleton "a" Bars))
+            , test "a shade is written as the word the document keeps, in either home, and deleted when it goes" <|
+                \_ ->
+                    let
+                        shaded =
+                            { emptyView | shades = Dict.singleton "0" Bars }
+
+                        patches at before after =
+                            viewPatches at (namedCols [ "a" ]) before after
+                                |> List.map (\p -> ( p.action, E.encode 0 (E.list identity p.path), E.encode 0 p.value ))
+                    in
+                    ( patches tableHome emptyView shaded
+                    , ( patches queryHome emptyView shaded, patches tableHome shaded emptyView )
+                    )
+                        |> Expect.equal
+                            ( [ ( "set", """[0,"0","shade"]""", "\"bar\"" ) ]
+                            , ( [ ( "set", """[0,"view","0","shade"]""", "\"bar\"" ) ]
+                              , [ ( "del", """[0,"0","shade"]""", "null" ) ]
+                              )
+                            )
+            ]
+        , describe "columnExtent"
+            [ test "the extent is the smallest and largest number the column holds" <|
+                \_ ->
+                    extentOf [ "3", "1", "9", "4" ]
+                        |> Expect.equal (Ok (Just ( 1, 9 )))
+            , test "a blank and a word are passed over rather than counted as zero" <|
+                \_ ->
+                    -- Counting them as zero would stretch every scale down to
+                    -- a value no row on screen holds.
+                    extentOf [ "\"\"", "null", "\"wat\"", "5", "7" ]
+                        |> Expect.equal (Ok (Just ( 5, 7 )))
+            , test "one value is its own extent, and a column with no number has none" <|
+                \_ ->
+                    ( extentOf [ "2", "\"\"" ], extentOf [ "\"\"", "null" ] )
+                        |> Expect.equal ( Ok (Just ( 2, 2 )), Ok Nothing )
+            , test "a value past what a float can carry is passed over like a blank, not folded into Infinity" <|
+                \_ ->
+                    -- JSON.parse reads a bare 1e400 as Infinity (still typeof
+                    -- "number", so D.float takes it), and folding it in with
+                    -- `max` stretched the whole column's scale to an endpoint
+                    -- no finite cell holds -- every real value crushed near
+                    -- one end and the infinite cell itself drawn at 0/0.
+                    -- `String.toFloat` takes the same word quoted as a JSON
+                    -- string ("Infinity", the string a `num` column's own
+                    -- cell reads back as after a round trip through
+                    -- `String.fromFloat`) exactly as leniently.
+                    ( extentOf [ "1e400", "5", "9" ], extentOf [ "1e400", "-1e400" ] )
+                        |> Expect.equal ( Ok (Just ( 5, 9 )), Ok Nothing )
+            , test "the same guard holds a value quoted as a string" <|
+                \_ ->
+                    extentOf [ "\"Infinity\"", "\"-Infinity\"", "5" ]
+                        |> Expect.equal (Ok (Just ( 5, 5 )))
+            ]
+        , describe "A json cell drawn as a sparkline"
+            [ test "the values are scaled to 0..1 by the column's own extremes" <|
+                \_ ->
+                    sparkValues [ 0, 5, 10 ]
+                        |> Expect.equal (Just [ 0, 0.5, 1 ])
+            , test "all-equal values draw level rather than dividing by zero" <|
+                \_ ->
+                    sparkValues [ 3, 3, 3 ]
+                        |> Expect.equal (Just [ 0.5, 0.5, 0.5 ])
+            , test "one number is not a series, and neither is none" <|
+                \_ ->
+                    ( sparkValues [ 7 ], sparkValues [] )
+                        |> Expect.equal ( Nothing, Nothing )
+            , test "a value a float cannot carry draws no line at all" <|
+                \_ ->
+                    -- JSON.parse reads a bare 1e400 as Infinity, and a scale
+                    -- divided by an infinite range is a row of NaN heights.
+                    D.decodeString (D.list D.float) "[1,5,1e400]"
+                        |> Result.map sparkValues
+                        |> Expect.equal (Ok Nothing)
+            , test "a longer array keeps its last sparkMax values, not its first" <|
+                \_ ->
+                    let
+                        kept =
+                            (1000 :: List.map toFloat (List.range 1 sparkMax))
+                                |> sparkValues
+                    in
+                    ( Maybe.map List.length kept, Maybe.andThen List.minimum kept, Maybe.andThen List.maximum kept )
+                        |> Expect.equal ( Just sparkMax, Just 0, Just 1 )
+            , test "a flat array of numbers renders bars" <|
+                \_ ->
+                    jsonCell "[1,2,3]"
+                        |> Query.findAll [ Selector.style "width" "3px" ]
+                        |> Query.count (Expect.equal 3)
+            , test "everything that is not a flat pair of numbers renders the text it always did" <|
+                \_ ->
+                    -- A top-level JSON string -- a column of digits held as
+                    -- text -- never reaches `D.list` at all, and must fall to
+                    -- the lenient `string` the same way the containers do.
+                    ()
+                        |> Expect.all
+                            ([ ( "{\"a\":1}", "a: 1" )
+                             , ( "[[1,2],[3,4]]", "1, 2, 3, 4" )
+                             , ( "[1,\"b\"]", "1, b" )
+                             , ( "[7]", "7" )
+                             , ( "\"00253\"", "00253" )
+                             ]
+                                |> List.map (\( json, drawn ) -> \_ -> jsonCell json |> Query.has [ Selector.text drawn ])
+                            )
+            , test "a value a float cannot carry OUTSIDE the drawn window still lets the window draw" <|
+                \_ ->
+                    -- The extremes (`lo`/`hi`) are already taken only from the
+                    -- last `sparkMax` values, `kept` -- but the validity guard
+                    -- used to scan the whole array, `vs`. A poisoned value far
+                    -- older than the window then blanked a sparkline whose
+                    -- drawn window was entirely finite: a 5,000-point series
+                    -- with one bad point on day one drew nothing at all,
+                    -- forever, however healthy the last 64 points were.
+                    -- `1.0e308 + 1.0e308` is this file's own way to write a
+                    -- literal Infinity: elm-format rewrites a bare `1.0e400`
+                    -- into the bare word `Infinity`, which is not a name this
+                    -- module has.
+                    ((1.0e308 + 1.0e308) :: List.map toFloat (List.range 1 sparkMax))
+                        |> sparkValues
+                        |> Maybe.map List.length
+                        |> Expect.equal (Just sparkMax)
+            , test "a value a float cannot carry INSIDE the drawn window still refuses the whole line" <|
+                \_ ->
+                    -- The mirror of the case above: once the poison is inside
+                    -- the last `sparkMax` values, there is no window left that
+                    -- is all finite, so the fix above must not turn this into
+                    -- a line with a NaN-shaped gap.
+                    (List.map toFloat (List.range 1 (sparkMax - 1)) ++ [ 1.0e308 + 1.0e308 ])
+                        |> sparkValues
+                        |> Expect.equal Nothing
             ]
         ]
+
+
+{-| One `json` cell, rendered the way the table renders it, wrapped in a div so
+the query has an element to start from.
+-}
+jsonCell : String -> Query.Single Msg
+jsonCell json =
+    -- A refusal is drawn rather than swallowed, the way `viewCell` draws one:
+    -- a helper answering blank on a decode error passes every test whose cell
+    -- is expected to be blank.
+    (case D.decodeString (cellDecoder Json Nothing Nothing 0 0) json of
+        Ok cell ->
+            Maybe.withDefault (Html.text "") cell
+
+        Err err ->
+            Html.text (D.errorToString err)
+    )
+        |> List.singleton
+        |> Html.div []
+        |> Query.fromHtml
 
 
 {-| A three-column sheet carrying every part of an arrangement: a secondary sort
@@ -1961,3 +2149,32 @@ namedCols names =
 
         _ ->
             Array.empty
+
+
+{-| The extent of a one-column `num` table holding these cells, as JSON. The
+column and the rows come back through `docDecoder`, the way every other fixture
+here is built, and a table that will not decode is the failure rather than a
+column with no numbers in it.
+-}
+extentOf : List String -> Result String (Maybe ( Float, Float ))
+extentOf cells =
+    ("""{"type":"table","data":[[{"name":"n","type":"num","key":"0"}]"""
+        ++ String.concat (List.map (\cell -> """,{"0":""" ++ cell ++ "}") cells)
+        ++ "]}"
+    )
+        |> D.decodeString docDecoder
+        |> Result.mapError D.errorToString
+        |> Result.andThen
+            (\doc ->
+                case doc of
+                    Tab tbl ->
+                        case Array.get 0 tbl.cols of
+                            Just col ->
+                                Ok (columnExtent tbl.rows col)
+
+                            Nothing ->
+                                Err "the fixture decoded with no columns"
+
+                    _ ->
+                        Err "the fixture decoded as something other than a table"
+            )

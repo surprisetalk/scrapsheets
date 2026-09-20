@@ -8,6 +8,8 @@ import { WebSocketClientAdapter } from "@automerge/automerge-repo-network-websoc
 import Stripe from "stripe";
 import pg from "postgresjs";
 import * as XLSX from "xlsx";
+import { parquetReadObjects } from "hyparquet";
+import { ByteWriter, parquetWrite, parquetWriteBuffer } from "hyparquet-writer";
 import {
   accountBuckets,
   app,
@@ -45,6 +47,7 @@ import {
   pollAlertSheet,
   pollNetOnce,
   pollNetSheet,
+  pollOnce,
   RATE_LIMIT_KEYS_MAX,
   rateLimitBuckets,
   requireSecret,
@@ -63,7 +66,7 @@ import {
 } from "./main.ts";
 import type { Col, NetHttp, Query, Sheet, Table, Template } from "./main.ts";
 import { DATASETS } from "./src/examples.mjs";
-import { MAX_QUERY_ROWS } from "./src/sql.mjs";
+import { cohortSql, MAX_NAMES, MAX_QUERY_ROWS } from "./src/sql.mjs";
 import ala from "alasql";
 import dbSql from "./schema/db.sql" with { type: "text" };
 import examplesSql from "./examples.sql" with { type: "text" };
@@ -660,11 +663,47 @@ Deno.test(async function allTests(t) {
     await server.shutdown();
   });
 
-  await t.step("The shop is publicly viewable", async () => {
+  await t.step("The shop is publicly viewable, and browsed by type and tag", async () => {
     const [cols_, ...rows] = await get<Table>("", `/shop`);
     const cols = Object.values(cols_);
     assert(cols.length);
     assert(rows.length);
+    // The two facets are columns of the answer, so the column panel is what
+    // browses them, over the whole catalogue the page asks for.
+    assertEquals(cols.map((col) => col.name).join(), "name,price,license,type,tags,");
+    const [, ...datasets] = await get<Table>("", `/shop`, { tags: "dataset" });
+    assert(datasets.length, "the seeded datasets are listed under their own tag");
+    assert(
+      datasets.every((row) => (row.tags as string[]).includes("dataset")),
+      "?tags= answers only the listings carrying it",
+    );
+    assert(datasets.length < rows.length, "and not the whole catalogue");
+
+    // The seeded catalogue -- every bundled dataset -- is already bigger than
+    // cselect's own default page, which is the bug the page's hardcoded
+    // ?limit=500 fixes: a bare /shop only ever sees the first page, and the
+    // page's own fetch is what asks for the rest.
+    const bare = await app.request("/shop");
+    const total = Number(bare.headers.get("Content-Range")?.split("/")[1]);
+    assertEquals((await bare.json()).data.length - 1, 50, "a bare /shop still answers only the default page");
+    assert(total > 50, "the seeded catalogue is bigger than one default page");
+    const [, ...whole] = await get<Table>("", `/shop`, { limit: 500 });
+    assertEquals(whole.length, total, "?limit=500 is what makes the whole catalogue visible, not just the first page");
+
+    // Adversarial ?tags= values. A NUL is refused before routing, by the guard
+    // every path and query string already goes through; a quote is a value
+    // bound through postgres.js, never spliced text, so it answers no rows
+    // rather than a 500 or a leaked row; a repeated key is Hono's own to
+    // resolve, and whichever single string it hands `qs.tags` is still bound
+    // the same parameterized way -- never a second where clause and never a
+    // crash over an array.
+    await reject("", `/shop?tags=%00`);
+    const [, ...quoted] = await get<Table>("", `/shop`, { tags: "'; drop table sheet; --" });
+    assertEquals(quoted.length, 0, "a quote in ?tags= matches no listing rather than breaking the query");
+    const stillThere = await get<Table>("", `/shop`);
+    assert(stillThere.length > 1, "the quote did not actually drop the table");
+    const repeated = await app.request("/shop?tags=a&tags=b");
+    assertEquals(repeated.status, 200, "a repeated ?tags= is answered rather than crashing on an array");
   });
 
   await t.step("Bob buys from the shop, then queries across the sheets he owns", async () => {
@@ -675,7 +714,7 @@ Deno.test(async function allTests(t) {
       const [cols_, ...rows] = await get<Table>(jwt, `/shop`);
       const cols = Object.values(cols_);
       assert(cols.length);
-      assertEquals(cols.map((col) => col.name).join(), "name,price,license,");
+      assertEquals(cols.map((col) => col.name).join(), "name,price,license,type,tags,");
       assert(rows.length);
 
       // Buy the first 3 items
@@ -1131,8 +1170,9 @@ Deno.test(async function allTests(t) {
         assertEquals(to("two@example.com").length, 0, "the run after an error must not call every row new");
       }
 
-      // A destination that is a url is posted to rather than mailed. Slack and
-      // Discord each read one field of the body; anything else gets the alert.
+      // A destination that is a url is posted to rather than mailed. Slack,
+      // Discord and Teams each read a shape they document; anything else gets
+      // the alert.
       {
         const posts: { url: string; body: Record<string, unknown> }[] = [];
         const fetcher = (url: string, _headers?: Record<string, string>, _method?: string, body?: string) => {
@@ -1164,14 +1204,50 @@ Deno.test(async function allTests(t) {
           "the run log holds the webhook's path",
         );
 
+        // Teams is Slack's deal exactly: the customer makes an Incoming Webhook
+        // in their own channel and pastes the url in, and the connector reads a
+        // MessageCard.
+        target("https://contoso.webhook.office.com/webhookb2/00/IncomingWebhook/11/22");
+        burn(2, 1.5);
+        clock += 120_000;
+        await pollAlert(alert_id, send, clock, fetcher);
+        assertEquals(posts.length, 2, "a Teams url is posted to");
+        assertEquals(Object.keys(posts[1].body), ["@type", "@context", "text"]);
+        assertEquals(posts[1].body["@type"], "MessageCard");
+        assert(String(posts[1].body.text).includes("burn watch"), String(posts[1].body.text));
+        assertEquals((await history())[0].delivery, "sent");
+        assertEquals((await history())[0].to, "contoso.webhook.office.com");
+        assert(
+          !JSON.stringify(await get<Table>(jwt, `/sheet/${alert_id}`)).includes("IncomingWebhook"),
+          "the run log holds the webhook's path",
+        );
+
+        // The bare host, with no tenant subdomain at all, is still Teams.
+        target("https://webhook.office.com/webhookb2/00/IncomingWebhook/11/22");
+        burn(2, 1.52);
+        clock += 120_000;
+        await pollAlert(alert_id, send, clock, fetcher);
+        assertEquals(posts.length, 3);
+        assertEquals(posts[2].body["@type"], "MessageCard", "a bare webhook.office.com is Teams too");
+
+        // A host that merely ends in the same letters is not a subdomain of
+        // it: the dot right before "webhook" has to be there, so a domain an
+        // attacker registered after office.com's own does not borrow its shape.
+        target("https://evil-webhook.office.com.attacker.test/webhookb2/00");
+        burn(2, 1.53);
+        clock += 120_000;
+        await pollAlert(alert_id, send, clock, fetcher);
+        assertEquals(posts.length, 4);
+        assertEquals(Object.keys(posts[3].body), ["sheet", "name", "rows"], "a look-alike host gets the generic body");
+
         // Every other url gets the alert itself: which sheet, its name, its rows.
         target("https://example.com/hooks/alerts");
         burn(2, 1.6);
         clock += 120_000;
         await pollAlert(alert_id, send, clock, fetcher);
-        assertEquals(posts.length, 2);
-        assertEquals([posts[1].body.sheet, posts[1].body.name], [alert_id, "burn watch"]);
-        assertEquals((posts[1].body.rows as unknown[]).length, 2);
+        assertEquals(posts.length, 5);
+        assertEquals([posts[4].body.sheet, posts[4].body.name], [alert_id, "burn watch"]);
+        assertEquals((posts[4].body.rows as unknown[]).length, 2);
 
         // A url inside this server's own network is refused by safeFetch, and a
         // refused post is recorded and sent again next interval, which is what a
@@ -2084,6 +2160,31 @@ Deno.test(async function allTests(t) {
       });
       assertEquals(Object.values(typed).map((c) => `${c.name}:${c.type}`).join(), "shop:text,rn:int");
 
+      // A seasonal series is a trend plus a pattern that repeats every period
+      // rows. This one is 100 + 10t plus the four-step pattern -6, 2, 8, -4,
+      // which already sums to zero over one cycle, so the decomposition has to
+      // hand that same pattern back.
+      const S = [104, 122, 138, 136, 144, 162, 178, 176, 184, 202, 218, 216]
+        .map((y, t) => `select ${t + 1} as t, ${y} as y`).join(" union all ");
+      const parts = await rows(
+        `select t, y, trend(y, 4) over (order by t) as trend,
+                seasonal(y, 4) over (order by t) as seasonal,
+                deseasonalized(y, 4) over (order by t) as clean,
+                trend(y, 3) over (order by t) as trend3
+         from (${S}) order by t`,
+      );
+      // An even period has no middle row, so the trend is the 2 x period
+      // average: the third row's is (104/2 + 122 + 138 + 136 + 144/2) / 4, and
+      // the two rows at each end have no window to sit in the middle of.
+      assertEquals(col(parts, "trend"), ",,130,140,150,160,170,180,190,200,,");
+      assertEquals(col(parts, "seasonal"), "-6,2,8,-4,-6,2,8,-4,-6,2,8,-4");
+      assertEquals(col(parts, "clean"), "110,120,130,140,150,160,170,180,190,200,210,220");
+      assertEquals(parts.slice(0, 4).reduce((n, r) => n + Number(r.seasonal), 0), 0);
+      // An odd period has a middle row, so the trend is the plain average of
+      // the period rows around it -- (122 + 138 + 136) / 3 on the third row --
+      // and one row at each end has no window.
+      assertEquals([parts[0].trend3, parts[2].trend3, parts[11].trend3].join(), ",132,");
+
       // A window that is not a select item of its own cannot be lifted, and
       // returning zeros for it is worse than saying so.
       for (
@@ -2098,6 +2199,9 @@ Deno.test(async function allTests(t) {
             `select shop, sum(amt) over (partition by shop range between 1 preceding and current row) as z from ${T}`,
             "range frame cannot count",
           ],
+          [`select t, trend(y, 1) over (order by t) as z from (${S})`, "whole number of steps in one cycle"],
+          [`select t, trend(y, 8) over (order by t) as z from (${S})`, "two whole cycles"],
+          [`select shop, seasonal(shop, 2) over (order by day) as z from ${T}`, "cannot add up"],
         ] as const
       ) {
         const res = await app.request(`/query`, {
@@ -2477,7 +2581,7 @@ Deno.test(async function allTests(t) {
         }],
       });
       await put(jwt, `/library/table:${dup.documentId}`, {});
-      for (const format of ["csv", "json", "ndjson", "md"]) {
+      for (const format of ["csv", "json", "ndjson", "md", "parquet"]) {
         const res = await exp(`table:${dup.documentId}`, format);
         assertEquals(res.status, 400, `${format} must refuse a sheet it cannot key by name`);
         assert((await res.text()).includes(`"a" appears more than once`), "and the duplicate must be named");
@@ -2585,6 +2689,82 @@ Deno.test(async function allTests(t) {
       assert(!cut.includes("xxxx"), `and never what it is: ${cut}`);
       const whole = await (await exp(`table:${wide.documentId}`, "csv")).text();
       assert(whole.includes("x".repeat(40000)), "and the .csv the refusal names carries the whole value");
+    }
+
+    // .parquet is the other export that answers bytes, read back with the
+    // library that wrote it for the reason the workbook above is. A parquet
+    // column holds one type, so what is under test is the per-column decision.
+    {
+      const read = async (res: Response) => {
+        const bytes = new Uint8Array(await res.arrayBuffer());
+        return await parquetReadObjects({
+          file: { byteLength: bytes.byteLength, slice: (start, end) => bytes.slice(start, end).buffer },
+        });
+      };
+      const file = await exp(sheet_id, "parquet");
+      assertEquals(file.headers.get("content-type"), "application/vnd.apache.parquet");
+      // The same rows .json answers with: the importer typed `age` num, which
+      // is a DOUBLE, and the int column in the fixture below is the INT64.
+      assertEquals(await read(file), [{ name: "Alice", age: 30 }, { name: "Bob", age: 25 }]);
+
+      const typed = automerge.create<{ data: Sheet["data"] }>({
+        data: [
+          arrayify([
+            { name: "n", type: "int", key: 0 },
+            { name: "paid", type: "usd", key: 1 },
+            // An alias: read through canonicalType it is a number, and read off
+            // COLUMN_TYPES directly it would have been a string.
+            { name: "cut", type: "pct", key: 2 },
+            { name: "ok", type: "bool", key: 3 },
+            { name: "day", type: "date", key: 4 },
+            { name: "at", type: "timestamp", key: 5 },
+            { name: "blob", type: "json", key: 6 },
+            { name: "note", type: "text", key: 7 },
+            // Every column below holds one value its own type cannot hold, so
+            // each is written whole as the text it is rather than coerced.
+            { name: "qty", type: "num", key: 8 },
+            { name: "count", type: "int", key: 9 },
+            { name: "when", type: "timestamp", key: 10 },
+          ]),
+          {
+            0: 7,
+            1: 1234.5,
+            2: 0.155,
+            3: true,
+            4: "2026-06-01",
+            // No zone designator, the shape a datetime-local input writes: it
+            // must land on the same instant as the zoned spelling would.
+            5: "2026-07-04T18:30:00",
+            6: { a: 1 },
+            7: "kept",
+            8: "n/a",
+            9: 1.5,
+            10: "whenever",
+          },
+          { 0: null, 1: null, 2: null, 3: null, 4: null, 5: null, 6: null, 7: null, 8: 2, 9: 2, 10: null },
+        ],
+      });
+      await put(jwt, `/library/table:${typed.documentId}`, {});
+      const [first, second] = await read(await exp(`table:${typed.documentId}`, "parquet"));
+      assertEquals(first.n, 7n, "an int column is an INT64");
+      assertEquals([first.paid, first.cut], [1234.5, 0.155], "every other numeric type is a DOUBLE");
+      assertEquals(first.ok, true);
+      assertEquals((first.day as Date).toISOString(), "2026-06-01T00:00:00.000Z", "a date is UTC midnight");
+      assertEquals(
+        (first.at as Date).toISOString(),
+        "2026-07-04T18:30:00.000Z",
+        "and a zoneless timestamp is UTC, not the server's own zone",
+      );
+      assertEquals(first.blob, { a: 1 });
+      assertEquals(first.note, "kept");
+      assertEquals([first.qty, second.qty], ["n/a", "2"], "a word in a num column takes the whole column to text");
+      assertEquals([first.count, second.count], ["1.5", "2"], "and so does a fraction in an int column");
+      assertEquals(first.when, "whenever", "and a date that does not parse");
+      // A blank is a parquet null in every column, whichever type it landed in.
+      assertEquals(
+        [second.n, second.paid, second.ok, second.day, second.blob, second.note, second.when],
+        [null, null, null, null, null, null, null],
+      );
     }
   });
 
@@ -2791,6 +2971,18 @@ Deno.test(async function allTests(t) {
       // the message is still for.
       const said = await fails(`select min(upper(code)) from @${codesId}`);
       assert(said.includes("min_text"), said);
+
+      // KEYWORD was widened past the clause words this check needs so
+      // namesIn() could read it too -- which cost this exact message: an
+      // alias spelled as one of the added words (bracketed, because AlaSQL
+      // itself refuses these bare, as its own keywords too) is a real name
+      // and must never be read as an exempt alias and silently dropped.
+      const saidEnd = await fails(`select min(upper(code)) as [end] from @${codesId}`);
+      assert(saidEnd.includes("min_text"), saidEnd);
+      const saidOrder = await fails(`select max(upper(code)) as [order] from @${codesId}`);
+      assert(saidOrder.includes("min_text"), saidOrder);
+      const saidLeft = await fails(`select min(upper(code)) as [left] from @${codesId}`);
+      assert(saidLeft.includes("min_text"), saidLeft);
 
       // And the replacements are still there to be written by hand.
       const [, row] = (await runs(
@@ -4644,6 +4836,11 @@ Deno.test(async function allTests(t) {
       emptyXml: await feed("https://emptyxml.body.test/feed"),
       latin1: await feed("https://latin1.body.test/feed"),
       utf16: await feed("https://utf16.body.test/feed"),
+      csvLatin1: await feed("https://csvlatin1.body.test/feed"),
+      csvBare: await feed("https://csvbare.body.test/feed"),
+      csvUnknown: await feed("https://csvunknown.body.test/feed"),
+      csvWrong: await feed("https://csvwrong.body.test/feed"),
+      ndjsonLatin1: await feed("https://ndjsonlatin1.body.test/feed"),
       itemText: await feed("https://itemtext.body.test/feed"),
       zipJson: await feed("https://zipjson.body.test/feed"),
       zipCrc: await feed("https://zipcrc.body.test/feed"),
@@ -4663,6 +4860,11 @@ Deno.test(async function allTests(t) {
       htmlFoot: await feed("https://htmlfoot.body.test/feed"),
       htmlBreak: await feed("https://htmlbreak.body.test/feed"),
       htmlHidden: await feed("https://htmlhidden.body.test/feed"),
+      parquet: await feed("https://parquet.body.test/feed"),
+      parquetBig: await feed("https://parquetbig.body.test/feed"),
+      parquetNot: await feed("https://parquetnot.body.test/feed"),
+      parquetCodec: await feed("https://parquetcodec.body.test/feed"),
+      zipParquet: await feed("https://zipparquet.body.test/feed"),
     };
     const gzip = async (text: string) =>
       new Uint8Array(
@@ -4693,12 +4895,14 @@ Deno.test(async function allTests(t) {
       for (const byte of bytes) c = crcTable[(c ^ byte) & 0xFF] ^ (c >>> 8);
       return (c ^ 0xFFFFFFFF) >>> 0;
     };
-    const zipOf = async (members: Record<string, string>): Promise<Uint8Array<ArrayBuffer>> => {
+    const zipOf = async (
+      members: Record<string, string | Uint8Array<ArrayBuffer>>,
+    ): Promise<Uint8Array<ArrayBuffer>> => {
       const parts: Uint8Array[] = [];
       const dir: Uint8Array[] = [];
       let at = 0;
       for (const [name, text] of Object.entries(members)) {
-        const raw = new TextEncoder().encode(text);
+        const raw = typeof text === "string" ? new TextEncoder().encode(text) : text;
         const packed = new Uint8Array(
           await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream("deflate-raw"))).arrayBuffer(),
         );
@@ -4756,6 +4960,36 @@ Deno.test(async function allTests(t) {
       new DataView(out.buffer).setUint16(base.byteLength - 22 + 20, comment.byteLength, true);
       return out;
     })();
+
+    // Written here with the library the .parquet export writes with rather than
+    // checked in: a fixture nobody can read is a fixture nobody maintains.
+    const parquetBody = new Uint8Array(parquetWriteBuffer({
+      columnData: [
+        { name: "id", data: [1n, 2n], type: "INT64" },
+        { name: "name", data: ["bolt", "nut"], type: "STRING" },
+      ],
+    }));
+    // JSON has no integer past 2^53, so an id rounded into a Number is an id
+    // two distinct rows now share -- the worry rowKeys() has about a key.
+    const parquetBigBody = new Uint8Array(parquetWriteBuffer({
+      columnData: [{ name: "id", data: [9007199254740993n], type: "INT64" }],
+    }));
+    const parquetZip = await zipOf({ "data.parquet": parquetBody });
+    // A file that declares GZIP and holds bytes nobody compressed: the reader
+    // refuses on the codec before it looks at a page, which is the only codec
+    // this server has no decompressor for that a test can build without one.
+    const parquetGzipBody = new Uint8Array(parquetWriteBuffer({
+      columnData: [{ name: "id", data: [1n], type: "INT64" }],
+      codec: "GZIP",
+      compressors: { GZIP: (input: Uint8Array) => input },
+    }));
+
+    // Latin-1 is one byte per code point, so the text is its own encoder. 0xE9
+    // is é there and is not valid UTF-8 at all, so the same bytes are a cell, a
+    // replacement character or a refusal depending only on what the answer said
+    // about them.
+    const latin1 = (text: string) => Uint8Array.from(text, (ch) => ch.charCodeAt(0));
+    const latin1Csv = latin1("t\ncaf\u00E9\n");
 
     const typed = (body: string | Uint8Array<ArrayBuffer>, type: string) =>
       new Response(body, { headers: { "content-type": type } });
@@ -4905,6 +5139,16 @@ Deno.test(async function allTests(t) {
             ),
             "text/html",
           ));
+        case "parquet.body.test":
+          return Promise.resolve(typed(parquetBody, "application/vnd.apache.parquet"));
+        case "parquetbig.body.test":
+          return Promise.resolve(typed(parquetBigBody, "application/x-parquet"));
+        case "parquetnot.body.test":
+          return Promise.resolve(typed(`<html><body>502 Bad Gateway</body></html>`, "application/parquet"));
+        case "parquetcodec.body.test":
+          return Promise.resolve(typed(parquetGzipBody, "application/vnd.apache.parquet"));
+        case "zipparquet.body.test":
+          return Promise.resolve(typed(parquetZip, "application/zip"));
         case "nsatom.body.test":
           // Prefixed Atom, which is most of the Atom on the internet.
           return Promise.resolve(typed(
@@ -4936,6 +5180,20 @@ Deno.test(async function allTests(t) {
             ]),
             "application/rss+xml",
           ));
+        case "csvlatin1.body.test":
+          // A Latin-1 export, and the answer is the only thing that says so: a
+          // CSV carries no declaration of its own the way a prolog does.
+          return Promise.resolve(typed(latin1Csv, "text/csv; charset=iso-8859-1"));
+        case "csvbare.body.test":
+          // The same bytes with nothing declared, which is every feed running
+          // today: the decode stays the non-fatal UTF-8 one it always was.
+          return Promise.resolve(typed(latin1Csv, "text/csv"));
+        case "csvunknown.body.test":
+          return Promise.resolve(typed("t\nplain\n", "text/csv; charset=x-nope"));
+        case "csvwrong.body.test":
+          return Promise.resolve(typed(latin1Csv, "text/csv; charset=utf-8"));
+        case "ndjsonlatin1.body.test":
+          return Promise.resolve(typed(latin1(`{"t":"caf\u00E9"}\n`), "application/x-ndjson; charset=iso-8859-1"));
         case "utf16.body.test": {
           const text = `<?xml version="1.0" encoding="UTF-16"?><rss><channel><item><t>wide</t></item></channel></rss>`;
           const wide = new Uint8Array(2 + text.length * 2);
@@ -5088,6 +5346,23 @@ Deno.test(async function allTests(t) {
     // A sixteen-bit document cannot be sniffed for its prolog as UTF-8, so the
     // byte-order mark is what says how wide it is. This was refused forever.
     assertEquals(await bodyOf(ids.utf16), [{ t: "wide" }]);
+    // A CSV states no encoding of its own, so the answer's charset is the whole
+    // of what says these bytes are Latin-1 -- and read as UTF-8 anyway the cell
+    // held U+FFFD, which nothing downstream can tell from what the feed sent.
+    assertEquals(await bodyOf(ids.csvLatin1), [{ t: "caf\u00E9" }]);
+    assertEquals(await bodyOf(ids.ndjsonLatin1), [{ t: "caf\u00E9" }]);
+    // And a body that declares nothing is decoded exactly as it was before there
+    // was a label to read, replacement character and all: no feed running today
+    // reads differently.
+    assertEquals(await bodyOf(ids.csvBare), [{ t: "caf\uFFFD" }]);
+    // A label this runtime has no decoder for is its own refusal, naming it.
+    const unknown = await errorOf(ids.csvUnknown);
+    assert(unknown.includes("declares an encoding this server cannot read"), unknown);
+    assert(unknown.includes("x-nope"), `it names the label: ${unknown}`);
+    // A declared label the bytes are not is the other one: a feed wrong about
+    // its own encoding is a failure row, never a cell nobody can read back.
+    const wrongLabel = await errorOf(ids.csvWrong);
+    assert(wrongLabel.includes("is not utf-8 text"), wrongLabel);
 
     // An HTML table is a header and a grid, so it goes through the reader every
     // delimited body takes: the digits are numbers and the blank is a null, the
@@ -5150,6 +5425,26 @@ Deno.test(async function allTests(t) {
     // A <meta charset> inside a script string is not a declaration, and this scan
     // runs before there is a parser that could know it.
     assertEquals(await bodyOf(ids.htmlHidden), [{ t: "caf\u00E9" }]);
+
+    // Parquet is binary, so it never takes the text decode: the rows come out
+    // keyed by column name, which is what every reader downstream keys on.
+    assertEquals(await bodyOf(ids.parquet), [{ id: 1, name: "bolt" }, { id: 2, name: "nut" }]);
+    assertEquals((await newest(ids.parquet)).meta.shape, { id: "number", name: "string" });
+    // An INT64 arrives as a BigInt, which JSON.stringify throws on. Past 2^53 it
+    // is its decimal text, never a Number that rounded two ids into one.
+    assertEquals(await bodyOf(ids.parquetBig), [{ id: "9007199254740993" }]);
+    // A body that declares parquet and is not one is refused by its magic, the
+    // way a feed that is not the feed it says it is is refused by its root.
+    const notParquet = await errorOf(ids.parquetNot);
+    assert(notParquet.includes("is not a parquet file"), notParquet);
+    assert(notParquet.includes("PAR1"), `it names what was expected: ${notParquet}`);
+    // A codec this reader has no decompressor for is a failure row quoting the
+    // codec, not a 500: gzip, zstd and brotli want a second dependency.
+    const codec = await errorOf(ids.parquetCodec);
+    assert(codec.includes("uses a codec this server cannot read"), codec);
+    assert(codec.includes("GZIP"), `it names the codec: ${codec}`);
+    // And a zip is a container whichever body is inside it.
+    assertEquals(await bodyOf(ids.zipParquet), [{ id: 1, name: "bolt" }, { id: 2, name: "nut" }]);
 
     // A bomb is the 413 an oversized body is, refused on what came out of the
     // decompressor rather than on the few hundred bytes that carried it -- and
@@ -6667,6 +6962,64 @@ Deno.test(async function allTests(t) {
     await reject(jwt, `/library/${ghId}/secret`, { method: "DELETE", body: JSON.stringify({ name: "hook:github" }) });
   });
 
+  // A LIST<INT64> nests a BigInt where parquetRows' own top-level map never
+  // looked, and JSON.stringify throws on one wherever it sits. POST /net/:id
+  // has no try/catch around readFeedBody the way the poller's pollNetSheet
+  // does, so the raw throw used to reach app.onError and answer the generic
+  // 500 -- exactly the unexplained crash the NUL-byte check above exists to
+  // keep out of this same door, just one layer deeper in the value. Signed
+  // by hand rather than through hookSign, which only takes a string body:
+  // decoding a binary parquet file to a string to sign and re-encoding it to
+  // send would sign different bytes than the ones that go out.
+  await t.step("A parquet delivery with a nested INT64 past 2^53 does not crash the door", async () => {
+    const { jwt } = await usr("nadia@example.com");
+    const hand = automerge.create<Sheet>({ type: "net-hook", data: [] });
+    const id = `net-hook:${hand.documentId}`;
+    await put(jwt, `/library/${id}`, {});
+    const target = `/net/${id}`;
+
+    // A three-level LIST<INT64>, the shape a real writer uses for a repeated
+    // field: hyparquet-writer's own columnData shorthand refuses a bare
+    // REPEATED column and auto-detects a plain array of BigInt as something
+    // narrower, so only the explicit schema reaches the nested-BigInt case.
+    const writer = new ByteWriter();
+    parquetWrite({
+      writer,
+      columnData: [{ name: "tags", data: [[9007199254740993n, 2n], [3n]] }],
+      schema: [
+        { name: "root", num_children: 1 },
+        { name: "tags", repetition_type: "REQUIRED", converted_type: "LIST", num_children: 1 },
+        { name: "list", repetition_type: "REPEATED", num_children: 1 },
+        { name: "element", type: "INT64", repetition_type: "REQUIRED" },
+      ],
+    });
+    const body = new Uint8Array(writer.getBuffer());
+
+    const stamp = Math.floor(Date.now() / 1000);
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(await hookSecret(id)),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const prefix = new TextEncoder().encode(`${stamp}\n${target}\n`);
+    const message = new Uint8Array(prefix.length + body.length);
+    message.set(prefix);
+    message.set(body, prefix.length);
+    const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, message));
+    const sig = `t=${stamp},v2=${Array.from(mac).map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+
+    const res = await app.request(target, {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/vnd.apache.parquet", "scrapsheets-signature": sig }),
+      body,
+    });
+    assertEquals(res.status, 200, `a nested BigInt must not crash the delivery door: ${await res.text()}`);
+    const [row] = await sql`select body from net where sheet_id = ${id} order by net_id desc limit 1`;
+    assertEquals(JSON.parse(row.body), [{ tags: ["9007199254740993", 2] }, { tags: [3] }]);
+  });
+
   await t.step("A key pasted into a cell is not published by accident", async () => {
     const { jwt } = await usr("vera@example.com");
     // Shaped like a Stripe key and worth nothing: the scan is over the shape,
@@ -6740,6 +7093,25 @@ Deno.test(async function allTests(t) {
     assert((await held.text()).includes("Slack webhook url"), "the refusal names the shape it matched");
     const [kept]: { public: boolean }[] = await sql`select public from sheet where sheet_id = ${hooked}`;
     assertEquals(kept.public, false, "and the credential stayed private");
+
+    // A Teams Incoming Webhook is the same credential pasted into the same
+    // cell. Its own sheet, because the scan names the first shape it meets.
+    const teams = automerge.create<Sheet>({
+      type: "table",
+      data: [
+        arrayify([{ name: "where", type: "text", key: 0 }]),
+        { 0: "https://contoso.webhook.office.com/webhookb2/00/IncomingWebhook/11/22" },
+      ],
+    });
+    const teamed = `table:${teams.documentId}`;
+    await put(jwt, `/library/${teamed}`, {});
+    const card = await app.request(`/library/${teamed}/public`, {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+      body: JSON.stringify({ public: true }),
+    });
+    assertEquals(card.status, 400, "a sheet holding a Teams webhook url does not go public");
+    assert((await card.text()).includes("Teams webhook url"), "the refusal names the shape it matched");
   });
 
   // The scan reads whatever a browser synced in, and it used to run before
@@ -6910,6 +7282,133 @@ Deno.test(async function allTests(t) {
     const chartId = `chart:${chart.documentId}`;
     await put(jwt, `/library/${chartId}`, { name: "drawn" });
 
+    // Two tables that share a column name, which is the pair the honesty rule
+    // is about: `qty` written bare in a join over both belongs to neither.
+    const catalogue = automerge.create<Sheet>({
+      type: "table",
+      data: [
+        arrayify([
+          { name: "qty", type: "num", key: 0 },
+          { name: "price", type: "num", key: 1 },
+          { name: "total", type: "num", key: 2 },
+          // A column named as a word AlaSQL will not parse bare, which is why a
+          // statement that reads one writes it in brackets.
+          { name: "end", type: "text", key: 3 },
+        ]),
+        { 0: 2, 1: 3, 2: 6, 3: "friday" },
+      ],
+    });
+    const catalogueId = `table:${catalogue.documentId}`;
+    await put(jwt, `/library/${catalogueId}`, { name: "catalogue" });
+
+    const restock = automerge.create<Sheet>({
+      type: "table",
+      data: [
+        arrayify([{ name: "qty", type: "num", key: 0 }, { name: "eta", type: "text", key: 1 }]),
+        { 0: 2, 1: "friday" },
+      ],
+    });
+    const restockId = `table:${restock.documentId}`;
+    await put(jwt, `/library/${restockId}`, { name: "restock" });
+
+    const picked = automerge.create<{ data: Sheet["data"] }>({
+      data: [{ lang: "sql", code: `select qty, price, [end] from @${catalogueId}`, args: [] }],
+    });
+    const pickedId = `query:${picked.documentId}`;
+    await put(jwt, `/library/${pickedId}`, { name: "picked" });
+
+    const everything = automerge.create<{ data: Sheet["data"] }>({
+      data: [{ lang: "sql", code: `select * from @${catalogueId}`, args: [] }],
+    });
+    const everythingId = `query:${everything.documentId}`;
+    await put(jwt, `/library/${everythingId}`, { name: "everything" });
+
+    // The third ref is a sheet this caller holds no role on, so its columns are
+    // unreadable -- and reading them is not what decides the other two.
+    const strange = "table:not-a-sheet-of-mine";
+    const mixed = automerge.create<{ data: Sheet["data"] }>({
+      data: [{
+        lang: "sql",
+        code: `select r.eta, c.price, m.mystery from @${catalogueId} c
+               join @${restockId} r on c.qty = r.qty join @${strange} m on m.qty = c.qty`,
+        args: [],
+      }],
+    });
+    const mixedId = `query:${mixed.documentId}`;
+    await put(jwt, `/library/${mixedId}`, { name: "mixed" });
+
+    // chartSql writes every column it names in brackets, and `total` is one of
+    // the words AlaSQL will not parse bare.
+    const plotted = automerge.create<{ data: [{ source: string; kind: string; x: string; y: string }] }>({
+      data: [{ source: `@${catalogueId}`, kind: "line", x: "qty", y: "total" }],
+    });
+    const plottedId = `chart:${plotted.documentId}`;
+    await put(jwt, `/library/${plottedId}`, { name: "plotted" });
+
+    // A box chart aggregates in its own query, so its statement carries five
+    // aliases (`lo`, `q1`, `med`, `q3`, `hi`) beside its real `x` and `y` --
+    // and none of those aliases is a column this chart actually read.
+    const boxed = automerge.create<{ data: [{ source: string; kind: string; x: string; y: string }] }>({
+      data: [{ source: `@${catalogueId}`, kind: "box", x: "qty", y: "price" }],
+    });
+    const boxedId = `chart:${boxed.documentId}`;
+    await put(jwt, `/library/${boxedId}`, { name: "boxed" });
+
+    // An alias spelled the same as a real column of the ref it reads, on a
+    // column that is not that one: `total` is aliased onto `qty`, so renaming
+    // catalogue's own `total` breaks nothing here.
+    const aliased = automerge.create<{ data: Sheet["data"] }>({
+      data: [{ lang: "sql", code: `select qty as total from @${catalogueId}`, args: [] }],
+    });
+    const aliasedId = `query:${aliased.documentId}`;
+    await put(jwt, `/library/${aliasedId}`, { name: "aliased" });
+
+    // A column named outside ASCII, read back through the bracket syntax
+    // chartSql itself writes with.
+    const foreign = automerge.create<Sheet>({
+      type: "table",
+      data: [arrayify([{ name: "café", type: "text", key: 0 }]), { 0: "loyal" }],
+    });
+    const foreignId = `table:${foreign.documentId}`;
+    await put(jwt, `/library/${foreignId}`, { name: "foreign" });
+
+    const unicoded = automerge.create<{ data: Sheet["data"] }>({
+      data: [{ lang: "sql", code: `select [café] from @${foreignId}`, args: [] }],
+    });
+    const unicodedId = `query:${unicoded.documentId}`;
+    await put(jwt, `/library/${unicodedId}`, { name: "unicoded" });
+
+    // A statement past namesIn's own MAX_NAMES bound: this dependent's row
+    // must still come back, with an honest "?" rather than taking the whole
+    // account's lineage read down with it.
+    const sprawling = automerge.create<{ data: Sheet["data"] }>({
+      data: [{
+        lang: "sql",
+        code: `select ${Array.from({ length: MAX_NAMES + 1 }, (_, i) => `col${i}`).join(", ")} from @${catalogueId}`,
+        args: [],
+      }],
+    });
+    const sprawlingId = `query:${sprawling.documentId}`;
+    await put(jwt, `/library/${sprawlingId}`, { name: "sprawling" });
+
+    // A table this caller holds a role on, so `mine` carries it, but no
+    // automerge document backs it: readColumns' own load must answer "?"
+    // rather than the earlier "outside the library" case, which never opens
+    // one at all.
+    const ghost_table_doc = `ghost-table-${crypto.randomUUID().replaceAll("-", "")}`;
+    const [ghost_table] = await sql`
+      insert into sheet (type, doc_id, name, created_by, row_0)
+      values ('table', ${ghost_table_doc}, 'ghost table', ${usr_id}, ${sql.json({})})
+      returning sheet_id
+    `;
+    await sql`insert into sheet_usr (sheet_id, usr_id, role) values (${ghost_table.sheet_id}, ${usr_id}, 'owner')`;
+    const ghostTableId = String(ghost_table.sheet_id);
+    const overGhost = automerge.create<{ data: Sheet["data"] }>({
+      data: [{ lang: "sql", code: `select qty from @${ghostTableId}`, args: [] }],
+    });
+    const overGhostId = `query:${overGhost.documentId}`;
+    await put(jwt, `/library/${overGhostId}`, { name: "over ghost" });
+
     // A sheet whose document never arrived. Claimed by hand, because the claim
     // is the one route that refuses an id with no document behind it.
     const ghost_doc = `ghost-${crypto.randomUUID().replaceAll("-", "")}`;
@@ -6920,10 +7419,50 @@ Deno.test(async function allTests(t) {
     `;
     await sql`insert into sheet_usr (sheet_id, usr_id, role) values (${ghost.sheet_id}, ${usr_id}, 'owner')`;
 
+    // A source table that happens to hold a column literally named `active` --
+    // a name cohortSql's own generated SQL also uses, for its own count, on
+    // every cohort table it writes, with no way to spell it differently.
+    const orders = automerge.create<Sheet>({
+      type: "table",
+      data: [
+        arrayify([
+          { name: "customer_id", type: "num", key: 0 },
+          { name: "ordered_on", type: "text", key: 1 },
+          { name: "active", type: "num", key: 2 },
+        ]),
+        { 0: 1, 1: "2026-01-01", 2: 1 },
+      ],
+    });
+    const ordersId = `table:${orders.documentId}`;
+    await put(jwt, `/library/${ordersId}`, { name: "orders" });
+
+    const cohorted = automerge.create<{ data: Sheet["data"] }>({
+      data: [{
+        lang: "sql",
+        code: cohortSql({ source: `@${ordersId}`, date: "ordered_on", key: "customer_id", value: "", grain: "month" }),
+        args: [],
+      }],
+    });
+    const cohortedId = `query:${cohorted.documentId}`;
+    await put(jwt, `/library/${cohortedId}`, { name: "cohorted" });
+
+    // A window whose own alias is read again by the statement that wraps it,
+    // the same shape a cohort table's `group by cohort` reads its own alias.
+    const trended = automerge.create<{ data: Sheet["data"] }>({
+      data: [{
+        lang: "sql",
+        code:
+          `select customer_id, active, trend(active, 2) over (order by customer_id) as trend from @${ordersId} order by trend`,
+        args: [],
+      }],
+    });
+    const trendedId = `query:${trended.documentId}`;
+    await put(jwt, `/library/${trendedId}`, { name: "trended" });
+
     const [cols, ...rows] = await get<Table>(jwt, "/sheet/library:lineage");
     assertEquals(
       Object.values(cols).map((c) => (c as Col).name).join(),
-      "sheet_id,name,type,depends_on,depends_on_name,depends_on_type",
+      "sheet_id,name,type,depends_on,depends_on_name,depends_on_type,columns",
       "the lineage sheet has a stable shape, because a query sheet selects from it",
     );
     const edges = (id: string) => rows.filter((r) => String(r.sheet_id) === id);
@@ -6938,6 +7477,55 @@ Deno.test(async function allTests(t) {
     assertEquals(edges(chartId).map((r) => String(r.depends_on)), [tableId], "a chart's source is one too");
     assertEquals(edges(tableId), [], "a table holds its own cells and depends on nothing");
 
+    // Which columns of the ref the edge is about: the names this statement
+    // holds that exactly one of its own refs carries, or the two states that
+    // are not a list of names.
+    const claims = (id: string) => Object.fromEntries(edges(id).map((r) => [String(r.depends_on), r.columns]));
+    assertEquals(
+      claims(pickedId)[catalogueId],
+      "end, price, qty",
+      "a query claims the columns it names, sorted, a bracket-quoted keyword among them",
+    );
+    assertEquals(claims(queryId)[tableId], "n", "a qualified name is claimed as its column and not as its alias");
+    assertEquals(claims(everythingId)[catalogueId], "*", "a select * is every column the ref holds");
+    assertEquals(claims(alertId)[queryId], "*", "and says so over a ref whose own columns nothing could read");
+    assertEquals(claims(mixedId)[catalogueId], "price", "a name both joined tables hold is claimed by neither");
+    assertEquals(claims(mixedId)[restockId], "eta", "while the name only one of them holds still is");
+    assertEquals(claims(mixedId)[strange], "?", "a ref outside this library is unread rather than guessed at");
+    assertEquals(claims(plottedId)[catalogueId], "qty, total", "a chart's bracket-quoted axis is claimed bare");
+    assertEquals(
+      claims(boxedId)[catalogueId],
+      "price, qty",
+      "a box chart's five aggregate aliases are not columns it read",
+    );
+    assertEquals(
+      claims(aliasedId)[catalogueId],
+      "qty",
+      "an alias spelled like a real column is not a claim on that column",
+    );
+    assertEquals(claims(unicodedId)[foreignId], "café", "a name outside ASCII is still one identifier");
+    assertEquals(
+      claims(sprawlingId)[catalogueId],
+      "?",
+      "a statement past namesIn's own bound reads as unknown, not as a crash",
+    );
+    assertEquals(
+      claims(overGhostId)[ghostTableId],
+      "?",
+      "a ref this caller holds a role on, but whose document will not load, is unread rather than guessed at",
+    );
+    assertEquals(
+      claims(cohortedId)[ordersId],
+      "customer_id, ordered_on",
+      "cohortSql's own aliases (cohort, first_seen, active, month_no), read again in its group by and order by, are " +
+        "not columns it read -- even one the source table genuinely holds under that same name, active here",
+    );
+    assertEquals(
+      claims(trendedId)[ordersId],
+      "active, customer_id",
+      "a window's own alias, read again by the statement wrapping it, is not a column it read",
+    );
+
     const lost = edges(String(ghost.sheet_id));
     assertEquals(lost.length, 1, "a sheet nobody can trace is still in the graph");
     assertEquals(lost[0].depends_on, null, "with nothing it is known to depend on");
@@ -6945,6 +7533,7 @@ Deno.test(async function allTests(t) {
       String(lost[0].name).includes("could not be read"),
       `and the reason in its name: ${String(lost[0].name)}`,
     );
+    assertEquals(lost[0].columns, null, "and no claim about columns, because nothing read any");
 
     // The refs the read answers with are the ones the engine loads: a query
     // over the lineage sheet resolves the same way freshness does.
@@ -9126,6 +9715,45 @@ Deno.test(async function allTests(t) {
     assert(
       String(byId[alert_id].next_run).includes("T"),
       `an alert the poller has run knows when it runs next, got ${byId[alert_id].next_run}`,
+    );
+  });
+
+  await t.step("Within a cycle, the feeds an alert reads are polled before the alert", async () => {
+    const { jwt } = await usr("cycle@example.com");
+    // Two intervals of their own ran the alert against the cycle before's rows.
+    // One cycle polls the feed and then runs the alert, so the count below is
+    // the run this very cycle stored.
+    const fetcher = (url: string) =>
+      Promise.resolve(
+        new Response(url === "https://cycle.feeds.test/rows.json" ? `[{"n":1}]` : `[]`, {
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    const feed = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://cycle.feeds.test/rows.json", interval: 3600 }],
+    });
+    const feed_id = `net-http:${feed.documentId}`;
+    await put(jwt, `/library/${feed_id}`, { name: "cycle feed" });
+    const alert = automerge.create<{ data: [{ code: string; to: string; interval: number }] }>({
+      data: [{ code: `select created_at from @${feed_id}`, to: "", interval: 3600 }],
+    });
+    const alert_id = `alert:${alert.documentId}`;
+    await put(jwt, `/library/${alert_id}`, { name: "cycle alert" });
+
+    // Neither sheet has ever run, so both are due whatever the clock says; the
+    // real clock is what leaves every earlier step's sheet at the due time it
+    // was left with.
+    await pollOnce(fetcher, () => Promise.resolve("sent"), Date.now());
+
+    const polls = (await get<Table>(jwt, `/sheet/${feed_id}`)).slice(1);
+    assertEquals(polls.length, 1, "the feed half of the cycle stored its run");
+    const [run] = (await get<Table>(jwt, `/sheet/${alert_id}`)).slice(1);
+    const record = JSON.parse(String(run.body)) as { status: string; rows: number };
+    assertEquals(
+      [record.status, record.rows],
+      ["firing", 1],
+      "the alert half reads the row the feed half stored this cycle, not the cycle before's",
     );
   });
 

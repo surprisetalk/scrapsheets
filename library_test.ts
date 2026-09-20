@@ -252,10 +252,10 @@ Deno.test("an alert can be snoozed for a day, and the snooze runs out on its own
   assert(chip("snooze a day"), "so the chip is offered again");
 });
 
-// The one verb that only means something over the sheet that is open. It is not
-// on the shortcut sheet -- it has no key -- so the palette is where it lives,
-// and it opens the same door the footer's new-alert row does.
-Deno.test("the palette subscribes to the sheet that is open", async () => {
+// The verbs that only mean something over the sheet that is open. Neither is on
+// the shortcut sheet -- neither has a key -- so the palette is where they live,
+// and each opens a door the footer already has a row for.
+Deno.test("the palette subscribes to the sheet that is open, and builds a cohort table from it", async () => {
   const { dom, doc, app, settle } = await boot("http://localhost/table:countries");
   const made: { type: string; data: Record<string, unknown>[] }[] = [];
   app.ports.newDoc.subscribe((sent: { type: string; data: Record<string, unknown>[] }) => made.push(sent));
@@ -278,15 +278,119 @@ Deno.test("the palette subscribes to the sheet that is open", async () => {
   );
   await key(doc.getElementById("palette"), { key: "Escape" });
 
+  // The other verb that only means something over the sheet that is open. It
+  // needs no login, unlike subscribing: the fields it sends carry no address
+  // the way an alert's destination does, and the footer's own new-query door
+  // asks nothing either. The columns are guessed -- the first date, the first
+  // name ending in _id ahead of the plain text column before it, the first
+  // money column -- and what goes out is the fields, because src/sql.mjs is
+  // what turns them into the statement.
+  app.ports.docSelected.send({
+    id: "table:signups",
+    data: {
+      doc: {
+        type: "table",
+        data: [
+          [
+            { name: "plan", type: "text", key: "0" },
+            { name: "signup_id", type: "text", key: "1" },
+            { name: "joined_on", type: "date", key: "2" },
+            { name: "fee", type: "usd", key: "3" },
+          ],
+          { "0": "pro", "1": "a", "2": "2024-01-03", "3": 5 },
+        ],
+      },
+    },
+  });
+  await settle();
+  await key(doc.body, { key: "k", ctrlKey: true });
+  await type("build a cohort");
+  assert(
+    rows().some((row) => row.includes("build a cohort table")),
+    `a logged-out visitor can still build a cohort table, got: ${rows().join("|")}`,
+  );
+  await key(doc.getElementById("palette"), { key: "ArrowDown" });
+  await key(doc.getElementById("palette"), { key: "Enter" });
+  assertEquals(made.length, 1, "the cohort command opens one sheet");
+  assertEquals(made[0].type, "query");
+  assertEquals(made[0].data[0], {
+    lang: "sql",
+    cohort: {
+      source: "@table:signups",
+      date: "joined_on",
+      key: "signup_id",
+      value: "fee",
+      grain: "month",
+    },
+  });
+
+  // A date column with no id-shaped or text column beside it has no key to
+  // group by, and a command that can only fail is not a command.
+  app.ports.docSelected.send({
+    id: "table:numbers-only",
+    data: {
+      doc: {
+        type: "table",
+        data: [
+          [
+            { name: "measured_on", type: "date", key: "0" },
+            { name: "count", type: "num", key: "1" },
+            { name: "total", type: "usd", key: "2" },
+          ],
+          { "0": "2024-01-03", "1": 3, "2": 5 },
+        ],
+      },
+    },
+  });
+  await settle();
+  await key(doc.body, { key: "k", ctrlKey: true });
+  await type("cohort");
+  assert(
+    !rows().some((row) => row.includes("build a cohort table")),
+    `a sheet with no key column has no cohort to build, got: ${rows().join("|")}`,
+  );
+  await key(doc.getElementById("palette"), { key: "Escape" });
+
+  // A sheet with no date column has no cohort to build either.
+  app.ports.docSelected.send({
+    id: "table:undated",
+    data: {
+      doc: {
+        type: "table",
+        data: [[{ name: "plan", type: "text", key: "0" }, { name: "fee", type: "usd", key: "1" }], {
+          "0": "pro",
+          "1": 5,
+        }],
+      },
+    },
+  });
+  await settle();
+  await key(doc.body, { key: "k", ctrlKey: true });
+  await type("cohort");
+  assert(
+    !rows().some((row) => row.includes("build a cohort table")),
+    `a sheet with no date column has no cohort to build, got: ${rows().join("|")}`,
+  );
+  await key(doc.getElementById("palette"), { key: "Escape" });
+
+  // Back to the sheet the rest of this test builds the alert from -- only the
+  // id matters from here, since nothing after this reads table:countries' own
+  // columns.
+  app.ports.docSelected.send({
+    id: "table:countries",
+    data: { doc: { type: "table", data: [[{ name: "a", type: "text", key: "0" }], { "0": "x" }] } },
+  });
+  await settle();
+
   app.ports.authResult.send({ usr_id: "u1", email: "ops@example.com" });
   await settle();
   await key(doc.body, { key: "k", ctrlKey: true });
   await type("subscribe");
   await key(doc.getElementById("palette"), { key: "ArrowDown" });
   await key(doc.getElementById("palette"), { key: "Enter" });
-  assertEquals(made.length, 1, "one command, one sheet");
-  assertEquals(made[0].type, "alert");
-  assertEquals(made[0].data[0], {
+  assertEquals(made.length, 2, "one command, one sheet");
+  assertEquals(made[1].type, "alert");
+  assertEquals(made[1].data[0], {
     code: "select * from @table:countries",
     to: "ops@example.com",
     interval: 3600,
@@ -306,6 +410,16 @@ Deno.test("the palette subscribes to the sheet that is open", async () => {
   assert(
     !rows().some((row) => row.includes("subscribe to this sheet")),
     `a chart is not a sheet to subscribe to, got: ${rows().join("|")}`,
+  );
+  await key(doc.getElementById("palette"), { key: "Escape" });
+
+  // A chart keeps no columns of its own -- `arrangeable` answers Nothing for
+  // it -- so there is nothing to guess a cohort's date and key from either.
+  await key(doc.body, { key: "k", ctrlKey: true });
+  await type("cohort");
+  assert(
+    !rows().some((row) => row.includes("build a cohort table")),
+    `a chart has no cohort to build, got: ${rows().join("|")}`,
   );
 });
 
@@ -635,6 +749,27 @@ Deno.test("the library merges what is stored under what is bundled", () => {
   assertEquals(starred["table:countries"].starred, true, "a bundled sheet keeps this browser's star");
   assertEquals(starred["table:countries"].name, "countries", "and still loses its name to the bundled one");
   assertEquals(starred["table:mine"].starred, undefined, "a sheet nobody starred carries no flag");
+  // Tags are the same kind of fact and the one that merges rather than overlays:
+  // a tag this browser put on a bundled demo has to outlive the merge, and the
+  // demo's own tags are what the gallery strip filters on.
+  const tags = library({ "query:lybunt": { tags: ["mine", "demo"] }, "table:mine": { name: "mine" } }) as Record<
+    string,
+    { tags?: string[] }
+  >;
+  assertEquals(tags["query:lybunt"].tags, ["demo", "nonprofit", "query", "mine"], "bundled tags first, stored after");
+  assertEquals(tags["table:mine"].tags, undefined, "a sheet nobody tagged carries none");
+  // A stored tags field this browser never wrote -- a hand-edited or stale
+  // localStorage value -- used to throw spreading a number or an object, and
+  // silently exploded a string into one letter per tag. Neither is a sheet the
+  // whole library should go down for.
+  for (const bad of [5, true, { a: 1 }, "oops"]) {
+    const merged = library({ "query:lybunt": { tags: bad } }) as Record<string, { tags?: string[] }>;
+    assertEquals(
+      merged["query:lybunt"].tags,
+      ["demo", "nonprofit", "query"],
+      `a stored tags of ${JSON.stringify(bad)} should not reach the merge`,
+    );
+  }
   assertEquals(shelf[""].name, "library", "the empty id is the library itself");
   for (const p of PORTALS) assert(shelf[`portal:${p}`], `portal:${p} should be listed`);
   assert(shelf["table:tutorial"], "the tutorial is part of the library");
@@ -768,9 +903,9 @@ Deno.test("a sheet is starred from its row, drawn first, dropped by a chosen sor
 // Trashing one row at a time is how a library of many sheets stays untidy. The
 // selection already says which rows, so the shortcut fans one updateLibrary out
 // over them -- a top-level Msg, because every DocMsg on the library is refused.
-Deno.test("the selected library rows are trashed together, and an empty selection is refused by name", async () => {
-  const { app, all, doc, dom, fire, settle, text } = await boot("http://localhost/");
-  const sent: { id: string; data: { trashed: boolean | null } }[] = [];
+Deno.test("the selected library rows are trashed and tagged together, and an empty selection is refused by name", async () => {
+  const { app, all, click, doc, dom, fire, settle, text, type_ } = await boot("http://localhost/");
+  const sent: { id: string; data: { trashed: boolean | null; tags: string[] | null } }[] = [];
   app.ports.updateLibrary.subscribe((s: (typeof sent)[number]) => sent.push(s));
   const key = async (init: Record<string, unknown>) => {
     doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, ...init }));
@@ -781,10 +916,16 @@ Deno.test("the selected library rows are trashed together, and an empty selectio
   assertEquals(sent, [], "a selection over no row writes nothing");
   assert(text().includes("holding no sheet"), `expected the refusal by name, got: ${text().slice(0, 200)}`);
 
+  // The tag box refuses the same selection, in its own words.
+  await type_(all("input").find((i) => i.getAttribute("placeholder") === "tag"), "mine");
+  await click(all("button.chip").find((b) => b.textContent?.trim() === "tag selected"));
+  assertEquals(sent, [], "a tag over no row writes nothing");
+  assert(text().includes("select the rows to tag"), `expected the refusal by name, got: ${text().slice(0, 200)}`);
+
   // A library of this test's own, so the rows under the selection are known.
   app.ports.librarySynced.send({
     "": { name: "library", system: true, doc: { type: "library" } },
-    "table:a": { name: "a", tags: [], doc: { type: "table", data: [[]] } },
+    "table:a": { name: "a", tags: ["keep"], doc: { type: "table", data: [[]] } },
     "table:b": { name: "b", tags: [], doc: { type: "table", data: [[]] } },
     "table:c": { name: "c", tags: [], doc: { type: "table", data: [[]] } },
   });
@@ -803,6 +944,101 @@ Deno.test("the selected library rows are trashed together, and an empty selectio
     sent.map((s) => [s.id, s.data.trashed]).sort(),
     [["table:a", true], ["table:b", true]],
     "one updateLibrary per selected row, and the row nobody selected is left alone",
+  );
+
+  // The same selection and the same fan-out for the strip's tag box, which is
+  // an argument rather than a shortcut: the tag is added to what each row
+  // already carries, so the tags a demo ships with survive it.
+  sent.length = 0;
+  const box = all("input").find((i) => i.getAttribute("placeholder") === "tag");
+  await type_(box, " mine ");
+  box?.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, key: "Enter" }));
+  await settle();
+  assertEquals(
+    sent.map((s) => [s.id, s.data.tags]).sort(),
+    [["table:a", ["keep", "mine"]], ["table:b", ["mine"]]],
+    "the tag is added to each selected row, trimmed, and the other tags are kept",
+  );
+  // The harness's updateLibrary subscriber only records what was sent -- the
+  // round trip through Library.set and back onto librarySynced is what the
+  // real page does, so it is redone here by hand for the checks below to read
+  // a library that already reflects the write above. `trashed` is left off on
+  // purpose: the earlier trash write never reached this browser's stored
+  // library either, in this harness, and folding it in here would drop table:a
+  // and table:b out of the drawn table, moving the same y under the selection
+  // onto a different sheet -- a real hazard `libraryIdAtRow`'s own doc names
+  // ("the rows as drawn"), but not the one this block is testing.
+  app.ports.librarySynced.send({
+    "": { name: "library", system: true, doc: { type: "library" } },
+    "table:a": { name: "a", tags: ["keep", "mine"], doc: { type: "table", data: [[]] } },
+    "table:b": { name: "b", tags: ["mine"], doc: { type: "table", data: [[]] } },
+    "table:c": { name: "c", tags: [], doc: { type: "table", data: [[]] } },
+  });
+  await settle();
+
+  sent.length = 0;
+  await type_(box, "  ");
+  await click(all("button.chip").find((b) => b.textContent?.trim() === "tag selected"));
+  assertEquals(sent, [], "a tag of nothing writes nothing");
+  assert(
+    text().includes("Expected a tag, received nothing"),
+    `expected the refusal by name, got: ${text().slice(0, 200)}`,
+  );
+
+  // A tags cell is read back by splitting on ", ", so a comma here would come
+  // back as two tags nobody typed -- refused rather than split for them.
+  sent.length = 0;
+  await type_(box, "a, b");
+  await click(all("button.chip").find((b) => b.textContent?.trim() === "tag selected"));
+  assertEquals(sent, [], "a tag holding a comma writes nothing");
+  assert(
+    text().includes("Expected one tag, received"),
+    `expected the refusal by name, got: ${text().slice(0, 200)}`,
+  );
+
+  // Both selected rows already carry "mine" from above, so nothing is written
+  // at all -- not an empty selection, and not a refusal either: the sheets
+  // simply have nothing to gain from running it again.
+  sent.length = 0;
+  await type_(box, "mine");
+  await click(all("button.chip").find((b) => b.textContent?.trim() === "tag selected"));
+  assertEquals(sent, [], "a tag every selected row already carries writes nothing");
+
+  // A tag differing only in case is a different tag: the free-hand cell edit
+  // does not lowercase either, so neither does this.
+  sent.length = 0;
+  await type_(box, "Mine");
+  await click(all("button.chip").find((b) => b.textContent?.trim() === "tag selected"));
+  assertEquals(
+    sent.map((s) => [s.id, s.data.tags]).sort(),
+    [["table:a", ["keep", "mine", "Mine"]], ["table:b", ["mine", "Mine"]]],
+    "case is not folded, so Mine is added beside mine",
+  );
+
+  // A selection that starts on the header row. Arrow-key navigation cannot
+  // reach it -- `clampIndex` holds y at 1 or above -- but a mouse drag can:
+  // the header is one more row of the same table, drawn by the same
+  // viewCell/CellHover pair as any data row. `libraryIdAtRow` answers Nothing
+  // at row 0 the same way it does one past the end, so it is dropped from the
+  // fan-out rather than crashing or being asked about.
+  const headerCell = all("td").find((td) =>
+    td.querySelector("span.sort")?.textContent?.trim().toLowerCase() === "tags"
+  );
+  assert(headerCell, "the tags header cell exists");
+  sent.length = 0;
+  await fire(headerCell, "mouseenter");
+  await fire(headerCell, "mousedown");
+  await fire(first, "mouseenter");
+  await fire(first, "mouseup");
+  await type_(box, "header-safe");
+  await click(all("button.chip").find((b) => b.textContent?.trim() === "tag selected"));
+  assertEquals(
+    sent.map((s) => [s.id, s.data.tags]),
+    // Reads model.library, not the "Mine" write two blocks up -- this
+    // harness's updateLibrary subscriber never round-trips on its own, and
+    // that write's own librarySynced echo was never resent.
+    [["table:a", ["keep", "mine", "header-safe"]]],
+    "the header row in the selection is silently skipped, not crashed on",
   );
 });
 
@@ -1113,7 +1349,7 @@ Deno.test("a join that would walk more pairs than one run is allowed is refused 
   // the server refuses rather than freezing the tab on it.
   const four = ["a", "b", "c", "d"].map((alias) => `@table:countries ${alias}`).join(", ");
   const said = await refused(`select count(*) as n from ${four}`);
-  const n = (shelf["table:countries"] as { doc: { data: unknown[] } }).doc.data.length - 1;
+  const n = (shelf["table:countries"] as unknown as { doc: { data: unknown[] } }).doc.data.length - 1;
   assert(said.includes(`${n ** 4} pairs`), said);
   assert(said.includes("filter each large sheet"), said);
   // A self-join of two is what the demos do, and it still runs.

@@ -130,9 +130,26 @@ nobody has delivered to in three days says so beside a poll that has been failin
 
 `GET /library/lineage` is what feeds what: one row per query, alert or chart and the sheet it reads, off the live
 document rather than a stale copy, so `select * from @library:lineage where depends_on = '@table:x'` is the list of what
-breaks if that sheet goes. An alert is silenced without being deleted: "snooze a day" on the alert page records every
-run and delivers none until the day is up, and "subscribe to this sheet" in the palette makes an alert that mails you
-when a sheet you are looking at gains a row.
+breaks if that sheet goes. Its `columns` column says which columns of that sheet each dependent names — `*` where it
+reads them all, `?` where nothing could check — so a rename knows what it breaks. An alert is silenced without being
+deleted: "snooze a day" on the alert page records every run and delivers none until the day is up, and "subscribe to
+this sheet" in the palette makes an alert that mails you when a sheet you are looking at gains a row. An alert's `to`
+may be a Teams Incoming Webhook url as well as a Slack or Discord one, and feeds are polled before the alerts that read
+them on one tick, so an alert never reads the cycle before's rows.
+
+A feed answering Parquet lands as rows, and `/export/<sheet_id>.parquet` answers one, typed once per column; a CSV, TSV
+or NDJSON feed that declares its `charset` is decoded in it, and one that declares nothing is read as it always was. A
+body served under a wrong label is a failure row that names the label.
+
+`trend(y, 12) over (order by month)`, `seasonal(...)` and `deseasonalized(...)` decompose a seasonal series in a query;
+`query:visit-decomposition` is the bundled example, and its fit is a second query over the first. "build a cohort table
+from this sheet" in the palette writes the cohort SQL for a table or query with a date and a key column and opens it as
+a query sheet you then edit.
+
+A numeric column can be shaded by its own values — a colour scale or data bars, from the column's panel, stored with the
+arrangement — and a `json` cell holding a list of numbers draws as a sparkline. In the library, one tag goes onto every
+selected row from the strip's tag box, and a tag put on a bundled demo survives the next merge. The shop lists type and
+tags as columns over the whole catalogue, so the column panel is the filter.
 
 The library table shows the same answer per row — last run, and failures since — and the demo strip marks a sheet whose
 feed is failing, so a dead feed is visible where you open it rather than only in the 15-minute alarm email. Ctrl/⌘+K

@@ -791,7 +791,16 @@ export const formatQueryError = (error, code) => {
 // Aliased columns are exempt. `select null as note` also yields undefined, and
 // wrongly rejecting a working query is worse than missing a typo the author
 // went out of their way to name.
-const KEYWORD = /^(from|where|group|order|having|limit|offset|join|on|and|or|union|into)$/i;
+//
+// The one list of words a name in a statement's own text is not a column by.
+// Widened past the clause keywords the alias capture below needed so namesIn()
+// can read it too: an alias spelled as one of the added words is now read as no
+// alias, which costs the min()/max() message below on `min(x) as end` and buys
+// one keyword list here instead of two that drift. Nothing whose reading is
+// also a plausible column name is on it -- QUALIFY_WORDS holds `date`, `int`
+// and `number`, and a sheet has columns by all three names.
+const KEYWORD =
+  /^(select|from|where|group|by|order|having|limit|offset|top|join|inner|left|right|full|outer|cross|natural|on|using|and|or|not|in|is|null|like|between|exists|case|when|then|else|end|as|asc|desc|distinct|all|union|intersect|except|into|values|over|partition|qualify|unpivot|pivot|for|with)$/i;
 
 export const checkResultColumns = (cols, rows, known = [], code = "") => {
   if (!rows.length) return;
@@ -805,11 +814,18 @@ export const checkResultColumns = (cols, rows, known = [], code = "") => {
   // wearing the guard as a disguise.
   const extremes = new Set(
     [...code.matchAll(
-      /\b(min|max)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)(?:\s+(?:as\s+)?["'`[]?([A-Za-z_][A-Za-z0-9_]*))?/gi,
+      /\b(min|max)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)(?:\s+(?:as\s+)?(["'`\[])?([A-Za-z_][A-Za-z0-9_]*))?/gi,
     )]
-      .flatMap(([, fn, arg, as]) => [
+      // A quoted or bracketed alias is a name the author wrote to be a name, the
+      // same reading namesIn() gives a bracket ("a name in brackets is in them
+      // because it is a column the engine would not otherwise parse") -- so it
+      // is never filtered by KEYWORD, which is now widened past the clause
+      // words this bare check still needs (`min(x) from t` must not read "from"
+      // as an implied alias) to the words namesIn() reads bare too, `end` and
+      // `order` among them, which is exactly what `as [end]` writes past.
+      .flatMap(([, fn, arg, delim, as]) => [
         `${fn.toUpperCase()}(${arg.trim()})`,
-        ...(as && !KEYWORD.test(as) ? [as] : []),
+        ...(as && (delim || !KEYWORD.test(as)) ? [as] : []),
       ]),
   );
   for (const { columnid } of cols) {
@@ -838,6 +854,94 @@ export const checkResultColumns = (cols, rows, known = [], code = "") => {
       Fix: hit ? `rename "${columnid}" to "${hit}"` : "check the column names in the sheet's type row",
     }));
   }
+};
+
+// Every identifier a statement mentions, which is every name a column of some
+// sheet it reads could be. It answers what is written and never which sheet a
+// name belongs to: scope is not something a regex can see, so a caller that
+// needs the sheet decides by who else holds the name.
+//
+// Three things are blanked before a name is read, and all three for the same
+// reason -- what is left is only what the statement could be naming a column
+// by. String literals go the way rewriteWindows() blanks them. So does every
+// sheet ref, down to the column a cell ref names: `@table:x` is an address
+// whose own words are not columns, while `@table:x.col` names col. And so does
+// the name after an `as`, which is the alias the statement gives its OWN
+// result and never a column it read -- `qty as price` claims qty, never price,
+// even when the ref this statement reads also holds a column spelled price;
+// chartSql's `[x] as x` would otherwise claim a column named `x` on every
+// chart that has one, and its box branch five more nobody wrote. Blanked here
+// rather than skipped at the match, because deciding it there means reading
+// back over the whole statement for every name in it, which is quadratic on
+// text a browser syncs in at whatever length it likes.
+//
+// What is matched is then read once, forwards: a name a `(` follows is a
+// function, a name a `.` follows is the qualifier and not the column beside
+// it, and a bracketed name is the bare one, because chartSql writes every
+// column it names quoted. The identifier is `\p{L}`, not `A-Za-z`, because a
+// column named in another script is a name and not a fragment of one --
+// matching ASCII alone split `café` into `caf` and a bracket around it, which
+// is a wrong guess in the one place this file promises never to guess.
+export const MAX_NAMES = 500;
+
+export const namesIn = (code) => {
+  let text = code
+    .replace(/'[^']*'/g, "''")
+    .replace(/@[a-z-]+:[A-Za-z0-9_-]+/g, " ");
+  // An alias this statement gives its OWN result is blanked everywhere it is
+  // spelled again, not only at its own `as`: a cohort table's `as cohort`
+  // reads again in its own `group by cohort` and `c.cohort`, and a window's
+  // `as trend` a caller wraps in `where trend > 0` the same way. Missing this
+  // is how a query built from cohortSql() or a window claimed its own
+  // generated names -- cohort, active, trend -- as columns of the sheet it
+  // reads, which a source column of that same name would make look right by
+  // coincidence and a bare mis-attribution otherwise. Blanking every mention
+  // can lose a genuine same-named column too, but the honesty rule already
+  // prefers losing a name to claiming one that is not there.
+  const aliases = new Set(
+    [...text.matchAll(/\bas\s+\[?([\p{L}_][\p{L}\p{N}_]*)\]?/giu)].map((m) => m[1]),
+  );
+  // Each alias is one more pass over the whole text, so the aliases are bounded
+  // before the names are: a statement a browser synced in could otherwise spell
+  // thousands of them and make this loop quadratic again.
+  if (aliases.size > MAX_NAMES) {
+    throw new Error(explain(`This statement names more than ${MAX_NAMES} aliases.`, {
+      Received: `${aliases.size} distinct aliases`,
+      Limit: `${MAX_NAMES} distinct aliases in one statement`,
+      Source: "the statement's own text",
+      Fix: "split it into a query sheet per part, and select from those",
+    }));
+  }
+  for (const alias of aliases) {
+    // `x as x` (qualified or bracketed either side) is not an invented name --
+    // cohortSql writes its key column exactly this way -- so it is left as the
+    // ordinary reference it is rather than blanked into losing the one column
+    // lineage most needs to keep, the key a rename would actually break.
+    if (new RegExp(`(?:^|[.\\s,(])\\[?${alias}\\]?\\s+as\\s+\\[?${alias}\\]?\\b`, "iu").test(text)) continue;
+    text = text.replace(new RegExp(`\\[?\\b${alias}\\b\\]?`, "giu"), " ");
+  }
+  const names = new Set();
+  // The first lookahead is what stops the second from being satisfied by a
+  // shorter name: without it `count(` backtracks to `coun`, which no `(`
+  // follows, and the function is read as a column.
+  const word = /\[[\p{L}_][\p{L}\p{N}_]*\](?!\s*[(.])|[\p{L}_][\p{L}\p{N}_]*(?![\p{L}\p{N}_])(?!\s*[(.])/gu;
+  for (const m of text.matchAll(word)) {
+    // A keyword is only a keyword bare: a name in brackets is in them because
+    // it is a column the engine would not otherwise parse, which is what
+    // chartSql writes an axis named `end` or `order` as.
+    if (m[0][0] !== "[" && KEYWORD.test(m[0])) continue;
+    const name = bare(m[0]);
+    names.add(name);
+    if (names.size > MAX_NAMES) {
+      throw new Error(explain(`This statement names more than ${MAX_NAMES} identifiers.`, {
+        Received: `${names.size} distinct names, counted through "${name}"`,
+        Limit: `${MAX_NAMES} distinct identifiers in one statement`,
+        Source: "the statement's own text",
+        Fix: "split it into a query sheet per part, and select from those",
+      }));
+    }
+  }
+  return [...names];
 };
 
 // --- window functions
@@ -872,10 +976,15 @@ export const WINDOW_TYPES = {
   nth_value: null,
   min: null,
   max: null,
+  trend: null,
+  seasonal: null,
+  deseasonalized: null,
 };
 
 // Ranking and offset functions read the whole partition; a frame never applies.
 const OFFSET = ["lag", "lead"];
+// The classical additive decomposition, which reads the whole partition too.
+export const DECOMPOSE = ["trend", "seasonal", "deseasonalized"];
 // The functions that return a row's own value, and so can be asked to look past
 // a null to the last row that had one. Everything else skips nulls already.
 const NULLABLE = ["lag", "lead", "first_value", "last_value", "nth_value"];
@@ -1309,6 +1418,86 @@ const winNum = (fn, v) => {
   return n;
 };
 
+// Classical additive decomposition: y = trend + seasonal + what is left. Every
+// row of a partition answers off the whole series, so it is computed once and
+// kept against the `ord` array, which applyWindows allocates fresh per window
+// and per partition -- so no row walks the series again, and the three
+// functions of one query each walk it once.
+// Nothing here can check that the series is evenly spaced -- it must be one row
+// per step of the cycle, in order, with no step missing.
+const decomposed = new WeakMap();
+
+const decompose = (w, rows, ord) => {
+  const hit = decomposed.get(ord);
+  if (hit) return hit;
+  const size = ord.length;
+  const period = w.counted.length ? w.counted[0] : null;
+  if (!Number.isInteger(period) || period < 2) {
+    throw new Error(explain(`${w.fn}() needs a whole number of steps in one cycle.`, {
+      Expected: "a whole number of at least 2, e.g. trend(visits, 12) for monthly rows over a year",
+      Received: JSON.stringify(period),
+      Source: `the ${w.alias} column in this query`,
+      Fix: `write ${w.fn}(<column>, 12) over (order by <the column that steps>)`,
+    }));
+  }
+  if (size < period * 2) {
+    throw new Error(explain(`${w.fn}() needs two whole cycles to tell a season from a trend.`, {
+      Expected: `at least ${period * 2} rows in a partition, two cycles of ${period}`,
+      Received: `${size} rows`,
+      Source: `the ${w.alias} column in this query`,
+      Fix: "shorten the period, widen the partition, or drop the decomposition",
+    }));
+  }
+
+  // A blank cell is the normal state of a spreadsheet column, so a blank y is a
+  // null trend and a null deseasonalized rather than a refusal. What is refused
+  // is a step of the cycle no trend row covers at all: averaging nothing is a
+  // NaN, and a NaN rides every row downstream saying nothing about why.
+  const y = ord.map((i) => winNum(w.fn, rows[i][w.hidden.args[0]]));
+  // The centred moving average: an even period has no middle row, so it is the
+  // 2 x period average -- half weight on each end point of period + 1 rows.
+  const half = Math.floor(period / 2);
+  const even = period % 2 === 0;
+  const trend = new Array(size).fill(null);
+  for (let p = half; p + half < size; p++) {
+    let total = 0;
+    for (let q = p - half; q <= p + half; q++) {
+      if (y[q] === null) {
+        total = null;
+        break;
+      }
+      total += even && (q === p - half || q === p + half) ? y[q] / 2 : y[q];
+    }
+    if (total !== null) trend[p] = total / period;
+  }
+
+  const sums = new Array(period).fill(0), counts = new Array(period).fill(0);
+  for (let p = 0; p < size; p++) {
+    if (trend[p] === null) continue;
+    sums[p % period] += y[p] - trend[p];
+    counts[p % period]++;
+  }
+  const means = sums.map((total, phase) => {
+    if (!counts[phase]) {
+      throw new Error(explain(`${w.fn}() found no row to read step ${phase + 1} of the cycle from.`, {
+        Expected: `a value at every one of the ${period} steps of a cycle, on a row the trend covers`,
+        Received: `${counts.filter((n) => n).length} of ${period} steps`,
+        Source: `the ${w.alias} column in this query`,
+        Fix: "fill the blanks in that column, or widen the partition so another cycle covers the step",
+      }));
+    }
+    return total / counts[phase];
+  });
+  // Centred so one cycle of the pattern sums to zero: what it moves is the
+  // level, and the level belongs to the trend.
+  const centre = means.reduce((a, b) => a + b, 0) / period;
+  const seasonal = means.map((m) => m - centre);
+
+  const answer = { trend, seasonal, y };
+  decomposed.set(ord, answer);
+  return answer;
+};
+
 const frameBounds = (frame, pos, peer, size) => {
   const edge = ({ at }, fallback) => at === -Infinity ? 0 : at === Infinity ? size - 1 : at === 0 ? fallback : pos + at;
   // A range frame moves to the edge of the peer group; a rows frame counts rows.
@@ -1370,6 +1559,13 @@ const winValue = (w, rows, ord, pos) => {
       if (--want === 0) return arg(p);
     }
     return w.counted.length > 1 ? w.counted[1] : null;
+  }
+  if (DECOMPOSE.includes(w.fn)) {
+    const { trend, seasonal, y } = decompose(w, rows, ord);
+    if (w.fn === "trend") return trend[pos];
+    const s = seasonal[pos % seasonal.length];
+    if (w.fn === "seasonal") return s;
+    return y[pos] === null ? null : y[pos] - s;
   }
 
   const [lo, hi] = frameBounds(w.frame, pos, { first, last }, size);
@@ -1789,21 +1985,23 @@ export const rewriteExtremes = (code, colsOf) => {
 // same query out of that, so the picture the page draws and the rows the server
 // exports are the same answer.
 
-// One of the columns a chart names, quoted for the engine. `total`, `store` and
-// `class` are AlaSQL keywords that will not parse as a bare identifier, so a
-// column named one of them used to reach the reader as a parse error with a
-// caret into SQL nobody wrote. Brackets are what AlaSQL quotes a name with, and
-// a name holding a `]` is refused below rather than quoted, which is what keeps
-// every statement built out of this well formed.
-const chartIdent = (what, value) => {
+// One of the columns a generated statement names, quoted for the engine.
+// `total`, `store` and `class` are AlaSQL keywords that will not parse as a bare
+// identifier, so a column named one of them used to reach the reader as a parse
+// error with a caret into SQL nobody wrote. Brackets are what AlaSQL quotes a
+// name with, and a name holding a `]` is refused below rather than quoted, which
+// is what keeps every statement built out of this well formed. `whose` is the
+// thing that named the column -- a chart, a cohort table -- because the refusal
+// is read beside the settings it is about.
+const chartIdent = (whose, what, value) => {
   // Typed, not coerced: /^[A-Za-z_]\w*$/.test(NaN) reads the string "NaN" and
   // passes, which would splice a bare NaN into the select list.
   if (typeof value === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) return `[${value}]`;
-  throw new Error(explain(`A chart's ${what} has to be a column name.`, {
+  throw new Error(explain(`A ${whose}'s ${what} has to be a column name.`, {
     Expected: "a plain column name, e.g. month",
     Received: show(value),
-    Source: "this chart sheet's settings",
-    Fix: "pick a column from the sheet the chart reads",
+    Source: `this ${whose}'s settings`,
+    Fix: `pick a column from the sheet the ${whose} reads`,
   }));
 };
 
@@ -1833,8 +2031,8 @@ export const chartSql = ({ source, kind = "line", x, y, y2 = "", series = "" }) 
   if (!/^@(?:table|query):[A-Za-z0-9_-]+$/.test(source ?? "")) {
     throw new Error(explain(`A chart reads one table or query sheet.`, {
       Expected: "@table:doc_id or @query:doc_id",
-      Received: JSON.stringify(source ?? null),
-      Source: "this chart sheet's settings",
+      Received: show(source ?? null),
+      Source: "this chart's settings",
       Fix: "set the source to a table or query sheet, e.g. @query:budget-burn",
     }));
   }
@@ -1849,12 +2047,12 @@ export const chartSql = ({ source, kind = "line", x, y, y2 = "", series = "" }) 
       Expected: CHART_KINDS.join(", "),
       Received: show(kind),
       "Did you mean": meant,
-      Source: "this chart sheet's settings",
+      Source: "this chart's settings",
       Fix: meant ? `set the kind to ${meant}` : `set the kind to one of ${CHART_KINDS.join(", ")}`,
     }));
   }
-  const across = chartIdent("x column", x);
-  const up = chartIdent("y column", y);
+  const across = chartIdent("chart", "x column", x);
+  const up = chartIdent("chart", "y column", y);
   // A box already splits its rows -- the five numbers per x are the split -- so
   // a second way to split them is a question with two answers. Refused by name
   // rather than ignored: a series box drawn as a plain one is a picture of rows
@@ -1865,7 +2063,7 @@ export const chartSql = ({ source, kind = "line", x, y, y2 = "", series = "" }) 
         throw new Error(explain(`A box chart is already the spread of its rows, so it takes no ${what}.`, {
           Expected: "a box chart with an x column and a y column and nothing else",
           Received: `${what} ${show(value)}`,
-          Source: "this chart sheet's settings",
+          Source: "this chart's settings",
           Fix: `clear the ${what}, or pick a kind that draws one`,
         }));
       }
@@ -1889,7 +2087,7 @@ export const chartSql = ({ source, kind = "line", x, y, y2 = "", series = "" }) 
     throw new Error(explain(`A kpi tile draws one number, so it has no second scale.`, {
       Expected: "a kpi with one y column",
       Received: `second y column ${show(y2)}`,
-      Source: "this chart sheet's settings",
+      Source: "this chart's settings",
       Fix: "clear the second y column, or draw this as a line",
     }));
   }
@@ -1897,7 +2095,7 @@ export const chartSql = ({ source, kind = "line", x, y, y2 = "", series = "" }) 
   // over the source, and two columns the page gives two axes to.
   const plot = y2 === ""
     ? `${across} as x, ${up} as y`
-    : `${across} as x, ${up} as y, ${chartIdent("second y column", y2)} as y2`;
+    : `${across} as x, ${up} as y, ${chartIdent("chart", "second y column", y2)} as y2`;
   // Ordered by the x column, so the line is drawn in the order it is read and
   // two runs of the same chart agree; by the series first when there is one, so
   // each series arrives whole and in that same order. Absent or blank is the one
@@ -1913,9 +2111,97 @@ export const chartSql = ({ source, kind = "line", x, y, y2 = "", series = "" }) 
   // the second of those sorts by the second scale's values.
   return series === ""
     ? `select ${plot} from ${source} order by 1`
-    : `select ${plot}, ${chartIdent("series column", series)} as series from ${source} order by ${
+    : `select ${plot}, ${chartIdent("chart", "series column", series)} as series from ${source} order by ${
       y2 === "" ? 3 : 4
     }, 1`;
+};
+
+// --- cohorts
+//
+// A cohort table, written once. `chartSql` runs on every read of a chart sheet,
+// because a chart keeps its settings and nothing else; this runs at creation
+// instead -- the text it answers becomes an ordinary query sheet's `code`, which
+// its owner then edits, and there is no cohort sheet type for anything to build
+// it from a second time.
+
+// How much of `date_trunc`'s ISO string names the cohort. ISO 8601 writes a year
+// in four characters, a month in seven and a day in ten, and a quarter and a
+// week truncate to a day. One entry per unit `UNITS` lists, and these keys are
+// what a grain is checked against rather than that list: a unit added there with
+// no width here is refused by name rather than reaching `substr` as an undefined
+// length.
+const COHORT_LABEL = { year: 4, quarter: 10, month: 7, week: 10, day: 10, hour: 13, minute: 16, second: 19 };
+
+export const cohortSql = ({ source, date, key, value = "", grain }) => {
+  // The same two prefixes a chart reads, for the same reason: a statement that
+  // runs on the server but not in the page is worse than one refused in both.
+  if (!/^@(?:table|query):[A-Za-z0-9_-]+$/.test(source ?? "")) {
+    throw new Error(explain(`A cohort table reads one table or query sheet.`, {
+      Expected: "@table:doc_id or @query:doc_id",
+      Received: show(source ?? null),
+      Source: "this cohort table's settings",
+      Fix: "build the cohort table from a table or query sheet, e.g. @table:orders",
+    }));
+  }
+  if (!Object.hasOwn(COHORT_LABEL, grain)) {
+    const grains = Object.keys(COHORT_LABEL);
+    const meant = typeof grain === "string" ? nearest(grain, grains) : undefined;
+    throw new Error(explain(`That is not a period to group a cohort by.`, {
+      Expected: grains.join(", "),
+      Received: show(grain),
+      "Did you mean": meant,
+      Source: "this cohort table's settings",
+      Fix: meant ? `group the cohort by ${meant}` : `group the cohort by one of ${grains.join(", ")}`,
+    }));
+  }
+  const when = chartIdent("cohort table", "date column", date);
+  const who = chartIdent("cohort table", "key column", key);
+  // A cohort table with no value column counts its keys and nothing else, the
+  // way a chart with no series draws one. Blank is what the page writes for a
+  // sheet holding no money column, and a sheet that broke over an empty field
+  // nobody filled is worse than a table of counts.
+  const amount = value === "" ? "" : chartIdent("cohort table", "value column", value);
+  const period = `${grain}_no`;
+  // The names this statement gives columns of its own. A source column spelled
+  // one of them lands in the generated SQL twice, and AlaSQL answers rows rather
+  // than refusing: a key named `cohort` is joined against the truncated first
+  // date and matches nothing, so the table comes back empty; one named
+  // `<grain>_no` overwrites the period number in every row; and a value summed
+  // off the key or the date column is text AlaSQL drops, so the field is missing
+  // from every row rather than zero. Which collisions corrupt and which happen
+  // to survive is AlaSQL's own alias shadowing, which promises nothing, so all
+  // of them are refused. A blank value is no column and collides with none of
+  // them, because `chartIdent` has already refused an empty date and key.
+  const named = ["cohort", "first_seen", "active", period];
+  for (
+    const [what, column, taken] of [
+      ["date column", date, named],
+      ["key column", key, named],
+      ["value column", value, [...named, date, key]],
+    ]
+  ) {
+    if (taken.includes(column)) {
+      throw new Error(explain(`A cohort table's ${what} has to be a column it does not already name.`, {
+        Expected: `a ${what} other than ${taken.join(", ")}`,
+        Received: show(column),
+        Source: "this cohort table's settings",
+        Fix: `rename that column in the sheet, or pick a different ${what}`,
+      }));
+    }
+  }
+  // `min_text` and not `min`: AlaSQL's `min` drops text and a date column reaches
+  // the engine as the ISO text it is stored as, so the first period a key appears
+  // in would be null for every key.
+  const first =
+    `select ${who}, date_trunc('${grain}', first_seen) as cohort from (select ${who}, min_text(${when}) as first_seen from ${source} group by ${who})`;
+  const carried = amount === "" ? "" : `, o.${amount} as ${amount}`;
+  const each = `select substr(c.cohort, 1, ${
+    COHORT_LABEL[grain]
+  }) as cohort, date_diff('${grain}', c.cohort, o.${when}) as ${period}, o.${who} as ${who}${carried} from ${source} o join (${first}) c on c.${who} = o.${who}`;
+  const measures = amount === ""
+    ? ""
+    : `, round(sum(${amount}), 2) as ${amount}, round(sum(${amount}) / count(distinct ${who}), 2) as [${value}_per_active]`;
+  return `select cohort, ${period}, count(distinct ${who}) as active${measures} from (${each}) group by cohort, ${period} order by cohort, ${period}`;
 };
 
 // --- resolving a query's sheet references

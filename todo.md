@@ -12,11 +12,15 @@ items are deleted — what shipped is described in `claude.md`. Anything below t
 
 The single biggest gap. Most of the Demo Gallery dies here first.
 
-- [ ] **A currency cannot be added to another currency by accident.** A `usd` column and an `eur` column sum today, and
-      the answer is a number with no meaning.
-  1. Money is value plus ISO 4217 code; `table:currencies` already ships the codes and minor units.
-  2. Addition across two codes is an error naming both, and says the fix is an explicit rate.
-  3. A rate is a join, not an operator: the error points at it rather than inventing one.
+- [ ] **A money column names its currency.** `usd` is the only money type in `COLUMN_TYPES`; there is no `eur` column to
+      refuse, so an EUR column is spelled `num` today and the refusal this item wants has nothing to fire on.
+  1. A parametric `money:XXX` family in `COLUMN_TYPES`, matched by prefix the way `enum:` is in `knownType()`, checked
+     against `table:currencies`' codes, with `usd` kept as a read-only alias of `money:USD`. Three language-boundary
+     copies move with it (`Type` in `main.ts`, `columnTypes`/`typeAliases` and the wildcard-free `spec` in `Main.elm`)
+     and `browser_test.ts` holds them equal.
+  2. Only then: addition across two codes is an error naming both, and says the fix is an explicit rate (a join, not an
+     operator). `itemType` peels function calls only and never operators, so this is a new walk over the select list,
+     not an extension of an existing pass; decide where it lives before starting.
 
 - [ ] **A timestamp means the same thing in two timezones.** Stored values are naive, rendered naive, and the zone is
       guessed at both ends.
@@ -41,18 +45,18 @@ The single biggest gap. Most of the Demo Gallery dies here first.
   1. Push the where clause into the DSN query for `codex-db`, and only what is provably safe to push.
   2. `describe` already reads the remote schema; the pushdown uses the same read.
 
-- [ ] **You name an expression once and use it in five sheets.** Every demo repeats the same case statement.
-  1. A `snippet` sheet holding named expressions; `planQuery()` expands them before the engine runs.
-  2. Expansion is textual and bounded like `MAX_REF_DEPTH`, and a cycle is reported as the path that closes it.
-  3. This is the seam Scrapscript eventually replaces.
-
-- [ ] **A join over sorted inputs does not build every pair first.** `qualify` covers the as-of join and
-      `haversine_km(...) <= n` covers within-distance, but both build the pairs before the filter, and AlaSQL cannot
-      parse `lateral` at all. Three questions share one missing piece — top-N-per-group, as-of, and nearest-neighbour —
-      so it is written once.
-  1. A join that walks two inputs already in order, keyed on time for an as-of and on distance for a nearest.
-  2. It is what **Geospatial**'s nearest-neighbour item waits on, and the only reason that item is separate is the
-     geodesy around it.
+- [ ] **You name an expression once and use it in five sheets.** Every demo repeats the same case statement. A cell ref
+      (`@table:snips.discount`) already answers a _value_ from a one-row sheet; it cannot carry an expression.
+  1. Decide the sheet first: a `snippet` type fails the check constraint in `schema/db.sql` and needs `db:apply` in the
+     order the map describes, plus the `Template`/`Sheet` unions, `docDecoder`, and the two-prefix guards in
+     `src/page.mjs` and `completionRef`. The no-schema version is a `using @table:x` clause over an ordinary table of
+     `name`/`expr` rows.
+  2. Expansion runs **before `scanRefs`**, not inside `planQuery()`: a snippet's text may itself hold `@refs`, and
+     `scanRefs` is what collects the ids `loadRefs` fetches. Both hosts call it at the same point, and the snippet sheet
+     is fetched through the same loader `loadRefs` is handed.
+  3. Its bound is its own, not `MAX_REF_DEPTH`: `checkRefPath` bounds the host's recursion through query sheets, not
+     textual expansion. A cycle is reported as the path that closes it, in the same shape.
+  4. This is the seam Scrapscript eventually replaces.
 
 ---
 
@@ -88,25 +92,43 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
       scientific, out of the column's panel — and percent and currency are the `percentage` and `usd` types. The
       separator is always `,` and the point always `.`.
   1. Locale-aware separators from a per-user setting rather than the browser's guess: one more per-user field, read
-     where `formatNumber` reads the format, so the cell, the stats row and the totals row change together.
+     where `formatNumber` reads the format, so the cell, the stats row and the totals row change together. There is no
+     per-user settings row today, so this is a `schema/db.sql` change first.
   2. A custom mask only after a second real use asks for one: a mask is a parser, and `formatNumber` is the one place a
      number becomes text.
 
-- [ ] **A cell can be coloured by a rule.** Nothing conditions on value today.
-  1. Colour scales, data bars, icon sets and rule-based cell colour, per column.
-  2. The rule is an expression over the row, the same one computed columns take.
+- [ ] **You colour a cell by a rule over its row.** A numeric column is shaded by its own values — a colour scale or
+      data bars, chosen in the column's panel beside the format select, stored with the arrangement as the view field
+      `shade`.
+  1. A rule that is an expression over the whole row waits on computed columns: there is nowhere yet for a per-row
+     expression to be written or evaluated.
+  2. Icon sets: a `Shade` constructor and a `shadeSpec` row, drawn in the same `div.shade` wrapper.
 
-- [ ] **You group rows and see subtotals without writing SQL.** `group by` exists only in a query sheet.
-  1. Collapsible groups with subtotals over the rows on screen, the way the totals row already respects the filter.
-  2. A pivot UI over the same machinery — AlaSQL's `pivot` is correct once `checkPivot()` has had its say.
+- [ ] **You group rows and see subtotals without writing SQL.** `group by` exists only in a query sheet. Interleaved
+      group-header rows break the identity "display row `n` is `sortedRows[n-1]`" that `displayYToDocY`, `selectedRows`,
+      `libraryIdAtRow`, `tableBounds` and about twelve write paths assume, so this is two items in order.
+  1. First, on its own: `displayYToDocY` answers `Maybe Int` and every caller refuses a write onto a row that is not a
+     document row by name.
+  2. Then collapsible groups with subtotals over the rows on screen, the way the totals row already respects the filter.
+     The bounded alternative that needs neither: a second footer `tr` per group below the table, grouped by one chosen
+     column, off `columnTotal`'s fold.
+  3. A pivot UI over the same machinery — AlaSQL's `pivot` is correct once `checkPivot()` has had its say.
 
 - [ ] **A very large sheet scrolls.** Every row renders.
   1. Virtualized rendering.
   2. Server-side pagination behind it, for sheets too big to send at all.
 
-- [ ] **A cell can carry a note and a sparkline.** Neither exists.
-  1. Cell notes, distinct from the threaded comments below.
-  2. Mini-charts in a cell, drawn the way the library thumbnails already are.
+- [ ] **A cell can carry a note.** A `json` cell holding a flat array of numbers draws as a sparkline now; notes do not
+      exist, and the row has nowhere to put one.
+  1. Decide row identity first. A note belongs to a row, and a row here has no id: `data` is a positional array that
+     `rowSplices`, `rowDeletions` and the `move` patch all address by index, so an insert above a noted row moves the
+     note to its neighbour.
+  2. Then decide where the note lives. It cannot be an extra field on the row object: `named()` in `main.ts` builds
+     every read and every export as `cols.map((col) => [col.name, row[col.key]])`, so a field no column names is dropped
+     on `GET /sheet`, on every export and on every MCP read — the note would be visible only to a browser with the
+     document open.
+  3. Only then the view: a marker on the cell, the note on hover or on a shortcut, and a `DocMsg` so undo, the viewer
+     refusal and the sync path are the ones already written.
 
 ---
 
@@ -138,21 +160,18 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
      else reuses.
   5. Bidirectional sync is the same definition read the other way, and waits on **Actions & write-back**.
 
-- [ ] **The response is parsed, not stored as a blob.** CSV, TSV, NDJSON, gzip, zip, XML, RSS, Atom and HTML land as the
-      JSON they mean, read by the type the answer declares. XLSX, Parquet and PDF are still one cell. Each is one more
-      entry in `BODY_PARSERS` and one more branch in `readFeedBody`.
+- [ ] **The response is parsed, not stored as a blob.** CSV, TSV, NDJSON, gzip, zip, XML, RSS, Atom, HTML and Parquet
+      land as the JSON they mean, read by the type the answer declares and decoded by the charset it declares. XLSX and
+      PDF are still one cell. A text format is one more entry in `BODY_PARSERS` and one more branch in `readFeedBody`; a
+      binary one also needs the text decode skipped, the way `how === "parquet"` does.
   1. XLSX: blocked, and the blocker is the pin. `npm:xlsx@0.18.5` is the last version SheetJS published to npm — check
      with `npm view xlsx dist-tags` — and its read path is exactly what `claude.md` means by "written with and never
      read with". Decide first: a newer SheetJS from the vendor's own registry, or a different reader. Do not call
      `XLSX.read` on the pinned one.
-  2. Parquet: pick the reader before writing the branch — `hyparquet` reads, `hyparquet-writer` writes — and make the
-     choice once, beside the Parquet export under **Reports & export**, which needs the same decision.
-  3. PDF table extraction, because half of government data ships as PDF. An HTML table already reads, so a PDF whose
+  2. PDF table extraction, because half of government data ships as PDF. An HTML table already reads, so a PDF whose
      tables a converter can turn into HTML is the cheap half; a scanned one is not.
-  4. A CSV, a TSV and an NDJSON body are still decoded as UTF-8 whatever their answer's `charset` said, and non-fatally,
-     so a Latin-1 export lands as U+FFFD in a cell. `markupText` already reads a charset and refuses a label it cannot
-     use; the work is deciding whether making the other formats fatal is safe for feeds already running, and that
-     decision is the whole item.
+  3. A gzipped Parquet body: the gzip sniff answers `json` or `csv` off the first character and never `parquet`, so one
+     is still one cell. Sniff `PAR1` there before the bracket test.
 
 ---
 
@@ -181,10 +200,12 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
   1. Schema browser and table picker, off the same read `describe` uses.
   2. Sampling for preview: never `select *` a billion-row table to draw a thumbnail.
 
-- [ ] **A codex cannot write unless you said so.** The session is set read-only, which is the right default and not a
-      permission.
-  1. An explicit write grant per connection, off by default.
-  2. Row and column masking, so a subset of a sensitive table can be exposed.
+- [ ] **A codex cannot write unless you said so.** The session is set read-only in `codexTables`, and that is the only
+      statement this server ever sends to a codex database: `GET /codex/:id` reads `information_schema` and nothing in
+      it. There is no arbitrary-SQL path, so there is nothing to grant with and nothing to mask on.
+  1. First a codex query path — which is "You pick a table without writing SQL first" and the pushdown item under
+     **Query engine**.
+  2. Then an explicit write grant per connection, off by default, and row and column masking over that path.
 
 - [ ] **A big table syncs by delta.** The whole table moves every time.
   1. Incremental sync with a watermark column.
@@ -203,15 +224,11 @@ The runner is in **Now**. These are what the Demo Gallery needs on top of it.
      `fiscal_period()` already do the arithmetic.
 
 - [ ] **You can backfill a schedule over a historical date range.** A net-http or alert sheet only ever runs forward
-      from the moment it was made.
-  1. Backfill: run a schedule over a historical date range.
-- [ ] **Sheets run in dependency order.** Each runs on its own timer, so a downstream sheet can run before its source.
-  1. A DAG derived from the `@sheet` refs `scanRefs()` already returns.
-  2. A cycle is refused as the path that closes it, exactly as `checkRefPath` reports one.
-
-- [ ] **A runaway pipeline hits a limit with a clear message.** Nothing is metered per user.
-  1. Run budgets and quotas per user and per sheet.
-  2. A manual approval step, so a pipeline can pause for a human before a write.
+      from the moment it was made. `POST /library/:id/run` runs one poll now, and the `{{cursor}}` watermark off the
+      previous run's row is the seam a backfill rides — but it is one opaque value, not a range.
+  1. Decide how a range is expressed before building: a `cursor` override on `POST /library/:id/run`,
+     `{{from}}`/`{{to}}` template variables, or a `POST /library/:id/backfill` that loops the cursor N times under a
+     bound. That decision is the item.
 
 ---
 
@@ -221,11 +238,12 @@ The runner is in **Now**. These are what the Demo Gallery needs on top of it.
       removed since the run before; a band is neither.
   1. An anomaly band needs the forecasting work under **Stats & modeling**, and waits for it.
 
-- [ ] **An alert reaches you on a phone.** Email and a webhook url ship; nothing reaches a device that is not reading
-      mail.
-  1. SMS, Teams and push, each a sender beside `sendAlertUrl` chosen off the destination the same way.
-  2. Each one needs an account somewhere -- a carrier, a Teams app, a push service -- so each is its own item once one
-     of them is picked.
+- [ ] **An alert reaches you on a phone.** Email, a webhook url and a Teams channel ship; nothing reaches a device that
+      is not reading mail.
+  1. SMS and push, each a sender beside `sendAlertUrl` chosen off the destination the same way.
+  2. Each needs an account somewhere -- a carrier, a push service -- so each is its own item once one of them is picked.
+     Teams needed none: an Incoming Webhook is a url the customer makes in their own channel and pastes into `to`, which
+     is why it shipped as one host arm and a `KEY_SHAPES` row rather than as an integration.
 
 ---
 
@@ -253,11 +271,15 @@ The missing other half: sheets that do something, not just show something.
 
 ## Lineage, tests & freshness
 
-- [ ] **You can see what a change to a sheet will break.** `library:lineage` is the graph: one row per sheet and the
-      sheet it depends on, off the live document through `scanRefs()`.
-  1. Impact analysis: what breaks if this column is renamed or removed, which needs the column names a dependent selects
-     and not only the sheet ids it names.
-  2. Warn dependents before a schema change lands.
+- [ ] **You are warned before a rename breaks a dependent.** `library:lineage` is the graph: one row per sheet and the
+      sheet it depends on, off the live document through `scanRefs()`, with the columns each dependent names of that
+      sheet in its `columns` column.
+  1. The rename and delete verbs in the column's own panel are the door; the read is `GET /library/lineage` filtered to
+     the rows whose `depends_on` is this sheet.
+  2. All three states are a warning, not just the first: a row naming the column in `columns`, a row whose `columns` is
+     `*` and so reads every column of it, and a row whose `columns` is `?`, which is nothing anybody could check. Name
+     each dependent by its `name` and let the typist confirm; a silent write past a `?` is the guess this column exists
+     to never make.
 - [ ] **A sheet states what must be true of it.** Nothing is asserted.
   1. Assertions: not-null, unique, accepted values, row-count range, freshness bound, referential integrity.
   2. Results land in the run log, and failing rows are quarantined rather than passed silently.
@@ -269,18 +291,20 @@ The missing other half: sheets that do something, not just show something.
 
 The Excel add-in market lives here.
 
-- [ ] **A seasonal series can be forecast.** `regr_predict()` is the straight line and `fit_exponential()` the
-      log-linear one.
-  1. Seasonal decomposition, which needs a series-to-series function — neither the aggregate protocol nor the window
-     pass can express one today, so that is the actual work.
+- [ ] **You can solve for an input.** No goal seek, no solver. A UDF receives evaluated values and a window receives
+      rows the engine already returned, so neither can re-evaluate an expression; the open decision is how the objective
+      is named (a snippet ref, a query re-run with a bound parameter, or a Scrapscript lambda — none exists).
+  1. Buildable now with no engine change: a sweep demo in `src/examples.mjs` — candidates from `SERIES` or
+     `@table:trials`, the objective per candidate, and `qualify row_number() over (order by abs(y - target)) = 1` to
+     pick the closest, the shape `query:asof-price` already uses.
+  2. Real goal seek and constrained optimization wait on the decision above.
 
-- [ ] **You can solve for an input.** No goal seek, no solver.
-  1. Goal seek over one cell, then constrained optimization over a sheet.
-
-- [ ] **A cohort table writes itself.** `query:cohort-retention` and `query:cohort-grid` are the worked SQL — derive the
-      cohort from the first order, then pivot.
-  1. A helper that writes that SQL from a source, a date column and a key.
-  2. Clustering and segmentation is the same shape of helper over a different verb.
+- [ ] **A clustering table writes itself.** You open a table or query sheet and the palette writes the segmentation SQL
+      for it, the way it already writes a cohort table.
+  1. `cohortSql` in `src/sql.mjs` is the precedent: a config object in, one validated SQL string out, a bad field
+     refused by name, and `newDoc` in `src/index.html` the one caller, because Elm cannot import that module.
+  2. The palette guesses the columns the way the cohort command does, and offers nothing over a sheet it cannot guess
+     from.
 
 ---
 
@@ -292,7 +316,7 @@ The Excel add-in market lives here.
 
 - [ ] **A nearest point is found without measuring every pair.** `point_in_polygon()` works as a join predicate and
       within-distance is `haversine_km(...) <= n`.
-  1. The sorted-input join under **Query engine** is the machinery; this item is the geodesy on top of it.
+  1. The sorted-input join under **Research** is the machinery; this item is the geodesy on top of it.
   2. Drive-time distance, and something that reprojects — neither exists.
 
 ---
@@ -314,14 +338,13 @@ The Excel add-in market lives here.
 
 ## Reports & export
 
-- [ ] **A report arrives looking like a report.** `csv`, `json`, `ndjson`, `md`, `ics` and `xlsx` ship through one
-      route; the workbook carries values, a number format per column and widths, and no cell styles, because the SheetJS
-      community edition drops them on write.
-  1. Parquet: one more row in `EXPORTS`, typed off `COLUMN_TYPES` the way `xlsxCell` is; pick the writer first
-     (`hyparquet-writer` or `parquet-wasm`, whichever runs on Deno Deploy) and say why beside the import.
-  2. PDF with a print layout: headers, page breaks, title page.
-  3. Prose plus live sheet embeds, so the narrative regenerates with the numbers.
-  4. Scheduled delivery, emailed with the file attached — the runner in **Now** is what it rides.
+- [ ] **A report arrives looking like a report.** `csv`, `json`, `ndjson`, `md`, `ics`, `xlsx` and `parquet` ship
+      through one route; the workbook carries values, a number format per column and widths, and no cell styles, because
+      the SheetJS community edition drops them on write, and the parquet file types each column once because a parquet
+      column is homogeneous.
+  1. PDF with a print layout: headers, page breaks, title page.
+  2. Prose plus live sheet embeds, so the narrative regenerates with the numbers.
+  3. Scheduled delivery, emailed with the file attached — the runner in **Now** is what it rides.
 
 ---
 
@@ -340,15 +363,26 @@ The Excel add-in market lives here.
   1. Global search across sheet names, column names and cell contents.
   2. Semantic search across a library: find the sheet, not the filename.
 
-- [ ] **The shop can be browsed.** It is one flat list ordered by name.
-  1. Facets: category, source, update cadence, license, price.
-  2. Tags and collections — curated bundles of related sheets.
-  3. "Used by N sheets" as the trust signal, plus ratings and reviews.
+- [ ] **The shop can be browsed.** Name, price, license, type and tags are columns of `GET /shop`, the column panel is
+      the facet, and the page asks for the whole catalogue.
+  1. You filter the shop by category, by source and by update cadence. None of the three is a field anywhere: they need
+     columns on `sheet` in `schema/db.sql`, a backfill for the seeded listings, and the deploy-before-constraint order
+     the map describes, before `GET /shop` can answer or filter them.
+  2. Collections — curated bundles of related sheets.
+  3. "Used by N sheets" as the trust signal, plus buyer ratings. `POST /shop/:sell_id/review` is already taken — it is
+     the operator's `keep` or `takedown` on a report — so a rating needs a route and a table of its own, and a listing
+     column that averages them.
 
-- [ ] **You see a dataset before you buy it.** There is no preview.
-  1. A free first-N-rows sample sheet for every paid dataset.
-  2. A changelog per dataset, and provenance on every published one: source URL, license, fetch date, transformation
-     chain.
+- [ ] **You see a dataset before you buy it.** There is no preview. `license` ships and is enforced at listing time.
+  1. A free first-N-rows sample for a `table` listing, as a public route beside `GET /shop`. Decided: it cannot call
+     `sheet()` (that hard-calls `assertSheetAccess` with a `usr_id` a public route has none of), so it reads the
+     document through `docData` and `named()`; it re-scans only the rows it returns against `KEY_SHAPES` and
+     `PII_SHAPES` and refuses with a 409 that names nothing, because `assertNoKeys` ran once at `POST /sell/:id` and the
+     document has synced since; it records an audit row with a null `usr_id` and `via: "public"`. Open, and the reason
+     it is not built: a public door that spends the seller's own sheet budget through `spend()` lets anyone starve that
+     sheet, and a door that does not spend breaks the one-budget invariant. Decide which before starting. `query`
+     listings need a `Context` with a user to run and stay out.
+  2. A changelog per dataset, and provenance on every published one: source URL, fetch date, transformation chain.
 
 ---
 
@@ -376,17 +410,32 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
 
 ## Collaboration
 
-- [ ] **You see who else is in the sheet.** Automerge syncs the document and nothing else.
-  1. Cursor presence with coloured indicators.
-  2. An active-user list in the sheet header, and presence in the library so you can see which sheets are live.
+- [ ] **You see who else is in the sheet.** Not blocked anywhere: the vendored `automerge-repo` bundle exports
+      `Presence` (heartbeat, TTL, `broadcast`, peer states) over `DocHandle.broadcast`, and the sync path in `main.ts`
+      relays an ephemeral frame — `carriesChanges` is false for it, so a viewer's is not refused, and `syncRole` still
+      gates it.
+  1. An active-user list in the sheet header first: a `Presence` started in `selectDoc` and stopped where `watched` is,
+     broadcasting `model.auth.email` (a client can claim any name; say so), one port pair, `model.peers`, chips in
+     `viewToolbar`.
+  2. Cursor presence after, throttled to 200ms or more: every frame goes through the server's serialized sync queue.
+  3. The cost is the harness: `fakeHandle` has no `broadcast`, and `glue()` builds one repo, so a presence test needs
+     two connected `realRepo`s or a server-side relay test in `main_test.ts` plus an Elm rendering test in
+     `page_test.ts`.
 
 - [ ] **You can argue about a cell in the cell.** There is nowhere to put a comment.
   1. Threaded comments on individual cells.
 
-- [ ] **You can go back.** Automerge stores the full history and nothing reads it.
-  1. A timeline slider showing document state over time.
-  2. A visual diff between any two versions.
-  3. Named snapshots, and rollback to any historical state.
+- [ ] **You can go back.** Automerge stores the full history and nothing reads it. The vendored bundle exports
+      `getHistory`, `view`, `getHeads`, `topoHistoryTraversal` and `diff`.
+  1. A timeline and a read-only past state first: `historyLoad`/`historyLoaded` and `historyView`/`historyShown` ports
+     modelled on `preflight`, using `getHistory(doc).map(h => h.change)` (never `.snapshot`, which rebuilds from scratch
+     per entry) and `view(doc, [hash])`. The past doc lives in a new `model.history`, **not** `docSelected` — reusing it
+     rebuilds the whole `Sheet` and leaves `changeDoc` live, so a keystroke on a past version would write the live
+     document. `glue_harness.ts` `deps` must list the new imports, and `import { x as y }` is refused there, so pick
+     names that do not collide in `index.html`'s module scope. Tests need `realRepo: true`; `fakeHandle` has no history.
+  2. A visual diff between two versions: `diff` answers automerge patches, and rendering a patch list as a cell-level
+     diff is its own design.
+  3. Named snapshots, and rollback — a write, in its own item.
   4. A conflict-resolution view, for the merges Automerge cannot decide.
 
 ---
@@ -414,18 +463,38 @@ Stripe Checkout ships platform-side; Connect payouts are the one piece missing.
   3. A sandbox: fake webhook deliveries and dry-run schedules.
 - [ ] **You can run it yourself.** There is no self-host path.
   1. A docker image, for the customers who cannot send data anywhere.
-  2. Workspace export and import, stated loudly as a feature rather than buried.
+  2. Workspace export: a zip of every sheet the account owns. There is no zip writer in the repo (only the reader
+     `zipMembers`/`zipData` and `crc32`); a stored-only writer round-tripped through that reader is the test. One
+     `<sheet_id>.csv` per table through `EXPORTS.csv.render` plus a `manifest.json` (name, type, tags, license, column
+     types), and a non-table sheet's settings as JSON, since its value is its document and not its run log. Bounded by
+     `USER_SHEETS_MAX` and a byte cap. **Not** `/export/workspace.zip`: that path collides with the `EXPORTS` route
+     regex.
+  3. Workspace import, its own item: N documents, N `sheet` and `sheet_usr` rows atomically, `assertSheetsQuota` over
+     the whole batch, `assertRoom` per sheet, and a decision on `@ref`s that name doc_ids which no longer exist.
 
 ---
 
 ## Navigation & workspace UX
 
-- [ ] **A library of hundreds of sheets is navigable.** Favourites and bulk trash are in; it is still one flat list.
-  1. Folders and workspaces.
-  2. Bulk tag, move and share over the same selection `TrashSelected` already reads.
+- [ ] **A library of hundreds of sheets is navigable.** Favourites, bulk trash and bulk tag are in; it is still one flat
+      list.
+  1. You select many library rows and move them into a folder together. Folders do not exist yet: a folder is a field on
+     the library entry this browser stores, `library()` in `src/page.mjs` merges it, and the library table gains a
+     column for it before any verb can move a sheet into one.
+  2. You select many library rows and share them together. One server call per sheet, through `POST /library/:id/share`,
+     so it needs a bounded fan-out and one refusal that names the sheets it could not share rather than a per-sheet
+     error nobody reads.
 - [ ] **Everything is reachable without a mouse or a screen.** Ctrl/⌘+K opens a palette over every sheet and every
-      runnable shortcut; nothing below it is done.
-  1. Full keyboard-only operation, screen reader support, contrast and focus order.
+      runnable shortcut, every modal is a labelled `role="dialog"`, every icon-only button and every placeholder-only
+      input carries an `aria-label`, and the table is a named `role="grid"`.
+  1. One modal at a time: settings, shortcuts and the palette can all be open at once today, each `aria-modal`. Close
+     the others in `ShortcutsToggle`, `PaletteToggle` and the `showSettings` route branch.
+  2. Trap focus inside an open modal and restore it to whatever opened it on close.
+  3. Give the `.grab` row handle and the `.grip` column resizer keyboard equivalents, so reorder and resize are not
+     mouse-only.
+  4. Put `gridcell` and `aria-selected` on the cells, so a reader hears which cell the selection is on.
+  5. Point the palette at its highlighted row with `aria-activedescendant`, since `selected` is a model index and
+     nothing in the DOM says which row it is.
 
 ---
 
@@ -592,6 +661,15 @@ Each ends in an item above, or in a decision to drop it.
       Spreadsheet Radio, MyExcelOnline, Humans of Data.
 - [ ] **Read lexega.com/blog/how-lexega-turns-sql-into-signals**: the SQL-into-signals framing may map onto query
       sheets.
+- [ ] **A join over sorted inputs does not build every pair first**, which was an item under **Query engine** and came
+      back here. `qualify` _is_ `rewriteWindows` — the pairs are built in AlaSQL's from clause before `applyWindows`
+      runs, and `checkJoinRows` refuses past `MAX_JOIN_ROWS` up front because the engine cannot be stopped once it
+      starts. Escaping the pair build means leaving the from clause, and the only hook is a from-function like
+      `from.SHEET`, which is deliberately written per host three times (`main.ts`, `src/page.mjs`, `examples_test.ts`).
+      Answer before it comes back: can one shared `ASOF(...)` take the loaded rows through the one existing host
+      difference; is the surface a string-typed from-function or a pattern `planQuery` recognises; how does
+      `checkJoinRows` learn not to charge a merge; and does nearest-neighbour by distance share any machinery with as-of
+      by time, which the old item asserted and nothing tested.
 
 - [ ] **Exact decimal money**, which was an item under **Query engine** and came back here. A `Decimal` carried as a
       string cannot be summed by the engine at all: AlaSQL compiles `SUM` as a first-class `aggregatorid`
@@ -599,8 +677,13 @@ Each ends in an item above, or in a decision to drop it.
       consulted and a UDF cannot replace it. Decide between patching the vendored bundle, rewriting `sum()` over a
       decimal column in a pre-engine pass the way `rewriteWindows()` rewrites a window, and keeping floats with the
       error bound written down. `round2` in `src/Main.elm` now rounds rather than truncating, which was the cent this
-      was losing on the way to the screen; the arithmetic under it is still a double. Comes back as an item under
-      **Query engine**, or does not come back.
+      was losing on the way to the screen; the arithmetic under it is still a double. Measured: the `sum()` rename is a
+      copy of `rewriteExtremes` (`grep -o 'aggregatorid=="[A-Z_]*"' src/alasql.mjs` confirms `SUM` is inlined like
+      `MIN`), but the type that marks the column is the cost — it cannot be `numeric: true` (`checkColumnTypes` would
+      `Number()` it) and cannot be `json.type: "string"` (`TEXT_TYPES` would sweep it into `min_text`, which compares
+      `"9" > "10"`), so it is a third category beside both, three language-boundary copies, and a new guard because an
+      un-rewritten `sum` over decimal text answers a number rather than the `undefined` `checkResultColumns` catches.
+      Comes back as two items under **Query engine** — the column first, exact `sum` second — or does not come back.
 
 ---
 

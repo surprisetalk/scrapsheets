@@ -304,7 +304,7 @@ Deno.test("hiding a column stops it rendering, and show-all brings it back", asy
 // die with the tab. They live on the columns in data[0] now, which is both where
 // applyPatches can reach (it is rooted at `data`) and where a share carries them.
 Deno.test("arranging a sheet writes the arrangement onto its columns", async () => {
-  const { app, all, click } = await boot("http://localhost/table:countries");
+  const { app, all, click, settle, type_ } = await boot("http://localhost/table:countries");
   const patches: { action: string; path: unknown[]; value: unknown }[] = [];
   app.ports.arrangeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
 
@@ -330,6 +330,147 @@ Deno.test("arranging a sheet writes the arrangement onto its columns", async () 
   await click(all("span.funnel")[1]);
   await click(all("span.funnel")[1]);
   assertEquals(patches, [], `closing an untouched panel should write nothing, got ${JSON.stringify(patches)}`);
+
+  // A numeric column is shaded by its values, and the colour goes on a wrapper
+  // inside the cell: an inline background on the td itself outranks
+  // `td.selected` and the match highlight, so selection and find would vanish
+  // on every shaded column.
+  patches.length = 0;
+  app.ports.docSelected.send({
+    id: "table:shaded",
+    data: {
+      doc: { type: "table", data: [[{ name: "n", type: "num", key: "0" }], { "0": 1 }, { "0": 5 }, { "0": 9 }] },
+    },
+  });
+  await settle();
+  await click(all("span.funnel")[0]);
+  await type_(all("label.shading select")[0], "bar");
+  assertEquals(
+    patches.map((p) => [p.path[1], p.path[2], p.value]),
+    [["0", "shade", "bar"]],
+    "choosing a shade stores one word on the column",
+  );
+
+  const shaded = all("tbody td div.shade").map((d) => d.getAttribute("style") ?? "");
+  assertEquals(shaded.length, 3, `every data cell of a shaded column draws the wrapper, got ${shaded.join(" | ")}`);
+  assert(
+    shaded.every((style) => style.includes("linear-gradient")),
+    `a bar is drawn as a gradient, got ${shaded.join(" | ")}`,
+  );
+  assert(
+    shaded[0].includes(" 0%") && shaded[2].includes(" 100%"),
+    `bars run from nothing at the column's smallest value to full at its largest, got ${shaded.join(" | ")}`,
+  );
+
+  // A shade written directly on a text column -- never offered by this panel,
+  // whose select sits behind the same numeric gate as decimals and format, but
+  // reachable by a document from anywhere else, a collaborator's older client
+  // among them -- must draw nothing. `format` and `decimals` already cannot
+  // touch a text cell: `cellDecoder`'s `Text` branch never reads them. Shading
+  // has no such branch to fall through, so it must refuse by column type
+  // itself rather than by what a number-shaped string happens to parse as.
+  app.ports.docSelected.send({
+    id: "table:shaded-text",
+    data: {
+      doc: {
+        type: "table",
+        data: [[{ name: "zip", type: "text", key: "0", shade: "bar" }], { "0": "02139" }, { "0": "94103" }],
+      },
+    },
+  });
+  await settle();
+  assertEquals(
+    all("tbody td div.shade").length,
+    0,
+    "a shade word on a text column must not paint a background behind digit-shaped text",
+  );
+
+  // The grid's own label falls back to "untitled sheet" for a document with no
+  // name -- neither "table:shaded" nor "table:shaded-text" above is in the
+  // library, so `info.name` defaults to "". No bundled sheet holds a `json`
+  // column with a numeric array either, so this is also where the sparkline
+  // is proven live in the real table, not just through Test.Html.Query.
+  assertEquals(
+    all("table[role='grid']").map((t) => t.getAttribute("aria-label")),
+    ["untitled sheet"],
+    "a synthetic sheet the library has never heard of draws no blank label",
+  );
+
+  app.ports.docSelected.send({
+    id: "table:json-spark",
+    data: {
+      doc: {
+        type: "table",
+        data: [[{ name: "series", type: "json", key: "0" }], { "0": [1, 5, 3] }, { "0": "not an array" }],
+      },
+    },
+  });
+  await settle();
+  assertEquals(
+    all("tbody td div[style*='width: 3px']").length,
+    3,
+    "the numeric-array cell draws three bars in the real table, not just the fixture Query.fromHtml exercises",
+  );
+  assertEquals(
+    all("tbody tr")[4]?.textContent?.trim(),
+    "not an array",
+    "a json cell that is not a numeric array still draws the text it always did, beside a sparkline row",
+  );
+});
+
+// One boot reaches every control a screen reader had nothing to read: the
+// fragment opens the settings modal and the tutorial flag draws its panel, so
+// the states that need no click are already on screen. A glyph is not a name and
+// neither is a placeholder -- a placeholder is gone the moment anything is typed.
+Deno.test("every modal, icon button and bare input says what it is", async () => {
+  const { dom, doc, all, click, settle } = await boot("http://localhost/table:countries#settings", { tutorial: 0 });
+  const labels = (sel: string) => all(sel).map((el) => el.getAttribute("aria-label") ?? "");
+  const key = async (k: string) => {
+    doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: k, ctrlKey: true, bubbles: true }));
+    await settle();
+  };
+
+  const grid = all("table[role='grid']");
+  assertEquals(grid.length, 1, "the rows are a grid");
+  assertEquals(grid[0].getAttribute("aria-label"), "countries", "named off the sheet");
+
+  assertEquals(
+    labels("div[role='dialog'][aria-modal='true']"),
+    ["sheet settings"],
+    "#settings opens one labelled dialog",
+  );
+  assertEquals(
+    labels("a[href='/']").filter((l) => l !== ""),
+    ["library"],
+    "the ⊞ link is named, and the wordmark beside it needs no label",
+  );
+  assertEquals(labels("#account input"), ["email", "password"]);
+  assertEquals(labels("main > input"), ["search the rows"]);
+
+  // Every icon-only button on screen at once: the settings close and the
+  // tutorial dismiss. A `button.x` with nothing but a × reads as "button".
+  const crosses = all("button.x");
+  assertEquals(crosses.length, 2, `expected the settings and tutorial crosses, got ${crosses.length}`);
+  assert(
+    crosses.every((b) => (b.getAttribute("aria-label") ?? "").length > 0),
+    `every × is named, got ${JSON.stringify(labels("button.x"))}`,
+  );
+
+  await click(crosses[0]);
+  await key("/");
+  assertEquals(labels("div[role='dialog']"), ["keyboard shortcuts"]);
+
+  await key("k");
+  assertEquals(labels("#palette"), ["jump to a sheet, or run a command"]);
+
+  await key("f");
+  assert(
+    labels("button.x").includes("close find and replace"),
+    `Ctrl+F's × is named, got ${JSON.stringify(labels("button.x"))}`,
+  );
+
+  await click(all("span.funnel")[0]);
+  assertEquals(labels("div.panel input[placeholder='contains...']"), ["filter flag"]);
 });
 
 Deno.test("a sheet opens arranged the way it was left", async () => {

@@ -51,6 +51,7 @@
       import {
         chartSql,
         checkResultColumns,
+        cohortSql,
         describeRef,
         formatQueryError,
         profileRef,
@@ -1120,6 +1121,15 @@
               if (!repo) {
                 app.ports.docErrored.send('Sync not initialized. Please refresh.');
                 return;
+              }
+
+              // Elm cannot import src/sql.mjs, so the palette sends the columns
+              // it guessed and the statement is written here. What lands is an
+              // ordinary query sheet: the guesses do not travel with it, and
+              // `cohortSql`'s refusal rides `catchy` to the page.
+              if (data?.[0]?.cohort) {
+                const { cohort, ...rest } = data[0];
+                data = [{ ...rest, code: cohortSql(cohort) }];
               }
 
               // Create document and wait for it to be ready

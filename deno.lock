@@ -41,6 +41,8 @@
     "npm:esbuild@0.25.10": "0.25.10",
     "npm:esbuild@~0.25.10": "0.25.10",
     "npm:fast-xml-parser@^5.11.1": "5.11.1",
+    "npm:hyparquet-writer@0.16.9": "0.16.9",
+    "npm:hyparquet@1.29.2": "1.29.2",
     "npm:jsdom@^26.1.0": "26.1.0",
     "npm:linkedom@~0.18.11": "0.18.12",
     "npm:pg-gateway@~0.3.0-beta.4": "0.3.0-beta.4",
@@ -1586,6 +1588,15 @@
         "debug@4.4.3"
       ]
     },
+    "hyparquet-writer@0.16.9": {
+      "integrity": "sha512-VZvH4Vq9lQwZa/+1y4YrEwF9+FAe5pED+mVN4AHflCoFk5LG2RemMHW9iwVlVqug7fO3ATwEMSG68cr3uZAkjQ==",
+      "dependencies": [
+        "hyparquet"
+      ]
+    },
+    "hyparquet@1.29.2": {
+      "integrity": "sha512-2LxinZ8X0JqToST+9OXcy9t3t5Q7ZneMTkSqUx/36Hv18pCTk/N71IWZc7APTSNG1Me39l/jjEvzZSZ0R+Knbw=="
+    },
     "iconv-lite@0.6.3": {
       "integrity": "sha512-4fCk79wshMdzMp2rH06qWrJE4iolqLhCUH+OiuIgU++RB0+94NlDL81atO7GX55uUKueo0txHNtvEyI6D7WdMw==",
       "dependencies": [
@@ -3113,6 +3124,8 @@
       "npm:elm@0.19.2-0",
       "npm:esbuild@~0.25.10",
       "npm:fast-xml-parser@^5.11.1",
+      "npm:hyparquet-writer@0.16.9",
+      "npm:hyparquet@1.29.2",
       "npm:jsdom@^26.1.0",
       "npm:linkedom@~0.18.11",
       "npm:pg-gateway@~0.3.0-beta.4",

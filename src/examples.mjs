@@ -3951,6 +3951,32 @@ const QUERIES = {
       "select department, spent_ytd, adopted_ytd, round(spent_ytd / adopted_ytd, 4) as burn_ratio, round(spent_ytd / months_in * 12, 0) as projected_year, round(spent_ytd / months_in * 12 - adopted_ytd / months_in * 12, 0) as projected_variance from @query:budget-ytd where month = '2026-08-01' order by burn_ratio desc",
     ),
   },
+  // A season and a trend are two different questions about one column, and the
+  // answer to each is a window over the whole series. The period is the rows in
+  // a year, because this sheet holds one row a month with none missing -- the
+  // shape the decomposition needs and cannot check for itself.
+  "query:visit-decomposition": {
+    name: "park visits, season and trend",
+    tags: ["demo", "government", "query"],
+    system: true,
+    doc: QuerySql(
+      { month: "date", visits: "num", trend: "num", seasonal: "num", deseasonalized: "num" },
+      "select month, visits, trend(visits, 12) over (order by month) as trend, seasonal(visits, 12) over (order by month) as seasonal, deseasonalized(visits, 12) over (order by month) as deseasonalized from @table:park-visits order by month",
+    ),
+  },
+  // The two halves added back together, which is the additive model's claim
+  // about a month. A window cannot be wrapped in arithmetic, so the sum is
+  // written here, over the sheet that computed them. The months at each end
+  // hold no trend, so there is nothing to add them to.
+  "query:visit-fit": {
+    name: "park visits against the fit",
+    tags: ["demo", "government", "query"],
+    system: true,
+    doc: QuerySql(
+      { month: "date", visits: "num", trend: "num", seasonal: "num", fitted: "num", residual: "num" },
+      "select month, visits, round(trend, 0) as trend, round(seasonal, 0) as seasonal, round(trend + seasonal, 0) as fitted, round(visits - trend - seasonal, 0) as residual from @query:visit-decomposition where trend is not null order by month",
+    ),
+  },
   "query:asof-price": {
     name: "price at the time of the trade",
     tags: ["demo", "markets", "query"],
@@ -6729,6 +6755,49 @@ const wellProduction = Table(
   ["Kestrel 1H", 24, "2026-12-01", 807.9],
 );
 
+// Gate counts at one park, one row a month with none missing, which is the
+// shape a decomposition needs: the summer peak repeats every twelve rows and
+// the park is busier every year.
+const parkVisits = Table(
+  ["month::date", "visits::num"].map(Col),
+  ["2024-01-01", 6930],
+  ["2024-02-01", 7260],
+  ["2024-03-01", 9740],
+  ["2024-04-01", 12890],
+  ["2024-05-01", 16070],
+  ["2024-06-01", 18550],
+  ["2024-07-01", 19690],
+  ["2024-08-01", 19480],
+  ["2024-09-01", 15210],
+  ["2024-10-01", 12690],
+  ["2024-11-01", 9940],
+  ["2024-12-01", 5520],
+  ["2025-01-01", 8800],
+  ["2025-02-01", 9040],
+  ["2025-03-01", 11630],
+  ["2025-04-01", 14760],
+  ["2025-05-01", 17840],
+  ["2025-06-01", 19990],
+  ["2025-07-01", 21670],
+  ["2025-08-01", 21350],
+  ["2025-09-01", 16990],
+  ["2025-10-01", 14580],
+  ["2025-11-01", 11810],
+  ["2025-12-01", 7290],
+  ["2026-01-01", 10240],
+  ["2026-02-01", 11020],
+  ["2026-03-01", 13500],
+  ["2026-04-01", 16540],
+  ["2026-05-01", 19730],
+  ["2026-06-01", 21860],
+  ["2026-07-01", 23440],
+  ["2026-08-01", 22790],
+  ["2026-09-01", 18970],
+  ["2026-10-01", 16450],
+  ["2026-11-01", 13590],
+  ["2026-12-01", 9180],
+);
+
 // What the bank says happened. The memo is what a bank writes: upper case,
 // truncated, sometimes with the words in the wrong order.
 const bankTxns = Table(
@@ -7652,6 +7721,7 @@ export const DATASETS = [
   { doc_id: "cloud-spend", name: "daily cloud spend", tags: ["demo", "software"], doc: cloudSpend },
   { doc_id: "orders", name: "customer orders", tags: ["demo", "retail"], doc: orders },
   { doc_id: "well-production", name: "well production", tags: ["demo", "energy"], doc: wellProduction },
+  { doc_id: "park-visits", name: "monthly park visits", tags: ["demo", "government"], doc: parkVisits },
   { doc_id: "bank-txns", name: "bank transactions", tags: ["demo", "finance"], doc: bankTxns },
   { doc_id: "ledger", name: "ap ledger", tags: ["demo", "finance"], doc: ledger },
   { doc_id: "claim-devel", name: "claim development", tags: ["demo", "insurance"], doc: claimDevel },

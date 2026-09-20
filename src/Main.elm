@@ -9,17 +9,21 @@ port module Main exposing
     , Freshness
     , Index
     , Moving(..)
+    , Msg
     , NumberFormat(..)
     , Rect
+    , Shade(..)
     , Sheet
     , SheetView
     , SortOrder(..)
     , Stat(..)
     , Table
     , TableBounds
+    , Type(..)
     , When(..)
     , blankRows
     , canonicalTypeNames
+    , cellDecoder
     , cellRewrites
     , chartAt
     , chartBoxes
@@ -31,6 +35,7 @@ port module Main exposing
     , chartSpan
     , civilDays
     , clampIndex
+    , columnExtent
     , columnSplit
     , computeBoolishStats
     , computeTemporalStats
@@ -81,6 +86,8 @@ port module Main exposing
     , skipHidden
     , sortRankOf
     , soundex
+    , sparkMax
+    , sparkValues
     , tableHome
     , typeName
     , usd
@@ -632,6 +639,49 @@ numberFormat name =
     numberFormats |> List.filter (\f -> (formatSpec f).name == name) |> List.head
 
 
+{-| How a numeric column's values are drawn as a picture of themselves: a
+colour scale across the column's own range, or a bar per cell. Not a column
+type and not a format -- `formatNumber` is untouched, because a shade is a
+background and never text.
+
+The absent case is no constructor, the way it is for a format: a column nobody
+shaded is a column with no entry.
+
+-}
+type Shade
+    = Scale
+    | Bars
+
+
+{-| The one table of shades: the word a document stores, and the label the
+column's panel offers. `Bars` is spelled out because `Bar` is already a way a
+chart is drawn.
+-}
+shadeSpec : Shade -> { name : String, label : String }
+shadeSpec shading =
+    case shading of
+        Scale ->
+            { name = "scale", label = "colour scale" }
+
+        Bars ->
+            { name = "bar", label = "data bars" }
+
+
+shades : List Shade
+shades =
+    [ Scale, Bars ]
+
+
+{-| The shade a word names, or none at all. A spelling outside the list is a
+column nobody shaded rather than an error, the way a format nobody wrote is:
+the shade is how you were reading the numbers, and losing it must never cost
+you the numbers.
+-}
+shade : String -> Maybe Shade
+shade name =
+    shades |> List.filter (\s -> (shadeSpec s).name == name) |> List.head
+
+
 {-| A value with its exponent divided out, `10 ^ exponent` computed as two
 smaller powers rather than one. `10 ^ exponent` alone overflows to Infinity
 past 308 and underflows to 0 past -323 -- both real exponents a float can
@@ -1156,11 +1206,20 @@ type alias Sheet =
     -- other than the one its type has.
     , formats : Dict String NumberFormat
 
+    -- How a numeric column's values are drawn as a picture of themselves,
+    -- where it asked to be drawn as one at all.
+    , shades : Dict String Shade
+
     -- What the open column panel's split box holds. One box, because one panel
     -- is open at a time, and this browser's own: it is the argument a split is
     -- about to be run with, never anything the document keeps.
     , splitOn : String
     , near : String
+
+    -- What the library strip's tag box holds, for the same reason the two above
+    -- are held: it is the argument `TagSelected` is about to be run with, and
+    -- nothing about it belongs to a document.
+    , tag : String
     , resizing : Maybe { key : String, startX : Int, startWidth : Int }
 
     -- The column or row being dragged to a new position, while the drag lasts.
@@ -1208,8 +1267,10 @@ emptySheet =
     , widths = Dict.empty
     , decimals = Dict.empty
     , formats = Dict.empty
+    , shades = Dict.empty
     , splitOn = ""
     , near = ""
+    , tag = ""
     , resizing = Nothing
     , moving = Nothing
     , storedView = emptyView
@@ -1391,12 +1452,13 @@ type alias SheetView =
     , widths : Dict String Int
     , decimals : Dict String Int
     , formats : Dict String NumberFormat
+    , shades : Dict String Shade
     }
 
 
 emptyView : SheetView
 emptyView =
-    { hidden = Set.empty, pinned = Set.empty, sort = [], filters = Dict.empty, widths = Dict.empty, decimals = Dict.empty, formats = Dict.empty }
+    { hidden = Set.empty, pinned = Set.empty, sort = [], filters = Dict.empty, widths = Dict.empty, decimals = Dict.empty, formats = Dict.empty, shades = Dict.empty }
 
 
 {-| One column's share of the view. Every field is optional and every default is
@@ -1413,6 +1475,7 @@ type alias ColView =
     , width : Maybe Int
     , decimals : Maybe Int
     , format : Maybe NumberFormat
+    , shade : Maybe Shade
     }
 
 
@@ -1450,6 +1513,10 @@ maxDecimals =
 {-| One column's view fields, under a key its home decides rather than one
 written beside them. A table's columns carry their own key; a query has no
 stored columns at all, so the map key is the only key there is.
+
+`D.map8` is the ceiling, so the ninth field is read by handing the record the
+`map8` half built one more argument. A tenth needs the same again.
+
 -}
 colViewFields : String -> D.Decoder ColView
 colViewFields key =
@@ -1478,6 +1545,7 @@ colViewFields key =
         (D.oneOf [ D.field "width" (D.map (\w -> iif (w >= minColWidth) (Just w) Nothing) D.int), D.succeed Nothing ])
         (D.oneOf [ D.field "decimals" (D.map (\d -> iif (d >= 0 && d <= maxDecimals) (Just d) Nothing) D.int), D.succeed Nothing ])
         (D.oneOf [ D.field "format" (D.map numberFormat D.string), D.succeed Nothing ])
+        |> D.andThen (\make -> D.map make (D.oneOf [ D.field "shade" (D.map shade D.string), D.succeed Nothing ]))
 
 
 colViewDecoder : D.Decoder ColView
@@ -1534,6 +1602,7 @@ viewOf cols =
     , widths = cols |> List.filterMap (\c -> Maybe.map (Tuple.pair c.key) c.width) |> Dict.fromList
     , decimals = cols |> List.filterMap (\c -> Maybe.map (Tuple.pair c.key) c.decimals) |> Dict.fromList
     , formats = cols |> List.filterMap (\c -> Maybe.map (Tuple.pair c.key) c.format) |> Dict.fromList
+    , shades = cols |> List.filterMap (\c -> Maybe.map (Tuple.pair c.key) c.shade) |> Dict.fromList
     }
 
 
@@ -1574,6 +1643,7 @@ pruneView doc sheet =
                     , widths = Dict.filter (\key _ -> Set.member key live) arrangement.widths
                     , decimals = Dict.filter (\key _ -> Set.member key live) arrangement.decimals
                     , formats = Dict.filter (\key _ -> Set.member key live) arrangement.formats
+                    , shades = Dict.filter (\key _ -> Set.member key live) arrangement.shades
                     }
 
                 onScreen =
@@ -1587,6 +1657,7 @@ pruneView doc sheet =
                 , widths = onScreen.widths
                 , decimals = onScreen.decimals
                 , formats = onScreen.formats
+                , shades = onScreen.shades
                 , storedView = keep sheet.storedView
             }
 
@@ -1653,6 +1724,8 @@ viewPatches at cols before after =
                         set x key "decimals" (Maybe.map E.int (Dict.get key after.decimals))
                     , only (Dict.get key before.formats) (Dict.get key after.formats) <|
                         set x key "format" (Maybe.map (formatSpec >> .name >> E.string) (Dict.get key after.formats))
+                    , only (Dict.get key before.shades) (Dict.get key after.shades) <|
+                        set x key "shade" (Maybe.map (shadeSpec >> .name >> E.string) (Dict.get key after.shades))
                     , only (text_ before.filters key) (text_ after.filters key) <|
                         set x key "filter" (Maybe.map E.string (text_ after.filters key))
                     , only (Dict.get key wasSorted) (Dict.get key nowSorted) <|
@@ -1747,6 +1820,7 @@ onScreenView sheet =
     , widths = sheet.widths
     , decimals = sheet.decimals
     , formats = sheet.formats
+    , shades = sheet.shades
     }
 
 
@@ -2316,6 +2390,19 @@ typeName typ =
     (spec typ).name
 
 
+{-| Whether a column's cells are numbers, rather than text that happens to
+read like one -- the gate `decimals`, `format` and `shade` all share. `format`
+needs no render-side copy of this: `cellDecoder`'s `Text` branch never reads
+`format` at all. Shading has no such branch to fall through, so without this a
+shade word landing on a text column (a collaborator's older client, a document
+from elsewhere) painted a background behind whichever cells were digit-shaped
+strings, `number`'s own lenient string branch parsing "02139" same as 02139.
+-}
+numericColumn : Type -> Bool
+numericColumn typ =
+    List.member typ [ Number, Usd, Percentage ]
+
+
 {-| A column the page makes up rather than reads: the library's own columns, a
 net sheet's created\_at and body, a chart's x and y. There is no document to
 have spelled its type, so `spec` supplies the spelling.
@@ -2599,6 +2686,16 @@ canonicalTypeNames =
     List.map Tuple.first columnTypes
 
 
+{-| How many listings one shop fetch asks for. The whole catalogue, because it
+is small enough to be one page and every column filter on the shop is a filter
+over the rows that came back; the answer's `Content-Range` is what says the day
+that stops being true.
+-}
+shopLimit : Int
+shopLimit =
+    500
+
+
 shopDecoder : D.Decoder Table
 shopDecoder =
     D.field "data" tableDecoder
@@ -2751,6 +2848,8 @@ type Msg
     | TrashToggle
     | DocStar Id Bool
     | TrashSelected
+    | TagSelected
+    | TagInput String
     | ColumnSplitInput String
     | ColumnNearInput String
     | DocDelete Id
@@ -2797,6 +2896,7 @@ type Msg
     | ColumnPin String
     | ColumnDecimals String String
     | ColumnFormat String String
+    | ColumnShade String String
     | ColumnMoveStart String
     | RowMoveStart Int
     | MoveEnd
@@ -3043,6 +3143,25 @@ onFindKeydown =
         )
 
 
+{-| The library strip's tag box. The global onKeyDown ignores INPUT focus, so
+Enter is handled here, on the box itself.
+-}
+onTagKeydown : H.Attribute Msg
+onTagKeydown =
+    A.preventDefaultOn "keydown"
+        (D.field "key" D.string
+            |> D.andThen
+                (\key ->
+                    case key of
+                        "Enter" ->
+                            D.succeed ( TagSelected, True )
+
+                        _ ->
+                            D.fail "unhandled"
+                )
+        )
+
+
 
 ---- UPDATE -------------------------------------------------------------------
 
@@ -3204,8 +3323,10 @@ update msg ({ sheet, auth } as model) =
                     , widths = stored.widths
                     , decimals = stored.decimals
                     , formats = stored.formats
+                    , shades = stored.shades
                     , splitOn = ""
                     , near = ""
+                    , tag = ""
                     , resizing = Nothing
                     , moving = Nothing
                     , storedView = stored
@@ -3214,7 +3335,7 @@ update msg ({ sheet, auth } as model) =
             , case data.data.doc |> D.decodeValue docDecoder of
                 Ok Shop ->
                     Http.get
-                        { url = model.api ++ "/shop"
+                        { url = model.api ++ "/shop?limit=" ++ String.fromInt shopLimit
                         , expect = Http.expectJson ShopFetch shopDecoder
                         }
 
@@ -3379,6 +3500,51 @@ update msg ({ sheet, auth } as model) =
 
                 _ ->
                     ( { model | error = "Expected the library open, received the sheet " ++ model.sheet.id ++ ". Source: trash selected sheets. Fix: open the library, select the rows, and run it again." }, Cmd.none )
+
+        TagSelected ->
+            -- Added to what each sheet already carries, never written over it:
+            -- the `demo` and `example` tags a bundled sheet ships with are what
+            -- the strip above filters on, and a replace would take them off.
+            case ( model.sheet.doc, String.trim model.sheet.tag ) of
+                ( Ok Library, "" ) ->
+                    ( { model | error = "Expected a tag, received nothing. Source: the library strip's tag box. Fix: type the tag, then run it." }, Cmd.none )
+
+                ( Ok Library, tag ) ->
+                    if String.contains "," tag then
+                        -- A tags cell is read back by splitting on ", ", so a
+                        -- comma here comes back as two tags nobody typed.
+                        ( { model | error = "Expected one tag, received " ++ tag ++ ". Source: the library strip's tag box. Fix: run one tag at a time, with no comma in it." }, Cmd.none )
+
+                    else
+                        let
+                            norm =
+                                normalizeRect model.sheet.select
+
+                            ids =
+                                List.range norm.a.y norm.b.y
+                                    |> List.filterMap (libraryIdAtRow model)
+
+                            tagsOf id =
+                                model.library |> Dict.get id |> Maybe.map .tags |> Maybe.withDefault []
+                        in
+                        if List.isEmpty ids then
+                            ( { model | error = "Expected a selection over library rows, received one holding no sheet. Source: rows " ++ String.fromInt norm.a.y ++ " to " ++ String.fromInt norm.b.y ++ ". Fix: select the rows to tag in the library table." }, Cmd.none )
+
+                        else
+                            ( model
+                            , ids
+                                |> List.filter (\id -> not (List.member tag (tagsOf id)))
+                                |> List.map (\id -> updateLibrary (Idd id { name = Nothing, tags = Just (tagsOf id ++ [ tag ]), trashed = Nothing, starred = Nothing }))
+                                |> Cmd.batch
+                            )
+
+                _ ->
+                    ( { model | error = "Expected the library open, received the sheet " ++ model.sheet.id ++ ". Source: tag selected sheets. Fix: open the library, select the rows, and run it again." }, Cmd.none )
+
+        TagInput tag ->
+            -- The model only, and never the document, for the reason the split
+            -- box below is: it is an argument to a verb nobody has run yet.
+            ( { model | sheet = { sheet | tag = tag } }, Cmd.none )
 
         ColumnSplitInput delimiter ->
             -- The model only, and never the document: the box is an argument to
@@ -4051,6 +4217,20 @@ update msg ({ sheet, auth } as model) =
 
                             Nothing ->
                                 Dict.remove key sheet.formats
+                }
+
+        ColumnShade key name ->
+            -- One click is one arrangement, the way the format select above it
+            -- is: a select has no keystrokes to write a patch for each of.
+            arrange model
+                { sheet
+                    | shades =
+                        case shade name of
+                            Just shading ->
+                                Dict.insert key shading sheet.shades
+
+                            Nothing ->
+                                Dict.remove key sheet.shades
                 }
 
         ColumnPin key ->
@@ -5763,12 +5943,19 @@ libraryCols model =
             ]
 
 
-viewModal : Msg -> List (Html Msg) -> Html Msg
-viewModal closeMsg content =
+{-| Every modal in the app, so the label is the one thing each caller has to
+supply: a screen reader announces the panel by it, and there is no heading
+inside `content` this function could read.
+-}
+viewModal : String -> Msg -> List (Html Msg) -> Html Msg
+viewModal label closeMsg content =
     H.div
         [ A.class "scrim", A.onClick closeMsg ]
         [ H.div
             [ A.class "panel"
+            , A.attribute "role" "dialog"
+            , A.attribute "aria-modal" "true"
+            , A.attribute "aria-label" label
             , S.paddingRem 1
             , S.minWidthRem 20
             , A.stopPropagationOn "click" (D.succeed ( NoOp, True ))
@@ -5783,10 +5970,11 @@ viewSettings show info share =
         text ""
 
     else
-        viewModal SettingsClose
+        viewModal "sheet settings"
+            SettingsClose
             [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter, S.marginBottom "1rem" ]
                 [ H.h3 [] [ text "Sheet Settings" ]
-                , H.button [ A.class "x", A.onClick SettingsClose ] [ text "×" ]
+                , H.button [ A.class "x", A.attribute "aria-label" "close the sheet settings", A.onClick SettingsClose ] [ text "×" ]
                 ]
             , H.div [ S.marginBottom "1rem" ]
                 [ H.label [ S.display "block", S.marginBottom "0.25rem", S.fontWeight "600" ] [ text "Name" ]
@@ -5936,7 +6124,8 @@ viewImport importing =
             text ""
 
         Just imp ->
-            viewModal ImportCancel
+            viewModal "import a file"
+                ImportCancel
                 [ H.p [ S.marginBottom "1rem" ]
                     [ text (imp.filename ++ ": " ++ String.fromInt imp.count ++ " rows. Correct a type before the sheet is made.") ]
                 , H.table [ A.class "import-preview", S.marginBottom "1rem" ]
@@ -5981,7 +6170,8 @@ viewDeleteConfirm maybeId =
             text ""
 
         Just id ->
-            viewModal DocDeleteCancel
+            viewModal "delete this sheet"
+                DocDeleteCancel
                 [ H.p [ S.marginBottom "1rem" ]
                     [ text "Delete this sheet from this browser's library for good? Trashing it instead is undoable; this is not." ]
                 , H.div [ S.displayFlex, S.gapRem 0.5, S.justifyContentFlexEnd ]
@@ -6121,6 +6311,14 @@ own new-alert door with the query and the destination filled in, so it is
 offered to a signed-in reader alone: the address the alert is sent to is the
 account's own.
 
+Building a cohort table is the footer's own new-query door with the columns
+guessed: the first date column, the first column named like an id, the first
+money column, by month. They are a first draft the reader then edits, which is
+what makes this a helper that writes the SQL rather than a wizard; the statement
+itself is `cohortSql` in src/sql.mjs, which `index.html` calls because Elm
+cannot import that module. A sheet with no date or no key column is not offered
+it at all: a command that can only fail is not a command.
+
 -}
 paletteRows : Model -> String -> List Command
 paletteRows model query =
@@ -6182,8 +6380,67 @@ paletteRows model query =
 
             else
                 []
+
+        cohortLabel : String
+        cohortLabel =
+            "build a cohort table from this sheet"
+
+        -- `arrangeable` already answers for the two sheets a cohort can be built
+        -- from and for no others, and it is the one place that knows where each
+        -- keeps its columns: a table's are its document's, a query's are
+        -- whatever its last run returned.
+        columns : List Col
+        columns =
+            arrangeable model.sheet |> Maybe.map (.cols >> Array.toList) |> Maybe.withDefault []
+
+        firstColumn : (Col -> Bool) -> Maybe String
+        firstColumn ok =
+            columns |> List.filter ok |> List.head |> Maybe.map .name
+
+        keyed : Maybe String
+        keyed =
+            case firstColumn (\c -> String.endsWith "_id" c.name) of
+                Nothing ->
+                    firstColumn (\c -> c.typ == Text)
+
+                named ->
+                    named
+
+        cohort : List Command
+        cohort =
+            case ( firstColumn (\c -> c.typ == Date || c.typ == Timestamp), keyed ) of
+                ( Just when, Just who ) ->
+                    if String.contains (String.toLower (String.trim query)) cohortLabel then
+                        [ Command cohortLabel model.sheet.id <|
+                            DocNew <|
+                                E.object
+                                    [ ( "type", E.string "query" )
+                                    , ( "data"
+                                      , E.list identity
+                                            [ E.object
+                                                [ ( "lang", E.string "sql" )
+                                                , ( "cohort"
+                                                  , E.object
+                                                        [ ( "source", E.string ("@" ++ model.sheet.id) )
+                                                        , ( "date", E.string when )
+                                                        , ( "key", E.string who )
+                                                        , ( "value", E.string (firstColumn (\c -> c.typ == Usd) |> Maybe.withDefault "") )
+                                                        , ( "grain", E.string "month" )
+                                                        ]
+                                                  )
+                                                ]
+                                            ]
+                                      )
+                                    ]
+                        ]
+
+                    else
+                        []
+
+                _ ->
+                    []
     in
-    List.take 12 (subscribe ++ paletteCommands model.library query)
+    List.take 12 (subscribe ++ cohort ++ paletteCommands model.library query)
 
 
 viewShortcuts : Bool -> Html Msg
@@ -6192,7 +6449,7 @@ viewShortcuts show =
         text ""
 
     else
-        viewModal (ShortcutsToggle False) <|
+        viewModal "keyboard shortcuts" (ShortcutsToggle False) <|
             H.h3 [] [ text "Keyboard shortcuts" ]
                 :: List.concatMap
                     (\( group, keys ) ->
@@ -6221,10 +6478,12 @@ viewPalette model =
                 commands =
                     paletteRows model p.query
             in
-            viewModal (PaletteToggle False)
+            viewModal "command palette"
+                (PaletteToggle False)
                 [ H.input
                     [ A.id "palette"
                     , A.placeholder "jump to a sheet, or run a command"
+                    , A.attribute "aria-label" "jump to a sheet, or run a command"
                     , A.value p.query
                     , A.onInput (InputChange PaletteQuery)
                     , onPaletteKeydown p.selected
@@ -6279,7 +6538,7 @@ viewFindReplace maybeFindReplace =
                 [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter ]
                     [ H.span [ S.fontWeight "600" ]
                         [ text (iif fr.showReplace "Find & Replace" "Find") ]
-                    , H.button [ A.class "x", A.onClick FindClose ] [ text "×" ]
+                    , H.button [ A.class "x", A.attribute "aria-label" "close find and replace", A.onClick FindClose ] [ text "×" ]
                     ]
                 , H.div [ S.displayFlex, S.gapRem 0.25 ]
                     [ H.input
@@ -7791,6 +8050,21 @@ cellDecoder typ decimals format i n =
             Date ->
                 D.map text string
 
+            Json ->
+                -- A flat array of numbers is a series, and a series is drawn.
+                -- Everything else -- an object, a nested array, an array of one
+                -- or of mixed values -- falls through to the lenient `string`,
+                -- which is what a json cell has always rendered as.
+                D.oneOf
+                    [ D.list D.float
+                        |> D.andThen
+                            (sparkValues
+                                >> Maybe.map (D.succeed << viewSpark)
+                                >> Maybe.withDefault (D.fail "not two or more finite numbers")
+                            )
+                    , D.map text string
+                    ]
+
             Enum _ ->
                 D.map text string
 
@@ -7844,11 +8118,58 @@ cellDecoder typ decimals format i n =
         )
 
 
+{-| The most values one sparkline draws. A cell is a fixed width, so a longer
+array loses its head and not its tail: the recent end of a series is the end a
+reader reads.
+-}
+sparkMax : Int
+sparkMax =
+    64
+
+
+{-| The last `sparkMax` numbers of a `json` cell, scaled to 0..1 by their own
+extremes -- `Nothing` where there is no line to draw, and the cell falls back to
+the text it always drew. All-equal values draw level: there is no range to
+divide by.
+-}
+sparkValues : List Float -> Maybe (List Float)
+sparkValues vs =
+    let
+        -- The window drawn, and the only values anything below asks about: a
+        -- value older than `sparkMax` entries is off the picture, and one that
+        -- is not finite there must not blank a window that is entirely finite.
+        kept =
+            List.drop (List.length vs - sparkMax) vs
+    in
+    case ( List.minimum kept, List.maximum kept ) of
+        ( Just lo, Just hi ) ->
+            if List.length kept < 2 || List.any (\v -> isNaN v || isInfinite v) kept then
+                Nothing
+
+            else if hi == lo then
+                Just (List.map (\_ -> 0.5) kept)
+
+            else
+                Just (List.map (\v -> (v - lo) / (hi - lo)) kept)
+
+        -- No values, so no extremes and no line.
+        _ ->
+            Nothing
+
+
+{-| One thin bar per value, each already scaled to 0..1. The library thumbnail
+(scaled by `docThumb` in src/page.mjs) and a `json` cell draw the one line.
+-}
+viewSpark : List Float -> Html Msg
+viewSpark scaled =
+    H.div [ S.displayFlex, S.alignItemsFlexEnd, S.gap "1px", S.heightPx 14 ] <|
+        List.map (\h -> H.div [ S.widthPx 3, S.height (String.fromFloat (4 + h * 10) ++ "px"), S.backgroundColor "#bbb" ] []) scaled
+
+
 viewThumb : Int -> Int -> List Float -> Html Msg
 viewThumb cols rows spark =
     if not (List.isEmpty spark) then
-        H.div [ S.displayFlex, S.alignItemsFlexEnd, S.gap "1px", S.heightPx 14 ] <|
-            List.map (\h -> H.div [ S.widthPx 3, S.height (String.fromFloat (4 + h * 10) ++ "px"), S.backgroundColor "#bbb" ] []) spark
+        viewSpark spark
 
     else if cols > 0 then
         H.span [ S.color "#666", S.fontSizeRem 0.75 ] [ text (String.fromInt cols ++ "×" ++ String.fromInt rows) ]
@@ -8018,7 +8339,7 @@ viewHeaderCell sheet col =
                 -- ask for; every other type reads its cells as the text they
                 -- already are.
                 numeric =
-                    List.member col.typ [ Number, Usd, Percentage ]
+                    numericColumn col.typ
 
                 isFilterOpen =
                     sheet.filterOpen == Just col.key
@@ -8065,7 +8386,7 @@ viewHeaderCell sheet col =
                     ]
                 , if isFilterOpen then
                     H.div [ A.class "panel", S.positionAbsolute, S.top "100%", S.left "0", S.padding "0.5rem", S.zIndex "100", S.minWidth "150px", S.fontSizeRem 0.875 ]
-                        [ H.input [ A.placeholder "contains...", A.value currentFilterValue, A.onInput (FilterInput col.key), S.width "100%" ] []
+                        [ H.input [ A.placeholder "contains...", A.attribute "aria-label" ("filter " ++ col.name), A.value currentFilterValue, A.onInput (FilterInput col.key), S.width "100%" ] []
                         , H.button [ A.onClick (ColumnHide col.key), S.marginTop "0.25rem" ] [ text "Hide column" ]
                         , H.button [ A.onClick (ColumnPin col.key), S.marginTop "0.25rem" ] [ text (iif isPinned "Unpin column" "Pin column") ]
                         , iif numeric
@@ -8098,6 +8419,24 @@ viewHeaderCell sheet col =
                                                     [ text (formatSpec format).label ]
                                             )
                                             numberFormats
+                                    )
+                                ]
+                            )
+                            (text "")
+                        , iif numeric
+                            (H.label [ A.class "shading", S.displayFlex, S.alignItemsCenter, S.gapRem 0.25, S.marginTop "0.25rem" ]
+                                [ text "shade"
+                                , H.select [ A.onInput (ColumnShade col.key) ]
+                                    (H.option [ A.value "", A.selected (Dict.get col.key sheet.shades == Nothing) ] [ text "none" ]
+                                        :: List.map
+                                            (\shading ->
+                                                H.option
+                                                    [ A.value (shadeSpec shading).name
+                                                    , A.selected (Dict.get col.key sheet.shades == Just shading)
+                                                    ]
+                                                    [ text (shadeSpec shading).label ]
+                                            )
+                                            shades
                                     )
                                 ]
                             )
@@ -8181,8 +8520,54 @@ viewEditCell sheet col =
             [ H.input [ A.id "new-cell", onEditorKeydown, A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.minWidthRem 8, S.border "none", S.borderRadius "0", S.padding "0" ] [] ]
 
 
-viewCell : Sheet -> Result String (Array Stat) -> Dict String Int -> Bool -> Int -> Int -> Col -> Row -> Html Msg
-viewCell sheet stats pins grab i n col row =
+{-| The background one shaded cell's value sits on.
+
+It goes on a wrapper inside the `td` and never on the `td` itself: an inline
+background there outranks `td.selected`, `td:hover` and the match highlight by
+specificity, so selection and find would vanish on every shaded column.
+
+The colour is the theme's own `--accent`, mixed into what is behind it rather
+than spelled out here, so the shade and the rest of the app cannot disagree
+about which blue this is.
+
+-}
+shadeAttr : Shade -> ( Float, Float ) -> Float -> H.Attribute Msg
+shadeAttr shading ( lo, hi ) v =
+    let
+        -- Where the value sits between the column's ends, or nothing at all
+        -- for a column whose every value is the same: there is no spread to
+        -- read, and the division would be by zero. Every value of such a
+        -- column is its largest as well as its smallest, which is why the
+        -- bar that stands in for the missing fraction is a whole one.
+        part =
+            iif (hi == lo) Nothing (Just ((v - lo) / (hi - lo)))
+    in
+    case shading of
+        Scale ->
+            -- Faint at the bottom of the column and no stronger than the
+            -- cell's own text stays readable over at the top.
+            S.backgroundColor
+                ("color-mix(in srgb, var(--accent) "
+                    ++ String.fromInt (round (8 + 40 * Maybe.withDefault 0.5 part))
+                    ++ "%, transparent)"
+                )
+
+        Bars ->
+            let
+                across =
+                    String.fromInt (round (100 * Maybe.withDefault 1 part)) ++ "%"
+            in
+            S.backgroundImage
+                ("linear-gradient(to right, color-mix(in srgb, var(--accent) 30%, transparent) "
+                    ++ across
+                    ++ ", transparent "
+                    ++ across
+                    ++ ")"
+                )
+
+
+viewCell : Sheet -> Result String (Array Stat) -> Dict String Int -> Dict String ( Float, Float ) -> Bool -> Int -> Int -> Col -> Row -> Html Msg
+viewCell sheet stats pins extents grab i n col row =
     H.td
         ([ A.onClick CellMouseClick
          , A.onDoubleClick <|
@@ -8226,6 +8611,47 @@ viewCell sheet stats pins grab i n col row =
                     viewHeaderCell sheet col
 
                 _ ->
+                    let
+                        value =
+                            row
+                                |> Dict.get col.key
+                                |> Maybe.withDefault (E.string "")
+                                |> D.decodeValue (cellDecoder col.typ (Dict.get col.key sheet.decimals) (Dict.get col.key sheet.formats) i n)
+                                |> Result.map (Maybe.withDefault (text ""))
+                                |> Result.mapError (D.errorToString >> text)
+                                |> (\r ->
+                                        case r of
+                                            Ok x ->
+                                                x
+
+                                            Err x ->
+                                                x
+                                   )
+
+                        -- This arm is the data rows; the header, the stats and
+                        -- the totals are other arms, and go unshaded.
+                        --
+                        -- The cell is read a second time, and only for a column
+                        -- somebody shaded: Elm is strict, so asking for the
+                        -- number beside the two lookups would decode every cell
+                        -- of every column on every keystroke. `positional` is
+                        -- the guard `columnExtent` already puts on the ends of
+                        -- the scale, asked again of the cell sitting on it, so
+                        -- a JSON `1e400` -- Infinity, still typeof "number" --
+                        -- draws no shade rather than a background written
+                        -- "Infinity%".
+                        shaded =
+                            case ( Dict.get col.key sheet.shades, Dict.get col.key extents ) of
+                                ( Just shading, Just extent ) ->
+                                    row
+                                        |> Dict.get col.key
+                                        |> Maybe.andThen (D.decodeValue number >> Result.toMaybe)
+                                        |> Maybe.andThen (\v -> iif (positional v) (Just v) Nothing)
+                                        |> Maybe.map (shadeAttr shading extent)
+
+                                _ ->
+                                    Nothing
+                    in
                     [ -- There is no row-number cell, so the first data cell carries
                       -- the row's handle. Only while the table is in document order:
                       -- `grab` is decided where the rows on screen are known.
@@ -8238,25 +8664,17 @@ viewCell sheet stats pins grab i n col row =
                             []
                         )
                         (text "")
-                    , row
-                        |> Dict.get col.key
-                        |> Maybe.withDefault (E.string "")
-                        |> D.decodeValue (cellDecoder col.typ (Dict.get col.key sheet.decimals) (Dict.get col.key sheet.formats) i n)
-                        |> Result.map (Maybe.withDefault (text ""))
-                        |> Result.mapError (D.errorToString >> text)
-                        |> (\r ->
-                                case r of
-                                    Ok x ->
-                                        x
+                    , case shaded of
+                        Just background ->
+                            H.div [ A.class "shade", background ] [ value ]
 
-                                    Err x ->
-                                        x
-                           )
+                        Nothing ->
+                            value
                     ]
 
 
-viewTableRow : Sheet -> Doc -> Result String (Array Stat) -> Dict String Int -> Bool -> Array Col -> Int -> Row -> Html Msg
-viewTableRow sheet doc stats pins grab cols n row =
+viewTableRow : Sheet -> Doc -> Result String (Array Stat) -> Dict String Int -> Dict String ( Float, Float ) -> Bool -> Array Col -> Int -> Row -> Html Msg
+viewTableRow sheet doc stats pins extents grab cols n row =
     H.tr
         [ A.classList [ ( "meta", n < 0 ) ]
         , case ( String.fromInt n, stats ) of
@@ -8267,7 +8685,7 @@ viewTableRow sheet doc stats pins grab cols n row =
                 S.displayTableRow
         ]
     <|
-        List.indexedMap (\i col -> viewCell sheet stats pins grab i n col row) (Array.toList cols)
+        List.indexedMap (\i col -> viewCell sheet stats pins extents grab i n col row) (Array.toList cols)
             ++ [ case doc of
                     Tab _ ->
                         H.th [ A.onClick (DocMsg SheetColumnPush), A.title "add column", S.widthRem 0.001, S.whiteSpaceNowrap ] [ text (iif (n == 0) "→" "") ]
@@ -8324,6 +8742,42 @@ columnTotal rows col =
 
         _ ->
             Nothing
+
+
+{-| The smallest and largest number a column holds over the rows actually on
+screen, or nothing where it holds no number at all. Deliberately not
+`sheet.stats`, for the reason the totals line beside it is not: stats are
+computed over every document row, so a shade that ignored the active filter
+would paint a scale nobody on screen can read -- and a query sheet has no stats
+at all.
+
+A blank cell and a cell that is not a number are passed over rather than
+counted as zero: the extent is the range of the values there are.
+
+A cell past what `positional` allows is passed over the same way -- JSON's own
+`1e400` decodes to Infinity without ever failing `number`'s check, typeof
+"number" in the host either way, and folding it in with `min`/`max` would
+stretch the whole column's scale to an endpoint no finite cell holds.
+
+-}
+columnExtent : Array Row -> Col -> Maybe ( Float, Float )
+columnExtent rows col =
+    Array.foldl
+        (\row acc ->
+            case row |> Dict.get col.key |> Maybe.andThen (D.decodeValue number >> Result.toMaybe) |> Maybe.andThen (\v -> iif (positional v) (Just v) Nothing) of
+                Just v ->
+                    case acc of
+                        Just ( lo, hi ) ->
+                            Just ( min lo v, max hi v )
+
+                        Nothing ->
+                            Just ( v, v )
+
+                Nothing ->
+                    acc
+        )
+        Nothing
+        rows
 
 
 sumColumn : Array Row -> String -> Float
@@ -8402,6 +8856,20 @@ viewGallery model =
                     ]
                     [ text ("🗑 " ++ String.fromInt trashed) ]
                 ]
+            -- The box holds the argument and the chip runs the verb, so the
+            -- tag is typed where the rows it lands on are selected.
+            ++ [ H.input
+                    [ A.value model.sheet.tag
+                    , A.onInput TagInput
+                    , onTagKeydown
+                    , A.placeholder "tag"
+                    , A.title "add this tag to every selected library row"
+                    , S.width "6rem"
+                    , S.fontSizeRem 0.8125
+                    ]
+                    []
+               , H.button [ A.class "chip", A.onClick TagSelected ] [ text "tag selected" ]
+               ]
         )
 
 
@@ -8467,7 +8935,7 @@ viewError error =
             H.div [ A.class "mono", S.backgroundColor "#fee", S.border "1px solid #c88", S.borderRadius "4px", S.padding "0.75rem", S.margin "0.5rem", S.fontSizeRem 0.8125, S.whiteSpacePre, S.overflowXAuto ]
                 [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.marginBottomRem 0.5 ]
                     [ H.strong [] [ text "Error" ]
-                    , H.button [ A.class "x", A.onClick (DocError "") ] [ text "×" ]
+                    , H.button [ A.class "x", A.attribute "aria-label" "dismiss this error", A.onClick (DocError "") ] [ text "×" ]
                     ]
                 , text error
                 ]
@@ -8481,8 +8949,8 @@ viewAuthForm auth =
 
         _ ->
             H.form [ A.id "account", A.onSubmit (AuthMsg AuthSubmit), S.displayGrid, S.gapRem 0.5, S.maxWidth "100vw", S.width "100%", S.gridTemplateColumns "1fr 1fr auto", S.paddingRem 0.5, S.borderTop "1px solid #aaa", S.backgroundColor "#f0f0f0", S.positionAbsolute, S.bottomPx 0, S.zIndex "10" ]
-                [ H.input [ S.minWidthRem 2, A.placeholder "email", A.type_ "email", A.name "email", A.value auth.email, A.onInput (InputChange AuthEmail), A.disabled (auth.state == LoggingIn) ] []
-                , H.input [ S.minWidthRem 2, A.placeholder "password", A.type_ "password", A.name "password", A.value auth.password, A.onInput (InputChange AuthPassword), A.disabled (auth.state == LoggingIn) ] []
+                [ H.input [ S.minWidthRem 2, A.placeholder "email", A.attribute "aria-label" "email", A.type_ "email", A.name "email", A.value auth.email, A.onInput (InputChange AuthEmail), A.disabled (auth.state == LoggingIn) ] []
+                , H.input [ S.minWidthRem 2, A.placeholder "password", A.attribute "aria-label" "password", A.type_ "password", A.name "password", A.value auth.password, A.onInput (InputChange AuthPassword), A.disabled (auth.state == LoggingIn) ] []
                 , H.button [ A.type_ "submit", A.disabled (auth.state == LoggingIn) ]
                     [ text (iif (auth.state == LoggingIn) "..." (iif (String.isEmpty auth.password) "signup" "login")) ]
                 ]
@@ -8496,7 +8964,7 @@ viewToolbar model info =
     in
     H.div [ S.displayFlex, S.flexDirectionRow, S.alignItemsCenter, S.whiteSpaceNowrap, S.gapRem 0.5, S.paddingRem 0.5, S.borderBottom "1px solid #aaa", S.background "#f0f0f0" ] <|
         List.concat
-            [ [ H.a [ A.href "/", A.title "library", S.fontWeight "900", S.fontSizeRem 1.25, S.lineHeight "1" ] [ text "⊞" ]
+            [ [ H.a [ A.href "/", A.title "library", A.attribute "aria-label" "library", S.fontWeight "900", S.fontSizeRem 1.25, S.lineHeight "1" ] [ text "⊞" ]
               , H.a [ A.href "/", A.id "title", S.fontWeight "900", S.marginLeftRem -0.25 ] [ text "scrapsheets" ]
               , text "/"
               ]
@@ -8551,7 +9019,7 @@ viewTutorial tutorial =
             H.div [ A.class "panel", S.positionFixed, S.bottomRem 3, S.rightRem 1, S.paddingRem 1, S.zIndex "90", S.maxWidthRem 18 ]
                 [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter, S.gapRem 1, S.marginBottomRem 0.5 ]
                     [ H.strong [] [ text "get started" ]
-                    , H.button [ A.class "x", A.onClick TutorialDismiss ] [ text "×" ]
+                    , H.button [ A.class "x", A.attribute "aria-label" "dismiss the tutorial", A.onClick TutorialDismiss ] [ text "×" ]
                     ]
                 , H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ] <|
                     List.indexedMap
@@ -9998,7 +10466,7 @@ viewQueryEditor model query =
                 H.div [ A.class "mono", S.backgroundColor "#fee", S.borderTop "2px solid #c66", S.padding "0.75rem", S.fontSizeRem 0.8125, S.whiteSpacePre, S.overflowXAuto, S.maxHeightRem 8, S.overflowYAuto ]
                     [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsStart ]
                         [ H.span [ S.color "#c00" ] [ text err ]
-                        , H.button [ A.class "x", A.onClick (DocError ""), S.color "#c00", S.marginLeft "0.5rem" ] [ text "×" ]
+                        , H.button [ A.class "x", A.attribute "aria-label" "dismiss this error", A.onClick (DocError ""), S.color "#c00", S.marginLeft "0.5rem" ] [ text "×" ]
                         ]
                     ]
         , if List.isEmpty query.examples then
@@ -10058,6 +10526,30 @@ view ({ sheet } as model) =
                             pins =
                                 pinLeft sheet cols
 
+                            -- The ends of every shaded column, over the rows as
+                            -- drawn: sorted, filtered and searched, the way the
+                            -- totals line below them is.
+                            extents =
+                                cols
+                                    |> Array.toList
+                                    |> List.filterMap
+                                        (\col ->
+                                            -- `if` and not `iif`, which is
+                                            -- strict and would fold every
+                                            -- column's rows whether it is
+                                            -- shaded or not. `numericColumn`
+                                            -- because a shade word may arrive
+                                            -- on a text column from a document
+                                            -- this panel never wrote, and no
+                                            -- extent is what stops it drawing.
+                                            if Dict.member col.key sheet.shades && numericColumn col.typ then
+                                                columnExtent sortedRows col |> Maybe.map (Tuple.pair col.key)
+
+                                            else
+                                                Nothing
+                                        )
+                                    |> Dict.fromList
+
                             -- The row handle, only where a drop has an honest target.
                             grab =
                                 (case doc of
@@ -10080,10 +10572,10 @@ view ({ sheet } as model) =
                                 H.div []
                                     [ iif (doc == Library) (viewGallery model) (text "")
                                     , viewFilterBar sheet (Array.length sortedRows) (Array.length rows)
-                                    , H.table [ A.onMouseLeave (CellHover (xy -1 -1)) ]
+                                    , H.table [ A.onMouseLeave (CellHover (xy -1 -1)), A.attribute "role" "grid", A.attribute "aria-label" (iif (doc == Library) "library" (iif (String.trim info.name == "") "untitled sheet" info.name)) ]
                                         [ H.tbody [] <|
                                             Array.toList <|
-                                                Array.indexedMap (\n_ row -> viewTableRow sheet doc stats pins grab cols (n_ - 2) row) <|
+                                                Array.indexedMap (\n_ row -> viewTableRow sheet doc stats pins extents grab cols (n_ - 2) row) <|
                                                     Array.append (Array.repeat 3 Dict.empty) sortedRows
                                         , viewTableFooter model.trash sheet pins cols sortedRows
                                         ]
@@ -10137,7 +10629,7 @@ view ({ sheet } as model) =
             , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
                 [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]
                     [ viewToolbar model info
-                    , H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder "search", S.width "100%", S.border "none", S.borderRadius "0", S.borderBottom "1px solid #aaa", S.padding "0.25rem 0.5rem", S.fontSizeRem 0.875, S.marginBottomPx -1, S.zIndex "2" ] []
+                    , H.input [ A.value model.search, A.onInput (InputChange SheetSearch), A.placeholder "search", A.attribute "aria-label" "search the rows", S.width "100%", S.border "none", S.borderRadius "0", S.borderBottom "1px solid #aaa", S.padding "0.25rem 0.5rem", S.fontSizeRem 0.875, S.marginBottomPx -1, S.zIndex "2" ] []
                     , content
                     ]
                 , aside

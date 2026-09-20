@@ -22,6 +22,7 @@ import {
   chartSql,
   checkColumnTypes,
   checkResultColumns,
+  cohortSql,
   describeRef,
   describeRows,
   knownType,
@@ -327,6 +328,146 @@ Deno.test("a chart plots a column AlaSQL will not parse bare, in both engines", 
     assertEquals(onServer, expected, `a ${doc.kind} chart over a keyword column draws the wrong rows`);
     assertEquals(inPage, onServer, `a ${doc.kind} chart over a keyword column draws differently in the page engine`);
   }
+});
+
+Deno.test("a cohort table answers what the bundled one was written by hand to answer", () => {
+  // `cohortSql` runs once, when the palette makes the sheet, so this is the only
+  // place its statement is read. What is compared is the rows and never the
+  // text: the whitespace in a generated statement is a promise to nobody.
+  const dataset = (DATASETS as { doc_id: string; doc: { data: Row[] } }[]).find((d) => d.doc_id === "orders")!;
+  const [cols_, ...rows] = dataset.doc.data;
+  const orders = rows.map((row) =>
+    Object.fromEntries((Object.values(cols_) as { name: string; key: string }[]).map((c) => [c.name, row[c.key]]))
+  );
+  checkColumnTypes("table:orders", Object.values(cols_), orders);
+  const loaded: Record<string, Row[]> = { "table:orders": orders };
+  const colsOf = { "table:orders": Object.keys(orders[0]).map((name) => ({ name })) };
+  const answer = (engine: Engine, code: string) => {
+    serveSheets(engine);
+    const { sql, cells } = scanRefs(code);
+    return engine(planQuery(sql, cells, loaded, colsOf).sql, [loaded]).data as Row[];
+  };
+  const byHand =
+    (EXAMPLES as unknown as Record<string, { doc: { data: { code: string }[] } }>)["query:cohort-retention"]
+      .doc.data[0].code;
+  const written = cohortSql({
+    source: "@table:orders",
+    date: "ordered_on",
+    key: "customer_id",
+    value: "revenue",
+    grain: "month",
+  });
+  for (const [name, engine] of engines) {
+    const want = answer(engine, byHand);
+    const got = answer(engine, written);
+    // The two name their counts differently -- the bundled one says `customers`
+    // where a generalised table says `active` -- so the columns they share are
+    // the cohort, the period and the money, and those are compared row for row.
+    const shared = Object.keys(want[0]).filter((col) => Object.hasOwn(got[0], col));
+    assertEquals([...shared].sort(), ["cohort", "month_no", "revenue"], `${name}: the two share other columns now`);
+    assertEquals(
+      got.map((row) => shared.map((col) => row[col])),
+      want.map((row) => shared.map((col) => row[col])),
+      `${name}: the written cohort table answers different rows from the bundled one`,
+    );
+  }
+});
+
+Deno.test("a cohort table groups by a column AlaSQL will not parse bare, in both engines", () => {
+  // Every name a cohort table splices goes through the same `chartIdent` a
+  // chart's axes do, and it splices them into a join, a group by and two
+  // aggregates -- more places than any chart does.
+  const loaded: Record<string, Row[]> = {
+    "table:keyword-cohort": [
+      { store: "a", class: "2024-01-03", total: 5 },
+      { store: "a", class: "2024-02-03", total: 7 },
+      { store: "b", class: "2024-02-05", total: 9 },
+    ],
+  };
+  const colsOf = { "table:keyword-cohort": ["store", "class", "total"].map((name) => ({ name })) };
+  const drawn = (code: string) =>
+    engines.map(([, engine]) => {
+      serveSheets(engine);
+      const { sql, cells } = scanRefs(code);
+      return JSON.stringify(engine(planQuery(sql, cells, loaded, colsOf).sql, [loaded]).data as Row[]);
+    });
+  const settings = { source: "@table:keyword-cohort", date: "class", key: "store", grain: "month" };
+  for (
+    const [code, expected] of [
+      [
+        cohortSql({ ...settings, value: "total" }),
+        `[{"cohort":"2024-01","month_no":0,"active":1,"total":5,"total_per_active":5},` +
+        `{"cohort":"2024-01","month_no":1,"active":1,"total":7,"total_per_active":7},` +
+        `{"cohort":"2024-02","month_no":0,"active":1,"total":9,"total_per_active":9}]`,
+      ],
+      // No value column is the count-only table: the keys that came back, and
+      // nothing about what they were worth.
+      [
+        cohortSql(settings),
+        `[{"cohort":"2024-01","month_no":0,"active":1},{"cohort":"2024-01","month_no":1,"active":1},` +
+        `{"cohort":"2024-02","month_no":0,"active":1}]`,
+      ],
+    ]
+  ) {
+    const [onServer, inPage] = drawn(code);
+    assertEquals(onServer, expected, `a cohort table over a keyword column answers the wrong rows`);
+    assertEquals(inPage, onServer, `a cohort table over a keyword column answers differently in the page engine`);
+  }
+});
+
+Deno.test("a cohort table refuses every field it cannot build from, by name", () => {
+  const ok = { source: "@table:orders", date: "ordered_on", key: "customer_id", value: "revenue", grain: "month" };
+  for (
+    const [settings, said] of [
+      [{ ...ok, source: "@chart:spend" }, "A cohort table reads one table or query sheet."],
+      [{ ...ok, grain: "monthly" }, "That is not a period to group a cohort by."],
+      [{ ...ok, date: 7 }, "A cohort table's date column has to be a column name."],
+      [{ ...ok, key: "" }, "A cohort table's key column has to be a column name."],
+      [{ ...ok, value: 3 }, "A cohort table's value column has to be a column name."],
+      // A column that shares a name with one this statement generates for
+      // itself is refused on no engine -- both answer rows, and the rows are
+      // wrong: a key named `cohort` joins against the truncated first date and
+      // matches nothing, so the table is empty; one named `month_no` overwrites
+      // the period number; and a value summed off the key or the date column is
+      // text AlaSQL drops, so that field is missing from every row. None of
+      // them reads as a mistake anywhere downstream.
+      [{ ...ok, key: "cohort" }, "A cohort table's key column has to be a column it does not already name."],
+      [{ ...ok, key: "month_no" }, "A cohort table's key column has to be a column it does not already name."],
+      [{ ...ok, value: "customer_id" }, "A cohort table's value column has to be a column it does not already name."],
+      [{ ...ok, value: "ordered_on" }, "A cohort table's value column has to be a column it does not already name."],
+      [{ ...ok, value: "cohort" }, "A cohort table's value column has to be a column it does not already name."],
+      [{ ...ok, value: "active" }, "A cohort table's value column has to be a column it does not already name."],
+      [{ ...ok, value: "month_no" }, "A cohort table's value column has to be a column it does not already name."],
+    ] as unknown as [Parameters<typeof cohortSql>[0], string][]
+  ) {
+    assertThrows(() => cohortSql(settings), Error, said);
+  }
+  // And the "did you mean" a near miss earns, since a grain is a word somebody
+  // types rather than a column they pick.
+  assertThrows(() => cohortSql({ ...ok, grain: "monthly" }), Error, "month");
+});
+
+// cohortSql and chartSql share the one chartIdent(), given "cohort table" or
+// "chart" as the noun rather than each writing its own checker -- so a chart's
+// own refusals, over every field chartIdent and chartSql itself can refuse,
+// still say "chart" and never leak the other caller's noun.
+Deno.test("a chart refuses every field it cannot build from, by name", () => {
+  const ok = { source: "@table:orders", kind: "line", x: "ordered_on", y: "revenue" };
+  for (
+    const [settings, said] of [
+      [{ ...ok, source: "@nope:spend" }, "A chart reads one table or query sheet."],
+      [{ ...ok, kind: "pie" }, "That is not a kind of chart."],
+      [{ ...ok, x: 7 }, "A chart's x column has to be a column name."],
+      [{ ...ok, y: "" }, "A chart's y column has to be a column name."],
+      [{ ...ok, y2: 3 }, "A chart's second y column has to be a column name."],
+      [{ ...ok, series: 3 }, "A chart's series column has to be a column name."],
+      [{ ...ok, kind: "box", series: "region" }, "A box chart is already the spread of its rows"],
+      [{ ...ok, kind: "box", y2: "margin" }, "A box chart is already the spread of its rows"],
+    ] as unknown as [Parameters<typeof chartSql>[0], string][]
+  ) {
+    assertThrows(() => chartSql(settings), Error, said);
+  }
+  assertThrows(() => chartSql({ ...ok, kind: "lin" }), Error, "line");
 });
 
 Deno.test("a bracketed select item types the way the bare one does", () => {

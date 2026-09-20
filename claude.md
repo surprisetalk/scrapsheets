@@ -276,107 +276,123 @@ navigation, in file order:
   a new word; a change condition's first run is a silent baseline and a run past `ALERT_ROWS` under one is an `error`
   row. `ALERT_WHEN` in `main.ts` and `whenSpec` in `Main.elm` are the two copies a language boundary forces. A `to`
   matching `^https?://` is delivered by `sendAlertUrl` through `safeFetch` instead of mailed — `{text}` to
-  hooks.slack.com, `{content}` to discord.com/api/webhooks, `{sheet, name, rows}` to anything else — refused posts
-  recorded and retried like a refused email, `sendWithinQuota` counting one the same as the other, and a digest over a
-  url refused at config read. The run row keeps a url's **host** and never its path: the path is the whole of a
-  webhook's authorization, and every viewer of the sheet reads that row. **An alert is silenced, not deleted, by
-  `snoozed_until`.** It is an ISO timestamp in the alert document's `data[0]`, read against the run's own clock, so one
-  in the past is over without anything clearing it, and one the regex and `Date.parse` cannot both read is an error run
-  naming the field rather than a quiet no-snooze. A run inside the snooze is decided and recorded as any other -- the
-  verdict in `status`, the rows in `matched`, so the baseline `added` and `removed` diff against still moves -- and its
-  `delivery` is `snoozed`, chosen below the no-destination line and above the digest branch: an alert nobody gave a
-  destination still reads as broken rather than silenced, and neither door mails a snoozed one. `sendWithinQuota` counts
-  only what was sent, `ALERT_OK` admits `snoozed` beside `sent` and the digest hold so a day of silence is not a day of
-  outage, and a snoozed run is `stuck`, so the run after it is not de-duped away as an answer somebody has already read.
-  `snoozedUntil` on `Main.elm`'s `Alert` is the page's copy and `isoStamp` is the one spelling of the stamp: the chip
-  asks `Time.now` at the click and writes now plus a day, and `viewAlert` decides whether the snooze still holds by
-  comparing the two stamps as text, because ISO sorts the way the calendar does -- so a cell the poller refuses draws as
-  whatever it says, with the `unsnooze` chip that clears it.
-- **Polling**: `pollNetOnce` and `pollAlertOnce` on a 15-second tick; a sheet's `method` is one of `NET_METHODS` and its
-  `body` is templated where a header already was — `{{secret:name}}` out of the secret table and `{{cursor}}` the same
-  watermark the cursor parameter carries, both kept as the sheet spells them in the failure row's repro, and a GET
-  carrying a body refused by `netRequest` while that unresolved text is still what is held — safeFetch is handed the
-  resolved one, and a size measured there is an oracle on the secret. Every row records the verb it went out with, and
-  the watermark rides every row a poll writes, failures among them: one bad poll that dropped it asked the feed for all
-  of history again. The validators do not travel with it — a 304 moves the row the validator came with, and a failure
-  row does not hold that body. Conditional requests, per-host `Retry-After`, bounded retries, and a `net` row per run —
-  including quiet ones, because a healthy quiet alert and a dead timer otherwise write the same nothing. A run's row
-  carries `meta.shape`, the columns the body answered with and the JSON type of each (`shapeOf`); a run whose shape
-  differs from the run before keeps its rows and carries `meta.shape_change` naming what was added, dropped and retyped
-  (`shapeChange`), and `POLL_OK` grades it as failed, once, so freshness and the status alarm hear it through the path
-  every other failure takes. A good run's body is its idempotency key: its digest rides `meta.sig`, the slot a
-  delivery's signature takes, so `net_hook_signature_idx` refuses the same body twice and `netRow` moves the row it
-  matched to now, marked `repeated`. A query over a net-http sheet reads only the runs `POLL_OK` grades (`sheet()` adds
-  it when `path_` is non-empty); the sheet view and the export keep the whole log, failures among them, so one bad poll
-  cannot empty what is built downstream. A sheet's `page_by` is one of `PAGE_BY` (`page`, `offset`, `cursor`, `link`)
-  and a poll reads every page into one body: the arrays concatenated, so `shapeOf`, the digest, `BODY_CAP` and every
-  reader downstream see what a one-page feed hands them. `page_param` names the query parameter the number, the offset
-  or the next cursor rides — a `link` feed names the whole url itself, and `page_path` says where in the answer the next
-  cursor sits. `pageConfig()` reads and refuses the three fields by name the way `netRequest` refuses a method;
-  `pageRows()` is the one page parser (a top-level array, or under `cursor` and `link` the one array-valued key of the
-  envelope; two arrays is a guess and is refused naming both, because `{warnings: [], items: [...]}` read as no rows at
-  all under a green run row) and `nextPage()` the one stop condition. A name before the last of `page_path` that page
-  one does not hold is a wrong path and a failure row, not a one-page feed; a later page dropping the envelope is the
-  feed's own way of saying there is no next. Page one carries the number or the offset, so the validators, the
-  `{{cursor}}` watermark and the host holdoff still ride the first request alone; a cursor and a Link header only arrive
-  with an answer. The walk is bounded by `PAGE_MAX` and by `BODY_CAP` checked as the pages sum, a `link` next page must
-  be on the origin the sheet names (scheme and port included), and `page_param` naming the sheet's own `cursor` is
-  refused because paging overwrites it on every request. **The sheet keeps nothing from a poll that failed part way**: a
-  429 or a 5xx on any page is the one `later()` retry path for the whole poll, every other refusal throws into the
-  catch, and the next scheduled poll starts at page one. The failure row names the page that broke, so its repro replays
-  that request. The pre-flight makes one request whatever `page_by` says. **A sheet's `mode` says what a good run does
-  to the runs before it.** It is one of `NET_MODES` (`append`, `replace`, `upsert`), a sheet without one appends the
-  whole log the way every feed did, and `storeConfig()` reads and refuses it beside `pageConfig()` off the same document
-  and before a request goes out -- with `key`, the dotted path into one row an `upsert` supersedes by, which that mode
-  needs and every other refuses, and `rows_path`, the dotted path to the array of rows in an envelope, which
-  `pageRows()` honours before its one-array guess so a feed answering `data` beside `included` names which one is the
-  answer. `NET_PATH` is the one spelling all three dotted paths are checked against, and `atNames()` the one walk along
-  them, answering nothing where the path runs out so each caller refuses in its own words. `netRow()` takes the
-  `Storing` beside the meta and does the insert and what it supersedes in one transaction: `replace` deletes the sheet's
-  earlier `POLL_OK` rows, `upsert` writes the sorted distinct key values as `meta.keys` (`rowKeys()`, reading the array
-  itself or the one at `rows_path`, refusing a row holding nothing at the key by its position rather than skipping it,
-  and refusing a number past `Number.MAX_SAFE_INTEGER` -- JSON has no integer past 2^53, so `JSON.parse` has already
-  folded two distinct ids into one float before this server sees them, which is the merge upsert exists to prevent) and
-  deletes the earlier rows whose `meta->'keys'` overlap them, guarded inside a `case` on `jsonb_typeof`. **Only a 2xx
-  supersedes anything**: a retry row and a caught refusal are handed `null`, so one bad poll cannot empty the sheet, and
-  the failure rows stay under `replace` because `POLL_OK` never counted them -- as does a run `POLL_OK` grades on
-  `shape_change`, which a query over the sheet does not read either. The run log stays the unit -- the key says which
-  earlier runs this one replaces, not which rows -- and `trimNet` and the digest dedupe are unchanged, so a repeated
-  body still moves its row to now and that moved row is the one `replace` keeps. **A 304 keeps every field the row it
-  moves already held**, `meta.sig` and `meta.keys` among them, and overwrites only the three a not-modified answer
-  changes: a quiet tick that rebuilt the row's meta out of the validators alone left a row that no longer said what it
-  had answered for, and the next real run superseded nothing.
+  hooks.slack.com, `{content}` to discord.com/api/webhooks, a MessageCard (`@type`, `@context`, `text`) to
+  `webhook.office.com` and to any `*.webhook.office.com`, and `{sheet, name, rows}` to anything else, a Power Automate
+  Workflows url (`*.logic.azure.com`) among them, because its body schema is whatever the customer's own flow declares
+  and there is no one shape to send it — refused posts recorded and retried like a refused email, `sendWithinQuota`
+  counting one the same as the other, and a digest over a url refused at config read. Teams needs no account of ours:
+  its Incoming Webhook is a url the customer makes in their own channel and pastes into `to`, exactly as a Slack one is,
+  so it ships where SMS and push do not. A Teams url is in `KEY_SHAPES` beside Slack's and Discord's, and its regex
+  allows **every** label `sendAlertUrl`'s own `.webhook.office.com` arm delivers to: a shape the publish scan calls safe
+  and that door posts to is a credential on its way out. The run row keeps a url's **host** and never its path: the path
+  is the whole of a webhook's authorization, and every viewer of the sheet reads that row. **An alert is silenced, not
+  deleted, by `snoozed_until`.** It is an ISO timestamp in the alert document's `data[0]`, read against the run's own
+  clock, so one in the past is over without anything clearing it, and one the regex and `Date.parse` cannot both read is
+  an error run naming the field rather than a quiet no-snooze. A run inside the snooze is decided and recorded as any
+  other -- the verdict in `status`, the rows in `matched`, so the baseline `added` and `removed` diff against still
+  moves -- and its `delivery` is `snoozed`, chosen below the no-destination line and above the digest branch: an alert
+  nobody gave a destination still reads as broken rather than silenced, and neither door mails a snoozed one.
+  `sendWithinQuota` counts only what was sent, `ALERT_OK` admits `snoozed` beside `sent` and the digest hold so a day of
+  silence is not a day of outage, and a snoozed run is `stuck`, so the run after it is not de-duped away as an answer
+  somebody has already read. `snoozedUntil` on `Main.elm`'s `Alert` is the page's copy and `isoStamp` is the one
+  spelling of the stamp: the chip asks `Time.now` at the click and writes now plus a day, and `viewAlert` decides
+  whether the snooze still holds by comparing the two stamps as text, because ISO sorts the way the calendar does -- so
+  a cell the poller refuses draws as whatever it says, with the `unsnooze` chip that clears it.
+- **Polling**: `pollOnce` on one 15-second tick under one re-entrancy flag -- `pollNetOnce`, then `pollAlertOnce` over
+  the rows it just stored. That order is the whole of the dependency order there is to run in: the only edge between two
+  sheets that run on a timer is net-http to alert, because a query, a chart and a dashboard compute when they are read
+  and a feed reads a url and never an `@ref`, so a DAG over `scanRefs()` would hold one edge one level deep. Two
+  intervals of their own ran an alert against the cycle before's rows, and only the net one had the flag, so two alert
+  cycles could overlap and deliver twice. Each half is awaited with a catch and a console line of its own, so a feed
+  half that threw leaves the alert half running; each spends its own cycle budget (`POLL_CYCLE_MS`, `ALERT_CYCLE_MS`,
+  the alert's its own number and not a share, so a pile of slow feeds cannot starve every alert), leaving what it did
+  not reach due for the next tick. `POST /library/:id/run` and `freshness()` read the per-sheet functions and the due
+  maps, so neither moved. A sheet's `method` is one of `NET_METHODS` and its `body` is templated where a header already
+  was — `{{secret:name}}` out of the secret table and `{{cursor}}` the same watermark the cursor parameter carries, both
+  kept as the sheet spells them in the failure row's repro, and a GET carrying a body refused by `netRequest` while that
+  unresolved text is still what is held — safeFetch is handed the resolved one, and a size measured there is an oracle
+  on the secret. Every row records the verb it went out with, and the watermark rides every row a poll writes, failures
+  among them: one bad poll that dropped it asked the feed for all of history again. The validators do not travel with it
+  — a 304 moves the row the validator came with, and a failure row does not hold that body. Conditional requests,
+  per-host `Retry-After`, bounded retries, and a `net` row per run — including quiet ones, because a healthy quiet alert
+  and a dead timer otherwise write the same nothing. A run's row carries `meta.shape`, the columns the body answered
+  with and the JSON type of each (`shapeOf`); a run whose shape differs from the run before keeps its rows and carries
+  `meta.shape_change` naming what was added, dropped and retyped (`shapeChange`), and `POLL_OK` grades it as failed,
+  once, so freshness and the status alarm hear it through the path every other failure takes. A good run's body is its
+  idempotency key: its digest rides `meta.sig`, the slot a delivery's signature takes, so `net_hook_signature_idx`
+  refuses the same body twice and `netRow` moves the row it matched to now, marked `repeated`. A query over a net-http
+  sheet reads only the runs `POLL_OK` grades (`sheet()` adds it when `path_` is non-empty); the sheet view and the
+  export keep the whole log, failures among them, so one bad poll cannot empty what is built downstream. A sheet's
+  `page_by` is one of `PAGE_BY` (`page`, `offset`, `cursor`, `link`) and a poll reads every page into one body: the
+  arrays concatenated, so `shapeOf`, the digest, `BODY_CAP` and every reader downstream see what a one-page feed hands
+  them. `page_param` names the query parameter the number, the offset or the next cursor rides — a `link` feed names the
+  whole url itself, and `page_path` says where in the answer the next cursor sits. `pageConfig()` reads and refuses the
+  three fields by name the way `netRequest` refuses a method; `pageRows()` is the one page parser (a top-level array, or
+  under `cursor` and `link` the one array-valued key of the envelope; two arrays is a guess and is refused naming both,
+  because `{warnings: [], items: [...]}` read as no rows at all under a green run row) and `nextPage()` the one stop
+  condition. A name before the last of `page_path` that page one does not hold is a wrong path and a failure row, not a
+  one-page feed; a later page dropping the envelope is the feed's own way of saying there is no next. Page one carries
+  the number or the offset, so the validators, the `{{cursor}}` watermark and the host holdoff still ride the first
+  request alone; a cursor and a Link header only arrive with an answer. The walk is bounded by `PAGE_MAX` and by
+  `BODY_CAP` checked as the pages sum, a `link` next page must be on the origin the sheet names (scheme and port
+  included), and `page_param` naming the sheet's own `cursor` is refused because paging overwrites it on every request.
+  **The sheet keeps nothing from a poll that failed part way**: a 429 or a 5xx on any page is the one `later()` retry
+  path for the whole poll, every other refusal throws into the catch, and the next scheduled poll starts at page one.
+  The failure row names the page that broke, so its repro replays that request. The pre-flight makes one request
+  whatever `page_by` says. **A sheet's `mode` says what a good run does to the runs before it.** It is one of
+  `NET_MODES` (`append`, `replace`, `upsert`), a sheet without one appends the whole log the way every feed did, and
+  `storeConfig()` reads and refuses it beside `pageConfig()` off the same document and before a request goes out -- with
+  `key`, the dotted path into one row an `upsert` supersedes by, which that mode needs and every other refuses, and
+  `rows_path`, the dotted path to the array of rows in an envelope, which `pageRows()` honours before its one-array
+  guess so a feed answering `data` beside `included` names which one is the answer. `NET_PATH` is the one spelling all
+  three dotted paths are checked against, and `atNames()` the one walk along them, answering nothing where the path runs
+  out so each caller refuses in its own words. `netRow()` takes the `Storing` beside the meta and does the insert and
+  what it supersedes in one transaction: `replace` deletes the sheet's earlier `POLL_OK` rows, `upsert` writes the
+  sorted distinct key values as `meta.keys` (`rowKeys()`, reading the array itself or the one at `rows_path`, refusing a
+  row holding nothing at the key by its position rather than skipping it, and refusing a number past
+  `Number.MAX_SAFE_INTEGER` -- JSON has no integer past 2^53, so `JSON.parse` has already folded two distinct ids into
+  one float before this server sees them, which is the merge upsert exists to prevent) and deletes the earlier rows
+  whose `meta->'keys'` overlap them, guarded inside a `case` on `jsonb_typeof`. **Only a 2xx supersedes anything**: a
+  retry row and a caught refusal are handed `null`, so one bad poll cannot empty the sheet, and the failure rows stay
+  under `replace` because `POLL_OK` never counted them -- as does a run `POLL_OK` grades on `shape_change`, which a
+  query over the sheet does not read either. The run log stays the unit -- the key says which earlier runs this one
+  replaces, not which rows -- and `trimNet` and the digest dedupe are unchanged, so a repeated body still moves its row
+  to now and that moved row is the one `replace` keeps. **A 304 keeps every field the row it moves already held**,
+  `meta.sig` and `meta.keys` among them, and overwrites only the three a not-modified answer changes: a quiet tick that
+  rebuilt the row's meta out of the validators alone left a row that no longer said what it had answered for, and the
+  next real run superseded nothing.
 - **A body is parsed by the type it declares.** `BODY_PARSERS` is the list -- `text/csv`, `text/tab-separated-values`,
   `application/x-ndjson`, `application/jsonl`, `application/gzip`, `application/x-gzip`, `application/zip`,
   `application/x-zip-compressed`, `application/xml`, `text/xml`, `application/rss+xml`, `application/atom+xml`,
-  `text/html`, `application/xhtml+xml` -- and `readFeedBody` is the one reader both doors call: `pollNetOnce` on every
-  page it reads, and `POST /net/:id` after the signature. A type on none of the list is stored as the text it arrived
-  as, which is what a JSON feed hands us already, and a body that did not answer 2xx is never parsed. A CSV and a TSV go
-  through `parseDelimited`, the text-to-`{cols, rows}` core lifted out of `readImport()` -- the importer is a thin
-  wrapper over it, so a feed's digits are numbers, its blanks are nulls and its ragged line is refused by number exactly
-  as an uploaded file's are, and `source` is what every one of those refusals names the line in: the uploaded file
-  there, the url here. `assertRoom` stayed behind in `readImport`: the row quota is a sheet's, and only that door makes
-  a sheet, so a feed's rows are bounded by `BODY_CAP` alone the way a JSON feed's always were. The rows are stored keyed
-  by column name; `col.key` is the document's own spelling and stays with the importer, the one door that writes a
-  document. NDJSON is one JSON value a line, a blank line no record and a line that will not parse a refusal naming it.
-  `expand()` is the one bounded decompressor and both compressed doors go through it: bytes are fed to
-  `DecompressionStream` `EXPAND_SLICE` at a time and read back through `readBody`, so a bomb is refused holding one
-  slice's expansion past the cap rather than the gigabyte it writes; handed the whole of a bomb at once the decompressor
-  answers all of it in one chunk, which is the cap spent after the memory is gone. It has one home rather than two
-  copies because it is a subtlety that only shows up under attack; it slices **before** the stream exists so `pull`
-  cannot throw, and it refuses a non-`Uint8Array` argument as ours -- a `TypeError` raised inside `pull` was caught by
-  the decompressor's own catch and reported as the host having sent a bad body. What came out of a gzip is read by its
-  first character -- a bracket or a brace is JSON, everything else a CSV -- because nothing in an answer says what a
-  gzip holds. **`BODY_CAP` is spent on three different numbers**, and no one of them stands in for another: the bytes
-  that arrived, what a gzip decompressed to, and what the body _means_ -- a file names its columns once and the rows it
-  means name them on every row, so a few kilobytes on the wire is megabytes in the column. The poller's cross-page sum
-  counts that third number too, what `readFeedBody` answered and not the wire bytes a page carried: three gzip pages
-  each under the cap decompressed summed to twice it while their wire bytes stayed at kilobytes. Every parsed body is
-  stored as the JSON text it means -- the array of rows for every format that holds one, and the document itself for a
-  generic XML body -- so `shapeOf`, `meta.sig`, `pageRows`, the export and every query downstream see exactly what a
-  JSON feed hands them, and a body its own declared type cannot parse is that poll's failure row or that delivery's 400,
-  never a stored blob. `BODY_DEPTH_MAX` bounds how many containers one body nests, because the only other thing stopping
-  a zip quine is a table two screens away holding no `zip` row.
+  `text/html`, `application/xhtml+xml`, `application/vnd.apache.parquet`, `application/x-parquet`, `application/parquet`
+  -- and `readFeedBody` is the one reader both doors call: `pollNetOnce` on every page it reads, and `POST /net/:id`
+  after the signature. A type on none of the list is stored as the text it arrived as, which is what a JSON feed hands
+  us already, and a body that did not answer 2xx is never parsed. A CSV and a TSV go through `parseDelimited`, the
+  text-to-`{cols, rows}` core lifted out of `readImport()` -- the importer is a thin wrapper over it, so a feed's digits
+  are numbers, its blanks are nulls and its ragged line is refused by number exactly as an uploaded file's are, and
+  `source` is what every one of those refusals names the line in: the uploaded file there, the url here. `assertRoom`
+  stayed behind in `readImport`: the row quota is a sheet's, and only that door makes a sheet, so a feed's rows are
+  bounded by `BODY_CAP` alone the way a JSON feed's always were. The rows are stored keyed by column name; `col.key` is
+  the document's own spelling and stays with the importer, the one door that writes a document. NDJSON is one JSON value
+  a line, a blank line no record and a line that will not parse a refusal naming it. `expand()` is the one bounded
+  decompressor and both compressed doors go through it: bytes are fed to `DecompressionStream` `EXPAND_SLICE` at a time
+  and read back through `readBody`, so a bomb is refused holding one slice's expansion past the cap rather than the
+  gigabyte it writes; handed the whole of a bomb at once the decompressor answers all of it in one chunk, which is the
+  cap spent after the memory is gone. It has one home rather than two copies because it is a subtlety that only shows up
+  under attack; it slices **before** the stream exists so `pull` cannot throw, and it refuses a non-`Uint8Array`
+  argument as ours -- a `TypeError` raised inside `pull` was caught by the decompressor's own catch and reported as the
+  host having sent a bad body. What came out of a gzip is read by its first character -- a bracket or a brace is JSON,
+  everything else a CSV -- because nothing in an answer says what a gzip holds. **`BODY_CAP` is spent on three different
+  numbers**, and no one of them stands in for another: the bytes that arrived, what a gzip decompressed to, and what the
+  body _means_ -- a file names its columns once and the rows it means name them on every row, so a few kilobytes on the
+  wire is megabytes in the column. The poller's cross-page sum counts that third number too, what `readFeedBody`
+  answered and not the wire bytes a page carried: three gzip pages each under the cap decompressed summed to twice it
+  while their wire bytes stayed at kilobytes. Every parsed body is stored as the JSON text it means -- the array of rows
+  for every format that holds one, and the document itself for a generic XML body -- so `shapeOf`, `meta.sig`,
+  `pageRows`, the export and every query downstream see exactly what a JSON feed hands them, and a body its own declared
+  type cannot parse is that poll's failure row or that delivery's 400, never a stored blob. `BODY_DEPTH_MAX` bounds how
+  many containers one body nests, because the only other thing stopping a zip quine is a table two screens away holding
+  no `zip` row.
 - **A NUL byte is refused where a body becomes the text a row stores.** Postgres text cannot hold one and the column is
   text because a body is a body, so `readFeedBody` asks its own answer for one as its last act, beside the `BODY_CAP`
   refusal and on the same `meant` and the same `source` -- which is what makes it one rule for both doors rather than
@@ -414,20 +430,43 @@ navigation, in file order:
   `<link href=...>` carries the url. A namespace prefix is dropped (`removeNSPrefix`), which is what makes `<a:entry>`
   an entry and a prefixed element addressable at all, since `rows_path` is checked against `NET_PATH` and a colon is not
   in it.
-- **A markup body is decoded the way it says to decode it.** `markupText()` is the only place a body's own encoding is
-  read, because XML and HTML are the only formats here that state one -- a CSV or an NDJSON body is still decoded as
-  UTF-8 whatever its answer said. The order is the one the web reads these in: a byte-order mark or the NUL beside the
-  opening `<` first, because a sixteen-bit document cannot be sniffed for its own declaration as UTF-8 and one was
-  refused as "not XML" on every poll forever; then the answer's own `charset` parameter (`CHARSET_PARAM`), which is what
-  lets a Latin-1 page carrying no `<meta charset>` be read at all rather than refused on its first accent; then a regex
-  over the first `MARKUP_HEAD_BYTES` -- `XML_ENCODING` for the prolog's `encoding="..."`, `HTML_CHARSET` for a
-  `<meta charset>` -- both ASCII by definition and so readable before the first byte that is not; then UTF-8. The decode
-  is **fatal**: Latin-1 RSS and Latin-1 HTML are both still common, and a bare UTF-8 decode turned every accented
-  character into U+FFFD and stored that as a cell, which nothing downstream can tell from a character the feed actually
-  sent. A label this runtime has no decoder for is its own refusal. The in-document scan cuts HTML comments and script
-  bodies out of the head first, because this runs before there is a parser that could know a `<meta charset>` written
-  inside a `<script>` string is not a declaration -- one there, ahead of the real tag, decoded a UTF-8 page as Latin-1
-  and stored the mojibake.
+- **A body is decoded in the encoding it declares, whatever its type.** `decodeAs()` is the one decoder construction and
+  the one home of the two refusals a label can earn: a label this runtime has no decoder for, and bytes that are not
+  that label. It is fatal, because a replacement character kept as a cell cannot be told from a character the feed
+  actually sent, and it strips nothing off the front -- a `TextDecoder` takes a byte-order mark off itself for every
+  encoding that has one, so a U+FEFF that survives is a second mark and is the feed's own character. Every label
+  reaching it is what one of `CHARSET_PARAM`, `XML_ENCODING` or `HTML_CHARSET` captured, so it is a bounded run of
+  `[\w.:-]` and safe in a headline the way a zip member's name is not. `readFeedBody` reads the answer's own `charset`
+  for every type: a body that declares one is decoded through `decodeAs`, and one that declares none takes the non-fatal
+  UTF-8 decode every body took before -- nothing is sniffed in its place, so the only feed this moved is one whose
+  stated label is wrong, and that one was storing U+FFFD in a cell. The label applies to what is decoded, so a gzip
+  answer's expansion takes it too, and the unparsed branch (`application/json` among them) follows the same rule. A zip
+  member carries no content type of its own, so neither the `.json` member's decode nor the recursive read of any other
+  member has a declared encoding to honour -- what is handed on is a `ZIP_MEMBERS` name with no parameter on it, which
+  is the undeclared path reached by the data rather than by a branch. `markupText()` is what remains the reader of a
+  body's _own_ declaration, because XML and HTML are the only formats here that state one inside the document, and it is
+  one line over `decodeAs`. Its order is the one the web reads these in: a byte-order mark or the NUL beside the opening
+  `<` first, because a sixteen-bit document cannot be sniffed for its own declaration as UTF-8 and one was refused as
+  "not XML" on every poll forever; then the answer's own `charset`, which is what lets a Latin-1 page carrying no
+  `<meta charset>` be read at all rather than refused on its first accent; then a regex over the first
+  `MARKUP_HEAD_BYTES` -- `XML_ENCODING` for the prolog's `encoding="..."`, `HTML_CHARSET` for a `<meta charset>` -- both
+  ASCII by definition and so readable before the first byte that is not; then UTF-8. The in-document scan cuts HTML
+  comments and script bodies out of the head first, because this runs before there is a parser that could know a
+  `<meta charset>` written inside a `<script>` string is not a declaration -- one there, ahead of the real tag, decoded
+  a UTF-8 page as Latin-1 and stored the mojibake.
+- **A parquet body is read as bytes, never as text.** `BODY_PARSERS` names `application/vnd.apache.parquet`,
+  `application/x-parquet` and `application/parquet`; `application/octet-stream` is not on it, although most parquet on
+  the web is served as one. `readFeedBody` leaves `text` empty for `how === "parquet"` and a `reading === "parquet"` arm
+  reads the bytes, so the body still leaves through the one `BODY_CAP`-on-`meant` check and the one NUL check every
+  other type takes. `parquetRows()` is the reader: `PARQUET_MAGIC` at byte 0 and at the last four bytes first -- the
+  shape `xmlFeedRoot` takes, since a body that declares a format and is not one is a refusal and never an empty green
+  run -- then `parquetReadObjects` over an in-memory AsyncBuffer (`{ byteLength, slice }`), and one catch that re-raises
+  the library's throw as the four-field refusal, quoting the codec when the message names one, because gzip, zstd and
+  brotli need `hyparquet-compressors` and that package is not here. An INT64 arrives as a BigInt, which `JSON.stringify`
+  throws on, at any depth a schema nests it: inside the safe range it is the number it is and outside it its decimal
+  text, never a rounded number, the worry `rowKeys()` has about 2^53. A Date is its ISO string. `ZIP_MEMBERS` gains
+  `parquet`, so a `.parquet` member is the body of its archive; the table still names no archive, so `BODY_DEPTH_MAX` is
+  unchanged. The gzip sniff answers `json` or `csv` and never `parquet`, so a gzipped parquet body is still one cell.
 - **RSS and Atom answer their rows; generic XML answers its document.** The two feed formats name the element a row sits
   in, so there is nothing to guess: `xmlRows()` walks the parsed document depth-first with each node's children pushed
   reversed -- which is what makes a stack hand them back in document order, where breadth-first returned a nested feed's
@@ -509,25 +548,25 @@ navigation, in file order:
   space before it takes the text, because `textContent` gives neither any width of its own and `10<br>20` read as the
   single number 1020, which was in neither cell.
 - **Run it now, stop it, and see when it runs next.** `paused: true` in `data[0]` takes a net-http or an alert sheet out
-  of both tickers: `pollNetSheet` and `pollAlertSheet` -- the one-sheet halves the two 15-second ticks now loop over, so
-  the timer and the button are the same code -- return before the fetch and before the row, and put the due entry back
-  exactly as they found it, so a paused sheet is looked at on every tick and a started one is due when it always was.
-  **A paused sheet is also out of the two graded liveness conditions**, whose sentences say so -- otherwise pausing a
-  feed past `POLL_STALE_S`, or an alert past twice its interval, drove the grade below 1.0 and `GET /status` answered
-  the 503 it answers when the poller has died. It is read through `pauseSwitch`, and only for the sheets already below
-  1.0, worst first, stopping at the first that is not paused: that sheet is the minimum, so a healthy answer opens no
-  document at all and the pollers' own 15-second `find` of the same documents is what makes a warm isolate's walk a
-  cache hit. `OVERDUE_MAX` is what stops pausing from being a way to pass: it is the reported-only `OVERDUE_CONDITION`'s
-  bar, and past it the two conditions stop asking about the switch and grade from the worst sheet. `INTERVAL_MAX_S` is
-  the far end of an `interval` field, clamped the way 60 seconds already clamped the near end: past it,
-  `now + interval * 1000` is a time `Date` cannot express, and one runaway sheet took the whole account's freshness read
-  down with a `RangeError`. `POST /library/:id/run` polls one sheet now through those same two functions -- owner or
-  editor through `assertSheetEditor`, one unit of the sheet's budget through `spend(sheet_id, "runs", ...)`, and nothing
-  cleared first, because the poll sets the due entry off the sheet's own interval as its first act and the tick a second
-  later steps over it. It answers the `net` row the run landed, found by asking for the newest row stamped at or after a
-  watermark taken off Postgres's own clock: an append, a 304's move, a repeated body's move and a quiet alert tick all
-  land that way, and comparing against the newest row before the poll misread a repeat, which moves whichever row
-  carried that body and not always the newest. The watermark is carried as seconds
+  of both halves of the tick: `pollNetSheet` and `pollAlertSheet` -- the one-sheet halves `pollNetOnce` and
+  `pollAlertOnce` loop over, so the timer and the button are the same code -- return before the fetch and before the
+  row, and put the due entry back exactly as they found it, so a paused sheet is looked at on every tick and a started
+  one is due when it always was. **A paused sheet is also out of the two graded liveness conditions**, whose sentences
+  say so -- otherwise pausing a feed past `POLL_STALE_S`, or an alert past twice its interval, drove the grade below 1.0
+  and `GET /status` answered the 503 it answers when the poller has died. It is read through `pauseSwitch`, and only for
+  the sheets already below 1.0, worst first, stopping at the first that is not paused: that sheet is the minimum, so a
+  healthy answer opens no document at all and the pollers' own 15-second `find` of the same documents is what makes a
+  warm isolate's walk a cache hit. `OVERDUE_MAX` is what stops pausing from being a way to pass: it is the reported-only
+  `OVERDUE_CONDITION`'s bar, and past it the two conditions stop asking about the switch and grade from the worst sheet.
+  `INTERVAL_MAX_S` is the far end of an `interval` field, clamped the way 60 seconds already clamped the near end: past
+  it, `now + interval * 1000` is a time `Date` cannot express, and one runaway sheet took the whole account's freshness
+  read down with a `RangeError`. `POST /library/:id/run` polls one sheet now through those same two functions -- owner
+  or editor through `assertSheetEditor`, one unit of the sheet's budget through `spend(sheet_id, "runs", ...)`, and
+  nothing cleared first, because the poll sets the due entry off the sheet's own interval as its first act and the tick
+  a second later steps over it. It answers the `net` row the run landed, found by asking for the newest row stamped at
+  or after a watermark taken off Postgres's own clock: an append, a 304's move, a repeated body's move and a quiet alert
+  tick all land that way, and comparing against the newest row before the poll misread a repeat, which moves whichever
+  row carried that body and not always the newest. The watermark is carried as seconds
   (`extract(epoch from
   now()::timestamp)`) and compared with `extract(epoch from created_at)` -- `net.created_at`
   carries no timezone, and a bound timestamp parameter comes back hours off the rows it was taken beside. Refused by
@@ -571,19 +610,28 @@ navigation, in file order:
   server whose own database is somewhere else: a server whose database is on loopback is a developer's machine, and
   there the only refusal is its own database. A query over `@codex-db:x` whose connection is dead is that refusal, never
   an empty result.
-- **Exports**: `GET /export/:id.{csv,json,ndjson,md,ics,xlsx}` is one route over `EXPORTS`, so access, pagination and
-  query recursion are `sheet()`'s, and a format is added by adding a row. `xlsx` is the one entry that answers bytes
-  rather than text (`npm:xlsx@0.18.5`, SheetJS — a zip of XML parts is well past what we write ourselves; **written with
-  and never read with**, and every advisory it carries is in the parsers no route calls). The community edition writes
-  values typed off `canonicalType` (`xlsxCell`, so `pct` formats like `percentage`), a number format per column
-  (`XLSX_FORMATS`) and a width from the longest value bounded by `XLSX_WIDTH_MAX`; cell styles are Pro-only, so the
-  header is a row of text, and no styling dependency is worth one. A date is a number wearing a date format, computed
-  off `dateMs()` — the one spelling `icsStamp` also reads, so a date-only cell and a zoneless timestamp are both UTC and
-  never the server's timezone, which is what handing SheetJS a `Date` would have used. A value its column cannot hold (a
-  word in a `num` column) is written as the text it is rather than coerced or dropped, and one past `XLSX_CELL_MAX`
-  (Excel's own 32,767, which `XLSX.write` throws on) is refused by name: where it is and how long, never what it is. The
-  workbook's sheet name is the id stripped of the characters Excel refuses and cut to `XLSX_NAME_MAX`, because Excel
-  rejects the name rather than repairing it.
+- **Exports**: `GET /export/:id.{csv,json,ndjson,md,ics,xlsx,parquet}` is one route over `EXPORTS`, so access,
+  pagination and query recursion are `sheet()`'s, and a format is added by adding a row. `xlsx` and `parquet` are the
+  two entries that answer bytes rather than text (`npm:xlsx@0.18.5`, SheetJS — a zip of XML parts is well past what we
+  write ourselves; **written with and never read with**, and every advisory it carries is in the parsers no route calls
+  — and `npm:hyparquet-writer`, which depends on exactly the `npm:hyparquet` the poller reads with, so one copy loads;
+  both pure JS with no WASM to instantiate on a cold start, the reason linkedom is here). **A parquet column holds one
+  type, so the type is decided once per column.** `PARQUET_TYPES` is read through `canonicalType` the way `EXPORTS.xlsx`
+  reads it, so a `pct` column is a number: `int` is INT64, every other `NUMERIC_TYPES` member DOUBLE, `bool` BOOLEAN,
+  `date` and `timestamp` TIMESTAMP in millis off `dateMs()`, `json` JSON, and everything else STRING. `parquetColumn()`
+  makes that decision in one pass, and a column holding any non-null value its own type cannot hold is written whole as
+  STRING, each value the text it is: nothing is coerced into a wrong number and no row is dropped, where `xlsxCell`
+  falls back a cell at a time. A blank is a parquet null. A number format has no home in the file format, so `decimals`
+  and `format` are not written. It is built off `named()`, so a sheet with two columns of one name is refused exactly as
+  `.csv` refuses it. The community edition writes values typed off `canonicalType` (`xlsxCell`, so `pct` formats like
+  `percentage`), a number format per column (`XLSX_FORMATS`) and a width from the longest value bounded by
+  `XLSX_WIDTH_MAX`; cell styles are Pro-only, so the header is a row of text, and no styling dependency is worth one. A
+  date is a number wearing a date format, computed off `dateMs()` — the one spelling `icsStamp` also reads, so a
+  date-only cell and a zoneless timestamp are both UTC and never the server's timezone, which is what handing SheetJS a
+  `Date` would have used. A value its column cannot hold (a word in a `num` column) is written as the text it is rather
+  than coerced or dropped, and one past `XLSX_CELL_MAX` (Excel's own 32,767, which `XLSX.write` throws on) is refused by
+  name: where it is and how long, never what it is. The workbook's sheet name is the id stripped of the characters Excel
+  refuses and cut to `XLSX_NAME_MAX`, because Excel rejects the name rather than repairing it.
 - **Outbound webhooks**: `POST /library/:id/webhook` names a url, which must answer a signed `ping` 2xx before it is
   registered, and that ping is where a url inside our network is refused by name. `flushWebhooks()` posts one signed
   `change` per hook per flush for every document `touched` since the last, heard as the storage's `doc-saved` and
@@ -640,14 +688,28 @@ navigation, in file order:
   holds the false-positive rate that misses buys. In the page the claim is a second checkbox under the public one,
   `SharePersonal` holding it in `model.share` and the next `SharePublic` sending it through `shareAction` as `personal`,
   which `index.html`'s public branch forwards. **`library:lineage` is what feeds a sheet**: one row per (`sheet_id`,
-  `name`, `type`, `depends_on`, `depends_on_name`, `depends_on_type`) for every query, alert and chart sheet the caller
-  has a `sheet_usr` row on, the code read from the live automerge document (`data[0].code`, or `chartSql(data[0])` for a
-  chart) and never `sheet.row_0`, handed to `scanRefs` and deduped so a self-join is one edge, `depends_on_name` read
-  only off the sheets the caller holds a role on, and a document that will not load a row whose `depends_on` is null and
-  whose `name` carries the refusal. It answers whole rather than paged the way a dashboard's tiles do, bounded twice --
-  `USER_SHEETS_MAX` on the documents it opens and `MAX_QUERY_ROWS` on the edges they name, because nothing caps the refs
-  one sheet's code holds -- and it is registered where `library:freshness` is: the early return in `sheet()`,
-  `assertNoKeys`'s skip list, and `GET /library/lineage`.
+  `name`, `type`, `depends_on`, `depends_on_name`, `depends_on_type`, `columns`) for every query, alert and chart sheet
+  the caller has a `sheet_usr` row on, the code read from the live automerge document (`data[0].code`, or
+  `chartSql(data[0])` for a chart) and never `sheet.row_0`, handed to `scanRefs` and deduped so a self-join is one edge,
+  `depends_on_name` read only off the sheets the caller holds a role on, and a document that will not load a row whose
+  `depends_on` is null and whose `name` carries the refusal. It answers whole rather than paged the way a dashboard's
+  tiles do, bounded twice -- `USER_SHEETS_MAX` on the documents it opens and `MAX_QUERY_ROWS` on the edges they name,
+  because nothing caps the refs one sheet's code holds -- and it is registered where `library:freshness` is: the early
+  return in `sheet()`, `assertNoKeys`'s skip list, and `GET /library/lineage`. **`library:lineage` also names which
+  columns each edge reads.** The `columns` column is in three states and never a guess: the sorted comma-joined names
+  the dependent's own statement mentions that **exactly one** of that dependent's refs holds as a column, which is the
+  rule `examples_test.ts`'s `ambiguous` set already types a joined column by; `*` where `SELECT_STAR` says the statement
+  holds a `select *` or an `alias.*`, which reads every column of everything it names, is knowable off the statement
+  alone and so outranks the next state and opens no document; and `?` where the ref's columns could not be read -- a
+  sheet outside the caller's `mine` map, a type whose `data[0]` holds settings rather than a column row (a query's
+  columns are what running it answers and lineage never runs one), a document that will not load, and a table document
+  holding no column row at all, because an empty list is not free here: it is also the honest answer for a ref the
+  statement names no column of. `namesIn()` in `src/sql.mjs` is what a statement mentions and `readColumns()` what a ref
+  holds: the document's own `data[0]` names for a `table` sheet and null for everything else, memoized in one Map per
+  call and asked only of sheets already in `mine`, so `USER_SHEETS_MAX` still bounds the documents opened and a sheet
+  ten queries name is opened once. A ref nothing could read holds no name in the count, so an unreadable sibling neither
+  claims a name nor takes one off the ref that does. The row for a document that will not load keeps its shape -- null
+  `depends_on`, the refusal in `name` -- with `columns` null, as does the row for a dependent naming no ref.
 
 ## Query engine (`src/sql.mjs`)
 
@@ -686,7 +748,79 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   `rewriteExtremes`, which is why `min([total])` is aimed at `min_text` exactly as `min(total)` is. `checkResultColumns`
   needs nothing -- every chart column is aliased. `rewriteUnpivot`'s value column and name column are held to the same
   `/^[A-Za-z_][A-Za-z0-9_]*$/` shape as its in-list, so all three names in one clause obey the one rule and the refusal
-  names which of the two is wrong.
+  names which of the two is wrong. `chartIdent` takes the thing that named the column first (`chartIdent("chart", ...)`,
+  `chartIdent("cohort table", ...)`), so its refusal says whose column is wrong, and every chart refusal names "this
+  chart's settings" the one way.
+- **`namesIn()` answers what a statement mentions, never which sheet it belongs to.** It is the distinct identifiers of
+  one statement, and three things are blanked before one is read: string literals, the way `rewriteWindows()` blanks
+  them; every sheet ref, down to the column a cell ref names, so `@table:x` contributes nothing and `@table:x.col`
+  contributes `col`; and every alias the statement gives its own result, **everywhere it is spelled again** and not only
+  after its `as` -- a cohort table's `as cohort` reads again in its own `group by cohort`, and a window's `as
+  trend`
+  in a caller's `where trend > 0`, and blanking the declaration alone let a query built from `cohortSql()` claim
+  `cohort`, `active` and `month_no` as columns of the sheet it reads whenever that sheet held a real column of the same
+  name. `x as x` is left alone: it is not an invented name, and it is exactly how `cohortSql` writes its key column, the
+  one column a rename would break. Blanked there rather than skipped at the match **because the statement is text a
+  browser syncs in at any length**: reading back over the whole of it per name is quadratic, and 288 KB of query cost
+  three seconds inside a loop that runs once per sheet in the account; each alias is one more pass over the text, so the
+  aliases are bounded by `MAX_NAMES` before the names are. What is left is read once, forwards -- a name a `(` follows
+  is a function, a name a `.` follows is a qualifier, a bracketed name is the bare one through `bare()` -- and the
+  lookahead that forbids a shorter match is what stops `count(` from backtracking to `coun` and being read as a column.
+  `KEYWORD` is the one list of words a **bare** name is not a column by, read by `checkResultColumns`'s alias capture
+  and by this, widened past the clause keywords rather than joined by a third list; a bracketed or quoted name is exempt
+  in both readers, because it is in brackets precisely to be a column the engine would not otherwise parse, which is how
+  a chart names an axis `end` or `order` -- and the widening once made `select min(x) as [end]` drop its text-min
+  refusal for an unexplained null, because the alias capture read the bare word list against a bracketed alias. Nothing
+  whose reading is also a plausible bare column name is on the list, which is why `date`, `int` and `number` stay in
+  `QUALIFY_WORDS` alone. `MAX_NAMES` bounds the identifiers one statement yields and its refusal carries the count and
+  the name it counted through.
+- **A cohort table is written once, not read.** The palette offers `build a cohort table from this sheet` over a table
+  or a query whose columns are known, and running it opens a new query sheet already holding the SQL.
+  `cohortSql({ source, date, key, value, grain })` in `src/sql.mjs`, directly after `chartSql`, generalises the bundled
+  `query:cohort-retention`: the cohort is the first period a key appears in (`min_text` over `date_trunc`, because
+  AlaSQL's `min` drops the ISO text a date column reaches the engine as), and each row is that cohort, the periods
+  since, the keys still active, and the value summed and per key. An empty `value` writes the count-only table. Unlike
+  `chartSql`, which runs on every read of a chart, this runs **once, at creation**: the text becomes an ordinary query
+  sheet's `code` its owner then edits, and there is no cohort sheet type for anything to build it a second time.
+  `source` takes the two prefixes a chart takes; `date`, `key` and `value` go through the same `chartIdent` a chart's
+  axes do. `grain` is checked against the keys of `COHORT_LABEL`, which is how much of `date_trunc`'s ISO string the
+  cohort label is, one entry per unit `UNITS` lists: a unit added there with no width here is refused by name rather
+  than reaching `substr` as an undefined length, which is also why the refusal quotes those keys and not `UNITS`. **No
+  column it reads may be a name the statement gives itself** -- `cohort`, `first_seen`, `active`, `<grain>_no` -- and no
+  value may be the date or the key. None of those fails on either engine: a key named `cohort` is joined against the
+  truncated first date and matches nothing, so the table comes back empty; one named `<grain>_no` overwrites the period
+  number in every row; and a value summed off the key or the date column is text AlaSQL drops, so that field is missing
+  from every row. Which collisions corrupt and which happen to survive is AlaSQL's own alias shadowing, so all of them
+  are one named refusal. Elm cannot import `src/sql.mjs`, so the palette sends the fields on `DocNew` and `newDoc` in
+  `src/index.html` calls `cohortSql` and writes its answer as the new document's `code`, the guesses not travelling with
+  it and a refusal riding `catchy` to `model.error`. The columns are **guessed and never asked for** -- the first date
+  or timestamp, the first name ending in `_id` else the first text column, the first usd column else none, by month --
+  because the item is a helper that writes the SQL rather than a wizard, and `arrangeable` is what answers where a sheet
+  keeps its columns. The command is not offered at all over a sheet `arrangeable` answers nothing for, or one with no
+  date or no key column: a command that can only fail is not a command. Creating a query sheet needs no login, unlike
+  subscribing, so it is not gated on `auth.state`. `examples_test.ts` checks the written table against the bundled one
+  row for row in both engines (on rows, never on SQL text), and `library_test.ts` checks the command, its payload and
+  its two absences on the palette test's existing boot.
+- **A seasonal series is decomposed by three windows, and the pass is the one that already reads a whole partition.**
+  `trend(y, period)`, `seasonal(y, period)` and `deseasonalized(y, period)` are the classical additive decomposition --
+  `DECOMPOSE` is the list, they branch where `OFFSET` does, before `frameBounds`, so a frame clause never reaches them,
+  and the period is `w.counted[0]`, the literal after the value that `ntile` already reads. trend is the centred moving
+  average of width `period`: for an even period the 2 x period average, half weight on each of the two end rows, and
+  null on the first and last floor(period/2) rows, which have no window to sit in the middle of. seasonal is the mean of
+  (y - trend) over the rows sharing the row's phase, `pos % period` within the ordered partition, centred so one cycle
+  sums to zero; deseasonalized is y minus it. `decompose()` answers all three for a partition at once and `decomposed`,
+  a WeakMap on the `ord` array `applyWindows` allocates fresh for each window of each partition, is what keeps the
+  per-row read from walking the series again -- the three functions of one query hold three entries and each walks it
+  once, which is why a partition costs a pass per window and not a pass per row. A blank cell is the normal state of a
+  spreadsheet column, so a blank y is a null trend and a null deseasonalized rather than a refusal. Refused by name: a
+  period that is not a whole number of at least 2, a partition holding fewer than two whole cycles with both numbers in
+  the message, a step of the cycle no trend row covers -- averaging nothing is a NaN every row downstream would carry --
+  and a value `winNum` cannot add up. All three are `null` in `WINDOW_TYPES` and absent from `SELECT_TYPES`: they follow
+  their argument and they are windows only, and `main.ts` demotes them from `int` to `num` beside `avg`, because a
+  moving average of whole numbers is not a whole number. **It is not a forecast**: `applyWindows` writes into rows the
+  engine has already returned, so nothing here can add a future row, and `rewriteWindows` refuses a window wrapped in
+  arithmetic, so `trend + seasonal` is a second query over the first -- `query:visit-decomposition` and
+  `query:visit-fit` over `table:park-visits` are the bundled pair.
 - **Types**: `COLUMN_TYPES` is every type a column may declare and what each one is; `NUMERIC_TYPES` is derived from it
   and `knownType()` matches the `enum:` family by prefix. `checkColumnTypes()` is the one place a cell becomes what its
   column says — a blank becomes `null`, a numeric string becomes its number. `selectTypes()` types a result column off
@@ -762,9 +896,11 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   it had. A trashed sheet is out of the library table, the demo strip and `paletteCommands`; `model.trash` swaps the
   last library column between `Trash` and `Restore` + `Delete`, and hides the footer's new-sheet rows.
 - **The star and the trash are one kind of fact: this browser's, about somebody else's sheet.** `starred` joins `seen`
-  and `trashed` as the third stored field that survives a system entry in `library()` (`src/page.mjs`), so starring a
-  bundled demo outlives the next merge; the three are one list there, overlaid only when truthy, because a stored
-  `false` is the absence a bundled entry already carries. `updateLibrary` is still the one port that writes them --
+  and `trashed` as the third stored field **overlaid** onto a system entry in `library()` (`src/page.mjs`), so starring
+  a bundled demo outlives the next merge; the three are one list there, taken only when truthy, because a stored `false`
+  is the absence a bundled entry already carries. `tags` is the fourth such field and the one that **merges** rather
+  than overlays, bundled first and no duplicates, because a bundled demo's own tags are what `viewGallery` filters on
+  and a tag this browser put on it was lost on the next merge. `updateLibrary` is still the one port that writes them --
   `Library.set` in `index.html` drops a null field out of the patch, so a fourth field cost it nothing. `Star` is a
   `Type` the way `Trash` is: a `spec` entry, a `seriesEncoder` branch and a `cellDecoder` branch, and nothing in
   `columnTypes`, because no document declares it; its cell carries both halves (`{id, on}`), so the toggle never reads
@@ -914,6 +1050,24 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   swallowed: a preview saying one row would go while it never looked at half the sheet is a preview lying about the
   sheet. The delete itself is `rowDeletions`, so undo, the viewer refusal and the sync path are the ones already
   written.
+- **A numeric column can be drawn as a picture of itself.** `Shade` is `Scale` or `Bars` -- spelled `Bars` because `Bar`
+  is already a `ChartKind` -- `shadeSpec` is the one table of the word a document stores and the label the panel offers,
+  and `shade` is the lenient reader, so a word nobody wrote is a column nobody shaded rather than an error, the way a
+  format nobody wrote is. It rides the arrangement: the panel's select under the format select, behind the same
+  `numericColumn` gate `decimals` and `format` use, one click one `arrange`, stored as the view field `shade` in both
+  homes. The extent it is drawn against is `columnExtent` over the rows as drawn -- sorted, filtered, searched --
+  computed once per shaded column in `view` beside `pins` and threaded through `viewTableRow` into `viewCell`,
+  deliberately not `sheet.stats`, which is whole-document and `Err` for a query sheet, for the reason `columnTotal`
+  beside it is not. Both ends and the cell sitting between them go through `positional`: JSON's own `1e400` decodes to
+  Infinity without ever failing `number`, and folded in with `min`/`max` it stretched the column's scale to an endpoint
+  no finite cell holds. The colour goes on a block `div.shade` **inside** the `td` and never on the `td`, because an
+  inline background there outranks `td.selected`, `td:hover` and the match highlight by specificity and selection and
+  find would vanish on every shaded column; it is drawn in the data arm alone, so the header, the stats and the totals
+  rows stay plain. `numericColumn` is asked again where the extent is built, because the panel's gate is this browser's
+  and a shade word may arrive on a text column from a document elsewhere -- `format` and `decimals` need no such copy,
+  since `cellDecoder`'s `Text` branch never reads them. `formatNumber` is untouched: a shade is a background, not text.
+  The server never reads a column's `decimals` or `format` and so never reads `shade`; there is no copy of `Shade`
+  outside `src/Main.elm` and nothing for `browser_test.ts` to hold equal.
 - **`formatNumber` is the one place a number becomes text.** The cell, the stats row and the totals row all go through
   it; they used to format independently and a `usd` column's total came out without its `$`. A value `positional` says
   is not written as digits — not finite, or a magnitude JavaScript writes as `1e+21` — skips the currency, the grouping
@@ -941,20 +1095,20 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   and a query, because the arrangement is kept; the library and the shop, because their order is how you read a listing
   this app builds and there is no document under it. Everything else is a feed — its rows are a run log, and a sort that
   worked and then forgot read as a bug in saving.
-- **The arrangement is stored on the columns, in two homes.** Sort, filter, hidden, pinned, width, decimals and format
-  live in `data[0]` as `sort`/`rank`, `filter`, `hidden`, `pinned`, `width`, `decimals`, `format`, so they survive a
-  reload and travel with a share. `viewDecoder` reads them on `DocSelect` and `arrange` writes them, diffed against
-  `sheet.storedView` so closing an untouched filter panel writes nothing. The panel's two typed fields — the filter box
-  and the decimal count — write the model on every keystroke and reach the document when the panel closes: a patch per
-  character is a sync per character for everybody watching, and typing "10" meant a 1 nobody chose. The format select
-  has no keystrokes to hold back, so one click is one `arrange`. A format spelled in a way nobody wrote is no format,
-  the way an out-of-range count is no count and an unusable width is no width — the arrangement is how you were reading
-  the rows, and losing it must never cost you the rows. `colViewFields` is at `D.map8` now, which is the ceiling: a
-  ninth view field needs `andThen` rather than another `map`. It goes around `updateDocMsg`: a resize is not data and
-  does not belong on the undo stack. `tableHome` and `queryHome` are the two addresses — a table's `data[0]` is the
-  column list, so the address is the position; a query's is one object, so the fields live under `view`, keyed by column
-  name the way its `cols` overrides are. `arrangeable` is the one `case` that picks, and `pruneView` is a table only,
-  deliberately.
+- **The arrangement is stored on the columns, in two homes.** Sort, filter, hidden, pinned, width, decimals, format and
+  shade live in `data[0]` as `sort`/`rank`, `filter`, `hidden`, `pinned`, `width`, `decimals`, `format`, `shade`, so
+  they survive a reload and travel with a share. `viewDecoder` reads them on `DocSelect` and `arrange` writes them,
+  diffed against `sheet.storedView` so closing an untouched filter panel writes nothing. The panel's two typed fields —
+  the filter box and the decimal count — write the model on every keystroke and reach the document when the panel
+  closes: a patch per character is a sync per character for everybody watching, and typing "10" meant a 1 nobody chose.
+  The format and shade selects have no keystrokes to hold back, so one click is one `arrange`. A format spelled in a way
+  nobody wrote is no format, the way an out-of-range count is no count and an unusable width is no width — the
+  arrangement is how you were reading the rows, and losing it must never cost you the rows. `colViewFields` reads eight
+  fields through `D.map8` and the ninth, `shade`, by handing the record that half-built one more argument through
+  `andThen`; a tenth needs the same again. It goes around `updateDocMsg`: a resize is not data and does not belong on
+  the undo stack. `tableHome` and `queryHome` are the two addresses — a table's `data[0]` is the column list, so the
+  address is the position; a query's is one object, so the fields live under `view`, keyed by column name the way its
+  `cols` overrides are. `arrangeable` is the one `case` that picks, and `pruneView` is a table only, deliberately.
 - **Reorder is a splice, pin is a sum.** A move is one `move` patch — on `data[0]` for a column, on `data` for a row —
   applied by `applyPatches` in `index.html` to the value the document already holds — rows are keyed by `col.key`, so no
   cell moves and the display index stays the document index. It is a `DocMsg` and not an arrangement: everyone looking
@@ -1087,13 +1241,49 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   same folded points.
 - **The palette is where you subscribe to a sheet.** `paletteRows` is what the palette reads now: the
   `subscribe to this
-  sheet` command over a table, a query, a net-http or a net-hook, and then `paletteCommands`, whose
+  sheet` command over a table, a query, a net-http or a net-hook, then
+  `build a cohort table from this sheet` (see the Query engine's cohort bullet), and then `paletteCommands`, whose
   signature stays the library and the query so the shortcut sheet and the palette still cannot drift. The command is a
   plain `DocNew` -- the footer's own new-alert door with `select * from @<sheet id>`, `when: added`, the default
   interval and `model.auth.email` filled in -- and it is offered only while `auth.state` is `LoggedIn`, because what a
   visitor typed into the login form is a string in that same field and not an account. `index.html` is what knows the
   address: it stores the email beside the session at login and hands it back on `authResult`, because logging in reloads
   the page.
+- **A tag is put on many sheets at once from the library strip.** `TagSelected` is a top-level `Msg` beside
+  `TrashSelected`, because `updateDocMsg` refuses every `DocMsg` on the library: it reads the sheet ids off the drawn
+  rows through `libraryIdAtRow` per selected y and fans out one `updateLibrary` per sheet through `Cmd.batch`. The tag
+  itself is `sheet.tag`, held the way `splitOn` and `near` are -- written by `TagInput` on every keystroke, never by the
+  document -- typed into the box `viewGallery` draws at the end of the strip and run by the `tag selected` chip or by
+  Enter through `onTagKeydown`. It is **added** to what the sheet already carries, read off `model.library`, so the
+  `demo` and `example` tags the strip filters on survive it and a sheet that already holds the tag is written nothing;
+  it is `String.trim`med and never lowercased, the way the tags cell edit is. It is not in `shortcutGroups`: that list
+  carries a bare `Msg` and the palette reads it, and this verb has an argument. Refused by name with nothing written: a
+  sheet that is not the library, a selection holding no library row, an empty tag, and a tag holding a comma, which a
+  tags cell would read back as two.
+- **The shop is browsed by its own columns.** `GET /shop` answers `type` (the listing's `sell_type`) and `tags` beside
+  name, price and license, and takes `?tags=` for a listing whose tags array holds that value, beside the `?name`,
+  `?sell_type` and `?sell_price` it already took. There is no second filter UI: the column panel is the facet, which
+  `arrangeControls` already admits on the shop, and the page asks for `/shop?limit=` `shopLimit` so what it filters is
+  the whole catalogue rather than `cselect`'s first page. The answer's `Content-Range` still carries the count, which is
+  what says the catalogue has outgrown one page.
+- **A `json` cell that holds a series draws it.** `cellDecoder`'s `Json` branch is a `D.oneOf`: `D.list D.float` through
+  `sparkValues`, and the lenient `string` for everything else -- an object, a nested array, a mixed array, an array of
+  one and an empty one all draw exactly the text they always drew. `sparkValues` answers `Nothing` for fewer than two
+  values or any drawn value that is not finite, and otherwise scales the last `sparkMax` of them to 0..1 by their own
+  min and max, all-equal values at a half. `viewSpark` is the bar loop both the cell and `viewThumb` draw through -- the
+  thumbnail's values arrive pre-scaled from `docThumb` in `src/page.mjs`, the cell's are scaled here. No new column
+  `Type` and no view field: a `json` column is still one word in `COLUMN_TYPES`, in `main.ts`'s `Type` union and in
+  `columnTypes`.
+- **A control that draws as a glyph or a placeholder says what it is.** `viewModal` takes a label and stamps
+  `role="dialog"`, `aria-modal="true"` and `aria-label` on the one panel every modal is built from, so settings, import,
+  delete-confirm, shortcuts and palette are labelled by the one edit. The icon-only buttons carry their own `aria-label`
+  -- the settings close, the find/replace close, both `DocError ""` dismissals and the tutorial dismissal -- as does the
+  toolbar's `⊞` library anchor, because a `title` is not a reliable accessible name. The inputs that carried only a
+  placeholder carry one too: the global search, `#palette`, the column panel's filter box (`"filter " ++ col.name`) and
+  the two `#account` inputs. The table is `role="grid"`, named off the sheet the way the toolbar names it. Still
+  missing: a focus trap or focus restore in a modal, a keyboard equivalent for the `.grab` and `.grip` drag handles,
+  `gridcell`/`aria-selected` on cells, `aria-activedescendant` in the palette, and the modals are not mutually
+  exclusive, so two `aria-modal` panels can be mounted at once.
 - **Known gaps**: `@library:freshness` and `@library:lineage` resolve on the server but not in the page. `describe`
   results carry no type in the page, and `WINDOW_TYPES` is server-only, so a window alias there falls back to the
   sheet's stored `cols`.

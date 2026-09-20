@@ -55,8 +55,13 @@ const tutorial = Table(
  * `seen` — when this browser last opened the sheet — `trashed` — whether it
  * threw the sheet away — and `starred` — whether it keeps the sheet at the top
  * of the library — are this browser's facts whoever owns the entry, so they are
- * the three stored fields that survive a system entry. A bundled demo has to be
+ * the stored fields that survive a system entry. A bundled demo has to be
  * trashable and starrable for the same reason it has to be openable.
+ *
+ * `tags` is the fourth and the one that merges rather than overlays: the
+ * bundled tags first, then the stored ones, no duplicates. A demo's own tags
+ * are what the gallery strip filters on, so a tag put on one here must not take
+ * them off.
  *
  * Restoring writes `trashed` back as `false` rather than null, because
  * Library.set drops a null field out of the patch rather than out of the entry —
@@ -77,10 +82,17 @@ export const library = (stored = {}) => {
     Object.entries(merged).map(([id, entry]) => {
       // Truthy and not `in`: a stored false is the absence a bundled entry
       // already carries, so unstarring one leaves it with no flag at all.
-      const e = ["seen", "trashed", "starred"].reduce(
+      const kept = ["seen", "trashed", "starred"].reduce(
         (kept, field) => (stored[id]?.[field] ? { ...kept, [field]: stored[id][field] } : kept),
         entry,
       );
+      // `Array.isArray`, not `?? []`: this browser's own writes are always an
+      // array, but a hand-edited or stale localStorage value is not, and
+      // spreading a non-array here threw for a number or an object and
+      // silently exploded a string into one letter per tag.
+      const arrayOf = (x) => Array.isArray(x) ? x : [];
+      const tags = [...new Set([...arrayOf(entry.tags), ...arrayOf(stored[id]?.tags)])];
+      const e = tags.length ? { ...kept, tags } : kept;
       return [id, e.doc && !e.thumb ? { ...e, thumb: docThumb(e.doc) } : e];
     }),
   );
