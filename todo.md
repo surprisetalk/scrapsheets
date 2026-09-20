@@ -112,19 +112,6 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
 
 ## Charts & dashboards
 
-- [ ] **A column named `total` can be charted.** `chartIdent` checks that a chart's x, y, y2 and series are plain column
-      names, and a SQL reserved word is one — so it passes, gets spliced in bare, and AlaSQL answers a raw parse error
-      with a caret into SQL the reader never wrote. Measured: `total`, `store`, `class`, `select` and `order` all break
-      as the **x** column on every kind (`select order as x, v as y …` has always failed, so this is not new); as the y
-      column they are fine. `line` and `box` are safe.
-  1. `chartIdent` refuses a reserved word by name, saying to rename the column — the cheap half, and it turns a parse
-     error into a sentence.
-  2. Quoting the identifier is the real fix and is one character, but `rewriteExtremes`, `selectTypes` and
-     `checkResultColumns` read the select list as text, so decide what a quoted name does to all three before changing
-     what `chartIdent` emits.
-  3. The same hole is in `unpivot`'s in-list and anywhere else a column name is spliced into generated SQL; fix it in
-     one place or not at all.
-
 - [ ] **A geo column draws a map.** Nothing renders geometry.
   1. Point maps and choropleths from a geo column.
   2. Boundary datasets as sheets — counties, tracts, ZCTAs, districts — are the other half and live in **Inventory**.
@@ -150,17 +137,6 @@ The unglamorous spreadsheet niceties. Their absence is what makes people leave.
   4. Google Sheets, Airtable and Notion by hand first: they are the migration path in and the OAuth shape everything
      else reuses.
   5. Bidirectional sync is the same definition read the other way, and waits on **Actions & write-back**.
-
-- [ ] **A NUL byte in a polled body is a named refusal, not an unexplained failure row.** `POST /net/:id` refuses one by
-      offset (Postgres text cannot hold a NUL); the poller has no such check, and an HTML cell carrying one reaches the
-      insert — verified: a `<td>` holding a NUL round-trips through `markupCell` with the byte intact.
-  1. The trap that makes this more than a one-line guard: `netRow()` is the poller's one writer, but a refusal thrown
-     there re-enters. `pollNetSheet`'s catch writes its own failure row through `netRow`, and that row's body is
-     `fetchFailure(...)`, whose `detail` is a slice of the same response text — so the same NUL throws again, this time
-     with nothing to catch it.
-  2. So the check belongs where a body becomes text that will be stored, before either path builds a row, and
-     `fetchFailure`'s `detail` needs the same treatment rather than a second copy of the rule.
-  3. Pre-existing: a JSON feed answering `"\u0000"` has always had it. HTML and XML only made it easy to hit.
 
 - [ ] **The response is parsed, not stored as a blob.** CSV, TSV, NDJSON, gzip, zip, XML, RSS, Atom and HTML land as the
       JSON they mean, read by the type the answer declares. XLSX, Parquet and PDF are still one cell. Each is one more
@@ -226,11 +202,9 @@ The runner is in **Now**. These are what the Demo Gallery needs on top of it.
   3. Business-day and fiscal-calendar triggers: third business day after month end. `business_days()` and
      `fiscal_period()` already do the arithmetic.
 
-- [ ] **You can backfill a schedule over a historical date range.** Running it now and pausing it are done; history is
-      not.
+- [ ] **You can backfill a schedule over a historical date range.** A net-http or alert sheet only ever runs forward
+      from the moment it was made.
   1. Backfill: run a schedule over a historical date range.
-  2. A paused sheet still ages in `library:freshness` and still drags the `GET /status` liveness conditions down; decide
-     whether `POLL_OK`/`ALERT_OK` should read `paused` before the backfill lands.
 - [ ] **Sheets run in dependency order.** Each runs on its own timer, so a downstream sheet can run before its source.
   1. A DAG derived from the `@sheet` refs `scanRefs()` already returns.
   2. A cycle is refused as the path that closes it, exactly as `checkRefPath` reports one.

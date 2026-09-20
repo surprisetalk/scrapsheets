@@ -37,8 +37,10 @@ import {
   type Method,
   NET_KEEP,
   netDue,
+  OVERDUE_MAX,
   PAGE_MAX,
   parseNetHeaders,
+  POLL_STALE_S,
   pollAlertOnce,
   pollAlertSheet,
   pollNetOnce,
@@ -5260,6 +5262,70 @@ Deno.test(async function allTests(t) {
     hostDue.clear();
   });
 
+  // An unlisted content type is the branch of readFeedBody that returns what
+  // arrived without reading it -- which is where a JSON feed's answer lands --
+  // so a byte Postgres cannot hold reached the insert and came back as a
+  // driver's words under a status-0 row, the unexplained failure this refusal
+  // exists to replace. The delivery door's half is asserted where the signature
+  // schemes are, and asserting it a second time here would say nothing new.
+  await t.step("A NUL byte in a polled body is a named refusal", async () => {
+    const { jwt } = await usr("nerea@example.com");
+    const feed = async (url: string) => {
+      const hand = automerge.create<Sheet>({ type: "net-http", data: [{ url, interval: 3600 }] });
+      const id = `net-http:${hand.documentId}`;
+      await put(jwt, `/library/${id}`, {});
+      return id;
+    };
+    const ids = {
+      raw: await feed("https://nulraw.body.test/feed"),
+      escaped: await feed("https://nulescaped.body.test/feed"),
+      zipped: await feed("https://nulgzip.body.test/feed"),
+    };
+    // The byte itself, beside the six characters a JSON encoder writes it as --
+    // which are text, and store like any other six.
+    const nulBody = `{"d":"a\u0000b"}`;
+    const escaped = String.raw`{"d":"a\u0000b"}`;
+    const zipped = new Uint8Array(
+      await new Response(
+        new Blob(["a\nx\u0000y\n"]).stream().pipeThrough(new CompressionStream("gzip")),
+      ).arrayBuffer(),
+    );
+    const fetcher = (url: string) =>
+      Promise.resolve(
+        url.startsWith("https://nulraw.")
+          ? new Response(nulBody, { headers: { "content-type": "application/json" } })
+          : url.startsWith("https://nulescaped.")
+          ? new Response(escaped, { headers: { "content-type": "application/json" } })
+          : new Response(zipped, { headers: { "content-type": "application/gzip" } }),
+      );
+    const at = Date.now() + 99_000_000;
+    for (const id of Object.values(ids)) await pollFeed(id, fetcher, at);
+    const newest = async (id: string) => {
+      const [row]: { body: string; meta: Record<string, unknown> }[] = await sql`
+        select body, meta from net where sheet_id = ${id} order by net_id desc limit 1
+      `;
+      return row;
+    };
+
+    const refused = await newest(ids.raw);
+    assertEquals(Number(refused.meta.status), 0, "a poll whose body cannot be stored is a failure row");
+    const error = String(JSON.parse(refused.body).error);
+    assert(error.includes("NUL byte at offset 7"), `naming the byte and where it is: ${error}`);
+    assert(error.includes("https://nulraw.body.test/feed"), `and the feed it was reading: ${error}`);
+    const [{ count }] = await sql`select count(*) from net where sheet_id = ${ids.raw}`;
+    assertEquals(Number(count), 1, "and nothing of the body it refused is stored beside it");
+
+    // Text that spells the byte is not the byte, and refusing it would be this
+    // reader deciding what the feed meant.
+    assertEquals((await newest(ids.escaped)).body, escaped);
+    // Nor is a NUL inside a gzip: what is stored is the rows that came out of
+    // it, and a JSON encoder writes the cell's byte as those same six characters.
+    assertEquals(JSON.parse((await newest(ids.zipped)).body), [{ a: "x\u0000y" }]);
+
+    for (const id of Object.values(ids)) netDue.set(id, Number.MAX_SAFE_INTEGER);
+    hostDue.clear();
+  });
+
   await t.step("MCP server: JSON-RPC 2.0 over POST /mcp/:id", async () => {
     const { jwt } = await usr("mia@example.com");
     const hand = automerge.create<Sheet>({
@@ -7156,7 +7222,7 @@ Deno.test(async function allTests(t) {
       values (${ids[0]}, 'GET', 'x', ${sql.json({ status: "99999999999999999999" })})
     `;
     assertEquals((await rows(jwt)).body.length > 0, true, "one unreadable status must not empty the answer");
-    assertEquals(Object.keys(await status()).length, 16, "nor take the alarm down with it");
+    assertEquals(Object.keys(await status()).length, 17, "nor take the alarm down with it");
     await sql`delete from net where sheet_id = ${ids[0]} and body = 'x'`;
 
     // A poll is not the only kind of run. A net-hook sheet's run is the
@@ -8579,12 +8645,18 @@ Deno.test(async function allTests(t) {
     hookBuckets.clear();
   });
 
+  const feedCondition = `Every net-http sheet that has ever polled and is not paused did so in the past ${
+    POLL_STALE_S / 3600
+  } hours.`;
+  const liveCondition = "Every alert sheet that is not paused ran within twice its own interval.";
+  const overdueCondition = `No more than ${OVERDUE_MAX} net-http or alert sheets are overdue, paused ones included.`;
+
   // The status check. Every condition is graded so that 1.0 is the minimum pass, which is what lets an uptime check
   // read the whole thing without knowing what any of it means.
   await t.step("Every status condition is graded so that 1.0 is the minimum pass", async () => {
     const grades = await status();
     const conditions = Object.keys(grades);
-    assertEquals(conditions.length, 16);
+    assertEquals(conditions.length, 17);
     for (const [condition, series] of Object.entries(grades)) {
       assert(condition.endsWith("."), `a condition is a sentence: ${condition}`);
       assert("0" in series, `${condition} must be graded now`);
@@ -8606,7 +8678,7 @@ Deno.test(async function allTests(t) {
     const survived = await app.request("/status");
     assertEquals(
       Object.keys(await survived.json()).length,
-      16,
+      17,
       "a malformed row must degrade a grade, not replace the whole answer with an error",
     );
 
@@ -8637,7 +8709,7 @@ Deno.test(async function allTests(t) {
     // from an alert that simply had nothing to say.
     await sql`update net set created_at = now() - interval '10 minutes' where sheet_id = ${quietAlert.sheet_id}`;
     assert(
-      (await status())["Every alert sheet ran within twice its own interval."]["0"] < 1,
+      (await status())[liveCondition]["0"] < 1,
       "an alert that stopped running must grade as stopped",
     );
     // An alert that has never run at all -- a poller that never fired once, on
@@ -8647,9 +8719,76 @@ Deno.test(async function allTests(t) {
     await sql`delete from net`;
     await sql`update sheet set created_at = now() - interval '3 hours' where type = 'alert'`;
     assert(
-      (await status())["Every alert sheet ran within twice its own interval."]["0"] < 1,
+      (await status())[liveCondition]["0"] < 1,
       "an alert that has never run must grade as never run",
     );
+
+    // A sheet somebody switched off is not a dead poller, and the alarm cannot
+    // tell the two apart from SQL: `paused` lives only in the automerge
+    // document, and a paused sheet writes no run to record it beside. So the
+    // condition opens a document -- for the overdue sheets alone, worst first,
+    // stopping at the first that is not paused. `net` is empty by here, so no
+    // net-http sheet is in the feeds half and every overdue sheet is an alert.
+    await sql`delete from sheet_usr where sheet_id like 'alert:%'`;
+    await sql`delete from sheet where type = 'alert'`;
+    const switched = automerge.create<{ data: [{ code: string; paused?: boolean }] }>({
+      data: [{ code: "select 1" }],
+    });
+    await sql`
+      insert into sheet (created_by, type, doc_id, name, created_at)
+      values ((select usr_id from usr where email = ''), 'alert', ${switched.documentId}, 'switched',
+              now() - interval '3 hours')
+    `;
+    assert((await status())[liveCondition]["0"] < 1, "an overdue alert nobody paused is a dead poller");
+
+    switched.change((d: { data: [{ paused?: boolean }] }) => {
+      d.data[0].paused = true;
+    });
+    assertEquals(
+      (await status())[liveCondition]["0"],
+      1,
+      "a sheet its owner switched off is not an outage",
+    );
+
+    // An unreadable document must never excuse a stale alert. 'ghost-doc' is
+    // not base58, so find rejects on the spelling rather than waiting out the
+    // lookup on a document nobody has.
+    await sql`
+      insert into sheet (created_by, type, doc_id, name, created_at)
+      values ((select usr_id from usr where email = ''), 'alert', 'ghost-doc', 'ghost',
+              now() - interval '3 hours')
+    `;
+    const ghosted = await status();
+    assert(ghosted[liveCondition]["0"] < 1, "a document that will not open grades as running");
+    assertEquals(
+      ghosted[overdueCondition]["0"],
+      OVERDUE_MAX / 2,
+      "the cap counts the paused sheet too, or pausing would be a way to leave the cap behind",
+    );
+
+    // The same switch on the other kind of sheet. A feed is graded off its
+    // newest poll where an alert is graded off its own interval, so the two
+    // walk lists built by two different CTEs and a sheet missing from the feeds
+    // one would read as healthy rather than as a feed nobody polls.
+    const feed = automerge.create<{ data: [{ url: string; paused?: boolean }] }>({
+      data: [{ url: "https://example.invalid/feed" }],
+    });
+    const feedSheet = `net-http:${feed.documentId}`;
+    await sql`
+      insert into sheet (created_by, type, doc_id, name)
+      values ((select usr_id from usr where email = ''), 'net-http', ${feed.documentId}, 'stale feed')
+    `;
+    await sql`
+      insert into net (sheet_id, method, body, meta, created_at)
+      values (${feedSheet}, 'GET', '[]', '{"status":200}'::jsonb, now() - make_interval(secs => ${POLL_STALE_S * 2}))
+    `;
+    assert((await status())[feedCondition]["0"] < 1, "a feed nobody paused is a poller that stopped");
+    feed.change((d: { data: [{ paused?: boolean }] }) => {
+      d.data[0].paused = true;
+    });
+    assertEquals((await status())[feedCondition]["0"], 1, "a feed its owner switched off is not an outage");
+    await sql`delete from net where sheet_id = ${feedSheet}`;
+    await sql`delete from sheet where sheet_id = ${feedSheet}`;
 
     // Done with the alert sheets. Every condition below is about an idle
     // product, and an alert sheet with no runs at all is a dead poller, not an
@@ -8718,6 +8857,56 @@ Deno.test(async function allTests(t) {
     for (const series of Object.values(body as Record<string, Record<string, number>>))
       for (const value of Object.values(series)) assertEquals(typeof value, "number");
     await sql`delete from net where sheet_id = 'net-hook:errors' and body = 'boom'`;
+  });
+
+  // The switch quiets the alarm up to the cap and not one sheet past it, which
+  // is the whole of what stops "pause everything" from being a way to turn this
+  // check off.
+  await t.step("Past the overdue cap a paused sheet is an outage again", async () => {
+    // In memory, and one insert for the lot: a route call per sheet costs more
+    // than this step is worth.
+    const docs = Array.from(
+      { length: OVERDUE_MAX + 1 },
+      () =>
+        automerge.create<{ data: [{ code: string; paused: boolean }] }>({
+          data: [{ code: "select 1", paused: true }],
+        }).documentId as string,
+    );
+    await sql`
+      insert into sheet (created_by, type, doc_id, name, created_at)
+      select (select usr_id from usr where email = ''), 'alert', d, 'capped', now() - interval '3 hours'
+      from unnest(${docs}::text[]) as d
+    `;
+    const over = await status();
+    assert(over[liveCondition]["0"] < 1, "past the cap nothing is asked about any switch");
+    assert(over[overdueCondition]["0"] < 1, "and the cap itself says how far past it is");
+
+    await sql`delete from sheet where doc_id = ${docs[0]}`;
+    const under = await status();
+    assertEquals(under[liveCondition]["0"], 1, "at the cap every overdue sheet is walked and every one is paused");
+    assertEquals(under[overdueCondition]["0"], 1, "and the cap is exactly met");
+    // Taken away again, so the pause step below polls its own sheet and not
+    // eleven of these.
+    await sql`delete from sheet where type = 'alert'`;
+  });
+
+  // A viewer's changes are refused at the sync socket, but an editor's are
+  // not, and nothing stops an editor from writing data[0] itself away to
+  // null. That is a document that loaded, not one that failed to -- and
+  // `null.paused` used to throw past every catch in liveness() and status(),
+  // turning the one endpoint that must never 500 into exactly that.
+  await t.step("A document that loaded with data[0] itself null does not crash the alarm", async () => {
+    const nullDoc = automerge.create<{ data: [null] }>({ data: [null] });
+    await sql`
+      insert into sheet (created_by, type, doc_id, name, created_at)
+      values ((select usr_id from usr where email = ''), 'alert', ${nullDoc.documentId}, 'null-config',
+              now() - interval '3 hours')
+    `;
+    assert(
+      (await status())[liveCondition]["0"] < 1,
+      "a document that cannot say whether it is paused must still grade the overdue alert as running",
+    );
+    await sql`delete from sheet where type = 'alert'`;
   });
 
   // The guard is over an address, and an address has more than one spelling.

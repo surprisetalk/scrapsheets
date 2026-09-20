@@ -1527,13 +1527,21 @@ const CAST_TYPES = {
 // How deep a select item is peeled before the type stops being worth chasing.
 const SELECT_DEPTH = 8;
 
+// Brackets are how AlaSQL quotes a name its parser will not take bare, and
+// `[total]` is the same column as `total`. Every pass here that reads a name out
+// of the query's own text reads it through this, or a quoted column is a
+// different column to that pass than the bare one: a select item that loses the
+// type hint it would have carried, an unpivot that wraps a second bracket round
+// a name that already had one.
+const bare = (text) => text.trim().replace(/^\[(.*)\]$/, "$1").trim();
+
 const itemType = (expr, nameToType) => {
   let text = expr.trim();
   let averaged = false;
   for (let i = 0; i < SELECT_DEPTH; i++) {
     if (/^'(?:[^']|'')*'$/.test(text)) return "text";
     if (/^-?\d+(?:\.\d+)?$/.test(text)) return "num";
-    const plain = text.match(/^(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)$/);
+    const plain = bare(text).match(/^(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)$/);
     // An average of whole numbers is not a whole number. Every other function
     // that follows its argument hands the type back untouched.
     if (plain) return averaged && nameToType[plain[1]] === "int" ? "num" : nameToType[plain[1]];
@@ -1585,7 +1593,7 @@ export const selectTypes = (code, nameToType) => {
     // `cast(x as int)` sits a bracket deeper and is not an alias.
     const as = findAt(code, depth, /\bas\s+["'`[]?([A-Za-z_][A-Za-z0-9_]*)/gi, 0, a, b);
     const item = code.slice(a, b).trim();
-    const name = as ? as[1] : item.match(/^(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)$/)?.[1];
+    const name = as ? as[1] : bare(item).match(/^(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)$/)?.[1];
     if (!name) continue;
     const type = itemType(as ? code.slice(a, as.index) : item, nameToType);
     if (type) out[name] = type;
@@ -1600,8 +1608,6 @@ export const selectTypes = (code, nameToType) => {
 // — it drops every column that is not being unpivoted, and the value column too
 // once you name it in the select list — so it never reaches the engine either.
 // Both run before the window pass, on SQL that scanRefs has already rewritten.
-
-const bare = (text) => text.trim().replace(/^\[(.*)\]$/, "$1").trim();
 
 export const checkPivot = (code) => {
   const m = code.match(/\bpivot\s*\([\s\S]*?\bin\s*\(([^()]*)\)/i);
@@ -1634,6 +1640,20 @@ export const rewriteUnpivot = (code, columnsOf) => {
       }));
     }
     const [value, name] = [bare(parsed[1]), bare(parsed[2])];
+    // The ident pattern above admits a bracketed name, whose content is anything
+    // but a `]` -- a space, a quote, another `[` -- and both of these are
+    // spliced straight back out inside brackets below. The in-list beside them
+    // is already held to a bare column name, so all three names in one clause
+    // obey the one rule rather than two.
+    for (const [what, col] of [["value column", value], ["name column", name]]) {
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(col)) continue;
+      throw new Error(explain(`An unpivot's ${what} takes a column name.`, {
+        Expected: "a column name in letters, digits and underscores, e.g. amount",
+        Received: col,
+        Source: `unpivot (${spec.trim()})`,
+        Fix: `write the ${what} as a bare name, e.g. unpivot (amount for month in (jan, feb))`,
+      }));
+    }
     const wide = parsed[3].split(",").map(bare);
     for (const col of wide) {
       if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(col)) continue;
@@ -1769,10 +1789,16 @@ export const rewriteExtremes = (code, colsOf) => {
 // same query out of that, so the picture the page draws and the rows the server
 // exports are the same answer.
 
+// One of the columns a chart names, quoted for the engine. `total`, `store` and
+// `class` are AlaSQL keywords that will not parse as a bare identifier, so a
+// column named one of them used to reach the reader as a parse error with a
+// caret into SQL nobody wrote. Brackets are what AlaSQL quotes a name with, and
+// a name holding a `]` is refused below rather than quoted, which is what keeps
+// every statement built out of this well formed.
 const chartIdent = (what, value) => {
   // Typed, not coerced: /^[A-Za-z_]\w*$/.test(NaN) reads the string "NaN" and
   // passes, which would splice a bare NaN into the select list.
-  if (typeof value === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) return value;
+  if (typeof value === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) return `[${value}]`;
   throw new Error(explain(`A chart's ${what} has to be a column name.`, {
     Expected: "a plain column name, e.g. month",
     Received: show(value),

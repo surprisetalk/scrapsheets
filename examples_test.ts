@@ -30,6 +30,7 @@ import {
   planQuery,
   register,
   rewriteExtremes,
+  rewriteUnpivot,
   scanRefs,
   selectTypes,
 } from "./src/sql.mjs";
@@ -288,6 +289,83 @@ Deno.test("every bundled example runs, in both engines, with the same answer", (
       `${id} answers differently in the page engine than on the server`,
     );
   }
+});
+
+Deno.test("a chart plots a column AlaSQL will not parse bare, in both engines", () => {
+  // `total`, `store` and `class` are keywords, and no bundled chart names one,
+  // so the brackets chartSql puts round every column it splices are checked
+  // here rather than by the replay above -- in both engines, because a chart is
+  // drawn from the page's statement and exported from the server's.
+  const loaded: Record<string, Row[]> = {
+    "table:keyword-chart": [{ total: "a", class: 2, store: 5 }, { total: "b", class: 4, store: 6 }],
+  };
+  const colsOf = { "table:keyword-chart": ["total", "class", "store"].map((name) => ({ name })) };
+  type Settings = { source: string; kind: string; x: string; y: string; series?: string };
+  const drawn = (doc: Settings) => {
+    const { sql, cells } = scanRefs(chartSql(doc));
+    return engines.map(([, engine]) => {
+      serveSheets(engine);
+      return JSON.stringify(engine(planQuery(sql, cells, loaded, colsOf).sql, [loaded]).data as Row[]);
+    });
+  };
+  for (
+    const [doc, expected] of [
+      [
+        { source: "@table:keyword-chart", kind: "line", x: "total", y: "class", series: "store" },
+        `[{"x":"a","y":2,"series":5},{"x":"b","y":4,"series":6}]`,
+      ],
+      // The box branch is the other shape: it splices the same two names into
+      // aggregates, a blank filter and a group by, where every other kind
+      // splices them into the select list alone.
+      [
+        { source: "@table:keyword-chart", kind: "box", x: "total", y: "class" },
+        `[{"x":"a","lo":2,"q1":2,"med":2,"q3":2,"hi":2},{"x":"b","lo":4,"q1":4,"med":4,"q3":4,"hi":4}]`,
+      ],
+    ] as [Settings, string][]
+  ) {
+    const [onServer, inPage] = drawn(doc);
+    assertEquals(onServer, expected, `a ${doc.kind} chart over a keyword column draws the wrong rows`);
+    assertEquals(inPage, onServer, `a ${doc.kind} chart over a keyword column draws differently in the page engine`);
+  }
+});
+
+Deno.test("a bracketed select item types the way the bare one does", () => {
+  // chartSql quotes every column it names and main.ts types a chart's result
+  // columns by reading that same select list back as text, so a pass that sees
+  // only an unquoted name costs every chart its types.
+  const known = { total: "usd", n: "int" };
+  for (
+    const [plain, quoted] of [
+      ["select total as x from @table:t", "select [total] as x from @table:t"],
+      ["select sum(total) as x from @table:t", "select sum([total]) as x from @table:t"],
+      ["select avg(n) as x from @table:t", "select avg([n]) as x from @table:t"],
+      ["select total, n from @table:t", "select [total], [n] from @table:t"],
+    ]
+  ) {
+    assertEquals(selectTypes(quoted, known), selectTypes(plain, known), `${quoted} types differently from ${plain}`);
+  }
+  // And a type is really read, rather than two empty answers agreeing.
+  const typed = (code: string) => (selectTypes(code, known) as Record<string, string>).x;
+  assertEquals(typed("select [total] as x from @table:t"), "usd");
+  assertEquals(typed("select avg([n]) as x from @table:t"), "num");
+});
+
+Deno.test("an unpivot names its two new columns the way it names the wide ones", () => {
+  // The clause's ident pattern admits a bracketed name, which may hold anything
+  // but a `]` -- and both of these are spliced back out inside brackets.
+  const columnsOf = { "table:wide": [{ name: "team" }, { name: "q1" }, { name: "q2" }] };
+  const wide = (spec: string) => `select * from SHEET('table:wide') unpivot (${spec})`;
+  assertThrows(
+    () => rewriteUnpivot(wide("[a b] for q in (q1, q2)"), columnsOf),
+    Error,
+    "value column takes a column name",
+  );
+  assertThrows(
+    () => rewriteUnpivot(wide("n for [q-1] in (q1, q2)"), columnsOf),
+    Error,
+    "name column takes a column name",
+  );
+  assert(rewriteUnpivot(wide("[n] for [q] in (q1, q2)"), columnsOf).includes("'q1' as [q]"));
 });
 
 Deno.test("the page engine still needs min_text(), and still has the UDFs", () => {

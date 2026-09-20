@@ -202,8 +202,11 @@ A change that breaks one of these is a bug even if the suite is green.
   need no count: a feed polls at most once a minute and a poll reads at most `PAGE_MAX` pages, so the sheets cap bounds
   them. A refusal that changed what an account keeps or sends says "quota" where `GET /status` reads it, the error log's
   413s and the alert run's delivery line; a 429 is shed unlogged and is not counted, by design.
-- **`POLL_OK` / `ALERT_OK` / `RUN_OF` / `RUN_OK` have one definition each.** `GET /status` and `library:freshness` both
-  read them from there. Two hand-copied copies had already drifted.
+- **`POLL_OK` / `ALERT_OK` / `RUN_OF` / `RUN_OK` / `pauseSwitch` have one definition each.** `GET /status` and
+  `library:freshness` both read them from there. Two hand-copied copies had already drifted. `pauseSwitch` is the odd
+  one -- it reads a document rather than a column, because a paused sheet writes no run for SQL to read -- and its two
+  callers read its `null` differently on purpose: `freshness()` reports the unknown as unknown, because naming the sheet
+  is its job, and `status()` grades it as running, because an unreadable document must never excuse a dead feed.
 - **The status check grades, never maximizes.** 1.0 is the minimum pass, `grade()` floors, and a condition that cannot
   compute throws by name.
 - **Secrets never reach a document.** Sheet secrets are referenced from a net-http header as `{{secret:name}}` and
@@ -347,41 +350,55 @@ navigation, in file order:
   `application/x-ndjson`, `application/jsonl`, `application/gzip`, `application/x-gzip`, `application/zip`,
   `application/x-zip-compressed`, `application/xml`, `text/xml`, `application/rss+xml`, `application/atom+xml`,
   `text/html`, `application/xhtml+xml` -- and `readFeedBody` is the one reader both doors call: `pollNetOnce` on every
-  page it reads, and `POST /net/:id` after the signature and before the NUL check, which asks the text that is stored
-  rather than the bytes that arrived. A type on none of the list is stored as the text it arrived as, which is what a
-  JSON feed hands us already, and a body that did not answer 2xx is never parsed. A CSV and a TSV go through
-  `parseDelimited`, the text-to-`{cols, rows}` core lifted out of `readImport()` -- the importer is a thin wrapper over
-  it, so a feed's digits are numbers, its blanks are nulls and its ragged line is refused by number exactly as an
-  uploaded file's are, and `source` is what every one of those refusals names the line in: the uploaded file there, the
-  url here. `assertRoom` stayed behind in `readImport`: the row quota is a sheet's, and only that door makes a sheet, so
-  a feed's rows are bounded by `BODY_CAP` alone the way a JSON feed's always were. The rows are stored keyed by column
-  name; `col.key` is the document's own spelling and stays with the importer, the one door that writes a document.
-  NDJSON is one JSON value a line, a blank line no record and a line that will not parse a refusal naming it. `expand()`
-  is the one bounded decompressor and both compressed doors go through it: bytes are fed to `DecompressionStream`
-  `EXPAND_SLICE` at a time and read back through `readBody`, so a bomb is refused holding one slice's expansion past the
-  cap rather than the gigabyte it writes; handed the whole of a bomb at once the decompressor answers all of it in one
-  chunk, which is the cap spent after the memory is gone. It has one home rather than two copies because it is a
-  subtlety that only shows up under attack; it slices **before** the stream exists so `pull` cannot throw, and it
-  refuses a non-`Uint8Array` argument as ours -- a `TypeError` raised inside `pull` was caught by the decompressor's own
-  catch and reported as the host having sent a bad body. What came out of a gzip is read by its first character -- a
-  bracket or a brace is JSON, everything else a CSV -- because nothing in an answer says what a gzip holds. **`BODY_CAP`
-  is spent on three different numbers**, and no one of them stands in for another: the bytes that arrived, what a gzip
-  decompressed to, and what the body _means_ -- a file names its columns once and the rows it means name them on every
-  row, so a few kilobytes on the wire is megabytes in the column. The poller's cross-page sum counts that third number
-  too, what `readFeedBody` answered and not the wire bytes a page carried: three gzip pages each under the cap
-  decompressed summed to twice it while their wire bytes stayed at kilobytes. Every parsed body is stored as the JSON
-  text it means -- the array of rows for every format that holds one, and the document itself for a generic XML body --
-  so `shapeOf`, `meta.sig`, `pageRows`, the export and every query downstream see exactly what a JSON feed hands them,
-  and a body its own declared type cannot parse is that poll's failure row or that delivery's 400, never a stored blob.
-  `BODY_DEPTH_MAX` bounds how many containers one body nests, because the only other thing stopping a zip quine is a
-  table two screens away holding no `zip` row.
+  page it reads, and `POST /net/:id` after the signature. A type on none of the list is stored as the text it arrived
+  as, which is what a JSON feed hands us already, and a body that did not answer 2xx is never parsed. A CSV and a TSV go
+  through `parseDelimited`, the text-to-`{cols, rows}` core lifted out of `readImport()` -- the importer is a thin
+  wrapper over it, so a feed's digits are numbers, its blanks are nulls and its ragged line is refused by number exactly
+  as an uploaded file's are, and `source` is what every one of those refusals names the line in: the uploaded file
+  there, the url here. `assertRoom` stayed behind in `readImport`: the row quota is a sheet's, and only that door makes
+  a sheet, so a feed's rows are bounded by `BODY_CAP` alone the way a JSON feed's always were. The rows are stored keyed
+  by column name; `col.key` is the document's own spelling and stays with the importer, the one door that writes a
+  document. NDJSON is one JSON value a line, a blank line no record and a line that will not parse a refusal naming it.
+  `expand()` is the one bounded decompressor and both compressed doors go through it: bytes are fed to
+  `DecompressionStream` `EXPAND_SLICE` at a time and read back through `readBody`, so a bomb is refused holding one
+  slice's expansion past the cap rather than the gigabyte it writes; handed the whole of a bomb at once the decompressor
+  answers all of it in one chunk, which is the cap spent after the memory is gone. It has one home rather than two
+  copies because it is a subtlety that only shows up under attack; it slices **before** the stream exists so `pull`
+  cannot throw, and it refuses a non-`Uint8Array` argument as ours -- a `TypeError` raised inside `pull` was caught by
+  the decompressor's own catch and reported as the host having sent a bad body. What came out of a gzip is read by its
+  first character -- a bracket or a brace is JSON, everything else a CSV -- because nothing in an answer says what a
+  gzip holds. **`BODY_CAP` is spent on three different numbers**, and no one of them stands in for another: the bytes
+  that arrived, what a gzip decompressed to, and what the body _means_ -- a file names its columns once and the rows it
+  means name them on every row, so a few kilobytes on the wire is megabytes in the column. The poller's cross-page sum
+  counts that third number too, what `readFeedBody` answered and not the wire bytes a page carried: three gzip pages
+  each under the cap decompressed summed to twice it while their wire bytes stayed at kilobytes. Every parsed body is
+  stored as the JSON text it means -- the array of rows for every format that holds one, and the document itself for a
+  generic XML body -- so `shapeOf`, `meta.sig`, `pageRows`, the export and every query downstream see exactly what a
+  JSON feed hands them, and a body its own declared type cannot parse is that poll's failure row or that delivery's 400,
+  never a stored blob. `BODY_DEPTH_MAX` bounds how many containers one body nests, because the only other thing stopping
+  a zip quine is a table two screens away holding no `zip` row.
+- **A NUL byte is refused where a body becomes the text a row stores.** Postgres text cannot hold one and the column is
+  text because a body is a body, so `readFeedBody` asks its own answer for one as its last act, beside the `BODY_CAP`
+  refusal and on the same `meant` and the same `source` -- which is what makes it one rule for both doors rather than
+  two copies that drift: `POST /net/:id` gets the 400 it always answered, and the poller, which cannot answer 400 at
+  all, gets the throw as a failure row through `pollNetSheet`'s catch, storable because the refusal names an offset and
+  never quotes the byte. It is asked of what is stored and not of what arrived: a gzip body is full of NULs and what is
+  stored is the rows that came out of it, written by `JSON.stringify`, which spells the byte as six characters that
+  store like any other six. The branch it exists for is the unparsed one -- a type on none of `BODY_PARSERS`,
+  `application/json` among them -- which used to return the decoded bytes before any check ran, so the byte reached
+  `netRow`'s insert and the sheet's own log recorded a driver's words under a status-0 row. It is now one more branch of
+  the one chain every other type takes, on `reading === undefined`, so it spends `BODY_CAP` too: a decode that writes
+  U+FFFD for invalid UTF-8 means more bytes than arrived, and neither door's wire check can stand in for that. The `zip`
+  block is the one early return left, and a `.json` member is refused by `jsonMeant` before it reaches either check,
+  since JSON has no unescaped control character -- which is also why a zipped `.json` member is the one body `BODY_CAP`
+  does not bound, as it was before this check moved.
 - **A type this server guessed is checked; a type the sender declared is not.** `jsonMeant()` is the line between them.
-  A body that declares `application/json` is taken at its word and stored as it arrived -- the NUL check downstream has
-  a better refusal for the one byte Postgres cannot hold than "not JSON" does, and it is the sender's claim either way
-  -- but what came out of a gzip and what a zip member's _name_ says are this server's own guesses, and an unchecked
-  guess stored an HTML error page verbatim under a green run row. So both go through `JSON.parse` and the text that
-  arrived is what is stored: re-serialising it would move the digest on `meta.sig` and a repeated body would stop being
-  recognised as one.
+  A body that declares `application/json` is taken at its word and stored as it arrived -- the NUL check at the end of
+  this same reader has a better refusal for the one byte Postgres cannot hold than "not JSON" does, and it is the
+  sender's claim either way -- but what came out of a gzip and what a zip member's _name_ says are this server's own
+  guesses, and an unchecked guess stored an HTML error page verbatim under a green run row. So both go through
+  `JSON.parse` and the text that arrived is what is stored: re-serialising it would move the digest on `meta.sig` and a
+  repeated body would stop being recognised as one.
 - **XML is read by a library, and read twice.** `npm:fast-xml-parser` is the tokenizer: an XML reader is what "never
   hand-roll anything that parses" is about, and this one expands no custom entity and refuses an external one, so the
   billion-laughs body is stored as the text `&lol2;` rather than as a gigabyte and an XXE never reaches the filesystem.
@@ -495,15 +512,22 @@ navigation, in file order:
   of both tickers: `pollNetSheet` and `pollAlertSheet` -- the one-sheet halves the two 15-second ticks now loop over, so
   the timer and the button are the same code -- return before the fetch and before the row, and put the due entry back
   exactly as they found it, so a paused sheet is looked at on every tick and a started one is due when it always was.
-  `INTERVAL_MAX_S` is the far end of an `interval` field, clamped the way 60 seconds already clamped the near end: past
-  it, `now + interval * 1000` is a time `Date` cannot express, and one runaway sheet took the whole account's freshness
-  read down with a `RangeError`. `POST /library/:id/run` polls one sheet now through those same two functions -- owner
-  or editor through `assertSheetEditor`, one unit of the sheet's budget through `spend(sheet_id, "runs", ...)`, and
-  nothing cleared first, because the poll sets the due entry off the sheet's own interval as its first act and the tick
-  a second later steps over it. It answers the `net` row the run landed, found by asking for the newest row stamped at
-  or after a watermark taken off Postgres's own clock: an append, a 304's move, a repeated body's move and a quiet alert
-  tick all land that way, and comparing against the newest row before the poll misread a repeat, which moves whichever
-  row carried that body and not always the newest. The watermark is carried as seconds
+  **A paused sheet is also out of the two graded liveness conditions**, whose sentences say so -- otherwise pausing a
+  feed past `POLL_STALE_S`, or an alert past twice its interval, drove the grade below 1.0 and `GET /status` answered
+  the 503 it answers when the poller has died. It is read through `pauseSwitch`, and only for the sheets already below
+  1.0, worst first, stopping at the first that is not paused: that sheet is the minimum, so a healthy answer opens no
+  document at all and the pollers' own 15-second `find` of the same documents is what makes a warm isolate's walk a
+  cache hit. `OVERDUE_MAX` is what stops pausing from being a way to pass: it is the reported-only `OVERDUE_CONDITION`'s
+  bar, and past it the two conditions stop asking about the switch and grade from the worst sheet. `INTERVAL_MAX_S` is
+  the far end of an `interval` field, clamped the way 60 seconds already clamped the near end: past it,
+  `now + interval * 1000` is a time `Date` cannot express, and one runaway sheet took the whole account's freshness read
+  down with a `RangeError`. `POST /library/:id/run` polls one sheet now through those same two functions -- owner or
+  editor through `assertSheetEditor`, one unit of the sheet's budget through `spend(sheet_id, "runs", ...)`, and nothing
+  cleared first, because the poll sets the due entry off the sheet's own interval as its first act and the tick a second
+  later steps over it. It answers the `net` row the run landed, found by asking for the newest row stamped at or after a
+  watermark taken off Postgres's own clock: an append, a 304's move, a repeated body's move and a quiet alert tick all
+  land that way, and comparing against the newest row before the poll misread a repeat, which moves whichever row
+  carried that body and not always the newest. The watermark is carried as seconds
   (`extract(epoch from
   now()::timestamp)`) and compared with `extract(epoch from created_at)` -- `net.created_at`
   carries no timezone, and a bound timestamp parameter comes back hours off the rows it was taken beside. Refused by
@@ -650,6 +674,19 @@ Shared by both engines. `planQuery()` runs the pre-engine passes in the one orde
   sheet whose cells fail the type check. **`explain <query>`** is the other intercepted statement: it runs the query
   with every guard and answers one row per stage (`load @ref`, `plan`, `engine`, `windows`, `total`) with rows in, rows
   out and milliseconds. `timed()` wraps the calls both hosts already make and does nothing on a plain run.
+- **A column name this engine generates is quoted, because a name is not always an identifier.** `total`, `store` and
+  `class` are AlaSQL keywords that will not parse bare, so `chartIdent` answers `[name]` and every site `chartSql`
+  splices one into takes it quoted -- the box branch's `min`, `max` and `percentile` arguments, its
+  `where <y> is not null` and its `group by`, the `plot` string and both returns, while the `order by` ordinals stay the
+  counted numbers they were. It still refuses a non-string and a name that is not identifier-shaped, which is what keeps
+  a `]` out of a bracket and the statement well formed; this quotes what a chart may name and does not widen it.
+  `bare()` is the one place a bracket is read back off a name, and it sits above `itemType` because every pass that
+  reads a name out of the query's own text asks it: `itemType` and `selectTypes`'s bare-name fallback, which would
+  otherwise type a quoted column as nothing and cost every chart its result types; `rewriteUnpivot`; and
+  `rewriteExtremes`, which is why `min([total])` is aimed at `min_text` exactly as `min(total)` is. `checkResultColumns`
+  needs nothing -- every chart column is aliased. `rewriteUnpivot`'s value column and name column are held to the same
+  `/^[A-Za-z_][A-Za-z0-9_]*$/` shape as its in-list, so all three names in one clause obey the one rule and the refusal
+  names which of the two is wrong.
 - **Types**: `COLUMN_TYPES` is every type a column may declare and what each one is; `NUMERIC_TYPES` is derived from it
   and `knownType()` matches the `enum:` family by prefix. `checkColumnTypes()` is the one place a cell becomes what its
   column says — a blank becomes `null`, a numeric string becomes its number. `selectTypes()` types a result column off

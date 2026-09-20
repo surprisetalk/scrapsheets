@@ -2016,6 +2016,47 @@ const RUN_OK = () =>
            when s.type = 'net-http' or s.type = 'net-socket' or s.type like 'codex-%' then (${POLL_OK()})
            else true end`;
 
+// Whether the owner of a net-http or alert sheet has switched it off. It lives
+// here for the reason the predicates above do: GET /status and
+// library:freshness both ask it, and a paused sheet writes no run, so this is
+// the one fact about a run that cannot be recorded beside one.
+//
+// Answers true, false, or null when the document did not answer -- and the two
+// callers read that null differently, on purpose. freshness() reports the
+// unknown as unknown, because naming the sheet is its job. status() grades it
+// as running, because an unreadable document must never excuse a dead feed.
+//
+// The wait is raced from outside find() rather than through find's own
+// { signal }: an aborted find caches a failed progress that a later find can
+// subscribe to after the terminal notification and never settle. automerge's
+// own handle timeout is 60 seconds where `deno task status` aborts the endpoint
+// at 30, so without a shorter wait one unreachable document is the alarm timing
+// out. The timer is cleared in a finally or Deno's op sanitizer reports it as a
+// leaked timer in every test that reaches this.
+const pauseSwitch = async (sheet_id: string, deadline: number): Promise<boolean | null> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const config = await Promise.race([
+    automerge.find<{ data: [{ paused?: boolean } | null] }>(sheet_id.split(":")[1] as AnyDocumentId)
+      .then((hand) => hand.doc()?.data?.[0]),
+    new Promise<undefined>((done) => {
+      timer = setTimeout(() => done(undefined), Math.max(0, deadline - Date.now()));
+    }),
+  ]).catch(() => undefined).finally(() => clearTimeout(timer));
+  // The same truthiness the two pollers read the field with, so this read and
+  // the thing it reports on cannot say different things about one document:
+  // `paused: "yes"` stops the poller, and a strict === true here called it
+  // running.
+  //
+  // Checked against both, not just the timeout's undefined: only a viewer's
+  // changes are refused at the sync socket, so an editor can write data[0]
+  // itself away to null, and a document that loaded is not a document that
+  // answered. `null.paused` throws, and an uncaught throw here is the one
+  // path through liveness() and status() that was never wrapped in a catch --
+  // this endpoint is the alarm, so that throw was a 500 standing in for the
+  // outage this check exists to name.
+  return config === undefined || config === null ? null : !!config.paused;
+};
+
 const STATUS_AGO = [0, 3600, 86400];
 
 // The numbers each condition's sentence quotes. They are read into the sentence
@@ -2026,16 +2067,33 @@ const STATUS_AGO = [0, 3600, 86400];
 // 250, not 100: a select 1 from Deno Deploy to Neon is ~98ms of network before
 // the database does anything, so a 100ms bar sat 2ms inside its own threshold
 // and failed one run in four on jitter alone. An alarm that fires every hour
-// with nothing wrong is one that gets muted, and it takes the twelve real
-// conditions with it. At 250 the condition means the database is degraded --
-// a saturated pool, a cold start, a query queue -- rather than a slow packet.
+// with nothing wrong is one that gets muted, and it takes every real condition
+// with it. At 250 the condition means the database is degraded -- a saturated
+// pool, a cold start, a query queue -- rather than a slow packet.
 const LATENCY_MS = 250;
 const REFUSALS_MAX = 20;
 // One open report fails the grade; this many is total failure.
 const REPORTS_OPEN_MAX = 10;
 // One account at a quota fails the grade; this many hits is total failure.
 const QUOTAS_HIT_MAX = 10;
-const POLL_STALE_S = 7200;
+export const POLL_STALE_S = 7200;
+// Three jobs, one number. It is the `limit` each of the two overdue lists is
+// read under; it caps the documents a walk opens, per list rather than per
+// call, so one status() answers at most twice it and the deadline below is what
+// bounds the pair; and it is the bar the condition below grades against -- so
+// the switch that quiets the two liveness conditions cannot quiet them without
+// end: pausing sheets walks this grade down the whole way to the cap, and past
+// the cap the liveness conditions stop asking about the switch at all and grade
+// from the worst sheet.
+export const OVERDUE_MAX = 10;
+// The wait a document gets before it counts as no answer: the whole of one
+// status() call's walk, and one row's own budget in freshness(), where a page
+// of rows is already bounded by the page it was asked for.
+const PAUSE_LOOKUP_MS = 5_000;
+// Bound to a const because REPORTED_ONLY has to match it exactly and the route
+// answers 500 when it does not -- an interpolated literal written out twice
+// would only be caught by a request.
+const OVERDUE_CONDITION = `No more than ${OVERDUE_MAX} net-http or alert sheets are overdue, paused ones included.`;
 const DB_BYTES_CAP = 4_000_000_000;
 const HEAP_BYTES_CAP = 512_000_000;
 
@@ -2125,29 +2183,62 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
 
   // Current state, with no history to read it against: how stale the feeds are,
   // how full the disk is, whether the seed is intact.
+  //
+  // The two liveness grades are spelled once, as a CTE each, because three
+  // things read them: the floor the condition falls back to, the list of
+  // sheets that are actually failing, and the count of those. Written as three
+  // scalar subqueries the per-sheet grade would be copied three times, which is
+  // how POLL_OK and RUN_OF came to live in one place. Still one round trip,
+  // healthy or not.
   const [live] = await sql`
+    with feeds as (
+      select s.sheet_id,
+             ${POLL_STALE_S}::numeric
+               / greatest(1, extract(epoch from (now() - max(n.created_at)))) as fresh
+      from sheet s inner join net n using (sheet_id)
+      where s.type = 'net-http' and (${RUN_OF()}) group by s.sheet_id
+    ),
+    -- Each alert against its own interval, taken off its newest run rather
+    -- than an automerge document. Twice, not once: one missed tick is a slow
+    -- poll, two in a row is a poller that stopped.
+    --
+    -- A left join, so an alert that has never run at all is graded from the
+    -- moment it was created. An inner join would have excluded exactly the
+    -- failure this condition is for -- a poller that never fired once, on a
+    -- cold isolate -- and an empty set grades as a pass. The 3600 an
+    -- interval-less run falls back to is pollAlertOnce's own default, so a
+    -- sheet that never said otherwise is graded against what it would use.
+    alerts as (
+      select sheet_id,
+             (2 * interval_s)::numeric / greatest(1, extract(epoch from (now() - last))) as fresh
+      from (select s.sheet_id, coalesce(max(n.created_at), s.created_at) as last,
+                   coalesce(
+                     (array_agg(substring(n.meta->>'interval' from '^[0-9]{1,9}$')::int
+                                order by n.created_at desc))[1], 3600) as interval_s
+            from sheet s left join net n on n.sheet_id = s.sheet_id and n.method = 'ALERT'
+            where s.type = 'alert' group by s.sheet_id, s.created_at) runs
+    ),
+    lives as (select sheet_id, fresh from feeds union all select sheet_id, fresh from alerts)
     select
-      (select coalesce(min(${POLL_STALE_S}::numeric / greatest(1, extract(epoch from (now() - last)))), 1)
-       from (select max(n.created_at) as last
-             from sheet s inner join net n using (sheet_id)
-             where s.type = 'net-http' and (${RUN_OF()}) group by s.sheet_id) feeds) as polls_fresh,
-      -- Each alert against its own interval, taken off its newest run rather
-      -- than an automerge document. Twice, not once: one missed tick is a slow
-      -- poll, two in a row is a poller that stopped.
-      --
-      -- A left join, so an alert that has never run at all is graded from the
-      -- moment it was created. An inner join would have excluded exactly the
-      -- failure this condition is for -- a poller that never fired once, on a
-      -- cold isolate -- and an empty set grades as a pass. The 3600 an
-      -- interval-less run falls back to is pollAlertOnce's own default, so a
-      -- sheet that never said otherwise is graded against what it would use.
-      (select coalesce(min((2 * interval_s)::numeric / greatest(1, extract(epoch from (now() - last)))), 1)
-       from (select coalesce(max(n.created_at), s.created_at) as last,
-                    coalesce(
-                      (array_agg(substring(n.meta->>'interval' from '^[0-9]{1,9}$')::int
-                                 order by n.created_at desc))[1], 3600) as interval_s
-             from sheet s left join net n on n.sheet_id = s.sheet_id and n.method = 'ALERT'
-             where s.type = 'alert' group by s.sheet_id, s.created_at) runs) as alerts_fresh,
+      -- The floor a liveness condition lands on when every sheet below 1.0
+      -- turns out to be paused: the minimum among the ones that are not
+      -- failing, which is 1.0 or better by construction, and 1.0 when there is
+      -- no sheet of that kind at all.
+      coalesce((select min(fresh) filter (where fresh >= 1) from feeds), 1) as polls_floor,
+      coalesce((select min(fresh) filter (where fresh >= 1) from alerts), 1) as alerts_floor,
+      -- The sheets that are actually failing, worst first, one past the cap so
+      -- liveness() can tell "at the cap" from "past it". fresh is cast to
+      -- float8 inside the object so what comes back is a JS number and not a
+      -- numeric's text.
+      (select coalesce(jsonb_agg(jsonb_build_object('sheet_id', sheet_id, 'fresh', fresh::float8)
+                                 order by fresh, sheet_id), '[]'::jsonb)
+       from (select sheet_id, fresh from feeds where fresh < 1
+             order by fresh, sheet_id limit ${OVERDUE_MAX + 1}) b) as polls_behind,
+      (select coalesce(jsonb_agg(jsonb_build_object('sheet_id', sheet_id, 'fresh', fresh::float8)
+                                 order by fresh, sheet_id), '[]'::jsonb)
+       from (select sheet_id, fresh from alerts where fresh < 1
+             order by fresh, sheet_id limit ${OVERDUE_MAX + 1}) b) as alerts_behind,
+      (select count(*) from lives where fresh < 1) as overdue,
       ${NET_KEEP}::numeric / greatest(1, coalesce(
         (select max(c) from (select count(*) as c from net group by sheet_id) logs), 0)) as log_capped,
       ${DB_BYTES_CAP}::numeric / greatest(1, pg_database_size(current_database())) as db_size,
@@ -2185,6 +2276,38 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
     "0": grade(condition, n),
   }];
 
+  // A liveness condition, with the sheets their owners switched off taken out
+  // of it. `paused` lives only in the automerge document, so the only way to
+  // read it is to open one -- and both conditions are a min over per-sheet
+  // grades, so a sheet at or above 1.0 cannot change the answer. Only the
+  // overdue ones are walked, worst first, stopping at the first that is not
+  // paused: that sheet is the minimum. A healthy account opens nothing, and a
+  // real outage worse than every paused sheet opens one.
+  //
+  // Past OVERDUE_MAX it opens nothing either and grades from the worst sheet:
+  // pausing is somebody's own switch up to the cap and an outage past it.
+  //
+  // It never throws, which is a deliberate reading of "crash loudly" and not an
+  // omission here: this endpoint is the alarm, a bad() would answer 500 where
+  // the alarm answers 503, and an uptime checker cannot tell a 500 from a dead
+  // server. A document that will not open grades as running.
+  //
+  // The walk is bounded twice, by the SQL limit that built the list and by one
+  // deadline shared across both conditions.
+  const lookupBy = Date.now() + PAUSE_LOOKUP_MS;
+  const liveness = async (
+    condition: string,
+    floor: number,
+    behind: { sheet_id: string; fresh: number }[],
+  ): Promise<[string, Record<string, number>]> => {
+    if (behind.length > OVERDUE_MAX) return now(condition, behind[0].fresh);
+    for (const sheet of behind) {
+      if (Date.now() > lookupBy) return now(condition, sheet.fresh);
+      if ((await pauseSwitch(sheet.sheet_id, lookupBy)) !== true) return now(condition, sheet.fresh);
+    }
+    return now(condition, floor);
+  };
+
   return Object.fromEntries([
     now(`The database answers a query in under ${LATENCY_MS}ms.`, LATENCY_MS / Math.max(1, dbMs)),
     byAgo("No request failed with a 5xx in the past hour.", (r) => r.no_5xx),
@@ -2195,12 +2318,18 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
     byAgo(`No more than ${REFUSALS_MAX} deliveries were refused in the past hour.`, (r) => r.refusals),
     now("Every failure is reaching the error log.", 1 / (1 + logWriteFailures)),
     byAgo("Every net-http poll in the past hour returned 2xx in the shape the feed had before.", (r) => r.polls_ok),
-    now(
-      `Every net-http sheet that has ever polled did so in the past ${POLL_STALE_S / 3600} hours.`,
-      live.polls_fresh,
+    await liveness(
+      `Every net-http sheet that has ever polled and is not paused did so in the past ${POLL_STALE_S / 3600} hours.`,
+      live.polls_floor,
+      live.polls_behind,
     ),
     byAgo("Every alert run in the past day either delivered or had nothing to deliver.", (r) => r.alerts_delivered),
-    now("Every alert sheet ran within twice its own interval.", live.alerts_fresh),
+    await liveness(
+      "Every alert sheet that is not paused ran within twice its own interval.",
+      live.alerts_floor,
+      live.alerts_behind,
+    ),
+    now(OVERDUE_CONDITION, OVERDUE_MAX / Math.max(1, Number(live.overdue))),
     now("No sheet's net log has grown past its retention cap.", live.log_capped),
     now(`The database is under ${DB_BYTES_CAP / 1e9} GB.`, live.db_size),
     now(`The server heap is under ${HEAP_BYTES_CAP / 1e6} MB.`, HEAP_BYTES_CAP / Deno.memoryUsage().heapUsed),
@@ -2215,8 +2344,16 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
 // Reported, but not paged on. A product nobody is using is failing, and that
 // grade belongs in the answer -- but a service with no users is not a service
 // that is down, and an alarm that fires every fifteen minutes about it is an
-// alarm that gets muted, taking the eleven technical conditions with it.
-const REPORTED_ONLY = ["Somebody created a sheet in the past 24 hours."];
+// alarm that gets muted, taking every technical condition with it.
+//
+// The overdue cap is here for the other half of that sentence. A paused sheet
+// is somebody's own switch, and an alarm that fires because a person turned a
+// sheet off is an alarm about a switch working. It is still graded, and the
+// grade still falls the whole way from the first paused sheet to the cap, so a
+// sheet paused and forgotten stays visible here, in library:freshness, and in
+// the cap it counts against -- and past the cap the two liveness conditions
+// page on it themselves.
+const REPORTED_ONLY = ["Somebody created a sheet in the past 24 hours.", OVERDUE_CONDITION];
 
 // Public, because an uptime check carries no bearer token. It answers grades and
 // no rows -- no ids, no names, no addresses -- though a grade is a ratio against
@@ -2936,21 +3073,6 @@ app.post("/net/:id", async (c) => {
   // After the signature, which covers the bytes as they were sent: decompressing
   // an unverified body is work anyone holding a doc_id could ask us for.
   const body = await readFeedBody(raw, c.req.header("content-type") ?? "", `POST /net/${sheet_id}`);
-  // Postgres text cannot hold a NUL, and the column is text because a body is
-  // a body. Verified bytes that cannot be stored used to reach the insert and
-  // come back as an unexplained 500 -- the one 500 a sheet's own owner can
-  // trigger by accident, by pointing a protobuf sender at it. Asked of what is
-  // stored rather than of what arrived: a gzip body is full of NULs and what
-  // is stored is the rows that came out of it.
-  const nul = body.indexOf("\0");
-  if (nul >= 0) {
-    bad(400, `This delivery to ${sheet_id} carries a byte that cannot be stored.`, {
-      Received: `a NUL byte at offset ${nul} of ${body.length}`,
-      Expected: "a body with no NUL bytes; every other byte, valid UTF-8 or not, is kept as sent",
-      Source: "the request body, against the text column it is stored in",
-      Fix: "send text or JSON; base64 the payload if it is binary",
-    });
-  }
   // The skew window bounds a replay to HOOK_SKEW seconds, which is not the same
   // as never: a delivery captured off the wire can be sent again, unchanged,
   // until its t goes stale. The unique index on (sheet_id, signature) is what
@@ -4083,7 +4205,6 @@ const readFeedBody = async (
   // The type alone: a charset or a boundary rides the same header, and a
   // parameter is not part of the name.
   const how = BODY_PARSERS[contentType.split(";")[0].trim().toLowerCase()];
-  if (how === undefined) return new TextDecoder().decode(raw);
   if (how === "zip") {
     const members = zipMembers(raw, source);
     const named = members.flatMap((member) => {
@@ -4148,7 +4269,13 @@ const readFeedBody = async (
   // a bracket or a brace, and everything else is read as a delimited file.
   const reading = how === "gzip" ? (/^\s*[[{]/.test(text) ? "json" : "csv") : how;
   let meant: string;
-  if (reading === "json") {
+  if (reading === undefined) {
+    // A type on none of the list is answered as the text it arrived as, which is
+    // what a JSON feed hands us already. Every other branch answers
+    // `JSON.stringify` of what it read, so this is the one answer that can still
+    // hold a byte nothing here has looked at.
+    meant = text;
+  } else if (reading === "json") {
     // Checked, and then the text that arrived is what is stored: re-serialising
     // it would change the digest that rides `meta.sig`, and a repeated body would
     // stop being recognised as one.
@@ -4205,6 +4332,22 @@ const readFeedBody = async (
       Limit: `${BODY_CAP} bytes per body, as it is stored`,
       Source: source,
       Fix: "send a paged or filtered answer, or shorten the column names every row now carries",
+    });
+  }
+  // Postgres text cannot hold a NUL, and the column is text because a body is
+  // a body. Bytes that cannot be stored used to reach the insert and come back
+  // as an unexplained 500 at the delivery door -- the one 500 a sheet's own
+  // owner can trigger by accident, by pointing a protobuf sender at it -- and
+  // as a failure row carrying a driver's words at the polling one. Asked of
+  // what is stored rather than of what arrived: a gzip body is full of NULs and
+  // what is stored is the rows that came out of it.
+  const nul = meant.indexOf("\0");
+  if (nul >= 0) {
+    bad(400, `This body carries a byte that cannot be stored.`, {
+      Received: `a NUL byte at offset ${nul} of ${meant.length}`,
+      Expected: "a body with no NUL bytes; every other byte, valid UTF-8 or not, is kept as sent",
+      Source: source,
+      Fix: "send text or JSON; base64 the payload if it is binary",
     });
   }
   return meant;
@@ -6703,20 +6846,12 @@ const freshness = async (c: Context, { limit, offset }: Record<string, string>):
     // Date cannot express would otherwise throw here and take every other
     // sheet's row down with it, not just this one's.
     row.next_run = due === undefined || !Number.isFinite(due) ? null : new Date(due).toISOString();
-    // Only the two types that carry the switch, and only when their document
-    // answers: a document that will not load is not an unpaused sheet, it is
-    // the failure the rest of this row is already about.
-    const config = row.type === "net-http" || row.type === "alert"
-      ? await automerge
-        .find<{ data: [{ paused?: boolean }] }>(sheet_id.split(":")[1] as AnyDocumentId)
-        .then((hand) => hand.doc()?.data?.[0])
-        .catch(() => undefined)
-      : undefined;
-    // The same truthiness the two pollers read the field with, so this read and
-    // the thing it reports on cannot say different things about one document:
-    // `paused: "yes"` stops the poller, and a strict === true here called it
-    // running.
-    row.paused = config === undefined ? null : !!config.paused;
+    // Only the two types that carry the switch. A document that will not answer
+    // is null here rather than "running": naming the sheet is this read's job,
+    // where GET /status reads the same null the other way.
+    row.paused = row.type === "net-http" || row.type === "alert"
+      ? await pauseSwitch(sheet_id, Date.now() + PAUSE_LOOKUP_MS)
+      : null;
   }
   return answer;
 };

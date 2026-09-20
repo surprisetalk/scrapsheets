@@ -6,10 +6,11 @@ deno task status
 ```
 
 `deno task status` grades every likely failure mode of the deployed service and exits nonzero when one that pages is
-failing. **1.0 is the minimum passing grade**, 0.0 is total failure, and anything above 1.0 is headroom. Usage is graded
-and printed but does not page: a product nobody used today is not an outage. `.github/workflows/status.yml` runs it
-every 15 minutes; a failed scheduled run emails the repo owner, and that email is the alarm. `GET /status` is the same
-answer as JSON, and needs no login.
+failing. **1.0 is the minimum passing grade**, 0.0 is total failure, and anything above 1.0 is headroom. Two conditions
+are graded and printed but do not page: usage, because a product nobody used today is not an outage, and the count of
+overdue feeds and alerts, because a sheet somebody paused on purpose is a switch working. `.github/workflows/status.yml`
+runs it every 15 minutes; a failed scheduled run emails the repo owner, and that email is the alarm. `GET /status` is
+the same answer as JSON, and needs no login.
 
 The server refuses to start without `JWT_SECRET`, `TOKEN_SECRET` and `DSN_ENCRYPTION_KEY`, each a long random string
 that must stay the same across restarts. They used to fall back to a random value and only warn, which dropped every
@@ -56,9 +57,9 @@ its one table, so a query over the feed reads one shape whatever the wire carrie
 is a failed run naming the line. A zip is the one member inside it this server can read, checked against its own
 checksum; an archive holding two it can read, or a page holding two tables, says so rather than guessing. Generic XML
 lands as the document it means, decoded the way its own declaration says to decode it, and `rows_path` names the rows in
-it. A paused sheet (the checkbox beside the interval) is stepped over by the poller, "run now" polls it this second and
-answers the row it wrote (`POST /library/<sheet_id>/run` over HTTP), and `library:freshness` says when each sheet runs
-next.
+it. A paused sheet (the checkbox beside the interval) is stepped over by the poller and left out of the status check's
+liveness grades, so pausing a feed does not read as an outage; "run now" polls it this second and answers the row it
+wrote (`POST /library/<sheet_id>/run` over HTTP), and `library:freshness` says when each sheet runs next.
 
 A sheet can hold its own secrets instead. `POST /library/<sheet_id>/secret` with `{"name":"hook","value":"..."}` sets
 the signing key; writing it again rotates it, and the one before still verifies until a third write retires it. `GET`
