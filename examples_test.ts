@@ -25,6 +25,8 @@ import {
   cohortSql,
   describeRef,
   describeRows,
+  KMEANS_DIMS,
+  kmeansSql,
   knownType,
   MAX_EXTREMES,
   NUMERIC_TYPES,
@@ -546,6 +548,61 @@ Deno.test("a score table refuses every field it cannot build from, by name", () 
     ] as unknown as [Parameters<typeof rfmSql>[0], string][]
   ) {
     assertThrows(() => rfmSql(settings), Error, said);
+  }
+});
+
+Deno.test("a segment table answers the bundled airport regions, the same in both engines", () => {
+  const dataset = (DATASETS as { doc_id: string; doc: { data: Row[] } }[]).find((d) => d.doc_id === "airports")!;
+  const [cols_, ...rows] = dataset.doc.data;
+  const airports = rows.map((row) =>
+    Object.fromEntries((Object.values(cols_) as { name: string; key: string }[]).map((c) => [c.name, row[c.key]]))
+  );
+  const loaded: Record<string, Row[]> = { "table:airports": airports };
+  const colsOf = { "table:airports": Object.keys(airports[0]).map((name) => ({ name })) };
+  const answer = (engine: Engine, code: string) => {
+    serveSheets(engine);
+    const { sql, cells } = scanRefs(code);
+    return engine(planQuery(sql, cells, loaded, colsOf).sql, [loaded]).data as Row[];
+  };
+  const byHand = (EXAMPLES as unknown as Record<string, { doc: { data: { code: string }[] } }>)["query:airport-regions"]
+    .doc.data[0].code;
+  const written = kmeansSql({ source: "@table:airports", key: "iata", columns: ["lat", "lon"], k: 3 });
+  const answers = engines.map(([name, engine]) => {
+    const got = answer(engine, written);
+    assertEquals(Object.keys(got[0]), ["iata", "lat", "lon", "segment"], `${name}: a segment table's columns`);
+    const want = new Map(answer(engine, byHand).map((row) => [row.iata, row.region]));
+    assertEquals(got.length, want.size, `${name}: one row per airport`);
+    for (const row of got)
+      assertEquals(row.segment, want.get(row.iata), `${name}: ${row.iata} lands in another segment`);
+    return got;
+  });
+  assertEquals(answers[1], answers[0], "a segment table answers differently in the page engine");
+});
+
+Deno.test("a segment table refuses every field it cannot build from, by name", () => {
+  const ok = { source: "@table:airports", key: "iata", columns: ["lat", "lon"], k: 3 };
+  const taken = (what: string) => `A segment table's ${what} has to be a column it does not already name.`;
+  const clusters = "A segment table's k has to be a whole number from 2 to";
+  const width = "A segment table clusters on 1 to";
+  for (
+    const [settings, said] of [
+      [{ ...ok, source: "@chart:spend" }, "A segment table reads one table or query sheet."],
+      [{ ...ok, k: 1 }, clusters],
+      [{ ...ok, k: 21 }, clusters],
+      [{ ...ok, k: 2.5 }, clusters],
+      [{ ...ok, k: "3" }, clusters],
+      [{ ...ok, columns: [] }, width],
+      [{ ...ok, columns: "lat" }, width],
+      [{ ...ok, columns: Array.from({ length: KMEANS_DIMS + 1 }, (_, i) => `x${i}`) }, width],
+      [{ ...ok, key: "" }, "A segment table's key column has to be a column name."],
+      [{ ...ok, columns: ["lat", 7] }, "A segment table's clustered column has to be a column name."],
+      [{ ...ok, key: "segment" }, taken("key column")],
+      [{ ...ok, columns: ["lat", "segment"] }, taken("clustered column")],
+      [{ ...ok, columns: ["lat", "iata"] }, taken("clustered column")],
+      [{ ...ok, columns: ["lat", "lat"] }, taken("clustered column")],
+    ] as unknown as [Parameters<typeof kmeansSql>[0], string][]
+  ) {
+    assertThrows(() => kmeansSql(settings), Error, said);
   }
 });
 

@@ -205,6 +205,17 @@ Deno.test("renaming a column leaves its type exactly as the document spelled it"
   await rename();
   assertEquals(asked, [here], "a rename asks who reads this sheet");
   assertEquals(patches, [], "and writes nothing until it hears back");
+
+  // C2 x run 8: Alt+Shift+arrow is gated over the palette, the shortcut sheet
+  // and the settings, but a held rename opens a dialog the same way and was
+  // missing from that list -- a move here would slip a patch under a table
+  // the user cannot currently edit through the normal door.
+  doc.body.dispatchEvent(
+    new dom.window.KeyboardEvent("keydown", { key: "ArrowRight", altKey: true, shiftKey: true, bubbles: true }),
+  );
+  await settle();
+  assertEquals(patches, [], "Alt+Shift+right while a rename is still asking must move nothing");
+
   const edge = { sheet_id: "query:fx", type: "query", depends_on: here, depends_on_name: "currencies" };
   app.ports.lineageLoaded.send({ id: "table:countries", rows: [{ ...edge, name: "elsewhere", columns: "minor" }] });
   await settle();
@@ -220,6 +231,11 @@ Deno.test("renaming a column leaves its type exactly as the document spelled it"
   doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
   await settle();
   assertEquals(dialogs(), ["sheets this change can break"], "Ctrl+K opens nothing over the warning");
+  doc.body.dispatchEvent(
+    new dom.window.KeyboardEvent("keydown", { key: "ArrowRight", altKey: true, shiftKey: true, bubbles: true }),
+  );
+  await settle();
+  assertEquals(patches, [], "and Alt+Shift+right over the warning must move nothing either");
   await button("Cancel");
   assertEquals(dialogs(), [], "Cancel closes the warning");
   assertEquals(patches, [], "and writes nothing");
@@ -405,6 +421,22 @@ Deno.test("arranging a sheet writes the arrangement onto its columns", async () 
     `bars run from nothing at the column's smallest value to full at its largest, got ${shaded.join(" | ")}`,
   );
 
+  // Arrows mark the column's thirds. The glyph is an attribute CSS draws, so
+  // the cell's text is still its value.
+  patches.length = 0;
+  await type_(all("label.shading select")[0], "arrows");
+  assertEquals(
+    patches.map((p) => [p.path[1], p.path[2], p.value]),
+    [["0", "shade", "arrows"]],
+    "choosing arrows stores the word the reader reads",
+  );
+  const arrows = all("tbody td div.shade");
+  assertEquals(
+    arrows.map((d) => [d.getAttribute("data-icon"), d.textContent, d.getAttribute("style") ?? ""]),
+    [["▼", "1", ""], ["▬", "5", ""], ["▲", "9", ""]],
+    "arrows point down for the bottom third, flat for the middle, up for the top, and draw no bar",
+  );
+
   // A shade written directly on a text column -- never offered by this panel,
   // whose select sits behind the same numeric gate as decimals and format, but
   // reachable by a document from anywhere else, a collaborator's older client
@@ -491,6 +523,12 @@ Deno.test("every modal, icon button and bare input says what it is", async () =>
   );
   assertEquals(labels("#account input"), ["email", "password"]);
   assertEquals(labels("main > input"), ["search the rows"]);
+  assertEquals(
+    labels(".grip[role='separator'][tabindex='0']").slice(0, 2),
+    ["resize flag", "resize name"],
+    "every resize grip is a focusable separator named for its column",
+  );
+  assertEquals(all(".grip").length, all(".grip[aria-label^='resize ']").length);
 
   // Every icon-only button on screen at once: the settings close and the
   // tutorial dismiss. A `button.x` with nothing but a × reads as "button".
@@ -802,8 +840,8 @@ Deno.test("a query sheet opens arranged the way it was left", async () => {
 // A pinned column stays put while the table scrolls sideways. Its left edge is
 // the widths of the sticky columns before it, so a column that sizes itself gets
 // one written when it is pinned -- an inexact sum overlaps the columns.
-Deno.test("pinning a column sticks it at the sum of the widths before it", async () => {
-  const { app, all, click, settle } = await boot("http://localhost/table:countries");
+Deno.test("pinning a column sticks it at the sum of the widths before it, and a grip resizes from the keyboard", async () => {
+  const { app, all, click, dom, settle } = await boot("http://localhost/table:countries");
   const patches: { action: string; path: unknown[]; value: unknown }[] = [];
   app.ports.arrangeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
 
@@ -824,6 +862,22 @@ Deno.test("pinning a column sticks it at the sum of the widths before it", async
     },
   });
   await settle();
+
+  // The grip takes the keyboard too: 8px an arrow, 32 with Shift, and one width
+  // stored when the key comes up, however many presses went before it.
+  const grip = all(".grip")[1];
+  assertEquals(grip.getAttribute("aria-valuenow"), "60", "the grip reads out the width it holds");
+  const press = (type: string, shiftKey = false) =>
+    grip.dispatchEvent(new dom.window.KeyboardEvent(type, { key: "ArrowRight", shiftKey, bubbles: true }));
+  press("keydown");
+  press("keydown", true);
+  await settle();
+  assertEquals(patches, [], `a width is stored when the key comes up, got ${JSON.stringify(patches)}`);
+  press("keyup");
+  await settle();
+  assertEquals(patches.map((p) => [p.path[1], p.path[2], p.value]), [["1", "width", 100]], "one width, 60 + 8 + 32");
+  assertEquals(all(".grip")[1].getAttribute("aria-valuenow"), "100");
+  patches.length = 0;
 
   await click(all("span.funnel")[2]);
   await click(all("button").find((b) => b.textContent?.trim() === "Pin column"));
@@ -911,13 +965,39 @@ Deno.test("dragging a column onto another moves it there, and off the table move
     [["move", [0, 2]]],
     "undoing a move puts the column back where it was",
   );
+
+  // The keyboard's way: the same one patch, and the selection goes with it.
+  // Elm updates on each event as it arrives, so one settle draws all four.
+  const cell = (x: number) => [...all("tbody tr")[3].querySelectorAll("td")][x];
+  for (const type of ["mouseenter", "mousedown", "mouseup"])
+    cell(2).dispatchEvent(new dom.window.MouseEvent(type, { bubbles: type !== "mouseenter" }));
+  patches.length = 0;
+  doc.body.dispatchEvent(
+    new dom.window.KeyboardEvent("keydown", { key: "ArrowRight", altKey: true, shiftKey: true, bubbles: true }),
+  );
+  await settle();
+  assertEquals(patches.map((p) => [p.action, p.path, p.value]), [["move", [0], [3, 2]]], "Alt+Shift+→ is one move");
+  assert(cell(3).getAttribute("aria-selected") === "true", "the selection moves with the column");
+
+  // The palette's Dom.focus is a Task that lands a frame later, so the document
+  // still hears the key while it is up: a move there must not edit the table
+  // nobody can see.
+  patches.length = 0;
+  doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+  await settle();
+  assertEquals(all("div[role='dialog']").length, 1, "the palette opened");
+  doc.body.dispatchEvent(
+    new dom.window.KeyboardEvent("keydown", { key: "ArrowLeft", altKey: true, shiftKey: true, bubbles: true }),
+  );
+  await settle();
+  assertEquals(patches, [], `Alt+Shift+← over an open palette should move nothing, got ${JSON.stringify(patches)}`);
 });
 
 // A row moves the same way: one `move` patch, at the root of `data` rather than
 // on `data[0]`. Only while the table is in document order -- a sorted view has
 // no honest target for the drop, so the handle is not there to grab.
 Deno.test("dragging a row onto another moves it there, and a sorted table offers no handle", async () => {
-  const { app, all, dom, doc, fire, settle, click, type_ } = await boot("http://localhost/table:countries");
+  const { app, all, dom, doc, fire, settle, click, type_, text } = await boot("http://localhost/table:countries");
   const patches: { action: string; path: unknown[]; value: unknown }[] = [];
   app.ports.changeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
   await settle();
@@ -948,6 +1028,22 @@ Deno.test("dragging a row onto another moves it there, and a sorted table offers
   await settle();
   assertEquals(patches.map((p) => [p.action, p.path, p.value]), [["move", [], [1, 3]]], "undo puts the row back");
 
+  // Alt+Shift+↓ moves the selected row past the one below it: that row moves
+  // above it, one patch, and the selection follows the row it was on. Elm
+  // updates on each event as it arrives, so one settle draws all four.
+  const nudge = async (y: number) => {
+    for (const type of ["mouseenter", "mousedown", "mouseup"])
+      rowCell(y).dispatchEvent(new dom.window.MouseEvent(type, { bubbles: type !== "mouseenter" }));
+    doc.body.dispatchEvent(
+      new dom.window.KeyboardEvent("keydown", { key: "ArrowDown", altKey: true, shiftKey: true, bubbles: true }),
+    );
+    await settle();
+  };
+  patches.length = 0;
+  await nudge(1);
+  assertEquals(patches.map((p) => [p.action, p.path, p.value]), [["move", [], [2, 1]]], "Alt+Shift+↓ is one move");
+  assert(rowCell(2).getAttribute("aria-selected") === "true", "the selection moves with the row");
+
   // A sort taken with the button still down: the row under the pointer is a
   // display row again, and the drop is refused rather than spliced blind.
   patches.length = 0;
@@ -957,6 +1053,9 @@ Deno.test("dragging a row onto another moves it there, and a sorted table offers
   await fire(doc, "mouseup");
   assertEquals(patches, [], `a drop after a mid-drag sort should move nothing, got ${JSON.stringify(patches)}`);
   assertEquals(all(`span.grab[title^="drag onto the row"]`).length, 0, "a sorted table offers no row handle");
+  await nudge(1);
+  assertEquals(patches, [], `a sorted table should move no row from the keyboard, got ${JSON.stringify(patches)}`);
+  assert(text().includes("received a sorted, filtered or searched view"), "and says why");
   assertEquals(all("span.grab").length, all("span.sort").length, "the column handles are still there");
 
   // A search is the other way a display row stops being a document row.

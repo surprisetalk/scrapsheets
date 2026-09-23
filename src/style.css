@@ -328,6 +328,24 @@ tr.meta .pin {
   cursor: grabbing;
 }
 
+/* A shaded cell's arrow. Drawn here for the same reason as `.grab`. No red and
+   green: higher is not always better, and the three glyphs differ in shape. */
+.shade[data-icon]::before {
+  content: attr(data-icon) " ";
+}
+
+.shade[data-icon="▲"]::before {
+  color: var(--accent);
+}
+
+.shade[data-icon="▬"]::before {
+  color: var(--muted);
+}
+
+.shade[data-icon="▼"]::before {
+  color: var(--ink);
+}
+
 .pinned {
   font-size: 0.625rem;
   line-height: 1;
@@ -345,6 +363,13 @@ tr.meta .pin {
 
 .grip:hover {
   border-right-color: var(--muted);
+}
+
+/* The grip is a transparent sliver, so the global inset outline would be lost
+   against the header. */
+.grip:focus-visible {
+  outline-offset: 0;
+  border-right-color: var(--accent);
 }
 
 .sort:hover {

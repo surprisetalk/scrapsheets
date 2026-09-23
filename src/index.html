@@ -55,6 +55,8 @@
         cohortSql,
         describeRef,
         formatQueryError,
+        KMEANS_DIMS,
+        kmeansSql,
         profileRef,
         register,
         rfmSql,
@@ -1246,7 +1248,8 @@
               // Elm cannot import src/sql.mjs, so the palette sends the columns
               // it guessed and the statement is written here. What lands is an
               // ordinary query sheet: the guesses do not travel with it, and
-              // `cohortSql`'s and `rfmSql`'s refusals ride `catchy` to the page.
+              // `cohortSql`'s, `rfmSql`'s and `kmeansSql`'s refusals ride `catchy`
+              // to the page.
               if (data?.[0]?.cohort) {
                 const { cohort, ...rest } = data[0];
                 data = [{ ...rest, code: cohortSql(cohort) }];
@@ -1254,6 +1257,12 @@
               if (data?.[0]?.rfm) {
                 const { rfm, ...rest } = data[0];
                 data = [{ ...rest, code: rfmSql(rfm) }];
+              }
+              // The palette sends every numeric column and `kmeans` clusters on
+              // at most KMEANS_DIMS, so a wider sheet's draft takes the first ones.
+              if (data?.[0]?.kmeans) {
+                const { kmeans, ...rest } = data[0];
+                data = [{ ...rest, code: kmeansSql({ ...kmeans, columns: kmeans.columns.slice(0, KMEANS_DIMS) }) }];
               }
 
               // Create document and wait for it to be ready

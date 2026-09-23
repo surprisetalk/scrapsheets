@@ -65,19 +65,17 @@ a condition in `GET /status`, not an item here.
 
 ## Types & validation
 
-- [ ] A cell holds a ratio, a duration, a multi-select, a reference, a file, or a quantity with its unit.
+- [ ] A cell holds a ratio, a multi-select, a reference, a file, or a quantity with its unit.
   1. Build one type per item, cheapest first. Each type is one `COLUMN_TYPES` row, the three language-boundary copies
      and a `browser_test.ts` pair.
   2. Ratio and basis points: display only, through `formatNumber`, over the stored number. `percentage` already ships.
-  3. Duration: store seconds, display h:mm.
-  4. Multi-select: a `json` array checked against the `enum:` list. An option list from another sheet is an `@ref` that
+  3. Multi-select: a `json` array checked against the `enum:` list. An option list from another sheet is an `@ref` that
      the check reads.
-  5. Reference: a cell that holds another sheet's key, checked on write. It waits on row identity (see the cell-note
+  4. Reference: a cell that holds another sheet's key, checked on write. It waits on row identity (see the cell-note
      item).
-  6. Attachment: waits on a file store, and none exists. Decide the store first.
-  7. Unit of measure: a quantity plus a unit. Adding lbs to kg is refused the same way two currencies are, so it comes
+  5. Attachment: waits on a file store, and none exists. Decide the store first.
+  6. Unit of measure: a quantity plus a unit. Adding lbs to kg is refused the same way two currencies are, so it comes
      after the money item.
-
 - [ ] A bad row is refused at every door and kept in a dead-letter sheet, and a sheet states what must be true of it.
   1. Decide first where a constraint lives. The suggestion is the column object in `data[0]`, beside `type`, which is
      where the arrangement already lives. Read it leniently, the way `viewDecoder` reads.
@@ -104,11 +102,9 @@ a condition in `GET /status`, not an item here.
   2. Add a custom mask only after a second real use asks for one. A mask is a parser, and `formatNumber` is the one
      place a number becomes text.
 
-- [ ] You colour a cell with an icon, or by a rule over its whole row.
-  1. Icon sets: add a `Shade` constructor and a `shadeSpec` row, drawn in the same `div.shade` wrapper.
-  2. A rule over the whole row comes after the computed-column item, because that item gives a per-row expression a
+- [ ] You colour a cell by a rule over its whole row.
+  1. A rule over the whole row comes after the computed-column item, because that item gives a per-row expression a
      place to live.
-
 - [ ] You group rows and see subtotals without writing SQL.
   1. Add collapsible groups, with subtotals over the rows on screen, the same way the totals row respects the filter. A
      smaller alternative needs neither: one footer `tr` per group under the table, grouped by one chosen column, from
@@ -191,10 +187,11 @@ a condition in `GET /status`, not an item here.
 ## Codex — databases
 
 - [ ] You connect the database you actually have, browse its tables, and read only the rows you filter.
-  1. A schema browser and table picker, built from the read `codexTables()` makes. The preview samples with a `limit`
-     and never runs `select *`.
-  2. A codex query path. Today the only statements are the read-only session and `information_schema`. Push down only a
-     where clause that is provably safe.
+  1. The Elm half of the schema browser. A table picker over `GET /codex/:id` and a preview over
+     `GET /codex/:id/preview?table=<name>&limit=<n>`, through a port pair like freshness. Draw both as text: every
+     column is typed `text` today.
+  2. A codex query path. Today the only statements are the read-only session, `information_schema` and the preview's
+     `limit`. Push down only a where clause that is provably safe.
   3. A write grant per connection, off by default, with row and column masking over that path.
   4. Incremental sync by a watermark column. CDC or logical replication after that.
   5. More engines, one at a time, each with its own driver and its own `cannotConnect()` mapping: MySQL, SQLite, SQL
@@ -247,17 +244,17 @@ a condition in `GET /status`, not an item here.
   2. The bundled sweep demo already shows the answer by search. Build goal seek on the chosen form, then add
      constraints.
 
-- [ ] You segment a sheet by k-means from the palette.
-  1. Add `kmeansSql({ source, key, columns, k })` to `src/sql.mjs` beside `rfmSql`. It writes the statement once, at
-     creation, as an ordinary query's `code`, shaped like `query:airport-regions`: every source row, plus
-     `kmeans_assign(m.centroids, …) as segment`, crossed with
-     `(select kmeans(k, array(c1), array(c2), …) as centroids from <source>) m`. Check the source through
-     `writtenFrom()`, the names through `chartIdent()`, and collisions through `refuseTaken()`. `k` runs from 2 to
-     `KMEANS_K_MAX`. Scaling stays the author's job: the generated code divides nothing.
-  2. Add "segment this sheet (k-means)" to `paletteRows` beside "score this sheet's customers (RFM)", offered when two
-     or more numeric columns are known, and built through the same guesses and the same create path.
-  3. Tests: `examples_test.ts` runs `kmeansSql` output through both engines and checks the refusals; one palette step
-     goes in the existing RFM palette test in `library_test.ts`, with no new boot.
+- [ ] You build a segment table over a sheet with more rows than the square root of `MAX_JOIN_ROWS`, and it answers in
+      both engines.
+  1. Decided: the fix goes in `checkJoinRows`, not in `kmeansSql`. AlaSQL has no `WITH` and no lateral join, so the
+     statement reads its source twice: once as the rows, and once inside `(select kmeans(…) … from <source>) m`, which
+     is one row. `checkJoinRows` multiplies every `SHEET()` and so squares the source, and its refusal tells the reader
+     to filter and join, which does not apply. `cohortSql`'s subquery groups by key and is a real join: leave it
+     charged.
+  2. Failing test first in `examples_test.ts`: `kmeansSql` over a generated table of `floor(sqrt(MAX_JOIN_ROWS)) + 1`
+     distinct rows answers in both engines.
+  3. In `checkJoinRows`, charge one row for a `SHEET()` inside a from-clause subquery that has no `group by` and only
+     aggregates in its select list.
 
 ---
 
@@ -396,15 +393,10 @@ a condition in `GET /status`, not an item here.
 
 ## Navigation & workspace UX
 
-- [ ] You find a sheet by what is in it, and you file hundreds of sheets into folders.
-  1. A folder is a field on the library entry this browser stores. `library()` in `src/page.mjs` merges it, and the
-     library table gets a column for it. Then a bulk verb moves many selected rows into one folder.
-  2. Bulk share: one `POST /library/:id/share` per sheet, as a bounded fan-out, with one refusal that names every sheet
+- [ ] You find a sheet by what is in it.
+  1. Bulk share: one `POST /library/:id/share` per sheet, as a bounded fan-out, with one refusal that names every sheet
      it could not share.
-  3. Global search over sheet names, column names and cell contents. Semantic search after that.
-
-- [ ] You reach everything without a mouse or a screen.
-  1. Keyboard equivalents for the `.grab` row handle and the `.grip` column resizer.
+  2. Global search over sheet names, column names and cell contents. Semantic search after that.
 
 ---
 

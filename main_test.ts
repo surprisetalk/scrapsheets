@@ -20,6 +20,7 @@ import {
   BODY_CAP,
   callerIp,
   cannotConnect,
+  CODEX_PREVIEW_MAX,
   createJwt,
   createToken,
   DSN_KEEP,
@@ -208,22 +209,49 @@ Deno.test(async function allTests(t) {
     started ??= (async () => {
       const db = new PGlite({ loadDataDir: bare });
       await db.waitReady;
-      await db.exec(`create table widget (widget_id int, name text)`);
+      await db.exec(`
+        create table widget (widget_id int, name text);
+        insert into widget values (1, 'bolt'), (2, 'nut');
+        create table "odd.name" (x int);
+      `);
       return db;
     })();
 
   const serve = (port: number, of: PGlite | (() => Promise<PGlite>)) => {
     const listener = Deno.listen({ hostname: "127.0.0.1", port });
+    // pg-gateway hands every socket's messages to one PGlite session. Postgres
+    // gives each connection its own backend, so two connections' extended-
+    // protocol exchanges never interleave there; here they would, and one side
+    // reads 'portal "" cannot be run'. So one connection holds the session until
+    // its Terminate ('X', what postgres.js's end() sends). The timeout frees a
+    // connection that never sends one: main.ts's own pool connection lives as
+    // long as the suite.
+    let queue: Promise<void> = Promise.resolve();
     (async () => {
       for await (const conn of listener) {
         const db = await (typeof of === "function" ? of() : of);
+        let held: Promise<void> | undefined;
+        let release: () => void = () => {};
         new PostgresConnection(conn, {
           async onStartup() {
             await db.waitReady;
           },
           async onMessage(data, { isAuthenticated }) {
             if (!isAuthenticated) return;
-            return await db.execProtocolRaw(data);
+            if (!held) {
+              held = queue;
+              queue = new Promise<void>((resolve) => {
+                const timer = setTimeout(resolve, 2_000);
+                release = () => {
+                  clearTimeout(timer);
+                  resolve();
+                };
+              });
+              await held;
+            }
+            const result = await db.execProtocolRaw(data);
+            if (data[0] === 0x58) release();
+            return result;
           },
         });
       }
@@ -2681,6 +2709,50 @@ Deno.test(async function allTests(t) {
       );
       assertEquals([m.G1.v, m.G2.v], ["", "kept"], "a null column name is a blank header, and its row survives");
 
+      // A duration is seconds wherever it arrives from, and a workbook counts
+      // it in days: 5400 written as-is under [h]:mm:ss opens as 5400 days.
+      const timed = async (csv: string) => {
+        const form = new FormData();
+        form.append("file", new File([csv], "laps.csv", { type: "text/csv" }));
+        return await app.request(`/import/csv?types=${encodeURIComponent(JSON.stringify({ took: "duration" }))}`, {
+          method: "POST",
+          headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+          body: form,
+        });
+      };
+      const laps = await timed("lap,took\na,1:30\nb,5400");
+      assertEquals(laps.status, 201, await laps.clone().text());
+      const lapsId = (await laps.json()).sheet_id;
+      const [, ...lapRows] = await get<Table>(jwt, `/sheet/${lapsId}`);
+      assertEquals(lapRows.map((r) => r.took), [5400, 5400], "h:mm and seconds store the same number");
+      const lapBook = XLSX.read(new Uint8Array(await (await exp(lapsId, "xlsx")).arrayBuffer()), {
+        type: "array",
+        cellNF: true,
+      });
+      const l = lapBook.Sheets[lapBook.SheetNames[0]];
+      assertEquals([l.B2.z, l.B2.v, l.B3.v], ["[h]:mm:ss", 0.0625, 0.0625]);
+
+      // A negative day fraction opens blank under [h]:mm:ss, so a negative
+      // duration goes out as text.
+      const negBook = XLSX.read(
+        new Uint8Array(
+          await (await exp((await (await timed("lap,took\na,-0:45")).json()).sheet_id, "xlsx")).arrayBuffer(),
+        ),
+        { type: "array", cellNF: true },
+      );
+      const n = negBook.Sheets[negBook.SheetNames[0]];
+      assertEquals(
+        XLSX.utils.format_cell(n.B2),
+        "-2700",
+        "a negative duration reads as its seconds, not as a blank cell",
+      );
+
+      const late = await timed("lap,took\na,1:30\nb,1:60");
+      assertEquals(late.status, 400);
+      const lateSaid = await late.text();
+      assert(lateSaid.includes("Line 3") && lateSaid.includes('"took"'), `names the line and the column: ${lateSaid}`);
+      assert(lateSaid.includes("h:mm"), `and says what a duration takes: ${lateSaid}`);
+
       // A cell past Excel's own 32,767-character limit throws out of
       // XLSX.write. It is refused by name here rather than cut to fit: a
       // workbook missing the tail of a cell is a wrong answer, and the formats
@@ -3219,6 +3291,32 @@ Deno.test(async function allTests(t) {
       args: [],
     });
     assertEquals([row.mean, Number(row.n)], [0.375, 2], "the blank is absent, not a zero, and the string is a number");
+
+    // A duration reads h:mm and h:mm:ss as seconds, and refuses anything else
+    // by row and column, the way a num column refuses a word.
+    const clock = automerge.create<{ data: Sheet["data"] }>({
+      data: [arrayify([{ name: "took", type: "duration", key: 0 }]), { 0: "1:30" }, { 0: "-0:00:05" }, { 0: 60 }],
+    });
+    await put(jwt, `/library/table:${clock.documentId}`, {});
+    const { data: [, sum] }: { data: Table } = await post(jwt, `/query`, {
+      lang: "sql",
+      code: `select sum(took) as secs from @table:${clock.documentId}`,
+      args: [],
+    });
+    assertEquals(sum.secs, 5455);
+    const stopped = automerge.create<{ data: Sheet["data"] }>({
+      data: [arrayify([{ name: "took", type: "duration", key: 0 }]), { 0: "1:30" }, { 0: "1:5" }],
+    });
+    await put(jwt, `/library/table:${stopped.documentId}`, {});
+    const halted = await app.request("/query", {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+      body: JSON.stringify({ lang: "sql", code: `select * from @table:${stopped.documentId}`, args: [] }),
+    });
+    assertEquals(halted.status, 400);
+    const stops = await halted.text();
+    assert(stops.includes(`row 2 of @table:${stopped.documentId}, column "took"`), stops);
+    assert(stops.includes("h:mm"), stops);
 
     // And a spelling nobody knows is refused by name rather than skipped, which
     // is the same failure wearing a typo.
@@ -8375,6 +8473,106 @@ Deno.test(async function allTests(t) {
       assertEquals(res.status, status, `${method} ${route} must answer ${status}, got ${res.status}: ${answer}`);
       assert(answer.includes(needle), `${method} ${route} must name ${JSON.stringify(needle)}, got: ${answer}`);
     }
+  });
+
+  await t.step("You preview the first rows of one far table without writing SQL", async () => {
+    const { jwt } = await usr("peek@example.com");
+    const { jwt: stranger } = await usr("peeker@example.com");
+    const hand = automerge.create<Sheet>({ type: "codex-db", data: [] });
+    const doc_id = hand.documentId;
+    const sheet_id = `codex-db:${doc_id}`;
+    await put(jwt, `/library/${sheet_id}`, { name: "the shop floor" });
+    await post(jwt, `/codex-db/${doc_id}`, { dsn: "postgresql://postgres@127.0.0.1:5435/postgres" });
+    const preview = (query: string, who = jwt) => {
+      rateLimitBuckets.clear();
+      return app.request(`/codex/${sheet_id}/preview?${query}`, {
+        headers: new Headers({ Authorization: `Bearer ${who}` }),
+      });
+    };
+    const runs = async () =>
+      (await sql`select meta from net where sheet_id = ${sheet_id} order by net_id`).map((r: { meta: unknown }) =>
+        r.meta as { status: number; rolled_over: boolean }
+      );
+
+    const [cols, ...rows] = await get<Table>(jwt, `/codex/${sheet_id}/preview`, { table: "widget" });
+    assertEquals(Object.values(cols), [
+      { name: "widget_id", type: "text", key: "widget_id" },
+      { name: "name", type: "text", key: "name" },
+    ], "the columns in table order, typed text as GET /codex/:id types them");
+    assertEquals(rows, [{ widget_id: 1, name: "bolt" }, { widget_id: 2, name: "nut" }], "rows keyed by name");
+    const [{ n: audited }] = await sql`
+      select count(*)::int as n from audit where sheet_id = ${sheet_id} and action = 'GET /codex/:id/preview'
+    `;
+    assertEquals(audited, 1, "one audit row for the one preview");
+    assertEquals((await runs()).length, 1, "one run row for the one connection");
+    assertEquals((await get<Table>(jwt, `/codex/${sheet_id}/preview`, { table: "widget", limit: 1 })).length, 2);
+
+    for (
+      const [query, needle] of [
+        ["table=widget%3B%20drop%20table%20widget", "is not in the database"],
+        ["table=Widget", "Did you mean"],
+        ["table=odd.name", "cannot be previewed by name"],
+        ["", "Name the table"],
+        ["table=", "Name the table"],
+        ...["0", "-1", "1.5", "1e2", "abc", "", String(CODEX_PREVIEW_MAX + 1)].map((limit) =>
+          [`table=widget&limit=${limit}`, "not a preview"] as const
+        ),
+      ] as const
+    ) {
+      const res = await preview(query);
+      const said = await res.text();
+      assertEquals(res.status, 400, `?${query} must refuse: ${said}`);
+      assert(said.includes(needle), `?${query} must say ${needle}: ${said}`);
+    }
+    assertEquals((await runs()).length, 5, "a refused name is one good run, a refused limit is none");
+
+    const shut = await preview("table=widget", stranger);
+    assertEquals(shut.status, 403);
+    assert((await shut.text()).includes("read access"), "a stranger gets the access refusal");
+
+    // A dead newest credential rolls over exactly as GET /codex/:id does.
+    await post(jwt, `/codex-db/${doc_id}`, { dsn: "postgresql://postgres:p4ssw0rd@127.0.0.1:5436/postgres" });
+    assertEquals((await get<Table>(jwt, `/codex/${sheet_id}/preview`, { table: "widget" })).length, 3);
+    assertEquals((await runs()).at(-1)?.rolled_over, true, "the run names which credential answered");
+    await post(jwt, `/codex-db/${doc_id}`, { dsn: "postgresql://postgres:p4ssw0rd@127.0.0.1:5437/postgres" });
+    const dead = await preview("table=widget");
+    const said = await dead.text();
+    assertEquals(dead.status, 502, `a dead connection is a refusal, never an empty answer: ${said}`);
+    assert(said.includes(`${DSN_KEEP} stored credentials`) && !said.includes("p4ssw0rd"), said);
+    assertEquals((await runs()).at(-1)?.status, 502, "a failure is a run like any other");
+  });
+
+  // Two sockets into the far database at once, which only the lock in serve()
+  // keeps apart.
+  await t.step("Two previews at once do not cross-wire their answers", async () => {
+    const { jwt } = await usr("breaker@example.com");
+    const hand = automerge.create<Sheet>({ type: "codex-db", data: [] });
+    const doc_id = hand.documentId;
+    const sheet_id = `codex-db:${doc_id}`;
+    await put(jwt, `/library/${sheet_id}`, { name: "the shop floor, dented" });
+    await post(jwt, `/codex-db/${doc_id}`, { dsn: "postgresql://postgres@127.0.0.1:5435/postgres" });
+
+    const [{ n: before }] = await sql`
+      select count(*)::int as n from audit where sheet_id = ${sheet_id} and action = 'GET /codex/:id/preview'
+    `;
+    rateLimitBuckets.clear();
+    const concurrent = (table: string) =>
+      app.request(`/codex/${sheet_id}/preview?table=${table}`, {
+        headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+      });
+    const [widget, dotted] = await Promise.all([concurrent("widget"), concurrent("odd.name")]);
+    const { data: a } = await widget.json();
+    const dottedSaid = await dotted.text();
+    assertEquals(a, [
+      [{ name: "widget_id", type: "text", key: "widget_id" }, { name: "name", type: "text", key: "name" }],
+      { widget_id: 1, name: "bolt" },
+      { widget_id: 2, name: "nut" },
+    ], "the widget preview must not answer with the other request's data");
+    assert(dottedSaid.includes("cannot be previewed by name"), `and the dotted name must still refuse: ${dottedSaid}`);
+    const [{ n: after }] = await sql`
+      select count(*)::int as n from audit where sheet_id = ${sheet_id} and action = 'GET /codex/:id/preview'
+    `;
+    assertEquals(after - before, 1, "only the one that answered is audited");
   });
 
   // safeFetch guarded our network and not theirs. Three things a polite

@@ -565,6 +565,7 @@ export const COLUMN_TYPES = {
   float: { json: { type: "number" }, numeric: true },
   usd: { json: { type: "number" }, numeric: true },
   percentage: { json: { type: "number" }, numeric: true },
+  duration: { json: { type: "number" }, numeric: true },
   bool: { json: { type: "boolean" } },
   date: { json: { type: "string", format: "date" } },
   timestamp: { json: { type: "string", format: "date-time" } },
@@ -666,6 +667,7 @@ export const checkColumnTypes = (id, cols, rows) => {
       }));
     }
     if (!NUMERIC_TYPES.includes(col.type)) continue;
+    const duration = canonicalType(col.type) === "duration";
     for (let i = 0; i < rows.length; i++) {
       const v = rows[i][col.name];
       if (absent(v)) {
@@ -679,9 +681,20 @@ export const checkColumnTypes = (id, cols, rows) => {
         rows[i][col.name] = Number(v.trim());
         continue;
       }
+      // A duration also reads the h:mm[:ss] that formatNumber in src/Main.elm
+      // writes, so a cell typed the way it is shown lands as its seconds.
+      const clock = duration && typeof v === "string" ? /^(-?)(\d+):([0-5]\d)(?::([0-5]\d))?$/.exec(v.trim()) : null;
+      const seconds = clock &&
+        (clock[1] ? -1 : 1) * (Number(clock[2]) * 3600 + Number(clock[3]) * 60 + Number(clock[4] ?? 0));
+      if (Number.isFinite(seconds)) {
+        rows[i][col.name] = seconds;
+        continue;
+      }
       throw new Error(explain(`Column "${col.name}" of @${id} holds a value its type does not allow.`, {
-        Expected: `${col.type}, so a number or a blank`,
-        Received: `${typeof v} ${JSON.stringify(v)}`,
+        Expected: duration
+          ? `${col.type}, so a number of seconds, h:mm, h:mm:ss or a blank`
+          : `${col.type}, so a number or a blank`,
+        Received: show(v),
         Source: `row ${i + 1} of @${id}, column "${col.name}"`,
         Fix: `clear that cell, or change the column's type to text`,
       }));
@@ -2206,9 +2219,9 @@ export const cohortSql = ({ source, date, key, value = "", grain }) => {
 // --- scores
 //
 // Recency, frequency and monetary scores per key, written once the way a cohort
-// table is. This is quantile scoring and not clustering: one statement cannot
-// iterate, so there are no distances, no centroids, no learned segments and no
-// combined segment label. Each score is `ntile` over one measure, and the
+// table is. This is quantile scoring and not clustering, which is `kmeansSql`'s
+// job: no distances, no centroids and no combined segment label. Each score is
+// `ntile` over one measure, and the
 // highest bucket is the best: the most recent, the most frequent, the most
 // spent. Recency orders by the last date seen and never by `now()`, so the two
 // hosts answer the same scores on different days. `applyWindows` splits a tie
@@ -2247,6 +2260,53 @@ export const rfmSql = ({ source, date, key, value, buckets }) => {
   return `select ${who}, last_seen, orders, ${amount}, ${score("last_seen", "r")}, ${score("orders", "f")}, ${
     score(amount, "m")
   } from (${each}) order by ${who}`;
+};
+
+// --- segments
+//
+// A k-means segment table, written once the way a cohort table is: every source
+// row's key and clustered columns, and the 1-based segment `kmeans_assign`
+// reads back off one `kmeans` over the whole source. Scaling stays the
+// author's: the statement divides nothing, so a column in dollars outweighs one
+// in years until the owner rescales it in the code.
+
+// Past this a segmentation is a list nobody reads as segments, and every pass
+// costs points times k.
+const KMEANS_K_MAX = 20;
+// With KMEANS_POINTS in register(), this bounds one pass of `kmeans`: points
+// times k times dimensions.
+export const KMEANS_DIMS = 12;
+
+export const kmeansSql = ({ source, key, columns, k }) => {
+  writtenFrom("segment table", source);
+  if (!Number.isInteger(k) || k < 2 || k > KMEANS_K_MAX) {
+    throw new Error(explain(`A segment table's k has to be a whole number from 2 to ${KMEANS_K_MAX}.`, {
+      Expected: `a whole number of segments from 2 to ${KMEANS_K_MAX}, e.g. 3`,
+      Received: show(k ?? null),
+      Source: "this segment table's settings",
+      Fix: "ask for the number of segments you mean to read, e.g. 3",
+    }));
+  }
+  if (!Array.isArray(columns) || !columns.length || columns.length > KMEANS_DIMS) {
+    throw new Error(explain(`A segment table clusters on 1 to ${KMEANS_DIMS} columns.`, {
+      Expected: `a list of 1 to ${KMEANS_DIMS} column names, e.g. ["lat", "lon"]`,
+      Received: show(columns ?? null),
+      Source: "this segment table's settings",
+      Fix: "list the numeric columns that tell the segments apart",
+    }));
+  }
+  const who = chartIdent("segment table", "key column", key);
+  const on = columns.map((column) => chartIdent("segment table", "clustered column", column));
+  // A source column spelled like the output name lands in the generated SQL
+  // twice, and AlaSQL's alias shadowing decides which one a row keeps.
+  refuseTaken("segment table", [
+    ["key column", key, ["segment"]],
+    ...columns.map((column, i) => ["clustered column", column, ["segment", key, ...columns.slice(0, i)]]),
+  ]);
+  const point = on.map((column) => `s.${column}`).join(", ");
+  return `select s.${who}, ${point}, kmeans_assign(m.centroids, ${point}) as segment from ${source} s, (select kmeans(${k}, ${
+    on.map((column) => `array(${column})`).join(", ")
+  }) as centroids from ${source}) m order by segment, s.${who}`;
 };
 
 // --- resolving a query's sheet references
@@ -2997,14 +3057,10 @@ export const register = (alasql) => {
   // and every step after is +, -, *, / and comparisons, which ECMAScript pins to
   // IEEE 754: both hosts answer bit for bit.
   const KMEANS_STEPS = 100;
-  // Past this a segmentation is a list nobody reads as segments, and every pass
-  // costs points times k.
-  const KMEANS_K_MAX = 20;
   // design() validates a response beside its predictors and scales them, which
-  // a clustering has no use for. These bound the same cost it bounds: one pass
-  // walks points times k times dimensions.
+  // a clustering has no use for. With KMEANS_DIMS this bounds the cost design()
+  // bounds.
   const KMEANS_POINTS = 5000;
-  const KMEANS_DIMS = 12;
   const closest = (point, centroids) => {
     let best = 0, far = Infinity;
     for (let j = 0; j < centroids.length; j++) {

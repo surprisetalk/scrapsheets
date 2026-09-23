@@ -313,8 +313,9 @@ Deno.test("the palette subscribes to the sheet that is open, and builds a cohort
             { name: "signup_id", type: "text", key: "1" },
             { name: "joined_on", type: "date", key: "2" },
             { name: "fee", type: "usd", key: "3" },
+            { name: "seats", type: "int", key: "4" },
           ],
-          { "0": "pro", "1": "a", "2": "2024-01-03", "3": 5 },
+          { "0": "pro", "1": "a", "2": "2024-01-03", "3": 5, "4": 2 },
         ],
       },
     },
@@ -353,16 +354,30 @@ Deno.test("the palette subscribes to the sheet that is open, and builds a cohort
     rfm: { source: "@table:signups", date: "joined_on", key: "signup_id", value: "fee", buckets: 5 },
   });
 
-  // A cohort counts keys with no money column; a score has nothing to score.
+  // The same key segments the rows by every numeric column, into three.
+  await key(doc.body, { key: "k", ctrlKey: true });
+  await type("k-means");
+  await key(doc.getElementById("palette"), { key: "ArrowDown" });
+  await key(doc.getElementById("palette"), { key: "Enter" });
+  assertEquals(made.length, 3, "the segment command opens one sheet");
+  assertEquals(made[2].type, "query");
+  assertEquals(made[2].data[0], {
+    lang: "sql",
+    kmeans: { source: "@table:signups", key: "signup_id", columns: ["fee", "seats"], k: 3 },
+  });
+
+  // A cohort counts keys with no money column; a score has nothing to score,
+  // and one numeric column is a sort, not a segmentation.
   app.ports.docSelected.send({
     id: "table:unpriced",
     data: {
       doc: {
         type: "table",
-        data: [[{ name: "plan", type: "text", key: "0" }, { name: "joined_on", type: "date", key: "1" }], {
-          "0": "pro",
-          "1": "2024-01-03",
-        }],
+        data: [[{ name: "plan", type: "text", key: "0" }, { name: "joined_on", type: "date", key: "1" }, {
+          name: "seats",
+          type: "int",
+          key: "2",
+        }], { "0": "pro", "1": "2024-01-03", "2": 2 }],
       },
     },
   });
@@ -371,8 +386,10 @@ Deno.test("the palette subscribes to the sheet that is open, and builds a cohort
   await type("this sheet");
   assert(
     rows().some((row) => row.includes("build a cohort table")) &&
-      !rows().some((row) => row.includes("(RFM)")),
-    `a sheet with no money column has a cohort but no score, got: ${rows().join("|")}`,
+      !rows().some((row) => row.includes("(RFM)") || row.includes("(k-means)")),
+    `a sheet with no money column and one numeric column has a cohort but no score and no segments, got: ${
+      rows().join("|")
+    }`,
   );
   await key(doc.getElementById("palette"), { key: "Escape" });
 
@@ -398,8 +415,8 @@ Deno.test("the palette subscribes to the sheet that is open, and builds a cohort
   await key(doc.body, { key: "k", ctrlKey: true });
   await type("this sheet");
   assert(
-    !rows().some((row) => row.includes("build a cohort table") || row.includes("(RFM)")),
-    `a sheet with no key column has no cohort to build and no customers to score, got: ${rows().join("|")}`,
+    !rows().some((row) => row.includes("build a cohort table") || row.includes("(RFM)") || row.includes("(k-means)")),
+    `a sheet with no key column has no cohort, no customers to score and no rows to segment, got: ${rows().join("|")}`,
   );
   await key(doc.getElementById("palette"), { key: "Escape" });
 
@@ -440,9 +457,9 @@ Deno.test("the palette subscribes to the sheet that is open, and builds a cohort
   await type("subscribe");
   await key(doc.getElementById("palette"), { key: "ArrowDown" });
   await key(doc.getElementById("palette"), { key: "Enter" });
-  assertEquals(made.length, 3, "one command, one sheet");
-  assertEquals(made[2].type, "alert");
-  assertEquals(made[2].data[0], {
+  assertEquals(made.length, 4, "one command, one sheet");
+  assertEquals(made[3].type, "alert");
+  assertEquals(made[3].data[0], {
     code: "select * from @table:countries",
     to: "ops@example.com",
     interval: 3600,
@@ -877,6 +894,15 @@ Deno.test("the library merges what is stored under what is bundled", () => {
   assertEquals(starred["table:countries"].starred, true, "a bundled sheet keeps this browser's star");
   assertEquals(starred["table:countries"].name, "countries", "and still loses its name to the bundled one");
   assertEquals(starred["table:mine"].starred, undefined, "a sheet nobody starred carries no flag");
+  // And the fourth: a folder is this browser's filing, so a bundled demo can be
+  // filed, and unfiling writes "" rather than null.
+  const filed = library({ "table:countries": { folder: "work" }, "table:tutorial": { folder: "" } }) as Record<
+    string,
+    { name: string; folder?: string }
+  >;
+  assertEquals(filed["table:countries"].folder, "work", "a bundled sheet keeps this browser's folder");
+  assertEquals(filed["table:countries"].name, "countries", "and still loses its name to the bundled one");
+  assertEquals(filed["table:tutorial"].folder, undefined, "an unfiled bundled sheet carries no folder");
   // Tags are the same kind of fact and the one that merges rather than overlays:
   // a tag this browser put on a bundled demo has to outlive the merge, and the
   // demo's own tags are what the gallery strip filters on.
@@ -1033,7 +1059,7 @@ Deno.test("a sheet is starred from its row, drawn first, dropped by a chosen sor
 // over them -- a top-level Msg, because every DocMsg on the library is refused.
 Deno.test("the selected library rows are trashed and tagged together, and an empty selection is refused by name", async () => {
   const { app, all, click, doc, dom, fire, settle, text, type_ } = await boot("http://localhost/");
-  const sent: { id: string; data: { trashed: boolean | null; tags: string[] | null } }[] = [];
+  const sent: { id: string; data: { trashed: boolean | null; tags: string[] | null; folder: string | null } }[] = [];
   app.ports.updateLibrary.subscribe((s: (typeof sent)[number]) => sent.push(s));
   const key = async (init: Record<string, unknown>) => {
     doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, ...init }));
@@ -1168,6 +1194,72 @@ Deno.test("the selected library rows are trashed and tagged together, and an emp
     [["table:a", ["keep", "mine", "header-safe"]]],
     "the header row in the selection is silently skipped, not crashed on",
   );
+
+  // The folder box fans out like the tag box, over rows a and b again.
+  const folderBox = all("input").find((i) => i.getAttribute("aria-label") === "folder");
+  const move = () => click(all("button.chip").find((b) => b.textContent?.trim() === "move to folder"));
+  await fire(first, "mouseenter");
+  await fire(first, "mousedown");
+  await fire(first, "mouseup");
+  await key({ key: "ArrowDown", shiftKey: true });
+  sent.length = 0;
+  await type_(folderBox, "  ");
+  await move();
+  assertEquals(sent, [], "a folder of nothing writes nothing");
+  assert(
+    text().includes("Expected a folder, received nothing"),
+    `expected the refusal by name, got: ${text().slice(0, 200)}`,
+  );
+  await type_(folderBox, " work/2026 ");
+  await move();
+  assertEquals(
+    sent.map((s) => [s.id, s.data.folder]).sort(),
+    [["table:a", "work/2026"], ["table:b", "work/2026"]],
+    "one updateLibrary per selected row, the folder trimmed",
+  );
+  // Library.set's round trip, by hand: a null field is dropped from the patch.
+  const store: Record<string, Record<string, unknown>> = {
+    "": { name: "library", system: true, doc: { type: "library" } },
+    "table:a": { name: "a", tags: ["keep"], doc: { type: "table", data: [[]] } },
+    "table:b": { name: "b", tags: [], doc: { type: "table", data: [[]] } },
+    "table:c": { name: "c", tags: [], doc: { type: "table", data: [[]] } },
+  };
+  for (const { id, data } of sent)
+    store[id] = { ...store[id], ...Object.fromEntries(Object.entries(data).filter(([, v]) => v !== null)) };
+  assertEquals([store["table:a"].folder, store["table:a"].tags], ["work/2026", ["keep"]], "the store holds the folder");
+  app.ports.librarySynced.send(store);
+  await settle();
+  const cellsOf = (name: string) => {
+    const row = all("tbody tr").find((tr) => [...tr.querySelectorAll("td")][2]?.textContent?.trim() === name);
+    return row ? [...row.querySelectorAll("td")] : [];
+  };
+  assertEquals(
+    ["a", "b", "c"].map((n) => cellsOf(n)[4]?.textContent?.trim()),
+    ["work/2026", "work/2026", ""],
+    "each moved row's folder cell reads the name",
+  );
+  await type_(all("main > input").find((i) => i.getAttribute("aria-label") === "search the rows"), "work/");
+  assertEquals(["a", "b", "c"].map((n) => cellsOf(n).length > 0), [true, true, false], "search matches the folder");
+  await type_(all("main > input").find((i) => i.getAttribute("aria-label") === "search the rows"), "");
+
+  // The cell holds the box's rule: one folder, no comma. Unfiling is blanking
+  // the cell, which writes "" and never null.
+  sent.length = 0;
+  const folderCell = cellsOf("a")[4];
+  for (const type of ["mouseenter", "mousedown", "mouseup", "click", "dblclick"]) await fire(folderCell, type);
+  await type_(all("#new-cell")[0], "work, play");
+  all("#new-cell")[0].dispatchEvent(new dom.window.FocusEvent("blur"));
+  await settle();
+  assertEquals(sent, [], "a folder cell holding a comma writes nothing");
+  assert(
+    text().includes("Expected one folder, received work, play"),
+    `expected the refusal, got: ${text().slice(0, 200)}`,
+  );
+  for (const type of ["mouseenter", "mousedown", "mouseup", "click", "dblclick"]) await fire(cellsOf("a")[4], type);
+  await type_(all("#new-cell")[0], "");
+  all("#new-cell")[0].dispatchEvent(new dom.window.FocusEvent("blur"));
+  await settle();
+  assertEquals(sent.map((s) => [s.id, s.data.folder]), [["table:a", ""]], "a blanked folder cell unfiles the sheet");
 });
 
 // A rename in the library lands on the sheet whose row was edited, which is the

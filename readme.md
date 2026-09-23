@@ -147,12 +147,14 @@ body served under a wrong label is a failure row that names the label.
 `trend(y, 12) over (order by month)`, `seasonal(...)` and `deseasonalized(...)` decompose a seasonal series in a query;
 `query:visit-decomposition` is the bundled example, and its fit is a second query over the first. "build a cohort table
 from this sheet" in the palette writes the cohort SQL for a table or query with a date and a key column and opens it as
-a query sheet you then edit.
+a query sheet you then edit. "score this sheet's customers (RFM)" and "segment this sheet (k-means)" do the same for
+recency/frequency/money scores and for `kmeans` clusters over the sheet's numeric columns.
 
-A numeric column can be shaded by its own values — a colour scale or data bars, from the column's panel, stored with the
-arrangement — and a `json` cell holding a list of numbers draws as a sparkline. In the library, one tag goes onto every
-selected row from the strip's tag box, and a tag put on a bundled demo survives the next merge. The shop lists type and
-tags as columns over the whole catalogue, so the column panel is the filter.
+A numeric column can be shaded by its own values — a colour scale, data bars or up/flat/down arrows by thirds, from the
+column's panel, stored with the arrangement — and a `json` cell holding a list of numbers draws as a sparkline. In the
+library, one tag goes onto every selected row from the strip's tag box, and a tag put on a bundled demo survives the
+next merge. "move to folder" files the selected rows the same way; a folder lives in this browser only. The shop lists
+type and tags as columns over the whole catalogue, so the column panel is the filter.
 
 The library table shows the same answer per row — last run, and failures since — and the demo strip marks a sheet whose
 feed is failing, so a dead feed is visible where you open it rather than only in the 15-minute alarm email. Ctrl/⌘+K
@@ -164,6 +166,7 @@ still on it. Delete is still there, inside the trash, and now it means what its 
 
 A star beside each row keeps a sheet at the top of the library and first in the palette, in this browser. A selection
 spanning several library rows and "trash selected sheets" (Ctrl/⌘+Shift+Backspace) trashes them all at once.
+Alt+Shift+arrows move the selected rows or columns, and a focused column edge resizes with the arrow keys.
 
 A column is cleaned from its own panel, beside hide and pin: trim, UPPER, lower, and drop every row this column has
 nothing in. Each one is an ordinary edit, so Ctrl/⌘+Z takes it back and everyone else looking at the sheet sees it. The

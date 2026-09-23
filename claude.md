@@ -64,7 +64,8 @@ that file. Keep the jsdom pairs even in boots: `grep -c "await boot(" page_test.
 - `main_test.ts` — the server. One `Deno.test` of ordered `t.step`s against in-process PGlite behind pg-gateway on
   `5434`. The steps share one database, so a step depends on the steps before it. `--filter` does not match step names.
   A second PGlite on `5435` is the codex external database, cloned from the first before the schema applies, built on
-  first connect. A DSN that must fail names a loopback port nobody listens on, never a hostname. `request()` clears
+  first connect. `serve()` gives each PGlite session to one connection at a time, until that connection's Terminate or a
+  timeout. A DSN that must fail names a loopback port nobody listens on, never a hostname. `request()` clears
   `rateLimitBuckets`; the limiter steps call `app.request` directly. **Do not split this file**: it was built and
   measured. The halves share `Deno.env` and `data/automerge`, and the gain was about half a second.
 - `examples_test.ts` — every bundled sheet through both engines (`npm:alasql`, `src/alasql.mjs`), row for row. Refuses a
@@ -197,8 +198,9 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   stored secret's name). `net_hook_signature_idx` on the verified digest refuses a replay.
 - Socket health: `POST /library/:id/socket` from a browser with the tab open. States: `connected`, `error`, never a
   close. Freshness lists a `net-socket` sheet only after its first `SOCKET` run.
-- Import: `readImport()` is the one CSV reader. `POST /import/preview` answers columns, types and first rows.
-  `POST /import/csv?types=…` makes the sheet; `types` is keyed by column name and checked against `CANONICAL_TYPES`.
+- Import: `readImport()` is the one CSV reader. A numeric cell goes through `checkColumnTypes()` one cell at a time, and
+  the refusal names the line. `POST /import/preview` answers columns, types and first rows. `POST /import/csv?types=…`
+  makes the sheet; `types` is keyed by column name and checked against `CANONICAL_TYPES`.
 
 **Polling**
 
@@ -300,10 +302,11 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   a flush. Owner or editor only.
 - Exports: `GET /export/:id.{csv,json,ndjson,md,ics,xlsx,parquet}` is one route over `EXPORTS`; add a format by adding a
   row. xlsx: `npm:xlsx@0.18.5`, **write only, never read**. `xlsxCell` types by `canonicalType`, `XLSX_FORMATS` per
-  column, width bounded by `XLSX_WIDTH_MAX`, dates through `dateMs()` as UTC, a value past `XLSX_CELL_MAX` refused by
-  place and length, the sheet name cut to `XLSX_NAME_MAX`. Parquet: `npm:hyparquet-writer`, built off `named()`.
-  `PARQUET_TYPES` through `canonicalType`; `parquetColumn()` writes a column whole as STRING when any value does not
-  fit. `exportRows()` is the one read both export routes share.
+  column (a duration as a day fraction under `[h]:mm:ss`, a negative one as text), width bounded by `XLSX_WIDTH_MAX`,
+  dates through `dateMs()` as UTC, a value past `XLSX_CELL_MAX` refused by place and length, the sheet name cut to
+  `XLSX_NAME_MAX`. Parquet: `npm:hyparquet-writer`, built off `named()`. `PARQUET_TYPES` through `canonicalType`;
+  `parquetColumn()` writes a column whole as STRING when any value does not fit. `exportRows()` is the one read both
+  export routes share.
 - Workspace: `GET /library.zip` is every sheet the caller owns (`sheet_usr.role = 'owner'`), less `codex-*` and the
   computed net-hook sheets, bounded by `USER_SHEETS_MAX`, as one stored zip. A table is `table/<doc_id>.csv`, byte-equal
   to its `.csv` export, one spend on its own budget. Any other sheet is `<type>/<doc_id>.json`, its `data[0]`, read
@@ -314,8 +317,19 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 
 **Codex (external databases)**
 
-- A sheet keeps `DSN_KEEP` credentials. `POST /codex-db/:id` inserts and trims. `GET /codex/:id` tries the newest first
-  and falls back only when `cannotConnect()` says so (SQLSTATE 08, 28, 3D). The catch wraps `codexTables()` alone.
+- A sheet keeps `DSN_KEEP` credentials. `POST /codex-db/:id` inserts and trims. `codexConnect(sheet_id, read)` is the
+  one credential loop, shared by `GET /codex/:id` and its preview. It tries the newest credential first and falls back
+  only when `cannotConnect()` says so (SQLSTATE 08, 28, 3D). The rollover catch wraps the session setup alone (the
+  statement timeout and read-only `SET`s, where postgres.js connects), never `read`. `codexTables(far)` lists each
+  public table with its columns in `ordinal_position` order.
+- Preview: `GET /codex/:id/preview?table=<name>&limit=<n>` answers `{ data: [cols, ...rows] }`, keyed by column name,
+  every column typed `text` as in `GET /codex/:id`. `rateLimit` and `assertSheetAccess` come first, then the type,
+  `table` and `limit` checks, none of which connects. `limit` defaults to `CODEX_PREVIEW_MAX` and is refused outside
+  1..`CODEX_PREVIEW_MAX` or when it is not digits. `table` must match a name `codexTables()` answers exactly; that
+  membership is the injection guard. An unknown name is refused with up to `NAMES_MAX` real names and a `nearest()`
+  suggestion. The statement names the columns and `public.<table>` through the driver's `sql(name)`, never `select *`. A
+  table or column name holding a dot is refused, because the driver splits identifiers on `.`. It is in `AUDITED`. No
+  `scrapsheets-key` reaches `/codex/`.
 - `checkCodexDsn()` refusals never roll over. `canonicalHost()` normalizes the host; `assertPublicHost()` checks it,
   unless our own database is on loopback.
 - Every attempt writes a `codexRun()` row with `meta.rolled_over`; `POLL_OK` grades a rollover failed. No refusal quotes
@@ -374,10 +388,16 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - `rfmSql({ source, date, key, value, buckets })` writes a score table the same way: one row per key with `last_seen`,
   `orders`, the summed value under its own name, and `r`, `f`, `m`, each a separate top-level `ntile(buckets)` item. The
   highest bucket is the best. Recency orders by `last_seen`, never `now()`. It is quantile scoring, not clustering.
-  `buckets` runs from 2 to `RFM_BUCKETS_MAX`. `writtenFrom()` is the one source check for `chartSql`, `cohortSql` and
-  `rfmSql`; `refuseTaken()` is the collision check for the last two.
+  `buckets` runs from 2 to `RFM_BUCKETS_MAX`. `writtenFrom()` is the one source check for `chartSql`, `cohortSql`,
+  `rfmSql` and `kmeansSql`; `refuseTaken()` is the collision check for the last three.
+- `kmeansSql({ source, key, columns, k })` writes a segment table the same way: every source row's key and `columns`,
+  plus `kmeans_assign(m.centroids, …) as segment`, crossed with one `kmeans(k, array(c1), …)` over the source, ordered
+  by `segment`, then the key. `k` runs from 2 to `KMEANS_K_MAX`, and `columns` holds 1 to `KMEANS_DIMS` names. Refused:
+  a key or a column spelled `segment`, and a column that repeats the key or another column. The statement scales
+  nothing.
 - Types: `COLUMN_TYPES`, `knownType()` (the `enum:` family by prefix). `checkColumnTypes()` is where a cell becomes its
-  column's type. `selectTypes()` and `WINDOW_TYPES` type a result off its select item.
+  column's type. A `duration` cell holds seconds; in a duration column the function also reads `h:mm` and `h:mm:ss`.
+  `selectTypes()` and `WINDOW_TYPES` type a result off its select item.
 - Fits: `fit_exponential()`, `fit_power()` through `curve()`. `fit_hyperbolic()` is Arps decline by Levenberg-Marquardt,
   bounded by `HYPERBOLIC_STEPS` and `HYPERBOLIC_POINTS`, `b` in `(0, B_MAX]`.
 - Regression: `ols(array(y), array(x1), …)` → `[b0, b1, …]`; `ols_predict(coefs, …)`. `logit` / `logit_predict` reweight
@@ -387,9 +407,9 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - Clusters: `kmeans(k, array(x1), …)` → k centroids sorted by coordinate; `kmeans_assign(centroids, x1, …)` → the
   1-based nearest, lowest index on a tie. Raw Euclidean distance: the author scales the inputs. Start points are
   k-means++ off `seedOf()` and `mulberry32`; Lloyd's passes stop when no point moves and no cluster is empty, bounded by
-  `KMEANS_STEPS`. Its bounds are its own: `KMEANS_K_MAX`, `KMEANS_POINTS`, `KMEANS_DIMS`. Refused: fewer than k distinct
-  points, a spread that is not finite, and in `kmeans_assign` a point whose distance to every centroid overflows.
-  `closest()` is the one distance for both.
+  `KMEANS_STEPS`. Its bounds are its own: `KMEANS_POINTS`, and `KMEANS_K_MAX` and `KMEANS_DIMS`, which it shares with
+  `kmeansSql`. Refused: fewer than k distinct points, a spread that is not finite, and in `kmeans_assign` a point whose
+  distance to every centroid overflows. `closest()` is the one distance for both.
 - Samplers: `sample_uniform`, `sample_normal`, `sample_triangular`, read back by `percentile()`. Never `Math.random`:
   each call seeds mulberry32 from an FNV-1a hash of the whole call. A non-finite draw is refused.
 - Guards: `checkQueryRows()` caps rows loaded; `checkJoinRows()` caps the from clause's product at `MAX_JOIN_ROWS`;
@@ -408,20 +428,25 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   types decode to `Unviewable typ`; replace that branch in `docDecoder` to give one a view. `unviewable` is the message:
   no query reads one on either host, so it names the door that does.
 - Flags: `{ api, tutorial }`. A missing `api` goes to `model.error`.
-- `updateDocMsg` refuses every `DocMsg` on the library, so library verbs (`TrashSelected`, `TagSelected`) are top-level
-  `Msg`s. They read ids through `libraryIdAtRow` (drawn order) and fan out one `updateLibrary` each.
+- `updateDocMsg` refuses every `DocMsg` on the library, so library verbs (`TrashSelected`, `TagSelected`,
+  `FolderSelected`) are top-level `Msg`s. They read ids through `librarySelection` (drawn order, over `libraryIdAtRow`)
+  and fan out one `updateLibrary` each.
 
 **Library**
 
-- `library()` in `src/page.mjs` merges this browser's store under everything bundled. `seen`, `trashed` and `starred`
-  overlay a system entry when truthy; `tags` merges, bundled first. `updateLibrary` is the one port that writes them;
-  `Library.set` drops a null field from the patch.
+- `library()` in `src/page.mjs` merges this browser's store under everything bundled. `seen`, `trashed`, `starred` and
+  `folder` overlay a system entry when truthy; `tags` merges, bundled first. `updateLibrary` is the one port that writes
+  them; a caller writes `{ noLibraryPatch | field = … }`. `Library.set` drops a null field from the patch.
 - Trash is undoable and asks nothing; `deleteDoc` purges and calls `Views.drop`. A trashed sheet leaves the table, the
   demo strip and the palette. `model.trash` swaps the last column.
 - `Star` is a `Type` with no `columnTypes` entry; its cell carries `{id, on}`. Starred sheets sort first only while
   `sheet.sort` is empty.
-- A tag goes on many sheets from the strip: `sheet.tag`, `TagInput`, `onTagKeydown`. It is added, trimmed, never
+- A tag goes on many sheets from the strip: `sheet.tag`, `TagInput`, `onEnter TagSelected`. It is added, trimmed, never
   lowercased. Refused: empty, holds a comma.
+- A folder is one flat string per sheet, in this browser's store only: no server field, not in `library.zip`. Many
+  sheets move from the strip: `sheet.folder`, `FolderInput`, `onEnter FolderSelected`. The name is trimmed and written
+  over the old one. The strip refuses an empty name; the strip and the `folder` cell both refuse a comma. Blanking the
+  cell writes `""`, never null. Search matches the folder. `SheetInfo.folder` reads a non-string as `""`.
 - Freshness: `index.html` reads `library:freshness` into `freshnessLoaded`. The column shows only when the answer is
   non-empty.
 
@@ -437,9 +462,11 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - Multi-sort, hide (`skipHidden`), resize, reorder, pin, row insert / duplicate / fill-down, find/replace, undo/redo,
   palette (Ctrl/⌘+K), shortcuts (Ctrl/⌘+/). `shortcutGroups` carries each key's `Msg`, and `paletteCommands` reads it.
 - The palette opens with nothing selected (`selected = -1`). `paletteRows` adds "subscribe to this sheet" (logged in,
-  over a table, query, net-http or net-hook) "build a cohort table" (a date and a key column known), and "score this
-  sheet's customers (RFM)" (a date, a key and a usd column known) ahead of `paletteCommands`. The last two read the same
-  guesses.
+  over a table, query, net-http or net-hook), "build a cohort table" (a date and a key column known), "score this
+  sheet's customers (RFM)" (a date, a key and a usd column known) and "segment this sheet (k-means)" (a key and at least
+  two other `numericColumn`s known, `k` 3) ahead of `paletteCommands`. The last three read the same guesses and go
+  through one `draft`. `newDoc` turns `data[0].cohort`, `.rfm` or `.kmeans` into `code`, and a `kmeans` draft keeps the
+  first `KMEANS_DIMS` columns.
 - Export chips link to `/export/<id>.<format>` for csv and xlsx.
 - `arrangeControls` decides where the arrangement is offered: table, query, library, shop.
 - The arrangement (sort/`rank`, `filter`, `hidden`, `pinned`, `width`, `decimals`, `format`, `shade`) lives on the
@@ -451,10 +478,17 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   hold the arrangement (bundled, or the server refused a write), `Views` keeps it under `scrapsheets-views`, held by
   `col.key`, merged back in `selectDoc` through `foldView` / `mergeView`. A `sync` frame covering the written head calls
   `Views.drop`. `decodeHeads` bridges base58 and hex heads.
-- Reorder is one `move` patch through `changeDoc`, undoable, refused for a viewer; `dropOf` builds it. A row handle
-  shows only while `inDocumentOrder`. `pinLeft` sums sticky widths, column 0 included.
+- Reorder is one `move` patch through `changeDoc`, undoable, refused for a viewer; `dropOf` builds a drop's, `nudgeOf`
+  an Alt+Shift+arrow's (checked in `updateKeyDown`'s arrow `case` ahead of Shift-expand, never under an open palette,
+  shortcut sheet, settings, import preview, delete confirm or held rename). A block moves by moving its neighbour to its
+  far side; a column's neighbour is the nearest one not hidden. `nudgeOf` refuses by name: a row move off
+  `inDocumentOrder`, a row outside the data rows, either end, a sheet that is not a `Tab`. A row handle shows only while
+  `inDocumentOrder`. `pinLeft` sums sticky widths, column 0 included.
 - Fill-down: `fillSeries` continues dates (`justinmimbs/date`, stepped off the last seed), numbers and trailing digits,
   else repeats. `parseDay` decides a date. `blankCell` decides blank. `seriesEncoder` writes by column type.
+- Resize from the keyboard: the header `.grip` is a focusable `separator` with `aria-valuenow` when the column has a
+  width. Its own `keydown` (arrows only, stopped) sends `ColumnResizeStep`, model only, floored at `minColWidth`; its
+  `keyup` sends `ColumnResizeEnd`, so one `arrange` per press or held run.
 - A write reaches only a drawn row. `displayYToDocY` answers `Maybe Int`: `Nothing` for y < 1 and past the drawn rows.
   `tableBounds` bounds y by the drawn rows and `clampIndex` floors y at 1 when nothing is drawn, so the keyboard stops
   at the last drawn row. A selection can still rest on an undrawn row after the rows change under it; there a keystroke
@@ -480,12 +514,14 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - Near-duplicates: `sheet.near` via `ColumnNearInput`. `nearDuplicates` buckets by `soundex`, scores by `similarity`,
   compares against rows that stay. Bounded by `maxFuzzyPairs` and `maxFuzzyRows`. Answers a `Result`; the preview reads
   `sheet.doc` and counts unreadable rows.
-- Shade: `Shade` is `Scale` or `Bars`; `shadeSpec` is the table, `shade` the lenient reader. Gated by `numericColumn` in
-  the panel and again where `columnExtent` is built. Extent is over the drawn rows. Drawn as `div.shade` inside the
-  `td`.
+- Shade: `Shade` is `Scale`, `Bars` or `Arrows`; `shadeSpec` is the table, `shade` the lenient reader. Gated by
+  `numericColumn` in the panel and again where `columnExtent` is built. Extent is over the drawn rows. Drawn as
+  `div.shade` inside the `td`. `Arrows` writes its glyph (▲ top third, ▬ middle or no spread, ▼ bottom third) to
+  `data-icon`; `style.css` draws and colours it, so the cell's text stays its value.
 - `formatNumber` is the one place a number becomes text: cell, stats row, totals row. `positional` guards non-digit
   values. `digitsOf`, `fixed`, `groupWhole`, `scientific`, `maxDecimals`. `NumberFormat` / `formatSpec` / `numberFormat`
-  are the format list and reader. A format lands on top of the type.
+  are the format list and reader. A format lands on top of the type, except on `Duration`: it draws `h:mm`, adds `:ss`
+  when the seconds are not whole minutes, and ignores `decimals` and `format`, which its column panel does not offer.
 - A `json` cell holding a number list draws a sparkline: `sparkValues`, `sparkMax`, `viewSpark` (shared with
   `viewThumb`).
 
@@ -550,16 +586,16 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   records `document.activeElement` as `opener` when a modal mounts over none, moves focus into a new modal when it is
   outside, and gives it back to `opener` when the last modal goes, if it `isConnected`. The palette input is a
   `combobox` over `#palette-list` (`listbox`) of `palette-<i>` options, and `aria-activedescendant` names a row only
-  while it is drawn. Icon-only buttons and placeholder-only inputs carry `aria-label`. The table is `role="grid"` and
-  `aria-multiselectable`; `inSelection` decides both the `selected` class and `aria-selected`; a header cell is a
-  `columnheader`.
+  while it is drawn. Icon-only buttons, placeholder-only inputs and every `.grip` carry `aria-label`. The table is
+  `role="grid"` and `aria-multiselectable`; `inSelection` decides both the `selected` class and `aria-selected`; a
+  header cell is a `columnheader`.
 
 **Known gaps**
 
 - `@library:freshness` and `@library:lineage` resolve on the server, not in the page.
 - `describe` results carry no type in the page, and `WINDOW_TYPES` is server-only.
-- No keyboard path for `.grab` / `.grip`. A back or forward onto `#settings` while the import preview is up mounts both,
-  and the Tab trap holds only the later one in document order.
+- A back or forward onto `#settings` while the import preview is up mounts both, and the Tab trap holds only the later
+  one in document order.
 - The rename and delete warning names only a column `library:lineage` claims: a name two joined refs both hold is
   claimed by neither, and a row with a null `depends_on` names no sheet, so neither warns.
 - A refused `historyView` shows its refusal in the modal, and the modal also keeps saying it is reading that version.

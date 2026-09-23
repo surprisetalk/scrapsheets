@@ -365,6 +365,7 @@ export type Type =
   | "float"
   | "usd"
   | "percentage"
+  | "duration"
   | "bool"
   | "date"
   | "timestamp"
@@ -6524,6 +6525,7 @@ const AUDITED = new Set([
   "/library/:id/hook",
   "/library/:id/webhook",
   "/codex/:id",
+  "/codex/:id/preview",
   "/codex-db/:id",
 ]);
 app.use("*", async (c, next) => {
@@ -8533,8 +8535,16 @@ const parseDelimited = (
       if (col.type === "text") obj[col.key] = val;
       else if (!val.trim()) obj[col.key] = null;
       else if (numeric.has(String(col.type))) {
-        if (isNaN(Number(val))) refuse("a number");
-        obj[col.key] = Number(val);
+        // checkColumnTypes() is the one place a cell becomes its column's type.
+        // For a known numeric type and a non-blank cell, its one refusal is the
+        // value's, so the catch answers that refusal with the file's line.
+        const cell: Row = { [col.name]: val };
+        try {
+          checkColumnTypes(source, [col], [cell]);
+        } catch {
+          refuse(col.type === "duration" ? "a number of seconds, h:mm or h:mm:ss" : "a number");
+        }
+        obj[col.key] = cell[col.name];
       } else if (col.type === "bool") {
         const word = val.toLowerCase();
         if (!["true", "false", "t", "f", "1", "0", "yes", "no"].includes(word)) refuse("true or false");
@@ -8723,10 +8733,12 @@ const named = (sheet_id: string, cols: Col[], rows: Row[]): Record<string, unkno
 // showed. Every other type opens as General, which is what a number with no
 // format means. A percentage cell holds a decimal (0.25 is 25%), the way
 // formatNumber in src/Main.elm reads one, and "0.00%" is the format that says
-// so.
+// so. A duration is a fraction of a day in the file format, as a date is, and
+// the brackets keep the hours counting past 24.
 const XLSX_FORMATS: Record<string, string> = {
   usd: "$#,##0.00",
   percentage: "0.00%",
+  duration: "[h]:mm:ss",
   date: "yyyy-mm-dd",
   timestamp: "yyyy-mm-dd hh:mm:ss",
 };
@@ -8774,10 +8786,17 @@ const assertXlsxCell = (sheet_id: string, where: string, len: number) => {
 // written as the text it is rather than coerced into a wrong number or dropped:
 // the sheet holds it, and an export that loses it is worse than one that shows
 // it.
+//
+// A negative duration is one such value: the file format has no negative day,
+// so a fraction below zero under [h]:mm:ss opens blank in Excel and in
+// SheetJS's own formatter alike. Text is what the sheet actually holds, so it
+// goes out as its seconds rather than as a cell nothing can read.
 const xlsxCell = (type: string, val: unknown, text: string): XLSX.CellObject => {
   const z = XLSX_FORMATS[type];
-  if ((NUMERIC_TYPES as string[]).includes(type) && typeof val === "number" && Number.isFinite(val))
+  if ((NUMERIC_TYPES as string[]).includes(type) && typeof val === "number" && Number.isFinite(val)) {
+    if (type === "duration") return val < 0 ? { t: "s", v: text } : { t: "n", v: (val * 1000) / XLSX_DAY_MS, z };
     return z === undefined ? { t: "n", v: val } : { t: "n", v: val, z };
+  }
   if (type === "bool" && typeof val === "boolean") return { t: "b", v: val };
   if (type === "date" || type === "timestamp") {
     const ms = dateMs(text);
@@ -9472,6 +9491,11 @@ const codexRun = async (sheet_id: string, started: number, status: number, body:
 // leave working.
 export const DSN_KEEP = 2;
 
+// A preview is what a person reads to pick a table: a screen or two of rows. A
+// read past that belongs to a query over the far database, which somebody else
+// pays for.
+export const CODEX_PREVIEW_MAX = 100;
+
 /** Did this credential fail to get in, as opposed to the far server answering
  * about the statement it was sent?
  *
@@ -9488,31 +9512,21 @@ export const DSN_KEEP = 2;
 export const cannotConnect = (err: unknown): boolean =>
   !(err instanceof pg.PostgresError) || /^(08|28|3D)/.test(String((err as { code?: string }).code ?? ""));
 
-/** The one connection this server opens into somebody else's database: read
- * only, bounded by a statement timeout, and closed however it ends. It asks for
- * the shape of the public schema and for nothing in it. */
-const codexTables = async (dsn: string) => {
-  const sql_ = pg(dsn, {
-    onnotice: (msg: { severity?: string }) => msg.severity !== "DEBUG" && console.log(msg),
-    connect_timeout: 5,
-    idle_timeout: 10,
-  });
-  try {
-    await sql_`SET statement_timeout = '10s'`;
-    await sql_`SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`;
-    return await sql_`
-      select
-        table_name as name,
-        '[[{"name":"name","type":"text","key":"column_name"},{"name":"type","type":"text","key":"data_type"},{"name":"key","type":"int","key":"ordinal_position"}]]'::jsonb || jsonb_agg(t)::jsonb as columns
-      from information_schema.tables t
-      inner join information_schema.columns c using (table_catalog,table_schema,table_name)
-      where table_schema = 'public'
-      group by table_name, table_type
-    `;
-  } finally {
-    await sql_.end();
-  }
-};
+/** The shape of the far database's public schema, and nothing in it: one row
+ * per table, its columns in table order. */
+const codexTables = async (far: typeof sql) =>
+  await far`
+    select
+      table_name as name,
+      '[[{"name":"name","type":"text","key":"column_name"},{"name":"type","type":"text","key":"data_type"},{"name":"key","type":"int","key":"ordinal_position"}]]'::jsonb
+        || jsonb_agg(jsonb_build_object(
+          'column_name', c.column_name, 'data_type', c.data_type, 'ordinal_position', c.ordinal_position
+        ) order by c.ordinal_position) as columns
+    from information_schema.tables t
+    inner join information_schema.columns c using (table_catalog,table_schema,table_name)
+    where table_schema = 'public'
+    group by table_name, table_type
+  `;
 
 // postgres: is a "non-special" scheme to the URL parser, so its host is opaque
 // text: "127.1", "0x7f.1" and "2130706433" are three more spellings of
@@ -9589,162 +9603,93 @@ const checkCodexDsn = async (dsn: string, sheet_id: string): Promise<void> => {
   if (!ipBlocked(appHost)) await assertPublicHost(ext.hostname, "connection string", source);
 };
 
-app.get("/codex/:id", async (c) => {
-  if (!rateLimit(`codex:${c.get("usr_id")}`)) {
-    bad(429, `Too many codex queries from this account.`, {
-      Expected: `a burst of at most ${RATE_LIMIT_MAX_TOKENS}, refilling at ${RATE_LIMIT_REFILL_RATE} per second`,
-      Received: "one query past that",
-      Source: `the codex budget for usr ${c.get("usr_id")}`,
-      Fix: "wait a second and ask again",
-    });
-  }
-  const sheet_id = c.req.param("id");
-  const [type, doc_id] = sheet_id.split(":");
-  // Before the clock starts, because a caller with no share on this sheet is
-  // not a connection that failed: logging their refusal would let anyone
-  // holding a doc_id write failures into somebody else's freshness.
-  await assertSheetAccess(c, sheet_id);
+/** The one connection this server opens into somebody else's database, for
+ * GET /codex/:id and its preview alike: read only, bounded by a statement
+ * timeout, closed however it ends, tried newest credential first, and one
+ * codexRun row per call whatever it comes to. `read` runs inside the session. */
+const codexConnect = async <T>(sheet_id: string, read: (far: typeof sql) => Promise<T>): Promise<T> => {
+  const doc_id = sheet_id.slice(sheet_id.indexOf(":") + 1);
   const started = Date.now();
   // Which of the stored credentials this read reached for, so the refusal below
   // can say how many were tried without naming one of them.
   let tried = 0;
   try {
-    switch (type) {
-      case "codex-db": {
-        // Newest first, and at most the two a rollover needs. A credential is
-        // rotated by writing another one, so the newest is the current one and
-        // the one before it is what a sheet keeps reading through while the
-        // far end is still catching up -- the same rule, and the same two
-        // rows, that a sheet secret is verified by.
-        const creds = await sql`
-          select dsn from db where sheet_id = ${sheet_id}
-          order by created_at desc, db_id desc limit ${DSN_KEEP}
-        `;
-        if (!creds.length) {
-          bad(400, `That codex sheet is not connected to anything.`, {
-            Expected: `a stored dsn for ${sheet_id}`,
-            Received: "no row",
-            Source: "the db table",
-            Fix: `save a connection string with POST /codex-db/${doc_id} first`,
-          });
-        }
-        // Bounded by the limit above: at most DSN_KEEP attempts, and the last
-        // one's failure is the one the catch below reports.
-        // Why the credential before the one that answered could not connect,
-        // which is the body of a rolled-over run: the sheet's members read
-        // this row, and the reason is theirs to act on before the next
-        // rotation retires the credential holding the read up.
-        let skipped = "";
-        for (const cred of creds) {
-          tried++;
-          const dsn = await decrypt("connection string", String(cred.dsn));
-          await checkCodexDsn(dsn, sheet_id);
-          // The connection is what is caught, and nothing after it:
-          // cannotConnect reads anything that is not the far server's own
-          // answer as a credential that did not get in, and a bug in the lines
-          // below is not that.
-          const rows = await codexTables(dsn).catch((err: unknown) => {
-            // The credential did not get in and there is an older one to try.
-            // Anything else -- a statement the far server answered about, or
-            // the last credential there is -- is this read's failure.
-            if (tried >= creds.length || !cannotConnect(err)) throw err;
-            skipped = reason(err);
-            return null;
-          });
-          if (!rows) continue;
-          const cols = rows.columns.map((col: { name: string }) => ({
-            name: col.name,
-            type: "text",
-            key: col.name,
-          })); // TODO:
-          await codexRun(sheet_id, started, 200, skipped, tried > 1);
-          return c.json({ data: [cols, ...rows] }, 200);
-        }
-        // The loop returns on the first credential that answers and rethrows on
-        // the last one that does not, so reaching here is this server's bug and
-        // not the far database's. Returned rather than called: bad() never
-        // returns, but deno lint reads the case syntactically and a bare call
-        // is a fallthrough to it.
-        return bad(500, `The connection behind ${sheet_id} was neither opened nor refused.`, {
-          Received: `${tried} of ${creds.length} stored credentials tried, and no answer either way`,
-          Expected: "an answer or a refusal from each credential in turn",
-          Source: "the credential loop in GET /codex/:id",
-          Fix: "report this with the sheet id; nothing the caller sent can cause it",
-        });
-      }
-      case "codex-scrapsheets": {
-        await codexRun(sheet_id, started, 200, "", false);
-        return c.json(
-          {
-            data: [
-              [
-                { name: "name", type: "text", key: "name" },
-                { name: "columns", type: "table", key: "columns" },
-              ],
-              {
-                name: "shop",
-                columns: [
-                  [
-                    { name: "name", type: "text", key: 0 },
-                    { name: "type", type: "text", key: 1 },
-                    { name: "key", type: "int", key: 2 },
-                  ],
-                  ["created_at", "text", 0],
-                  ["sell_id", "text", 1],
-                  ["sell_type", "text", 2],
-                  ["sell_price", "text", 3],
-                  ["name", "text", 4],
-                ],
-              },
-              {
-                name: "library",
-                columns: [
-                  [
-                    { name: "name", type: "text", key: 0 },
-                    { name: "type", type: "text", key: 1 },
-                    { name: "key", type: "int", key: 2 },
-                  ],
-                  ["s.created_at", "text", 0],
-                  ["s.type", "text", 1],
-                  ["s.doc_id", "text", 2],
-                  ["s.name", "text", 3],
-                  ["s.tags", "text", 4],
-                  ["s.sell_price", "text", 5],
-                ],
-              },
-            ],
-          },
-          200,
-        );
-      }
-      default:
-        bad(400, `That is not a codex this server can open.`, {
-          Expected: "codex-db",
-          Received: show(type),
-          Source: `the type prefix on sheet id ${sheet_id}`,
-          Fix: "fix the type prefix on the id",
-        });
+    // Newest first, and at most the two a rollover needs. A credential is
+    // rotated by writing another one, so the newest is the current one and
+    // the one before it is what a sheet keeps reading through while the
+    // far end is still catching up -- the same rule, and the same two
+    // rows, that a sheet secret is verified by.
+    const creds = await sql`
+      select dsn from db where sheet_id = ${sheet_id}
+      order by created_at desc, db_id desc limit ${DSN_KEEP}
+    `;
+    if (!creds.length) {
+      bad(400, `That codex sheet is not connected to anything.`, {
+        Expected: `a stored dsn for ${sheet_id}`,
+        Received: "no row",
+        Source: "the db table",
+        Fix: `save a connection string with POST /codex-db/${doc_id} first`,
+      });
     }
+    // Bounded by the limit above: at most DSN_KEEP attempts, and the last
+    // one's failure is the one the catch below reports.
+    // Why the credential before the one that answered could not connect,
+    // which is the body of a rolled-over run: the sheet's members read
+    // this row, and the reason is theirs to act on before the next
+    // rotation retires the credential holding the read up.
+    let skipped = "";
+    for (const cred of creds) {
+      tried++;
+      const dsn = await decrypt("connection string", String(cred.dsn));
+      await checkCodexDsn(dsn, sheet_id);
+      const far = pg(dsn, {
+        onnotice: (msg: { severity?: string }) => msg.severity !== "DEBUG" && console.log(msg),
+        connect_timeout: 5,
+        idle_timeout: 10,
+      });
+      try {
+        // postgres.js connects on the first statement, so the session setup is
+        // what is caught, and not `read`: cannotConnect reads anything that is
+        // not the far server's own answer as a credential that did not get in,
+        // and a bug in `read` is not that.
+        const opened = await (async () => {
+          await far`SET statement_timeout = '10s'`;
+          await far`SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`;
+          return true;
+        })().catch((err: unknown) => {
+          // The credential did not get in and there is an older one to try.
+          // Anything else -- a statement the far server answered about, or
+          // the last credential there is -- is this read's failure.
+          if (tried >= creds.length || !cannotConnect(err)) throw err;
+          skipped = reason(err);
+          return false;
+        });
+        if (!opened) continue;
+        const answer = await read(far);
+        await codexRun(sheet_id, started, 200, skipped, tried > 1);
+        return answer;
+      } finally {
+        await far.end();
+      }
+    }
+    // The loop returns on the first credential that answers and rethrows on
+    // the last one that does not, so reaching here is this server's bug and
+    // not the far database's.
+    return bad(500, `The connection behind ${sheet_id} was neither opened nor refused.`, {
+      Received: `${tried} of ${creds.length} stored credentials tried, and no answer either way`,
+      Expected: "an answer or a refusal from each credential in turn",
+      Source: "the credential loop in codexConnect()",
+      Fix: "report this with the sheet id; nothing the caller sent can cause it",
+    });
   } catch (err) {
-    // A refusal about the id itself is not a connection that failed, and
-    // `net` refuses the row anyway: its check constraint takes a net-, an
-    // alert: or a codex- sheet and nothing else.
-    if (type.startsWith("codex-")) {
-      await codexRun(
-        sheet_id,
-        started,
-        err instanceof HTTPException ? err.status : 502,
-        reason(err),
-        false,
-      );
-    }
+    await codexRun(sheet_id, started, err instanceof HTTPException ? err.status : 502, reason(err), false);
     if (err instanceof HTTPException) throw err;
     // The far database did not answer: no such host, refused, wrong password,
     // no such database, or a DSN postgres.js decodes and refuses where new URL
     // did not. Ours to name and not ours to fix, which is a 502 and not a 500.
     // codexRun's own comment establishes the message names the host or the
     // parse and never the password.
-    bad(502, `The database behind ${sheet_id} did not answer.`, {
+    return bad(502, `The database behind ${sheet_id} did not answer.`, {
       Received: reason(err),
       Expected: "a reachable postgres server that takes the stored credentials",
       // The count and never the credentials: a reader of this sheet is told
@@ -9755,6 +9700,170 @@ app.get("/codex/:id", async (c) => {
       Fix: `check the host, the credentials and the network, then save the dsn again with POST /codex-db/${doc_id}`,
     });
   }
+};
+
+app.get("/codex/:id", async (c) => {
+  if (!rateLimit(`codex:${c.get("usr_id")}`)) {
+    bad(429, `Too many codex queries from this account.`, {
+      Expected: `a burst of at most ${RATE_LIMIT_MAX_TOKENS}, refilling at ${RATE_LIMIT_REFILL_RATE} per second`,
+      Received: "one query past that",
+      Source: `the codex budget for usr ${c.get("usr_id")}`,
+      Fix: "wait a second and ask again",
+    });
+  }
+  const sheet_id = c.req.param("id");
+  const [type] = sheet_id.split(":");
+  // Before codexConnect starts its clock, because a caller with no share on
+  // this sheet is not a connection that failed: logging their refusal would let
+  // anyone holding a doc_id write failures into somebody else's freshness.
+  await assertSheetAccess(c, sheet_id);
+  switch (type) {
+    case "codex-db": {
+      const rows = await codexConnect(sheet_id, codexTables);
+      const cols = rows.columns.map((col: { name: string }) => ({
+        name: col.name,
+        type: "text",
+        key: col.name,
+      })); // TODO:
+      return c.json({ data: [cols, ...rows] }, 200);
+    }
+    case "codex-scrapsheets": {
+      await codexRun(sheet_id, Date.now(), 200, "", false);
+      return c.json(
+        {
+          data: [
+            [
+              { name: "name", type: "text", key: "name" },
+              { name: "columns", type: "table", key: "columns" },
+            ],
+            {
+              name: "shop",
+              columns: [
+                [
+                  { name: "name", type: "text", key: 0 },
+                  { name: "type", type: "text", key: 1 },
+                  { name: "key", type: "int", key: 2 },
+                ],
+                ["created_at", "text", 0],
+                ["sell_id", "text", 1],
+                ["sell_type", "text", 2],
+                ["sell_price", "text", 3],
+                ["name", "text", 4],
+              ],
+            },
+            {
+              name: "library",
+              columns: [
+                [
+                  { name: "name", type: "text", key: 0 },
+                  { name: "type", type: "text", key: 1 },
+                  { name: "key", type: "int", key: 2 },
+                ],
+                ["s.created_at", "text", 0],
+                ["s.type", "text", 1],
+                ["s.doc_id", "text", 2],
+                ["s.name", "text", 3],
+                ["s.tags", "text", 4],
+                ["s.sell_price", "text", 5],
+              ],
+            },
+          ],
+        },
+        200,
+      );
+    }
+    default:
+      bad(400, `That is not a codex this server can open.`, {
+        Expected: "codex-db",
+        Received: show(type),
+        Source: `the type prefix on sheet id ${sheet_id}`,
+        Fix: "fix the type prefix on the id",
+      });
+  }
+});
+
+// The first rows of one far table, named from the list GET /codex/:id answers.
+// Membership in that list is the injection guard, and the driver's own
+// identifier escaping names the table and each column on top of it.
+app.get("/codex/:id/preview", async (c) => {
+  if (!rateLimit(`codex:${c.get("usr_id")}`)) {
+    bad(429, `Too many codex queries from this account.`, {
+      Expected: `a burst of at most ${RATE_LIMIT_MAX_TOKENS}, refilling at ${RATE_LIMIT_REFILL_RATE} per second`,
+      Received: "one query past that",
+      Source: `the codex budget for usr ${c.get("usr_id")}`,
+      Fix: "wait a second and ask again",
+    });
+  }
+  const sheet_id = c.req.param("id");
+  const [type] = sheet_id.split(":");
+  await assertSheetAccess(c, sheet_id);
+  if (type !== "codex-db") {
+    bad(400, `Only a connected database has rows to preview.`, {
+      Expected: "codex-db",
+      Received: show(type),
+      Source: `the type prefix on sheet id ${sheet_id}`,
+      Fix: `read GET /codex/${sheet_id} for what this codex holds`,
+    });
+  }
+  const table = c.req.query("table");
+  if (!table) {
+    bad(400, `Name the table to preview.`, {
+      Received: show(table),
+      Expected: `?table= and one name GET /codex/${sheet_id} lists`,
+      Source: "the table query parameter",
+      Fix: `read GET /codex/${sheet_id} and send one of its names, spelled exactly`,
+    });
+  }
+  const asked = c.req.query("limit");
+  const limit = asked === undefined ? CODEX_PREVIEW_MAX : /^[0-9]+$/.test(asked) ? Number(asked) : NaN;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > CODEX_PREVIEW_MAX) {
+    bad(400, `That limit is not a preview.`, {
+      Received: show(asked),
+      Expected: `a whole number from 1 to ${CODEX_PREVIEW_MAX}`,
+      Source: "the limit query parameter",
+      Fix: `send ?limit=${CODEX_PREVIEW_MAX}, or leave it out`,
+    });
+  }
+  const { tables, columns, rows } = await codexConnect(sheet_id, async (far) => {
+    const tables = await codexTables(far);
+    const columns: string[] | undefined = tables.find((row: { name: string }) => row.name === table)?.columns
+      .slice(1).map((col: { column_name: string }) => col.column_name);
+    // postgres.js reads a dot inside an identifier as a schema qualifier, so a
+    // name holding one would name another relation. Refused below, never read.
+    const plain = columns && ![table, ...columns].some((name) => name.includes("."));
+    return {
+      tables: tables.map((row: { name: string }) => row.name),
+      columns,
+      rows: plain ? await far`select ${far(columns)} from public.${far(table)} limit ${limit}` : null,
+    };
+  });
+  if (!columns) {
+    // Postgres cuts an identifier at 63 bytes, so a longer name is no table's,
+    // and nearest() is an edit distance: its cost grows with the name's length.
+    const hit = table.length > 63 ? undefined : nearest(table, tables);
+    bad(400, `That table is not in the database behind ${sheet_id}.`, {
+      Received: show(table),
+      Expected: tables.length
+        ? `one of its public tables, spelled exactly: ${tables.slice(0, NAMES_MAX).map(show).join(", ")}${
+          tables.length > NAMES_MAX ? `, and ${tables.length - NAMES_MAX} more` : ""
+        }`
+        : "a public table, and the database holds none",
+      "Did you mean": hit === undefined ? undefined : show(hit),
+      Source: `the table query parameter, against GET /codex/${sheet_id}`,
+      Fix: hit === undefined ? `send one name GET /codex/${sheet_id} lists` : `send ?table=${encodeURIComponent(hit)}`,
+    });
+  }
+  if (!rows) {
+    bad(400, `That table cannot be previewed by name.`, {
+      Received: [table, ...columns].filter((name) => name.includes(".")).slice(0, NAMES_MAX).map(show).join(", "),
+      Expected: "a table and column names that hold no dot",
+      Source: `the public schema of the database behind ${sheet_id}`,
+      Fix: "preview a view over it whose names hold no dot",
+    });
+  }
+  // Typed text, as GET /codex/:id types its columns: typing a far column is its own item.
+  const cols = columns.map((name) => ({ name, type: "text", key: name }));
+  return c.json({ data: [cols, ...rows] }, 200);
 });
 
 app.post("/codex-db/:id", async (c) => {

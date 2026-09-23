@@ -516,6 +516,55 @@ suite =
                         |> Expect.equal (Just (SheetColumnMove 2 0))
              ]
             )
+        , describe "nudgeOf"
+            (let
+                sheet select =
+                    { emptySheet
+                        | doc =
+                            D.decodeString docDecoder
+                                """{"type":"table","data":[[{"name":"a","type":"text","key":"0"},{"name":"b","type":"text","key":"1"},{"name":"c","type":"text","key":"2"},{"name":"d","type":"text","key":"3"}],{"0":"w"},{"0":"x"},{"0":"y"},{"0":"z"}]}"""
+                                |> Result.mapError D.errorToString
+                        , select = select
+                        , hidden = Set.singleton "2"
+                    }
+
+                refusal =
+                    Result.map Tuple.first >> Result.mapError (String.left 40)
+             in
+             [ test "a block of rows moves by moving its neighbour to its far side, and the selection follows" <|
+                \_ ->
+                    ( nudgeOf "" (sheet (rect 0 2 0 3)) 0 -1, nudgeOf "" (sheet (rect 0 3 0 2)) 0 1 )
+                        |> Expect.equal ( Ok ( SheetRowMove 1 3, rect 0 1 0 2 ), Ok ( SheetRowMove 4 2, rect 0 4 0 3 ) )
+             , test "the first row goes no higher and the last no lower" <|
+                \_ ->
+                    [ nudgeOf "" (sheet (rect 0 1 0 2)) 0 -1, nudgeOf "" (sheet (rect 0 4 0 4)) 0 1 ]
+                        |> List.map refusal
+                        |> Expect.equal [ Err "Expected room to move the selected rows ", Err "Expected room to move the selected rows " ]
+             , test "a column steps over a hidden neighbour to the nearest drawn one" <|
+                \_ ->
+                    ( nudgeOf "" (sheet (rect 1 1 1 1)) 1 0, nudgeOf "" (sheet (rect 3 1 3 1)) -1 0 )
+                        |> Expect.equal ( Ok ( SheetColumnMove 3 1, rect 2 1 2 1 ), Ok ( SheetColumnMove 1 3, rect 2 1 2 1 ) )
+             , test "the first column goes no further left and the last no further right" <|
+                \_ ->
+                    [ nudgeOf "" (sheet (rect 0 1 0 1)) -1 0, nudgeOf "" (sheet (rect 1 1 3 1)) 1 0 ]
+                        |> List.map refusal
+                        |> Expect.equal [ Err "Expected room to move the selected colum", Err "Expected room to move the selected colum" ]
+             , test "a sorted table, a searched one, the header and a sheet that is not a table refuse a row move by name" <|
+                \_ ->
+                    [ nudgeOf "" (sheet (rect 0 2 0 2) |> (\s -> { s | sort = [ ( "0", Ascending ) ] })) 0 1
+                    , nudgeOf "x" (sheet (rect 0 2 0 2)) 0 1
+                    , nudgeOf "" (sheet (rect 0 0 0 2)) 0 1
+                    , nudgeOf "" emptySheet 0 1
+                    ]
+                        |> List.map refusal
+                        |> Expect.equal
+                            [ Err "Expected the rows on screen in the docum"
+                            , Err "Expected the rows on screen in the docum"
+                            , Err "Expected data rows selected, rows 1 to 4"
+                            , Err "Expected a table, whose rows and columns"
+                            ]
+             ]
+            )
         , describe "docDecoder"
             [ test "net-http decodes url and interval; headers, method, body and the paging fields default to one plain GET" <|
                 \_ ->
@@ -1336,6 +1385,25 @@ suite =
                 \_ ->
                     [ reads "usd" (Just 0) Nothing 1234.6, reads "usd" (Just 4) Nothing -1234.5 ]
                         |> Expect.equal [ "$1,235", "-$1,234.5000" ]
+            , test "a duration column holds seconds and reads hours and minutes, and seconds only when there are some" <|
+                \_ ->
+                    [ 0, 59, 60, 3599, 3600, 5400, 5405, -2700, 360000 ]
+                        |> List.map (reads "duration" Nothing Nothing)
+                        |> Expect.equal [ "0:00", "0:00:59", "0:01", "0:59:59", "1:00", "1:30", "1:30:05", "-0:45", "100:00" ]
+            , test "a duration takes neither a decimal count nor a format" <|
+                \_ ->
+                    [ reads "duration" (Just 3) Nothing 5400, reads "duration" Nothing (Just Scientific) 5400, reads "duration" (Just 0) (Just Grouped) 360000 ]
+                        |> Expect.equal [ "1:30", "1:30", "100:00" ]
+            , test "a duration cell draws its seconds as the table draws them" <|
+                \_ ->
+                    D.decodeString (cellDecoder Duration Nothing Nothing 0 0) "5400"
+                        |> Result.toMaybe
+                        |> Maybe.andThen identity
+                        |> Maybe.withDefault (Html.text "no cell")
+                        |> List.singleton
+                        |> Html.div []
+                        |> Query.fromHtml
+                        |> Query.has [ Selector.text "1:30" ]
             , test "a percentage column counts the decimals of the percent, not of the fraction" <|
                 \_ ->
                     [ reads "percentage" (Just 1) Nothing 0.12345, reads "percentage" (Just 0) Nothing 0.126 ]
@@ -1438,8 +1506,8 @@ suite =
                     -- seeds were read through. Written back as text, a num
                     -- column held "30" where it had held 10 -- which MCP's
                     -- write_cells refuses for that very column.
-                    [ fills "num" "30", fills "usd" "30", fills "text" "30" ]
-                        |> Expect.equal [ Just "30", Just "30", Just "\"30\"" ]
+                    [ fills "num" "30", fills "usd" "30", fills "duration" "5400", fills "text" "30" ]
+                        |> Expect.equal [ Just "30", Just "30", Just "5400", Just "\"30\"" ]
             , test "a column no series belongs in keeps the value it held" <|
                 \_ ->
                     -- A bool column's seeds render "true" and a json column's
@@ -1718,13 +1786,14 @@ suite =
                         read =
                             """{"type":"table","data":[[{"name":"a","type":"num","key":"0","shade":"scale"},
                                 {"name":"b","type":"num","key":"1","shade":"bar"},
-                                {"name":"c","type":"num","key":"2","shade":"icons","width":220,"hidden":true}]]}"""
+                                {"name":"c","type":"num","key":"2","shade":"icons","width":220,"hidden":true},
+                                {"name":"d","type":"num","key":"3","shade":"arrows"}]]}"""
                                 |> D.decodeString viewDecoder
                                 |> Result.withDefault emptyView
                     in
                     ( Dict.toList read.shades, ( read.widths, read.hidden ) )
                         |> Expect.equal
-                            ( [ ( "0", Scale ), ( "1", Bars ) ]
+                            ( [ ( "0", Scale ), ( "1", Bars ), ( "3", Arrows ) ]
                             , ( Dict.singleton "2" 220, Set.singleton "2" )
                             )
             , test "a shade that is not a string is no shade, not a decode failure" <|
@@ -1938,7 +2007,7 @@ libraryOf entries =
     entries
         |> List.map
             (\( id, name, scratch ) ->
-                ( id, { name = name, tags = [], scratch = scratch, system = False, thumb = E.null, seen = "", trashed = False, starred = False } )
+                ( id, { name = name, tags = [], scratch = scratch, system = False, thumb = E.null, seen = "", trashed = False, starred = False, folder = "" } )
             )
         |> Dict.fromList
 

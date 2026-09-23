@@ -54,19 +54,22 @@ const tutorial = Table(
  * id, so a stale copy of a bundled example cannot shadow the real one. The empty
  * id is the library itself, which is what an unrecognised route falls back to.
  * `seen` — when this browser last opened the sheet — `trashed` — whether it
- * threw the sheet away — and `starred` — whether it keeps the sheet at the top
- * of the library — are this browser's facts whoever owns the entry, so they are
- * the stored fields that survive a system entry. A bundled demo has to be
- * trashable and starrable for the same reason it has to be openable.
+ * threw the sheet away — `starred` — whether it keeps the sheet at the top of
+ * the library — and `folder` — the one folder it filed the sheet in — are this
+ * browser's facts whoever owns the entry, so they are the stored fields that
+ * survive a system entry. A bundled demo has to be trashable, starrable and
+ * fileable for the same reason it has to be openable. A folder never reaches
+ * the server, so `library.zip`'s manifest carries none.
  *
- * `tags` is the fourth and the one that merges rather than overlays: the
+ * `tags` is the fifth and the one that merges rather than overlays: the
  * bundled tags first, then the stored ones, no duplicates. A demo's own tags
  * are what the gallery strip filters on, so a tag put on one here must not take
  * them off.
  *
  * Restoring writes `trashed` back as `false` rather than null, because
  * Library.set drops a null field out of the patch rather than out of the entry —
- * a null would leave the sheet in the trash.
+ * a null would leave the sheet in the trash. Unfiling writes `folder` back as
+ * "" for the same reason.
  */
 export const library = (stored = {}) => {
   const merged = {
@@ -83,7 +86,7 @@ export const library = (stored = {}) => {
     Object.entries(merged).map(([id, entry]) => {
       // Truthy and not `in`: a stored false is the absence a bundled entry
       // already carries, so unstarring one leaves it with no flag at all.
-      const kept = ["seen", "trashed", "starred"].reduce(
+      const kept = ["seen", "trashed", "starred", "folder"].reduce(
         (kept, field) => (stored[id]?.[field] ? { ...kept, [field]: stored[id][field] } : kept),
         entry,
       );

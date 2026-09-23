@@ -66,6 +66,7 @@ port module Main exposing
     , nearDuplicates
     , nextSortOrder
     , normalizeRect
+    , nudgeOf
     , paletteCommands
     , parseAnnotation
     , parseCsv
@@ -644,9 +645,10 @@ numberFormat name =
 
 
 {-| How a numeric column's values are drawn as a picture of themselves: a
-colour scale across the column's own range, or a bar per cell. Not a column
-type and not a format -- `formatNumber` is untouched, because a shade is a
-background and never text.
+colour scale across the column's own range, a bar per cell, or an arrow for the
+third the value sits in. Not a column type and not a format -- `formatNumber`
+is untouched, because a shade is drawn around the value and never becomes its
+text.
 
 The absent case is no constructor, the way it is for a format: a column nobody
 shaded is a column with no entry.
@@ -655,6 +657,7 @@ shaded is a column with no entry.
 type Shade
     = Scale
     | Bars
+    | Arrows
 
 
 {-| The one table of shades: the word a document stores, and the label the
@@ -670,10 +673,13 @@ shadeSpec shading =
         Bars ->
             { name = "bar", label = "data bars" }
 
+        Arrows ->
+            { name = "arrows", label = "arrows by thirds" }
+
 
 shades : List Shade
 shades =
-    [ Scale, Bars ]
+    [ Scale, Bars, Arrows ]
 
 
 {-| The shade a word names, or none at all. A spelling outside the list is a
@@ -800,6 +806,9 @@ already put one. A format lands on top of the type rather than instead of it --
 money asked for an exponent keeps its symbol and a percentage keeps its sign --
 so `grouped` on a usd column asks for exactly what that column already writes.
 
+A duration is the exception: its cell holds seconds and reads h:mm, or h:mm:ss
+when the seconds are not whole minutes, and it takes neither count nor format.
+
 -}
 formatNumber : Type -> Maybe Int -> Maybe NumberFormat -> Float -> String
 formatNumber typ decimals format v =
@@ -821,6 +830,21 @@ formatNumber typ decimals format v =
             ( Percentage, _ ) ->
                 digitsOf decimals format (v * 100) ++ "%"
 
+            ( Duration, _ ) ->
+                let
+                    whole =
+                        round (abs v)
+
+                    two n =
+                        String.padLeft 2 '0' (String.fromInt n)
+                in
+                -- Not `//`: it compiles to `| 0`, which wraps a quotient past 2^31.
+                iif (v < 0 && whole > 0) "-" ""
+                    ++ String.fromInt (floor (toFloat whole / 3600))
+                    ++ ":"
+                    ++ two (modBy 60 (floor (toFloat whole / 60)))
+                    ++ iif (modBy 60 whole == 0) "" (":" ++ two (modBy 60 whole))
+
             _ ->
                 digitsOf decimals format v
 
@@ -836,7 +860,12 @@ port librarySynced : (D.Value -> msg) -> Sub msg
 left as it was — src/index.html drops a null out of the patch rather than out of
 the entry — so restoring writes `Just False` and never `Nothing`.
 -}
-port updateLibrary : Idd { name : Maybe String, tags : Maybe (List String), trashed : Maybe Bool, starred : Maybe Bool } -> Cmd msg
+port updateLibrary : Idd { name : Maybe String, tags : Maybe (List String), trashed : Maybe Bool, starred : Maybe Bool, folder : Maybe String } -> Cmd msg
+
+
+noLibraryPatch : { name : Maybe String, tags : Maybe (List String), trashed : Maybe Bool, starred : Maybe Bool, folder : Maybe String }
+noLibraryPatch =
+    { name = Nothing, tags = Nothing, trashed = Nothing, starred = Nothing, folder = Nothing }
 
 
 port changeId : Id -> Cmd msg
@@ -1197,6 +1226,7 @@ type alias SheetInfo =
     , seen : String -- ISO 8601, when this browser last opened it; "" if never
     , trashed : Bool -- whether this browser put it in the trash
     , starred : Bool -- whether this browser keeps it at the top of the library
+    , folder : String -- the folder this browser filed it in; "" if none
     }
 
 
@@ -1294,10 +1324,12 @@ type alias Sheet =
     , splitOn : String
     , near : String
 
-    -- What the library strip's tag box holds, for the same reason the two above
-    -- are held: it is the argument `TagSelected` is about to be run with, and
-    -- nothing about it belongs to a document.
+    -- What the library strip's tag and folder boxes hold, for the same reason
+    -- the two above are held: they are the arguments `TagSelected` and
+    -- `FolderSelected` are about to be run with, and nothing about them belongs
+    -- to a document.
     , tag : String
+    , folder : String
     , resizing : Maybe { key : String, startX : Int, startWidth : Int }
 
     -- The column or row being dragged to a new position, while the drag lasts.
@@ -1349,6 +1381,7 @@ emptySheet =
     , splitOn = ""
     , near = ""
     , tag = ""
+    , folder = ""
     , resizing = Nothing
     , moving = Nothing
     , storedView = emptyView
@@ -1886,6 +1919,65 @@ dropOf moving hover tbl =
                 |> Maybe.andThen (onto SheetRowMove from)
 
 
+{-| Alt+Shift+arrow: the selected rows or columns one place along, as the same
+one `move` patch a drop makes, with the selection moved to where they land.
+
+A block moves by moving its neighbour to its far side, which is what keeps it
+one patch whatever its size. A column's neighbour is the nearest drawn one, so a
+hidden column is stepped over rather than being a place the block stops at. A
+row moves only while the rows on screen are the document's, for the reason
+`inDocumentOrder` gives.
+
+-}
+nudgeOf : String -> Sheet -> Int -> Int -> Result String ( DocMsg, Rect )
+nudgeOf search sheet dx dy =
+    let
+        r =
+            normalizeRect sheet.select
+
+        moved =
+            Rect (xy (sheet.select.a.x + dx) (sheet.select.a.y + dy)) (xy (sheet.select.b.x + dx) (sheet.select.b.y + dy))
+
+        what =
+            iif (dy /= 0) "rows" "columns"
+
+        atEnd =
+            "Expected room to move the selected "
+                ++ what
+                ++ " one place "
+                ++ iif (dx < 0) "left" (iif (dx > 0) "right" (iif (dy < 0) "up" "down"))
+                ++ ", received a selection already at that end of the table. Nothing was moved. Source: Alt+Shift+arrow. Fix: move them the other way, or select other "
+                ++ what
+                ++ "."
+    in
+    case sheet.doc of
+        Ok (Tab tbl) ->
+            if dy /= 0 then
+                if not (inDocumentOrder search sheet tbl.rows) then
+                    Err "Expected the rows on screen in the document's order, received a sorted, filtered or searched view, where a row on screen is not the row it stands for. Nothing was moved. Source: Alt+Shift+↑/↓. Fix: clear the sort, the filters and the search, then move the rows again."
+
+                else if r.a.y < 1 || r.b.y > Array.length tbl.rows then
+                    Err ("Expected data rows selected, rows 1 to " ++ String.fromInt (Array.length tbl.rows) ++ ", received rows " ++ String.fromInt r.a.y ++ " to " ++ String.fromInt r.b.y ++ ". Nothing was moved. Source: Alt+Shift+↑/↓. Fix: select rows below the header, then move them.")
+
+                else if dy < 0 then
+                    iif (r.a.y <= 1) (Err atEnd) (Ok ( SheetRowMove (r.a.y - 1) r.b.y, moved ))
+
+                else
+                    iif (r.b.y >= Array.length tbl.rows) (Err atEnd) (Ok ( SheetRowMove (r.b.y + 1) r.a.y, moved ))
+
+            else
+                tbl.cols
+                    |> Array.toIndexedList
+                    |> List.filter (\( x, c ) -> not (Set.member c.key sheet.hidden) && iif (dx < 0) (x < r.a.x) (x > r.b.x))
+                    |> List.map Tuple.first
+                    |> iif (dx < 0) List.maximum List.minimum
+                    |> Maybe.map (\x -> ( SheetColumnMove x (iif (dx < 0) r.b.x r.a.x), moved ))
+                    |> Result.fromMaybe atEnd
+
+        _ ->
+            Err "Expected a table, whose rows and columns are stored in the order it draws them, received a sheet whose order is computed or listed. Nothing was moved. Source: Alt+Shift+arrow. Fix: change the order where it is made: a query's select list and order by, or the table the rows come from."
+
+
 {-| The arrangement as it stands on screen: the half of a `Sheet` that is a
 `SheetView`.
 -}
@@ -2114,6 +2206,7 @@ type Type
     | Usd
     | Boolean
     | Percentage
+    | Duration
     | Date
     | Many Type
     | Link
@@ -2417,6 +2510,9 @@ spec typ =
         Percentage ->
             { name = "percentage", align = S.textAlignRight, width = Just 64 }
 
+        Duration ->
+            { name = "duration", align = S.textAlignRight, width = Just 64 }
+
         Date ->
             { name = "date", align = S.textAlignLeft, width = Just 112 }
 
@@ -2478,7 +2574,7 @@ strings, `number`'s own lenient string branch parsing "02139" same as 02139.
 -}
 numericColumn : Type -> Bool
 numericColumn typ =
-    List.member typ [ Number, Usd, Percentage ]
+    List.member typ [ Number, Usd, Percentage, Duration ]
 
 
 {-| A column the page makes up rather than reads: the library's own columns, a
@@ -2735,6 +2831,7 @@ columnTypes =
     , ( "float", Number )
     , ( "usd", Usd )
     , ( "percentage", Percentage )
+    , ( "duration", Duration )
     , ( "bool", Boolean )
     , ( "date", Date )
     , ( "timestamp", Timestamp )
@@ -2967,6 +3064,8 @@ type Msg
     | TrashSelected
     | TagSelected
     | TagInput String
+    | FolderSelected
+    | FolderInput String
     | ColumnSplitInput String
     | ColumnNearInput String
     | DocDelete Id
@@ -3024,6 +3123,7 @@ type Msg
     | ColumnResizeStart String Int
     | ColumnResizeMove Int
     | ColumnResizeEnd
+    | ColumnResizeStep String Int
     | FilterToggle String
     | FilterClear String
     | FilterInput String String
@@ -3064,6 +3164,7 @@ type alias KeyEvent =
     , shift : Bool
     , ctrl : Bool
     , meta : Bool
+    , alt : Bool
     }
 
 
@@ -3189,19 +3290,20 @@ subs model =
 
 keyEventDecoder : D.Decoder Msg
 keyEventDecoder =
-    D.map5
-        (\key shift ctrl meta tagName ->
+    D.map6
+        (\key shift ctrl meta alt tagName ->
             -- Skip keyboard handling when focus is on input elements
             if List.member tagName [ "INPUT", "TEXTAREA", "SELECT" ] then
                 NoOp
 
             else
-                KeyDown { key = key, shift = shift, ctrl = ctrl, meta = meta }
+                KeyDown { key = key, shift = shift, ctrl = ctrl, meta = meta, alt = alt }
         )
         (D.field "key" D.string)
         (D.field "shiftKey" D.bool)
         (D.field "ctrlKey" D.bool)
         (D.field "metaKey" D.bool)
+        (D.field "altKey" D.bool)
         (D.at [ "target", "tagName" ] D.string |> D.maybe |> D.map (Maybe.withDefault ""))
 
 
@@ -3277,18 +3379,18 @@ onFindKeydown =
         )
 
 
-{-| The library strip's tag box. The global onKeyDown ignores INPUT focus, so
-Enter is handled here, on the box itself.
+{-| The library strip's tag and folder boxes. The global onKeyDown ignores
+INPUT focus, so Enter is handled here, on the box itself.
 -}
-onTagKeydown : H.Attribute Msg
-onTagKeydown =
+onEnter : Msg -> H.Attribute Msg
+onEnter msg =
     A.preventDefaultOn "keydown"
         (D.field "key" D.string
             |> D.andThen
                 (\key ->
                     case key of
                         "Enter" ->
-                            D.succeed ( TagSelected, True )
+                            D.succeed ( msg, True )
 
                         _ ->
                             D.fail "unhandled"
@@ -3313,6 +3415,28 @@ libraryIdAtRow model y =
         |> Maybe.andThen (\tbl -> Array.get (y - 1) (filterAndSort model.search model.sheet tbl.rows))
         |> Maybe.andThen (Dict.get "sheet_id")
         |> Maybe.andThen (D.decodeValue D.string >> Result.toMaybe)
+
+
+{-| The sheets on the selected library rows, off the rows as drawn -- sorted,
+filtered, searched -- the way every other library verb reads them. A y with no
+sheet behind it is a header row or past the end, and is dropped; a selection
+of nothing but those is refused, in the words of the verb that asked.
+-}
+librarySelection : String -> Model -> Result String (List String)
+librarySelection verb model =
+    let
+        norm =
+            normalizeRect model.sheet.select
+
+        ids =
+            List.range norm.a.y norm.b.y
+                |> List.filterMap (libraryIdAtRow model)
+    in
+    if List.isEmpty ids then
+        Err ("Expected a selection over library rows, received one holding no sheet. Source: rows " ++ String.fromInt norm.a.y ++ " to " ++ String.fromInt norm.b.y ++ ". Fix: select the rows to " ++ verb ++ " in the library table.")
+
+    else
+        Ok ids
 
 
 {-| The keyboard walks whatever the view draws -- a table, the library as
@@ -3414,6 +3538,7 @@ update msg ({ sheet, auth } as model) =
                             (D.oneOf [ D.field "seen" D.string, D.succeed "" ])
                             (D.oneOf [ D.field "trashed" D.bool, D.succeed False ])
                             (D.oneOf [ D.field "starred" D.bool, D.succeed False ])
+                            |> D.andThen (\info -> D.map info (D.oneOf [ D.field "folder" D.string, D.succeed "" ]))
                         )
                     )
                     data
@@ -3465,6 +3590,7 @@ update msg ({ sheet, auth } as model) =
                     , splitOn = ""
                     , near = ""
                     , tag = ""
+                    , folder = ""
                     , resizing = Nothing
                     , moving = Nothing
                     , storedView = stored
@@ -3598,16 +3724,16 @@ update msg ({ sheet, auth } as model) =
             -- No confirmation: being undoable is the whole point of the trash,
             -- and a dialog in front of a reversible act only teaches people to
             -- click through the one in front of an irreversible one.
-            ( model, updateLibrary (Idd id { name = Nothing, tags = Nothing, trashed = Just True, starred = Nothing }) )
+            ( model, updateLibrary (Idd id { noLibraryPatch | trashed = Just True }) )
 
         DocRestore id ->
-            ( model, updateLibrary (Idd id { name = Nothing, tags = Nothing, trashed = Just False, starred = Nothing }) )
+            ( model, updateLibrary (Idd id { noLibraryPatch | trashed = Just False }) )
 
         TrashToggle ->
             ( { model | trash = not model.trash }, Cmd.none )
 
         DocStar id on ->
-            ( model, updateLibrary (Idd id { name = Nothing, tags = Nothing, trashed = Nothing, starred = Just on }) )
+            ( model, updateLibrary (Idd id { noLibraryPatch | starred = Just on }) )
 
         TrashSelected ->
             -- One `updateLibrary` per sheet rather than one carrying a list: the
@@ -3615,26 +3741,16 @@ update msg ({ sheet, auth } as model) =
             -- shape of message on it is a second thing `Library.set` has to know.
             case model.sheet.doc of
                 Ok Library ->
-                    let
-                        norm =
-                            normalizeRect model.sheet.select
+                    case librarySelection "trash" model of
+                        Err error ->
+                            ( { model | error = error }, Cmd.none )
 
-                        -- Off the rows as drawn -- sorted, filtered, searched --
-                        -- the way every other library verb reads them. A y with
-                        -- no sheet behind it is a header row or past the end.
-                        ids =
-                            List.range norm.a.y norm.b.y
-                                |> List.filterMap (libraryIdAtRow model)
-                    in
-                    if List.isEmpty ids then
-                        ( { model | error = "Expected a selection over library rows, received one holding no sheet. Source: rows " ++ String.fromInt norm.a.y ++ " to " ++ String.fromInt norm.b.y ++ ". Fix: select the rows to trash in the library table." }, Cmd.none )
-
-                    else
-                        ( model
-                        , ids
-                            |> List.map (\id -> updateLibrary (Idd id { name = Nothing, tags = Nothing, trashed = Just True, starred = Nothing }))
-                            |> Cmd.batch
-                        )
+                        Ok ids ->
+                            ( model
+                            , ids
+                                |> List.map (\id -> updateLibrary (Idd id { noLibraryPatch | trashed = Just True }))
+                                |> Cmd.batch
+                            )
 
                 _ ->
                     ( { model | error = "Expected the library open, received the sheet " ++ model.sheet.id ++ ". Source: trash selected sheets. Fix: open the library, select the rows, and run it again." }, Cmd.none )
@@ -3655,26 +3771,20 @@ update msg ({ sheet, auth } as model) =
 
                     else
                         let
-                            norm =
-                                normalizeRect model.sheet.select
-
-                            ids =
-                                List.range norm.a.y norm.b.y
-                                    |> List.filterMap (libraryIdAtRow model)
-
                             tagsOf id =
                                 model.library |> Dict.get id |> Maybe.map .tags |> Maybe.withDefault []
                         in
-                        if List.isEmpty ids then
-                            ( { model | error = "Expected a selection over library rows, received one holding no sheet. Source: rows " ++ String.fromInt norm.a.y ++ " to " ++ String.fromInt norm.b.y ++ ". Fix: select the rows to tag in the library table." }, Cmd.none )
+                        case librarySelection "tag" model of
+                            Err error ->
+                                ( { model | error = error }, Cmd.none )
 
-                        else
-                            ( model
-                            , ids
-                                |> List.filter (\id -> not (List.member tag (tagsOf id)))
-                                |> List.map (\id -> updateLibrary (Idd id { name = Nothing, tags = Just (tagsOf id ++ [ tag ]), trashed = Nothing, starred = Nothing }))
-                                |> Cmd.batch
-                            )
+                            Ok ids ->
+                                ( model
+                                , ids
+                                    |> List.filter (\id -> not (List.member tag (tagsOf id)))
+                                    |> List.map (\id -> updateLibrary (Idd id { noLibraryPatch | tags = Just (tagsOf id ++ [ tag ]) }))
+                                    |> Cmd.batch
+                                )
 
                 _ ->
                     ( { model | error = "Expected the library open, received the sheet " ++ model.sheet.id ++ ". Source: tag selected sheets. Fix: open the library, select the rows, and run it again." }, Cmd.none )
@@ -3683,6 +3793,34 @@ update msg ({ sheet, auth } as model) =
             -- The model only, and never the document, for the reason the split
             -- box below is: it is an argument to a verb nobody has run yet.
             ( { model | sheet = { sheet | tag = tag } }, Cmd.none )
+
+        FolderSelected ->
+            -- Written over what each sheet carries: a sheet sits in one folder.
+            case ( model.sheet.doc, String.trim model.sheet.folder ) of
+                ( Ok Library, "" ) ->
+                    ( { model | error = "Expected a folder, received nothing. Source: the library strip's folder box. Fix: type the folder, then run it." }, Cmd.none )
+
+                ( Ok Library, folder ) ->
+                    if String.contains "," folder then
+                        ( { model | error = "Expected one folder, received " ++ folder ++ ". Source: the library strip's folder box. Fix: name the folder with no comma in it." }, Cmd.none )
+
+                    else
+                        case librarySelection "file" model of
+                            Err error ->
+                                ( { model | error = error }, Cmd.none )
+
+                            Ok ids ->
+                                ( model
+                                , ids
+                                    |> List.map (\id -> updateLibrary (Idd id { noLibraryPatch | folder = Just folder }))
+                                    |> Cmd.batch
+                                )
+
+                _ ->
+                    ( { model | error = "Expected the library open, received the sheet " ++ model.sheet.id ++ ". Source: move selected sheets to a folder. Fix: open the library, select the rows, and run it again." }, Cmd.none )
+
+        FolderInput folder ->
+            ( { model | sheet = { sheet | folder = folder } }, Cmd.none )
 
         ColumnSplitInput delimiter ->
             -- The model only, and never the document: the box is an argument to
@@ -4002,7 +4140,7 @@ update msg ({ sheet, auth } as model) =
                         ( model, Cmd.none )
 
         SettingsNameChange newName ->
-            ( model, updateLibrary (Idd sheet.id { name = Just newName, tags = Nothing, trashed = Nothing, starred = Nothing }) )
+            ( model, updateLibrary (Idd sheet.id { noLibraryPatch | name = Just newName }) )
 
         SettingsTagsChange newTags ->
             let
@@ -4012,7 +4150,7 @@ update msg ({ sheet, auth } as model) =
                         |> List.map String.trim
                         |> List.filter (not << String.isEmpty)
             in
-            ( model, updateLibrary (Idd sheet.id { name = Nothing, tags = Just tags, trashed = Nothing, starred = Nothing }) )
+            ( model, updateLibrary (Idd sheet.id { noLibraryPatch | tags = Just tags }) )
 
         DocNew x ->
             ( model, newDoc x )
@@ -4569,6 +4707,13 @@ update msg ({ sheet, auth } as model) =
             -- rather than one per pixel.
             arrange model { sheet | resizing = Nothing }
 
+        ColumnResizeStep key dx ->
+            -- The model only: the grip's keyup ends the step with
+            -- `ColumnResizeEnd`, so a held key stores one width, as a drag does.
+            ( { model | sheet = { sheet | widths = Dict.insert key (max minColWidth (dx + (colOf sheet key |> Maybe.andThen (colPx sheet) |> Maybe.withDefault autoColWidth))) sheet.widths } }
+            , Cmd.none
+            )
+
         FilterToggle key ->
             let
                 newFilterOpen =
@@ -5047,10 +5192,24 @@ updateDocMsg edit ({ sheet } as model) =
                 SheetWrite { x, y } ->
                     case ( libraryIdAtRow model y, Maybe.map .name (Array.get x (libraryCols model)) ) of
                         ( Just id, Just "name" ) ->
-                            ( closed, updateLibrary (Idd id { name = sheet.write, tags = Nothing, trashed = Nothing, starred = Nothing }) )
+                            ( closed, updateLibrary (Idd id { noLibraryPatch | name = sheet.write }) )
 
                         ( Just id, Just "tags" ) ->
-                            ( closed, updateLibrary (Idd id { name = Nothing, tags = sheet.write |> Maybe.map (String.split ", " >> List.map String.trim), trashed = Nothing, starred = Nothing }) )
+                            ( closed, updateLibrary (Idd id { noLibraryPatch | tags = sheet.write |> Maybe.map (String.split ", " >> List.map String.trim) }) )
+
+                        ( Just id, Just "folder" ) ->
+                            case Maybe.map String.trim sheet.write of
+                                Just folder ->
+                                    if String.contains "," folder then
+                                        ( { closed | error = "Expected one folder, received " ++ folder ++ ". Source: the folder cell of library row " ++ String.fromInt y ++ ". Fix: name the folder with no comma in it." }, Cmd.none )
+
+                                    else
+                                        -- A blanked cell unfiles: "" rather than null, which
+                                        -- Library.set would drop and leave the folder as it was.
+                                        ( closed, updateLibrary (Idd id { noLibraryPatch | folder = Just folder }) )
+
+                                Nothing ->
+                                    ( closed, Cmd.none )
 
                         ( Nothing, _ ) ->
                             -- Written to a row the library does not draw. The empty
@@ -6059,6 +6218,30 @@ updateKeyDown event ({ sheet } as model) =
                     in
                     ( { model | sheet = { sheet | select = newSelect } }, Cmd.none )
 
+                -- Not Alt alone: on Windows and Linux Alt+←/→ is the browser's
+                -- back and forward, and a subscription cannot preventDefault it.
+                --
+                -- A panel over the table does not stop this subscription: the
+                -- palette's Dom.focus is a Task that lands a frame later, and
+                -- the shortcut sheet and the settings focus a div and a button,
+                -- which `keyEventDecoder` lets through. A move there would edit
+                -- a table nobody can see. The import preview, the delete
+                -- confirm and a held rename open the same kind of dialog over
+                -- the table -- model.history is the one exception, gated at
+                -- the top of this function instead, because every other key is
+                -- refused there too and not only this one.
+                nudge dx dy =
+                    if List.any identity [ model.palette /= Nothing, model.showShortcuts, model.showSettings, model.importing /= Nothing, model.deleteConfirm /= Nothing, model.pending /= Nothing ] then
+                        ( model, Cmd.none )
+
+                    else
+                        case nudgeOf model.search sheet dx dy of
+                            Ok ( edit, moved ) ->
+                                updateDocMsg edit { model | sheet = { sheet | select = moved } }
+
+                            Err message ->
+                                ( { model | error = message }, Cmd.none )
+
                 -- Get selected row indices for deletion (never the header/type rows y <= 0)
                 selectedRows =
                     let
@@ -6081,28 +6264,40 @@ updateKeyDown event ({ sheet } as model) =
             in
             case event.key of
                 "ArrowUp" ->
-                    if event.shift then
+                    if event.alt && event.shift then
+                        nudge 0 -1
+
+                    else if event.shift then
                         expand 0 -1
 
                     else
                         move 0 -1
 
                 "ArrowDown" ->
-                    if event.shift then
+                    if event.alt && event.shift then
+                        nudge 0 1
+
+                    else if event.shift then
                         expand 0 1
 
                     else
                         move 0 1
 
                 "ArrowLeft" ->
-                    if event.shift then
+                    if event.alt && event.shift then
+                        nudge -1 0
+
+                    else if event.shift then
                         expand -1 0
 
                     else
                         move -1 0
 
                 "ArrowRight" ->
-                    if event.shift then
+                    if event.alt && event.shift then
+                        nudge 1 0
+
+                    else if event.shift then
                         expand 1 0
 
                     else
@@ -6482,6 +6677,7 @@ libraryCols model =
               , madeCol "thumb" "" Thumb
               , madeCol "name" "name" Text
               , madeCol "tags" "tags" (Many Text)
+              , madeCol "folder" "folder" Text
 
               -- When this browser last opened the sheet. Sortable by the header
               -- click; "" for never-opened sorts to the far end either way.
@@ -6831,6 +7027,9 @@ shortcutGroups =
         , ( "Ctrl/⌘+Enter", "insert rows above", Nothing )
         , ( "Ctrl/⌘+Shift+Enter", "duplicate rows", Nothing )
         , ( "Ctrl/⌘+D", "fill down", Nothing )
+        , ( "Alt+Shift+↑ / Alt+Shift+↓", "move rows", Nothing )
+        , ( "Alt+Shift+← / Alt+Shift+→", "move columns", Nothing )
+        , ( "← / → on a column's grip", "resize, Shift for more", Nothing )
         , ( "Ctrl/⌘+Shift+D", "delete duplicate rows", Just (DocMsg SheetRowsDedupe) )
         ]
       )
@@ -6935,6 +7134,10 @@ Scoring customers is the same door over the same guesses, into `rfmSql`: recency
 frequency and money scored per key. A score needs money to score, so a sheet
 with no money column is not offered it either.
 
+Segmenting is the same door into `kmeansSql`: the guessed key and every other
+numeric column, clustered by k-means. Clustering needs two columns to be more
+than a sort, so a sheet with fewer is not offered it.
+
 -}
 paletteRows : Model -> String -> List Command
 paletteRows model query =
@@ -6997,10 +7200,6 @@ paletteRows model query =
             else
                 []
 
-        cohortLabel : String
-        cohortLabel =
-            "build a cohort table from this sheet"
-
         -- `arrangeable` already answers for the two sheets a cohort can be built
         -- from and for no others, and it is the one place that knows where each
         -- keeps its columns: a table's are its document's, a query's are
@@ -7030,79 +7229,82 @@ paletteRows model query =
         money =
             firstColumn (\c -> c.typ == Usd)
 
+        -- `newDoc` in index.html reads `field` and writes the statement into
+        -- `code`.
+        draft : String -> String -> List ( String, E.Value ) -> List Command
+        draft name field settings =
+            if String.contains (String.toLower (String.trim query)) (String.toLower name) then
+                [ Command name model.sheet.id <|
+                    DocNew <|
+                        E.object
+                            [ ( "type", E.string "query" )
+                            , ( "data"
+                              , E.list identity
+                                    [ E.object
+                                        [ ( "lang", E.string "sql" )
+                                        , ( field, E.object (( "source", E.string ("@" ++ model.sheet.id) ) :: settings) )
+                                        ]
+                                    ]
+                              )
+                            ]
+                ]
+
+            else
+                []
+
         cohort : List Command
         cohort =
             case ( dated, keyed ) of
                 ( Just when, Just who ) ->
-                    if String.contains (String.toLower (String.trim query)) cohortLabel then
-                        [ Command cohortLabel model.sheet.id <|
-                            DocNew <|
-                                E.object
-                                    [ ( "type", E.string "query" )
-                                    , ( "data"
-                                      , E.list identity
-                                            [ E.object
-                                                [ ( "lang", E.string "sql" )
-                                                , ( "cohort"
-                                                  , E.object
-                                                        [ ( "source", E.string ("@" ++ model.sheet.id) )
-                                                        , ( "date", E.string when )
-                                                        , ( "key", E.string who )
-                                                        , ( "value", E.string (Maybe.withDefault "" money) )
-                                                        , ( "grain", E.string "month" )
-                                                        ]
-                                                  )
-                                                ]
-                                            ]
-                                      )
-                                    ]
+                    draft "build a cohort table from this sheet"
+                        "cohort"
+                        [ ( "date", E.string when )
+                        , ( "key", E.string who )
+                        , ( "value", E.string (Maybe.withDefault "" money) )
+                        , ( "grain", E.string "month" )
                         ]
-
-                    else
-                        []
 
                 _ ->
                     []
-
-        rfmLabel : String
-        rfmLabel =
-            "score this sheet's customers (RFM)"
 
         rfm : List Command
         rfm =
             case ( dated, keyed, money ) of
                 ( Just when, Just who, Just spent ) ->
-                    if String.contains (String.toLower (String.trim query)) (String.toLower rfmLabel) then
-                        [ Command rfmLabel model.sheet.id <|
-                            DocNew <|
-                                E.object
-                                    [ ( "type", E.string "query" )
-                                    , ( "data"
-                                      , E.list identity
-                                            [ E.object
-                                                [ ( "lang", E.string "sql" )
-                                                , ( "rfm"
-                                                  , E.object
-                                                        [ ( "source", E.string ("@" ++ model.sheet.id) )
-                                                        , ( "date", E.string when )
-                                                        , ( "key", E.string who )
-                                                        , ( "value", E.string spent )
-                                                        , ( "buckets", E.int 5 )
-                                                        ]
-                                                  )
-                                                ]
-                                            ]
-                                      )
-                                    ]
+                    draft "score this sheet's customers (RFM)"
+                        "rfm"
+                        [ ( "date", E.string when )
+                        , ( "key", E.string who )
+                        , ( "value", E.string spent )
+                        , ( "buckets", E.int 5 )
                         ]
 
-                    else
-                        []
+                _ ->
+                    []
+
+        -- The key is the row's name and not a coordinate, even when its type is
+        -- a number.
+        clustered : List String
+        clustered =
+            columns |> List.filter (\c -> numericColumn c.typ && Just c.name /= keyed) |> List.map .name
+
+        kmeans : List Command
+        kmeans =
+            case ( keyed, clustered ) of
+                ( Just who, _ :: _ :: _ ) ->
+                    draft "segment this sheet (k-means)"
+                        "kmeans"
+                        [ ( "key", E.string who )
+                        , ( "columns", E.list E.string clustered )
+
+                        -- Three is the fewest segments with a middle one.
+                        , ( "k", E.int 3 )
+                        ]
 
                 _ ->
                     []
     in
-    List.take 12 (subscribe ++ cohort ++ rfm ++ paletteCommands model.library query)
+    List.take 12 (subscribe ++ cohort ++ rfm ++ kmeans ++ paletteCommands model.library query)
 
 
 viewShortcuts : Bool -> Html Msg
@@ -7694,6 +7896,9 @@ computeStats doc =
                             Usd ->
                                 computeNumericStats tbl.rows col.key
 
+                            Duration ->
+                                computeNumericStats tbl.rows col.key
+
                             Text ->
                                 computeTextStats tbl.rows col.key
 
@@ -7736,7 +7941,7 @@ resolveTable model =
                 { cols = libraryCols model
                 , rows =
                     model.library
-                        |> Dict.filter (\k v -> k /= "" && not v.scratch && v.trashed == model.trash && List.any (String.contains model.search) (k :: v.name :: v.tags))
+                        |> Dict.filter (\k v -> k /= "" && not v.scratch && v.trashed == model.trash && List.any (String.contains model.search) (k :: v.name :: v.folder :: v.tags))
                         |> Dict.toList
                         -- Starred first, and only while nobody has chosen a
                         -- sort: `filterAndSortIndexed`'s own sort is stable, so
@@ -7754,6 +7959,7 @@ resolveTable model =
                                     , ( "type", E.string (Maybe.withDefault "" <| List.head <| String.split ":" k) )
                                     , ( "name", E.string (iif (String.isEmpty (String.trim v.name)) "(untitled)" v.name) )
                                     , ( "tags", E.list E.string v.tags )
+                                    , ( "folder", E.string v.folder )
                                     , ( "opened", E.string v.seen )
                                     , ( "freshness", E.string (freshnessCell (Dict.get k model.freshness)) )
                                     , ( "trash", E.string k )
@@ -8490,6 +8696,9 @@ seriesEncoder typ =
         Percentage ->
             Just asNumber
 
+        Duration ->
+            Just asNumber
+
         Unknown ->
             Nothing
 
@@ -8878,6 +9087,9 @@ cellDecoder typ decimals format i n =
             Percentage ->
                 D.oneOf [ D.map (text << formatNumber Percentage decimals format) number, D.map text string ]
 
+            Duration ->
+                D.oneOf [ D.map (text << formatNumber Duration decimals format) number, D.map text string ]
+
             Date ->
                 D.map text string
 
@@ -9172,6 +9384,11 @@ viewHeaderCell sheet col =
                 numeric =
                     numericColumn col.typ
 
+                -- formatNumber draws a duration as h:mm whatever its count or
+                -- format, so the panel offers neither.
+                counted =
+                    numeric && col.typ /= Duration
+
                 isFilterOpen =
                     sheet.filterOpen == Just col.key
 
@@ -9188,7 +9405,7 @@ viewHeaderCell sheet col =
                     [ iif movable
                         (H.span
                             [ A.class "grab"
-                            , A.title "drag onto the column it should sit at"
+                            , A.title "drag onto the column it should sit at, or select it and press Alt+Shift+← →"
                             , A.stopPropagationOn "mousedown" (D.succeed ( ColumnMoveStart col.key, True ))
                             ]
                             []
@@ -9207,10 +9424,42 @@ viewHeaderCell sheet col =
                         (text "")
                     , iif controls
                         (H.span
-                            [ A.class "grip"
-                            , A.title "drag to resize"
-                            , A.on "mousedown" (D.map (ColumnResizeStart col.key) (D.field "clientX" (D.map round D.float)))
-                            ]
+                            ([ A.class "grip"
+                             , A.title "drag to resize, or focus and press ← →"
+                             , A.tabindex 0
+                             , A.attribute "role" "separator"
+                             , A.attribute "aria-orientation" "vertical"
+                             , A.attribute "aria-label" ("resize " ++ col.name)
+                             , A.on "mousedown" (D.map (ColumnResizeStart col.key) (D.field "clientX" (D.map round D.float)))
+
+                             -- Its own listener, stopped here: the document's
+                             -- would read the same arrow as a move of the
+                             -- selection.
+                             , A.custom "keydown"
+                                (D.map2
+                                    (\key shift ->
+                                        case key of
+                                            "ArrowLeft" ->
+                                                D.succeed (iif shift -32 -8)
+
+                                            "ArrowRight" ->
+                                                D.succeed (iif shift 32 8)
+
+                                            _ ->
+                                                D.fail "not a resize key"
+                                    )
+                                    (D.field "key" D.string)
+                                    (D.field "shiftKey" D.bool)
+                                    |> D.andThen identity
+                                    |> D.map (\dx -> { message = ColumnResizeStep col.key dx, stopPropagation = True, preventDefault = True })
+                                )
+                             , A.on "keyup"
+                                (D.field "key" D.string
+                                    |> D.andThen (\key -> iif (key == "ArrowLeft" || key == "ArrowRight") (D.succeed ColumnResizeEnd) (D.fail "not a resize key"))
+                                )
+                             ]
+                                ++ (colPx sheet col |> Maybe.map (\px -> [ A.attribute "aria-valuenow" (String.fromInt px) ]) |> Maybe.withDefault [])
+                            )
                             []
                         )
                         (text "")
@@ -9220,7 +9469,7 @@ viewHeaderCell sheet col =
                         [ H.input [ A.placeholder "contains...", A.attribute "aria-label" ("filter " ++ col.name), A.value currentFilterValue, A.onInput (FilterInput col.key), S.width "100%" ] []
                         , H.button [ A.onClick (ColumnHide col.key), S.marginTop "0.25rem" ] [ text "Hide column" ]
                         , H.button [ A.onClick (ColumnPin col.key), S.marginTop "0.25rem" ] [ text (iif isPinned "Unpin column" "Pin column") ]
-                        , iif numeric
+                        , iif counted
                             (H.label [ A.class "decimals", S.displayFlex, S.alignItemsCenter, S.gapRem 0.25, S.marginTop "0.25rem" ]
                                 [ text "decimals"
                                 , H.input
@@ -9236,7 +9485,7 @@ viewHeaderCell sheet col =
                                 ]
                             )
                             (text "")
-                        , iif numeric
+                        , iif counted
                             (H.label [ A.class "format", S.displayFlex, S.alignItemsCenter, S.gapRem 0.25, S.marginTop "0.25rem" ]
                                 [ text "format"
                                 , H.select [ A.onInput (ColumnFormat col.key) ]
@@ -9351,7 +9600,7 @@ viewEditCell sheet col =
             [ H.input [ A.id "new-cell", onEditorKeydown, A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.minWidthRem 8, S.border "none", S.borderRadius "0", S.padding "0" ] [] ]
 
 
-{-| The background one shaded cell's value sits on.
+{-| What one shaded cell draws around its value: a background, or an arrow.
 
 It goes on a wrapper inside the `td` and never on the `td` itself: an inline
 background there outranks `td.selected`, `td:hover` and the match highlight by
@@ -9394,6 +9643,25 @@ shadeAttr shading ( lo, hi ) v =
                     ++ ", transparent "
                     ++ across
                     ++ ")"
+                )
+
+        Arrows ->
+            -- The glyph is drawn by `style.css` from this attribute, so the
+            -- cell's textContent stays its value for copy and find.
+            A.attribute "data-icon"
+                (case part of
+                    Just p ->
+                        if p >= 2 / 3 then
+                            "▲"
+
+                        else if p <= 1 / 3 then
+                            "▼"
+
+                        else
+                            "▬"
+
+                    Nothing ->
+                        "▬"
                 )
 
 
@@ -9492,7 +9760,7 @@ viewCell sheet stats pins extents grab i n col row =
                       iif (i == 0 && grab)
                         (H.span
                             [ A.class "grab"
-                            , A.title "drag onto the row it should sit at"
+                            , A.title "drag onto the row it should sit at, or select it and press Alt+Shift+↑ ↓"
                             , A.stopPropagationOn "mousedown" (D.succeed ( RowMoveStart n, True ))
                             ]
                             []
@@ -9572,6 +9840,9 @@ columnTotal rows col =
             Just (sumColumn rows col.key)
 
         Usd ->
+            Just (sumColumn rows col.key)
+
+        Duration ->
             Just (sumColumn rows col.key)
 
         _ ->
@@ -9695,7 +9966,7 @@ viewGallery model =
             ++ [ H.input
                     [ A.value model.sheet.tag
                     , A.onInput TagInput
-                    , onTagKeydown
+                    , onEnter TagSelected
                     , A.placeholder "tag"
                     , A.title "add this tag to every selected library row"
                     , S.width "6rem"
@@ -9703,6 +9974,18 @@ viewGallery model =
                     ]
                     []
                , H.button [ A.class "chip", A.onClick TagSelected ] [ text "tag selected" ]
+               , H.input
+                    [ A.value model.sheet.folder
+                    , A.onInput FolderInput
+                    , onEnter FolderSelected
+                    , A.placeholder "folder"
+                    , A.attribute "aria-label" "folder"
+                    , A.title "move every selected library row to this folder"
+                    , S.width "6rem"
+                    , S.fontSizeRem 0.8125
+                    ]
+                    []
+               , H.button [ A.class "chip", A.onClick FolderSelected ] [ text "move to folder" ]
                ]
         )
 
@@ -11349,7 +11632,7 @@ view : Model -> Browser.Document Msg
 view ({ sheet } as model) =
     let
         info =
-            model.library |> Dict.get sheet.id |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = E.null, seen = "", trashed = False, starred = False }
+            model.library |> Dict.get sheet.id |> Maybe.withDefault { name = "", tags = [], scratch = False, system = False, thumb = E.null, seen = "", trashed = False, starred = False, folder = "" }
 
         stats =
             sheet.stats
