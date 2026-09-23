@@ -68,6 +68,7 @@
     "hyparquet": "npm:hyparquet@1.29.2/src/index.js",
     "hyparquet-writer": "npm:hyparquet-writer@0.16.9/src/index.js",
     "alasql": "npm:alasql@^4.17.3",
+    "croner": "npm:croner@10.0.1",
     "elm": "npm:elm@0.19.2-0",
     "elm-format": "npm:elm-format@^0.8.8",
     "elm-review": "npm:elm-review@^2.13.5",

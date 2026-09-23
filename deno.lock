@@ -31,6 +31,7 @@
     "npm:alasql@*": "4.17.3_@babel+core@7.29.7_react@19.2.8_react-native@0.86.2",
     "npm:alasql@4.17.3": "4.17.3_@babel+core@7.29.7_react@19.2.8_react-native@0.86.2",
     "npm:alasql@^4.17.3": "4.17.3_@babel+core@7.29.7_react@19.2.8_react-native@0.86.2",
+    "npm:croner@10.0.1": "10.0.1",
     "npm:elm-format@~0.8.8": "0.8.8",
     "npm:elm-review@*": "2.13.5",
     "npm:elm-review@2.13.5": "2.13.5",
@@ -1086,6 +1087,9 @@
     "crc-32@1.2.2": {
       "integrity": "sha512-ROmzCKrTnOwybPcJApAA6WBWij23HVfGVNKqqrZpuyZOHqK2CwHSvpGuyt/UNNvaIjEd8X5IFGp4Mh+Ie1IHJQ==",
       "bin": true
+    },
+    "croner@10.0.1": {
+      "integrity": "sha512-ixNtAJndqh173VQ4KodSdJEI6nuioBWI0V1ITNKhZZsO0pEMoDxz539T4FTTbSZ/xIOSuDnzxLVRqBVSvPNE2g=="
     },
     "cross-fetch@4.1.0": {
       "integrity": "sha512-uKm5PU+MHTootlWEY+mZ4vvXoCn4fLQxT9dSc1sXVMSFkINTJVN8cAQROpwcKm8bJ/c7rgZVIBWzH5T78sNZZw==",
@@ -3118,6 +3122,7 @@
       "npm:@automerge/automerge@^3.4.0",
       "npm:@electric-sql/pglite@~0.5.4",
       "npm:alasql@^4.17.3",
+      "npm:croner@10.0.1",
       "npm:elm-format@~0.8.8",
       "npm:elm-review@^2.13.5",
       "npm:elm-test@0.19.2-0",

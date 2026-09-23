@@ -10,6 +10,7 @@ import pg from "postgresjs";
 import * as XLSX from "xlsx";
 import { parquetReadObjects } from "hyparquet";
 import { ByteWriter, parquetWrite, parquetWriteBuffer } from "hyparquet-writer";
+import { Cron } from "croner";
 import {
   accountBuckets,
   app,
@@ -9323,9 +9324,10 @@ Deno.test(async function allTests(t) {
     hookBuckets.clear();
   });
 
-  const feedCondition = `Every net-http sheet that has ever polled and is not paused did so in the past ${
-    POLL_STALE_S / 3600
-  } hours.`;
+  const feedCondition =
+    `Every net-http sheet that has ever polled and is not paused did so within twice its own interval, or within ${
+      POLL_STALE_S / 3600
+    } hours if that is longer.`;
   const liveCondition = "Every alert sheet that is not paused ran within twice its own interval.";
   const overdueCondition = `No more than ${OVERDUE_MAX} net-http or alert sheets are overdue, paused ones included.`;
 
@@ -9465,6 +9467,18 @@ Deno.test(async function allTests(t) {
       d.data[0].paused = true;
     });
     assertEquals((await status())[feedCondition]["0"], 1, "a feed its owner switched off is not an outage");
+    // A feed is graded against twice the interval its newest poll recorded,
+    // so a daily one is on time a day after its poll and late three days on.
+    feed.change((d: { data: [{ paused?: boolean }] }) => {
+      d.data[0].paused = false;
+    });
+    await sql`
+      update net set meta = '{"status":200,"interval":86400}'::jsonb, created_at = now() - interval '20 hours'
+      where sheet_id = ${feedSheet}
+    `;
+    assert((await status())[feedCondition]["0"] >= 1, "a daily feed that polled 20 hours ago is on time");
+    await sql`update net set created_at = now() - interval '3 days' where sheet_id = ${feedSheet}`;
+    assert((await status())[feedCondition]["0"] < 1, "a daily feed that last polled 3 days ago has stopped");
     await sql`delete from net where sheet_id = ${feedSheet}`;
     await sql`delete from sheet where sheet_id = ${feedSheet}`;
 
@@ -9759,7 +9773,7 @@ Deno.test(async function allTests(t) {
   });
 
   await t.step("You run a sheet now, pause it, and see when it runs next", async () => {
-    const { jwt } = await usr("runner@example.com");
+    const { jwt, usr_id } = await usr("runner@example.com");
     const watched = automerge.create<Sheet>({
       type: "table",
       data: [arrayify([{ name: "n", type: "num", key: 0 }]), { 0: 1 }],
@@ -9770,7 +9784,9 @@ Deno.test(async function allTests(t) {
     // An alert is the runnable sheet with no wire in it: it runs a query and
     // writes its row, so "now" is answerable without a fetch. `to` is empty, so
     // the run decides and delivers nothing.
-    const alert = automerge.create<{ data: [{ code: string; to: string; interval: number; paused?: boolean }] }>({
+    const alert = automerge.create<
+      { data: [{ code: string; to: string; interval: number; paused?: boolean; cron?: string; timezone?: string }] }
+    >({
       data: [{ code: `select n from @${table_id}`, to: "", interval: 3600 }],
     });
     const alert_id = `alert:${alert.documentId}`;
@@ -9864,6 +9880,49 @@ Deno.test(async function allTests(t) {
       String(byId[alert_id].next_run).includes("T"),
       `an alert the poller has run knows when it runs next, got ${byId[alert_id].next_run}`,
     );
+
+    // A cron wins over the interval, read in the sheet's own zone. Both
+    // pollers record the gap to the run croner names as meta.interval.
+    const weekdays = new Cron("0 9 * * 1-5", { timezone: "America/Chicago", mode: "5-part" }).nextRun(new Date(clock));
+    assert(weekdays, "croner names a next weekday morning");
+    const gap = Math.ceil((weekdays.getTime() - clock) / 1000);
+    const cronFeed = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{
+        url: "https://cron.feeds.test/rows.json",
+        interval: 60,
+        cron: "0 9 * * 1-5",
+        timezone: "America/Chicago",
+      }],
+    });
+    const cronFeedId = `net-http:${cronFeed.documentId}`;
+    await put(jwt, `/library/${cronFeedId}`, { name: "weekday feed" });
+    await pollNetSheet(
+      cronFeedId,
+      cronFeed.documentId,
+      () => Promise.resolve(new Response(`[{"n":1}]`, { headers: { "Content-Type": "application/json" } })),
+      clock,
+    );
+    alert.change((d: { data: [{ cron?: string; timezone?: string }] }) => {
+      d.data[0].cron = "0 9 * * 1-5";
+      d.data[0].timezone = "America/Chicago";
+    });
+    await pollAlertSheet(
+      { sheet_id: alert_id, doc_id: alert.documentId, name: "on demand", created_by: usr_id },
+      () => Promise.resolve("sent"),
+      clock,
+    );
+    const scheduled = Object.fromEntries(
+      (await get<Table>(jwt, "/sheet/library:freshness")).slice(1).map((r) => [String(r.sheet_id), r]),
+    );
+    assertEquals(scheduled[cronFeedId].next_run, weekdays.toISOString(), "freshness names the run croner names");
+    assertEquals(scheduled[alert_id].next_run, weekdays.toISOString());
+    const [feedRun] = await sql`
+      select meta from net where sheet_id = ${cronFeedId} and meta->>'status' = '200' order by net_id desc limit 1
+    `;
+    assertEquals(feedRun.meta.interval, gap, "a feed's poll records the gap to its next run");
+    const [alertRun] = await sql`select meta from net where sheet_id = ${alert_id} order by net_id desc limit 1`;
+    assertEquals(alertRun.meta.interval, gap, "an alert's run records the gap to its next run");
   });
 
   await t.step("You re-run a feed from a past watermark", async () => {
@@ -10052,6 +10111,65 @@ Deno.test(async function allTests(t) {
         byId[alert_id].next_run
       }`,
     );
+  });
+
+  await t.step("A schedule the poller cannot follow is the sheet's own failure, naming the field", async () => {
+    const { jwt, usr_id } = await usr("unscheduled@example.com");
+    type Schedule = { cron?: string; timezone?: string };
+    const feed = automerge.create<{ data: [{ url: string; interval: number } & Schedule] }>({
+      data: [{ url: "https://unscheduled.feeds.test/rows.json", interval: 3600 }],
+    });
+    const feed_id = `net-http:${feed.documentId}`;
+    await put(jwt, `/library/${feed_id}`, { name: "unscheduled feed" });
+    const alert = automerge.create<{ data: [{ code: string; to: string; interval: number } & Schedule] }>({
+      data: [{ code: "select 1 as n", to: "", interval: 3600 }],
+    });
+    const alert_id = `alert:${alert.documentId}`;
+    await put(jwt, `/library/${alert_id}`, { name: "unscheduled alert" });
+    const clock = Date.now() + 500_000_000;
+    const newest = async (sheet_id: string) =>
+      (await sql`select body, meta from net where sheet_id = ${sheet_id} order by net_id desc limit 1`)[0];
+    const cases: [Schedule, string][] = [
+      [{ cron: "0 9 * *" }, "is not a pattern croner can read"],
+      [{ cron: "0 9 * * *", timezone: "Mars/Olympus" }, "is not a zone croner knows"],
+      [{ cron: "0 0 30 2 *" }, "never fires again"],
+      [{ timezone: "America/Chicago" }, "has no cron to apply to"],
+      [{ cron: "* * * * * *" }, "is not a pattern croner can read"],
+      // croner's refusal quotes the whole zone back, so this one broke the
+      // row's size before the refusal cut croner's message.
+      [{ cron: "0 9 * * *", timezone: "z".repeat(10_000) }, "is not a zone croner knows"],
+    ];
+    for (const [schedule, headline] of cases) {
+      const write = (d: { data: [Schedule] }) => {
+        delete d.data[0].cron;
+        delete d.data[0].timezone;
+        Object.assign(d.data[0], schedule);
+      };
+      feed.change(write);
+      alert.change(write);
+      await pollNetSheet(feed_id, feed.documentId, () => {
+        throw new Error(`a feed whose schedule is refused fetched anyway: ${JSON.stringify(schedule)}`);
+      }, clock);
+      const polled = await newest(feed_id);
+      assert(String(polled.body).includes(headline), `${JSON.stringify(schedule)} names ${headline}: ${polled.body}`);
+      assert(
+        String(polled.body).length < 2_000,
+        `a refused schedule is a bounded row, got ${String(polled.body).length}`,
+      );
+      assertEquals(polled.meta.interval, 3600, "the failure row records the hour it waits");
+      assertEquals(netDue.get(feed_id), clock + 3600_000, "and the feed stays due on the ordinary retry");
+      await pollAlertSheet(
+        { sheet_id: alert_id, doc_id: alert.documentId, name: "unscheduled alert", created_by: usr_id },
+        () => Promise.resolve("sent"),
+        clock,
+      );
+      const ran = await newest(alert_id);
+      const record = JSON.parse(String(ran.body)) as { status: string; error: string };
+      assertEquals(record.status, "error", `${JSON.stringify(schedule)} is an error run`);
+      assert(record.error.includes(headline), `${JSON.stringify(schedule)} names ${headline}: ${record.error}`);
+      assert(record.error.length < 2_000, `a refused schedule is a bounded run, got ${record.error.length}`);
+      assertEquals(ran.meta.interval, 3600);
+    }
   });
 
   await sql.end();

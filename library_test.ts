@@ -31,9 +31,10 @@ import {
   PORTALS,
   rememberedTypes,
   sheets,
+  trapStep,
 } from "./src/page.mjs";
 import alasql from "./src/alasql.mjs";
-import { boot, El, refused, resolver, rowsOf, shelf } from "./page_harness.ts";
+import { boot, El, refused, resolver, rowsOf, shelf, until } from "./page_harness.ts";
 
 // A feed's first poll used to be the first news of a wrong url or a missing
 // secret. The button asks for the request now, and what comes back is shown
@@ -191,6 +192,22 @@ Deno.test("a feed can be paused, run now, and says when it runs next", async () 
   ticked.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
   await settle();
   assertEquals(patches, [{ action: "set", path: [0, "paused"], value: true }]);
+
+  // The schedule is two text fields written the same way. The page checks
+  // neither: the poller's refusal is the check, and the run row shows it.
+  for (const [label, value] of [["cron schedule", "0 9 * * 1-5"], ["cron timezone", "America/Chicago"]]) {
+    const input = all(`input[aria-label="${label}"]`)[0] as unknown as
+      | { value: string; dispatchEvent: (e: unknown) => boolean }
+      | undefined;
+    assert(input, `a feed offers the ${label}`);
+    input.value = value;
+    input.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+  }
+  await settle();
+  assertEquals(patches.slice(1), [
+    { action: "set", path: [0, "cron"], value: "0 9 * * 1-5" },
+    { action: "set", path: [0, "timezone"], value: "America/Chicago" },
+  ]);
 
   // Off the freshness the page already receives. A paused sheet says so rather
   // than naming a time its due entry still holds and no longer means.
@@ -725,6 +742,82 @@ Deno.test("Escape closes the palette without running anything", async () => {
   assertEquals(doc.location.pathname, at, "and nothing was opened");
 });
 
+// A past version is text in a plain table, drawn over the live sheet. Every key
+// the live sheet takes is a write, so under the history none of them reaches it.
+Deno.test("the history lists a sheet's versions, draws a past one, and no key writes under it", async () => {
+  const { dom, doc, app, all, click, fire, settle, text } = await boot("http://localhost/table:countries");
+  const chip = () => all("button").find((b) => b.textContent === "history");
+  assertEquals(chip(), undefined, "a bundled sheet has no automerge document, so it offers no history");
+  const writes: unknown[] = [], loads: unknown[] = [], views: unknown[] = [];
+  app.ports.changeDoc.subscribe((w: unknown) => writes.push(w));
+  app.ports.historyLoad.subscribe((id: unknown) => loads.push(id));
+  app.ports.historyView.subscribe((ask: unknown) => views.push(ask));
+  const cols = [{ key: "a", name: "city", type: "text" }, { key: "b", name: "", type: "text" }];
+  app.ports.docSelected.send({
+    id: "table:mine",
+    data: { doc: { type: "table", data: [cols, { a: "Lima", b: "x" }] } },
+  });
+  await settle();
+  const key = async (init: Record<string, unknown>) => {
+    doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { bubbles: true, ...init }));
+    await settle();
+  };
+  // One write first, so Ctrl+Z has something it could undo.
+  const lima = all("td").find((td) => td.textContent?.trim() === "Lima");
+  assert(lima, "the live sheet is drawn");
+  for (const type of ["mouseenter", "mousedown", "mouseup"]) await fire(lima, type);
+  await key({ key: "Delete" });
+  assertEquals(writes.length, 1, "Delete on the live sheet writes");
+
+  await click(chip());
+  assertEquals(loads, ["table:mine"], "the chip asks for the open sheet's history");
+  assert(text().includes("reading the history"), "and says so until it lands");
+  app.ports.historyLoaded.send({ id: "table:other", data: { versions: [], left: 0 } });
+  await settle();
+  assert(text().includes("reading the history"), "an answer for another sheet is not this one's");
+  const version = (hash: string, time: number, seq: number) => ({
+    hash,
+    time,
+    actor: "0123456789abcdef",
+    seq,
+    message: null,
+  });
+  app.ports.historyLoaded.send({
+    id: "table:mine",
+    data: { versions: [version("h2", 1790000000, 2), version("h1", 0, 1)], left: 3 },
+  });
+  await settle();
+  assertEquals(
+    all("#versions button").map((b) => b.textContent),
+    ["2026-09-21T14:13:20Z01234567", "change 101234567"],
+    "each version by its stamp, or by its sequence number when automerge has no time",
+  );
+  assert(text().includes("3 older versions are not listed."), "and the answer's count of what it left out");
+
+  await click(all("#versions button")[1]);
+  assertEquals(views, [{ id: "table:mine", hash: "h1" }], "picking a version asks for its rows");
+  app.ports.historyShown.send({
+    id: "table:mine",
+    data: { hash: "h1", columns: ["city", ""], rows: [["Quito", null]] },
+  });
+  await until(settle, "the past rows", () => all("#past td").length > 0);
+  assertEquals(
+    [all("#past th").map((th) => th.textContent), all("#past td").map((td) => td.textContent)],
+    [["city", ""], ["Quito", "NULL"]],
+    "the past version is its column names over its cells, as text",
+  );
+
+  await key({ key: "z", ctrlKey: true });
+  await key({ key: "Delete" });
+  await key({ key: "x" });
+  app.ports.pasteFromClipboard.send("pasted");
+  await settle();
+  assertEquals(writes.length, 1, "Ctrl+Z, Delete, typing and a paste write nothing under the history");
+  assertEquals(all("#new-cell").length, 0, "and no key opened an editor");
+  await key({ key: "Escape" });
+  assertEquals(all("#past").length, 0, "Escape closes the history");
+});
+
 Deno.test("?embed=1 renders the sheet with no chrome around it", async () => {
   const { doc, all } = await boot("http://localhost/table:countries?embed=1");
   assert(all("tbody tr").length > 190, "an embed still renders the sheet");
@@ -1123,6 +1216,17 @@ Deno.test("a remembered header lays its types over the server's guesses", () => 
     ["num", "text"],
     "no memory keeps the guess",
   );
+});
+
+Deno.test("a Tab inside a modal wraps at both ends, and lands nowhere in an empty one", () => {
+  assertEquals(trapStep(0, -1, false), -1, "no control: nowhere to land, forward");
+  assertEquals(trapStep(0, -1, true), -1, "no control: nowhere to land, back");
+  assertEquals([trapStep(1, 0, false), trapStep(1, 0, true), trapStep(1, -1, true)], [0, 0, 0], "one control holds");
+  assertEquals([trapStep(3, -1, false), trapStep(3, -1, true)], [0, 2], "from outside: the first, or the last");
+  assertEquals([trapStep(3, 0, false), trapStep(3, 1, true)], [1, 0], "a step inside");
+  assertEquals([trapStep(3, 2, false), trapStep(3, 0, true)], [0, 2], "and a wrap at each end");
+  for (const [count, index, back] of [[0, 0, false], [3, 3, false], [3, -2, true], [2.5, 0, false], [3, 0, "yes"]])
+    assertThrows(() => trapStep(count, index, back), Error, "I cannot step focus through a modal from here.");
 });
 
 Deno.test("an arrangement this browser has to keep is held by column key", () => {

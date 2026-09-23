@@ -16,7 +16,23 @@ import Test.Html.Selector as Selector
 suite : Test
 suite =
     describe "Main"
-        [ describe "Navigation"
+        [ describe "unviewable"
+            [ test "a codex sheet points at the route that reads it, not at a query that cannot" <|
+                \_ ->
+                    unviewable "codex-db" "codex-db:abc"
+                        |> Expect.all
+                            [ String.contains "GET /codex/codex-db:abc" >> Expect.equal True
+                            , String.contains "select * from" >> Expect.equal False
+                            ]
+            , test "a portal is read live, and a template is bought" <|
+                \_ ->
+                    ( unviewable "portal" "portal:x", unviewable "template" "template:y" )
+                        |> Expect.all
+                            [ Tuple.first >> String.contains "GET /portal/x/sync" >> Expect.equal True
+                            , Tuple.second >> String.contains "Buy it from the shop" >> Expect.equal True
+                            ]
+            ]
+        , describe "Navigation"
             [ describe "clampIndex"
                 [ test "clamps x to lower bound" <|
                     \_ ->
@@ -38,6 +54,10 @@ suite =
                     \_ ->
                         clampIndex { maxX = 5, maxY = 10 } { x = 3, y = 7 }
                             |> Expect.equal { x = 3, y = 7 }
+                , test "a filter that draws no rows floors y at 1, never the header row" <|
+                    \_ ->
+                        clampIndex { maxX = 5, maxY = 0 } { x = 2, y = 3 }
+                            |> Expect.equal { x = 2, y = 1 }
                 ]
             , describe "moveSelection"
                 [ test "moves right within bounds" <|
@@ -141,6 +161,10 @@ suite =
                     \_ ->
                         selectAll { maxX = 0, maxY = 1 }
                             |> Expect.equal { a = { x = 0, y = 1 }, b = { x = 0, y = 1 } }
+                , test "Ctrl+A over a filter that draws no rows never selects the header" <|
+                    \_ ->
+                        selectAll { maxX = 5, maxY = 0 }
+                            |> Expect.equal { a = { x = 0, y = 1 }, b = { x = 5, y = 1 } }
                 ]
             , describe "displayYToDocY / filterAndSortIndexed"
                 [ test "identity without sort, filter, or search" <|
@@ -154,7 +178,7 @@ suite =
                                     ]
                         in
                         List.map (displayYToDocY "" emptySheet rows) [ 1, 2, 3 ]
-                            |> Expect.equal [ 1, 2, 3 ]
+                            |> Expect.equal [ Just 1, Just 2, Just 3 ]
                 , test "sorted display rows map back to their document rows" <|
                     \_ ->
                         let
@@ -170,8 +194,8 @@ suite =
                         in
                         -- display order apple, banana, cherry -> document rows 2, 1, 3
                         List.map (displayYToDocY "" sheet rows) [ 1, 2, 3 ]
-                            |> Expect.equal [ 2, 1, 3 ]
-                , test "search hides rows but preserves original document indices" <|
+                            |> Expect.equal [ Just 2, Just 1, Just 3 ]
+                , test "search hides rows but preserves original document indices, and a row past the drawn ones maps to nothing" <|
                     \_ ->
                         let
                             rows =
@@ -183,10 +207,10 @@ suite =
                         in
                         -- only avocado (document row 3) contains "av"
                         ( filterAndSortIndexed "av" emptySheet rows |> Array.map Tuple.first |> Array.toList
-                        , displayYToDocY "av" emptySheet rows 1
+                        , List.map (displayYToDocY "av" emptySheet rows) [ 1, 2, 3 ]
                         )
-                            |> Expect.equal ( [ 2 ], 3 )
-                , test "header rows (y <= 0) are never remapped" <|
+                            |> Expect.equal ( [ 2 ], [ Just 3, Nothing, Nothing ] )
+                , test "header rows (y <= 0) map to no document row" <|
                     \_ ->
                         let
                             rows =
@@ -196,7 +220,7 @@ suite =
                                 { emptySheet | sort = [ ( "0", Descending ) ] }
                         in
                         List.map (displayYToDocY "" sheet rows) [ 0, -1, -2 ]
-                            |> Expect.equal [ 0, -1, -2 ]
+                            |> Expect.equal [ Nothing, Nothing, Nothing ]
                 ]
             , describe "multi-column sort"
                 [ test "a second key breaks ties left by the first" <|
@@ -291,7 +315,7 @@ suite =
                     \_ ->
                         let
                             ( forward, backward ) =
-                                rowSplices (\_ -> Just Dict.empty) 0 [ 3, 4 ] identity
+                                rowSplices (\_ -> Just Dict.empty) 0 [ 3, 4 ] Just
                         in
                         ( List.map (.value >> E.encode 0) forward
                         , List.map (.value >> E.encode 0) backward
@@ -307,7 +331,7 @@ suite =
                                 Just (Dict.fromList [ ( "0", E.int i ) ])
 
                             ( forward, backward ) =
-                                rowSplices source 1 [ 3, 4 ] identity
+                                rowSplices source 1 [ 3, 4 ] Just
                         in
                         ( List.map (.value >> E.encode 0) forward
                         , List.map (.value >> E.encode 0) backward
@@ -318,13 +342,13 @@ suite =
                                 )
                 , test "duplicate indices collapse to one splice" <|
                     \_ ->
-                        rowSplices (\_ -> Just Dict.empty) 0 [ 2, 2, 2 ] identity
+                        rowSplices (\_ -> Just Dict.empty) 0 [ 2, 2, 2 ] Just
                             |> Tuple.first
                             |> List.length
                             |> Expect.equal 1
                 , test "a source with no row emits nothing" <|
                     \_ ->
-                        rowSplices (\_ -> Nothing) 1 [ 1, 2 ] identity
+                        rowSplices (\_ -> Nothing) 1 [ 1, 2 ] Just
                             |> Expect.equal ( [], [] )
                 ]
             , describe "rectToIndices"
@@ -496,15 +520,15 @@ suite =
             [ test "net-http decodes url and interval; headers, method, body and the paging fields default to one plain GET" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False, cron = "", timezone = "" }))
             , test "net-http decodes a headers string" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"headers":"X-Key: abc"}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "X-Key: abc", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False }))
-            , test "net-http decodes the method and body it posts with" <|
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "X-Key: abc", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False, cron = "", timezone = "" }))
+            , test "net-http decodes the method and body it posts with, and the schedule it runs on" <|
                 \_ ->
-                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"method":"POST","body":"{}"}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "POST", body = "{}", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False }))
+                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"method":"POST","body":"{}","cron":"0 9 * * 1-5","timezone":"America/Chicago"}]}"""
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "POST", body = "{}", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False, cron = "0 9 * * 1-5", timezone = "America/Chicago" }))
             , test "net-http refuses a method the poller would not send" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"method":"PATCH"}]}"""
@@ -523,7 +547,7 @@ suite =
             , test "net-http decodes the paging fields the poller reads a whole feed with" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"page_by":"cursor","page_param":"after","page_path":"meta.next"}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "cursor", pageParam = "after", pagePath = "meta.next", mode = "", key = "", rowsPath = "", paused = False }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "cursor", pageParam = "after", pagePath = "meta.next", mode = "", key = "", rowsPath = "", paused = False, cron = "", timezone = "" }))
             , test "net-http refuses a paging mode the poller does not know" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"page_by":"scroll"}]}"""
@@ -532,7 +556,7 @@ suite =
             , test "net-http decodes what a good run does to the runs before it" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"mode":"upsert","key":"id","rows_path":"data"}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "upsert", key = "id", rowsPath = "data", paused = False }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "upsert", key = "id", rowsPath = "data", paused = False, cron = "", timezone = "" }))
             , test "net-http refuses a storage mode the poller does not know" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"mode":"merge"}]}"""
@@ -546,11 +570,11 @@ suite =
             , test "alert without a when fires on rows, the way it did before there was one" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60}]}"""
-                        |> Expect.equal (Ok (Alert { code = "", to = "", interval = 60, digest = False, when = OnRows, paused = False, snoozedUntil = "" }))
-            , test "alert decodes its when" <|
+                        |> Expect.equal (Ok (Alert { code = "", to = "", interval = 60, digest = False, when = OnRows, paused = False, snoozedUntil = "", cron = "", timezone = "" }))
+            , test "alert decodes its when and its schedule" <|
                 \_ ->
-                    D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60,"when":"added"}]}"""
-                        |> Expect.equal (Ok (Alert { code = "", to = "", interval = 60, digest = False, when = OnAdded, paused = False, snoozedUntil = "" }))
+                    D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60,"when":"added","cron":"0 9 * * 1-5","timezone":"America/Chicago"}]}"""
+                        |> Expect.equal (Ok (Alert { code = "", to = "", interval = 60, digest = False, when = OnAdded, paused = False, snoozedUntil = "", cron = "0 9 * * 1-5", timezone = "America/Chicago" }))
             , test "alert with an unknown when is refused rather than shown as rows" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60,"when":"bogus"}]}"""
@@ -664,6 +688,23 @@ suite =
                     nameClash (namedCols [ "", "b" ]) 1 ""
                         |> Expect.equal (Just "")
             ]
+        , test "dependents: a sheet reading the column by name, every column or unknown columns is at risk, and a longer name is not" <|
+            \_ ->
+                dependents "table:a"
+                    [ "amount" ]
+                    [ { name = "by name", dependsOn = "table:a", columns = "amount, code" }
+                    , { name = "star", dependsOn = "table:a", columns = "*" }
+                    , { name = "unknown", dependsOn = "table:a", columns = "?" }
+                    , { name = "longer", dependsOn = "table:a", columns = "amount_usd, code" }
+                    , { name = "inside", dependsOn = "table:a", columns = "code, net amount" }
+                    , { name = "none", dependsOn = "table:a", columns = "" }
+                    , { name = "other sheet", dependsOn = "table:b", columns = "amount" }
+                    ]
+                    |> Expect.equal
+                        [ ( "by name", "reads \"amount\"" )
+                        , ( "star", "selects every column" )
+                        , ( "unknown", "reads columns nobody could list" )
+                        ]
         , describe "chartPoints"
             [ test "reads the x label and the y number, in the order given" <|
                 \_ ->

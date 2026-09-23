@@ -76,6 +76,8 @@ import * as XLSX from "xlsx";
 // condition: the default one pulls node:fs.
 import { parquetReadObjects } from "hyparquet";
 import { parquetWriteBuffer } from "hyparquet-writer";
+// croner: MIT, no dependencies, its own types, IANA zones through Intl; cron-parser pulls in luxon.
+import { Cron } from "croner";
 
 // --- refusals
 //
@@ -450,6 +452,8 @@ export type NetHttp = {
   key?: string;
   rows_path?: string;
   paused?: boolean;
+  cron?: string;
+  timezone?: string;
 };
 // An alert is a query plus somewhere to send it. The condition is the query's
 // own where clause: it fires when the query returns a row, which is the only
@@ -466,6 +470,8 @@ export type Alert = {
   when?: When;
   paused?: boolean;
   snoozed_until?: string;
+  cron?: string;
+  timezone?: string;
 };
 // A chart is a sheet: where the numbers come from, which columns to draw, and
 // -- when the rows hold more than one thing -- the column that names which
@@ -2234,12 +2240,18 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
   // how POLL_OK and RUN_OF came to live in one place. Still one round trip,
   // healthy or not.
   const [live] = await sql`
+    -- Each feed against the longer of POLL_STALE_S and twice the interval its
+    -- newest poll recorded. greatest() skips a null, so a row written before
+    -- polls recorded one is graded against POLL_STALE_S alone.
     with feeds as (
-      select s.sheet_id,
-             ${POLL_STALE_S}::numeric
-               / greatest(1, extract(epoch from (now() - max(n.created_at)))) as fresh
-      from sheet s inner join net n using (sheet_id)
-      where s.type = 'net-http' and (${RUN_OF()}) group by s.sheet_id
+      select sheet_id,
+             greatest(${POLL_STALE_S}, 2 * interval_s)::numeric
+               / greatest(1, extract(epoch from (now() - last))) as fresh
+      from (select s.sheet_id, max(n.created_at) as last,
+                   (array_agg(case when n.meta->>'interval' ~ '^[0-9]{1,9}$' then (n.meta->>'interval')::bigint end
+                              order by n.created_at desc))[1] as interval_s
+            from sheet s inner join net n using (sheet_id)
+            where s.type = 'net-http' and (${RUN_OF()}) group by s.sheet_id) polls
     ),
     -- Each alert against its own interval, taken off its newest run rather
     -- than an automerge document. Twice, not once: one missed tick is a slow
@@ -2362,7 +2374,9 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
     now("Every failure is reaching the error log.", 1 / (1 + logWriteFailures)),
     byAgo("Every net-http poll in the past hour returned 2xx in the shape the feed had before.", (r) => r.polls_ok),
     await liveness(
-      `Every net-http sheet that has ever polled and is not paused did so in the past ${POLL_STALE_S / 3600} hours.`,
+      `Every net-http sheet that has ever polled and is not paused did so within twice its own interval, or within ${
+        POLL_STALE_S / 3600
+      } hours if that is longer.`,
       live.polls_floor,
       live.polls_behind,
     ),
@@ -3508,6 +3522,102 @@ const ALERT_CYCLE_MS = 3_000;
 // account rather than just this one -- so both pollers clamp here the same
 // way they already clamp the near end at 60.
 const INTERVAL_MAX_S = 86_400 * 3650;
+
+// When a net-http or alert sheet is due next, and the gap to it in seconds,
+// which both pollers record as `meta.interval`. Whole and at most
+// INTERVAL_MAX_S, because GET /status reads it through a nine-digit guard. A
+// `cron` wins over `interval`, which stays in the document because the page's
+// net-http decoder requires it. croner only computes the time: the poller
+// stays the one timer. Its `timezone` defaults to the host's zone, so an
+// absent one is passed as UTC. `mode: "5-part"` refuses a seconds field. The
+// page's inputs write "" when a field is cleared, so "" is absent.
+const nextDue = (
+  sheet_id: string,
+  config: { interval?: unknown; cron?: unknown; timezone?: unknown },
+  now: number,
+): { due: number; interval: number } => {
+  const cron = config.cron ?? "";
+  const timezone = config.timezone ?? "";
+  if (typeof cron !== "string") {
+    throw new Error(explain(`The cron on ${sheet_id} is not text.`, {
+      Received: show(config.cron),
+      Expected: "a five-field cron pattern such as 0 9 * * 1-5, or no cron at all",
+      Source: "data[0].cron on the sheet's document",
+      Fix: "write the pattern as text in the cron field, or clear it",
+    }));
+  }
+  if (typeof timezone !== "string") {
+    throw new Error(explain(`The timezone on ${sheet_id} is not text.`, {
+      Received: show(config.timezone),
+      Expected: "an IANA zone name such as America/Chicago, or no timezone at all for UTC",
+      Source: "data[0].timezone on the sheet's document",
+      Fix: "write the zone's name in the timezone field, or clear it",
+    }));
+  }
+  if (cron === "") {
+    if (timezone !== "") {
+      throw new Error(explain(`The timezone on ${sheet_id} has no cron to apply to.`, {
+        Received: `timezone ${show(timezone)} and no cron`,
+        Expected: "a cron beside the timezone, or neither",
+        Source: "data[0].timezone and data[0].cron on the sheet's document",
+        Fix: "write a cron pattern such as 0 9 * * 1-5, or clear the timezone",
+      }));
+    }
+    if (config.interval !== undefined && config.interval !== null && !(Number(config.interval) > 0)) {
+      throw new Error(explain(`The interval on ${sheet_id} is not a number of seconds.`, {
+        Received: show(config.interval),
+        Expected: "a positive number of seconds, or no interval at all for the default 3600",
+        Source: "data[0].interval on the sheet's document",
+        Fix: "put seconds in the interval cell, or clear it",
+      }));
+    }
+    const interval = Math.max(60, Math.min(INTERVAL_MAX_S, Math.round(Number(config.interval) || 3600)));
+    return { due: now + interval * 1000, interval };
+  }
+  let schedule: Cron;
+  try {
+    schedule = new Cron(cron, { timezone: timezone || "UTC", mode: "5-part" });
+  } catch (err) {
+    throw new Error(explain(`The cron on ${sheet_id} is not a pattern croner can read.`, {
+      // croner's message quotes the whole pattern back, sometimes twice.
+      Received: `${show(cron)}, refused with: ${reason(err).slice(0, 200)}`,
+      Expected: "five fields: minute, hour, day of month, month, day of week, such as 0 9 * * 1-5",
+      Source: "data[0].cron on the sheet's document",
+      Fix: "fix the pattern, or clear it to poll every interval",
+    }));
+  }
+  let next: Date | null;
+  // croner reads the zone only here, so a bad zone throws here and not above.
+  try {
+    next = schedule.nextRun(new Date(now));
+  } catch (err) {
+    throw new Error(explain(`The timezone on ${sheet_id} is not a zone croner knows.`, {
+      // croner's message quotes the whole zone back.
+      Received: `${show(timezone)}, refused with: ${reason(err).slice(0, 200)}`,
+      Expected: "an IANA zone name such as America/Chicago, or no timezone at all for UTC",
+      Source: "data[0].timezone on the sheet's document",
+      Fix: "spell the zone the way the IANA database does",
+    }));
+  }
+  if (next === null) {
+    throw new Error(explain(`The cron on ${sheet_id} never fires again.`, {
+      Received: show(cron),
+      Expected: `a pattern with a run after ${new Date(now).toISOString()}`,
+      Source: "data[0].cron on the sheet's document",
+      Fix: "name a date that exists, such as a day of month every month holds",
+    }));
+  }
+  const interval = Math.ceil((next.getTime() - now) / 1000);
+  if (interval > INTERVAL_MAX_S) {
+    throw new Error(explain(`The cron on ${sheet_id} next fires further away than a schedule may reach.`, {
+      Received: `${show(cron)}, next at ${next.toISOString()}, ${interval} seconds away`,
+      Expected: `a next run at most ${INTERVAL_MAX_S} seconds away`,
+      Source: "data[0].cron on the sheet's document",
+      Fix: "choose a pattern that fires more often",
+    }));
+  }
+  return { due: next.getTime(), interval };
+};
 // A body arrives in chunks, and a host that trickles empty ones is a loop the
 // byte cap alone cannot end.
 const BODY_CHUNKS_MAX = 10_000;
@@ -5152,7 +5262,9 @@ export const pollNetSheet = async (
   // -- the single thing the cursor exists to prevent. The validators do not
   // travel with it: a 304 moves the row the validator came with, and a
   // failure row does not hold that body.
-  let carried: Record<string, string> = {};
+  // `interval` rides it too, for GET /status: a poll that throws before its
+  // schedule is read keeps the hour the due map just assumed.
+  const carried: { cursor?: string; interval: number } = { interval: 3600 };
   try {
     // The last row is where this feed's state lives: the validators the last
     // good body carried, the watermark it was fetched at, and how many
@@ -5178,7 +5290,7 @@ export const pollNetSheet = async (
       select net_id, meta from net where sheet_id = ${sheet_id} order by net_id desc limit 1
     `;
     const was = prev?.meta ?? {};
-    if (was.cursor) carried = { cursor: String(was.cursor) };
+    if (was.cursor) carried.cursor = String(was.cursor);
     const config = (await automerge.find<{ data: [NetHttp] }>(doc_id as AnyDocumentId)).doc()?.data?.[0];
     if (!config) throw new Error("The document has no config in data[0].");
     // Obeyed before anything else the document says: nothing is fetched and
@@ -5190,7 +5302,9 @@ export const pollNetSheet = async (
       else netDue.set(sheet_id, wasDue);
       return;
     }
-    netDue.set(sheet_id, now + Math.max(60, Math.min(INTERVAL_MAX_S, Number(config.interval) || 3600)) * 1000);
+    const next = nextDue(sheet_id, config, now);
+    netDue.set(sheet_id, next.due);
+    carried.interval = next.interval;
     if (!config.url) return;
     url = config.url;
     headers = parseNetHeaders(config.headers);
@@ -5384,7 +5498,15 @@ export const pollNetSheet = async (
         update net
         set created_at = now(),
             meta = ${
-        sql.json({ ...prev.meta, ...kept, status: 200, not_modified: true, ms: Date.now() - started, bytes: 0 })
+        sql.json({
+          ...prev.meta,
+          ...kept,
+          interval: carried.interval,
+          status: 200,
+          not_modified: true,
+          ms: Date.now() - started,
+          bytes: 0,
+        })
       }
         where net_id = ${prev.net_id}
       `;
@@ -5524,7 +5646,9 @@ export const pollNetSheet = async (
       // What the run read off the wire, every page of it, which is what the
       // cap refused a byte past and what a slow feed is measured by.
       bytes,
-      ...(res.ok ? { ...kept, sig, shape, ...(change ? { shape_change: change } : {}) } : carried),
+      ...(res.ok
+        ? { ...kept, interval: carried.interval, sig, shape, ...(change ? { shape_change: change } : {}) }
+        : carried),
     }, storing);
   } catch (err) {
     const message = reason(err);
@@ -5879,21 +6003,9 @@ export const pollAlertSheet = async (
       else alertDue.set(sheet_id, wasDue);
       return;
     }
-    // The status check reads this number back out of the run and reports it as
-    // the alert's own interval, so a value nobody can parse has to be a crash
-    // rather than a silent hour. Rounded, because the guard the check reads it
-    // through is anchored on digits: a fractional interval would drop out and
-    // be graded against the default instead.
-    if (config.interval !== undefined && config.interval !== null && !(Number(config.interval) > 0)) {
-      throw new Error(explain(`The interval on ${sheet_id} is not a number of seconds.`, {
-        Received: show(config.interval),
-        Expected: "a positive number of seconds, or no interval at all for the default 3600",
-        Source: "data[0].interval on the alert document",
-        Fix: "put seconds in the interval cell, or clear it",
-      }));
-    }
-    interval = Math.max(60, Math.min(INTERVAL_MAX_S, Math.round(Number(config.interval) || 3600)));
-    alertDue.set(sheet_id, now + interval * 1000);
+    const next = nextDue(sheet_id, config, now);
+    interval = next.interval;
+    alertDue.set(sheet_id, next.due);
     const when: When = config.when ?? "rows";
     if (!(ALERT_WHEN as readonly string[]).includes(when)) {
       throw new Error(explain(`The when on ${sheet_id} is not a condition an alert knows.`, {

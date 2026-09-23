@@ -27,6 +27,7 @@ import {
   profileRows,
   scanRefs,
   selectTypes,
+  show,
   timed,
   toRecords,
 } from "./sql.mjs";
@@ -484,4 +485,24 @@ export const rememberedTypes = (imports, cols) => {
     type: remembered[col.name] ?? col.type,
     remembered: col.name in remembered,
   }));
+};
+
+/** Where a Tab lands among a modal's `count` focusable elements when focus is
+ * on the one at `index`, or on none of them at -1. Answers -1 when there is
+ * nowhere to land. */
+export const trapStep = (count, index, back) => {
+  if (
+    !Number.isInteger(count) || !Number.isInteger(index) || typeof back !== "boolean" || count < 0 || index < -1 ||
+    index >= count
+  ) {
+    throw new Error(explain(`I cannot step focus through a modal from here.`, {
+      Expected: "a whole count of focusable elements, an index from -1 to one below it, and a boolean direction",
+      Received: `count ${show(count)}, index ${show(index)}, back ${show(back)}`,
+      Source: "the Tab trap in src/index.html",
+      Fix: "pass the modal's focusable list length and the active element's indexOf in it",
+    }));
+  }
+  if (count === 0) return -1;
+  if (index === -1) return back ? count - 1 : 0;
+  return (index + (back ? count - 1 : 1)) % count;
 };

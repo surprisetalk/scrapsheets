@@ -508,7 +508,22 @@ Deno.test({
       type: "table",
       data: [[{ name: "a", type: "text", key: "0" }], { "0": "before" }],
     } as { data: [Record<string, unknown>[], Record<string, string>] };
-    const page = await glue("http://localhost/table:edited1", { docs: { edited1: doc } });
+    const lineage = {
+      data: [
+        [{ name: "depends_on", type: "text", key: "depends_on" }],
+        { sheet_id: "query:q1", name: "totals", type: "query", depends_on: "table:edited1", columns: "a" },
+        { sheet_id: "query:q2", name: "elsewhere", type: "query", depends_on: "table:other", columns: "a" },
+      ],
+    };
+    const page = await glue("http://localhost/table:edited1", {
+      docs: { edited1: doc },
+      stored: { user: { usr_id: "u1", jwt: "a-token" } },
+      respond: (url) => url.endsWith("/library/lineage") ? lineage : { data: [] },
+    });
+    const heard: unknown[] = [];
+    const port = page.app.ports.lineageLoaded as unknown as { send: (v: unknown) => void };
+    const send = port.send;
+    port.send = (value) => (heard.push(value), send(value));
 
     const cell = [...page.all("tbody tr")[3].querySelectorAll("td")][0];
     for (const type of ["mouseenter", "click", "dblclick"]) await page.fire(cell, type);
@@ -518,6 +533,48 @@ Deno.test({
     assert(
       page.text().includes("after"),
       `and the document's answer is what renders, got: ${page.text().slice(0, 200)}`,
+    );
+
+    // A header rename asks the server who reads this sheet, logged in, and the
+    // answer reaches Elm whole and named by the sheet it is about.
+    const header = page.all("td").find((td) => td.querySelector("span.sort"));
+    assert(header, "the header cell holds the sort span");
+    for (const type of ["mouseenter", "click", "dblclick"]) await page.fire(header, type);
+    await page.type_(page.all("#new-cell")[0], "renamed");
+    await until(page.settle, "the lineage answer to reach Elm", () => heard.length > 0);
+    assert(page.asked.some((r) => r.url.endsWith("/library/lineage")), "the rename reads the lineage");
+    assertEquals(heard, [{ id: "table:edited1", rows: lineage.data.slice(1) }]);
+    assertEquals(doc.data[0][0].name, "a", "the name waits on the answer");
+    assert(page.text().includes("totals"), `the warning names the dependent, got: ${page.text().slice(0, 300)}`);
+
+    // The warning traps Tab the same way every modal does.
+    const { ownerDocument: pdoc } = page.all("body")[0] as unknown as {
+      ownerDocument: {
+        activeElement: El | null;
+        querySelector: (sel: string) => El | null;
+        defaultView: { KeyboardEvent: new (type: string, init: Record<string, unknown>) => unknown };
+      };
+    };
+    const tab = (shiftKey = false) =>
+      pdoc.activeElement?.dispatchEvent(
+        new pdoc.defaultView.KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true }),
+      );
+    const [pfirst, ...prest] = [
+      ...pdoc.querySelector('[aria-modal="true"]')!.querySelectorAll("a[href], button, input, select, textarea"),
+    ];
+    assertEquals(pdoc.activeElement, pfirst, "the warning took focus onto its first control");
+    tab(true);
+    assertEquals(pdoc.activeElement, prest.at(-1), "Shift+Tab off the first control wraps to the last");
+    tab();
+    assertEquals(pdoc.activeElement, pfirst, "and Tab off the last wraps to the first");
+
+    await page.click(page.all("div[role='dialog'] button").find((b) => b.textContent === "Rename"));
+    assertEquals(doc.data[0][0].name, "renamed", "Rename writes the held name");
+    assertEquals(pdoc.querySelector('[aria-modal="true"]'), null, "Rename closes the warning");
+    assertEquals(
+      pdoc.activeElement,
+      pdoc.querySelector("table[role='grid']"),
+      "and focus returns to the grid the header sits in, not the document body",
     );
     page.close();
   },
@@ -576,6 +633,74 @@ Deno.test({
       [],
       "and nothing was asked of the server",
     );
+
+    // The keyboard stays inside the dialog while it is up, and goes back where
+    // it came from when it closes. jsdom moves no focus on a Tab of its own, so
+    // wherever focus lands is the glue's doing, and it lands synchronously.
+    type Focusable = El & { focus: () => void; contains: (el: unknown) => boolean };
+    type Event = new (type: string, init: Record<string, unknown>) => unknown;
+    const { ownerDocument: doc } = page.all("body")[0] as unknown as {
+      ownerDocument: {
+        activeElement: El | null;
+        querySelector: (sel: string) => Focusable | null;
+        defaultView: { KeyboardEvent: Event; MouseEvent: Event };
+      };
+    };
+    const dialog = () => doc.querySelector('[aria-modal="true"]');
+    const tab = (shiftKey = false) =>
+      doc.activeElement?.dispatchEvent(
+        new doc.defaultView.KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true }),
+      );
+    const opener = () => page.all('a[href="#settings"]')[0] as Focusable;
+    const close = () => page.click(page.all('button[aria-label="close the sheet settings"]')[0]);
+    const focused = (el: unknown, what: string) =>
+      assert(
+        doc.activeElement === el,
+        `${what}, got focus on ${(doc.activeElement as unknown as { outerHTML?: string })?.outerHTML?.slice(0, 120)}`,
+      );
+    const selected = () =>
+      page.all("td").flatMap((td, at) => td.getAttribute("aria-selected") === "true" ? [at] : []).join();
+    const cell = page.all("td").find((td) => td.textContent === "Norway");
+    assert(cell, "the countries sheet draws Norway");
+    // A cell selected behind the dialog gives a Tab that leaks something to move.
+    for (const type of ["mouseenter", "mousedown", "mouseup"])
+      cell.dispatchEvent(new doc.defaultView.MouseEvent(type, { bubbles: type !== "mouseenter" }));
+
+    const [first, ...rest] = [...dialog()!.querySelectorAll("a[href], button, input, select, textarea")];
+    focused(first, "the dialog that opened took focus onto its first control");
+    tab(true);
+    focused(rest.at(-1), "Shift+Tab off the first control wraps to the last");
+    tab();
+    focused(first, "and Tab off the last wraps to the first");
+    tab();
+    focused(rest[0], "Tab steps forward inside the dialog");
+    await page.settle();
+    assertEquals(
+      selected(),
+      String(page.all("td").indexOf(cell)),
+      "the grid behind the dialog never heard a Tab: the clicked cell is still the one selected",
+    );
+
+    await close();
+    assertEquals(dialog(), null, "the × closes the dialog");
+    opener().focus();
+    await page.click(opener());
+    assert(dialog()?.contains(doc.activeElement), "the link opened the dialog, and focus went inside it");
+    await close();
+    focused(opener(), "closing it hands focus back to the link that opened it");
+
+    // A hidden input ahead of the first real control once left focus on <body>:
+    // a browser never focuses one, and from <body> Tab stepped back onto it.
+    (doc as unknown as { body: { insertAdjacentHTML: (at: string, html: string) => void } }).body.insertAdjacentHTML(
+      "beforeend",
+      '<div role="dialog" aria-modal="true" id="hidden-first"><input type="hidden"><button>ok</button></div>',
+    );
+    await until(
+      page.settle,
+      "the glue to take up the new dialog",
+      () => doc.querySelector("#hidden-first")?.getAttribute("tabindex") === "-1",
+    );
+    focused(doc.querySelector("#hidden-first button"), "the button after a hidden input takes focus");
     page.close();
   },
 });

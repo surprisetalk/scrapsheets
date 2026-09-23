@@ -3183,6 +3183,20 @@ const QUERIES = {
       "select f.field, f.hybrid, f.seed_per_acre, f.fert_per_acre, f.yield_bu, round(ols_predict(m.coefs, f.seed_per_acre, f.fert_per_acre), 1) as fitted_bu, round(f.yield_bu - ols_predict(m.coefs, f.seed_per_acre, f.fert_per_acre), 1) as residual_bu from @table:fields f, (select ols(array(yield_bu), array(seed_per_acre), array(fert_per_acre)) as coefs from @table:fields) m order by residual_bu desc",
     ),
   },
+  // Three regions nobody drew. The clustering is the subquery -- one kmeans()
+  // over every airport's coordinates -- and its centroids ride back onto each
+  // row the way the regression's coefficients do above. A degree of longitude
+  // is not a degree of latitude and the map wraps at 180, so this is no
+  // distance a pilot would fly; at three groups the continents still fall out.
+  "query:airport-regions": {
+    name: "airports in three regions",
+    tags: ["demo", "reference", "query"],
+    system: true,
+    doc: QuerySql(
+      { lat: "num", lon: "num", region: "int" },
+      "select a.iata, a.name, a.country, a.lat, a.lon, kmeans_assign(m.centroids, a.lat, a.lon) as region from @table:airports a, (select kmeans(3, array(lat), array(lon)) as centroids from @table:airports) m order by region, a.country, a.iata",
+    ),
+  },
   // A conflict check. Every name on the other side of one matter, scored against
   // every client on another: the firm cannot act against somebody it acts for,
   // and the intake form spells them differently every time.
@@ -3975,6 +3989,19 @@ const QUERIES = {
     doc: QuerySql(
       { month: "date", visits: "num", trend: "num", seasonal: "num", fitted: "num", residual: "num" },
       "select month, visits, round(trend, 0) as trend, round(seasonal, 0) as seasonal, round(trend + seasonal, 0) as fitted, round(visits - trend - seasonal, 0) as residual from @query:visit-decomposition where trend is not null order by month",
+    ),
+  },
+  // The band an alert watches: a month whose residual is more than two standard
+  // deviations from zero. A window cannot sit inside arithmetic or a where
+  // clause, so the deviation is an aggregate crossed in from a subquery.
+  // Subscribing to this sheet is the alert.
+  "query:visit-band": {
+    name: "park visits outside their usual band",
+    tags: ["demo", "government", "query"],
+    system: true,
+    doc: QuerySql(
+      { month: "date", visits: "num", fitted: "num", residual: "num", sd: "num" },
+      "select v.month, v.visits, v.fitted, v.residual, round(s.sd, 0) as sd from @query:visit-fit v, (select stdev(residual) as sd from @query:visit-fit) s where abs(v.residual) > 2 * s.sd order by v.month",
     ),
   },
   "query:asof-price": {

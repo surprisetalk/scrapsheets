@@ -168,26 +168,69 @@ Deno.test("clicking a header sorts, and shift-clicking adds a second key", async
 // `int` into `num`, `percentage` into `pct` and `float` into a spelling the
 // decoder did not know. One field per patch is the fix, and this is the proof.
 Deno.test("renaming a column leaves its type exactly as the document spelled it", async () => {
-  const { dom, app, all, settle, type_ } = await boot("http://localhost/table:currencies");
+  const { dom, doc, app, all, settle, type_, text } = await boot("http://localhost/table:currencies");
   const patches: { action: string; path: unknown[]; value: unknown }[] = [];
   app.ports.changeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
+  const asked: string[] = [];
+  app.ports.lineageFor.subscribe((id: string) => asked.push(id));
+  const here = "table:currencies";
+  const dialogs = () => all("div[role='dialog']").map((el) => el.getAttribute("aria-label"));
+  const button = async (label: string) => {
+    const found = all("div[role='dialog'] button").find((b) => b.textContent === label);
+    assert(found, `expected a ${label} button in ${JSON.stringify(dialogs())}`);
+    found.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
+    await settle();
+  };
 
   // `minor` is table:currencies' int column -- the spelling that used to be
   // flattened. Its header cell is the td the sort span sits in.
-  const span = all("span.sort").find((s) => s.textContent?.startsWith("minor"));
-  assert(span, "expected a `minor` column in table:currencies");
-  const cell = (span as unknown as { closest: (s: string) => El | null }).closest("td");
-  assert(cell, "the header span should sit in a td");
-
-  for (const type of ["mouseenter", "click", "dblclick"]) {
-    cell.dispatchEvent(new dom.window.MouseEvent(type, { bubbles: true }));
+  const rename = async () => {
+    const span = all("span.sort").find((s) => s.textContent?.startsWith("minor"));
+    assert(span, "expected a `minor` column in table:currencies");
+    const cell = (span as unknown as { closest: (s: string) => El | null }).closest("td");
+    assert(cell, "the header span should sit in a td");
+    for (const type of ["mouseenter", "click", "dblclick"]) {
+      cell.dispatchEvent(new dom.window.MouseEvent(type, { bubbles: true }));
+      await settle();
+    }
+    const editor = all("#new-cell")[0];
+    assert(editor, "double-clicking a header should open its editor");
+    await type_(editor, "minor units");
+    editor.dispatchEvent(new dom.window.FocusEvent("blur", { bubbles: false }));
     await settle();
-  }
-  const editor = all("#new-cell")[0];
-  assert(editor, "double-clicking a header should open its editor");
-  await type_(editor, "minor units");
-  editor.dispatchEvent(new dom.window.FocusEvent("blur", { bubbles: false }));
+  };
+
+  // A dependent that reads `minor` by name: the rename waits, and the warning
+  // names the sheet and why. An answer about another sheet is not this one's.
+  await rename();
+  assertEquals(asked, [here], "a rename asks who reads this sheet");
+  assertEquals(patches, [], "and writes nothing until it hears back");
+  const edge = { sheet_id: "query:fx", type: "query", depends_on: here, depends_on_name: "currencies" };
+  app.ports.lineageLoaded.send({ id: "table:countries", rows: [{ ...edge, name: "elsewhere", columns: "minor" }] });
   await settle();
+  assertEquals(dialogs(), [], "an answer about another sheet opens nothing");
+  app.ports.lineageLoaded.send({
+    id: here,
+    rows: [{ ...edge, name: "fx totals", columns: "code, minor" }, { ...edge, name: "near miss", columns: "minor_x" }],
+  });
+  await settle();
+  assertEquals(dialogs(), ["sheets this change can break"]);
+  assert(text().includes("fx totals") && text().includes('reads "minor"'), `names the dependent, got ${text()}`);
+  assert(!text().includes("near miss"), "a column whose name only starts with this one is not at risk");
+  doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }));
+  await settle();
+  assertEquals(dialogs(), ["sheets this change can break"], "Ctrl+K opens nothing over the warning");
+  await button("Cancel");
+  assertEquals(dialogs(), [], "Cancel closes the warning");
+  assertEquals(patches, [], "and writes nothing");
+
+  // Anonymous, so nobody can say who reads it: the glue answers why, and the
+  // typist decides.
+  await rename();
+  app.ports.lineageLoaded.send({ id: here, error: "you are not logged in." });
+  await settle();
+  assert(text().includes("could not be read: you are not logged in."), `says why, got ${text()}`);
+  await button("Rename");
 
   assertEquals(patches.length, 1, `a rename is one patch, got ${JSON.stringify(patches)}`);
   assertEquals(patches[0].value, "minor units");
@@ -519,7 +562,7 @@ Deno.test("every modal, icon button and bare input says what it is", async () =>
 });
 
 Deno.test("a sheet opens arranged the way it was left", async () => {
-  const { app, all, text, settle } = await boot("http://localhost/table:countries");
+  const { dom, doc, app, all, text, fire, settle } = await boot("http://localhost/table:countries");
   app.ports.docSelected.send({
     id: "table:arranged",
     data: {
@@ -552,6 +595,86 @@ Deno.test("a sheet opens arranged the way it was left", async () => {
   // Ascending on the first column, over the rows the filter left.
   const first = all("tbody tr").map((tr) => tr.querySelector("td")?.textContent).filter((t) => t === "a" || t === "b");
   assertEquals(first, ["a", "b"], "the rows should arrive in the stored order");
+
+  // The filter draws two of three rows. A write reaches only a drawn row: the
+  // keyboard stops at the last one, and a selection the filter then hides is
+  // refused by name rather than written onto document row 3's hidden "c".
+  const patches: { action: string; path: unknown[]; value: unknown }[] = [];
+  app.ports.changeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
+  const key = async (k: string) => {
+    doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: k, bubbles: true }));
+    await settle();
+  };
+  const a = all("td").find((td) => td.textContent?.trim() === "a");
+  assert(a, "row a is drawn");
+  await fire(a, "mouseenter");
+  await fire(a, "mousedown");
+  await fire(a, "mouseup");
+  await key("ArrowDown");
+  await key("ArrowDown");
+  await key("ArrowDown");
+  assertEquals(
+    all("td.selected:not(.r0)").map((td) => td.textContent?.trim()),
+    ["b"],
+    "ArrowDown stops at the last drawn row",
+  );
+  await key("Delete");
+  assertEquals(
+    patches.map((p) => [p.action, p.path, p.value]),
+    [["set", [1, "0"], ""]],
+    "Delete clears the drawn row b, which is document row 1, and never the hidden row 3",
+  );
+
+  // A collaborator's edit moves b out of the filter while it is selected.
+  patches.length = 0;
+  app.ports.docChanged.send({
+    id: "table:arranged",
+    data: {
+      doc: null,
+      handle: null,
+      patchInfo: null,
+      patches: [{ action: "put", path: ["data", 1, "2"], value: "no" }],
+    },
+  });
+  await settle();
+  assert(text().includes("Showing 1 of 3 rows"), `the filter now hides b, got: ${text().slice(0, 300)}`);
+  await key("Delete");
+  assertEquals(patches, [], `a write onto a row the filter hides writes nothing, got ${JSON.stringify(patches)}`);
+  assert(text().includes("received one on row 2,"), `the refusal names the row, got: ${text().slice(0, 400)}`);
+
+  // A second collaborator edit hides "a" too: the filter now draws nothing.
+  // Arrow keys must not walk the selection onto the header row (y = 0) in
+  // that state, or a keystroke there would silently rename column "n".
+  patches.length = 0;
+  app.ports.docChanged.send({
+    id: "table:arranged",
+    data: {
+      doc: null,
+      handle: null,
+      patchInfo: null,
+      patches: [{ action: "put", path: ["data", 2, "2"], value: "no" }],
+    },
+  });
+  await settle();
+  assert(text().includes("Showing 0 of 3 rows"), `the filter now hides every row, got: ${text().slice(0, 300)}`);
+  const headerBefore = all("span.sort").find((s) => s.textContent?.startsWith("n"))?.textContent;
+  await key("ArrowDown");
+  await key("ArrowDown");
+  await key("Z");
+  assert(text().includes("received one on row 1,"), `the keystroke is refused by name, got: ${text().slice(0, 400)}`);
+  // A refused keystroke leaves no pending write for the next selected cell.
+  const header = all("td[role='columnheader']").find((td) => td.textContent?.trim().startsWith("n"));
+  assert(header, "column n's header is drawn");
+  await fire(header, "mouseenter");
+  await fire(header, "mousedown");
+  await fire(header, "mouseup");
+  assertEquals(all("#new-cell").length, 0, "no editor opens on the header with the refused keystroke in it");
+  assertEquals(patches, [], `typing with nothing drawn must write nothing, got ${JSON.stringify(patches)}`);
+  assertEquals(
+    all("span.sort").find((s) => s.textContent?.startsWith("n"))?.textContent,
+    headerBefore,
+    "an arrow key on an empty filter must never land the selection on the header, so a keystroke cannot rename the column",
+  );
 });
 
 // A query's rows are computed, so there are no stored columns to write an

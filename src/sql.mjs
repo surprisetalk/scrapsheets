@@ -1694,6 +1694,8 @@ const SELECT_TYPES = {
   logit: "json",
   ols_predict: "num",
   logit_predict: "num",
+  kmeans: "json",
+  kmeans_assign: "int",
   sample_uniform: "num",
   sample_normal: "num",
   sample_triangular: "num",
@@ -2634,11 +2636,19 @@ export const register = (alasql) => {
   // and leaves log and cos implementation-defined, so a normal draw is bit-equal
   // wherever one engine runs both hosts and may differ in the last ulp between a
   // browser and the server; uniform and triangular are exact everywhere.
+  //
+  // The hash reads the call one value at a time: kmeans() hands it every
+  // coordinate it clusters, and one string of all of them is a copy of the sheet.
   const seedOf = (name, args) => {
     // FNV-1a, 32 bits: Math.imul is the multiply that wraps the way the hash is
     // defined to, rather than the one that loses the low bits to a double.
     let h = 0x811c9dc5;
-    for (const ch of `${name}(${args.join(",")})`) h = Math.imul(h ^ ch.codePointAt(0), 0x01000193) >>> 0;
+    const feed = (text) => {
+      for (const ch of text) h = Math.imul(h ^ ch.codePointAt(0), 0x01000193) >>> 0;
+    };
+    feed(`${name}(`);
+    for (const [i, a] of args.entries()) feed(i ? `,${a}` : `${a}`);
+    feed(")");
     return h;
   };
   // mulberry32: one multiply-xor round per draw, every step on a uint32.
@@ -2974,6 +2984,215 @@ export const register = (alasql) => {
   // exp() of a large negative number is 0 and of a large positive one is
   // Infinity, so both ends answer a probability rather than a NaN.
   fn.logit_predict = (coefs, ...ats) => 1 / (1 + Math.exp(-linear("logit_predict", coefs, ats)));
+
+  // Segmentation: kmeans(k, array(x1), array(x2), ...) answers k centroids and
+  // kmeans_assign(centroids, x1, x2, ...) reads back each row's 1-based cluster,
+  // the way ols() and ols_predict() split a fit from its reading.
+  //
+  // Distance is raw Euclidean, so a column in dollars outweighs one in years:
+  // scale the inputs first. Scaling here would make kmeans_assign carry the
+  // scale beside the centroids.
+  //
+  // Start points are k-means++, drawn from mulberry32 the way the samplers draw,
+  // and every step after is +, -, *, / and comparisons, which ECMAScript pins to
+  // IEEE 754: both hosts answer bit for bit.
+  const KMEANS_STEPS = 100;
+  // Past this a segmentation is a list nobody reads as segments, and every pass
+  // costs points times k.
+  const KMEANS_K_MAX = 20;
+  // design() validates a response beside its predictors and scales them, which
+  // a clustering has no use for. These bound the same cost it bounds: one pass
+  // walks points times k times dimensions.
+  const KMEANS_POINTS = 5000;
+  const KMEANS_DIMS = 12;
+  const closest = (point, centroids) => {
+    let best = 0, far = Infinity;
+    for (let j = 0; j < centroids.length; j++) {
+      let d = 0;
+      for (let c = 0; c < point.length; c++) d += (point[c] - centroids[j][c]) ** 2;
+      // Strict: a tie goes to the lower index.
+      if (d < far) [best, far] = [j, d];
+    }
+    return [best, far];
+  };
+  fn.kmeans = (k_, ...xss) => {
+    const k = num("kmeans", 1, k_);
+    if (!Number.isInteger(k) || k < 2 || k > KMEANS_K_MAX) {
+      throw fail(
+        "kmeans() argument 1",
+        `a whole number of clusters from 2 to ${KMEANS_K_MAX}`,
+        show(k_),
+        "ask for the number of segments you mean to read, e.g. kmeans(3, array(x), array(y))",
+      );
+    }
+    if (!xss.length)
+      throw fail("kmeans()", "at least one column to cluster on", "only k", "add one, e.g. kmeans(3, array(x))");
+    if (xss.length > KMEANS_DIMS) {
+      throw fail(
+        "kmeans()",
+        `at most ${KMEANS_DIMS} columns to cluster on`,
+        `${xss.length}`,
+        "cluster on the columns that tell the segments apart and drop the rest",
+      );
+    }
+    const cols = xss.map((xs, j) => nums("kmeans", j + 2, xs));
+    const n = cols[0].length;
+    for (const [j, x] of cols.entries()) {
+      if (x.length !== n) {
+        throw fail(
+          "kmeans()",
+          "every array the same length",
+          `${n} values in argument 2 and ${x.length} in argument ${j + 2}`,
+          "aggregate every column over the same rows",
+        );
+      }
+    }
+    if (n > KMEANS_POINTS) {
+      throw fail(
+        "kmeans()",
+        `at most ${KMEANS_POINTS} points`,
+        `${n}`,
+        "cluster a sample, or aggregate the rows to one point per customer first",
+      );
+    }
+    const points = Array.from({ length: n }, (_, i) => cols.map((x) => x[i]));
+    const distinct = new Set(points.map((p) => p.join(","))).size;
+    if (distinct < k) {
+      throw fail(
+        "kmeans()",
+        `at least ${k} distinct points for ${k} clusters`,
+        `${distinct} distinct points`,
+        "ask for fewer clusters, or widen the query so more rows match",
+      );
+    }
+    // Every centroid is a mean of points, so it stays inside their box, and no
+    // distance inside the box is past its diagonal. A finite diagonal is every
+    // distance finite, and a mean summed as offsets from the low corner cannot
+    // overflow either.
+    const lo = cols.map((x) => x.reduce((a, b) => (b < a ? b : a))),
+      hi = cols.map((x) => x.reduce((a, b) => (b > a ? b : a)));
+    let diagonal = 0;
+    for (let c = 0; c < cols.length; c++) diagonal += (hi[c] - lo[c]) ** 2;
+    if (!Number.isFinite(diagonal)) {
+      throw fail(
+        "kmeans()",
+        "points whose squared distances fit in a finite number",
+        `a squared spread of ${show(diagonal)} across the columns`,
+        "scale the inputs down first, e.g. divide by the column's largest value",
+      );
+    }
+    const draw = mulberry32(seedOf("kmeans", [k, ...cols.flat()]));
+    // k-means++: each start point is drawn in proportion to its squared distance
+    // from the nearest one already drawn. A drawn point has weight zero, so no
+    // start point repeats while the weights sum to a finite number above zero.
+    // A sum that overflows or underflows can draw a repeat, and the empty
+    // cluster it leaves takes a new point below.
+    const centroids = [[...points[Math.floor(draw() * n)]]];
+    const weight = points.map((p) => closest(p, centroids)[1]);
+    while (centroids.length < k) {
+      let total = 0;
+      for (const w of weight) total += w;
+      const target = draw() * total;
+      let at = 0;
+      for (let sum = weight[0]; sum <= target && at < n - 1;) sum += weight[++at];
+      centroids.push([...points[at]]);
+      for (let i = 0; i < n; i++) {
+        const d = closest(points[i], [centroids[centroids.length - 1]])[1];
+        if (d < weight[i]) weight[i] = d;
+      }
+    }
+    const assigned = new Array(n).fill(-1), own = new Array(n);
+    for (let steps = 1;; steps++) {
+      let moved = 0;
+      const counts = new Array(k).fill(0);
+      for (let i = 0; i < n; i++) {
+        const [j, d] = closest(points[i], centroids);
+        if (assigned[i] !== j) moved++;
+        assigned[i] = j;
+        own[i] = d;
+        counts[j]++;
+      }
+      const empty = counts.filter((c) => !c).length;
+      if (!moved && !empty) break;
+      if (steps >= KMEANS_STEPS) {
+        throw new Error(explain(`kmeans() did not settle on ${k} clusters.`, {
+          Limit: `${KMEANS_STEPS} assignment passes`,
+          Received: `${steps} passes, the last moving ${moved} points and leaving ${empty} clusters empty`,
+          Source: "the points handed to kmeans()",
+          Fix: "ask for fewer clusters, or scale the columns so no one of them decides every distance",
+        }));
+      }
+      const sums = Array.from({ length: k }, () => new Array(cols.length).fill(0));
+      for (let i = 0; i < n; i++) for (let c = 0; c < cols.length; c++) sums[assigned[i]][c] += points[i][c] - lo[c];
+      for (let j = 0; j < k; j++) if (counts[j]) centroids[j] = sums[j].map((s, c) => lo[c] + s / counts[j]);
+      // An empty cluster takes the point farthest from its own centroid, lowest
+      // index on a tie. With k distinct points some point sits off every
+      // centroid, and a point taken is at distance zero, so the next empty
+      // cluster takes another.
+      for (let j = 0; j < k; j++) {
+        if (counts[j]) continue;
+        let at = 0;
+        for (let i = 1; i < n; i++) if (own[i] > own[at]) at = i;
+        centroids[j] = [...points[at]];
+        own[at] = 0;
+      }
+    }
+    // Sorted by their coordinates, so a cluster's number does not hang on which
+    // start point happened to be drawn first.
+    return centroids.sort((a, b) => {
+      for (let c = 0; c < a.length; c++) if (a[c] !== b[c]) return a[c] - b[c];
+      return 0;
+    });
+  };
+  fn.kmeans_assign = (centroids, ...xs) => {
+    if (!xs.length) {
+      throw fail(
+        "kmeans_assign()",
+        "one point value per clustered column after the centroids",
+        "only the centroids",
+        "add them, e.g. kmeans_assign(m.centroids, x, y)",
+      );
+    }
+    const shape = `a non-empty array of at most ${KMEANS_K_MAX} centroids, each an array of ${xs.length} numbers`;
+    // kmeans() never answers more than KMEANS_K_MAX centroids, so a longer array
+    // is a column passed by mistake, and every row would walk all of it.
+    if (
+      !Array.isArray(centroids) || !centroids.length || centroids.length > KMEANS_K_MAX ||
+      !centroids.every(Array.isArray)
+    ) {
+      throw fail(
+        "kmeans_assign() argument 1",
+        shape,
+        show(centroids),
+        "cluster in a subquery and read its column here, e.g. kmeans_assign(m.centroids, x, y)",
+      );
+    }
+    const at = centroids.map((c) => nums("kmeans_assign", 1, c));
+    for (const [j, c] of at.entries()) {
+      if (c.length !== xs.length) {
+        throw fail(
+          "kmeans_assign()",
+          shape,
+          `centroid ${j + 1} of ${c.length} numbers beside ${xs.length} point values`,
+          "hand it one value per column, in the order kmeans() clustered them",
+        );
+      }
+    }
+    const point = xs.map((x, c) => num("kmeans_assign", c + 2, x));
+    const [j, d] = closest(point, at);
+    // kmeans() checks its own box, but a row read back can sit far outside it.
+    // Two squared distances that both overflow tie at Infinity, and the tie
+    // would name centroid 1 whichever is nearer.
+    if (!Number.isFinite(d)) {
+      throw fail(
+        "kmeans_assign()",
+        "a point whose squared distance to some centroid fits in a finite number",
+        `${show(point)}, whose squared distance to every centroid overflows`,
+        "scale the point the way the clustered columns were scaled",
+      );
+    }
+    return j + 1;
+  };
 
   // Median absolute deviation, and the outlier score built on it. 1.4826 scales
   // a MAD to the standard deviation of a normal sample, so robust_z reads on the

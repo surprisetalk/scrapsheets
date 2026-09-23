@@ -40,6 +40,7 @@ port module Main exposing
     , computeBoolishStats
     , computeTemporalStats
     , cycleSort
+    , dependents
     , detectFormat
     , displayYToDocY
     , docDecoder
@@ -90,6 +91,7 @@ port module Main exposing
     , sparkValues
     , tableHome
     , typeName
+    , unviewable
     , usd
     , viewDecoder
     , viewPatches
@@ -158,8 +160,10 @@ rect ax ay bx by =
 
 clampIndex : TableBounds -> Index -> Index
 clampIndex bounds idx =
+    -- Elm's `clamp lo hi` answers `hi` when `lo > hi`. With no drawn rows
+    -- `maxY` is 0, and row 0 is the header, which a keystroke renames.
     { x = clamp 0 bounds.maxX idx.x
-    , y = clamp 1 bounds.maxY idx.y
+    , y = clamp 1 (max 1 bounds.maxY) idx.y
     }
 
 
@@ -275,7 +279,7 @@ expandSelection bounds dx dy sel =
 
 selectAll : TableBounds -> Rect
 selectAll bounds =
-    Rect (xy 0 1) (xy bounds.maxX bounds.maxY)
+    Rect (xy 0 1) (clampIndex bounds (xy bounds.maxX bounds.maxY))
 
 
 rectToIndices : Rect -> List Index
@@ -891,6 +895,24 @@ port preflight : Idd { url : String, headers : String, method : String, body : S
 port preflightLoaded : (Idd D.Value -> msg) -> Sub msg
 
 
+{-| The open sheet's versions, newest first, as automerge records them. The
+answer comes back on `historyLoaded`, named by sheet.
+-}
+port historyLoad : String -> Cmd msg
+
+
+port historyLoaded : (Idd D.Value -> msg) -> Sub msg
+
+
+{-| One version's rows, read off the document as it stood at that change. The
+answer comes back on `historyShown`, named by sheet and by version.
+-}
+port historyView : { id : String, hash : String } -> Cmd msg
+
+
+port historyShown : (Idd D.Value -> msg) -> Sub msg
+
+
 {-| The sheet's own poll, now rather than on its timer: the row it writes comes
 back on `runLoaded`, named by sheet the way a pre-flight is.
 -}
@@ -966,6 +988,16 @@ visitor is sent nothing at all, which is why the library's column is absent
 rather than a row of blanks that would read as "nothing is wrong".
 -}
 port freshnessLoaded : (D.Value -> msg) -> Sub msg
+
+
+{-| Which sheets read this one, asked for when a rename or a delete would break
+them. The answer is `library:lineage` whole, or why it could not be read, and it
+names the sheet it was asked about the way a pre-flight does.
+-}
+port lineageFor : String -> Cmd msg
+
+
+port lineageLoaded : (D.Value -> msg) -> Sub msg
 
 
 {-| Sharing runs through JS because the JWT lives there, same as changeDoc.
@@ -1059,6 +1091,7 @@ type alias Model =
     , sheet : Sheet
     , auth : Auth
     , deleteConfirm : Maybe String
+    , pending : Maybe Pending
 
     -- Whether the library is showing what was thrown away instead of what was kept.
     , trash : Bool
@@ -1069,6 +1102,10 @@ type alias Model =
     , share : Share
     , showShortcuts : Bool
     , palette : Maybe Palette
+
+    -- A past version of the open sheet. Its own field and never `sheet`: every
+    -- view of a `Sheet` is wired to writes, and this one is read and nothing else.
+    , history : Maybe History
     , freshness : Dict Id Freshness
     , tutorial : Maybe Int
     , embed : Bool
@@ -1090,11 +1127,52 @@ type alias Freshness =
     { lastRun : Maybe String, failures : Int, nextRun : Maybe String }
 
 
+{-| A rename or a delete held back until `library:lineage` says who reads the
+columns it touches. `write` is the header editor's text, which closes on hold.
+-}
+type alias Pending =
+    { id : Id
+    , edit : DocMsg
+    , write : Maybe String
+    , columns : List String
+    , stage : Stage
+    }
+
+
+{-| `Warning` carries each dependent's name and why it is at risk, or why
+nobody could say. `Confirmed` lives for one `updateDocMsg` call: the replay
+that writes the held edit.
+-}
+type Stage
+    = Asking
+    | Warning (Result String (List ( String, String )))
+    | Confirmed
+
+
 {-| The command palette: what has been typed, and which match is selected.
 Nothing is closed.
 -}
 type alias Palette =
     { query : String, selected : Int }
+
+
+{-| The versions of one sheet, and the one of them on screen. `left` is how many
+older versions the answer left out. A `Nothing` is an answer still in flight.
+-}
+type alias History =
+    { id : Id
+    , versions : Maybe (Result String (List Version))
+    , left : Int
+    , hash : Maybe String
+    , past : Maybe (Result String { columns : List String, rows : List (List String) })
+    }
+
+
+{-| One change, in automerge's own words. `time` is epoch seconds, and 0 when
+the writer stamped none.
+-}
+type alias Version =
+    { hash : String, time : Int, actor : String, seq : Int, message : Maybe String }
 
 
 type alias Auth =
@@ -1963,8 +2041,8 @@ type Doc
     | Tab Table
     | Query Query_
     | NetHook
-    | NetHttp { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String, mode : String, key : String, rowsPath : String, paused : Bool }
-    | Alert { code : String, to : String, interval : Int, digest : Bool, when : When, paused : Bool, snoozedUntil : String }
+    | NetHttp { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String, mode : String, key : String, rowsPath : String, paused : Bool, cron : String, timezone : String }
+    | Alert { code : String, to : String, interval : Int, digest : Bool, when : When, paused : Bool, snoozedUntil : String, cron : String, timezone : String }
     | Chart Chart_
     | Dashboard (List String)
     | NetSocket { url : String }
@@ -2479,10 +2557,10 @@ docDecoder =
                                     (D.field "url" D.string)
 
                     "net-http" ->
-                        -- Eleven fields, and D.map8 is the ceiling: the request is
-                        -- decoded beside what is done with its answer, and the two
-                        -- halves are joined rather than one of them going through
-                        -- `andThen` for the sake of three more names.
+                        -- More fields than D.map8 takes: the request and its
+                        -- schedule are decoded beside what is done with the answer,
+                        -- and the two halves are joined rather than one of them
+                        -- going through `andThen` for the sake of more names.
                         D.field "data" <|
                             D.index 0 <|
                                 D.map2
@@ -2500,17 +2578,21 @@ docDecoder =
                                             , key = keep.key
                                             , rowsPath = keep.rowsPath
                                             , paused = keep.paused
+                                            , cron = req.cron
+                                            , timezone = req.timezone
                                             }
                                     )
-                                    (D.map5
-                                        (\url interval headers method body ->
-                                            { url = url, interval = interval, headers = headers, method = method, body = body }
+                                    (D.map7
+                                        (\url interval headers method body cron timezone ->
+                                            { url = url, interval = interval, headers = headers, method = method, body = body, cron = cron, timezone = timezone }
                                         )
                                         (D.field "url" D.string)
                                         (D.field "interval" D.int)
                                         (D.oneOf [ D.field "headers" D.string, D.succeed "" ])
                                         (optionalField "method" (D.string |> D.andThen methodDecoder) "GET")
                                         (optionalField "body" D.string "")
+                                        (optionalField "cron" D.string "")
+                                        (optionalField "timezone" D.string "")
                                     )
                                     (D.map7
                                         (\by param path mode key rowsPath paused ->
@@ -2528,24 +2610,42 @@ docDecoder =
                     "alert" ->
                         D.field "data" <|
                             D.index 0 <|
-                                D.map7 (\code to interval digest when paused snoozedUntil -> Alert { code = code, to = to, interval = interval, digest = digest, when = when, paused = paused, snoozedUntil = snoozedUntil })
-                                    (D.oneOf [ D.field "code" D.string, D.succeed "" ])
-                                    (D.oneOf [ D.field "to" D.string, D.succeed "" ])
-                                    (D.oneOf [ D.field "interval" D.int, D.succeed 3600 ])
-                                    (D.oneOf [ D.field "digest" D.bool, D.succeed False ])
-                                    -- Absent is rows, the way a document written before there was a
-                                    -- `when` means it. Present and unknown, or present and not a
-                                    -- string, is refused by name rather than shown as rows: a select
-                                    -- saying "rows" over a document that says otherwise is a lie the
-                                    -- server would not tell.
-                                    (optionalField "when" (D.string |> D.andThen whenDecoder) OnRows)
-                                    (optionalField "paused" D.bool False)
-                                    -- A plain string the decoder does not
-                                    -- check, the way `page_param` is: the
-                                    -- poller's own refusal is the check, and a
-                                    -- sheet the server has refused must still
-                                    -- draw so its owner can fix the cell.
-                                    (optionalField "snoozed_until" D.string "")
+                                -- Split the way the net-http branch is: D.map8 is the ceiling.
+                                D.map3
+                                    (\cfg cron timezone ->
+                                        Alert
+                                            { code = cfg.code
+                                            , to = cfg.to
+                                            , interval = cfg.interval
+                                            , digest = cfg.digest
+                                            , when = cfg.when
+                                            , paused = cfg.paused
+                                            , snoozedUntil = cfg.snoozedUntil
+                                            , cron = cron
+                                            , timezone = timezone
+                                            }
+                                    )
+                                    (D.map7 (\code to interval digest when paused snoozedUntil -> { code = code, to = to, interval = interval, digest = digest, when = when, paused = paused, snoozedUntil = snoozedUntil })
+                                        (D.oneOf [ D.field "code" D.string, D.succeed "" ])
+                                        (D.oneOf [ D.field "to" D.string, D.succeed "" ])
+                                        (D.oneOf [ D.field "interval" D.int, D.succeed 3600 ])
+                                        (D.oneOf [ D.field "digest" D.bool, D.succeed False ])
+                                        -- Absent is rows, the way a document written before there was a
+                                        -- `when` means it. Present and unknown, or present and not a
+                                        -- string, is refused by name rather than shown as rows: a select
+                                        -- saying "rows" over a document that says otherwise is a lie the
+                                        -- server would not tell.
+                                        (optionalField "when" (D.string |> D.andThen whenDecoder) OnRows)
+                                        (optionalField "paused" D.bool False)
+                                        -- A plain string the decoder does not
+                                        -- check, the way `page_param` is: the
+                                        -- poller's own refusal is the check, and a
+                                        -- sheet the server has refused must still
+                                        -- draw so its owner can fix the cell.
+                                        (optionalField "snoozed_until" D.string "")
+                                    )
+                                    (optionalField "cron" D.string "")
+                                    (optionalField "timezone" D.string "")
 
                     "chart" ->
                         D.field "data" (D.index 0 chartDecoder)
@@ -2781,6 +2881,7 @@ init flags url nav =
                     , password = ""
                     }
                 , deleteConfirm = Nothing
+                , pending = Nothing
                 , trash = False
                 , importing = Nothing
                 , showSettings = False
@@ -2788,6 +2889,7 @@ init flags url nav =
                 , share = emptyShare
                 , showShortcuts = False
                 , palette = Nothing
+                , history = Nothing
                 , freshness = Dict.empty
                 , tutorial = iif (tutorialStep < 0) Nothing (Just (clamp 0 4 tutorialStep))
                 , now = 0
@@ -2823,15 +2925,17 @@ route url model =
     }
 
 
-{-| Settings, the shortcut sheet and the palette each mount an `aria-modal`
-panel, and a screen reader reads only one of them. Settings lives in the URL's
-`#settings`, so it closes through `SettingsClose` or a reload opens it again.
+{-| Settings, the shortcut sheet, the palette, the history and a held rename or
+delete each mount an `aria-modal` panel, and a screen reader reads only one of
+them. Settings lives in the URL's `#settings`, so it closes through
+`SettingsClose` or a reload opens it again. A held edit closes the way Cancel
+closes it: unwritten.
 -}
 closeModals : Model -> ( Model, Cmd Msg )
 closeModals model =
     let
         closed =
-            { model | palette = Nothing, showShortcuts = False }
+            { model | palette = Nothing, showShortcuts = False, pending = Nothing, history = Nothing }
     in
     iif model.showSettings (update SettingsClose closed) ( closed, Cmd.none )
 
@@ -2877,6 +2981,7 @@ type Msg
     | AlertSnoozeAt Time.Posix
     | RunNow
     | RunLoad (Idd D.Value)
+    | HistoryMsg HistoryMsg
     | ShareEmailChange String
     | ShareRoleChange String
     | ShareDaysChange String
@@ -2889,6 +2994,9 @@ type Msg
     | ShareHook
     | ShortcutsToggle Bool
     | FreshnessLoad D.Value
+    | LineageLoad D.Value
+    | PendingConfirm
+    | PendingCancel
     | Goto Id
     | PaletteToggle Bool
     | PaletteNav Int
@@ -2959,6 +3067,14 @@ type alias KeyEvent =
     }
 
 
+type HistoryMsg
+    = HistoryOpen
+    | HistoryLoad (Idd D.Value)
+    | HistoryPick String
+    | HistoryShow (Idd D.Value)
+    | HistoryClose
+
+
 type AuthMsg
     = AuthSubmit
     | AuthLogout
@@ -3008,6 +3124,8 @@ type Input
     | NetKey
     | NetRowsPath
     | NetPaused
+    | NetCron
+    | NetTimezone
     | AlertCode
     | AlertTo
     | AlertDigest
@@ -3045,9 +3163,12 @@ subs model =
         , columnsLoaded ColumnsLoad
         , shareLoaded ShareLoad
         , preflightLoaded PreflightLoad
+        , historyLoaded (HistoryMsg << HistoryLoad)
+        , historyShown (HistoryMsg << HistoryShow)
         , runLoaded RunLoad
         , importPreviewed ImportPreviewed
         , freshnessLoaded FreshnessLoad
+        , lineageLoaded LineageLoad
         , case model.sheet.resizing of
             Just _ ->
                 Sub.batch
@@ -3202,7 +3323,7 @@ tableBounds : Model -> TableBounds
 tableBounds model =
     case resolveTable model of
         Ok tbl ->
-            { maxX = Array.length tbl.cols - 1, maxY = Array.length tbl.rows }
+            { maxX = Array.length tbl.cols - 1, maxY = Array.length (filterAndSort model.search model.sheet tbl.rows) }
 
         Err _ ->
             { maxX = 0, maxY = 0 }
@@ -3250,6 +3371,8 @@ update msg ({ sheet, auth } as model) =
             ( { next
                 | palette = iif next.showSettings Nothing next.palette
                 , showShortcuts = next.showShortcuts && not next.showSettings
+                , pending = iif (next.showSettings || next.id /= model.id) Nothing next.pending
+                , history = iif (next.showSettings || next.id /= model.id) Nothing next.history
                 , share =
                     -- Whatever the panel holds belongs to the sheet it was
                     -- loaded for, so a navigation empties it. A secret goes
@@ -3652,6 +3775,9 @@ update msg ({ sheet, auth } as model) =
                 , Cmd.none
                 )
 
+        HistoryMsg historyMsg ->
+            updateHistory historyMsg model
+
         ShareEmailChange email ->
             ( { model | share = (\s -> { s | email = email }) model.share }, Cmd.none )
 
@@ -3732,9 +3858,10 @@ update msg ({ sheet, auth } as model) =
             ( { model | showSettings = False }, Nav.replaceUrl model.nav ("/" ++ model.id) )
 
         ShortcutsToggle show ->
-            -- Neither this nor the palette opens over the import preview or the
-            -- delete confirm: closing the preview throws away the file it read.
-            if show && (model.importing /= Nothing || model.deleteConfirm /= Nothing) then
+            -- Neither this nor the palette opens over the import preview, the
+            -- delete confirm or a held edit: closing the preview throws away
+            -- the file it read, and closing a held edit throws away the edit.
+            if show && (model.importing /= Nothing || model.deleteConfirm /= Nothing || model.pending /= Nothing) then
                 ( model, Cmd.none )
 
             else
@@ -3755,6 +3882,59 @@ update msg ({ sheet, auth } as model) =
                 Err err ->
                     ( { model | error = "The feed health answer arrived in a shape I could not read: " ++ D.errorToString err }, Cmd.none )
 
+        LineageLoad value ->
+            case ( model.pending, D.decodeValue (D.field "id" D.string) value ) of
+                ( Just held, Ok id ) ->
+                    -- loadLineage answers every ask, so an answer can arrive
+                    -- after the edit it was for was cancelled and another held.
+                    if id /= held.id || held.stage /= Asking then
+                        ( model, Cmd.none )
+
+                    else
+                        let
+                            found =
+                                case D.decodeValue (D.field "error" D.string) value of
+                                    Ok reason ->
+                                        Err reason
+
+                                    Err _ ->
+                                        D.decodeValue (D.field "rows" lineageDecoder) value
+                                            |> Result.mapError (\err -> "The answer arrived in a shape I could not read: " ++ D.errorToString err)
+                                            |> Result.map (dependents held.id held.columns)
+                        in
+                        if found == Ok [] then
+                            confirmPending held model
+
+                        else
+                            let
+                                ( closed, leave ) =
+                                    closeModals model
+                            in
+                            ( { closed | pending = Just { held | stage = Warning found } }, leave )
+
+                ( Nothing, Ok _ ) ->
+                    -- The answer to an edit already cancelled.
+                    ( model, Cmd.none )
+
+                ( _, Err err ) ->
+                    ( { model
+                        | pending = Nothing
+                        , error = "Expected the dependents answer to name the sheet it is about, received one I could not read: " ++ D.errorToString err ++ " Nothing was written. Source: loadLineage in src/index.html. Fix: make the change again."
+                      }
+                    , Cmd.none
+                    )
+
+        PendingConfirm ->
+            case model.pending of
+                Just held ->
+                    confirmPending held model
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        PendingCancel ->
+            ( { model | pending = Nothing }, Cmd.none )
+
         Goto id ->
             ( model, Nav.pushUrl model.nav ("/" ++ id) )
 
@@ -3763,7 +3943,7 @@ update msg ({ sheet, auth } as model) =
             -- on the first row, so Enter on a palette nobody had pointed at ran
             -- whatever the shortcut sheet happened to list first -- two
             -- keystrokes, and the first row is a verb that deletes rows.
-            if open && (model.importing /= Nothing || model.deleteConfirm /= Nothing) then
+            if open && (model.importing /= Nothing || model.deleteConfirm /= Nothing || model.pending /= Nothing) then
                 ( model, Cmd.none )
 
             else
@@ -3995,6 +4175,22 @@ update msg ({ sheet, auth } as model) =
             , changeDoc
                 { id = sheet.id
                 , data = [ { action = "set", path = [ E.int 0, E.string "paused" ], value = E.bool (x /= "") } ]
+                }
+            )
+
+        InputChange NetCron x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "cron" ], value = E.string x } ]
+                }
+            )
+
+        InputChange NetTimezone x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "timezone" ], value = E.string x } ]
                 }
             )
 
@@ -4609,7 +4805,7 @@ update msg ({ sheet, auth } as model) =
                     cs.select.a
 
                 newSel =
-                    xy (clamp 0 bounds.maxX (sel.x + dx)) (clamp 1 bounds.maxY (sel.y + dy))
+                    clampIndex bounds { x = sel.x + dx, y = sel.y + dy }
             in
             ( { committed | sheet = { cs | select = Rect newSel newSel } }, cmd )
 
@@ -4785,7 +4981,8 @@ update msg ({ sheet, auth } as model) =
                                                     Array.get x tbl.cols
                                                         |> Maybe.andThen
                                                             (\col ->
-                                                                Array.get (displayYToDocY model.search sheet tbl.rows y - 1) tbl.rows
+                                                                displayYToDocY model.search sheet tbl.rows y
+                                                                    |> Maybe.andThen (\docY -> Array.get (docY - 1) tbl.rows)
                                                                     |> Maybe.andThen (Dict.get col.key)
                                                                     |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
                                                             )
@@ -4802,7 +4999,12 @@ update msg ({ sheet, auth } as model) =
                     ( model, Cmd.none )
 
         ClipboardPaste text ->
-            updatePaste text model
+            -- Refused under a past version, for the reason `updateKeyDown` gives.
+            if model.history == Nothing then
+                updatePaste text model
+
+            else
+                ( model, Cmd.none )
 
         SelectAll ->
             ( { model | sheet = { sheet | select = selectAll (tableBounds model) } }, Cmd.none )
@@ -4810,6 +5012,27 @@ update msg ({ sheet, auth } as model) =
 
 
 ---- VIEW ---------------------------------------------------------------------
+
+
+{-| The held edit, replayed through `updateDocMsg` against the document as it
+is now, so every refusal it would have met it meets again.
+-}
+confirmPending : Pending -> Model -> ( Model, Cmd Msg )
+confirmPending held ({ sheet } as model) =
+    if held.id /= sheet.id then
+        ( { model
+            | pending = Nothing
+            , error = "Expected the rename or delete to land on " ++ held.id ++ ", received it with " ++ sheet.id ++ " open. Nothing was written. Source: the sheet changed while its dependents were read. Fix: open " ++ held.id ++ " and make the change again."
+          }
+        , Cmd.none
+        )
+
+    else
+        let
+            ( written, cmd ) =
+                updateDocMsg held.edit { model | pending = Just { held | stage = Confirmed }, sheet = { sheet | write = held.write } }
+        in
+        ( { written | pending = Nothing }, cmd )
 
 
 updateDocMsg : DocMsg -> Model -> ( Model, Cmd Msg )
@@ -4847,9 +5070,132 @@ updateDocMsg edit ({ sheet } as model) =
         Ok (Tab table) ->
             let
                 -- Map a display row coordinate to its document row coordinate (accounts for sort/filter/search)
-                toDoc : Int -> Int
+                toDoc : Int -> Maybe Int
                 toDoc y =
                     displayYToDocY model.search sheet table.rows y
+
+                -- The display rows this edit names that no drawn row stands
+                -- behind. Any one refuses the whole edit, so the patches below
+                -- skip them only on a path that is never sent.
+                undrawn =
+                    (case edit of
+                        SheetWrite { y } ->
+                            iif (y >= 1 && sheet.write /= Nothing) [ y ] []
+
+                        SheetRowInsert indices ->
+                            indices
+
+                        SheetRowDuplicate indices ->
+                            indices
+
+                        SheetRowDelete indices ->
+                            indices
+
+                        SheetFillDown r ->
+                            List.range (max 1 (normalizeRect r).a.y) (normalizeRect r).b.y
+
+                        SheetClearCells indices ->
+                            List.map .y indices
+
+                        CellCheck i _ ->
+                            [ i.y ]
+
+                        SheetRowPush ->
+                            []
+
+                        SheetColumnPush ->
+                            []
+
+                        SheetColumnDelete _ ->
+                            []
+
+                        SheetColumnMove _ _ ->
+                            []
+
+                        SheetRowMove _ _ ->
+                            []
+
+                        SheetColumnTrim _ ->
+                            []
+
+                        SheetColumnCase _ _ ->
+                            []
+
+                        SheetRowsDropBlank _ ->
+                            []
+
+                        SheetRowsDedupe ->
+                            []
+
+                        SheetRowsDedupeNear _ _ ->
+                            []
+
+                        SheetColumnSplit _ _ ->
+                            []
+                    )
+                        |> List.filter (\y -> toDoc y == Nothing)
+
+                -- The names this edit takes away from a sheet that reads them.
+                atRisk =
+                    case edit of
+                        SheetWrite { x, y } ->
+                            case ( y, Array.get x table.cols, sheet.write ) of
+                                ( 0, Just col, Just write ) ->
+                                    iif (write == col.name) [] [ col.name ]
+
+                                _ ->
+                                    []
+
+                        SheetColumnDelete indices ->
+                            List.filterMap (\i -> Array.get i table.cols |> Maybe.map .name) indices
+
+                        SheetRowPush ->
+                            []
+
+                        SheetColumnPush ->
+                            []
+
+                        SheetRowInsert _ ->
+                            []
+
+                        SheetRowDuplicate _ ->
+                            []
+
+                        SheetRowDelete _ ->
+                            []
+
+                        SheetColumnMove _ _ ->
+                            []
+
+                        SheetRowMove _ _ ->
+                            []
+
+                        SheetClearCells _ ->
+                            []
+
+                        SheetFillDown _ ->
+                            []
+
+                        SheetColumnTrim _ ->
+                            []
+
+                        SheetColumnCase _ _ ->
+                            []
+
+                        SheetRowsDropBlank _ ->
+                            []
+
+                        SheetRowsDedupe ->
+                            []
+
+                        SheetRowsDedupeNear _ _ ->
+                            []
+
+                        SheetColumnSplit _ _ ->
+                            []
+
+                        CellCheck _ _ ->
+                            []
 
                 -- Helper to get old cell value as E.Value (rowIdx is a document coordinate)
                 getOldValue : Int -> String -> E.Value
@@ -4951,25 +5297,22 @@ updateDocMsg edit ({ sheet } as model) =
                                             ( [], [] )
 
                                         Just write ->
-                                            let
-                                                docY =
-                                                    toDoc rowY
+                                            case toDoc rowY of
+                                                Just docY ->
+                                                    ( [ { action = "set"
+                                                        , path = [ E.int docY, E.string col.key ]
+                                                        , value = E.string write
+                                                        }
+                                                      ]
+                                                    , [ { action = "set"
+                                                        , path = [ E.int docY, E.string col.key ]
+                                                        , value = getOldValue docY col.key
+                                                        }
+                                                      ]
+                                                    )
 
-                                                forward =
-                                                    [ { action = "set"
-                                                      , path = [ E.int docY, E.string col.key ]
-                                                      , value = E.string write
-                                                      }
-                                                    ]
-
-                                                backward =
-                                                    [ { action = "set"
-                                                      , path = [ E.int docY, E.string col.key ]
-                                                      , value = getOldValue docY col.key
-                                                      }
-                                                    ]
-                                            in
-                                            ( forward, backward )
+                                                Nothing ->
+                                                    ( [], [] )
 
                                 _ ->
                                     ( [], [] )
@@ -5023,7 +5366,7 @@ updateDocMsg edit ({ sheet } as model) =
                             rowSplices (\i -> Array.get (i - 1) table.rows) 1 indices toDoc
 
                         SheetRowDelete indices ->
-                            rowDeletions table.rows (List.map toDoc indices)
+                            rowDeletions table.rows (List.filterMap toDoc indices)
 
                         SheetColumnTrim key ->
                             withColumn key (\col -> cellRewrites col String.trim table.rows)
@@ -5154,7 +5497,7 @@ updateDocMsg edit ({ sheet } as model) =
                                     max 1 norm.a.y
 
                                 rows =
-                                    List.range top norm.b.y
+                                    List.range top norm.b.y |> List.filterMap toDoc
 
                                 patchPairs =
                                     List.range norm.a.x norm.b.x
@@ -5177,8 +5520,8 @@ updateDocMsg edit ({ sheet } as model) =
                                                             texts =
                                                                 rows
                                                                     |> List.map
-                                                                        (\y ->
-                                                                            Array.get (toDoc y - 1) table.rows
+                                                                        (\docY ->
+                                                                            Array.get (docY - 1) table.rows
                                                                                 |> Maybe.map (\row -> iif (blankCell col.key row) "" (cellText col.key row))
                                                                                 |> Maybe.withDefault ""
                                                                         )
@@ -5212,15 +5555,16 @@ updateDocMsg edit ({ sheet } as model) =
                                                                         fillSeries seeds (List.length rows - List.length seeds) |> List.map encode
 
                                                                     _ ->
-                                                                        List.repeat (List.length rows - 1) (getOldValue (toDoc top) col.key)
+                                                                        case rows of
+                                                                            first :: _ ->
+                                                                                List.repeat (List.length rows - 1) (getOldValue first col.key)
+
+                                                                            [] ->
+                                                                                []
                                                         in
                                                         List.map2 Tuple.pair (List.drop (List.length rows - List.length values) rows) values
                                                             |> List.map
-                                                                (\( y, value ) ->
-                                                                    let
-                                                                        docY =
-                                                                            toDoc y
-                                                                    in
+                                                                (\( docY, value ) ->
                                                                     ( { action = "set"
                                                                       , path = [ E.int docY, E.string col.key ]
                                                                       , value = value
@@ -5247,23 +5591,20 @@ updateDocMsg edit ({ sheet } as model) =
                                     indices
                                         |> List.filterMap
                                             (\idx ->
-                                                Array.get idx.x table.cols
-                                                    |> Maybe.map
-                                                        (\col ->
-                                                            let
-                                                                docY =
-                                                                    toDoc idx.y
-                                                            in
-                                                            ( { action = "set"
-                                                              , path = [ E.int docY, E.string col.key ]
-                                                              , value = E.string ""
-                                                              }
-                                                            , { action = "set"
-                                                              , path = [ E.int docY, E.string col.key ]
-                                                              , value = getOldValue docY col.key
-                                                              }
-                                                            )
+                                                Maybe.map2
+                                                    (\col docY ->
+                                                        ( { action = "set"
+                                                          , path = [ E.int docY, E.string col.key ]
+                                                          , value = E.string ""
+                                                          }
+                                                        , { action = "set"
+                                                          , path = [ E.int docY, E.string col.key ]
+                                                          , value = getOldValue docY col.key
+                                                          }
                                                         )
+                                                    )
+                                                    (Array.get idx.x table.cols)
+                                                    (toDoc idx.y)
                                             )
 
                                 forward =
@@ -5275,12 +5616,9 @@ updateDocMsg edit ({ sheet } as model) =
                             ( forward, backward )
 
                         CellCheck i c ->
-                            case Array.get i.x table.cols of
-                                Just col ->
+                            case ( Array.get i.x table.cols, toDoc i.y ) of
+                                ( Just col, Just docY ) ->
                                     let
-                                        docY =
-                                            toDoc i.y
-
                                         oldValue =
                                             getOldValue docY col.key
 
@@ -5300,7 +5638,7 @@ updateDocMsg edit ({ sheet } as model) =
                                     in
                                     ( forward, backward )
 
-                                Nothing ->
+                                _ ->
                                     ( [], [] )
 
                 -- Why this edit cannot be stored, if it cannot. The two header
@@ -5370,26 +5708,70 @@ updateDocMsg edit ({ sheet } as model) =
                     else
                         []
             in
-            case writeRefusal of
+            case iif (List.isEmpty undrawn) writeRefusal (Just (undrawnRows undrawn)) of
                 Just message ->
                     ( { model | sheet = { sheet | write = Nothing }, error = message }, Cmd.none )
 
                 Nothing ->
-                    if List.isEmpty forwardPatches then
-                        ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
+                    let
+                        refuse message =
+                            ( { model | sheet = { sheet | write = Nothing }, error = message }, Cmd.none )
 
-                    else
-                        advanceTutorial 1
-                            ( { model
-                                | sheet =
-                                    { sheet
-                                        | write = Nothing
-                                        , undoStack = newUndoStack
-                                        , redoStack = newRedoStack
-                                    }
-                              }
-                            , changeDoc { id = sheet.id, data = forwardPatches }
-                            )
+                        busy =
+                            "Expected one open question at a time, received a rename or a delete while another dialog is open or a check on who reads this sheet is still out. Nothing was written. Source: a keystroke behind an open dialog. Fix: answer or close that dialog, then make the change again."
+
+                        written =
+                            if List.isEmpty forwardPatches then
+                                ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
+
+                            else
+                                advanceTutorial 1
+                                    ( { model
+                                        | sheet =
+                                            { sheet
+                                                | write = Nothing
+                                                , undoStack = newUndoStack
+                                                , redoStack = newRedoStack
+                                            }
+                                      }
+                                    , changeDoc { id = sheet.id, data = forwardPatches }
+                                    )
+                    in
+                    case ( model.pending, atRisk ) of
+                        ( Just held, _ ) ->
+                            if held.stage == Confirmed then
+                                if held.columns == atRisk then
+                                    written
+
+                                else
+                                    refuse
+                                        ("Expected to change "
+                                            ++ String.join ", " (List.map quoted held.columns)
+                                            ++ ", received "
+                                            ++ iif (List.isEmpty atRisk) "no column" (String.join ", " (List.map quoted atRisk))
+                                            ++ " where those were. Nothing was written. Source: the columns changed while their dependents were read. Fix: make the change again."
+                                        )
+
+                            else if List.isEmpty atRisk then
+                                written
+
+                            else
+                                refuse busy
+
+                        ( Nothing, [] ) ->
+                            written
+
+                        ( Nothing, _ ) ->
+                            if model.importing /= Nothing || model.deleteConfirm /= Nothing || model.history /= Nothing then
+                                refuse busy
+
+                            else
+                                ( { model
+                                    | sheet = { sheet | write = Nothing }
+                                    , pending = Just { id = sheet.id, edit = edit, write = sheet.write, columns = atRisk, stage = Asking }
+                                  }
+                                , lineageFor sheet.id
+                                )
 
         Ok _ ->
             -- Every edit the keyboard offers, on a sheet nobody types into.
@@ -5399,10 +5781,131 @@ updateDocMsg edit ({ sheet } as model) =
             ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
 
 
+{-| No query reads these on either host: the page's engine takes only table and
+query refs, and the server refuses a template and a portal and reads a codex
+through its own route.
+-}
+unviewable : String -> String -> String
+unviewable typ id =
+    typ
+        ++ " sheets sync but have no view yet, and a query cannot read one. "
+        ++ (if String.startsWith "codex-" typ then
+                "GET /codex/" ++ id ++ " answers its tables."
+
+            else if typ == "portal" then
+                "Read it live over GET /portal/" ++ (String.split ":" id |> List.drop 1 |> String.join ":") ++ "/sync."
+
+            else
+                "Buy it from the shop, then open the copy you get back."
+           )
+
+
+updateHistory : HistoryMsg -> Model -> ( Model, Cmd Msg )
+updateHistory msg model =
+    case msg of
+        HistoryOpen ->
+            -- Not over the import preview, the delete confirm or a held edit,
+            -- for the reason `ShortcutsToggle` gives.
+            if model.importing /= Nothing || model.deleteConfirm /= Nothing || model.pending /= Nothing then
+                ( model, Cmd.none )
+
+            else
+                let
+                    ( closed, leave ) =
+                        closeModals model
+                in
+                ( { closed | history = Just { id = model.sheet.id, versions = Nothing, left = 0, hash = Nothing, past = Nothing } }
+                , Cmd.batch [ leave, historyLoad model.sheet.id ]
+                )
+
+        HistoryLoad data ->
+            -- An answer lands only on the history it was asked for, because the
+            -- sheet may have changed while it was in flight.
+            ( { model
+                | history =
+                    Maybe.map
+                        (\h ->
+                            if data.id /= h.id then
+                                h
+
+                            else
+                                let
+                                    version =
+                                        D.map5 Version
+                                            (D.field "hash" D.string)
+                                            (D.field "time" D.int)
+                                            (D.field "actor" D.string)
+                                            (D.field "seq" D.int)
+                                            (D.field "message" (D.nullable D.string))
+                                in
+                                case D.decodeValue (D.map2 Tuple.pair (D.field "versions" (D.list version)) (D.field "left" D.int)) data.data of
+                                    Ok ( versions, left ) ->
+                                        { h | versions = Just (Ok versions), left = left }
+
+                                    Err err ->
+                                        { h | versions = Just (Err ("The sheet's history arrived in a shape I could not read: " ++ D.errorToString err)) }
+                        )
+                        model.history
+              }
+            , Cmd.none
+            )
+
+        HistoryPick hash ->
+            case model.history of
+                Just h ->
+                    ( { model | history = Just { h | hash = Just hash, past = Nothing } }, historyView { id = h.id, hash = hash } )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        HistoryShow data ->
+            -- By sheet, for the reason `HistoryLoad` gives, and by version,
+            -- because another one may have been picked while it was in flight.
+            ( { model
+                | history =
+                    Maybe.map
+                        (\h ->
+                            if data.id /= h.id then
+                                h
+
+                            else
+                                let
+                                    -- A cell reads the way `cellText` reads one, so a
+                                    -- missing cell is the blank the live table draws for it.
+                                    past =
+                                        D.map3 (\hash columns rows -> ( hash, { columns = columns, rows = rows } ))
+                                            (D.field "hash" D.string)
+                                            (D.field "columns" (D.list D.string))
+                                            (D.field "rows" (D.list (D.list (D.map (D.decodeValue string >> Result.withDefault "") D.value))))
+                                in
+                                case D.decodeValue past data.data of
+                                    Ok ( hash, shown ) ->
+                                        iif (h.hash == Just hash) { h | past = Just (Ok shown) } h
+
+                                    Err err ->
+                                        { h | past = Just (Err ("A past version arrived in a shape I could not read: " ++ D.errorToString err)) }
+                        )
+                        model.history
+              }
+            , Cmd.none
+            )
+
+        HistoryClose ->
+            ( { model | history = Nothing }, Cmd.none )
+
+
 updateKeyDown : KeyEvent -> Model -> ( Model, Cmd Msg )
 updateKeyDown event ({ sheet } as model) =
-    -- Handle global shortcuts first (Ctrl+F, Ctrl+H, Escape for find/replace)
-    if (event.ctrl || event.meta) && event.key == "k" then
+    -- A past version is drawn over the live sheet, and every key below writes
+    -- to the live one. So under it Escape closes it and no other key does a thing.
+    if model.history /= Nothing then
+        if event.key == "Escape" then
+            updateHistory HistoryClose model
+
+        else
+            ( model, Cmd.none )
+
+    else if (event.ctrl || event.meta) && event.key == "k" then
         update (PaletteToggle (model.palette == Nothing)) model
 
     else if (event.ctrl || event.meta) && event.key == "/" then
@@ -5454,6 +5957,9 @@ updateKeyDown event ({ sheet } as model) =
     else if event.key == "Escape" && model.deleteConfirm /= Nothing then
         update DocDeleteCancel model
 
+    else if event.key == "Escape" && model.pending /= Nothing then
+        update PendingCancel model
+
     else if event.key == "Escape" && sheet.filterOpen /= Nothing then
         -- Escape closes the panel, which is one of the moments the filter it
         -- holds is stored. It does not clear the filter -- that is what the
@@ -5487,14 +5993,11 @@ updateKeyDown event ({ sheet } as model) =
             move : Int -> Int -> ( Model, Cmd Msg )
             move dx dy =
                 let
-                    newX =
-                        skipHidden sheet bounds dx (clamp 0 bounds.maxX (sel.x + dx))
-
-                    newY =
-                        clamp 1 bounds.maxY (sel.y + dy)
+                    clamped =
+                        clampIndex bounds { x = sel.x + dx, y = sel.y + dy }
 
                     newSel =
-                        xy newX newY
+                        xy (skipHidden sheet bounds dx clamped.x) clamped.y
                 in
                 ( { model | sheet = { sheet | select = Rect newSel newSel } }
                 , Cmd.none
@@ -5509,7 +6012,7 @@ updateKeyDown event ({ sheet } as model) =
                                 Array.get sel.x tbl.cols
 
                             row =
-                                Array.get (displayYToDocY model.search sheet tbl.rows sel.y - 1) tbl.rows
+                                displayYToDocY model.search sheet tbl.rows sel.y |> Maybe.andThen (\docY -> Array.get (docY - 1) tbl.rows)
                         in
                         case ( col, row ) of
                             ( Just c, Just r ) ->
@@ -5523,6 +6026,9 @@ updateKeyDown event ({ sheet } as model) =
                                 ( { model | sheet = { sheet | write = Just val } }
                                 , Task.attempt (always NoOp) (Dom.focus "new-cell")
                                 )
+
+                            ( Just _, Nothing ) ->
+                                iif (sel.y >= 1) ( { model | error = undrawnRows [ sel.y ] }, Cmd.none ) ( model, Cmd.none )
 
                             _ ->
                                 ( model, Cmd.none )
@@ -5652,7 +6158,7 @@ updateKeyDown event ({ sheet } as model) =
                     if event.ctrl || event.meta then
                         let
                             newSel =
-                                xy bounds.maxX bounds.maxY
+                                clampIndex bounds (xy bounds.maxX bounds.maxY)
                         in
                         ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
 
@@ -5671,8 +6177,11 @@ updateKeyDown event ({ sheet } as model) =
                         -- A printable character starts editing with it
                         case sheet.doc of
                             Ok (Tab tbl) ->
-                                case Array.get sel.x tbl.cols of
-                                    Just _ ->
+                                case ( Array.get sel.x tbl.cols, sel.y >= 1 && displayYToDocY model.search sheet tbl.rows sel.y == Nothing ) of
+                                    ( Just _, True ) ->
+                                        ( { model | error = undrawnRows [ sel.y ] }, Cmd.none )
+
+                                    ( Just _, False ) ->
                                         ( { model | sheet = { sheet | write = Just event.key } }
                                         , Task.attempt (always NoOp) (Dom.focus "new-cell")
                                         )
@@ -5733,14 +6242,15 @@ updatePaste text ({ sheet } as model) =
                 visibleCount =
                     Array.length (filterAndSortIndexed model.search sheet tbl.rows)
 
-                -- Map a display row to its document row; positions past the visible set become appended rows
+                -- `sel.y` is at least 1, so a row that maps to nothing is past the drawn rows, and the paste appends it.
                 docRowFor : Int -> Int
                 docRowFor dispY =
-                    if dispY <= visibleCount then
-                        displayYToDocY model.search sheet tbl.rows dispY
+                    case displayYToDocY model.search sheet tbl.rows dispY of
+                        Just docY ->
+                            docY
 
-                    else
-                        currentRowCount + (dispY - visibleCount)
+                        Nothing ->
+                            currentRowCount + (dispY - visibleCount)
 
                 -- How many new columns/rows needed?
                 neededCols =
@@ -6236,6 +6746,60 @@ viewDeleteConfirm maybeId =
                 ]
 
 
+viewPending : Maybe Pending -> Html Msg
+viewPending pending =
+    case pending of
+        Just { edit, write, columns, stage } ->
+            case stage of
+                Warning found ->
+                    let
+                        ( verb, change ) =
+                            case ( edit, write ) of
+                                ( SheetColumnDelete _, _ ) ->
+                                    ( "Delete", "Deleting " ++ String.join ", " (List.map quoted columns) )
+
+                                ( _, Just name ) ->
+                                    ( "Rename", "Renaming " ++ String.join ", " (List.map quoted columns) ++ " to " ++ quoted name )
+
+                                ( _, Nothing ) ->
+                                    ( "Rename", "Renaming " ++ String.join ", " (List.map quoted columns) )
+                    in
+                    viewModal "sheets this change can break"
+                        PendingCancel
+                        [ case found of
+                            Ok rows ->
+                                H.div []
+                                    [ H.p [] [ text (change ++ " can break these sheets:") ]
+                                    , H.ul [ S.marginBottom "1rem" ]
+                                        (List.map (\( name, why ) -> H.li [] [ H.strong [] [ text name ], text (" " ++ why) ]) rows)
+                                    ]
+
+                            Err reason ->
+                                H.p [ S.marginBottom "1rem" ]
+                                    [ text (change ++ " can break a sheet that reads it, and which sheets do could not be read: " ++ reason) ]
+                        , H.div [ S.displayFlex, S.gapRem 0.5, S.justifyContentFlexEnd ]
+                            [ H.button [ A.onClick PendingCancel, S.padding "0.5rem 1rem" ] [ text "Cancel" ]
+                            , H.button
+                                [ A.onClick PendingConfirm
+                                , S.padding "0.5rem 1rem"
+                                , S.border "none"
+                                , S.background "#dc3545"
+                                , S.color "#fff"
+                                ]
+                                [ text verb ]
+                            ]
+                        ]
+
+                Asking ->
+                    text ""
+
+                Confirmed ->
+                    text ""
+
+        Nothing ->
+            text ""
+
+
 {-| The list of what exists, and the palette's source. A third field carries the
 message the palette runs, so the two cannot drift into disagreeing about what the
 app can do -- `Nothing` is a key that only means something against a selection,
@@ -6623,6 +7187,78 @@ viewPalette model =
                 ]
 
 
+{-| The past rows are text in a plain `table`, built from nothing a live sheet
+view uses: no cell takes a click, an input or a drag. The glue's refusals land
+in `model.error`, drawn here too because the scrim covers the banner.
+-}
+viewHistory : String -> Maybe History -> Html Msg
+viewHistory refusal history =
+    case history of
+        Nothing ->
+            text ""
+
+        Just h ->
+            let
+                failed error =
+                    H.pre [ S.color "#b00", S.whiteSpacePreWrap, S.fontSizeRem 0.75 ] [ text error ]
+            in
+            viewModal "sheet history"
+                (HistoryMsg HistoryClose)
+                [ H.div [ S.displayFlex, S.justifyContentSpaceBetween, S.alignItemsCenter, S.marginBottom "0.5rem" ]
+                    [ H.h3 [] [ text "History" ]
+                    , H.button [ A.class "x", A.attribute "aria-label" "close the history", A.onClick (HistoryMsg HistoryClose) ] [ text "×" ]
+                    ]
+                , viewError refusal
+                , case h.versions of
+                    Nothing ->
+                        H.span [ S.color "#666" ] [ text "reading the history…" ]
+
+                    Just (Err error) ->
+                        failed error
+
+                    Just (Ok versions) ->
+                        H.div [ A.id "versions", S.displayFlex, S.flexDirectionColumn, S.maxHeight "30vh", S.overflowYAuto, S.fontSizeRem 0.875 ] <|
+                            List.map
+                                (\v ->
+                                    H.button
+                                        [ A.onClick (HistoryMsg (HistoryPick v.hash))
+                                        , A.attribute "aria-pressed" (iif (h.hash == Just v.hash) "true" "false")
+                                        , S.displayFlex
+                                        , S.gapRem 1
+                                        , S.textAlignLeft
+                                        , S.border "none"
+                                        , S.padding "0.25rem 0.375rem"
+                                        , S.background (iif (h.hash == Just v.hash) "#e8e8f8" "transparent")
+                                        ]
+                                        [ text (iif (v.time == 0) ("change " ++ String.fromInt v.seq) (isoStamp (v.time * 1000)))
+                                        , H.span [ A.class "mono", S.color "#666" ] [ text (String.left 8 v.actor) ]
+                                        , text (Maybe.withDefault "" v.message)
+                                        ]
+                                )
+                                versions
+                                ++ iif (h.left > 0)
+                                    [ H.span [ S.color "#666" ] [ text (String.fromInt h.left ++ iif (h.left == 1) " older version is" " older versions are" ++ " not listed.") ] ]
+                                    []
+                , case ( h.hash, h.past ) of
+                    ( Nothing, _ ) ->
+                        text ""
+
+                    ( Just _, Nothing ) ->
+                        H.span [ S.color "#666" ] [ text "reading that version…" ]
+
+                    ( Just _, Just (Err error) ) ->
+                        failed error
+
+                    ( Just _, Just (Ok past) ) ->
+                        H.div [ S.maxHeight "40vh", S.overflowAuto, S.marginTopRem 0.5 ]
+                            [ H.table [ A.id "past", S.fontSizeRem 0.875 ]
+                                [ H.thead [] [ H.tr [] (List.map (\name -> H.th [] [ text name ]) past.columns) ]
+                                , H.tbody [] (List.map (\row -> H.tr [] (List.map (\cell -> H.td [] [ text cell ]) row)) past.rows)
+                                ]
+                            ]
+                ]
+
+
 viewFindReplace : Maybe FindReplace -> Html Msg
 viewFindReplace maybeFindReplace =
     case maybeFindReplace of
@@ -6890,38 +7526,47 @@ skipping every replacement it made.
 replaceMatches : Model -> Sheet -> FindReplace -> Table -> List Index -> ( Model, Cmd Msg )
 replaceMatches model sheet fr tbl matches =
     let
+        toDoc =
+            displayYToDocY model.search sheet tbl.rows
+
+        -- A match found before the search or a filter changed can name a row
+        -- that is no longer drawn. Any one refuses the whole replace.
+        undrawn =
+            matches |> List.map .y |> List.filter (\y -> toDoc y == Nothing)
+
         patchPairs =
             matches
                 |> List.filterMap
                     (\matchIdx ->
-                        Array.get matchIdx.x tbl.cols
-                            |> Maybe.map
-                                (\col ->
-                                    let
-                                        docY =
-                                            displayYToDocY model.search sheet tbl.rows matchIdx.y
-
-                                        old =
-                                            Array.get (docY - 1) tbl.rows
-                                                |> Maybe.andThen (Dict.get col.key)
-                                                |> Maybe.withDefault E.null
-                                    in
-                                    ( { action = "set"
-                                      , path = [ E.int docY, E.string col.key ]
-                                      , value = E.string fr.replaceText
-                                      }
-                                    , { action = "set"
-                                      , path = [ E.int docY, E.string col.key ]
-                                      , value = old
-                                      }
-                                    )
+                        Maybe.map2
+                            (\col docY ->
+                                let
+                                    old =
+                                        Array.get (docY - 1) tbl.rows
+                                            |> Maybe.andThen (Dict.get col.key)
+                                            |> Maybe.withDefault E.null
+                                in
+                                ( { action = "set"
+                                  , path = [ E.int docY, E.string col.key ]
+                                  , value = E.string fr.replaceText
+                                  }
+                                , { action = "set"
+                                  , path = [ E.int docY, E.string col.key ]
+                                  , value = old
+                                  }
                                 )
+                            )
+                            (Array.get matchIdx.x tbl.cols)
+                            (toDoc matchIdx.y)
                     )
 
         forward =
             List.map Tuple.first patchPairs
     in
-    if List.isEmpty forward then
+    if not (List.isEmpty undrawn) then
+        ( { model | error = undrawnRows undrawn }, Cmd.none )
+
+    else if List.isEmpty forward then
         ( model, Cmd.none )
 
     else
@@ -6955,6 +7600,74 @@ nameClash cols x write =
 
     else
         cols |> Array.filter (\col -> col.name == write) |> Array.get 0 |> Maybe.map .name
+
+
+{-| The `library:lineage` rows that name a sheet they depend on. A row with a
+null `depends_on` names none, so it is not one.
+-}
+lineageDecoder : D.Decoder (List { name : String, dependsOn : String, columns : String })
+lineageDecoder =
+    D.list
+        (D.field "depends_on" (D.nullable D.string)
+            |> D.andThen
+                (\on ->
+                    case on of
+                        Just dependsOn ->
+                            D.map2 (\name columns -> Just { name = name, dependsOn = dependsOn, columns = columns })
+                                (D.field "name" D.string)
+                                (D.field "columns" D.string)
+
+                        Nothing ->
+                            D.succeed Nothing
+                )
+        )
+        |> D.map (List.filterMap identity)
+
+
+{-| Each sheet that reads one of `names` off sheet `id`, and why it is at risk.
+`columns` is the server's comma-and-space join, `*` or `?`. A name is found
+only between separators, never inside another name, and a name that itself
+holds ", " can match where it should not: a warning too many, never one too few.
+-}
+dependents : Id -> List String -> List { name : String, dependsOn : String, columns : String } -> List ( String, String )
+dependents id names =
+    List.filterMap
+        (\row ->
+            let
+                listed name =
+                    (row.columns == name)
+                        || String.startsWith (name ++ ", ") row.columns
+                        || String.endsWith (", " ++ name) row.columns
+                        || String.contains (", " ++ name ++ ", ") row.columns
+            in
+            if row.dependsOn /= id then
+                Nothing
+
+            else if row.columns == "*" then
+                Just ( row.name, "selects every column" )
+
+            else if row.columns == "?" then
+                Just ( row.name, "reads columns nobody could list" )
+
+            else if row.columns == "" then
+                -- No claimed name. The server claims a name for neither ref
+                -- when two joined refs both hold it, so such a row can still
+                -- read the column, and no warning names it.
+                Nothing
+
+            else
+                case List.filter listed names of
+                    [] ->
+                        Nothing
+
+                    hit ->
+                        Just ( row.name, "reads " ++ String.join ", " (List.map quoted hit) )
+        )
+
+
+quoted : String -> String
+quoted name =
+    E.encode 0 (E.string name)
 
 
 orElse : Maybe a -> Maybe a -> Maybe a
@@ -7016,11 +7729,7 @@ resolveTable model =
             Ok tbl
 
         ( Ok (Unviewable typ), _ ) ->
-            Err
-                (typ
-                    ++ " sheets sync but have no view yet. Read this one from a query sheet with: select * from @"
-                    ++ model.sheet.id
-                )
+            Err (unviewable typ model.sheet.id)
 
         ( Ok Library, _ ) ->
             Ok
@@ -7952,12 +8661,14 @@ fillSeries seeds count =
                             List.repeat count last
 
 
-rowSplices : (Int -> Maybe Row) -> Int -> List Int -> (Int -> Int) -> ( List Patch, List Patch )
+rowSplices : (Int -> Maybe Row) -> Int -> List Int -> (Int -> Maybe Int) -> ( List Patch, List Patch )
 rowSplices source offset indices toDoc =
     let
+        -- `updateDocMsg` refuses the whole edit through `undrawnRows` before
+        -- these patches go out when any index maps to nothing.
         targets =
             indices
-                |> List.map toDoc
+                |> List.filterMap toDoc
                 |> Set.fromList
                 |> Set.toList
                 |> List.filterMap (\i -> source i |> Maybe.map (\row -> ( i + offset, row )))
@@ -8015,16 +8726,23 @@ columnHiddenAt sheet x =
         |> Maybe.withDefault False
 
 
-displayYToDocY : String -> Sheet -> Array Row -> Int -> Int
-displayYToDocY search sheet rows y =
-    if y < 1 then
-        y
+undrawnRows : List Int -> String
+undrawnRows ys =
+    let
+        named =
+            ys |> Set.fromList |> Set.toList |> List.map String.fromInt
+    in
+    "Expected an edit on rows this view draws, received one on "
+        ++ iif (List.length named == 1) "row " "rows "
+        ++ String.join ", " named
+        ++ ", which this view does not draw. Nothing was written. Source: the search or a filter hides that row, or the rows changed after you selected it or found it. Fix: select a drawn row, or clear the search or the filter, and edit again."
 
-    else
-        filterAndSortIndexed search sheet rows
-            |> Array.get (y - 1)
-            |> Maybe.map (\( orig, _ ) -> orig + 1)
-            |> Maybe.withDefault y
+
+displayYToDocY : String -> Sheet -> Array Row -> Int -> Maybe Int
+displayYToDocY search sheet rows y =
+    filterAndSortIndexed search sheet rows
+        |> Array.get (y - 1)
+        |> Maybe.map (\( orig, _ ) -> orig + 1)
 
 
 {-| A dragged width wins over the type's own, and a type with no width of its
@@ -9105,9 +9823,11 @@ viewToolbar model info =
             , [ H.button [ A.class "chip", A.onClick (ShortcutsToggle True), iif (sheet.id == "") S.marginLeftAuto (A.classList []) ] [ text "keys" ] ]
             , case sheet.doc of
                 Ok (Tab _) ->
-                    List.map
-                        (\format -> H.a [ A.class "chip", A.href (model.api ++ "/export/" ++ sheet.id ++ "." ++ format), A.download (sheet.id ++ "." ++ format) ] [ text ("export " ++ format) ])
-                        [ "csv", "xlsx" ]
+                    -- A bundled sheet is a plain object in the page, with no automerge document to have a history.
+                    iif info.system [] [ H.button [ A.class "chip", A.onClick (HistoryMsg HistoryOpen), A.title "read this sheet as it was" ] [ text "history" ] ]
+                        ++ List.map
+                            (\format -> H.a [ A.class "chip", A.href (model.api ++ "/export/" ++ sheet.id ++ "." ++ format), A.download (sheet.id ++ "." ++ format) ] [ text ("export " ++ format) ])
+                            [ "csv", "xlsx" ]
 
                 Ok (Chart _) ->
                     List.map
@@ -9204,7 +9924,7 @@ viewNetHook model =
         ]
 
 
-viewNetHttp : Model -> { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String, mode : String, key : String, rowsPath : String, paused : Bool } -> Html Msg
+viewNetHttp : Model -> { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String, mode : String, key : String, rowsPath : String, paused : Bool, cron : String, timezone : String } -> Html Msg
 viewNetHttp model cfg =
     let
         paging =
@@ -9227,6 +9947,14 @@ viewNetHttp model cfg =
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "poll every (seconds)"
             , H.input [ A.type_ "number", A.value (String.fromInt cfg.interval), A.onInput (InputChange NetInterval) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "or on a cron schedule, which wins over the seconds"
+            , H.input [ A.class "mono", A.type_ "text", A.value cfg.cron, A.placeholder "0 9 * * 1-5", A.attribute "aria-label" "cron schedule", A.title "minute hour day-of-month month day-of-week: the poller refuses anything else, and the run row says why", A.spellcheck False, A.onInput (InputChange NetCron) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "in the timezone"
+            , H.input [ A.class "mono", A.type_ "text", A.value cfg.timezone, A.placeholder "UTC", A.attribute "aria-label" "cron timezone", A.title "an IANA zone such as America/Chicago; empty is UTC, and a zone needs a cron", A.spellcheck False, A.onInput (InputChange NetTimezone) ] []
             ]
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "headers"
@@ -9362,7 +10090,7 @@ viewNextRun paused model =
         ]
 
 
-viewAlert : Model -> { code : String, to : String, interval : Int, digest : Bool, when : When, paused : Bool, snoozedUntil : String } -> Html Msg
+viewAlert : Model -> { code : String, to : String, interval : Int, digest : Bool, when : When, paused : Bool, snoozedUntil : String, cron : String, timezone : String } -> Html Msg
 viewAlert model cfg =
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
@@ -9376,6 +10104,14 @@ viewAlert model cfg =
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "check every (seconds)"
             , H.input [ A.type_ "number", A.value (String.fromInt cfg.interval), A.onInput (InputChange NetInterval) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "or on a cron schedule, which wins over the seconds"
+            , H.input [ A.class "mono", A.type_ "text", A.value cfg.cron, A.placeholder "0 9 * * 1-5", A.attribute "aria-label" "cron schedule", A.title "minute hour day-of-month month day-of-week: the poller refuses anything else, and the run row says why", A.spellcheck False, A.onInput (InputChange NetCron) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "in the timezone"
+            , H.input [ A.class "mono", A.type_ "text", A.value cfg.timezone, A.placeholder "UTC", A.attribute "aria-label" "cron timezone", A.title "an IANA zone such as America/Chicago; empty is UTC, and a zone needs a cron", A.spellcheck False, A.onInput (InputChange NetTimezone) ] []
             ]
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "fires when"
@@ -10737,10 +11473,12 @@ view ({ sheet } as model) =
             [ viewAuthForm model.auth
             , viewFindReplace sheet.findReplace
             , viewDeleteConfirm model.deleteConfirm
+            , viewPending model.pending
             , viewImport model.importing
             , viewSettings model.showSettings info model.share
             , viewShortcuts model.showShortcuts
             , viewPalette model
+            , viewHistory model.error model.history
             , viewTutorial model.tutorial
             , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
                 [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]

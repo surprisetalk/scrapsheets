@@ -693,6 +693,68 @@ Deno.test("the page engine still needs min_text(), and still has the UDFs", () =
     ),
     { coefs: "json", odds: "json", fitted: "num", chance: "num", u: "num", n: "num", t: "num" },
   );
+  assertEquals(
+    selectTypes(`select kmeans(3, array(x), array(y)) as c, kmeans_assign(c, x, y) as g from @table:t`, {}),
+    { c: "json", g: "int" },
+  );
+  // Three blobs far apart, each point a fixed offset from its blob's middle.
+  // The same call twice and the same call in each engine answer the same
+  // centroids, and each centroid lands on a middle.
+  const middles = [[0, 0], [40, 5], [10, 30]];
+  const blobs = middles.flatMap(([mx, my], b) =>
+    Array.from({ length: 15 }, (_, i) => ({ x: mx + ((i * 7 + b) % 5) - 2, y: my + ((i * 3 + b) % 5) - 2 }))
+  );
+  const clustered = engines.flatMap(([, engine]) =>
+    [1, 2].map(() =>
+      engine(
+        `select p.x, p.y, kmeans_assign(m.c, p.x, p.y) g, m.c from ? p,
+                (select kmeans(3, array(x), array(y)) c from ?) m`,
+        [blobs, blobs],
+      ).data
+    )
+  );
+  for (const other of clustered.slice(1)) assertEquals(other, clustered[0], "one kmeans() call answered two ways");
+  const centroids = clustered[0][0].c as number[][];
+  assertEquals(centroids.length, 3);
+  for (const [j, [mx, my]] of [...middles].sort((a, b) => a[0] - b[0]).entries()) {
+    const [cx, cy] = centroids[j];
+    assert(Math.abs(cx - mx) < 0.5 && Math.abs(cy - my) < 0.5, `centroid ${j + 1} at ${cx}, ${cy}, not ${mx}, ${my}`);
+  }
+  for (const [i, row] of clustered[0].entries())
+    assertEquals(row.g, [1, 3, 2][Math.floor(i / 15)], `point ${i} landed in the wrong cluster`);
+});
+
+Deno.test("kmeans() and kmeans_assign() refuse what they cannot cluster", () => {
+  const [, engine] = engines[0];
+  const pts = [{ x: 1, y: 1 }, { x: 2, y: 2 }, { x: 9, y: 9 }];
+  const refused: [string, unknown[], string][] = [
+    ["select kmeans(1, array(x)) c from ?", [pts], "a whole number of clusters from 2 to 20"],
+    ["select kmeans(21, array(x)) c from ?", [pts], "a whole number of clusters from 2 to 20"],
+    ["select kmeans(2.5, array(x)) c from ?", [pts], "a whole number of clusters from 2 to 20"],
+    ["select kmeans('two', array(x)) c from ?", [pts], "a finite number"],
+    ["select kmeans(2) c from ?", [pts], "at least one column to cluster on"],
+    [`select kmeans(2, ${"array(x), ".repeat(13)}array(x)) c from ?`, [pts], "at most 12 columns"],
+    ["select kmeans(2, array(x), x) c from ?", [pts], "an array of numbers"],
+    ["select kmeans(2, array(x), array(z)) c from ?", [[{ x: 1, z: 1 }, { x: 2, z: null }]], "only finite numbers"],
+    ["select kmeans(2, ?, ?) c from ?", [[1, 2], [1], pts], "every array the same length"],
+    ["select kmeans(2, ?) c from ?", [Array.from({ length: 5001 }, (_, i) => i), pts], "at most 5000 points"],
+    ["select kmeans(3, array(x)) c from ?", [[{ x: 1 }, { x: 1 }, { x: 2 }]], "at least 3 distinct points"],
+    ["select kmeans(2, ?, ?) c from ?", [[-1e300, 1e300], [0, 0], pts], "squared distances fit in a finite number"],
+    ["select kmeans_assign(1, x) g from ?", [pts], "a non-empty array of at most 20 centroids"],
+    ["select kmeans_assign(?, x) g from ?", [[], pts], "a non-empty array of at most 20 centroids"],
+    ["select kmeans_assign(?, x) g from ?", [[1, 2], pts], "a non-empty array of at most 20 centroids"],
+    [
+      "select kmeans_assign(?, x) g from ?",
+      [Array.from({ length: 21 }, (_, i) => [i]), pts],
+      "a non-empty array of at most 20 centroids",
+    ],
+    ["select kmeans_assign(?, x) g from ?", [[[1], ["a"]], pts], "only finite numbers"],
+    ["select kmeans_assign(?, x, y) g from ?", [[[1, 1], [2]], pts], "centroid 2 of 1 numbers beside 2 point values"],
+    ["select kmeans_assign(?) g from ?", [[[1]], pts], "one point value per clustered column"],
+    ["select kmeans_assign(?, ?) g from ?", [[[-1e200], [1e200]], 1.5e200, pts], "fits in a finite number"],
+    ["select kmeans_assign(?, x, y) g from ?", [[[1, 1]], [{ x: 1, y: "" }]], "a finite number"],
+  ];
+  for (const [code, params, said] of refused) assertThrows(() => engine(code, params), Error, said, code);
 });
 
 Deno.test("min() and max() over a text column answer, in both engines", () => {

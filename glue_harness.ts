@@ -6,7 +6,7 @@
 
 import { assert, assertEquals } from "@std/assert";
 import { cbor, decodeHeads, encodeHeads, Repo as AutomergeRepo } from "@automerge/automerge-repo";
-import { decodeSyncMessage, encodeSyncMessage } from "@automerge/automerge";
+import { decodeSyncMessage, encodeSyncMessage, getHistory, view } from "@automerge/automerge";
 import { JSDOM } from "jsdom";
 import { BrowserWebSocketClientAdapter } from "./src/automerge-repo-ws.mjs";
 import * as pageExports from "./src/page.mjs";
@@ -193,6 +193,8 @@ export const glue = async (
     cbor,
     decodeHeads,
     decodeSyncMessage,
+    getHistory,
+    view,
     BrowserWebSocketClientAdapter,
     IndexedDBStorageAdapter: class {},
     Repo: realRepo

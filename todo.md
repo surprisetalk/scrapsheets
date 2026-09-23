@@ -110,21 +110,10 @@ a condition in `GET /status`, not an item here.
      place to live.
 
 - [ ] You group rows and see subtotals without writing SQL.
-  1. Make `displayYToDocY` answer `Maybe Int`. Its callers:
-     - copy (two call sites, read-only)
-     - the `toDoc` closure in `updateDocMsg`, used by cell write, insert, duplicate, delete, fill-down and clear
-     - paste's `docRowFor`
-     - replace-all
-     - `rowSplices`, which takes `(Int -> Int)` and changes type
-     - four tests in `tests/MainTest.elm`
-
-     Today `Maybe.withDefault y` maps a row past the drawn set to the same document index. Check insert and duplicate on
-     the last row, and y ≤ 0, before anything answers `Nothing`. A write that gets `Nothing` refuses by name.
-  2. Then add collapsible groups, with subtotals over the rows on screen, the same way the totals row respects the
-     filter. A smaller alternative needs neither: one footer `tr` per group under the table, grouped by one chosen
-     column, from the fold `columnTotal` already does.
-  3. A pivot UI over the same machinery. AlaSQL's `pivot` is correct once `checkPivot()` has checked it.
-
+  1. Add collapsible groups, with subtotals over the rows on screen, the same way the totals row respects the filter. A
+     smaller alternative needs neither: one footer `tr` per group under the table, grouped by one chosen column, from
+     the fold `columnTotal` already does.
+  2. A pivot UI over the same machinery. AlaSQL's `pivot` is correct once `checkPivot()` has checked it.
 - [ ] You write a note on a cell and discuss it in a thread.
   1. Decide row identity first. A note belongs to a row, and a row here has no id. `data` is a positional array that
      `rowSplices`, `rowDeletions` and the `move` patch address by index, so an insert above a noted row moves the note
@@ -216,23 +205,15 @@ a condition in `GET /status`, not an item here.
 
 ## Scheduling
 
-- [ ] A schedule means what you meant: cron, local time, business days, or "when upstream changes".
-  1. Decide first the shape of the three trigger kinds in `data[0]`. Today `interval` is seconds, clamped by
-     `INTERVAL_MAX_S`.
-  2. Parse cron with an established library, and say which one. Do not hand-roll the parser.
-  3. Timezone and DST through `Intl`, in the sheet's own zone.
-  4. Business-day and fiscal triggers through `business_days()` and `fiscal_period()`.
-  5. "On upstream change": a net row already touches its document for `flushWebhooks`. The same touch makes its
+- [ ] A schedule means what you meant: business days, or "when upstream changes".
+  1. Business-day and fiscal triggers through `business_days()` and `fiscal_period()`, answered by `nextDue()`: the one
+     due-time rule both pollers call, which already reads `cron` and `timezone`.
+  2. "On upstream change": a net row already touches its document for `flushWebhooks`. The same touch makes its
      dependents due.
 
 ---
 
 ## Alerts
-
-- [ ] An alert fires when a value leaves its usual band.
-  1. The band is a query. The residual is `y - trend(y, p) - seasonal(y, p)`, and the alert fires past `k` times the
-     residual's `stddev`. Ship this as a bundled demo alert beside the monthly decomposition demo.
-  2. Add a `when: band` only if the demo shows that a where clause cannot say it.
 
 - [ ] An alert reaches your phone.
   1. Web push first. It needs no vendor account: VAPID keys are secrets, each user has a subscription, and `src/sw.js`
@@ -257,27 +238,6 @@ a condition in `GET /status`, not an item here.
 
 ---
 
-## Lineage
-
-- [ ] You are warned before a rename or a delete breaks a sheet that depends on this one.
-  1. Decide the door first. The column panel has no rename verb and no delete verb. A rename is the header edit (a
-     `SheetWrite` at y=0 that writes `[0, x, "name"]`). A delete is Ctrl/⌘+Backspace (`SheetColumnDelete`). Either
-     intercept both and hold the pending write in the model, or add panel buttons.
-  2. The read: `GET /library/lineage` takes no filter and opens every document the caller holds. Fetch it on the verb,
-     never when the panel opens, and keep the rows whose `depends_on` is this sheet. Model the port pair on
-     `freshnessLoaded`, and send a failure through `httpErrorDetail`.
-  3. Warn on all three states:
-     - a row that names the column in `columns`
-     - a row whose `columns` is `*`, which reads every column
-     - a row whose `columns` is `?`, which nobody could check
-
-     Name each dependent by its `name`, and the typist confirms. A silent write past `?` is the guess this column exists
-     to prevent.
-  4. A bundled sheet, or a reader who is not logged in, cannot read lineage. Treat that as the `?` state.
-  5. A delete of several columns is one warning that names every column.
-
----
-
 ## Stats & modeling
 
 - [ ] You solve for an input with goal seek or a constrained optimizer.
@@ -287,11 +247,17 @@ a condition in `GET /status`, not an item here.
   2. The bundled sweep demo already shows the answer by search. Build goal seek on the chosen form, then add
      constraints.
 
-- [ ] You segment a sheet by k-means.
-  1. A `kmeans(k, array(x1), array(x2), …)` UDF shaped like `ols`. Its iterations are bounded the way `HYPERBOLIC_STEPS`
-     bounds its fit. Its start points are seeded like the samplers (mulberry32 from an FNV-1a hash of the call), so both
-     hosts give the same answer.
-  2. Then add a palette command beside the RFM command, built the same way.
+- [ ] You segment a sheet by k-means from the palette.
+  1. Add `kmeansSql({ source, key, columns, k })` to `src/sql.mjs` beside `rfmSql`. It writes the statement once, at
+     creation, as an ordinary query's `code`, shaped like `query:airport-regions`: every source row, plus
+     `kmeans_assign(m.centroids, …) as segment`, crossed with
+     `(select kmeans(k, array(c1), array(c2), …) as centroids from <source>) m`. Check the source through
+     `writtenFrom()`, the names through `chartIdent()`, and collisions through `refuseTaken()`. `k` runs from 2 to
+     `KMEANS_K_MAX`. Scaling stays the author's job: the generated code divides nothing.
+  2. Add "segment this sheet (k-means)" to `paletteRows` beside "score this sheet's customers (RFM)", offered when two
+     or more numeric columns are known, and built through the same guesses and the same create path.
+  3. Tests: `examples_test.ts` runs `kmeansSql` output through both engines and checks the refusals; one palette step
+     goes in the existing RFM palette test in `library_test.ts`, with no new boot.
 
 ---
 
@@ -392,17 +358,10 @@ a condition in `GET /status`, not an item here.
      queue.
 
 - [ ] You go back to a past version of a sheet.
-  1. Decide first how a past document is drawn. Every table view takes the live `Sheet` and is wired to writes. Either
-     build a plain read-only table from the past rows, or disable writes in every view and every global key (undo,
-     paste, delete).
-  2. A timeline and a read-only past state: `historyLoad`/`historyLoaded` and `historyView`/`historyShown` ports, built
-     like `preflight`. Use `getHistory(doc).map(h => h.change)`, never `.snapshot`, and `view(doc, [hash])`. The past
-     document lives in a new `model.history`, never in `docSelected`. Bound the entries, with the count in the message.
-     `glue_harness.ts` `deps` lists the new imports, with no `import { x as y }`. Tests need `realRepo: true`.
-  3. A visual diff between two versions. `diff` answers automerge patches, and rendering them as a cell-level diff is
+  1. A visual diff between two versions. `diff` answers automerge patches, and rendering them as a cell-level diff is
      its own design.
-  4. Named snapshots, then rollback, which is a write.
-  5. A conflict view, for the merges automerge cannot decide.
+  2. Named snapshots, then rollback, which is a write.
+  3. A conflict view, for the merges automerge cannot decide.
 
 ---
 
@@ -445,8 +404,7 @@ a condition in `GET /status`, not an item here.
   3. Global search over sheet names, column names and cell contents. Semantic search after that.
 
 - [ ] You reach everything without a mouse or a screen.
-  1. Trap focus inside an open modal, and give focus back to whatever opened it when it closes.
-  2. Keyboard equivalents for the `.grab` row handle and the `.grip` column resizer.
+  1. Keyboard equivalents for the `.grab` row handle and the `.grip` column resizer.
 
 ---
 

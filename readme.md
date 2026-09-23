@@ -60,7 +60,9 @@ checksum; an archive holding two it can read, or a page holding two tables, says
 lands as the document it means, decoded the way its own declaration says to decode it, and `rows_path` names the rows in
 it. A paused sheet (the checkbox beside the interval) is stepped over by the poller and left out of the status check's
 liveness grades, so pausing a feed does not read as an outage; "run now" polls it this second and answers the row it
-wrote (`POST /library/<sheet_id>/run` over HTTP), and `library:freshness` says when each sheet runs next.
+wrote (`POST /library/<sheet_id>/run` over HTTP), and `library:freshness` says when each sheet runs next. A `cron`
+pattern and a `timezone` beside the interval run a feed or an alert on a calendar instead, such as `0 9 * * 1-5` in
+`America/Chicago`, and `{"cursor": "2024-01-31"}` on a run asks the feed again from that date.
 
 A sheet can hold its own secrets instead. `POST /library/<sheet_id>/secret` with `{"name":"hook","value":"..."}` sets
 the signing key; writing it again rotates it, and the one before still verifies until a third write retires it. `GET`

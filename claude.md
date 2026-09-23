@@ -70,15 +70,16 @@ that file. Keep the jsdom pairs even in boots: `grep -c "await boot(" page_test.
 - `examples_test.ts` — every bundled sheet through both engines (`npm:alasql`, `src/alasql.mjs`), row for row. Refuses a
   chart source with a repeated (series, x) pair.
 - `page_test.ts` — the table and the query sheet: render, sort, arrange, keyboard.
-- `library_test.ts` — the library, the sheets opened from it (feed, alert, chart, dashboard), the palette, and the parts
-  of `src/page.mjs` that need no page.
+- `library_test.ts` — the library, the sheets opened from it (feed, alert, chart, dashboard), the palette, the history
+  modal, and the parts of `src/page.mjs` that need no page.
 - `glue_test.ts` — what the glue does to a document.
 - `sync_test.ts` — what arrives from outside: a CSV chosen or dropped, a socket report, a fork, a real automerge
-  document, the row and column verbs, and `src/sw.js` over a hand-made `self`, `caches` and `fetch`.
+  document and its history, the row and column verbs, and `src/sw.js` over a hand-made `self`, `caches` and `fetch`.
 - `page_harness.ts` — shared by the four jsdom files: compiled Elm, window globals, `boot`, `rendered()`, `until`,
   `settle(ms)`, the page-side engine. Refuses a `dist` older than `src`.
 - `glue_harness.ts` — `glue()` runs `index.html`'s module script over jsdom with `fetch` and `WebSocket` recorded.
-  `docs` hands it a synced document. `realRepo` swaps in real automerge.
+  `docs` hands it a synced document. `realRepo` swaps in real automerge. `deps` supplies every name `index.html`
+  imports, under its own spelling; a renamed import is refused.
 - `browser_test.ts` — no browser. `dist` is fresh, `index.html` wires the WASM and import map, every root-absolute asset
   is in `_redirects`, imports resolve, nothing reaches a CDN. Lints `index.html`'s module script and `src/sw.js` through
   `deno lint` (`BROWSER_GLOBALS` is the allowlist). Holds the language-boundary copies equal (see Invariants).
@@ -226,13 +227,22 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - `namedRows()` applies `rows_path` when there is no paging. It refuses an answer that is already an array, and a row
   that is not an object.
 - Pause and run: `paused: true` in `data[0]` skips a net-http or alert sheet and keeps its due entry. A paused sheet
-  leaves the two liveness conditions until `OVERDUE_MAX`. `INTERVAL_MAX_S` clamps `interval`. `POST /library/:id/run`
-  needs `assertSheetEditor`, spends `runs`, and answers the newest `net` row at or after a watermark from Postgres's
-  clock, as epoch seconds (`net.created_at` has no timezone). Refusals: paused 409, wrong type 400, nothing recorded
-  409\. A body may carry `cursor`, an ISO date or a zoned date and time: `pollNetSheet`'s `since` replaces the stored
-  watermark in the cursor parameter and in `{{cursor}}`, and sends no conditional header. A good run still writes
-  `cursor` as now. A bad cursor is 400, a cursor on an alert 400, a cursor on a `replace` feed 409, a cursor on a feed
-  with no `cursor` field and no `{{cursor}}` in its body 409. Freshness adds `paused` and `next_run`.
+  leaves the two liveness conditions until `OVERDUE_MAX`. `nextDue()` is the one due-time rule both pollers call:
+  `interval` clamped to 60..`INTERVAL_MAX_S`, or croner's next `cron` run. `POST /library/:id/run` needs
+  `assertSheetEditor`, spends `runs`, and answers the newest `net` row at or after a watermark from Postgres's clock, as
+  epoch seconds (`net.created_at` has no timezone). Refusals: paused 409, wrong type 400, nothing recorded 409\. A body
+  may carry `cursor`, an ISO date or a zoned date and time: `pollNetSheet`'s `since` replaces the stored watermark in
+  the cursor parameter and in `{{cursor}}`, and sends no conditional header. A good run still writes `cursor` as now. A
+  bad cursor is 400, a cursor on an alert 400, a cursor on a `replace` feed 409, a cursor on a feed with no `cursor`
+  field and no `{{cursor}}` in its body 409. Freshness adds `paused` and `next_run`.
+- Schedule: `cron` (five fields, `npm:croner`, `mode: "5-part"`) and `timezone` (an IANA name, UTC when absent) in
+  `data[0]` of a net-http or alert sheet. `cron` wins over `interval`, and croner only computes the time;
+  `interval = ceil((due - now) / 1000)`. `nextDue()` refuses a cron or timezone that is not text, a pattern or zone
+  croner refuses, a pattern that never fires again, a next run past `INTERVAL_MAX_S`, a timezone with no cron, and an
+  interval that is not positive. An empty string is absent. A refusal is the feed's failure row or the alert's error
+  run, and the sheet stays due in an hour. Every row both pollers write carries `meta.interval`; a feed's rides
+  `carried`. The feed liveness condition grades each feed against `greatest(POLL_STALE_S, 2 * meta.interval)` off its
+  newest poll; the alert one against `2 * meta.interval`.
 
 **Feed bodies**
 
@@ -374,6 +384,12 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   the same equations, bounded by `LOGIT_STEPS`, `y` all 0 or 1, separation refused through `LOGIT_FIT`. `gauss()` is the
   shared solver and names the dependent column. `design()` is the one validator (`OLS_POINTS`, `OLS_TERMS`,
   `OLS_SINGULAR`).
+- Clusters: `kmeans(k, array(x1), …)` → k centroids sorted by coordinate; `kmeans_assign(centroids, x1, …)` → the
+  1-based nearest, lowest index on a tie. Raw Euclidean distance: the author scales the inputs. Start points are
+  k-means++ off `seedOf()` and `mulberry32`; Lloyd's passes stop when no point moves and no cluster is empty, bounded by
+  `KMEANS_STEPS`. Its bounds are its own: `KMEANS_K_MAX`, `KMEANS_POINTS`, `KMEANS_DIMS`. Refused: fewer than k distinct
+  points, a spread that is not finite, and in `kmeans_assign` a point whose distance to every centroid overflows.
+  `closest()` is the one distance for both.
 - Samplers: `sample_uniform`, `sample_normal`, `sample_triangular`, read back by `percentile()`. Never `Math.random`:
   each call seeds mulberry32 from an FNV-1a hash of the whole call. A non-finite draw is refused.
 - Guards: `checkQueryRows()` caps rows loaded; `checkJoinRows()` caps the from clause's product at `MAX_JOIN_ROWS`;
@@ -389,7 +405,8 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - `update` is one exhaustive `case` with no wildcard. Long branches: `updateDocMsg`, `updateKeyDown`, `updatePaste`,
   `updateShareLoad`.
 - `Doc`: `Library`, `Shop`, `Tab`, `Query`, `NetHook`, `NetHttp`, `Alert`, `Chart`, `Dashboard`, `NetSocket`. Other
-  types decode to `Unviewable typ`; replace that branch in `docDecoder` to give one a view.
+  types decode to `Unviewable typ`; replace that branch in `docDecoder` to give one a view. `unviewable` is the message:
+  no query reads one on either host, so it names the door that does.
 - Flags: `{ api, tutorial }`. A missing `api` goes to `model.error`.
 - `updateDocMsg` refuses every `DocMsg` on the library, so library verbs (`TrashSelected`, `TagSelected`) are top-level
   `Msg`s. They read ids through `libraryIdAtRow` (drawn order) and fan out one `updateLibrary` each.
@@ -438,6 +455,22 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   shows only while `inDocumentOrder`. `pinLeft` sums sticky widths, column 0 included.
 - Fill-down: `fillSeries` continues dates (`justinmimbs/date`, stepped off the last seed), numbers and trailing digits,
   else repeats. `parseDay` decides a date. `blankCell` decides blank. `seriesEncoder` writes by column type.
+- A write reaches only a drawn row. `displayYToDocY` answers `Maybe Int`: `Nothing` for y < 1 and past the drawn rows.
+  `tableBounds` bounds y by the drawn rows and `clampIndex` floors y at 1 when nothing is drawn, so the keyboard stops
+  at the last drawn row. A selection can still rest on an undrawn row after the rows change under it; there a keystroke
+  and Enter refuse, `updateDocMsg` collects `undrawn` (no wildcard: a new `DocMsg` names its display rows there), and
+  `replaceMatches` checks its matches. Any undrawn row refuses the whole edit through `undrawnRows`, with nothing
+  written. `rowSplices` takes `(Int -> Maybe Int)`. Paste appends past the drawn rows.
+- Rename and delete warning: in `updateDocMsg`'s Tab tail, after every refusal, `atRisk` names the columns a header
+  rename (`SheetWrite` at y = 0, name changed) or `SheetColumnDelete` takes away. A non-empty list holds the edit in
+  `model.pending` and sends `lineageFor`. `loadLineage` in `index.html` reads `GET /library/lineage` whole and answers
+  `lineageLoaded` with `{ id, rows }` or `{ id, error }`; logged out, a bundled sheet, a non-2xx, a throw and its
+  timeout are an `error`. `LineageLoad` ignores another id. `dependents` keeps rows whose `depends_on` is this sheet and
+  whose `columns` names a held column between separators, or is `*` or `?`. None: `confirmPending` writes at once.
+  Otherwise `viewPending` names each dependent and why; an `error` is the unknown state and says why. `PendingConfirm`
+  replays the edit through `updateDocMsg` under `Confirmed`, which refuses if the held names moved. `PendingCancel`,
+  Escape, `closeModals`, and `UrlChange` to another sheet or `#settings` drop it unwritten. A second rename or delete
+  while one is held, or over the import preview, the delete confirm or the history, is refused.
 - Cleaning, in the column panel behind `movable`: trim, UPPER, lower, drop blank rows, split, near-duplicates.
   `SheetRowsDedupe` is in the palette. Helpers: `cellRewrites()`, `blankRows()`, `duplicateRows()` (signs a row by its
   cells), `rowDeletions()`. They read every document row and reach a table only.
@@ -458,12 +491,24 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 
 **Sheets with settings**
 
-- Net-http: `page_by`, `page_param`, `page_path`, `mode`, `key`, `rows_path` sit in `data[0]` through `optionalField`.
-  `pageForm` and `storeForm` are the tables of what each mode takes. `pageByDecoder` and `netModeDecoder` refuse unknown
-  modes; the free-text fields are not checked. The branch is `D.map2` over `D.map5` and `D.map6`.
+- Net-http: `page_by`, `page_param`, `page_path`, `mode`, `key`, `rows_path`, `cron`, `timezone` sit in `data[0]`
+  through `optionalField`. `pageForm` and `storeForm` are the tables of what each mode takes. `pageByDecoder` and
+  `netModeDecoder` refuse unknown modes; the free-text fields are not checked. The branch is `D.map2` over two
+  `D.map7`s.
 - Pre-flight: `preflight { id, url, headers, method, body }` → `POST /library/:id/preflight` → `preflightLoaded`,
   matched by id, drawn by `viewPreflight`.
+- History: the `history` chip in `viewToolbar` on a `Tab` that is not `system` → `HistoryOpen` → `historyLoad id` →
+  `getHistory(doc)` off the open handle, newest first, the newest `HISTORY_MAX` decoded through `.change` →
+  `historyLoaded { versions: [{ hash, time, actor, seq, message }], left }` → `HistoryPick hash` →
+  `historyView { id, hash }` → `view(doc, [hash]).data` → `historyShown { hash, columns, rows }`. Both answers are
+  matched by id, and a view also by hash. The past lives in `model.history`, never `sheet`. `updateHistory` is the one
+  `HistoryMsg` case. `viewHistory` draws a plain `table#past` of text cells through `viewModal`; a `time` of 0 draws
+  `change <seq>`. While it is up, `updateKeyDown` answers Escape alone and `ClipboardPaste` does nothing. The glue's
+  refusals ride `catchy` to `model.error`, and `viewHistory` draws `viewError` too, because the scrim covers the banner.
 - Run now and pause: a `paused` checkbox, `runNow` / `runLoaded`. `runLine` picks the shape by the row's `method`.
+- Schedule: `NetCron` and `NetTimezone` write `cron` and `timezone` through `changeDoc` on net-http and alert alike,
+  beside `NetInterval`, with `aria-label` `cron schedule` and `cron timezone`. The page checks neither field. The alert
+  branch is `D.map3` over a `D.map7` and the two schedule fields.
 - Alert snooze: `snoozedUntil`, `isoStamp`; stamps compare as text.
 - Import: `CsvImportFile` / `importCsv`, or a drop through `setupDragDrop`, both into `uploadCsv` →
   `POST /import/preview` → `importPreviewed` → `viewImport` → `ImportConfirm` → `POST /import/csv`. `rememberedTypes`
@@ -495,19 +540,29 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   network first, cache second. `SHELL` is every `_redirects` path plus `/`, keyed by pathname. Nothing cross-origin is
   answered. Only the shell works offline.
 - Accessibility: `viewModal` takes a label and sets `role="dialog"`, `aria-modal`, `aria-label`. One is up at a time:
-  `closeModals` clears the palette and the shortcut sheet and closes settings through `SettingsClose`, so `#settings`
-  leaves the URL; `UrlChange` onto `#settings` clears the other two; the toggles open nothing over the import preview or
-  the delete confirm. The palette input is a `combobox` over `#palette-list` (`listbox`) of `palette-<i>` options, and
-  `aria-activedescendant` names a row only while it is drawn. Icon-only buttons and placeholder-only inputs carry
-  `aria-label`. The table is `role="grid"` and `aria-multiselectable`; `inSelection` decides both the `selected` class
-  and `aria-selected`; a header cell is a `columnheader`.
+  `closeModals` clears the palette, the shortcut sheet, the history and a held rename or delete, and closes settings
+  through `SettingsClose`, so `#settings` leaves the URL; `UrlChange` onto `#settings` clears the other four, and one
+  onto another sheet clears the history and a held edit; the toggles and `HistoryOpen` open nothing over the import
+  preview, the delete confirm or a held edit. Focus stays in the modal, in the glue: `MODAL` and `FOCUSABLE` in
+  `index.html` are the two selectors, and `topModal()` is the last `MODAL` in document order. A capture-phase `keydown`
+  on `document` takes every Tab while a modal is up, so Elm never hears it, and focuses the next or previous `FOCUSABLE`
+  through `trapStep(count, index, back)` in `src/page.mjs`, wrapping; `-1` lands on the dialog. The `MutationObserver`
+  records `document.activeElement` as `opener` when a modal mounts over none, moves focus into a new modal when it is
+  outside, and gives it back to `opener` when the last modal goes, if it `isConnected`. The palette input is a
+  `combobox` over `#palette-list` (`listbox`) of `palette-<i>` options, and `aria-activedescendant` names a row only
+  while it is drawn. Icon-only buttons and placeholder-only inputs carry `aria-label`. The table is `role="grid"` and
+  `aria-multiselectable`; `inSelection` decides both the `selected` class and `aria-selected`; a header cell is a
+  `columnheader`.
 
 **Known gaps**
 
 - `@library:freshness` and `@library:lineage` resolve on the server, not in the page.
 - `describe` results carry no type in the page, and `WINDOW_TYPES` is server-only.
-- No modal focus trap or restore, and no keyboard path for `.grab` / `.grip`. A back or forward onto `#settings` while
-  the import preview is up mounts both.
+- No keyboard path for `.grab` / `.grip`. A back or forward onto `#settings` while the import preview is up mounts both,
+  and the Tab trap holds only the later one in document order.
+- The rename and delete warning names only a column `library:lineage` claims: a name two joined refs both hold is
+  claimed by neither, and a row with a null `depends_on` names no sheet, so neither warns.
+- A refused `historyView` shows its refusal in the modal, and the modal also keeps saying it is reading that version.
 
 ## Schema (`schema/db.sql`)
 

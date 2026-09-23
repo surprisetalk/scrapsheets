@@ -418,6 +418,46 @@ Deno.test({
     for (const type of ["mouseenter", "click", "dblclick"]) await page.fire(cell, type);
     await page.type_(page.all("#new-cell")[0], "once");
     assertEquals(sent, 1, "one change is delivered to the page once");
+
+    // The same document read back as its history: every change, newest first,
+    // and the version before the typed cell holds the row without it.
+    type Versions = { versions: { hash: string; seq: number; time: number }[]; left: number };
+    const loaded: { id: string; data: Versions }[] = [], shown: { id: string; data: unknown }[] = [];
+    const { historyLoaded, historyShown } = page.app.ports;
+    const [load, show] = [historyLoaded.send, historyShown.send];
+    historyLoaded.send = (d: unknown) => (loaded.push(d as (typeof loaded)[0]), load(d));
+    historyShown.send = (d: unknown) => (shown.push(d as (typeof shown)[0]), show(d));
+    await page.click(page.all("button").find((b) => b.textContent === "history"));
+    await until(page.settle, "the history of the open sheet", () => loaded.length > 0);
+    const [{ data: { versions, left } }] = loaded;
+    assertEquals(loaded[0].id, id, "the answer names the sheet it is for");
+    assertEquals(
+      [versions.map((v) => v.seq), left],
+      [[3, 2, 1], 0],
+      "made, a row pushed, a cell typed: three changes, newest first, none left out",
+    );
+    assert(versions.every((v) => v.time > 0), "automerge-repo stamps every change with a time");
+    await page.click(page.all("#versions button")[1]);
+    await until(page.settle, "the older version's rows", () => shown.length > 0);
+    assertEquals(
+      shown[0],
+      { id, data: { hash: versions[1].hash, columns: ["a"], rows: [[undefined]] } },
+      "the version before the typed cell answers its one row, blank, by position under the column names",
+    );
+
+    // `view` answers `{}` for a hash the document never had, rather than throwing.
+    const errored: unknown[] = [];
+    const errSend = page.app.ports.docErrored.send;
+    page.app.ports.docErrored.send = (msg: unknown) => (errored.push(msg), errSend(msg));
+    const bogus = "f".repeat(64);
+    historyLoaded.send({ id, data: { versions: [...versions, { ...versions[0], hash: bogus, seq: 0 }], left } });
+    await page.settle();
+    await page.click(page.all("#versions button")[3]);
+    await until(page.settle, "the refusal for a hash the document never had", () => errored.length > 0);
+    const refusal =
+      `[historyView] Expected a past version of ${id}, received no rows for hash ${bogus}. Source: history. Fix: reopen the sheet's history and pick another version.`;
+    assertEquals([errored, shown.length], [[refusal], 1], "a hash this document never had is refused by name");
+    assert(page.text().includes(refusal), "inside the modal, where the scrim does not cover it");
     page.close();
   },
 });

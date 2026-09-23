@@ -25,7 +25,7 @@
     </script>
     <script type="module">
       // Initialize Automerge WASM first
-      import { decodeSyncMessage, initializeWasm } from "@automerge/automerge";
+      import { decodeSyncMessage, getHistory, initializeWasm, view } from "@automerge/automerge";
       await initializeWasm(fetch("/automerge.wasm"));
 
       // Import Automerge packages
@@ -47,6 +47,7 @@
         rememberedTypes,
         PARSERS,
         sheets,
+        trapStep,
       } from "/page.mjs";
       import {
         chartSql,
@@ -293,11 +294,65 @@
           codeEditor.dispatchEvent(new Event('input', { bubbles: true }));
         });
 
+        // Elm cannot read `activeElement`, so the modal focus trap lives here.
+        // `viewModal` marks every modal with aria-modal.
+        const MODAL = '[aria-modal="true"]';
+        // A browser never focuses an input of type hidden, even on an explicit
+        // focus() call, so `:not([disabled])` alone does not make an input a stop.
+        const FOCUSABLE =
+          'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+        const topModal = () => [...document.querySelectorAll(MODAL)].at(-1);
+        let opener;
+        let mounted;
+        // A held rename or delete closes its own input (sheet.write goes to
+        // Nothing) as soon as it starts asking, well before the dependents
+        // answer is back and the warning has anything to show. The input is
+        // gone by then and activeElement has already fallen back to <body>, so
+        // the warning's opener would be the body rather than the cell the edit
+        // came from. Tracked on every focus instead, by the grid around the
+        // cell rather than the cell's own editor, because the editor is what
+        // disappears; given a tabindex the same ad hoc way a modal with
+        // nothing focusable inside gets one below.
+        let lastFocused;
+        document.addEventListener('focusin', (e) => {
+          const stop = e.target.closest?.('table[role="grid"]') ?? e.target;
+          if (stop !== document.body) lastFocused = stop;
+        });
+        // Capture phase, so Elm's document keydown never hears a Tab while a
+        // modal is up: it would move the grid selection behind the modal.
+        document.addEventListener('keydown', (e) => {
+          const modal = topModal();
+          if (e.key !== 'Tab' || !modal) return;
+          e.preventDefault();
+          e.stopPropagation();
+          const stops = [...modal.querySelectorAll(FOCUSABLE)];
+          const at = trapStep(stops.length, stops.indexOf(document.activeElement), e.shiftKey);
+          (at === -1 ? modal : stops[at]).focus();
+        }, true);
+
         // Re-setup editor tracking when DOM changes (e.g., navigating to a query)
         const observer = new MutationObserver(() => {
           if (document.getElementById('code')) {
             setupQueryEditorTracking();
           }
+          const modal = topModal();
+          if (modal && !mounted) {
+            opener = document.activeElement === document.body && lastFocused?.isConnected
+              ? lastFocused
+              : document.activeElement;
+          }
+          if (modal && modal !== mounted && !modal.contains(document.activeElement)) {
+            // A dialog is not focusable without a tabindex, and one with no
+            // control inside must still hold focus.
+            modal.tabIndex = -1;
+            (modal.querySelector(FOCUSABLE) ?? modal).focus();
+          }
+          if (!modal && mounted && opener.isConnected) {
+            // The grid fallback above is not naturally focusable either.
+            if (opener.tabIndex < 0) opener.tabIndex = -1;
+            opener.focus();
+          }
+          mounted = modal;
         });
         observer.observe(document.body, { childList: true, subtree: true });
 
@@ -371,6 +426,35 @@
           // reload, which is the whole point of not waiting for the status email.
           setInterval(loadFreshness, 60000);
 
+          // Who reads sheet `id`, asked before a rename or a delete. Every path
+          // answers, so the edit Elm holds never waits on a silence. The server
+          // traces only a logged-in reader's own sheets, and nothing traces the
+          // sheets that ship with the page, so those two answer why not.
+          const loadLineage = async (id) => {
+            const unknown = (error) => app.ports.lineageLoaded.send({ id, error });
+            const token = getAuthToken();
+            if (!token) return unknown("you are not logged in, and only a logged-in reader's sheets are traced.");
+            if (Library.get()[id]?.doc) return unknown("this sheet ships with the page, and the sheets that read it are traced nowhere.");
+            try {
+              const res = await fetch(`${API_BASE}/library/lineage`, {
+                headers: { Authorization: `Bearer ${token}` },
+                // The edit is held until this answers; a stalled socket otherwise
+                // holds it for as long as the browser keeps the request open.
+                signal: AbortSignal.timeout(10000),
+              });
+              if (!res.ok)
+                return unknown(
+                  `the read failed (${res.status}): ${httpErrorDetail(await res.text(), res.headers.get("Content-Type") ?? "")}`,
+                );
+              const { data } = await res.json();
+              // data[0] is the column list, as every sheet read sends it.
+              app.ports.lineageLoaded.send({ id, rows: data.slice(1) });
+            } catch (err) {
+              unknown(`the read failed: ${err?.message ?? String(err)}`);
+            }
+          };
+          app.ports.lineageFor.subscribe(loadLineage);
+
           // Sharing lives here rather than in Elm because the JWT does. Every
           // action re-reads the member list, so the modal never shows stale state.
           //
@@ -398,6 +482,41 @@
             const { data } = await res.json();
             app.ports.preflightLoaded.send({ id, data });
           }, 'preflight'));
+
+          // `.change` and never `.snapshot`: a snapshot rebuilds the whole
+          // document once per version. Only the newest HISTORY_MAX are decoded.
+          const HISTORY_MAX = 200;
+          const openDoc = (id) => {
+            const [, doc_id] = id.split(":");
+            if (sheet?.documentId !== doc_id)
+              throw new Error(
+                `Expected the open sheet's automerge document for ${id}, received ${
+                  sheet ? `the one for ${sheet.documentId}` : "none"
+                }. Source: history. Fix: open the sheet again, then ask for its history.`,
+              );
+            return sheet.doc();
+          };
+          app.ports.historyLoad.subscribe(catchy((id) => {
+            const history = getHistory(openDoc(id));
+            const versions = history.slice(-HISTORY_MAX).reverse()
+              .map(({ change: { hash, time, actor, seq, message } }) => ({ hash, time, actor, seq, message }));
+            app.ports.historyLoaded.send({ id, data: { versions, left: history.length - versions.length } });
+          }, 'historyLoad'));
+          // By position under the names: `col.key` stays in the document, and a
+          // new column is named "" until somebody types a name, so rows keyed by
+          // name would keep one of a table's unnamed columns and drop the rest.
+          // `view` answers `{}` for a hash the document never had, not a throw.
+          app.ports.historyView.subscribe(catchy(({ id, hash }) => {
+            const [cols, ...rows] = view(openDoc(id), [hash]).data ?? [];
+            if (!cols)
+              throw new Error(
+                `Expected a past version of ${id}, received no rows for hash ${hash}. Source: history. Fix: reopen the sheet's history and pick another version.`,
+              );
+            app.ports.historyShown.send({
+              id,
+              data: { hash, columns: cols.map((col) => col.name), rows: rows.map((row) => cols.map((col) => row[col.key])) },
+            });
+          }, 'historyView'));
 
           // The sheet's own poll, now. The answer is the row it wrote, named by
           // sheet for the same reason a pre-flight's is: a run started on one
