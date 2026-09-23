@@ -13,6 +13,7 @@ import { Col, EXAMPLES, Table } from "./examples.mjs";
 import { PORTALS as FEEDS } from "./portals.mjs";
 import {
   applyWindows,
+  bound,
   checkResultColumns,
   DESCRIBE_COLUMNS,
   describeRef,
@@ -20,6 +21,7 @@ import {
   explain,
   loadedOf,
   loadRefs,
+  MAX_REF_DEPTH,
   nearest,
   planQuery,
   PROFILE_COLUMNS,
@@ -319,10 +321,27 @@ export const PARSERS = { "application/atom+xml": atomToJson };
 // built, and `find(doc_id)`, which pulls a document out of the automerge repo.
 // Everything else — the recursion through referenced queries, the cycle bound,
 // the column bookkeeping, the pass order — is the same in a test as in the page.
+//
+// A third, `heads(doc_id)`, turns on the cache of referenced query answers. The
+// editor runs the open query per keystroke; the cache keeps each run from
+// re-running every query under it from the leaves.
 
-export const sheets = (alasql, shelf, find) => {
+export const QUERY_CACHE_MAX = 64;
+
+// A call whose answer changes with no document changing. `sample_*` is seeded
+// off its own arguments, so it is not here. It reads the raw text: AlaSQL
+// takes "…" as a string too, so blanking '…' spans can swallow a real call. A
+// quoted word costs a miss, never a stale answer.
+const VOLATILE =
+  /\b(?:http|now|random|getdate|curdate|newid|uuid|gen_random_uuid)\s*\(|\bfrom\s+http\b|\bcurrent_(?:date|time|timestamp)\b/i;
+
+export const sheets = (alasql, shelf, find, heads) => {
   const rows = new Map();
   const types = new Map();
+  // JSON.stringify([id, code]) -> { deps: [[sheet id, heads]], depth, answer }
+  const cached = new Map();
+  // A bundled document ships with the build and never changes under it.
+  const headsOf = (id) => shelf()[id]?.doc ? "bundled" : heads(id.split(":")[1]);
 
   alasql.from.SHEET = (id, _opts, cb, idx, query) => {
     let res = rows.get(id) ?? (shelf()[id]?.doc?.data && toRecords(shelf()[id].doc.data));
@@ -352,7 +371,10 @@ export const sheets = (alasql, shelf, find) => {
    * name gets matched against. */
   const columns = () => [...new Set([...rows.values()].flatMap((rs) => Object.keys(rs?.[0] ?? {})))];
 
-  const runSql = async (code, params, path = []) => {
+  // `reads` collects what this run read, nested runs included: every document
+  // and its heads, the longest chain of refs below, and whether any statement
+  // on the way was volatile.
+  const runSql = async (code, params, path = [], reads = { deps: new Map(), depth: 0, volatile: false }) => {
     // `describe @table:abc` never reaches the engine: it loads the one sheet it
     // names and reports its shape. Same statement, same answer, on the server.
     // `explain <query>` runs the query and answers with its profile instead.
@@ -371,6 +393,9 @@ export const sheets = (alasql, shelf, find) => {
         const [type, ref_id] = id.split(":");
         if (!["table", "query"].includes(type))
           throw new Error(`@${id}: only table and query sheets can be referenced in queries.`);
+        // Heads before the document: a change that lands between the two reads
+        // costs a miss, never a stale hit.
+        const at = heads && await headsOf(id);
         const doc = shelf()[id]?.doc ?? await find(ref_id);
         if (!doc?.data) {
           const known = Object.keys(shelf()).filter((k) => /^(table|query):/.test(k));
@@ -383,16 +408,35 @@ export const sheets = (alasql, shelf, find) => {
             `  Fix:          ${hit ? `write @${hit} instead` : "open the sheet once so it loads, or check the id"}`,
           ].join("\n"));
         }
+        if (heads) reads.deps.set(id, at);
         // A referenced query runs through runSql too, so a window inside one is
         // computed rather than handed to AlaSQL. The server recurses in `sheet()`
         // instead, which is the one place the two engines are shaped differently.
-        if (type !== "query") return doc.data;
-        const inner = await runSql(doc.data[0].code, { "": null }, [...path, id]);
+        if (type !== "query") {
+          reads.depth = Math.max(reads.depth, 1);
+          return doc.data;
+        }
+        const text = doc.data[0].code;
+        const key = JSON.stringify([id, text]);
+        const hit = cached.get(key);
+        // A hit skips checkRefPath below it. Past MAX_REF_DEPTH it runs cold, so
+        // the refusal is the one the server gives.
+        if (hit && path.length + hit.depth < MAX_REF_DEPTH) {
+          const now = await Promise.all(hit.deps.map(([dep]) => headsOf(dep)));
+          if (hit.deps.every(([, then], i) => now[i] === then)) {
+            for (const [dep, then] of hit.deps) reads.deps.set(dep, then);
+            reads.depth = Math.max(reads.depth, 1 + hit.depth);
+            return hit.answer;
+          }
+        }
+        cached.delete(key);
+        const nested = { deps: new Map(), depth: 0, volatile: VOLATILE.test(text) };
+        const inner = await runSql(text, { "": null }, [...path, id], nested);
         // A query sheet's columns carry the types its select list produced,
         // which runSql has already stamped on them. Without them
         // `describe @query:x` reported every type as undefined in the page and
         // the real one on the server, off the same query.
-        return [
+        const answer = [
           Object.fromEntries(inner.columns.map((c, i) => [i, {
             key: c.columnid,
             name: c.columnid,
@@ -400,6 +444,14 @@ export const sheets = (alasql, shelf, find) => {
           }])),
           ...inner.data,
         ];
+        for (const [dep, then] of nested.deps) reads.deps.set(dep, then);
+        reads.depth = Math.max(reads.depth, 1 + nested.depth);
+        reads.volatile ||= nested.volatile;
+        if (heads && !nested.volatile) {
+          cached.set(key, { deps: [...nested.deps], depth: nested.depth, answer });
+          bound(cached, QUERY_CACHE_MAX);
+        }
+        return answer;
       },
       // Kept as they load, so SHEET can serve them and a nested query sees what
       // its parent already fetched.
@@ -488,6 +540,60 @@ export const rememberedTypes = (imports, cols) => {
     type: remembered[col.name] ?? col.type,
     remembered: col.name in remembered,
   }));
+};
+
+export const SHARE_MANY_MAX = 100;
+const SHARE_MANY_AT_ONCE = 4;
+
+/** `send(id)` resolves when the server keeps the share and throws an error
+ * carrying the answer's `status` when it does not. A `shelf` entry with a
+ * `doc` ships with the page, so the server has no row for it. */
+export const shareMany = async (ids, send, shelf) => {
+  if (!Array.isArray(ids) || ids.length > SHARE_MANY_MAX) {
+    throw new Error(explain(`I cannot share that many sheets in one step.`, {
+      Expected: `at most ${SHARE_MANY_MAX} sheets`,
+      Received: Array.isArray(ids) ? `${ids.length} sheets` : show(ids),
+      Source: "share selected, in the library strip",
+      Fix: `select at most ${SHARE_MANY_MAX} rows, share them, then select and share the rest`,
+    }));
+  }
+  const refusals = new Map();
+  const shared = new Set();
+  const asked = ids.filter((id) => {
+    if (!shelf[id]?.doc) return true;
+    refusals.set(id, "it ships with the page, so it has no members. Fork it, then share the fork");
+    return false;
+  });
+  const ask = async (id) => {
+    try {
+      await send(id);
+      shared.add(id);
+    } catch (err) {
+      refusals.set(id, err?.message ?? String(err));
+      return err;
+    }
+  };
+  const probe = asked.length ? await ask(asked[0]) : undefined;
+  // POST /library/:id/share checks the owner first and the body and the
+  // address after, so a 400 or a 404 on one sheet is the answer for all.
+  if ([400, 404].includes(probe?.status)) {
+    if (asked.length > 1) {
+      refusals.set(
+        asked[0],
+        `${refusals.get(asked[0])} The other ${asked.length - 1} were not asked: each would get this answer.`,
+      );
+    }
+  } else if (asked.length > 1) {
+    let next = 1;
+    const worker = async () => {
+      while (next < asked.length) await ask(asked[next++]);
+    };
+    await Promise.all(Array.from({ length: Math.min(SHARE_MANY_AT_ONCE, asked.length - 1) }, worker));
+  }
+  return {
+    shared: ids.filter((id) => shared.has(id)),
+    refused: ids.filter((id) => refusals.has(id)).map((id) => ({ id, error: refusals.get(id) })),
+  };
 };
 
 /** Where a Tab lands among a modal's `count` focusable elements when focus is

@@ -193,6 +193,22 @@ const diff = (u, a, b) => {
   return Math.trunc((b.getTime() - a.getTime()) / ms);
 };
 
+// A business day is a weekday, holidays included: table:holidays ends, and a schedule that silently stops skipping
+// them is worse than one that never does.
+const weekday = (d) => d.getUTCDay() !== 0 && d.getUTCDay() !== 6;
+
+// The day of the month that is the nth weekday of `month` (1-12), counted from the end when n is negative, so -1 is the
+// last. Null when the month holds fewer.
+export const nthWeekday = (year, month, n) => {
+  const days = [];
+  for (let day = 1; day <= 31; day++) {
+    const d = new Date(Date.UTC(year, month - 1, day));
+    if (d.getUTCMonth() !== month - 1) break;
+    if (weekday(d)) days.push(day);
+  }
+  return days.at(n > 0 ? n - 1 : n) ?? null;
+};
+
 // --- text similarity
 
 export const levenshtein = (a, b) => {
@@ -417,11 +433,11 @@ export const checkCells = (cells, rowsOf, colsOf = {}) => {
   }
 };
 
-const MAX_REF_DEPTH = 8;
+export const MAX_REF_DEPTH = 8;
 
 // Bounds the @query -> @query chain. A cycle is reported as the path that closes
 // it, because "nested too deeply" sends you looking for the wrong problem.
-const checkRefPath = (path, id) => {
+export const checkRefPath = (path, id) => {
   if (path.includes(id)) {
     throw new Error(
       `Query references form a cycle: ${
@@ -718,9 +734,45 @@ export const checkColumnTypes = (id, cols, rows) => {
 // sheets pays it too, and the fix is the same, filter each sheet first. The
 // bound sits above every bundled demo, which examples_test.ts proves.
 
+// A map that grows with traffic is capped by count as well as swept by idle
+// time: a caller can mint keys faster than a sweep runs.
+export const bound = (map, max) => {
+  while (map.size > max) map.delete(map.keys().next().value);
+};
+
 export const MAX_QUERY_ROWS = 200_000;
 export const MAX_QUERY_MS = 15_000;
 export const MAX_JOIN_ROWS = 10_000_000;
+
+// AlaSQL's grammar aggregators, then every alasql.aggr entry after register(),
+// by name. examples_test.ts holds this a superset of both engines'.
+export const AGGREGATES = [
+  "aggr",
+  "array",
+  "avg",
+  "count",
+  "first",
+  "group_concat",
+  "last",
+  "max",
+  "min",
+  "sum",
+  "total",
+  "array_agg",
+  "max_text",
+  "median",
+  "min_text",
+  "mode",
+  "quart",
+  "quart2",
+  "quart3",
+  "std",
+  "stddev",
+  "stdev",
+  "stdevp",
+  "var",
+  "varp",
+];
 
 export const checkQueryRows = (total, id) => {
   if (total <= MAX_QUERY_ROWS) return total;
@@ -732,18 +784,84 @@ export const checkQueryRows = (total, id) => {
   }));
 };
 
+const CLAUSE = /\b(select|from|where|group|having|order|limit|offset|union|except|intersect|qualify|pivot|unpivot)\b/gi;
+const clauseAt = (s, depth, level, from, to) => {
+  let last = null;
+  for (let m; (m = findAt(s, depth, CLAUSE, level, from, to)); from = m.index + m[0].length) last = m[1].toLowerCase();
+  return last;
+};
+
 export const checkJoinRows = (sql, docs) => {
   // Every SHEET('id') in the scanned SQL is one from-clause occurrence; a cell
   // ref's scalar subquery is one too, over one row, so it multiplies by one.
-  const walked = [...sql.matchAll(/SHEET\('([^']+)'\)/g)].map((m) => m[1]).filter((id) => docs[id]);
-  const product = walked.reduce((n, id) => n * docs[id].length, 1);
-  if (product <= MAX_JOIN_ROWS) return;
-  throw new Error(explain(`This query joins more rows than one run is allowed.`, {
-    Received: `${product} pairs to walk: ${walked.map((id) => `@${id} (${docs[id].length})`).join(" × ")}`,
-    Limit: `${MAX_JOIN_ROWS} pairs across the from clause of one query, counted before any where or on`,
-    Source: "the @sheet refs joined in this query",
-    Fix: "filter each large sheet in its own query sheet first, then join those",
-  }));
+  // AlaSQL runs a subquery in a from clause once and joins its answer, so an
+  // ungrouped subquery whose every column sits inside an aggregate walks its
+  // own product and hands the outer one a single row.
+  const depth = topLevel(sql);
+  // The bracket that holds each position, or -1 at the top level. One forward
+  // pass: a backward search from each ref is quadratic in the refs.
+  const held = [];
+  for (let i = 0, open = [-1]; i < sql.length; i++) {
+    if (depth[i] >= 0 && (sql[i] === ")" || sql[i] === "]")) open.pop();
+    held.push(open.at(-1));
+    if (depth[i] >= 0 && (sql[i] === "(" || sql[i] === "[")) open.push(i);
+  }
+  const refs = [...sql.matchAll(/SHEET\('([^']+)'\)/g)].filter((m) => docs[m[1]]);
+  // A subquery is judged once, off its first ref. Each `continue` leaves it
+  // charged to the product around it, as before.
+  const judged = new Set(), single = new Set();
+  for (const { index: at } of refs) {
+    const o = held[at];
+    if (o < 0 || sql[o] !== "(" || judged.has(o)) continue;
+    judged.add(o);
+    const c = closeAt(sql, depth, o), level = depth[o] + 1;
+    if (c < 0) continue;
+    const select = findAt(sql, depth, /\bselect\b/gi, level, o + 1, c);
+    if (!select || sql.slice(o + 1, select.index).trim() !== "") continue;
+    const from = findAt(sql, depth, /\bfrom\b/gi, level, select.index, c);
+    if (!from || from.index > at || clauseAt(sql, depth, level, o + 1, at) !== "from") continue;
+    if (findAt(sql, depth, /\b(?:union|except|intersect)\b|\bgroup\s+by\b/gi, level, o + 1, c)) continue;
+    const outer = held[o] + 1;
+    if (!/(?:\bfrom|\bjoin|,)\s*$/i.test(sql.slice(outer, o))) continue;
+    if (clauseAt(sql, depth, depth[o], outer, o) !== "from") continue;
+    const items = splitAt(sql, depth, select.index + select[0].length, from.index, level);
+    const aggregated = items.every(([a, b]) => {
+      if (/\bover\b/i.test(sql.slice(a, b))) return false;
+      let rest = sql.slice(a, b), calls = 0;
+      const call = /\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
+      call.lastIndex = a;
+      for (let m; (m = call.exec(sql)) && m.index < b;) {
+        if (depth[m.index] < 0 || !AGGREGATES.includes(m[1].toLowerCase())) continue;
+        const open = m.index + m[0].length - 1, close = closeAt(sql, depth, open);
+        if (close < 0 || close >= b) return false;
+        // AlaSQL parses a min() or max() of two or more arguments as the scalar.
+        if (/^m(?:in|ax)$/i.test(m[1]) && splitAt(sql, depth, open + 1, close, depth[open] + 1).length > 1) continue;
+        rest = rest.slice(0, m.index - a) + " ".repeat(close + 1 - m.index) + rest.slice(close + 1 - a);
+        calls++;
+        call.lastIndex = close + 1;
+      }
+      return calls > 0 && namesIn(rest).length === 0;
+    });
+    if (items.length && aggregated) single.add(o);
+  }
+  // Each ref multiplies into the nearest one-row subquery around it, or into
+  // the statement's own from clause.
+  const scopes = new Map();
+  for (const { index: at, 1: id } of refs) {
+    let o = held[at];
+    while (o >= 0 && !single.has(o)) o = held[o];
+    scopes.set(o, [...(scopes.get(o) ?? []), id]);
+  }
+  for (const walked of scopes.values()) {
+    const product = walked.reduce((n, id) => n * docs[id].length, 1);
+    if (product <= MAX_JOIN_ROWS) continue;
+    throw new Error(explain(`This query joins more rows than one run is allowed.`, {
+      Received: `${product} pairs to walk: ${walked.map((id) => `@${id} (${docs[id].length})`).join(" × ")}`,
+      Limit: `${MAX_JOIN_ROWS} pairs across the from clause of one query, counted before any where or on`,
+      Source: "the @sheet refs joined in this query",
+      Fix: "filter each large sheet in its own query sheet first, then join those",
+    }));
+  }
 };
 
 // --- error formatting
@@ -1078,10 +1196,10 @@ const splitAt = (s, depth, from, to, level) => {
   return spans.filter(([a, b]) => s.slice(a, b).trim() !== "");
 };
 
-const BOUND = /^(?:(unbounded)\s+(preceding|following)|(current)\s+row|(\d+)\s+(preceding|following))$/i;
+const FRAME_EDGE = /^(?:(unbounded)\s+(preceding|following)|(current)\s+row|(\d+)\s+(preceding|following))$/i;
 
-const bound = (text, spec) => {
-  const m = text.trim().match(BOUND);
+const frameEdge = (text, spec) => {
+  const m = text.trim().match(FRAME_EDGE);
   if (!m) {
     throw new Error(explain(`A window frame bound is not one I understand.`, {
       Expected: "unbounded preceding, N preceding, current row, N following, or unbounded following",
@@ -1106,8 +1224,8 @@ const parseFrame = (text, spec) => {
     }));
   }
   const mode = m[1].toLowerCase();
-  const start = bound(m[2] ?? m[4], spec);
-  const end = m[3] === undefined ? { at: 0 } : bound(m[3], spec);
+  const start = frameEdge(m[2] ?? m[4], spec);
+  const end = m[3] === undefined ? { at: 0 } : frameEdge(m[3], spec);
   // A range frame counts peers, not rows, so an offset in rows has no meaning here.
   if (mode === "range" && [start.at, end.at].some((n) => Number.isFinite(n) && n !== 0)) {
     throw new Error(explain(`A range frame cannot count a number of rows.`, {
@@ -3561,10 +3679,7 @@ export const register = (alasql) => {
     const sign = from <= to ? 1 : -1;
     if (sign < 0) [from, to] = [to, from];
     let n = 0;
-    for (let d = from; d < to; d = new Date(d.getTime() + DAY)) {
-      const w = d.getUTCDay();
-      if (w !== 0 && w !== 6) n++;
-    }
+    for (let d = from; d < to; d = new Date(d.getTime() + DAY)) if (weekday(d)) n++;
     return n * sign;
   };
 

@@ -17,13 +17,11 @@ suite : Test
 suite =
     describe "Main"
         [ describe "unviewable"
-            [ test "a codex sheet points at the route that reads it, not at a query that cannot" <|
+            [ test "names no codex route: a codex sheet has its own view" <|
                 \_ ->
                     unviewable "codex-db" "codex-db:abc"
-                        |> Expect.all
-                            [ String.contains "GET /codex/codex-db:abc" >> Expect.equal True
-                            , String.contains "select * from" >> Expect.equal False
-                            ]
+                        |> String.contains "/codex/"
+                        |> Expect.equal False
             , test "a portal is read live, and a template is bought" <|
                 \_ ->
                     ( unviewable "portal" "portal:x", unviewable "template" "template:y" )
@@ -569,15 +567,15 @@ suite =
             [ test "net-http decodes url and interval; headers, method, body and the paging fields default to one plain GET" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False, cron = "", timezone = "" }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False, cron = "", timezone = "", businessDay = Nothing }))
             , test "net-http decodes a headers string" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"headers":"X-Key: abc"}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "X-Key: abc", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False, cron = "", timezone = "" }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "X-Key: abc", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False, cron = "", timezone = "", businessDay = Nothing }))
             , test "net-http decodes the method and body it posts with, and the schedule it runs on" <|
                 \_ ->
-                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"method":"POST","body":"{}","cron":"0 9 * * 1-5","timezone":"America/Chicago"}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "POST", body = "{}", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False, cron = "0 9 * * 1-5", timezone = "America/Chicago" }))
+                    D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"method":"POST","body":"{}","cron":"0 9 * * *","timezone":"America/Chicago","business_day":3}]}"""
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "POST", body = "{}", pageBy = "", pageParam = "", pagePath = "", mode = "", key = "", rowsPath = "", paused = False, cron = "0 9 * * *", timezone = "America/Chicago", businessDay = Just 3 }))
             , test "net-http refuses a method the poller would not send" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"method":"PATCH"}]}"""
@@ -596,7 +594,7 @@ suite =
             , test "net-http decodes the paging fields the poller reads a whole feed with" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"page_by":"cursor","page_param":"after","page_path":"meta.next"}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "cursor", pageParam = "after", pagePath = "meta.next", mode = "", key = "", rowsPath = "", paused = False, cron = "", timezone = "" }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "cursor", pageParam = "after", pagePath = "meta.next", mode = "", key = "", rowsPath = "", paused = False, cron = "", timezone = "", businessDay = Nothing }))
             , test "net-http refuses a paging mode the poller does not know" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"page_by":"scroll"}]}"""
@@ -605,7 +603,7 @@ suite =
             , test "net-http decodes what a good run does to the runs before it" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"mode":"upsert","key":"id","rows_path":"data"}]}"""
-                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "upsert", key = "id", rowsPath = "data", paused = False, cron = "", timezone = "" }))
+                        |> Expect.equal (Ok (NetHttp { url = "https://x.test", interval = 60, headers = "", method = "GET", body = "", pageBy = "", pageParam = "", pagePath = "", mode = "upsert", key = "id", rowsPath = "data", paused = False, cron = "", timezone = "", businessDay = Nothing }))
             , test "net-http refuses a storage mode the poller does not know" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"net-http","data":[{"url":"https://x.test","interval":60,"mode":"merge"}]}"""
@@ -619,11 +617,11 @@ suite =
             , test "alert without a when fires on rows, the way it did before there was one" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60}]}"""
-                        |> Expect.equal (Ok (Alert { code = "", to = "", interval = 60, digest = False, when = OnRows, paused = False, snoozedUntil = "", cron = "", timezone = "" }))
-            , test "alert decodes its when and its schedule" <|
+                        |> Expect.equal (Ok (Alert { code = "", to = "", interval = 60, digest = False, when = OnRows, paused = False, snoozedUntil = "", cron = "", timezone = "", businessDay = Nothing, upstream = False }))
+            , test "alert decodes its when, its schedule and its upstream switch" <|
                 \_ ->
-                    D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60,"when":"added","cron":"0 9 * * 1-5","timezone":"America/Chicago"}]}"""
-                        |> Expect.equal (Ok (Alert { code = "", to = "", interval = 60, digest = False, when = OnAdded, paused = False, snoozedUntil = "", cron = "0 9 * * 1-5", timezone = "America/Chicago" }))
+                    D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60,"when":"added","cron":"0 9 * * *","timezone":"America/Chicago","business_day":-1,"upstream":true}]}"""
+                        |> Expect.equal (Ok (Alert { code = "", to = "", interval = 60, digest = False, when = OnAdded, paused = False, snoozedUntil = "", cron = "0 9 * * *", timezone = "America/Chicago", businessDay = Just -1, upstream = True }))
             , test "alert with an unknown when is refused rather than shown as rows" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"alert","data":[{"code":"","to":"","interval":60,"when":"bogus"}]}"""
@@ -650,10 +648,27 @@ suite =
                 \_ ->
                     D.decodeString docDecoder """{"type":"template"}"""
                         |> Expect.equal (Ok (Unviewable "template"))
-            , test "any codex-* type decodes to Unviewable" <|
+            , test "a codex-* type decodes to Codex, which has a view" <|
                 \_ ->
-                    D.decodeString docDecoder """{"type":"codex-db"}"""
-                        |> Expect.equal (Ok (Unviewable "codex-db"))
+                    ( D.decodeString docDecoder """{"type":"codex-db"}""", D.decodeString docDecoder """{"type":"codex-scrapsheets"}""" )
+                        |> Expect.equal ( Ok (Codex "codex-db"), Ok (Codex "codex-scrapsheets") )
+            , describe "codexTablesDecoder"
+                [ test "codex-db's column list is keyed by the catalogue's names" <|
+                    \_ ->
+                        D.decodeString codexTablesDecoder
+                            """[[{"name":"name","type":"text","key":"name"},{"name":"columns","type":"text","key":"columns"}],
+                                {"name":"orders","columns":[[{"name":"name","type":"text","key":"column_name"},{"name":"type","type":"text","key":"data_type"},{"name":"key","type":"int","key":"ordinal_position"}],
+                                  {"column_name":"id","data_type":"integer","ordinal_position":1},
+                                  {"column_name":"placed","data_type":"timestamp with time zone","ordinal_position":2}]}]"""
+                            |> Expect.equal (Ok [ { name = "orders", columns = [ ( "id", "integer" ), ( "placed", "timestamp with time zone" ) ] } ])
+                , test "codex-scrapsheets' column list is keyed by position" <|
+                    \_ ->
+                        D.decodeString codexTablesDecoder
+                            """[[{"name":"name","type":"text","key":"name"},{"name":"columns","type":"table","key":"columns"}],
+                                {"name":"shop","columns":[[{"name":"name","type":"text","key":0},{"name":"type","type":"text","key":1},{"name":"key","type":"int","key":2}],
+                                  ["created_at","text",0],["sell_id","text",1]]}]"""
+                            |> Expect.equal (Ok [ { name = "shop", columns = [ ( "created_at", "text" ), ( "sell_id", "text" ) ] } ])
+                ]
             , test "an unrecognized type fails to decode" <|
                 \_ ->
                     D.decodeString docDecoder """{"type":"wat"}"""

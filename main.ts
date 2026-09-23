@@ -35,11 +35,13 @@ import { DATASETS } from "./src/examples.mjs";
 import { PORTALS } from "./src/portals.mjs";
 import {
   applyWindows,
+  bound,
   CANONICAL_TYPES,
   canonicalType,
   chartSql,
   checkColumnTypes,
   checkQueryRows,
+  checkRefPath,
   checkResultColumns,
   COLUMN_TYPES,
   DECOMPOSE,
@@ -53,6 +55,7 @@ import {
   MAX_QUERY_ROWS,
   namesIn,
   nearest,
+  nthWeekday,
   NUMERIC_TYPES,
   planQuery,
   PROFILE_COLUMNS,
@@ -276,13 +279,6 @@ const hookVerify = async (secret: string, message: Uint8Array<ArrayBuffer>, sign
   return await crypto.subtle.verify("HMAC", await hmacKey(secret), bytes, message);
 };
 
-/** Caps a map by insertion order, oldest key first out. Sweeping by idle time
- * alone loses to a caller minting keys faster than the 60-second broom runs, so
- * every map that grows with traffic is capped here as well. */
-const bound = <V>(map: Map<string, V>, max: number): void => {
-  while (map.size > max) map.delete(map.keys().next().value!);
-};
-
 // Simple in-memory rate limiter (token bucket algorithm)
 export const rateLimitBuckets = new Map<string, { tokens: number; lastRefill: number }>();
 // Accounts apart from addresses: a map evicts its oldest key when it fills,
@@ -455,6 +451,7 @@ export type NetHttp = {
   paused?: boolean;
   cron?: string;
   timezone?: string;
+  business_day?: number;
 };
 // An alert is a query plus somewhere to send it. The condition is the query's
 // own where clause: it fires when the query returns a row, which is the only
@@ -473,6 +470,8 @@ export type Alert = {
   snoozed_until?: string;
   cron?: string;
   timezone?: string;
+  business_day?: number;
+  upstream?: boolean;
 };
 // A chart is a sheet: where the numbers come from, which columns to draw, and
 // -- when the rows hold more than one thing -- the column that names which
@@ -3180,7 +3179,10 @@ app.post("/net/:id", async (c) => {
     refund();
     throw err;
   }
-  if (stored) touch(sheet_id.split(":")[1]);
+  if (stored) {
+    touch(sheet_id.split(":")[1]);
+    upstreamChanged(sheet_id, Date.now());
+  }
   if (!stored) {
     refund();
     bad(409, `This delivery to ${sheet_id} has already been stored.`, {
@@ -3521,8 +3523,14 @@ const ALERT_CYCLE_MS = 3_000;
 // + interval * 1000` risks a value `Date` cannot hold, and library:freshness
 // turning that into `next_run` would then throw for every sheet on the
 // account rather than just this one -- so both pollers clamp here the same
-// way they already clamp the near end at 60.
+// way they already clamp the near end.
 const INTERVAL_MAX_S = 86_400 * 3650;
+const INTERVAL_MIN_S = 60;
+// The most weekdays a month holds: a 31-day month that starts Monday to Wednesday.
+const BUSINESS_DAY_MAX = 23;
+// The most cron runs nextDue() walks to reach a business day: a year of a daily
+// cron, which covers any month list.
+const BUSINESS_DAY_WALK_MAX = 400;
 
 // When a net-http or alert sheet is due next, and the gap to it in seconds,
 // which both pollers record as `meta.interval`. Whole and at most
@@ -3534,7 +3542,7 @@ const INTERVAL_MAX_S = 86_400 * 3650;
 // page's inputs write "" when a field is cleared, so "" is absent.
 const nextDue = (
   sheet_id: string,
-  config: { interval?: unknown; cron?: unknown; timezone?: unknown },
+  config: { interval?: unknown; cron?: unknown; timezone?: unknown; business_day?: unknown },
   now: number,
 ): { due: number; interval: number } => {
   const cron = config.cron ?? "";
@@ -3555,6 +3563,20 @@ const nextDue = (
       Fix: "write the zone's name in the timezone field, or clear it",
     }));
   }
+  const businessDay = config.business_day ?? null;
+  if (
+    businessDay !== null &&
+    !(Number.isInteger(businessDay) && businessDay !== 0 && Math.abs(businessDay as number) <= BUSINESS_DAY_MAX)
+  ) {
+    throw new Error(explain(`The business day on ${sheet_id} is not a weekday a month can hold.`, {
+      Received: show(config.business_day),
+      Expected:
+        `a whole number from 1 to ${BUSINESS_DAY_MAX}, or from -1 to -${BUSINESS_DAY_MAX} counted from the month's end, or no business day at all`,
+      Source: "data[0].business_day on the sheet's document",
+      Fix: "write 3 for the third weekday of the month, or -1 for the last",
+    }));
+  }
+  const nth = businessDay as number | null;
   if (cron === "") {
     if (timezone !== "") {
       throw new Error(explain(`The timezone on ${sheet_id} has no cron to apply to.`, {
@@ -3562,6 +3584,14 @@ const nextDue = (
         Expected: "a cron beside the timezone, or neither",
         Source: "data[0].timezone and data[0].cron on the sheet's document",
         Fix: "write a cron pattern such as 0 9 * * 1-5, or clear the timezone",
+      }));
+    }
+    if (nth !== null) {
+      throw new Error(explain(`The business day on ${sheet_id} needs a cron for its time and months.`, {
+        Received: `business_day ${show(nth)} and no cron`,
+        Expected: "a cron such as 0 9 * * * beside the business day, which gives the time and the months",
+        Source: "data[0].business_day and data[0].cron on the sheet's document",
+        Fix: "write a cron pattern such as 0 9 * * *, or clear the business day",
       }));
     }
     if (config.interval !== undefined && config.interval !== null && !(Number(config.interval) > 0)) {
@@ -3572,7 +3602,7 @@ const nextDue = (
         Fix: "put seconds in the interval cell, or clear it",
       }));
     }
-    const interval = Math.max(60, Math.min(INTERVAL_MAX_S, Math.round(Number(config.interval) || 3600)));
+    const interval = Math.max(INTERVAL_MIN_S, Math.min(INTERVAL_MAX_S, Math.round(Number(config.interval) || 3600)));
     return { due: now + interval * 1000, interval };
   }
   let schedule: Cron;
@@ -3587,6 +3617,15 @@ const nextDue = (
       Fix: "fix the pattern, or clear it to poll every interval",
     }));
   }
+  const [, , dayOfMonth, , dayOfWeek] = cron.trim().split(/\s+/);
+  if (nth !== null && (dayOfMonth !== "*" || dayOfWeek !== "*")) {
+    throw new Error(explain(`The cron on ${sheet_id} names days, and its business day names the day too.`, {
+      Received: `${show(cron)} with business_day ${show(nth)}`,
+      Expected: "* in the cron's day-of-month and day-of-week fields, such as 0 9 * * *",
+      Source: "data[0].cron and data[0].business_day on the sheet's document",
+      Fix: "write * in both day fields and let the business day pick the day, or clear the business day",
+    }));
+  }
   let next: Date | null;
   // croner reads the zone only here, so a bad zone throws here and not above.
   try {
@@ -3599,6 +3638,30 @@ const nextDue = (
       Source: "data[0].timezone on the sheet's document",
       Fix: "spell the zone the way the IANA database does",
     }));
+  }
+  // croner has no business-day field, so its runs are walked until one falls,
+  // as a date in the sheet's zone, on the month's nth weekday. A month that
+  // holds fewer weekdays has no such run and is walked past.
+  if (nth !== null) {
+    const local = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone || "UTC",
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+    });
+    for (let walked = 0; next !== null; walked++) {
+      const at = Object.fromEntries(local.formatToParts(next).map((p) => [p.type, p.value]));
+      if (nthWeekday(Number(at.year), Number(at.month), nth) === Number(at.day)) break;
+      if (walked === BUSINESS_DAY_WALK_MAX) {
+        throw new Error(explain(`The cron on ${sheet_id} never reached business day ${nth} in ${walked} runs.`, {
+          Received: `${show(cron)} with business_day ${show(nth)}, walked from ${new Date(now).toISOString()}`,
+          Expected: `business day ${nth} within ${BUSINESS_DAY_WALK_MAX} of the cron's runs`,
+          Source: "data[0].cron and data[0].business_day on the sheet's document",
+          Fix: "fire once a day, or name months that hold that many weekdays",
+        }));
+      }
+      next = schedule.nextRun(next);
+    }
   }
   if (next === null) {
     throw new Error(explain(`The cron on ${sheet_id} never fires again.`, {
@@ -5162,6 +5225,7 @@ const netRow = async (
   body: string,
   meta: Record<string, unknown>,
   storing: Storing | null,
+  now: number,
 ): Promise<void> => {
   const status = Number(meta.status);
   const good = status >= 200 && status < 300;
@@ -5171,6 +5235,7 @@ const netRow = async (
   // one bad poll is the whole of what replace must never do.
   const keys = storing?.mode === "upsert" && good ? rowKeys(storing, body) : null;
   const wrote = keys ? { ...meta, keys } : meta;
+  let inserted = false;
   await sql.begin(async (tx: Sql) => {
     // A body this sheet already holds is not appended again. The digest of a
     // good run's body rides `meta.sig`, the slot a delivery's signature takes,
@@ -5181,6 +5246,7 @@ const netRow = async (
       insert into net (sheet_id, method, body, meta) values (${sheet_id}, ${method}, ${body}, ${sql.json(wrote)})
       on conflict (sheet_id, (meta->>'sig')) do nothing returning net_id
     `;
+    inserted = !!stored;
     const [moved] = stored ? [stored] : await tx`
       update net set created_at = now(), meta = ${sql.json({ ...wrote, repeated: true })}
       where sheet_id = ${sheet_id} and meta->>'sig' = ${String(meta.sig)}
@@ -5228,6 +5294,8 @@ const netRow = async (
   // and not the feed's: a receiver told about every failed poll would hear
   // one a minute about nothing arriving.
   if (good) touch(sheet_id.split(":")[1]);
+  // A repeat moved a row this sheet already held, so nothing new arrived.
+  if (good && inserted) upstreamChanged(sheet_id, now);
 };
 
 /** One feed, polled now: the request the sheet describes, the row it writes and
@@ -5458,6 +5526,7 @@ export const pollNetSheet = async (
         }),
         { status: answered?.status ?? 0, ms: Date.now() - started, bytes: detail.length, attempt, ...carried },
         null,
+        now,
       );
     };
     const res = await request(url);
@@ -5641,23 +5710,30 @@ export const pollNetSheet = async (
     // question about the body this sheet actually holds; the watermark is
     // carried onto this one, because where the feed had been read to is true
     // whether or not this poll answered.
-    await netRow(sheet_id, method, logged, {
-      status: res.status,
-      ms: Date.now() - started,
-      // What the run read off the wire, every page of it, which is what the
-      // cap refused a byte past and what a slow feed is measured by.
-      bytes,
-      ...(res.ok
-        ? { ...kept, interval: carried.interval, sig, shape, ...(change ? { shape_change: change } : {}) }
-        : carried),
-    }, storing);
+    await netRow(
+      sheet_id,
+      method,
+      logged,
+      {
+        status: res.status,
+        ms: Date.now() - started,
+        // What the run read off the wire, every page of it, which is what the
+        // cap refused a byte past and what a slow feed is measured by.
+        bytes,
+        ...(res.ok
+          ? { ...kept, interval: carried.interval, sig, shape, ...(change ? { shape_change: change } : {}) }
+          : carried),
+      },
+      storing,
+      now,
+    );
   } catch (err) {
     const message = reason(err);
     console.error(`net-http poll ${sheet_id}:`, message);
     const failure = fetchFailure(url, headers, null, message, method, body);
     // No attempt count: giving up, a malformed Retry-After and a sheet that
     // cannot be read all land here, and the next scheduled poll starts over.
-    await netRow(sheet_id, method, JSON.stringify(failure), { status: 0, ms: 0, bytes: 0, ...carried }, null)
+    await netRow(sheet_id, method, JSON.stringify(failure), { status: 0, ms: 0, bytes: 0, ...carried }, null, now)
       .catch((dbErr: unknown) => console.error(`net-http poll ${sheet_id}: could not record the error:`, dbErr));
   }
 };
@@ -5815,6 +5891,23 @@ export const webhookTimer = setInterval(() => {
 // distinguishable from a dead one, which it is not when only changes are kept.
 
 const alertDue = new Map<string, number>();
+
+// The net-* sheets each `upstream` alert read on its last good run, and that
+// run's clock. Held in memory like the due map beside it, so a restart forgets
+// both and every alert runs on the first tick, which fills this again.
+const alertReads = new Map<string, { reads: Set<string>; ran: number }>();
+
+/** A net-* sheet stored a new row: every `upstream` alert that read it is due
+ * now, or a minute after its last run, whichever is later. A due time already
+ * sooner stays. */
+const upstreamChanged = (sheet_id: string, now: number): void => {
+  for (const [alert_id, { reads, ran }] of alertReads) {
+    const due = alertDue.get(alert_id);
+    // No due entry is an alert the next tick runs anyway.
+    if (due === undefined || !reads.has(sheet_id)) continue;
+    alertDue.set(alert_id, Math.min(due, Math.max(now, ran + INTERVAL_MIN_S * 1000)));
+  }
+};
 
 // How many matched rows an alert keeps, and so the most it can diff against the
 // run before. Past this the rows are still counted and still sent, but the run
@@ -6004,9 +6097,22 @@ export const pollAlertSheet = async (
       else alertDue.set(sheet_id, wasDue);
       return;
     }
+    // A webhook delivery can land while this run's query reads, and the query
+    // may miss it. So the reads stay held through the run, on this run's clock,
+    // and that delivery makes the alert due a minute on.
+    const held = alertReads.get(sheet_id);
+    if (held) alertReads.set(sheet_id, { reads: held.reads, ran: now });
     const next = nextDue(sheet_id, config, now);
     interval = next.interval;
     alertDue.set(sheet_id, next.due);
+    if (config.upstream !== undefined && typeof config.upstream !== "boolean") {
+      throw new Error(explain(`The upstream switch on ${sheet_id} is not true or false.`, {
+        Received: show(config.upstream),
+        Expected: "true, false, or no upstream at all",
+        Source: "data[0].upstream on the alert document",
+        Fix: "tick or clear the box in the alert's settings",
+      }));
+    }
     const when: When = config.when ?? "rows";
     if (!(ALERT_WHEN as readonly string[]).includes(when)) {
       throw new Error(explain(`The when on ${sheet_id} is not a condition an alert knows.`, {
@@ -6070,6 +6176,36 @@ export const pollAlertSheet = async (
       const text = await res.text();
       if (!res.ok) throw new Error(`the query failed with ${res.status}: ${text.slice(0, 400)}`);
       rows = (JSON.parse(text) as { data: Row[] }).data.slice(1);
+    }
+    // The feeds behind the rows: the refs, and the refs of every query sheet
+    // they name. After the query, so each document opened here is one the
+    // owner's own query has just opened.
+    if (!config.upstream) alertReads.delete(sheet_id);
+    else {
+      const reads = new Set<string>();
+      const walked = new Set<string>();
+      const walk = async (text: string, path: string[]): Promise<void> => {
+        for (const id of scanRefs(text).ids) {
+          checkRefPath(path, id);
+          if (id.startsWith("net-")) reads.add(id);
+          if (!id.startsWith("query:") || walked.has(id)) continue;
+          walked.add(id);
+          const hand = await automerge.find<{ data: Sheet["data"] }>(id.split(":")[1] as AnyDocumentId);
+          const head = (docData(hand, id)[0] ?? {}) as Record<string, unknown>;
+          if (typeof head.code !== "string") {
+            throw new Error(explain(`The query ${id}, which this alert reads, holds no code to follow.`, {
+              Received: show(head.code),
+              Expected: "the query's SQL as text",
+              Source: `data[0].code on ${id}, reached from ${sheet_id}`,
+              Fix: "write the query's SQL, or clear the upstream box on this alert",
+            }));
+          }
+          await walk(head.code, [...path, id]);
+        }
+      };
+      await walk(code, []);
+      alertReads.set(sheet_id, { reads, ran: now });
+      bound(alertReads, RATE_LIMIT_KEYS_MAX);
     }
     const fingerprint = await digest(rows);
     const [last]: { net_id: string; body: string }[] = await sql`
@@ -6202,6 +6338,8 @@ export const pollAlertSheet = async (
         : await sendWithinQuota(created_by, deliver),
     };
   } catch (err) {
+    // A failing alert waits for its own schedule, however often its feeds change.
+    alertReads.delete(sheet_id);
     const message = reason(err);
     console.error(`alert ${sheet_id}:`, message);
     record = { status: "error", rows: 0, fingerprint: await digest(message), error: message };

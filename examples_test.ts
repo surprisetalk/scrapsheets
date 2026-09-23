@@ -18,6 +18,7 @@ import page from "./src/alasql.mjs";
 import { DATASETS, EXAMPLES } from "./src/examples.mjs";
 import { sheets } from "./src/page.mjs";
 import {
+  AGGREGATES,
   applyWindows,
   chartSql,
   checkColumnTypes,
@@ -29,6 +30,7 @@ import {
   kmeansSql,
   knownType,
   MAX_EXTREMES,
+  MAX_JOIN_ROWS,
   NUMERIC_TYPES,
   planQuery,
   register,
@@ -577,6 +579,36 @@ Deno.test("a segment table answers the bundled airport regions, the same in both
     return got;
   });
   assertEquals(answers[1], answers[0], "a segment table answers differently in the page engine");
+});
+
+Deno.test("a segment table over more rows than the square root of the join cap answers in both engines", () => {
+  const n = Math.floor(Math.sqrt(MAX_JOIN_ROWS)) + 1;
+  const points = Array.from({ length: n }, (_, i) => ({ id: `p${i}`, x: i % 100, y: Math.floor(i / 100) }));
+  const loaded: Record<string, Row[]> = { "table:points": points };
+  const colsOf = { "table:points": ["id", "x", "y"].map((name) => ({ name })) };
+  const written = kmeansSql({ source: "@table:points", key: "id", columns: ["x", "y"], k: 3 });
+  const answers = engines.map(([name, engine]) => {
+    serveSheets(engine);
+    const { sql, cells } = scanRefs(written);
+    const got = engine(planQuery(sql, cells, loaded, colsOf).sql, [loaded]).data as Row[];
+    assertEquals(got.length, n, `${name}: one row per point`);
+    assertEquals(new Set(got.map((row) => row.segment)), new Set([1, 2, 3]), `${name}: three segments`);
+    return got;
+  });
+  assertEquals(answers[1], answers[0], "a segment table answers differently in the page engine");
+});
+
+Deno.test("AGGREGATES names every aggregate either engine knows", () => {
+  const grammar = [...Deno.readTextFileSync("src/alasql.mjs").matchAll(/aggregatorid===?"([A-Z_]+)"/g)]
+    .map((m) => m[1].toLowerCase())
+    // REDUCE is the route to alasql.aggr, which the loop below reads by name.
+    .filter((name) => name !== "reduce");
+  assert(grammar.includes("sum"), "the grammar scan found no aggregators; AlaSQL's bundle changed shape");
+  const registered = engines.flatMap(([, engine]) =>
+    Object.keys((engine as unknown as { aggr: Record<string, unknown> }).aggr).map((name) => name.toLowerCase())
+  );
+  for (const name of new Set([...grammar, ...registered]))
+    assert((AGGREGATES as string[]).includes(name), `AGGREGATES in src/sql.mjs is missing "${name}"`);
 });
 
 Deno.test("a segment table refuses every field it cannot build from, by name", () => {

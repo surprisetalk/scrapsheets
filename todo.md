@@ -187,26 +187,13 @@ a condition in `GET /status`, not an item here.
 ## Codex — databases
 
 - [ ] You connect the database you actually have, browse its tables, and read only the rows you filter.
-  1. The Elm half of the schema browser. A table picker over `GET /codex/:id` and a preview over
-     `GET /codex/:id/preview?table=<name>&limit=<n>`, through a port pair like freshness. Draw both as text: every
-     column is typed `text` today.
-  2. A codex query path. Today the only statements are the read-only session, `information_schema` and the preview's
+  1. A codex query path. Today the only statements are the read-only session, `information_schema` and the preview's
      `limit`. Push down only a where clause that is provably safe.
-  3. A write grant per connection, off by default, with row and column masking over that path.
-  4. Incremental sync by a watermark column. CDC or logical replication after that.
-  5. More engines, one at a time, each with its own driver and its own `cannotConnect()` mapping: MySQL, SQLite, SQL
+  2. A write grant per connection, off by default, with row and column masking over that path.
+  3. Incremental sync by a watermark column. CDC or logical replication after that.
+  4. More engines, one at a time, each with its own driver and its own `cannotConnect()` mapping: MySQL, SQLite, SQL
      Server, DuckDB, BigQuery, Snowflake, Redshift, ClickHouse, MongoDB, Athena.
-  6. SSH tunnel and TLS options.
-
----
-
-## Scheduling
-
-- [ ] A schedule means what you meant: business days, or "when upstream changes".
-  1. Business-day and fiscal triggers through `business_days()` and `fiscal_period()`, answered by `nextDue()`: the one
-     due-time rule both pollers call, which already reads `cron` and `timezone`.
-  2. "On upstream change": a net row already touches its document for `flushWebhooks`. The same touch makes its
-     dependents due.
+  5. SSH tunnel and TLS options.
 
 ---
 
@@ -243,18 +230,6 @@ a condition in `GET /status`, not an item here.
      parameter, or a Scrapscript lambda (none exists yet).
   2. The bundled sweep demo already shows the answer by search. Build goal seek on the chosen form, then add
      constraints.
-
-- [ ] You build a segment table over a sheet with more rows than the square root of `MAX_JOIN_ROWS`, and it answers in
-      both engines.
-  1. Decided: the fix goes in `checkJoinRows`, not in `kmeansSql`. AlaSQL has no `WITH` and no lateral join, so the
-     statement reads its source twice: once as the rows, and once inside `(select kmeans(…) … from <source>) m`, which
-     is one row. `checkJoinRows` multiplies every `SHEET()` and so squares the source, and its refusal tells the reader
-     to filter and join, which does not apply. `cohortSql`'s subquery groups by key and is a real join: leave it
-     charged.
-  2. Failing test first in `examples_test.ts`: `kmeansSql` over a generated table of `floor(sqrt(MAX_JOIN_ROWS)) + 1`
-     distinct rows answers in both engines.
-  3. In `checkJoinRows`, charge one row for a `SHEET()` inside a from-clause subquery that has no `group by` and only
-     aggregates in its select list.
 
 ---
 
@@ -394,9 +369,7 @@ a condition in `GET /status`, not an item here.
 ## Navigation & workspace UX
 
 - [ ] You find a sheet by what is in it.
-  1. Bulk share: one `POST /library/:id/share` per sheet, as a bounded fan-out, with one refusal that names every sheet
-     it could not share.
-  2. Global search over sheet names, column names and cell contents. Semantic search after that.
+  1. Global search over sheet names, column names and cell contents. Semantic search after that.
 
 ---
 
@@ -404,8 +377,11 @@ a condition in `GET /status`, not an item here.
 
 - [ ] A large sheet scrolls, a forty-sheet chain does not re-run on every keystroke, and a million-row join runs.
   1. Virtualized rendering. Today every row renders.
-  2. Cache a query sheet's result, keyed by its code plus the heads of every sheet it reads (`scanRefs()` gives the
-     list). An explicit refresh, and a refresh when a dependency's heads change. Recompute only what is downstream.
+  2. A nested `@query:` answer already comes from the page cache in `sheets(..., heads)` until a document it read
+     changes heads. What is left: an open query refreshes when a dependency's heads change with no keystroke, and only
+     what is downstream of the changed document runs again. Subscribe to `change` on the handle of each document the
+     open query read, drop only the cache keys that read it, and call `runQuery` once. Today nothing subscribes: the
+     next keystroke or reopen reads the new heads.
   3. Run a query in a Worker, with progress. The engine cannot be preempted, which is why `MAX_QUERY_ROWS` is the real
      guard.
   4. Chunked execution on the server past the cap, with the page reading pages of the result. `checkQueryRows()` keeps

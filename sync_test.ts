@@ -59,7 +59,7 @@ Deno.test({
       page.text().includes("Correct a type before the sheet is made"),
       `the preview is shown: ${page.text().slice(-300)}`,
     );
-    const selects = page.all("select");
+    const selects = page.all("table.import-preview select");
     assertEquals(
       selects.map((el) => (el as unknown as { value: string }).value),
       ["text", "num"],
@@ -115,7 +115,7 @@ Deno.test({
       stored: { ...imported.stored, imports: { "name\u0001code": { code: "text" } } },
     });
     await page.pickFile("more countries.csv", "name,code\nPeru,PE\n");
-    const selects = page.all("select");
+    const selects = page.all("table.import-preview select");
     assertEquals(
       selects.map((el) => (el as unknown as { value: string }).value),
       ["text", "text"],
@@ -246,6 +246,77 @@ Deno.test({
     assertEquals(anon.asked.filter((r) => r.url.endsWith("/socket")), [], "nobody logged in reports nothing");
     assert(anon.text().includes("connected"), "but the page still says what it can see");
     anon.close();
+  },
+});
+
+// A codex doc_id names the server's connection, not an automerge document, so
+// the repo is never asked for one: the sheet is read over its own routes.
+Deno.test({
+  name: "a connected database opens without the repo, lists its tables, and reads a picked one",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const found: string[] = [];
+    // The preview's body arrives only on `release()`, so the answer is still in
+    // flight when the url changes under it.
+    let release = () => {};
+    const rows = new ReadableStream({
+      start: (body) => {
+        release = () => {
+          body.enqueue(
+            new TextEncoder().encode(
+              JSON.stringify({ data: [[{ name: "sku", type: "text", key: "sku" }], { sku: "A-1" }] }),
+            ),
+          );
+          body.close();
+        };
+      },
+    });
+    const page = await glue("http://localhost/codex-db:abc", {
+      stored: { user: { usr_id: "u1", jwt: "a-token" } },
+      docs: new Proxy({}, {
+        get: (_docs, doc_id) => {
+          found.push(String(doc_id));
+          return undefined;
+        },
+      }),
+      respond: (url) =>
+        url.endsWith("/codex/codex-db:abc")
+          ? {
+            data: [
+              [{ name: "name", type: "text", key: "name" }, { name: "columns", type: "text", key: "columns" }],
+              {
+                name: "order items",
+                columns: [[{ name: "name", type: "text", key: "column_name" }, {
+                  name: "type",
+                  type: "text",
+                  key: "data_type",
+                }], { column_name: "sku", data_type: "text" }],
+              },
+            ],
+          }
+          : url.includes("/preview?")
+          ? new Response(rows, { headers: { "Content-Type": "application/json" } })
+          : { data: [] },
+    });
+    const codex = () => page.asked.filter((r) => r.url.includes("/codex/")).map((r) => r.url);
+    assertEquals(found, [], "no document is looked for");
+    assertEquals(codex(), [`${API_BASE}/codex/codex-db:abc`], "the tables are read once, and no rows yet");
+
+    await page.click(page.all("button.codex-table")[0]);
+    assertEquals(codex().at(-1), `${API_BASE}/codex/codex-db:abc/preview?table=order%20items`, "the server's own cap");
+
+    // Elm sends `changeId` on every url change, and a codex has no document for
+    // `changeId` to recognise, so opening settings selects the open sheet again.
+    const before = codex().length;
+    await page.go("/codex-db:abc#settings");
+    release();
+    const drawn = () => page.all("td").some((td) => td.textContent?.trim() === "A-1");
+    await until(page.settle, "the picked table's rows, answered after settings opened", drawn);
+    await page.go("/codex-db:abc");
+    assert(drawn(), `the rows survive closing settings: ${page.text().slice(-200)}`);
+    assertEquals(codex().length, before, "and neither url change reads the database again");
+    page.close();
   },
 });
 

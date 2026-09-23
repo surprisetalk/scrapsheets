@@ -117,8 +117,8 @@ A change that breaks one of these is a bug even if the suite is green.
   to make one.
 - **Every jsonb write goes through `sql.json(...)`**, never `JSON.stringify`.
 - **Every cast out of jsonb is guarded inside a `case`**, never beside it with `and`.
-- **Every bounded map goes through `bound(map, max)`.** Every loop, retry and recursion has a bound whose message
-  carries the counter.
+- **Every bounded map goes through `bound(map, max)`**, exported from `src/sql.mjs` so the page and the server share it.
+  Every loop, retry and recursion has a bound whose message carries the counter.
 - **One budget per sheet.** `spend(sheet_id, what, rows, bytes, fix)` on `hookBucket()`, synchronous. Every door into a
   document sheet spends one unit: a webhook delivery, a socket report, a whole read through `sheet()`, an append (its
   bytes as volume). Computed sheets are free. Spend after the access check. The refusal is an unlogged 429.
@@ -230,19 +230,25 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   that is not an object.
 - Pause and run: `paused: true` in `data[0]` skips a net-http or alert sheet and keeps its due entry. A paused sheet
   leaves the two liveness conditions until `OVERDUE_MAX`. `nextDue()` is the one due-time rule both pollers call:
-  `interval` clamped to 60..`INTERVAL_MAX_S`, or croner's next `cron` run. `POST /library/:id/run` needs
-  `assertSheetEditor`, spends `runs`, and answers the newest `net` row at or after a watermark from Postgres's clock, as
-  epoch seconds (`net.created_at` has no timezone). Refusals: paused 409, wrong type 400, nothing recorded 409\. A body
-  may carry `cursor`, an ISO date or a zoned date and time: `pollNetSheet`'s `since` replaces the stored watermark in
-  the cursor parameter and in `{{cursor}}`, and sends no conditional header. A good run still writes `cursor` as now. A
-  bad cursor is 400, a cursor on an alert 400, a cursor on a `replace` feed 409, a cursor on a feed with no `cursor`
-  field and no `{{cursor}}` in its body 409. Freshness adds `paused` and `next_run`.
-- Schedule: `cron` (five fields, `npm:croner`, `mode: "5-part"`) and `timezone` (an IANA name, UTC when absent) in
-  `data[0]` of a net-http or alert sheet. `cron` wins over `interval`, and croner only computes the time;
-  `interval = ceil((due - now) / 1000)`. `nextDue()` refuses a cron or timezone that is not text, a pattern or zone
-  croner refuses, a pattern that never fires again, a next run past `INTERVAL_MAX_S`, a timezone with no cron, and an
-  interval that is not positive. An empty string is absent. A refusal is the feed's failure row or the alert's error
-  run, and the sheet stays due in an hour. Every row both pollers write carries `meta.interval`; a feed's rides
+  `interval` clamped to `INTERVAL_MIN_S`..`INTERVAL_MAX_S`, or croner's next `cron` run, narrowed to a `business_day`
+  when one is set. `POST /library/:id/run` needs `assertSheetEditor`, spends `runs`, and answers the newest `net` row at
+  or after a watermark from Postgres's clock, as epoch seconds (`net.created_at` has no timezone). Refusals: paused 409,
+  wrong type 400, nothing recorded 409\. A body may carry `cursor`, an ISO date or a zoned date and time:
+  `pollNetSheet`'s `since` replaces the stored watermark in the cursor parameter and in `{{cursor}}`, and sends no
+  conditional header. A good run still writes `cursor` as now. A bad cursor is 400, a cursor on an alert 400, a cursor
+  on a `replace` feed 409, a cursor on a feed with no `cursor` field and no `{{cursor}}` in its body 409. Freshness adds
+  `paused` and `next_run`.
+- Schedule: `cron` (five fields, `npm:croner`, `mode: "5-part"`), `timezone` (an IANA name, UTC when absent) and
+  `business_day` sit in `data[0]` of a net-http or alert sheet. `cron` wins over `interval`, and croner only computes
+  the time; `interval = ceil((due - now) / 1000)`. `business_day` is 1..`BUSINESS_DAY_MAX`, or the same range negated to
+  count from the month's end (-1 is the last). It needs a cron with `*` in both day fields: the cron gives the time and
+  the months. `nextDue()` walks croner's runs, at most `BUSINESS_DAY_WALK_MAX`, to the first whose date in the zone
+  (`Intl.DateTimeFormat`) is `nthWeekday()`; a month with too few weekdays is walked past. A business day is a weekday,
+  and holidays are not skipped. `nextDue()` refuses a cron or timezone that is not text, a pattern or zone croner
+  refuses, a pattern that never fires again, a next run past `INTERVAL_MAX_S`, a timezone with no cron, an interval that
+  is not positive, a business day that is not a whole number in range, a business day with no cron or beside a cron that
+  names days, and a walk past its bound. An empty string is absent. A refusal is the feed's failure row or the alert's
+  error run, and the sheet stays due in an hour. Every row both pollers write carries `meta.interval`; a feed's rides
   `carried`. The feed liveness condition grades each feed against `greatest(POLL_STALE_S, 2 * meta.interval)` off its
   newest poll; the alert one against `2 * meta.interval`.
 
@@ -289,6 +295,15 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - Snooze: `snoozed_until` is an ISO timestamp in `data[0]`; one that will not parse is an error run. A snoozed run is
   decided and recorded with `delivery: snoozed`, after the no-destination check and before the digest branch. `ALERT_OK`
   admits it, `sendWithinQuota` skips it, and it is `stuck`.
+- Upstream: `upstream: true` in an alert's `data[0]` also makes it due when a feed it reads stores a new row; it sits
+  beside `interval` or `cron` and never replaces them. A good run of an upstream alert records the net-* sheets it read
+  in `alertReads` (`bound(alertReads, RATE_LIMIT_KEYS_MAX)`), with that run's clock, found after its query succeeds:
+  `scanRefs` over its code, then each `query:` ref's live `data[0].code`, bounded by `checkRefPath`. Charts, tables and
+  other alerts are not followed. `netRow` calls `upstreamChanged(sheet_id, now)` only when a 2xx run inserted its row,
+  never on a repeat, a failure or a 304; `POST /net/:id` calls it when a delivery is stored. `upstreamChanged` moves
+  `alertDue` to the later of now and the last run plus `INTERVAL_MIN_S`, never later than the due time already there. A
+  failed run, or a run without `upstream`, drops the entry. An `upstream` that is not a boolean is an error run. After a
+  restart `alertReads` is empty until each alert's first run, which is immediate because `alertDue` is empty too.
 
 **Outbound**
 
@@ -367,7 +382,7 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 `planQuery()` runs the pre-engine passes in order.
 
 - Refs: `@type:doc_id` is a sheet; `@type:doc_id.column` is a scalar from a one-row sheet. `scanRefs()` is the one
-  scanner. `checkRefPath` bounds depth and names a cycle.
+  scanner. `checkRefPath` bounds depth and names a cycle; `main.ts` imports it for the alert's upstream walk.
 - `rewriteExtremes()` runs first. It aims `min(x)` / `max(x)` at `min_text` / `max_text` when `x` is a bare column every
   loaded sheet types as one of `TEXT_TYPES`. It skips a windowed call, an expression, a name typed two ways, and a name
   the query aliases. `MAX_EXTREMES` bounds the calls.
@@ -398,6 +413,9 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - Types: `COLUMN_TYPES`, `knownType()` (the `enum:` family by prefix). `checkColumnTypes()` is where a cell becomes its
   column's type. A `duration` cell holds seconds; in a duration column the function also reads `h:mm` and `h:mm:ss`.
   `selectTypes()` and `WINDOW_TYPES` type a result off its select item.
+- Business days: `weekday()` is the one definition, Monday to Friday in UTC, holidays included; `business_days()` counts
+  through it. `nthWeekday(year, month, n)` answers the day of the nth weekday, from the end when n is negative, or null
+  when the month holds fewer. `nextDue()` in `main.ts` is its only caller.
 - Fits: `fit_exponential()`, `fit_power()` through `curve()`. `fit_hyperbolic()` is Arps decline by Levenberg-Marquardt,
   bounded by `HYPERBOLIC_STEPS` and `HYPERBOLIC_POINTS`, `b` in `(0, B_MAX]`.
 - Regression: `ols(array(y), array(x1), …)` → `[b0, b1, …]`; `ols_predict(coefs, …)`. `logit` / `logit_predict` reweight
@@ -412,11 +430,17 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   distance to every centroid overflows. `closest()` is the one distance for both.
 - Samplers: `sample_uniform`, `sample_normal`, `sample_triangular`, read back by `percentile()`. Never `Math.random`:
   each call seeds mulberry32 from an FNV-1a hash of the whole call. A non-finite draw is refused.
-- Guards: `checkQueryRows()` caps rows loaded; `checkJoinRows()` caps the from clause's product at `MAX_JOIN_ROWS`;
-  `checkResultColumns()` turns a silent undefined column into an error; `nearest()` backs every "did you mean".
+- Guards: `checkQueryRows()` caps rows loaded; `checkJoinRows()` caps each from clause's product at `MAX_JOIN_ROWS`. A
+  subquery in a from clause (after `from`, `join` or a from-clause `,`) is one row to the product around it when a
+  `SHEET()` sits in its own top-level from clause, it has no top-level `group by`, `union`, `except` or `intersect`, and
+  every select item holds an `AGGREGATES` call, no `over`, and no name `namesIn()` reads outside the calls; every ref
+  inside it multiplies into its own product, checked on its own. `AGGREGATES` is AlaSQL's grammar aggregators plus every
+  `alasql.aggr` key after `register()`; `examples_test.ts` holds it a superset of both engines'. `checkResultColumns()`
+  turns a silent undefined column into an error; `nearest()` backs every "did you mean".
 - AlaSQL gotchas: a `group by` expression sees an empty row, so bin in a subquery first. A throw inside a from-clause
   subquery is discarded; `formatQueryError()` restores it. `min()` / `max()` drop text. `total`, `store` and `class`
-  will not parse bare. Never patch `src/alasql.mjs`; `deno task vendor` rebuilds it.
+  will not parse bare. A `min()` or `max()` of two or more arguments is the scalar, not the aggregate. Never patch
+  `src/alasql.mjs`; `deno task vendor` rebuilds it.
 
 ## Frontend (`src/Main.elm`, `src/index.html`)
 
@@ -424,13 +448,13 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 
 - `update` is one exhaustive `case` with no wildcard. Long branches: `updateDocMsg`, `updateKeyDown`, `updatePaste`,
   `updateShareLoad`.
-- `Doc`: `Library`, `Shop`, `Tab`, `Query`, `NetHook`, `NetHttp`, `Alert`, `Chart`, `Dashboard`, `NetSocket`. Other
-  types decode to `Unviewable typ`; replace that branch in `docDecoder` to give one a view. `unviewable` is the message:
-  no query reads one on either host, so it names the door that does.
+- `Doc`: `Library`, `Shop`, `Tab`, `Query`, `NetHook`, `NetHttp`, `Alert`, `Chart`, `Dashboard`, `NetSocket`,
+  `Codex typ` (every `codex-*`). `portal` and `template` decode to `Unviewable typ`; replace that branch in `docDecoder`
+  to give one a view. `unviewable` is the message: no query reads one on either host, so it names the door that does.
 - Flags: `{ api, tutorial }`. A missing `api` goes to `model.error`.
 - `updateDocMsg` refuses every `DocMsg` on the library, so library verbs (`TrashSelected`, `TagSelected`,
-  `FolderSelected`) are top-level `Msg`s. They read ids through `librarySelection` (drawn order, over `libraryIdAtRow`)
-  and fan out one `updateLibrary` each.
+  `FolderSelected`, `ShareSelected`) are top-level `Msg`s. They read ids through `librarySelection` (drawn order, over
+  `libraryIdAtRow`). The first three fan out one `updateLibrary` each; `ShareSelected` sends one `shareMany`.
 
 **Library**
 
@@ -447,12 +471,28 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   sheets move from the strip: `sheet.folder`, `FolderInput`, `onEnter FolderSelected`. The name is trimmed and written
   over the old one. The strip refuses an empty name; the strip and the `folder` cell both refuse a comma. Blanking the
   cell writes `""`, never null. Search matches the folder. `SheetInfo.folder` reads a non-string as `""`.
+- Many sheets are shared with one person from the strip: `sheet.shareTo` (`type=email`, `aria-label` `share with`),
+  `sheet.shareRole` (the `share as` select: viewer, editor, owner), `onEnter ShareSelected`. `ShareSelected` refuses an
+  address with no `@` and an empty selection, then sends `shareMany { ids, email, role }`. `index.html` runs
+  `shareMany(ids, send, shelf)` from `src/page.mjs` and answers `sharedMany { ids, email, shared, refused }`.
+  `shareMany` throws past `SHARE_MANY_MAX`, refuses a sheet `shelf` holds a document for without sending it, sends the
+  first other id alone and stops there on a 400 or 404, then sends the rest `SHARE_MANY_AT_ONCE` at a time, keeping
+  every refusal in `ids` order. `send` is `POST /library/:id/share` through `API_BASE`. `SharedMany` writes a full
+  success to `sheet.shareNote` (`role="status"`) and anything refused to `model.error` as one line naming each sheet by
+  its library name.
 - Freshness: `index.html` reads `library:freshness` into `freshnessLoaded`. The column shows only when the answer is
   non-empty.
 
 **Queries and the editor**
 
-- `sheets(alasql, shelf, find)` in `src/page.mjs` runs cross-sheet queries in the page.
+- `sheets(alasql, shelf, find, heads)` in `src/page.mjs` runs cross-sheet queries in the page. A nested `@query:` answer
+  is cached; the open query is not. With `heads(doc_id)`, the `fetch` runSql passes to `loadRefs` keeps each nested
+  answer in one map keyed by `[sheet id, code]`, beside `deps` (every sheet id the run read, nested runs included, with
+  its heads) and `depth` (the longest ref chain below it). A shelf document's heads are `"bundled"`. A hit reads every
+  dep's heads again, and any difference is a miss. A hit is served only while the path above plus its `depth` stays
+  under `MAX_REF_DEPTH`. `VOLATILE` tests the raw text with string literals blanked, and a statement it matches is never
+  cached, nor is a query that reads through one, nor a refusal. `QUERY_CACHE_MAX` bounds the map. With no `heads`,
+  nothing is cached. `index.html` passes the ready handle's `heads().join()`.
 - Completion: `completionTrigger`, `completionRef`, `completionAt`. Columns come through the `columnsFor` /
   `columnsLoaded` port, answered by running `describe @<ref>` in the page. A failed ref logs by name and caches an empty
   answer. `ColumnsLoad` recomputes the open list. The dropdown is `id="complete"`.
@@ -527,10 +567,10 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 
 **Sheets with settings**
 
-- Net-http: `page_by`, `page_param`, `page_path`, `mode`, `key`, `rows_path`, `cron`, `timezone` sit in `data[0]`
-  through `optionalField`. `pageForm` and `storeForm` are the tables of what each mode takes. `pageByDecoder` and
-  `netModeDecoder` refuse unknown modes; the free-text fields are not checked. The branch is `D.map2` over two
-  `D.map7`s.
+- Net-http: `page_by`, `page_param`, `page_path`, `mode`, `key`, `rows_path`, `cron`, `timezone`, `business_day` sit in
+  `data[0]` through `optionalField`. `pageForm` and `storeForm` are the tables of what each mode takes. `pageByDecoder`
+  and `netModeDecoder` refuse unknown modes; the free-text fields are not checked. The branch is `D.map3` over two
+  `D.map7`s and `business_day`, read as `Maybe Int`.
 - Pre-flight: `preflight { id, url, headers, method, body }` → `POST /library/:id/preflight` → `preflightLoaded`,
   matched by id, drawn by `viewPreflight`.
 - History: the `history` chip in `viewToolbar` on a `Tab` that is not `system` → `HistoryOpen` → `historyLoad id` →
@@ -542,13 +582,31 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   `change <seq>`. While it is up, `updateKeyDown` answers Escape alone and `ClipboardPaste` does nothing. The glue's
   refusals ride `catchy` to `model.error`, and `viewHistory` draws `viewError` too, because the scrim covers the banner.
 - Run now and pause: a `paused` checkbox, `runNow` / `runLoaded`. `runLine` picks the shape by the row's `method`.
-- Schedule: `NetCron` and `NetTimezone` write `cron` and `timezone` through `changeDoc` on net-http and alert alike,
-  beside `NetInterval`, with `aria-label` `cron schedule` and `cron timezone`. The page checks neither field. The alert
-  branch is `D.map3` over a `D.map7` and the two schedule fields.
+- Schedule: `NetCron`, `NetTimezone` and `NetBusinessDay` write `cron`, `timezone` and `business_day` through
+  `changeDoc` on net-http and alert alike, beside `NetInterval`, with `aria-label` `cron schedule`, `cron timezone` and
+  `business day of the month`. A blank business day is a `del`; one that is not a whole number goes to `model.error`.
+  The page checks no range and no pattern. The alert's `upstream` checkbox (`aria-label`
+  `run when a feed it reads changes`) writes through `InputChange AlertUpstream`. The alert branch is `D.map5` over a
+  `D.map7`, `cron`, `timezone`, `business_day` and `upstream`.
 - Alert snooze: `snoozedUntil`, `isoStamp`; stamps compare as text.
 - Import: `CsvImportFile` / `importCsv`, or a drop through `setupDragDrop`, both into `uploadCsv` →
   `POST /import/preview` → `importPreviewed` → `viewImport` → `ImportConfirm` → `POST /import/csv`. `rememberedTypes`
   under `scrapsheets-imports` keeps types by header. `parseCsv` in `Main.elm` is the clipboard, not import.
+
+**Codex**
+
+- A codex id is no automerge document: `changeId` skips `repo.find` for a `codex-` id, and `selectDoc` hands Elm a doc
+  of `{ type }`, so the page selects a codex again on every url change. `DocSelect` sets `model.codex` (`id`, `tables`,
+  `picked`) and sends `codexLoad`; a `DocSelect` of the codex already open keeps its tables, pick and rows and sends
+  nothing. `CodexRefresh` (the "refresh" chip) asks again. Nothing polls: each list read opens a far connection and
+  writes a `codexRun` row.
+- `loadCodex` answers `codexLoaded` with `{ id, tables }` or `{ id, error }` on every path, logged out included, matched
+  by id. `codexTablesDecoder` reads both server shapes through `tableDecoder` by column name.
+- `viewCodex` lists `button.chip.codex-table` ("name · N columns", a `title` of each column and type, `aria-pressed` on
+  the pick). `CodexPick` acts only on codex-db and sends `codexPreview { id, table }`; `index.html` GETs
+  `/codex/<id>/preview?table=` with no `limit` and answers through `docQueried`. A refusal answers
+  `codexLoaded { id, error }` and clears the pick. `previewing` lets only the newest preview land. `resolveTable` says
+  what the grid waits on. codex-scrapsheets lists its tables with the buttons disabled.
 
 **Charts**
 

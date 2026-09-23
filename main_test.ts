@@ -69,7 +69,7 @@ import {
   zipData,
   zipMembers,
 } from "./main.ts";
-import type { Col, NetHttp, Query, Sheet, Table, Template } from "./main.ts";
+import type { Alert, Col, NetHttp, Query, Sheet, Table, Template } from "./main.ts";
 import { DATASETS } from "./src/examples.mjs";
 import { cohortSql, MAX_NAMES, MAX_QUERY_ROWS } from "./src/sql.mjs";
 import ala from "alasql";
@@ -10121,6 +10121,68 @@ Deno.test(async function allTests(t) {
     assertEquals(feedRun.meta.interval, gap, "a feed's poll records the gap to its next run");
     const [alertRun] = await sql`select meta from net where sheet_id = ${alert_id} order by net_id desc limit 1`;
     assertEquals(alertRun.meta.interval, gap, "an alert's run records the gap to its next run");
+
+    // A business day picks the day out of the cron's runs: the nth weekday of
+    // the month in the sheet's zone, or from the month's end when negative. The
+    // cron's month list is a quarter. The oracle counts weekdays itself.
+    const chicago = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Chicago",
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+    });
+    const businessRun = (pattern: string, n: number) => {
+      const cron = new Cron(pattern, { timezone: "America/Chicago", mode: "5-part" });
+      for (let run = cron.nextRun(new Date(clock)), i = 0; run && i < 100; run = cron.nextRun(run), i++) {
+        const [month, day, year] = chicago.format(run).split("/").map(Number);
+        const weekdays = Array.from({ length: 31 }, (_, k) => new Date(Date.UTC(year, month - 1, k + 1)))
+          .filter((d) => d.getUTCMonth() === month - 1 && d.getUTCDay() % 6 !== 0)
+          .map((d) => d.getUTCDate());
+        if (weekdays.at(n > 0 ? n - 1 : n) === day) return run;
+      }
+      throw new Error(`no business day ${n} of ${pattern} within 100 runs of ${new Date(clock).toISOString()}`);
+    };
+    const businessFeed = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{
+        url: "https://business.feeds.test/rows.json",
+        interval: 60,
+        cron: "0 9 * * *",
+        timezone: "America/Chicago",
+        business_day: 3,
+      }],
+    });
+    const businessFeedId = `net-http:${businessFeed.documentId}`;
+    await put(jwt, `/library/${businessFeedId}`, { name: "third business day feed" });
+    await pollNetSheet(
+      businessFeedId,
+      businessFeed.documentId,
+      () => Promise.resolve(new Response(`[{"n":1}]`, { headers: { "Content-Type": "application/json" } })),
+      clock,
+    );
+    alert.change((d: { data: [{ cron?: string; business_day?: number }] }) => {
+      d.data[0].cron = "0 9 * 1,4,7,10 *";
+      d.data[0].business_day = -1;
+    });
+    await pollAlertSheet(
+      { sheet_id: alert_id, doc_id: alert.documentId, name: "on demand", created_by: usr_id },
+      () => Promise.resolve("sent"),
+      clock,
+    );
+    const third = businessRun("0 9 * * *", 3), last = businessRun("0 9 * 1,4,7,10 *", -1);
+    const business = Object.fromEntries(
+      (await get<Table>(jwt, "/sheet/library:freshness")).slice(1).map((r) => [String(r.sheet_id), r]),
+    );
+    assertEquals(business[businessFeedId].next_run, third.toISOString(), "a feed runs on the third weekday");
+    assertEquals(
+      business[alert_id].next_run,
+      last.toISOString(),
+      "an alert at -1 runs on the quarter month's last weekday",
+    );
+    const [businessPoll] = await sql`
+      select meta from net where sheet_id = ${businessFeedId} and meta->>'status' = '200' order by net_id desc limit 1
+    `;
+    assertEquals(businessPoll.meta.interval, Math.ceil((third.getTime() - clock) / 1000));
   });
 
   await t.step("You re-run a feed from a past watermark", async () => {
@@ -10229,7 +10291,7 @@ Deno.test(async function allTests(t) {
   });
 
   await t.step("Within a cycle, the feeds an alert reads are polled before the alert", async () => {
-    const { jwt } = await usr("cycle@example.com");
+    const { jwt, usr_id } = await usr("cycle@example.com");
     // Two intervals of their own ran the alert against the cycle before's rows.
     // One cycle polls the feed and then runs the alert, so the count below is
     // the run this very cycle stored.
@@ -10265,6 +10327,86 @@ Deno.test(async function allTests(t) {
       ["firing", 1],
       "the alert half reads the row the feed half stored this cycle, not the cycle before's",
     );
+
+    // `upstream: true` runs an hourly alert in the cycle its feed stores a new
+    // row, through a query between them. The clocks are in the past, so no
+    // sheet an earlier step left due in the real future is taken.
+    let body = `[{"n":1}]`;
+    const upFeed = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "https://upstream.feeds.test/rows.json", interval: 60 }],
+    });
+    const upFeed_id = `net-http:${upFeed.documentId}`;
+    await put(jwt, `/library/${upFeed_id}`, { name: "upstream feed" });
+    const between = automerge.create<Sheet>({
+      type: "query",
+      data: [{ lang: "sql", code: `select created_at from @${upFeed_id}`, args: [] }],
+    });
+    const between_id = `query:${between.documentId}`;
+    await put(jwt, `/library/${between_id}`, { name: "upstream query" });
+    const alertOver = async (upstream: boolean) => {
+      const doc = automerge.create<{ data: [Alert] }>({
+        data: [{ code: `select count(*) as n from @${between_id}`, to: "", interval: 3600, upstream }],
+      });
+      const id = `alert:${doc.documentId}`;
+      await put(jwt, `/library/${id}`, { name: `upstream ${upstream}` });
+      return id;
+    };
+    const up_id = await alertOver(true);
+    const plain_id = await alertOver(false);
+    const runs = async (id: string) =>
+      Number((await sql`select count(*)::int as n from net where sheet_id = ${id}`)[0].n);
+    const upFetcher = (url: string) =>
+      Promise.resolve(
+        new Response(url === "https://upstream.feeds.test/rows.json" ? body : `[]`, {
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    const t0 = Date.now() - 600_000;
+    await pollOnce(upFetcher, () => Promise.resolve("sent"), t0);
+    assertEquals([await runs(up_id), await runs(plain_id)], [1, 1], "both alerts run once on their first tick");
+
+    body = `[{"n":2}]`;
+    const t1 = t0 + 61_000;
+    await pollOnce(upFetcher, () => Promise.resolve("sent"), t1);
+    assertEquals(await runs(upFeed_id), 2, "the feed stored a new row");
+    assertEquals(await runs(up_id), 2, "the upstream alert ran in the cycle its feed stored a new row");
+    assertEquals(await runs(plain_id), 1, "an alert without upstream keeps its hour");
+
+    // A second new row inside a minute of the last run waits for the minute.
+    body = `[{"n":3}]`;
+    netDue.set(upFeed_id, 0);
+    await pollOnce(upFetcher, () => Promise.resolve("sent"), t1 + 30_000);
+    assertEquals(await runs(upFeed_id), 3, "the feed stored a third row");
+    assertEquals(await runs(up_id), 2, "a new row inside a minute of the last run does not run it again yet");
+    await pollOnce(upFetcher, () => Promise.resolve("sent"), t1 + 61_000);
+    assertEquals(await runs(up_id), 3, "the minute after its last run, the deferred row runs it");
+
+    // The same body again moves the row it matches; nothing new arrived.
+    netDue.set(upFeed_id, 0);
+    await pollOnce(upFetcher, () => Promise.resolve("sent"), t1 + 150_000);
+    const [moved] = await sql`select meta from net where sheet_id = ${upFeed_id} order by created_at desc limit 1`;
+    assertEquals(moved.meta.repeated, true, "the feed's poll was a repeat");
+    assertEquals(await runs(up_id), 3, "a repeated body does not make the alert due");
+    assertEquals(await runs(plain_id), 1, "the plain alert still waits for its hour");
+
+    // A delivery a net-hook stores counts the same as a feed's new row.
+    const hook = automerge.create<Sheet>({ type: "net-hook", data: [] });
+    const hook_id = `net-hook:${hook.documentId}`;
+    await put(jwt, `/library/${hook_id}`, { name: "upstream hook" });
+    const hookAlert = automerge.create<{ data: [Alert] }>({
+      data: [{ code: `select body from @${hook_id}`, to: "", interval: 3600, upstream: true }],
+    });
+    const hookAlert_id = `alert:${hookAlert.documentId}`;
+    await put(jwt, `/library/${hookAlert_id}`, { name: "upstream hook alert" });
+    await pollAlertSheet(
+      { sheet_id: hookAlert_id, doc_id: hookAlert.documentId, name: "hook", created_by: usr_id },
+      () => Promise.resolve("sent"),
+      t0,
+    );
+    assertEquals((await deliver(hook_id, `{"x":1}`)).status, 200, "the signed delivery is stored");
+    await pollAlertOnce(() => Promise.resolve("sent"), Date.now());
+    assertEquals(await runs(hookAlert_id), 2, "a stored delivery runs the alert that reads it");
   });
 
   await t.step("run now: a runaway interval must not break freshness for the whole account", async () => {
@@ -10313,7 +10455,7 @@ Deno.test(async function allTests(t) {
 
   await t.step("A schedule the poller cannot follow is the sheet's own failure, naming the field", async () => {
     const { jwt, usr_id } = await usr("unscheduled@example.com");
-    type Schedule = { cron?: string; timezone?: string };
+    type Schedule = { cron?: string; timezone?: string; business_day?: unknown };
     const feed = automerge.create<{ data: [{ url: string; interval: number } & Schedule] }>({
       data: [{ url: "https://unscheduled.feeds.test/rows.json", interval: 3600 }],
     });
@@ -10336,11 +10478,18 @@ Deno.test(async function allTests(t) {
       // croner's refusal quotes the whole zone back, so this one broke the
       // row's size before the refusal cut croner's message.
       [{ cron: "0 9 * * *", timezone: "z".repeat(10_000) }, "is not a zone croner knows"],
+      [{ cron: "0 9 * * *", business_day: 0 }, "is not a weekday a month can hold"],
+      [{ cron: "0 9 * * *", business_day: -24 }, "is not a weekday a month can hold"],
+      [{ cron: "0 9 * * *", business_day: "3" }, "is not a weekday a month can hold"],
+      [{ business_day: 3 }, "needs a cron for its time and months"],
+      [{ cron: "0 9 1 * *", business_day: 3 }, "names days"],
+      [{ cron: "0 9 * * 1-5", business_day: 3 }, "names days"],
     ];
     for (const [schedule, headline] of cases) {
       const write = (d: { data: [Schedule] }) => {
         delete d.data[0].cron;
         delete d.data[0].timezone;
+        delete d.data[0].business_day;
         Object.assign(d.data[0], schedule);
       };
       feed.change(write);

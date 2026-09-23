@@ -62,7 +62,9 @@ it. A paused sheet (the checkbox beside the interval) is stepped over by the pol
 liveness grades, so pausing a feed does not read as an outage; "run now" polls it this second and answers the row it
 wrote (`POST /library/<sheet_id>/run` over HTTP), and `library:freshness` says when each sheet runs next. A `cron`
 pattern and a `timezone` beside the interval run a feed or an alert on a calendar instead, such as `0 9 * * 1-5` in
-`America/Chicago`, and `{"cursor": "2024-01-31"}` on a run asks the feed again from that date.
+`America/Chicago`, and `{"cursor": "2024-01-31"}` on a run asks the feed again from that date. `business_day: 3` beside
+a cron of `0 9 * * *` runs on the third weekday of each month (holidays are not skipped), and `upstream: true` on an
+alert also runs it as soon as a feed it reads, directly or through a query, stores a new row.
 
 A sheet can hold its own secrets instead. `POST /library/<sheet_id>/secret` with `{"name":"hook","value":"..."}` sets
 the signing key; writing it again rotates it, and the one before still verifies until a third write retires it. `GET`
@@ -153,8 +155,10 @@ recency/frequency/money scores and for `kmeans` clusters over the sheet's numeri
 A numeric column can be shaded by its own values — a colour scale, data bars or up/flat/down arrows by thirds, from the
 column's panel, stored with the arrangement — and a `json` cell holding a list of numbers draws as a sparkline. In the
 library, one tag goes onto every selected row from the strip's tag box, and a tag put on a bundled demo survives the
-next merge. "move to folder" files the selected rows the same way; a folder lives in this browser only. The shop lists
-type and tags as columns over the whole catalogue, so the column panel is the filter.
+next merge. "move to folder" files the selected rows the same way; a folder lives in this browser only. "share selected"
+shares the selected rows with one address and one role, and names in one line every sheet it could not share. A
+connected database opens as a list of its tables; picking one shows its first rows. The shop lists type and tags as
+columns over the whole catalogue, so the column panel is the filter.
 
 The library table shows the same answer per row — last run, and failures since — and the demo strip marks a sheet whose
 feed is failing, so a dead feed is visible where you open it rather than only in the 15-minute alarm email. Ctrl/⌘+K

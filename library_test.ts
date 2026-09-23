@@ -13,7 +13,7 @@
 // The two are kept even in boots, because a boot is Elm's first paint into
 // jsdom and that is what either file costs. Counted rather than eyeballed:
 // `grep -c "await boot(" page_test.ts library_test.ts`.
-import { assert, assertEquals, assertThrows } from "@std/assert";
+import { assert, assertEquals, assertRejects, assertThrows } from "@std/assert";
 import { JSDOM } from "jsdom";
 import {
   API_BASE,
@@ -29,7 +29,10 @@ import {
   library,
   mergeView,
   PORTALS,
+  QUERY_CACHE_MAX,
   rememberedTypes,
+  SHARE_MANY_MAX,
+  shareMany,
   sheets,
   trapStep,
 } from "./src/page.mjs";
@@ -96,6 +99,77 @@ Deno.test("a feed's request can be tested before the poller runs it", async () =
   });
   await settle();
   assert(text().includes("does not hold {{secret:weather}}"), "a refusal is shown in the poller's own words");
+
+  // A connected database, on the same page: its tables are asked for once as it
+  // opens, and a table's rows only once one is picked.
+  const loads: string[] = [];
+  const previews: { id: string; table: string }[] = [];
+  app.ports.codexLoad.subscribe((id: string) => loads.push(id));
+  app.ports.codexPreview.subscribe((ask: (typeof previews)[number]) => previews.push(ask));
+  app.ports.docSelected.send({ id: "codex-db:abc", data: { doc: { type: "codex-db" } } });
+  await settle();
+  assertEquals(loads, ["codex-db:abc"], "the tables are asked for once, by sheet");
+  assertEquals(previews, [], "and no rows until a table is picked");
+
+  const columnsHeader = [{ name: "name", type: "text", key: "column_name" }, {
+    name: "type",
+    type: "text",
+    key: "data_type",
+  }];
+  const tables = [
+    [{ name: "name", type: "text", key: "name" }, { name: "columns", type: "text", key: "columns" }],
+    {
+      name: "orders",
+      columns: [
+        columnsHeader,
+        { column_name: "id", data_type: "integer" },
+        { column_name: "placed", data_type: "date" },
+      ],
+    },
+  ];
+  app.ports.codexLoaded.send({ id: "codex-db:other", tables });
+  await settle();
+  assertEquals(all("button.codex-table").length, 0, "another sheet's tables are not listed here");
+
+  app.ports.codexLoaded.send({ id: "codex-db:abc", tables });
+  await settle();
+  const orders = all("button.codex-table")[0];
+  assertEquals(orders?.textContent, "orders · 2 columns");
+  assertEquals(orders?.getAttribute("title"), "id integer\nplaced date", "each column and its type");
+  assert(text().includes("Pick a table to read its first rows."), `the grid waits on a pick: ${text().slice(-300)}`);
+
+  await click(orders);
+  assertEquals(previews, [{ id: "codex-db:abc", table: "orders" }]);
+  assertEquals(all("button.codex-table")[0]?.getAttribute("aria-pressed"), "true", "the pick is marked");
+
+  app.ports.docQueried.send({
+    id: "codex-db:abc",
+    data: [[{ name: "id", type: "text", key: "id" }, { name: "placed", type: "text", key: "placed" }], {
+      id: "7",
+      placed: "2026-09-01",
+    }],
+  });
+  await settle();
+  assert(all("td").some((td) => td.textContent?.trim() === "2026-09-01"), "the preview draws as the grid");
+
+  // codex-scrapsheets answers no preview. jsdom, like a screen reader, delivers
+  // a click dispatched at a disabled button, so the update must refuse it too.
+  loads.length = 0;
+  previews.length = 0;
+  app.ports.docSelected.send({ id: "codex-scrapsheets:xyz", data: { doc: { type: "codex-scrapsheets" } } });
+  await settle();
+  assertEquals(loads, ["codex-scrapsheets:xyz"]);
+  app.ports.codexLoaded.send({ id: "codex-scrapsheets:xyz", tables: [tables[0], tables[1]] });
+  await settle();
+  const shopButton = all("button.codex-table")[0];
+  assert(
+    (shopButton as unknown as { disabled: boolean })?.disabled,
+    "the button is disabled on a sheet with no preview",
+  );
+  assert(text().includes("only a connected database answers a preview"), "the aside says why");
+  await click(shopButton);
+  assertEquals(previews, [], "a disabled table asks for no preview, even from a dispatched click");
+  assertEquals(shopButton?.getAttribute("aria-pressed"), "false", "still not picked");
 });
 
 // A feed you could not stop and could not start. The switch is a field on the
@@ -193,9 +267,20 @@ Deno.test("a feed can be paused, run now, and says when it runs next", async () 
   await settle();
   assertEquals(patches, [{ action: "set", path: [0, "paused"], value: true }]);
 
-  // The schedule is two text fields written the same way. The page checks
-  // neither: the poller's refusal is the check, and the run row shows it.
-  for (const [label, value] of [["cron schedule", "0 9 * * 1-5"], ["cron timezone", "America/Chicago"]]) {
+  // The schedule is written field by field the same way. The page checks no
+  // range: the poller's refusal is the check, and the run row shows it. A
+  // blank business day leaves the document; a fraction writes nothing and says
+  // why. jsdom sanitizes a number input as a browser does, so text never
+  // reaches the handler.
+  for (
+    const [label, value] of [
+      ["cron schedule", "0 9 * * *"],
+      ["cron timezone", "America/Chicago"],
+      ["business day of the month", "3"],
+      ["business day of the month", "3.5"],
+      ["business day of the month", ""],
+    ]
+  ) {
     const input = all(`input[aria-label="${label}"]`)[0] as unknown as
       | { value: string; dispatchEvent: (e: unknown) => boolean }
       | undefined;
@@ -205,9 +290,12 @@ Deno.test("a feed can be paused, run now, and says when it runs next", async () 
   }
   await settle();
   assertEquals(patches.slice(1), [
-    { action: "set", path: [0, "cron"], value: "0 9 * * 1-5" },
+    { action: "set", path: [0, "cron"], value: "0 9 * * *" },
     { action: "set", path: [0, "timezone"], value: "America/Chicago" },
+    { action: "set", path: [0, "business_day"], value: 3 },
+    { action: "del", path: [0, "business_day"], value: null },
   ]);
+  assert(text().includes("must be a whole number, got: 3.5"), `a fraction is refused by name: ${text().slice(0, 400)}`);
 
   // Off the freshness the page already receives. A paused sheet says so rather
   // than naming a time its due entry still holds and no longer means.
@@ -226,6 +314,29 @@ Deno.test("a feed can be paused, run now, and says when it runs next", async () 
   await settle();
   assertEquals(box()?.checked, true, "a paused document draws the switch ticked");
   assert(!text().includes("next run "), "and says paused instead of a time that no longer means anything");
+
+  // An alert's upstream switch is written the same way, and drawn off the document.
+  const upstream = () =>
+    all(`input[aria-label="run when a feed it reads changes"]`)[0] as unknown as
+      | { checked: boolean; dispatchEvent: (e: unknown) => boolean }
+      | undefined;
+  assertEquals(upstream(), undefined, "a feed has no upstream switch");
+  const openAlert = async (fields: Record<string, unknown>) => {
+    app.ports.docSelected.send({
+      id: "alert:up",
+      data: { doc: { type: "alert", data: [{ code: "select 1", to: "", interval: 3600, ...fields }] } },
+    });
+    await settle();
+  };
+  await openAlert({});
+  assertEquals(upstream()?.checked, false, "an alert with no upstream field is on its schedule alone");
+  const before = patches.length;
+  upstream()!.checked = true;
+  upstream()!.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+  await settle();
+  assertEquals(patches.slice(before), [{ action: "set", path: [0, "upstream"], value: true }]);
+  await openAlert({ upstream: true });
+  assertEquals(upstream()?.checked, true, "an upstream document draws the switch ticked");
 });
 
 // Silence without deletion. The chip writes the document the way every other
@@ -1070,11 +1181,40 @@ Deno.test("the selected library rows are trashed and tagged together, and an emp
   assertEquals(sent, [], "a selection over no row writes nothing");
   assert(text().includes("holding no sheet"), `expected the refusal by name, got: ${text().slice(0, 200)}`);
 
+  // Every control in the strip is a placeholder-only input or a bare select, so
+  // every one of them needs its own aria-label -- a screen reader announces
+  // nothing else for it.
+  const stripTagBox = all("input").find((i) => i.getAttribute("placeholder") === "tag");
+  const stripFolderBox = all("input").find((i) => i.getAttribute("placeholder") === "folder");
+  const stripShareToBox = all("input").find((i) => i.getAttribute("placeholder") === "share with");
+  const stripShareRoleSelect = all("select").find((s) => s.getAttribute("aria-label") === "share as");
+  for (
+    const [control, label] of [
+      [stripTagBox, "tag"],
+      [stripFolderBox, "folder"],
+      [stripShareToBox, "share with"],
+      [stripShareRoleSelect, "share as"],
+    ] as const
+  ) {
+    assert(control, `expected the ${label} control in the library strip`);
+    assertEquals(control.getAttribute("aria-label"), label, `the strip's ${label} control needs an aria-label`);
+  }
+
   // The tag box refuses the same selection, in its own words.
   await type_(all("input").find((i) => i.getAttribute("placeholder") === "tag"), "mine");
   await click(all("button.chip").find((b) => b.textContent?.trim() === "tag selected"));
   assertEquals(sent, [], "a tag over no row writes nothing");
   assert(text().includes("select the rows to tag"), `expected the refusal by name, got: ${text().slice(0, 200)}`);
+
+  // And the share box, with an address it would take.
+  const shares: { ids: string[]; email: string; role: string }[] = [];
+  app.ports.shareMany.subscribe((s: (typeof shares)[number]) => shares.push(s));
+  const shareBox = all("input").find((i) => i.getAttribute("aria-label") === "share with");
+  const share = () => click(all("button.chip").find((b) => b.textContent?.trim() === "share selected"));
+  await type_(shareBox, "them@example.com");
+  await share();
+  assertEquals(shares, [], "a share over no row asks nothing");
+  assert(text().includes("select the rows to share"), `expected the refusal by name, got: ${text().slice(0, 200)}`);
 
   // A library of this test's own, so the rows under the selection are known.
   app.ports.librarySynced.send({
@@ -1260,6 +1400,42 @@ Deno.test("the selected library rows are trashed and tagged together, and an emp
   all("#new-cell")[0].dispatchEvent(new dom.window.FocusEvent("blur"));
   await settle();
   assertEquals(sent.map((s) => [s.id, s.data.folder]), [["table:a", ""]], "a blanked folder cell unfiles the sheet");
+
+  // The share box goes out once for the whole selection, in drawn order.
+  for (const type of ["mouseenter", "mousedown", "mouseup"]) await fire(cellsOf("a")[2], type);
+  await key({ key: "ArrowDown", shiftKey: true });
+  await type_(shareBox, " them ");
+  await share();
+  assertEquals(shares, [], "an address with no @ asks nothing");
+  assert(
+    text().includes("Expected an email address, received them"),
+    `expected the refusal, got: ${text().slice(0, 200)}`,
+  );
+  await type_(shareBox, " them@example.com ");
+  await type_(all("select").find((s) => s.getAttribute("aria-label") === "share as"), "editor");
+  await share();
+  assertEquals(shares, [{ ids: ["table:a", "table:b"], email: "them@example.com", role: "editor" }]);
+  app.ports.sharedMany.send({
+    ids: ["table:a", "table:b"],
+    email: "them@example.com",
+    shared: [],
+    refused: [{ id: "table:a", error: "Only an owner can change table:a." }, { id: "table:b", error: "Nobody." }],
+  });
+  await settle();
+  assert(
+    text().includes(
+      "Expected to share 2 sheets with them@example.com, shared 0. Not shared: a (Only an owner can change table:a.), b (Nobody.). Fix:",
+    ),
+    `expected one line naming both, got: ${text().slice(0, 400)}`,
+  );
+  app.ports.sharedMany.send({
+    ids: ["table:a", "table:b"],
+    email: "them@example.com",
+    shared: ["table:a", "table:b"],
+    refused: [],
+  });
+  await settle();
+  assert(text().includes("Shared 2 sheets with them@example.com."), `expected the count, got: ${text().slice(0, 400)}`);
 });
 
 // A rename in the library lands on the sheet whose row was edited, which is the
@@ -1319,6 +1495,61 @@ Deno.test("a Tab inside a modal wraps at both ends, and lands nowhere in an empt
   assertEquals([trapStep(3, 2, false), trapStep(3, 0, true)], [0, 2], "and a wrap at each end");
   for (const [count, index, back] of [[0, 0, false], [3, 3, false], [3, -2, true], [2.5, 0, false], [3, 0, "yes"]])
     assertThrows(() => trapStep(count, index, back), Error, "I cannot step focus through a modal from here.");
+});
+
+Deno.test("many sheets are shared four at a time, a refusal about the address stops at the first, and none is dropped", async () => {
+  const shelf = { "table:shipped": { name: "shipped", doc: { type: "table", data: [[]] } } };
+  const refuse = (status: number, message: string) => Object.assign(new Error(message), { status });
+  let open = 0, most = 0;
+  const sent: string[] = [];
+  const send = async (id: string) => {
+    sent.push(id);
+    most = Math.max(most, ++open);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    open--;
+    if (id === "table:3" || id === "table:7") throw refuse(403, `Only an owner can change ${id}.`);
+  };
+  const ids = Array.from({ length: 10 }, (_, i) => `table:${i}`);
+  assertEquals(
+    await shareMany([...ids.slice(0, 5), "table:shipped", ...ids.slice(5)], send, shelf),
+    {
+      shared: ids.filter((id) => id !== "table:3" && id !== "table:7"),
+      refused: [
+        { id: "table:3", error: "Only an owner can change table:3." },
+        { id: "table:shipped", error: "it ships with the page, so it has no members. Fork it, then share the fork" },
+        { id: "table:7", error: "Only an owner can change table:7." },
+      ],
+    },
+    "every sheet answered, in the order asked, the bundled one refused here",
+  );
+  assertEquals([sent.length, sent.includes("table:shipped")], [10, false], "a bundled sheet is never sent");
+  assertEquals(most, 4, "never more than four open at once");
+
+  sent.length = 0;
+  const nobody = async (id: string) => {
+    sent.push(id);
+    throw refuse(404, "Nobody here goes by that address.");
+  };
+  assertEquals(
+    await shareMany(["table:shipped", ...ids.slice(0, 3)], nobody, shelf),
+    {
+      shared: [],
+      refused: [
+        { id: "table:shipped", error: "it ships with the page, so it has no members. Fork it, then share the fork" },
+        {
+          id: "table:0",
+          error: "Nobody here goes by that address. The other 2 were not asked: each would get this answer.",
+        },
+      ],
+    },
+  );
+  assertEquals(sent, ["table:0"], "a 404 on the first sheet asks no other");
+
+  await assertRejects(
+    () => shareMany(Array.from({ length: SHARE_MANY_MAX + 1 }, (_, i) => `table:${i}`), send, shelf),
+    Error,
+    `${SHARE_MANY_MAX + 1} sheets`,
+  );
 });
 
 Deno.test("an arrangement this browser has to keep is held by column key", () => {
@@ -1542,6 +1773,86 @@ Deno.test("a reference cycle is refused as the path that closes it", async () =>
   }
 });
 
+// Documents behind find(), not on the shelf, with heads a test moves by hand.
+const spied = (docs: Record<string, { data: unknown[] }>) => {
+  const found: string[] = [], at: Record<string, number> = {};
+  return {
+    at,
+    finds: (doc_id: string) => found.filter((f) => f === doc_id).length,
+    find: (doc_id: string) => (found.push(doc_id), Promise.resolve(docs[doc_id])),
+    heads: (doc_id: string) => Promise.resolve(`${at[doc_id] ?? 0}`),
+  };
+};
+const ints = (...ns: number[]) => [{ 0: { key: "0", name: "n", type: "int" } }, ...ns.map((n) => ({ 0: n }))];
+const code = (sql: string) => ({ data: [{ code: sql }] });
+const answer = async (engine: ReturnType<typeof sheets>, sql: string) =>
+  (await engine.runSql(sql, { "": null })).data as Record<string, unknown>[];
+
+Deno.test("a nested query answer is reused until a document it read changes", async () => {
+  const docs = {
+    t: { data: ints(1, 2) },
+    mid: code("select sum(n) as s from @table:t"),
+    live: code("select n, http('x') as h from @table:t"),
+    over: code("select n from @query:live"),
+  };
+  const spy = spied(docs);
+  const engine = sheets(alasql, () => ({}), spy.find, spy.heads);
+  assertEquals(await answer(engine, "select s from @query:mid"), [{ s: 3 }]);
+  assertEquals(await answer(engine, "select s + 1 as s from @query:mid"), [{ s: 4 }]);
+  assertEquals(spy.finds("t"), 1, "the second run reads the inner answer, not the table under it");
+
+  docs.t.data = ints(1, 2, 4);
+  spy.at.t = 1;
+  assertEquals(await answer(engine, "select s from @query:mid"), [{ s: 7 }]);
+  assertEquals(spy.finds("t"), 2, "new heads on the table re-run the query over it");
+
+  const was = alasql.fn.http;
+  alasql.fn.http = () => 0;
+  try {
+    for (const ref of ["live", "live", "over", "over"]) await answer(engine, `select n from @query:${ref}`);
+  } finally {
+    alasql.fn.http = was;
+  }
+  assertEquals(spy.finds("t"), 6, "an http() answer is never reused, nor any answer read through one");
+});
+
+Deno.test("the nested query cache holds the newest answers, and nothing without heads", async () => {
+  const docs: Record<string, { data: unknown[] }> = { t: { data: ints(1) } };
+  const many = Array.from({ length: QUERY_CACHE_MAX + 1 }, (_, i) => `q${i}`);
+  for (const id of many) docs[id] = code("select n from @table:t");
+  const spy = spied(docs);
+  const engine = sheets(alasql, () => ({}), spy.find, spy.heads);
+  await answer(engine, many.map((id) => `select n from @query:${id}`).join(" union all "));
+  assertEquals(spy.finds("t"), many.length);
+  await answer(engine, `select n from @query:${many.at(-1)}`);
+  assertEquals(spy.finds("t"), many.length, "the newest answer is kept");
+  await answer(engine, "select n from @query:q0");
+  assertEquals(spy.finds("t"), many.length + 1, "the oldest answer is evicted");
+
+  const bare = spied({ t: { data: ints(1) }, mid: code("select n from @table:t") });
+  const uncached = sheets(alasql, () => ({}), bare.find);
+  for (let i = 0; i < 2; i++) await answer(uncached, "select n from @query:mid");
+  assertEquals(bare.finds("t"), 2, "no heads, no cache");
+});
+
+Deno.test("a cached answer neither hides a volatile call between quotes nor a chain nested too deep", async () => {
+  // AlaSQL reads "it's" as a string, so blanking '…' spans across the text
+  // took random() for a quoted word and cached it.
+  const chain: Record<string, { data: unknown[] }> = {
+    t: { data: ints(1) },
+    quoted: code(`select n, "it's" as a, random() as r, "that's" as b from @table:t`),
+    q1: code("select n from @table:t"),
+  };
+  for (let i = 2; i <= 8; i++) chain[`q${i}`] = code(`select n from @query:q${i - 1}`);
+  const spy = spied(chain);
+  const engine = sheets(alasql, () => ({}), spy.find, spy.heads);
+  for (let i = 0; i < 2; i++) await answer(engine, "select n from @query:quoted");
+  assertEquals(spy.finds("t"), 2, "a volatile call is never cached, whatever quotes sit around it");
+
+  await answer(engine, "select n from @query:q4");
+  await assertRejects(() => answer(engine, "select n from @query:q8"), Error, "nested more than");
+});
+
 Deno.test("describe reports a sheet whose cells are wrong, and select still will not", async () => {
   // The one statement that has to work on a broken sheet, because that is the
   // sheet you need to inspect. main_test.ts asserts the same thing of the server;
@@ -1586,6 +1897,25 @@ Deno.test("a join that would walk more pairs than one run is allowed is refused 
   // A self-join of two is what the demos do, and it still runs.
   const [row] = await rowsOf(`select count(*) as n from @table:countries a, @table:countries b where a.code = b.code`);
   assertEquals(row.n, n);
+  // An ungrouped subquery whose every column sits inside an aggregate is one row
+  // to the from clause around it, and its own from clause is charged on its own.
+  const three = ["a", "b", "c"].map((alias) => `@table:countries ${alias}`).join(", ");
+  for (
+    const sub of [
+      "select code, count(*) as k from @table:countries group by code",
+      "select count(*) as k, code from @table:countries",
+    ]
+  ) {
+    const charged = await refused(`select count(*) as n from ${three}, (${sub}) g`);
+    assert(charged.includes(`${n ** 4} pairs`), charged);
+  }
+  const inner = await refused(`select count(*) as n from @table:countries z, (select count(*) as k from ${four}) m`);
+  assert(inner.includes(`${n ** 4} pairs`), inner);
+  const [split] = await rowsOf(
+    `select count(*) as n from @table:countries a, @table:countries b,
+       (select count(*) as k from @table:countries c, @table:countries d) m where a.code = b.code`,
+  );
+  assertEquals(split.n, n);
 });
 
 Deno.test("explain answers the query's profile in the page, one row per stage", async () => {

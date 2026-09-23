@@ -2,6 +2,7 @@ port module Main exposing
     ( ChartKind(..)
     , ClipboardData
     , ClipboardFormat(..)
+    , CodexTable
     , Col
     , Doc(..)
     , DocMsg(..)
@@ -35,6 +36,7 @@ port module Main exposing
     , chartSpan
     , civilDays
     , clampIndex
+    , codexTablesDecoder
     , columnExtent
     , columnSplit
     , computeBoolishStats
@@ -1019,6 +1021,22 @@ rather than a row of blanks that would read as "nothing is wrong".
 port freshnessLoaded : (D.Value -> msg) -> Sub msg
 
 
+{-| A connected database's tables, asked for when its sheet opens and on
+"refresh", never on a timer. The answer comes back on `codexLoaded` as
+`{ id, tables }` or `{ id, error }`, named by sheet.
+-}
+port codexLoad : String -> Cmd msg
+
+
+port codexLoaded : (D.Value -> msg) -> Sub msg
+
+
+{-| One table's first rows. The rows come back on `docQueried`, and a refusal on
+`codexLoaded` as `{ id, error }`.
+-}
+port codexPreview : { id : String, table : String } -> Cmd msg
+
+
 {-| Which sheets read this one, asked for when a rename or a delete would break
 them. The answer is `library:lineage` whole, or why it could not be read, and it
 names the sheet it was asked about the way a pre-flight does.
@@ -1059,6 +1077,16 @@ shareAsk =
 
 
 port shareLoaded : (D.Value -> msg) -> Sub msg
+
+
+{-| The library strip's share: the selected sheets, in drawn order, shared with
+one address as one role. `sharedMany` answers `{ ids, email, shared, refused }`,
+each refusal `{ id, error }`.
+-}
+port shareMany : { ids : List String, email : String, role : String } -> Cmd msg
+
+
+port sharedMany : (D.Value -> msg) -> Sub msg
 
 
 type alias DocDelta =
@@ -1135,6 +1163,10 @@ type alias Model =
     -- A past version of the open sheet. Its own field and never `sheet`: every
     -- view of a `Sheet` is wired to writes, and this one is read and nothing else.
     , history : Maybe History
+
+    -- The open connected database's tables and the one picked, if the open
+    -- sheet is a codex.
+    , codex : Maybe { id : Id, tables : Maybe (Result String (List CodexTable)), picked : Maybe String }
     , freshness : Dict Id Freshness
     , tutorial : Maybe Int
     , embed : Bool
@@ -1330,6 +1362,12 @@ type alias Sheet =
     -- to a document.
     , tag : String
     , folder : String
+
+    -- The strip's share box, role and the line that says what the last share
+    -- did, held for the same reason.
+    , shareTo : String
+    , shareRole : String
+    , shareNote : String
     , resizing : Maybe { key : String, startX : Int, startWidth : Int }
 
     -- The column or row being dragged to a new position, while the drag lasts.
@@ -1382,6 +1420,9 @@ emptySheet =
     , near = ""
     , tag = ""
     , folder = ""
+    , shareTo = ""
+    , shareRole = "viewer"
+    , shareNote = ""
     , resizing = Nothing
     , moving = Nothing
     , storedView = emptyView
@@ -2133,11 +2174,12 @@ type Doc
     | Tab Table
     | Query Query_
     | NetHook
-    | NetHttp { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String, mode : String, key : String, rowsPath : String, paused : Bool, cron : String, timezone : String }
-    | Alert { code : String, to : String, interval : Int, digest : Bool, when : When, paused : Bool, snoozedUntil : String, cron : String, timezone : String }
+    | NetHttp { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String, mode : String, key : String, rowsPath : String, paused : Bool, cron : String, timezone : String, businessDay : Maybe Int }
+    | Alert { code : String, to : String, interval : Int, digest : Bool, when : When, paused : Bool, snoozedUntil : String, cron : String, timezone : String, businessDay : Maybe Int, upstream : Bool }
     | Chart Chart_
     | Dashboard (List String)
     | NetSocket { url : String }
+    | Codex String
     | Unviewable String
 
 
@@ -2659,8 +2701,8 @@ docDecoder =
                         -- going through `andThen` for the sake of more names.
                         D.field "data" <|
                             D.index 0 <|
-                                D.map2
-                                    (\req keep ->
+                                D.map3
+                                    (\req keep businessDay ->
                                         NetHttp
                                             { url = req.url
                                             , interval = req.interval
@@ -2676,6 +2718,7 @@ docDecoder =
                                             , paused = keep.paused
                                             , cron = req.cron
                                             , timezone = req.timezone
+                                            , businessDay = businessDay
                                             }
                                     )
                                     (D.map7
@@ -2702,13 +2745,14 @@ docDecoder =
                                         (optionalField "rows_path" D.string "")
                                         (optionalField "paused" D.bool False)
                                     )
+                                    (optionalField "business_day" (D.map Just D.int) Nothing)
 
                     "alert" ->
                         D.field "data" <|
                             D.index 0 <|
                                 -- Split the way the net-http branch is: D.map8 is the ceiling.
-                                D.map3
-                                    (\cfg cron timezone ->
+                                D.map5
+                                    (\cfg cron timezone businessDay upstream ->
                                         Alert
                                             { code = cfg.code
                                             , to = cfg.to
@@ -2719,6 +2763,8 @@ docDecoder =
                                             , snoozedUntil = cfg.snoozedUntil
                                             , cron = cron
                                             , timezone = timezone
+                                            , businessDay = businessDay
+                                            , upstream = upstream
                                             }
                                     )
                                     (D.map7 (\code to interval digest when paused snoozedUntil -> { code = code, to = to, interval = interval, digest = digest, when = when, paused = paused, snoozedUntil = snoozedUntil })
@@ -2742,6 +2788,8 @@ docDecoder =
                                     )
                                     (optionalField "cron" D.string "")
                                     (optionalField "timezone" D.string "")
+                                    (optionalField "business_day" (D.map Just D.int) Nothing)
+                                    (optionalField "upstream" D.bool False)
 
                     "chart" ->
                         D.field "data" (D.index 0 chartDecoder)
@@ -2770,7 +2818,7 @@ docDecoder =
 
                     _ ->
                         if String.startsWith "codex-" typ then
-                            D.succeed (Unviewable typ)
+                            D.succeed (Codex typ)
 
                         else
                             D.fail ("Unknown sheet type: " ++ typ)
@@ -2782,6 +2830,66 @@ tableDecoder =
     D.map2 Table
         (D.index 0 (D.array colDecoder))
         (D.map (Array.slice 1 -1 << Array.push Dict.empty) (D.array rowDecoder))
+
+
+{-| One table of a connected database, as `GET /codex/:id` lists it.
+-}
+type alias CodexTable =
+    { name : String
+    , columns : List ( String, String )
+    }
+
+
+{-| `GET /codex/:id` answers a table whose `columns` cell is a table of its own.
+codex-db keys those cells by the catalogue's names (`column_name`, `data_type`)
+and codex-scrapsheets by position, so every cell is read by its column's name.
+-}
+codexTablesDecoder : D.Decoder (List CodexTable)
+codexTablesDecoder =
+    let
+        keyOf : String -> Table -> D.Decoder String
+        keyOf name tbl =
+            case tbl.cols |> Array.toList |> List.filter (\col -> col.name == name) of
+                [ col ] ->
+                    D.succeed col.key
+
+                found ->
+                    D.fail
+                        ("Expected one column named "
+                            ++ name
+                            ++ ", received "
+                            ++ String.fromInt (List.length found)
+                            ++ " among: "
+                            ++ (tbl.cols |> Array.toList |> List.map .name |> String.join ", ")
+                        )
+
+        cell : D.Decoder a -> Row -> String -> D.Decoder a
+        cell decoder row key =
+            case Dict.get key row |> Maybe.map (D.decodeValue decoder) of
+                Just (Ok value) ->
+                    D.succeed value
+
+                Just (Err err) ->
+                    D.fail ("Cell " ++ key ++ ": " ++ D.errorToString err)
+
+                Nothing ->
+                    D.fail ("Expected a cell under key " ++ key ++ ", received a row without one")
+
+        rows : Table -> String -> String -> (Row -> String -> String -> D.Decoder a) -> D.Decoder (List a)
+        rows tbl first second each =
+            D.map2 Tuple.pair (keyOf first tbl) (keyOf second tbl)
+                |> D.andThen
+                    (\( k1, k2 ) ->
+                        Array.foldr (\row -> D.map2 (::) (each row k1 k2)) (D.succeed []) tbl.rows
+                    )
+
+        columns : D.Decoder (List ( String, String ))
+        columns =
+            tableDecoder
+                |> D.andThen (\tbl -> rows tbl "name" "type" (\row k1 k2 -> D.map2 Tuple.pair (cell D.string row k1) (cell D.string row k2)))
+    in
+    tableDecoder
+        |> D.andThen (\tbl -> rows tbl "name" "columns" (\row k1 k2 -> D.map2 CodexTable (cell D.string row k1) (cell columns row k2)))
 
 
 rowDecoder : D.Decoder Row
@@ -2987,6 +3095,7 @@ init flags url nav =
                 , showShortcuts = False
                 , palette = Nothing
                 , history = Nothing
+                , codex = Nothing
                 , freshness = Dict.empty
                 , tutorial = iif (tutorialStep < 0) Nothing (Just (clamp 0 4 tutorialStep))
                 , now = 0
@@ -3066,6 +3175,10 @@ type Msg
     | TagInput String
     | FolderSelected
     | FolderInput String
+    | ShareSelected
+    | ShareToInput String
+    | ShareRoleInput String
+    | SharedMany D.Value
     | ColumnSplitInput String
     | ColumnNearInput String
     | DocDelete Id
@@ -3080,6 +3193,9 @@ type Msg
     | AlertSnoozeAt Time.Posix
     | RunNow
     | RunLoad (Idd D.Value)
+    | CodexLoad D.Value
+    | CodexPick String
+    | CodexRefresh
     | HistoryMsg HistoryMsg
     | ShareEmailChange String
     | ShareRoleChange String
@@ -3227,9 +3343,11 @@ type Input
     | NetPaused
     | NetCron
     | NetTimezone
+    | NetBusinessDay
     | AlertCode
     | AlertTo
     | AlertDigest
+    | AlertUpstream
     | AlertWhen
     | AlertSnoozed
     | ChartSource
@@ -3263,12 +3381,14 @@ subs model =
         , queryEditorState QueryEditorUpdate
         , columnsLoaded ColumnsLoad
         , shareLoaded ShareLoad
+        , sharedMany SharedMany
         , preflightLoaded PreflightLoad
         , historyLoaded (HistoryMsg << HistoryLoad)
         , historyShown (HistoryMsg << HistoryShow)
         , runLoaded RunLoad
         , importPreviewed ImportPreviewed
         , freshnessLoaded FreshnessLoad
+        , codexLoaded CodexLoad
         , lineageLoaded LineageLoad
         , case model.sheet.resizing of
             Just _ ->
@@ -3557,6 +3677,16 @@ update msg ({ sheet, auth } as model) =
                 -- re-reading on every change would overwrite a filter mid-word.
                 stored =
                     data.data.doc |> D.decodeValue viewDecoder |> Result.withDefault emptyView
+
+                doc =
+                    data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString
+
+                -- A codex has no automerge document for index.html's `changeId`
+                -- to recognise, so the page selects it again on every url change
+                -- (twice at boot, again for settings). Each read of its tables
+                -- opens a connection to the far database.
+                reopened =
+                    Maybe.map .id model.codex == Just data.id
             in
             ( { model
                 | error = ""
@@ -3566,9 +3696,9 @@ update msg ({ sheet, auth } as model) =
                     , hover = xy -1 -1
                     , drag = False
                     , write = Nothing
-                    , doc = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString
-                    , table = Err ""
-                    , stats = data.data.doc |> D.decodeValue docDecoder |> Result.mapError D.errorToString |> Result.andThen computeStats
+                    , doc = doc
+                    , table = iif reopened sheet.table (Err "")
+                    , stats = Result.andThen computeStats doc
                     , hidden = stored.hidden
                     , pinned = stored.pinned
                     , sort = stored.sort
@@ -3591,17 +3721,30 @@ update msg ({ sheet, auth } as model) =
                     , near = ""
                     , tag = ""
                     , folder = ""
+                    , shareTo = ""
+                    , shareRole = "viewer"
+                    , shareNote = ""
                     , resizing = Nothing
                     , moving = Nothing
                     , storedView = stored
                     }
+                , codex =
+                    case doc of
+                        Ok (Codex _) ->
+                            iif reopened model.codex (Just { id = data.id, tables = Nothing, picked = Nothing })
+
+                        _ ->
+                            Nothing
               }
-            , case data.data.doc |> D.decodeValue docDecoder of
+            , case doc of
                 Ok Shop ->
                     Http.get
                         { url = model.api ++ "/shop?limit=" ++ String.fromInt shopLimit
                         , expect = Http.expectJson ShopFetch shopDecoder
                         }
+
+                Ok (Codex _) ->
+                    iif reopened Cmd.none (codexLoad data.id)
 
                 _ ->
                     Cmd.none
@@ -3822,6 +3965,82 @@ update msg ({ sheet, auth } as model) =
         FolderInput folder ->
             ( { model | sheet = { sheet | folder = folder } }, Cmd.none )
 
+        ShareSelected ->
+            case ( model.sheet.doc, String.trim model.sheet.shareTo ) of
+                ( Ok Library, email ) ->
+                    if not (String.contains "@" email) then
+                        ( { model | error = "Expected an email address, received " ++ iif (email == "") "nothing" email ++ ". Source: the library strip's share box. Fix: type the address of the person to share with, then run it." }, Cmd.none )
+
+                    else
+                        case librarySelection "share" model of
+                            Err error ->
+                                ( { model | error = error }, Cmd.none )
+
+                            Ok ids ->
+                                ( { model | sheet = { sheet | shareNote = "" } }
+                                , shareMany { ids = ids, email = email, role = model.sheet.shareRole }
+                                )
+
+                _ ->
+                    ( { model | error = "Expected the library open, received the sheet " ++ model.sheet.id ++ ". Source: share selected sheets. Fix: open the library, select the rows, and run it again." }, Cmd.none )
+
+        ShareToInput email ->
+            ( { model | sheet = { sheet | shareTo = email } }, Cmd.none )
+
+        ShareRoleInput role ->
+            ( { model | sheet = { sheet | shareRole = role } }, Cmd.none )
+
+        SharedMany value ->
+            -- A late answer lands on whatever sheet is open, as shareAction's
+            -- refusals do through docErrored. It names every sheet it is about,
+            -- so it reads right anywhere, and a dropped one hides which shares
+            -- failed.
+            let
+                answer =
+                    D.map4 (\ids email shared refused -> { ids = ids, email = email, shared = shared, refused = refused })
+                        (D.field "ids" (D.list D.string))
+                        (D.field "email" D.string)
+                        (D.field "shared" (D.list D.string))
+                        (D.field "refused" (D.list (D.map2 Tuple.pair (D.field "id" D.string) (D.field "error" D.string))))
+
+                sheets n =
+                    String.fromInt n ++ iif (n == 1) " sheet" " sheets"
+
+                -- A sheet trashed and purged since the ask is gone from the
+                -- library, so its id is its name.
+                nameOf id =
+                    case model.library |> Dict.get id |> Maybe.map .name of
+                        Just name ->
+                            iif (name == "") id name
+
+                        Nothing ->
+                            id
+            in
+            case D.decodeValue answer value of
+                Err err ->
+                    ( { model | error = "Expected the answer to share selected as ids, email, shared and refused, received " ++ D.errorToString err ++ ". Source: the sharedMany port in src/index.html. Fix: answer every shareMany with what shareMany in src/page.mjs returns." }, Cmd.none )
+
+                Ok { ids, email, shared, refused } ->
+                    if List.isEmpty refused then
+                        ( { model | sheet = { sheet | shareNote = "Shared " ++ sheets (List.length shared) ++ " with " ++ email ++ "." } }, Cmd.none )
+
+                    else
+                        ( { model
+                            | sheet = { sheet | shareNote = "" }
+                            , error =
+                                "Expected to share "
+                                    ++ sheets (List.length ids)
+                                    ++ " with "
+                                    ++ email
+                                    ++ ", shared "
+                                    ++ String.fromInt (List.length shared)
+                                    ++ ". Not shared: "
+                                    ++ String.join ", " (List.map (\( id, error ) -> nameOf id ++ " (" ++ error ++ ")") refused)
+                                    ++ ". Fix: check the address and the role, own each sheet named, then select those rows and share them again."
+                          }
+                        , Cmd.none
+                        )
+
         ColumnSplitInput delimiter ->
             -- The model only, and never the document: the box is an argument to
             -- a verb nobody has run yet, and a patch per keystroke is a sync per
@@ -3912,6 +4131,66 @@ update msg ({ sheet, auth } as model) =
                   }
                 , Cmd.none
                 )
+
+        CodexLoad value ->
+            case ( model.codex, D.decodeValue (D.field "id" D.string) value ) of
+                ( Just codex, Ok id ) ->
+                    if id /= codex.id then
+                        ( model, Cmd.none )
+
+                    else
+                        let
+                            tables =
+                                value
+                                    |> D.decodeValue
+                                        (D.maybe (D.field "error" D.string)
+                                            |> D.andThen
+                                                (\error ->
+                                                    case error of
+                                                        Just err ->
+                                                            D.succeed (Err err)
+
+                                                        Nothing ->
+                                                            D.field "tables" codexTablesDecoder |> D.map Ok
+                                                )
+                                        )
+                                    |> Result.mapError (\err -> "The tables arrived in a shape I could not read: " ++ D.errorToString err)
+                                    |> Result.andThen identity
+                        in
+                        case tables of
+                            Ok _ ->
+                                ( { model | codex = Just { codex | tables = Just tables } }, Cmd.none )
+
+                            Err _ ->
+                                ( { model | codex = Just { codex | tables = Just tables, picked = Nothing }, sheet = { sheet | table = Err "" } }, Cmd.none )
+
+                ( Nothing, Ok _ ) ->
+                    ( model, Cmd.none )
+
+                ( _, Err err ) ->
+                    ( { model | error = "A database's tables arrived without the sheet they belong to: " ++ D.errorToString err }, Cmd.none )
+
+        CodexPick table ->
+            -- Only codex-db answers a preview. A click dispatched at a
+            -- disabled button (a screen reader, a test) still reaches here.
+            case ( model.codex, model.sheet.doc ) of
+                ( Just codex, Ok (Codex "codex-db") ) ->
+                    ( { model | codex = Just { codex | picked = Just table }, sheet = { sheet | table = Err "" } }
+                    , codexPreview { id = codex.id, table = table }
+                    )
+
+                _ ->
+                    ( model, Cmd.none )
+
+        CodexRefresh ->
+            case model.codex of
+                Just codex ->
+                    ( { model | codex = Just { codex | tables = Nothing, picked = Nothing }, sheet = { sheet | table = Err "" } }
+                    , codexLoad codex.id
+                    )
+
+                Nothing ->
+                    ( model, Cmd.none )
 
         HistoryMsg historyMsg ->
             updateHistory historyMsg model
@@ -4332,6 +4611,27 @@ update msg ({ sheet, auth } as model) =
                 }
             )
 
+        InputChange NetBusinessDay x ->
+            case ( String.toInt x, String.isEmpty x ) of
+                ( Just n, _ ) ->
+                    ( model
+                    , changeDoc
+                        { id = sheet.id
+                        , data = [ { action = "set", path = [ E.int 0, E.string "business_day" ], value = E.int n } ]
+                        }
+                    )
+
+                ( Nothing, True ) ->
+                    ( model
+                    , changeDoc
+                        { id = sheet.id
+                        , data = [ { action = "del", path = [ E.int 0, E.string "business_day" ], value = E.null } ]
+                        }
+                    )
+
+                ( Nothing, False ) ->
+                    ( { model | error = "The business day must be a whole number, got: " ++ x }, Cmd.none )
+
         InputChange AlertCode x ->
             ( model
             , changeDoc
@@ -4353,6 +4653,14 @@ update msg ({ sheet, auth } as model) =
             , changeDoc
                 { id = sheet.id
                 , data = [ { action = "set", path = [ E.int 0, E.string "digest" ], value = E.bool (x /= "") } ]
+                }
+            )
+
+        InputChange AlertUpstream x ->
+            ( model
+            , changeDoc
+                { id = sheet.id
+                , data = [ { action = "set", path = [ E.int 0, E.string "upstream" ], value = E.bool (x /= "") } ]
                 }
             )
 
@@ -5941,17 +6249,13 @@ updateDocMsg edit ({ sheet } as model) =
 
 
 {-| No query reads these on either host: the page's engine takes only table and
-query refs, and the server refuses a template and a portal and reads a codex
-through its own route.
+query refs, and the server refuses a template and a portal.
 -}
 unviewable : String -> String -> String
 unviewable typ id =
     typ
         ++ " sheets sync but have no view yet, and a query cannot read one. "
-        ++ (if String.startsWith "codex-" typ then
-                "GET /codex/" ++ id ++ " answers its tables."
-
-            else if typ == "portal" then
+        ++ (if typ == "portal" then
                 "Read it live over GET /portal/" ++ (String.split ":" id |> List.drop 1 |> String.join ":") ++ "/sync."
 
             else
@@ -7973,6 +8277,23 @@ resolveTable model =
         ( _, Ok tbl ) ->
             Ok tbl
 
+        ( Ok (Codex typ), Err "" ) ->
+            case ( typ, Maybe.andThen .tables model.codex, Maybe.andThen .picked model.codex ) of
+                ( _, Nothing, _ ) ->
+                    Err "Reading this database's tables …"
+
+                ( _, Just (Err err), _ ) ->
+                    Err err
+
+                ( "codex-db", Just (Ok _), Nothing ) ->
+                    Err "Pick a table to read its first rows."
+
+                ( "codex-db", Just (Ok _), Just table ) ->
+                    Err ("Reading the first rows of " ++ table ++ " …")
+
+                ( _, Just (Ok _), _ ) ->
+                    Err (typ ++ " lists its tables and has no rows to read: only a connected database (codex-db) answers a preview.")
+
         ( Ok NetHook, Err "" ) ->
             Ok emptyNetTable
 
@@ -9968,6 +10289,7 @@ viewGallery model =
                     , A.onInput TagInput
                     , onEnter TagSelected
                     , A.placeholder "tag"
+                    , A.attribute "aria-label" "tag"
                     , A.title "add this tag to every selected library row"
                     , S.width "6rem"
                     , S.fontSizeRem 0.8125
@@ -9986,7 +10308,23 @@ viewGallery model =
                     ]
                     []
                , H.button [ A.class "chip", A.onClick FolderSelected ] [ text "move to folder" ]
+               , H.input
+                    [ A.type_ "email"
+                    , A.value model.sheet.shareTo
+                    , A.onInput ShareToInput
+                    , onEnter ShareSelected
+                    , A.placeholder "share with"
+                    , A.attribute "aria-label" "share with"
+                    , A.title "share every selected library row with this address"
+                    , S.width "10rem"
+                    , S.fontSizeRem 0.8125
+                    ]
+                    []
+               , H.select [ A.attribute "aria-label" "share as", A.onInput ShareRoleInput, A.value model.sheet.shareRole, S.fontSizeRem 0.8125 ]
+                    (List.map (\r -> H.option [ A.value r, A.selected (r == model.sheet.shareRole) ] [ text r ]) [ "viewer", "editor", "owner" ])
+               , H.button [ A.class "chip", A.onClick ShareSelected ] [ text "share selected" ]
                ]
+            ++ iif (model.sheet.shareNote == "") [] [ H.span [ A.attribute "role" "status", S.color "#666", S.fontSizeRem 0.8125 ] [ text model.sheet.shareNote ] ]
         )
 
 
@@ -10207,7 +10545,7 @@ viewNetHook model =
         ]
 
 
-viewNetHttp : Model -> { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String, mode : String, key : String, rowsPath : String, paused : Bool, cron : String, timezone : String } -> Html Msg
+viewNetHttp : Model -> { url : String, interval : Int, headers : String, method : String, body : String, pageBy : String, pageParam : String, pagePath : String, mode : String, key : String, rowsPath : String, paused : Bool, cron : String, timezone : String, businessDay : Maybe Int } -> Html Msg
 viewNetHttp model cfg =
     let
         paging =
@@ -10238,6 +10576,10 @@ viewNetHttp model cfg =
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "in the timezone"
             , H.input [ A.class "mono", A.type_ "text", A.value cfg.timezone, A.placeholder "UTC", A.attribute "aria-label" "cron timezone", A.title "an IANA zone such as America/Chicago; empty is UTC, and a zone needs a cron", A.spellcheck False, A.onInput (InputChange NetTimezone) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "on this business day of the month"
+            , H.input [ A.type_ "number", A.value (Maybe.withDefault "" (Maybe.map String.fromInt cfg.businessDay)), A.placeholder "3, or -1 for the last", A.attribute "aria-label" "business day of the month", A.title "the nth weekday of each month the cron names, counted from the end when negative; the cron gives the time and needs * in both day fields; holidays count as business days", A.onInput (InputChange NetBusinessDay) ] []
             ]
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "headers"
@@ -10373,7 +10715,7 @@ viewNextRun paused model =
         ]
 
 
-viewAlert : Model -> { code : String, to : String, interval : Int, digest : Bool, when : When, paused : Bool, snoozedUntil : String, cron : String, timezone : String } -> Html Msg
+viewAlert : Model -> { code : String, to : String, interval : Int, digest : Bool, when : When, paused : Bool, snoozedUntil : String, cron : String, timezone : String, businessDay : Maybe Int, upstream : Bool } -> Html Msg
 viewAlert model cfg =
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
         [ H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
@@ -10397,6 +10739,10 @@ viewAlert model cfg =
             , H.input [ A.class "mono", A.type_ "text", A.value cfg.timezone, A.placeholder "UTC", A.attribute "aria-label" "cron timezone", A.title "an IANA zone such as America/Chicago; empty is UTC, and a zone needs a cron", A.spellcheck False, A.onInput (InputChange NetTimezone) ] []
             ]
         , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
+            [ text "on this business day of the month"
+            , H.input [ A.type_ "number", A.value (Maybe.withDefault "" (Maybe.map String.fromInt cfg.businessDay)), A.placeholder "3, or -1 for the last", A.attribute "aria-label" "business day of the month", A.title "the nth weekday of each month the cron names, counted from the end when negative; the cron gives the time and needs * in both day fields; holidays count as business days", A.onInput (InputChange NetBusinessDay) ] []
+            ]
+        , H.label [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25, S.fontSizeRem 0.875 ]
             [ text "fires when"
             , H.select [ A.value (whenSpec cfg.when).name, A.onInput (InputChange AlertWhen) ] <|
                 List.map (\w -> H.option [ A.value (whenSpec w).name, A.selected (w == cfg.when) ] [ text (whenSpec w).label ]) whens
@@ -10404,6 +10750,10 @@ viewAlert model cfg =
         , H.label [ S.displayFlex, S.gapRem 0.5, S.alignItemsCenter, S.fontSizeRem 0.875 ]
             [ H.input [ A.type_ "checkbox", A.checked cfg.digest, A.onCheck (\on -> InputChange AlertDigest (iif on "1" "")) ] []
             , text "fold into the daily digest, sent to the account email"
+            ]
+        , H.label [ S.displayFlex, S.gapRem 0.5, S.alignItemsCenter, S.fontSizeRem 0.875 ]
+            [ H.input [ A.type_ "checkbox", A.checked cfg.upstream, A.attribute "aria-label" "run when a feed it reads changes", A.onCheck (\on -> InputChange AlertUpstream (iif on "1" "")) ] []
+            , text "also run when a feed it reads stores a new row, at most once a minute"
             ]
         , H.label [ S.displayFlex, S.gapRem 0.5, S.alignItemsCenter, S.fontSizeRem 0.875 ]
             [ H.input [ A.id "paused", A.type_ "checkbox", A.checked cfg.paused, A.onCheck (\on -> InputChange NetPaused (iif on "1" "")) ] []
@@ -11534,6 +11884,54 @@ viewChart cfg tbl =
             ]
 
 
+viewCodex : Model -> String -> Html Msg
+viewCodex model typ =
+    let
+        picked =
+            Maybe.andThen .picked model.codex
+    in
+    H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
+        (H.div [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.5 ]
+            [ H.h3 [] [ text "tables" ]
+            , H.button [ A.class "chip", A.onClick CodexRefresh, A.title "ask the database for its tables again", S.marginLeftAuto ] [ text "refresh" ]
+            ]
+            :: (case Maybe.andThen .tables model.codex of
+                    Nothing ->
+                        [ H.p [ S.fontSizeRem 0.875, S.color "#666" ] [ text "reading the tables" ] ]
+
+                    Just (Err err) ->
+                        [ H.p [ A.class "codex-error", S.fontSizeRem 0.875, S.color "#c00", S.whiteSpacePreWrap ] [ text err ] ]
+
+                    Just (Ok []) ->
+                        [ H.p [ S.fontSizeRem 0.875, S.color "#666" ] [ text "The database holds no public tables." ] ]
+
+                    Just (Ok tables) ->
+                        List.map
+                            (\table ->
+                                H.button
+                                    [ A.class "chip codex-table"
+                                    , A.onClick (CodexPick table.name)
+                                    , A.disabled (typ /= "codex-db")
+                                    , A.title (table.columns |> List.map (\( name, t ) -> name ++ " " ++ t) |> String.join "\n")
+                                    , A.attribute "aria-pressed" (iif (picked == Just table.name) "true" "false")
+                                    , iif (picked == Just table.name) (S.background "#fff8e0") (A.classList [])
+                                    , S.textAlignLeft
+                                    ]
+                                    [ text (table.name ++ " · " ++ String.fromInt (List.length table.columns) ++ iif (List.length table.columns == 1) " column" " columns") ]
+                            )
+                            tables
+                            ++ [ H.p [ S.fontSizeRem 0.875, S.color "#666" ]
+                                    [ text
+                                        (iif (typ == "codex-db")
+                                            "Pick a table to read its first rows. Every column reads as text."
+                                            "These tables are listed, not read: only a connected database answers a preview."
+                                        )
+                                    ]
+                               ]
+               )
+        )
+
+
 viewNetSocket : Model -> { url : String } -> Html Msg
 viewNetSocket model cfg =
     H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.5, S.paddingRem 1, S.minWidth "25vw" ]
@@ -11740,6 +12138,9 @@ view ({ sheet } as model) =
 
                     Ok (NetSocket cfg) ->
                         [ viewNetSocket model cfg ]
+
+                    Ok (Codex typ) ->
+                        [ viewCodex model typ ]
 
                     _ ->
                         []

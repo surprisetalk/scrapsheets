@@ -46,6 +46,7 @@
         mergeView,
         rememberedTypes,
         PARSERS,
+        shareMany,
         sheets,
         trapStep,
       } from "/page.mjs";
@@ -457,6 +458,50 @@
           };
           app.ports.lineageFor.subscribe(loadLineage);
 
+          // A connected database's tables, and one table's first rows. Never on
+          // a timer: every GET /codex/:id opens a connection to the far
+          // database and writes a run row, and every preview writes an audit
+          // row that is never trimmed. Every path answers, as lineage's does.
+          // Only the newest pick's answer lands: two picks in flight can
+          // answer out of order, and `docQueried` names the sheet, not the table.
+          let previewing = null;
+          const codexRefusal = async (res) =>
+            `the read failed (${res.status}): ${httpErrorDetail(await res.text(), res.headers.get("Content-Type") ?? "")}`;
+          const loadCodex = async (id) => {
+            // A list read starts the sheet over, and a preview in flight is not its answer.
+            previewing = null;
+            const refuse = (error) => app.ports.codexLoaded.send({ id, error });
+            const token = getAuthToken();
+            if (!token) return refuse("Log in to read a connected database: its tables are read under your account.");
+            try {
+              const res = await fetch(`${API_BASE}/codex/${id}`, { headers: { Authorization: `Bearer ${token}` } });
+              if (!res.ok) return refuse(await codexRefusal(res));
+              const { data } = await res.json();
+              app.ports.codexLoaded.send({ id, tables: data });
+            } catch (err) {
+              refuse(`the read failed: ${err?.message ?? String(err)}`);
+            }
+          };
+          app.ports.codexLoad.subscribe(loadCodex);
+          app.ports.codexPreview.subscribe(async ({ id, table }) => {
+            const ask = {};
+            previewing = ask;
+            const refuse = (error) => previewing === ask && app.ports.codexLoaded.send({ id, error });
+            const token = getAuthToken();
+            if (!token) return refuse("Log in to read a connected database: its rows are read under your account.");
+            try {
+              // No limit: the server's own cap is the one spelling of a preview's size.
+              const res = await fetch(`${API_BASE}/codex/${id}/preview?table=${encodeURIComponent(table)}`, {
+                headers: { Authorization: `Bearer ${token}` },
+              });
+              if (!res.ok) return refuse(await codexRefusal(res));
+              const { data } = await res.json();
+              if (previewing === ask) app.ports.docQueried.send({ id, data });
+            } catch (err) {
+              refuse(`the read failed: ${err?.message ?? String(err)}`);
+            }
+          });
+
           // Sharing lives here rather than in Elm because the JWT does. Every
           // action re-reads the member list, so the modal never shows stale state.
           //
@@ -596,6 +641,27 @@
             const { data } = await send("/share", "GET");
             app.ports.shareLoaded.send({ id, action, members: data.members, public: data.public, ...(link ? { link } : {}) });
           }, 'shareAction'));
+
+          // The library strip's share, one POST per selected sheet. The answer
+          // echoes the ids and the address, so Elm names what it asked for.
+          app.ports.shareMany.subscribe(catchy(async ({ ids, email, role }) => {
+            const token = getAuthToken();
+            if (!token) return app.ports.docErrored.send("Log in to share the selected sheets.");
+            const send = async (id) => {
+              const res = await fetch(`${API_BASE}/library/${id}/share`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                body: JSON.stringify({ email, role }),
+                signal: AbortSignal.timeout(10000),
+              });
+              if (!res.ok) {
+                const error = httpErrorDetail(await res.text(), res.headers.get("Content-Type") ?? "") ||
+                  `POST /library/${id}/share failed (${res.status}).`;
+                throw Object.assign(new Error(error), { status: res.status });
+              }
+            };
+            app.ports.sharedMany.send({ ids, email, ...(await shareMany(ids, send, Library.get())) });
+          }, 'shareMany'));
 
           // Register a document with the server, retrying on 404 (sync timing)
           async function registerDocWithRetry(id, name) {
@@ -832,6 +898,8 @@
             alasql,
             Library.get,
             (doc_id) => repo.find(doc_id).then(async (h) => (await h.whenReady?.(), h.doc())),
+            // A handle's heads() throws until it is ready.
+            (doc_id) => repo.find(doc_id).then(async (h) => (await h.whenReady?.(), h.heads().join())),
           );
           // Pull the origin's own words out of an error body so the message names a cause,
           // not just a status code (arxiv hides it in <entry><summary>, most APIs in JSON).
@@ -981,7 +1049,8 @@
             lastRun = { id: null, key: null };
 
             const libraryEntry = Library.get()[id];
-            const doc = libraryEntry?.doc ?? sheetHandle?.doc?.();
+            // A codex sheet's document is its database, read over GET /codex/:id.
+            const doc = libraryEntry?.doc ?? sheetHandle?.doc?.() ?? (type.startsWith("codex-") ? { type } : undefined);
 
             if (!doc) {
               if (type && doc_id) {
@@ -1185,8 +1254,9 @@
             }
 
             // System sheets (bundled examples, tutorial, portals) live in the
-            // library entry itself; their ids are not automerge document ids.
-            if (Library.get()[id]?.doc) {
+            // library entry itself, and a codex doc_id names the server's
+            // connection row: neither is an automerge document id.
+            if (Library.get()[id]?.doc || id.startsWith("codex-")) {
               sheet = null;
               await selectDoc(id, null);
               return;
