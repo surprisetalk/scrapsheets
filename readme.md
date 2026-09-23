@@ -6,11 +6,12 @@ deno task status
 ```
 
 `deno task status` grades every likely failure mode of the deployed service and exits nonzero when one that pages is
-failing. **1.0 is the minimum passing grade**, 0.0 is total failure, and anything above 1.0 is headroom. Two conditions
-are graded and printed but do not page: usage, because a product nobody used today is not an outage, and the count of
-overdue feeds and alerts, because a sheet somebody paused on purpose is a switch working. `.github/workflows/status.yml`
-runs it every 15 minutes; a failed scheduled run emails the repo owner, and that email is the alarm. `GET /status` is
-the same answer as JSON, and needs no login.
+failing. **1.0 is the minimum passing grade**, 0.0 is total failure, and anything above 1.0 is headroom. The usage goals
+(a sheet made, a signup, a signup who made a sheet, a payment, and somebody other than the operator using the app) and
+the count of overdue feeds and alerts are graded and printed but do not page: a product nobody used today is not an
+outage, and a sheet somebody paused on purpose is a switch working. `.github/workflows/status.yml` runs it every 15
+minutes; a failed scheduled run emails the repo owner, and that email is the alarm. `GET /status` is the same answer as
+JSON, and needs no login.
 
 The server refuses to start without `JWT_SECRET`, `TOKEN_SECRET` and `DSN_ENCRYPTION_KEY`, each a long random string
 that must stay the same across restarts. They used to fall back to a random value and only warn, which dropped every
@@ -246,6 +247,12 @@ report is waiting.
 # watch mode
 watch src { try { cp -vu src/* dist ; elm make src/Main.elm --debug --output=dist/index.js } }
 ```
+
+Where it is going. Scrapsheets is not Google Sheets and not Airtable. Every table is a queryable database, every query
+result is a shareable table, every portal is a live data stream, and every sheet is an API. The shop takes payment
+through Stripe Checkout. The MCP server lets a model read and write sheets. Pipelines keep sheets up to date.
+Scrapscript formulas, which are content-addressed programs, are the part nobody else can copy. `todo.md` is the queue,
+and the usage conditions in `deno task status` measure whether anybody outside this repo uses it.
 
 The library works anonymously out of the box: bundled datasets (countries, US states, periodic table, CSS colors,
 events), example queries that join them with `@sheet_id` refs, seven live portals, and a first-run tutorial.

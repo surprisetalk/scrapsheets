@@ -2005,6 +2005,20 @@ const chartIdent = (whose, what, value) => {
   }));
 };
 
+// Only what a query can reference: the page refuses any other prefix while
+// loading, and a statement that runs on the server but not in the page is worse
+// than one refused in both.
+const writtenFrom = (whose, source) => {
+  if (!/^@(?:table|query):[A-Za-z0-9_-]+$/.test(source ?? "")) {
+    throw new Error(explain(`A ${whose} reads one table or query sheet.`, {
+      Expected: "@table:doc_id or @query:doc_id",
+      Received: show(source ?? null),
+      Source: `this ${whose}'s settings`,
+      Fix: `build the ${whose} from a table or query sheet, e.g. @table:orders`,
+    }));
+  }
+};
+
 // Every way a chart may be drawn, and the one list of them: `kindSpec` in
 // src/Main.elm is this list on the other side of the wire, and browser_test.ts
 // fails when the two stop agreeing. A kind nobody draws used to render as a
@@ -2025,17 +2039,7 @@ export const CHART_KINDS = ["line", "bar", "area", "scatter", "kpi", "box"];
 const BOX_QUANTILES = [["q1", 0.25], ["med", 0.5], ["q3", 0.75]];
 
 export const chartSql = ({ source, kind = "line", x, y, y2 = "", series = "" }) => {
-  // Only what a query can reference: the page refuses any other prefix while
-  // loading, and a chart that runs on the server but not in the page is worse
-  // than one that is refused in both.
-  if (!/^@(?:table|query):[A-Za-z0-9_-]+$/.test(source ?? "")) {
-    throw new Error(explain(`A chart reads one table or query sheet.`, {
-      Expected: "@table:doc_id or @query:doc_id",
-      Received: show(source ?? null),
-      Source: "this chart's settings",
-      Fix: "set the source to a table or query sheet, e.g. @query:budget-burn",
-    }));
-  }
+  writtenFrom("chart", source);
   // A chart that was never given a kind is a line, which is what the page's own
   // decoder defaults to. Anything else that is not on the list is refused.
   if (!CHART_KINDS.includes(kind)) {
@@ -2132,17 +2136,21 @@ export const chartSql = ({ source, kind = "line", x, y, y2 = "", series = "" }) 
 // length.
 const COHORT_LABEL = { year: 4, quarter: 10, month: 7, week: 10, day: 10, hour: 13, minute: 16, second: 19 };
 
-export const cohortSql = ({ source, date, key, value = "", grain }) => {
-  // The same two prefixes a chart reads, for the same reason: a statement that
-  // runs on the server but not in the page is worse than one refused in both.
-  if (!/^@(?:table|query):[A-Za-z0-9_-]+$/.test(source ?? "")) {
-    throw new Error(explain(`A cohort table reads one table or query sheet.`, {
-      Expected: "@table:doc_id or @query:doc_id",
-      Received: show(source ?? null),
-      Source: "this cohort table's settings",
-      Fix: "build the cohort table from a table or query sheet, e.g. @table:orders",
-    }));
+const refuseTaken = (whose, fields) => {
+  for (const [what, column, taken] of fields) {
+    if (taken.includes(column)) {
+      throw new Error(explain(`A ${whose}'s ${what} has to be a column it does not already name.`, {
+        Expected: `a ${what} other than ${taken.join(", ")}`,
+        Received: show(column),
+        Source: `this ${whose}'s settings`,
+        Fix: `rename that column in the sheet, or pick a different ${what}`,
+      }));
+    }
   }
+};
+
+export const cohortSql = ({ source, date, key, value = "", grain }) => {
+  writtenFrom("cohort table", source);
   if (!Object.hasOwn(COHORT_LABEL, grain)) {
     const grains = Object.keys(COHORT_LABEL);
     const meant = typeof grain === "string" ? nearest(grain, grains) : undefined;
@@ -2173,22 +2181,11 @@ export const cohortSql = ({ source, date, key, value = "", grain }) => {
   // of them are refused. A blank value is no column and collides with none of
   // them, because `chartIdent` has already refused an empty date and key.
   const named = ["cohort", "first_seen", "active", period];
-  for (
-    const [what, column, taken] of [
-      ["date column", date, named],
-      ["key column", key, named],
-      ["value column", value, [...named, date, key]],
-    ]
-  ) {
-    if (taken.includes(column)) {
-      throw new Error(explain(`A cohort table's ${what} has to be a column it does not already name.`, {
-        Expected: `a ${what} other than ${taken.join(", ")}`,
-        Received: show(column),
-        Source: "this cohort table's settings",
-        Fix: `rename that column in the sheet, or pick a different ${what}`,
-      }));
-    }
-  }
+  refuseTaken("cohort table", [
+    ["date column", date, named],
+    ["key column", key, named],
+    ["value column", value, [...named, date, key]],
+  ]);
   // `min_text` and not `min`: AlaSQL's `min` drops text and a date column reaches
   // the engine as the ISO text it is stored as, so the first period a key appears
   // in would be null for every key.
@@ -2202,6 +2199,52 @@ export const cohortSql = ({ source, date, key, value = "", grain }) => {
     ? ""
     : `, round(sum(${amount}), 2) as ${amount}, round(sum(${amount}) / count(distinct ${who}), 2) as [${value}_per_active]`;
   return `select cohort, ${period}, count(distinct ${who}) as active${measures} from (${each}) group by cohort, ${period} order by cohort, ${period}`;
+};
+
+// --- scores
+//
+// Recency, frequency and monetary scores per key, written once the way a cohort
+// table is. This is quantile scoring and not clustering: one statement cannot
+// iterate, so there are no distances, no centroids, no learned segments and no
+// combined segment label. Each score is `ntile` over one measure, and the
+// highest bucket is the best: the most recent, the most frequent, the most
+// spent. Recency orders by the last date seen and never by `now()`, so the two
+// hosts answer the same scores on different days. `applyWindows` splits a tie
+// in the order the rows arrive, which the outer `order by` makes key order.
+
+// Percentiles are the finest grade anybody names. Past them a score is a row
+// rank, which `row_number()` already answers.
+const RFM_BUCKETS_MAX = 100;
+
+export const rfmSql = ({ source, date, key, value, buckets }) => {
+  writtenFrom("score table", source);
+  if (!Number.isInteger(buckets) || buckets < 2 || buckets > RFM_BUCKETS_MAX) {
+    throw new Error(explain(`A score table's buckets have to be a whole number from 2 to ${RFM_BUCKETS_MAX}.`, {
+      Expected: `a whole number from 2 to ${RFM_BUCKETS_MAX}, e.g. 5`,
+      Received: show(buckets ?? null),
+      Source: "this score table's settings",
+      Fix: "score into 5 buckets, the usual RFM scale",
+    }));
+  }
+  const when = chartIdent("score table", "date column", date);
+  const who = chartIdent("score table", "key column", key);
+  const amount = chartIdent("score table", "value column", value);
+  // A source column spelled like an output name lands in the generated SQL
+  // twice, and AlaSQL's alias shadowing decides which one a row keeps.
+  const named = ["last_seen", "orders", "r", "f", "m"];
+  refuseTaken("score table", [
+    ["date column", date, named],
+    ["key column", key, [...named, date]],
+    ["value column", value, [...named, date, key]],
+  ]);
+  // `max_text` and not `max`: AlaSQL's `max` drops text, and a date reaches the
+  // engine as its ISO text.
+  const each =
+    `select ${who}, max_text(${when}) as last_seen, count(*) as orders, round(sum(${amount}), 2) as ${amount} from ${source} group by ${who}`;
+  const score = (measure, name) => `ntile(${buckets}) over (order by ${measure}) as ${name}`;
+  return `select ${who}, last_seen, orders, ${amount}, ${score("last_seen", "r")}, ${score("orders", "f")}, ${
+    score(amount, "m")
+  } from (${each}) order by ${who}`;
 };
 
 // --- resolving a query's sheet references

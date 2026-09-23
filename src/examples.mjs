@@ -3993,6 +3993,19 @@ const QUERIES = {
       "select t.trade_id, t.traded_on, t.ticker, t.side, t.qty, p.close as price_at_trade, p.day as price_day, date_diff('day', p.day, t.traded_on) as days_stale, round(t.qty * p.close, 2) as notional from @table:trades t join @table:pair-prices p on p.ticker = t.ticker and p.day <= t.traded_on qualify row_number() over (partition by t.trade_id order by p.day desc) = 1 order by t.traded_on",
     ),
   },
+  // Goal seek by search: no engine can re-evaluate an expression for a UDF, so
+  // the candidates are rows and the answer is the closest one. Demand falls 30
+  // units a week per dollar and costs are 8 a unit plus 2,000 a week; profit
+  // peaks near 20.67, so the candidates stop at 20 to keep one root.
+  "query:goal-seek-price": {
+    name: "the lowest price that earns 2,000 a week",
+    tags: ["demo", "query"],
+    system: true,
+    doc: QuerySql(
+      { price: "num", units: "num", profit: "usd" },
+      "select price, units, round((price - 8) * units - 2000, 2) as profit from (select price, 1000 - 30 * price as units from (select 5 + trial * 0.03 as price from @table:trials) a) b qualify row_number() over (order by abs((price - 8) * units - 2000 - 2000)) = 1",
+    ),
+  },
   "query:headcount-long": {
     name: "hiring plan, one row per quarter",
     tags: ["demo", "query"],

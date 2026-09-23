@@ -423,7 +423,9 @@ Deno.test("arranging a sheet writes the arrangement onto its columns", async () 
 // the states that need no click are already on screen. A glyph is not a name and
 // neither is a placeholder -- a placeholder is gone the moment anything is typed.
 Deno.test("every modal, icon button and bare input says what it is", async () => {
-  const { dom, doc, all, click, settle } = await boot("http://localhost/table:countries#settings", { tutorial: 0 });
+  const { dom, doc, app, all, click, settle, type_ } = await boot("http://localhost/table:countries#settings", {
+    tutorial: 0,
+  });
   const labels = (sel: string) => all(sel).map((el) => el.getAttribute("aria-label") ?? "");
   const key = async (k: string) => {
     doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: k, ctrlKey: true, bubbles: true }));
@@ -456,11 +458,44 @@ Deno.test("every modal, icon button and bare input says what it is", async () =>
     `every × is named, got ${JSON.stringify(labels("button.x"))}`,
   );
 
-  await click(crosses[0]);
+  // One modal at a time: each opens over the last by closing it. Settings
+  // closes through the URL, or a reload would open it again.
+  await key("k");
+  assertEquals(labels("div[role='dialog']"), ["command palette"], "the palette opens over settings by closing it");
+  assertEquals(doc.location.hash, "", "and #settings leaves the URL");
+
+  const input = doc.getElementById("palette");
+  assertEquals(input.getAttribute("role"), "combobox");
+  assertEquals(input.getAttribute("aria-controls"), "palette-list");
+  assertEquals(doc.getElementById("palette-list")?.getAttribute("role"), "listbox");
+  assertEquals(input.getAttribute("aria-activedescendant"), null, "nothing is pointed at before an arrow");
+  input.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+  await settle();
+  const lit = all("#palette-list button")
+    .filter((b) => !(b.getAttribute("style") ?? "").includes("transparent"))
+    .map((b) => b.getAttribute("id"));
+  assertEquals(lit.length, 1, "one row is highlighted");
+  assertEquals(input.getAttribute("aria-activedescendant"), lit[0], "the input names the highlighted row");
+  assertEquals(all("#palette-list [aria-selected='true']").map((b) => b.getAttribute("id")), lit);
+
+  // An arrow over no matches once crashed Elm (`modBy 0`). The crash leaves
+  // the DOM as it was, so only the window's error event tells.
+  let crashed: unknown = null;
+  dom.window.addEventListener("error", (e: unknown) => {
+    crashed = e;
+  });
+  await type_(input, "no such command");
+  assertEquals(all("#palette-list button").length, 0, "nothing matches");
+  input.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+  await settle();
+  assertEquals(input.getAttribute("aria-activedescendant"), null, "nothing to point at");
+  assertEquals(crashed, null, `an arrow key over no matches should not throw, got ${(crashed as ErrorEvent)?.message}`);
+
   await key("/");
-  assertEquals(labels("div[role='dialog']"), ["keyboard shortcuts"]);
+  assertEquals(labels("div[role='dialog']"), ["keyboard shortcuts"], "the shortcut sheet closes the palette");
 
   await key("k");
+  assertEquals(labels("div[role='dialog']"), ["command palette"], "and the palette closes the shortcut sheet");
   assertEquals(labels("#palette"), ["jump to a sheet, or run a command"]);
 
   await key("f");
@@ -471,6 +506,16 @@ Deno.test("every modal, icon button and bare input says what it is", async () =>
 
   await click(all("span.funnel")[0]);
   assertEquals(labels("div.panel input[placeholder='contains...']"), ["filter flag"]);
+
+  // An import preview closes the others, and nothing opens over it: closing it
+  // would drop the file it read.
+  assertEquals(labels("div[role='dialog']"), ["command palette"], "the palette is still up when the preview lands");
+  app.ports.importPreviewed.send({ filename: "a.csv", name: "a", cols: [], rows: [], count: 0 });
+  await settle();
+  assertEquals(labels("div[role='dialog']"), ["import a file"]);
+  await key("k");
+  await key("/");
+  assertEquals(labels("div[role='dialog']"), ["import a file"], "Ctrl+K and Ctrl+/ do nothing over an import");
 });
 
 Deno.test("a sheet opens arranged the way it was left", async () => {
@@ -570,6 +615,17 @@ Deno.test("the keyboard moves over a query's result, and a write to it is refuse
   assertEquals(selected(), ["Fire"], "ArrowDown walks the result's rows");
   await key({ key: "ArrowRight" });
   assertEquals(selected(), ["0.3"], "ArrowRight walks its columns");
+  assertEquals(
+    all("td[aria-selected]").map((td) => [td.getAttribute("aria-selected"), td.textContent?.trim()]),
+    [["true", "0.3"]],
+    "the selected cell says so to a screen reader, and no other cell does",
+  );
+  assertEquals(all("table[role='grid'][aria-multiselectable='true']").length, 1);
+  assertEquals(
+    all("td[role='columnheader']").length,
+    2,
+    "each header cell is a column header",
+  );
   await key({ key: "ArrowDown" });
   await key({ key: "ArrowRight" });
   assertEquals(selected(), ["0.3"], "and the edge of the result is the edge");

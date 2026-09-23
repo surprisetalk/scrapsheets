@@ -2823,6 +2823,19 @@ route url model =
     }
 
 
+{-| Settings, the shortcut sheet and the palette each mount an `aria-modal`
+panel, and a screen reader reads only one of them. Settings lives in the URL's
+`#settings`, so it closes through `SettingsClose` or a reload opens it again.
+-}
+closeModals : Model -> ( Model, Cmd Msg )
+closeModals model =
+    let
+        closed =
+            { model | palette = Nothing, showShortcuts = False }
+    in
+    iif model.showSettings (update SettingsClose closed) ( closed, Cmd.none )
+
+
 
 ---- MESSAGES -----------------------------------------------------------------
 
@@ -3235,7 +3248,9 @@ update msg ({ sheet, auth } as model) =
                     route url model
             in
             ( { next
-                | share =
+                | palette = iif next.showSettings Nothing next.palette
+                , showShortcuts = next.showShortcuts && not next.showSettings
+                , share =
                     -- Whatever the panel holds belongs to the sheet it was
                     -- loaded for, so a navigation empties it. A secret goes
                     -- either way: it must not follow you to another sheet.
@@ -3717,7 +3732,17 @@ update msg ({ sheet, auth } as model) =
             ( { model | showSettings = False }, Nav.replaceUrl model.nav ("/" ++ model.id) )
 
         ShortcutsToggle show ->
-            ( { model | showShortcuts = show }, Cmd.none )
+            -- Neither this nor the palette opens over the import preview or the
+            -- delete confirm: closing the preview throws away the file it read.
+            if show && (model.importing /= Nothing || model.deleteConfirm /= Nothing) then
+                ( model, Cmd.none )
+
+            else
+                let
+                    ( closed, leave ) =
+                        iif show (closeModals model) ( model, Cmd.none )
+                in
+                ( { closed | showShortcuts = show }, leave )
 
         FreshnessLoad value ->
             -- Reported, never swallowed. A column that quietly shows nothing
@@ -3738,9 +3763,17 @@ update msg ({ sheet, auth } as model) =
             -- on the first row, so Enter on a palette nobody had pointed at ran
             -- whatever the shortcut sheet happened to list first -- two
             -- keystrokes, and the first row is a verb that deletes rows.
-            ( { model | palette = iif open (Just { query = "", selected = -1 }) Nothing }
-            , iif open (Task.attempt (always NoOp) (Dom.focus "palette")) Cmd.none
-            )
+            if open && (model.importing /= Nothing || model.deleteConfirm /= Nothing) then
+                ( model, Cmd.none )
+
+            else
+                let
+                    ( closed, leave ) =
+                        iif open (closeModals model) ( model, Cmd.none )
+                in
+                ( { closed | palette = iif open (Just { query = "", selected = -1 }) Nothing }
+                , Cmd.batch [ leave, iif open (Task.attempt (always NoOp) (Dom.focus "palette")) Cmd.none ]
+                )
 
         PaletteNav delta ->
             case model.palette of
@@ -3754,8 +3787,17 @@ update msg ({ sheet, auth } as model) =
                         -- to the last one.
                         from =
                             iif (p.selected < 0) (iif (delta < 0) 0 -1) p.selected
+
+                        -- A real `if`: `iif` evaluates both arguments, and
+                        -- Elm's `modBy 0` is a runtime crash, not a value.
+                        selected =
+                            if shown == 0 then
+                                -1
+
+                            else
+                                modBy shown (from + delta)
                     in
-                    ( { model | palette = Just { p | selected = iif (shown == 0) -1 (modBy shown (from + delta)) } }
+                    ( { model | palette = Just { p | selected = selected } }
                     , Cmd.none
                     )
 
@@ -3821,7 +3863,13 @@ update msg ({ sheet, auth } as model) =
         ImportPreviewed value ->
             case D.decodeValue importingDecoder value of
                 Ok importing ->
-                    ( { model | importing = Just importing }, Cmd.none )
+                    -- The file is read and sent while the page stays live, so
+                    -- another modal can open before the preview lands.
+                    let
+                        ( closed, leave ) =
+                            closeModals model
+                    in
+                    ( { closed | importing = Just importing }, leave )
 
                 Err err ->
                     ( { model | error = "The import preview could not be read: " ++ D.errorToString err }, Cmd.none )
@@ -6319,6 +6367,10 @@ itself is `cohortSql` in src/sql.mjs, which `index.html` calls because Elm
 cannot import that module. A sheet with no date or no key column is not offered
 it at all: a command that can only fail is not a command.
 
+Scoring customers is the same door over the same guesses, into `rfmSql`: recency,
+frequency and money scored per key. A score needs money to score, so a sheet
+with no money column is not offered it either.
+
 -}
 paletteRows : Model -> String -> List Command
 paletteRows model query =
@@ -6406,9 +6458,17 @@ paletteRows model query =
                 named ->
                     named
 
+        dated : Maybe String
+        dated =
+            firstColumn (\c -> c.typ == Date || c.typ == Timestamp)
+
+        money : Maybe String
+        money =
+            firstColumn (\c -> c.typ == Usd)
+
         cohort : List Command
         cohort =
-            case ( firstColumn (\c -> c.typ == Date || c.typ == Timestamp), keyed ) of
+            case ( dated, keyed ) of
                 ( Just when, Just who ) ->
                     if String.contains (String.toLower (String.trim query)) cohortLabel then
                         [ Command cohortLabel model.sheet.id <|
@@ -6424,7 +6484,7 @@ paletteRows model query =
                                                         [ ( "source", E.string ("@" ++ model.sheet.id) )
                                                         , ( "date", E.string when )
                                                         , ( "key", E.string who )
-                                                        , ( "value", E.string (firstColumn (\c -> c.typ == Usd) |> Maybe.withDefault "") )
+                                                        , ( "value", E.string (Maybe.withDefault "" money) )
                                                         , ( "grain", E.string "month" )
                                                         ]
                                                   )
@@ -6439,8 +6499,46 @@ paletteRows model query =
 
                 _ ->
                     []
+
+        rfmLabel : String
+        rfmLabel =
+            "score this sheet's customers (RFM)"
+
+        rfm : List Command
+        rfm =
+            case ( dated, keyed, money ) of
+                ( Just when, Just who, Just spent ) ->
+                    if String.contains (String.toLower (String.trim query)) (String.toLower rfmLabel) then
+                        [ Command rfmLabel model.sheet.id <|
+                            DocNew <|
+                                E.object
+                                    [ ( "type", E.string "query" )
+                                    , ( "data"
+                                      , E.list identity
+                                            [ E.object
+                                                [ ( "lang", E.string "sql" )
+                                                , ( "rfm"
+                                                  , E.object
+                                                        [ ( "source", E.string ("@" ++ model.sheet.id) )
+                                                        , ( "date", E.string when )
+                                                        , ( "key", E.string who )
+                                                        , ( "value", E.string spent )
+                                                        , ( "buckets", E.int 5 )
+                                                        ]
+                                                  )
+                                                ]
+                                            ]
+                                      )
+                                    ]
+                        ]
+
+                    else
+                        []
+
+                _ ->
+                    []
     in
-    List.take 12 (subscribe ++ cohort ++ paletteCommands model.library query)
+    List.take 12 (subscribe ++ cohort ++ rfm ++ paletteCommands model.library query)
 
 
 viewShortcuts : Bool -> Html Msg
@@ -6484,13 +6582,19 @@ viewPalette model =
                     [ A.id "palette"
                     , A.placeholder "jump to a sheet, or run a command"
                     , A.attribute "aria-label" "jump to a sheet, or run a command"
+                    , A.attribute "role" "combobox"
+                    , A.attribute "aria-expanded" "true"
+                    , A.attribute "aria-controls" "palette-list"
+                    , iif (p.selected >= 0 && p.selected < List.length commands)
+                        (A.attribute "aria-activedescendant" ("palette-" ++ String.fromInt p.selected))
+                        (A.classList [])
                     , A.value p.query
                     , A.onInput (InputChange PaletteQuery)
                     , onPaletteKeydown p.selected
                     , S.width "100%"
                     ]
                     []
-                , H.div [ S.displayFlex, S.flexDirectionColumn, S.marginTopRem 0.5, S.maxHeight "60vh", S.overflowYAuto, S.fontSizeRem 0.875 ] <|
+                , H.div [ A.id "palette-list", A.attribute "role" "listbox", S.displayFlex, S.flexDirectionColumn, S.marginTopRem 0.5, S.maxHeight "60vh", S.overflowYAuto, S.fontSizeRem 0.875 ] <|
                     case commands of
                         [] ->
                             [ H.span [ S.color "#666" ] [ text "nothing matches" ] ]
@@ -6500,6 +6604,9 @@ viewPalette model =
                                 (\i command ->
                                     H.button
                                         [ A.onClick (PaletteRun i)
+                                        , A.id ("palette-" ++ String.fromInt i)
+                                        , A.attribute "role" "option"
+                                        , A.attribute "aria-selected" (iif (i == p.selected) "true" "false")
                                         , S.displayFlex
                                         , S.justifyContentSpaceBetween
                                         , S.gapRem 1
@@ -7976,18 +8083,24 @@ pinAttrs pins col =
             []
 
 
-cellClasses : Sheet -> Int -> Int -> H.Attribute Msg
-cellClasses sheet i n =
+{-| Both corners at -1 on one axis span that whole axis. Every corner at -1 is
+no selection.
+-}
+inSelection : Rect -> Int -> Int -> Bool
+inSelection ({ a, b } as select) i n =
     let
-        { a, b } =
-            sheet.select
-
         between a_ b_ i_ =
             min a_ b_ <= i_ && i_ <= max a_ b_
 
         eq a_ b_ i_ =
             a_ == i_ && i_ == b_
+    in
+    (select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1)
 
+
+cellClasses : Sheet -> Int -> Int -> H.Attribute Msg
+cellClasses sheet i n =
+    let
         cellIdx =
             xy i n
 
@@ -8008,7 +8121,7 @@ cellClasses sheet i n =
                     False
     in
     A.classList
-        [ ( "selected", (sheet.select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1) )
+        [ ( "selected", inSelection sheet.select i n )
         , ( "r0", n == 0 )
         , ( "c0", i == 0 )
         , ( "match-highlight", isMatch && not isCurrentMatch )
@@ -8589,6 +8702,9 @@ viewCell sheet stats pins extents grab i n col row =
          , A.onMouseEnter (CellHover (xy i n))
          , iif (n == 0 && sheet.filterOpen == Just col.key) (S.zIndex "2") (A.classList [])
          , cellClasses sheet i n
+         , iif (inSelection sheet.select i n) (A.attribute "aria-selected" "true") (A.classList [])
+         , -- A `td` in a `role="grid"` table is a gridcell already, so only a header cell names its role.
+           iif (n == 0) (A.attribute "role" "columnheader") (A.classList [])
          , (spec col.typ).align
          , colWidth sheet col
          , iif (Set.member col.key sheet.hidden) S.displayNone (A.classList [])
@@ -10572,7 +10688,7 @@ view ({ sheet } as model) =
                                 H.div []
                                     [ iif (doc == Library) (viewGallery model) (text "")
                                     , viewFilterBar sheet (Array.length sortedRows) (Array.length rows)
-                                    , H.table [ A.onMouseLeave (CellHover (xy -1 -1)), A.attribute "role" "grid", A.attribute "aria-label" (iif (doc == Library) "library" (iif (String.trim info.name == "") "untitled sheet" info.name)) ]
+                                    , H.table [ A.onMouseLeave (CellHover (xy -1 -1)), A.attribute "role" "grid", A.attribute "aria-multiselectable" "true", A.attribute "aria-label" (iif (doc == Library) "library" (iif (String.trim info.name == "") "untitled sheet" info.name)) ]
                                         [ H.tbody [] <|
                                             Array.toList <|
                                                 Array.indexedMap (\n_ row -> viewTableRow sheet doc stats pins extents grab cols (n_ - 2) row) <|

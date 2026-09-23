@@ -32,6 +32,7 @@ import {
   register,
   rewriteExtremes,
   rewriteUnpivot,
+  rfmSql,
   scanRefs,
   selectTypes,
 } from "./src/sql.mjs";
@@ -445,6 +446,107 @@ Deno.test("a cohort table refuses every field it cannot build from, by name", ()
   // And the "did you mean" a near miss earns, since a grain is a word somebody
   // types rather than a column they pick.
   assertThrows(() => cohortSql({ ...ok, grain: "monthly" }), Error, "month");
+});
+
+// The first statement anything writes with `ntile`, so this is where the two
+// engines are held to one answer for it.
+Deno.test("a score table answers the same scores in both engines, the best bucket highest", () => {
+  const dataset = (DATASETS as { doc_id: string; doc: { data: Row[] } }[]).find((d) => d.doc_id === "orders")!;
+  const [cols_, ...rows] = dataset.doc.data;
+  const orders = rows.map((row) =>
+    Object.fromEntries((Object.values(cols_) as { name: string; key: string }[]).map((c) => [c.name, row[c.key]]))
+  );
+  checkColumnTypes("table:orders", Object.values(cols_), orders);
+  const loaded: Record<string, Row[]> = { "table:orders": orders };
+  const colsOf = { "table:orders": Object.keys(orders[0]).map((name) => ({ name })) };
+  const code = rfmSql({
+    source: "@table:orders",
+    date: "ordered_on",
+    key: "customer_id",
+    value: "revenue",
+    buckets: 5,
+  });
+  const [onServer, inPage] = engines.map(([, engine]) => {
+    serveSheets(engine);
+    const { sql, cells } = scanRefs(code);
+    const plan = planQuery(sql, cells, loaded, colsOf);
+    return applyWindows(engine(plan.sql, [loaded]), plan, (q: string, params: unknown[]) => engine(q, params).data)
+      .data as Row[];
+  });
+  assertEquals(inPage, onServer, "a score table answers differently in the page engine");
+  assertEquals(onServer.length, new Set(orders.map((o) => o.customer_id)).size, "one row per customer");
+  for (const [score, measure] of [["r", "last_seen"], ["f", "orders"], ["m", "revenue"]]) {
+    // Ties split by row order, and the rows come back by key.
+    const ranked = [...onServer].sort((a, b) =>
+      a[measure] === b[measure]
+        ? (a.customer_id as number) - (b.customer_id as number)
+        : (a[measure] as number) < (b[measure] as number)
+        ? -1
+        : 1
+    );
+    const scores = ranked.map((row) => row[score] as number);
+    assertEquals([scores[0], scores.at(-1)], [1, 5], `${score} runs from the worst bucket to the best`);
+    assert(
+      scores.every((s, i) => i === 0 || s >= scores[i - 1]),
+      `${score} never falls as ${measure} rises, got ${scores.join(",")}`,
+    );
+  }
+});
+
+Deno.test("a score table keys, dates and sums columns AlaSQL will not parse bare, in both engines", () => {
+  const loaded: Record<string, Row[]> = {
+    "table:keyword-rfm": [
+      { store: "a", class: "2024-01-03", total: 5 },
+      { store: "a", class: "2024-02-03", total: 7 },
+      { store: "b", class: "2024-02-05", total: 9 },
+      { store: "c", class: "2024-01-05", total: 1 },
+    ],
+  };
+  const colsOf = { "table:keyword-rfm": ["store", "class", "total"].map((name) => ({ name })) };
+  const code = rfmSql({ source: "@table:keyword-rfm", date: "class", key: "store", value: "total", buckets: 2 });
+  const [onServer, inPage] = engines.map(([, engine]) => {
+    serveSheets(engine);
+    const { sql, cells } = scanRefs(code);
+    const plan = planQuery(sql, cells, loaded, colsOf);
+    return JSON.stringify(
+      applyWindows(engine(plan.sql, [loaded]), plan, (q: string, params: unknown[]) => engine(q, params).data).data,
+    );
+  });
+  // b and c tie on one order each, and row order -- by key -- puts b first.
+  assertEquals(
+    onServer,
+    `[{"store":"a","last_seen":"2024-02-03","orders":2,"total":12,"r":1,"f":2,"m":2},` +
+      `{"store":"b","last_seen":"2024-02-05","orders":1,"total":9,"r":2,"f":1,"m":1},` +
+      `{"store":"c","last_seen":"2024-01-05","orders":1,"total":1,"r":1,"f":1,"m":1}]`,
+    "a score table over keyword columns answers the wrong rows",
+  );
+  assertEquals(inPage, onServer, "a score table over keyword columns answers differently in the page engine");
+});
+
+Deno.test("a score table refuses every field it cannot build from, by name", () => {
+  const ok = { source: "@table:orders", date: "ordered_on", key: "customer_id", value: "revenue", buckets: 5 };
+  const taken = (what: string) => `A score table's ${what} has to be a column it does not already name.`;
+  for (
+    const [settings, said] of [
+      [{ ...ok, source: "@chart:spend" }, "A score table reads one table or query sheet."],
+      [{ ...ok, buckets: 1 }, "A score table's buckets have to be a whole number from 2 to"],
+      [{ ...ok, buckets: 101 }, "A score table's buckets have to be a whole number from 2 to"],
+      [{ ...ok, buckets: 2.5 }, "A score table's buckets have to be a whole number from 2 to"],
+      [{ ...ok, buckets: "5" }, "A score table's buckets have to be a whole number from 2 to"],
+      [{ ...ok, date: 7 }, "A score table's date column has to be a column name."],
+      [{ ...ok, key: "" }, "A score table's key column has to be a column name."],
+      [{ ...ok, value: "" }, "A score table's value column has to be a column name."],
+      [{ ...ok, date: "last_seen" }, taken("date column")],
+      [{ ...ok, key: "r" }, taken("key column")],
+      [{ ...ok, key: "ordered_on" }, taken("key column")],
+      [{ ...ok, value: "orders" }, taken("value column")],
+      [{ ...ok, value: "m" }, taken("value column")],
+      [{ ...ok, value: "customer_id" }, taken("value column")],
+      [{ ...ok, value: "ordered_on" }, taken("value column")],
+    ] as unknown as [Parameters<typeof rfmSql>[0], string][]
+  ) {
+    assertThrows(() => rfmSql(settings), Error, said);
+  }
 });
 
 // cohortSql and chartSql share the one chartIdent(), given "cohort table" or

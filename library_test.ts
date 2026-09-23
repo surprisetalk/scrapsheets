@@ -324,6 +324,41 @@ Deno.test("the palette subscribes to the sheet that is open, and builds a cohort
     },
   });
 
+  // The same three guesses score the customers, into five buckets.
+  await key(doc.body, { key: "k", ctrlKey: true });
+  await type("rfm");
+  await key(doc.getElementById("palette"), { key: "ArrowDown" });
+  await key(doc.getElementById("palette"), { key: "Enter" });
+  assertEquals(made.length, 2, "the score command opens one sheet");
+  assertEquals(made[1].type, "query");
+  assertEquals(made[1].data[0], {
+    lang: "sql",
+    rfm: { source: "@table:signups", date: "joined_on", key: "signup_id", value: "fee", buckets: 5 },
+  });
+
+  // A cohort counts keys with no money column; a score has nothing to score.
+  app.ports.docSelected.send({
+    id: "table:unpriced",
+    data: {
+      doc: {
+        type: "table",
+        data: [[{ name: "plan", type: "text", key: "0" }, { name: "joined_on", type: "date", key: "1" }], {
+          "0": "pro",
+          "1": "2024-01-03",
+        }],
+      },
+    },
+  });
+  await settle();
+  await key(doc.body, { key: "k", ctrlKey: true });
+  await type("this sheet");
+  assert(
+    rows().some((row) => row.includes("build a cohort table")) &&
+      !rows().some((row) => row.includes("(RFM)")),
+    `a sheet with no money column has a cohort but no score, got: ${rows().join("|")}`,
+  );
+  await key(doc.getElementById("palette"), { key: "Escape" });
+
   // A date column with no id-shaped or text column beside it has no key to
   // group by, and a command that can only fail is not a command.
   app.ports.docSelected.send({
@@ -344,10 +379,10 @@ Deno.test("the palette subscribes to the sheet that is open, and builds a cohort
   });
   await settle();
   await key(doc.body, { key: "k", ctrlKey: true });
-  await type("cohort");
+  await type("this sheet");
   assert(
-    !rows().some((row) => row.includes("build a cohort table")),
-    `a sheet with no key column has no cohort to build, got: ${rows().join("|")}`,
+    !rows().some((row) => row.includes("build a cohort table") || row.includes("(RFM)")),
+    `a sheet with no key column has no cohort to build and no customers to score, got: ${rows().join("|")}`,
   );
   await key(doc.getElementById("palette"), { key: "Escape" });
 
@@ -366,10 +401,10 @@ Deno.test("the palette subscribes to the sheet that is open, and builds a cohort
   });
   await settle();
   await key(doc.body, { key: "k", ctrlKey: true });
-  await type("cohort");
+  await type("this sheet");
   assert(
-    !rows().some((row) => row.includes("build a cohort table")),
-    `a sheet with no date column has no cohort to build, got: ${rows().join("|")}`,
+    !rows().some((row) => row.includes("build a cohort table") || row.includes("(RFM)")),
+    `a sheet with no date column has no cohort to build and no customers to score, got: ${rows().join("|")}`,
   );
   await key(doc.getElementById("palette"), { key: "Escape" });
 
@@ -388,9 +423,9 @@ Deno.test("the palette subscribes to the sheet that is open, and builds a cohort
   await type("subscribe");
   await key(doc.getElementById("palette"), { key: "ArrowDown" });
   await key(doc.getElementById("palette"), { key: "Enter" });
-  assertEquals(made.length, 2, "one command, one sheet");
-  assertEquals(made[1].type, "alert");
-  assertEquals(made[1].data[0], {
+  assertEquals(made.length, 3, "one command, one sheet");
+  assertEquals(made[2].type, "alert");
+  assertEquals(made[2].data[0], {
     code: "select * from @table:countries",
     to: "ops@example.com",
     interval: 3600,
@@ -416,10 +451,10 @@ Deno.test("the palette subscribes to the sheet that is open, and builds a cohort
   // A chart keeps no columns of its own -- `arrangeable` answers Nothing for
   // it -- so there is nothing to guess a cohort's date and key from either.
   await key(doc.body, { key: "k", ctrlKey: true });
-  await type("cohort");
+  await type("this sheet");
   assert(
-    !rows().some((row) => row.includes("build a cohort table")),
-    `a chart has no cohort to build, got: ${rows().join("|")}`,
+    !rows().some((row) => row.includes("build a cohort table") || row.includes("(RFM)")),
+    `a chart has no cohort to build and no customers to score, got: ${rows().join("|")}`,
   );
 });
 

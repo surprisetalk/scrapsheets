@@ -48,6 +48,7 @@ import {
   pollNetOnce,
   pollNetSheet,
   pollOnce,
+  pollTimer,
   RATE_LIMIT_KEYS_MAX,
   rateLimitBuckets,
   requireSecret,
@@ -63,6 +64,8 @@ import {
   WEBHOOK_FAILS_MAX,
   WEBHOOKS_PER_SHEET_MAX,
   webhookTimer,
+  zipData,
+  zipMembers,
 } from "./main.ts";
 import type { Col, NetHttp, Query, Sheet, Table, Template } from "./main.ts";
 import { DATASETS } from "./src/examples.mjs";
@@ -171,6 +174,10 @@ const usr = async (email: string) => {
 };
 
 Deno.test(async function allTests(t) {
+  // The production poller would fire with the real safeFetch once a slow run
+  // passes 15 seconds and write DNS-failure rows over fixtures on `.test`
+  // hosts; every step here drives the poller itself.
+  clearInterval(pollTimer);
   const pglite = new PGlite({ extensions: { citext } });
   await pglite.waitReady;
   // The empty cluster, taken before our own schema is applied. Booting a PGlite
@@ -2768,6 +2775,75 @@ Deno.test(async function allTests(t) {
     }
   });
 
+  await t.step("GET /library.zip holds every sheet the caller owns", async () => {
+    const { jwt } = await usr("zip@example.com");
+    const { jwt: other } = await usr("zip-other@example.com");
+    const auth = { headers: new Headers({ Authorization: `Bearer ${jwt}` }) };
+    const table = automerge.create<{ data: Sheet["data"] }>({
+      data: [
+        arrayify([{ name: "name", type: "text", key: 0 }, { name: "n", type: "num", key: 1 }]),
+        { 0: "Alice", 1: 30 },
+        { 0: "Bob, Jr.", 1: 2 },
+      ],
+    });
+    await put(jwt, `/library/table:${table.documentId}`, { name: "people", tags: ["zip"] });
+    const settings: Query = { lang: "sql", code: `select name from @table:${table.documentId}`, args: [] };
+    const query = automerge.create<{ data: Sheet["data"] }>({ data: [settings] });
+    await put(jwt, `/library/query:${query.documentId}`, { name: "names" });
+    // Shared in as an editor: the caller can read it, and it is not theirs to download.
+    const theirs = automerge.create<{ data: Sheet["data"] }>({
+      data: [arrayify([{ name: "x", type: "text", key: 0 }])],
+    });
+    await put(other, `/library/table:${theirs.documentId}`, {});
+    await post(other, `/library/table:${theirs.documentId}/share`, { email: "zip@example.com", role: "editor" });
+
+    const res = await app.request("/library.zip", auth);
+    assertEquals(res.status, 200, await res.clone().text());
+    assertEquals(res.headers.get("content-type"), "application/zip");
+    const raw = new Uint8Array(await res.arrayBuffer());
+    const members = zipMembers(raw, "GET /library.zip");
+    const csvName = `table/${table.documentId}.csv`;
+    const queryName = `query/${query.documentId}.json`;
+    assertEquals(members.map((m) => m.name).sort(), [csvName, "manifest.json", queryName].sort());
+    const read = async (name: string) =>
+      new TextDecoder().decode(await zipData(raw, members.find((m) => m.name === name)!, "GET /library.zip"));
+    const exported = await app.request(`/export/table:${table.documentId}.csv`, auth);
+    assertEquals(await read(csvName), await exported.text());
+    assertEquals(JSON.parse(await read(queryName)), settings);
+    assertEquals(JSON.parse(await read("manifest.json")), [
+      {
+        sheet_id: `query:${query.documentId}`,
+        name: "names",
+        type: "query",
+        tags: [],
+        license: null,
+      },
+      {
+        sheet_id: `table:${table.documentId}`,
+        name: "people",
+        type: "table",
+        tags: ["zip"],
+        license: null,
+        columns: [{ name: "name", type: "text" }, { name: "n", type: "num" }],
+      },
+    ]);
+    const [{ n }] = await sql`
+      select count(*)::int as n from audit
+      where action = 'export' and sheet_id in (${`table:${table.documentId}`}, ${`query:${query.documentId}`})
+    `;
+    assertEquals(n, 2);
+
+    // One sheet that cannot export fails the whole download: nothing is skipped.
+    const clash = automerge.create<{ data: Sheet["data"] }>({
+      data: [arrayify([{ name: "a", type: "text", key: 0 }, { name: "a", type: "text", key: 1 }]), { 0: "x", 1: "y" }],
+    });
+    await put(jwt, `/library/table:${clash.documentId}`, {});
+    const refused = await app.request("/library.zip", auth);
+    assertEquals(refused.status, 400);
+    const said = await refused.text();
+    assert(said.includes(`table:${clash.documentId} has two columns with the same name`), said);
+  });
+
   await t.step("A CSV that does not match its own header is a rejection, not a coercion", async () => {
     const { jwt } = await usr("ruth@example.com");
     const importCsv = (text: string) =>
@@ -4865,10 +4941,12 @@ Deno.test(async function allTests(t) {
       parquetNot: await feed("https://parquetnot.body.test/feed"),
       parquetCodec: await feed("https://parquetcodec.body.test/feed"),
       zipParquet: await feed("https://zipparquet.body.test/feed"),
+      gzipParquet: await feed("https://gzipparquet.body.test/feed"),
+      gzipPar1Csv: await feed("https://gzippar1csv.body.test/feed"),
     };
-    const gzip = async (text: string) =>
+    const gzip = async (body: string | Uint8Array<ArrayBuffer>) =>
       new Uint8Array(
-        await new Response(new Blob([text]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer(),
+        await new Response(new Blob([body]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer(),
       );
     const zippedJson = await gzip(`[{"n":1}]`);
     const zippedCsv = await gzip("a,b\n1,2\n");
@@ -4975,6 +5053,9 @@ Deno.test(async function allTests(t) {
       columnData: [{ name: "id", data: [9007199254740993n], type: "INT64" }],
     }));
     const parquetZip = await zipOf({ "data.parquet": parquetBody });
+    const parquetGzip = await gzip(parquetBody);
+    // Magic at the front only: a CSV whose first header opens with it.
+    const par1CsvGzip = await gzip("PAR1,b\n1,2\n");
     // A file that declares GZIP and holds bytes nobody compressed: the reader
     // refuses on the codec before it looks at a page, which is the only codec
     // this server has no decompressor for that a test can build without one.
@@ -5149,6 +5230,10 @@ Deno.test(async function allTests(t) {
           return Promise.resolve(typed(parquetGzipBody, "application/vnd.apache.parquet"));
         case "zipparquet.body.test":
           return Promise.resolve(typed(parquetZip, "application/zip"));
+        case "gzipparquet.body.test":
+          return Promise.resolve(typed(parquetGzip, "application/gzip"));
+        case "gzippar1csv.body.test":
+          return Promise.resolve(typed(par1CsvGzip, "application/gzip"));
         case "nsatom.body.test":
           // Prefixed Atom, which is most of the Atom on the internet.
           return Promise.resolve(typed(
@@ -5430,6 +5515,10 @@ Deno.test(async function allTests(t) {
     // keyed by column name, which is what every reader downstream keys on.
     assertEquals(await bodyOf(ids.parquet), [{ id: 1, name: "bolt" }, { id: 2, name: "nut" }]);
     assertEquals((await newest(ids.parquet)).meta.shape, { id: "number", name: "string" });
+    // A gzip names nothing of what it holds, and parquet says so itself at both
+    // ends; one end alone is a CSV that happens to open with the magic.
+    assertEquals(await bodyOf(ids.gzipParquet), [{ id: 1, name: "bolt" }, { id: 2, name: "nut" }]);
+    assertEquals(await bodyOf(ids.gzipPar1Csv), [{ PAR1: 1, b: 2 }]);
     // An INT64 arrives as a BigInt, which JSON.stringify throws on. Past 2^53 it
     // is its decimal text, never a Number that rounded two ids into one.
     assertEquals(await bodyOf(ids.parquetBig), [{ id: "9007199254740993" }]);
@@ -7811,7 +7900,7 @@ Deno.test(async function allTests(t) {
       values (${ids[0]}, 'GET', 'x', ${sql.json({ status: "99999999999999999999" })})
     `;
     assertEquals((await rows(jwt)).body.length > 0, true, "one unreadable status must not empty the answer");
-    assertEquals(Object.keys(await status()).length, 17, "nor take the alarm down with it");
+    assertEquals(Object.keys(await status()).length, 21, "nor take the alarm down with it");
     await sql`delete from net where sheet_id = ${ids[0]} and body = 'x'`;
 
     // A poll is not the only kind of run. A net-hook sheet's run is the
@@ -9245,7 +9334,7 @@ Deno.test(async function allTests(t) {
   await t.step("Every status condition is graded so that 1.0 is the minimum pass", async () => {
     const grades = await status();
     const conditions = Object.keys(grades);
-    assertEquals(conditions.length, 17);
+    assertEquals(conditions.length, 21);
     for (const [condition, series] of Object.entries(grades)) {
       assert(condition.endsWith("."), `a condition is a sentence: ${condition}`);
       assert("0" in series, `${condition} must be graded now`);
@@ -9267,7 +9356,7 @@ Deno.test(async function allTests(t) {
     const survived = await app.request("/status");
     assertEquals(
       Object.keys(await survived.json()).length,
-      17,
+      21,
       "a malformed row must degrade a grade, not replace the whole answer with an error",
     );
 
@@ -9395,9 +9484,68 @@ Deno.test(async function allTests(t) {
     );
     await sql`update sheet set created_at = now() - interval '3 days'
               where created_by <> (select usr_id from usr where email = '')`;
+    // The go-to-market goals, pushed out of every window: the suite signed up,
+    // bought and used the app minutes ago.
+    const signedUp = "Somebody signed up in the past week.";
+    const madeSheet = "Somebody who signed up in the past week made a sheet.";
+    const paid = "Somebody paid in the past week.";
+    const usedByOthers = "Somebody other than the operator used the app in the past day.";
+    await sql`update usr set created_at = created_at - interval '30 days'`;
+    await sql`update audit set created_at = created_at - interval '30 days'`;
+    await sql`update payment set created_at = created_at - interval '30 days'`;
+    // The operator is the product's own account, so neither signing up nor
+    // using the app counts.
+    await sql`update usr set created_at = now() where email = 'erin@example.com'`;
+    await sql`
+      insert into audit (sheet_id, usr_id, action, via)
+      values ('net-hook:errors', (select usr_id from usr where email = 'erin@example.com'), 'read', 'jwt'),
+             ('net-hook:errors', (select usr_id from usr where email = ''), 'read', 'jwt'),
+             ('net-hook:errors', null, 'read', 'link')
+    `;
     const idle = await app.request("/status");
     assertEquals(idle.status, 200, "a product nobody used today is not an outage");
-    assertEquals((await idle.json())["Somebody created a sheet in the past 24 hours."]["0"], 0);
+    const idleGrades = await idle.json();
+    for (
+      const condition of ["Somebody created a sheet in the past 24 hours.", signedUp, madeSheet, paid, usedByOthers]
+    ) {
+      assertEquals(Object.keys(idleGrades[condition]), ["0", "3600", "86400"], `${condition} carries the trend`);
+      assertEquals(idleGrades[condition]["0"], 0, `${condition} counts nobody on an idle product`);
+    }
+
+    // Two rounds, not one per condition: each status() call runs every check.
+    const [newcomer] = await sql`insert into usr (email) values ('newcomer@example.com') returning usr_id`;
+    await sql`
+      insert into payment (buyer_id, seller_id, sell_id, sheet_id, amount)
+      select ${newcomer.usr_id}, created_by, sell_id, sheet_id, 0 from sheet where sheet_id = 'net-hook:errors'
+    `;
+    const joined = await status();
+    assertEquals(joined[signedUp]["0"], 1, "one new account is somebody signing up, and the operator is not");
+    assertEquals(joined[madeSheet]["0"], 0, "an account with no sheet has not made one");
+    assertEquals(joined[paid]["0"], 0, "a free claim is not a payment");
+    assertEquals(joined[usedByOthers]["0"], 0, "the operator, the sentinel and a share link are nobody");
+
+    await sql`
+      insert into sheet (created_by, type, doc_id, name)
+      values (${newcomer.usr_id}, 'table', 'newcomer-probe', 'first sheet')
+    `;
+    await sql`
+      insert into payment (buyer_id, seller_id, sell_id, amount, stripe_session_id)
+      select ${newcomer.usr_id}, created_by, sell_id, 5, 'cs_status_probe' from sheet where sheet_id = 'net-hook:errors'
+    `;
+    await sql`
+      insert into audit (sheet_id, usr_id, action, via)
+      values ('table:newcomer-probe', ${newcomer.usr_id}, 'read', 'jwt')
+    `;
+    const active = await app.request("/status");
+    assertEquals(active.status, 200, "a usage goal never pages");
+    const activeGrades = await active.json();
+    assertEquals(activeGrades[madeSheet]["0"], 1, "the newcomer's first sheet is the activation");
+    assertEquals(activeGrades[paid]["0"], 1, "a paid Checkout Session is somebody paying");
+    assertEquals(activeGrades[usedByOthers]["0"], 1, "an account other than the operator's is somebody using the app");
+    await sql`delete from audit where usr_id = ${newcomer.usr_id}`;
+    await sql`delete from payment where buyer_id = ${newcomer.usr_id}`;
+    await sql`delete from sheet where created_by = ${newcomer.usr_id}`;
+    await sql`delete from usr where usr_id = ${newcomer.usr_id}`;
 
     // 200 is reachable. The suite has spent the run filling the error log and
     // failing net-http polls on purpose, so a clean log is what proves the
@@ -9716,6 +9864,111 @@ Deno.test(async function allTests(t) {
       String(byId[alert_id].next_run).includes("T"),
       `an alert the poller has run knows when it runs next, got ${byId[alert_id].next_run}`,
     );
+  });
+
+  await t.step("You re-run a feed from a past watermark", async () => {
+    const { jwt } = await usr("backfill@example.com");
+    const feed = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{
+        url: "http://93.184.216.91/items",
+        interval: 3600,
+        cursor: "since",
+        method: "POST",
+        body: `{"after":"{{cursor}}"}`,
+      }],
+    });
+    const feed_id = `net-http:${feed.documentId}`;
+    await put(jwt, `/library/${feed_id}`, { name: "backfill feed" });
+    const seen: { url: string; headers: Record<string, string>; body?: string }[] = [];
+    const answer = (n: number) =>
+      Promise.resolve(
+        new Response(`[{"n":${n}}]`, { headers: { "Content-Type": "application/json", ETag: `"v${n}"` } }),
+      );
+    // An hour back, so the host gap this poll holds is over before the run.
+    const first = Date.now() - 3600_000;
+    await pollNetSheet(feed_id, feed.documentId, (url, headers, _method, body) => {
+      seen.push({ url, headers: { ...headers }, body });
+      return answer(1);
+    }, first);
+
+    // Through the route, so safeFetch is the door and fetch is the wire.
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = ((url: string, init?: RequestInit) => {
+      seen.push({
+        url: String(url),
+        headers: Object.fromEntries(new Headers(init?.headers).entries()),
+        body: String(init?.body),
+      });
+      return answer(2);
+    }) as typeof fetch;
+    let ran: { meta: { cursor: string; status: number } };
+    try {
+      ({ data: ran } = await post(jwt, `/library/${feed_id}/run`, { cursor: "2024-01-31T00:00:00Z" }));
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+    const backfill = seen[1];
+    assertEquals(
+      new URL(backfill.url).searchParams.get("since"),
+      "2024-01-31T00:00:00Z",
+      "the url asks from the cursor",
+    );
+    assertEquals(backfill.body, `{"after":"2024-01-31T00:00:00Z"}`, "and so does the body");
+    assertEquals(backfill.headers["if-none-match"], undefined, "a backfill sends no validator");
+    assertEquals(ran.meta.status, 200);
+    assert(ran.meta.cursor > new Date(first).toISOString(), `the watermark moves to the run, got ${ran.meta.cursor}`);
+
+    // The schedule carries on from the backfill's own start, validators and all.
+    await pollNetSheet(feed_id, feed.documentId, (url, headers, _method, body) => {
+      seen.push({ url, headers: { ...headers }, body });
+      return answer(3);
+    }, Date.now() + 3600_000);
+    const next = seen[2];
+    assertEquals(
+      new URL(next.url).searchParams.get("since"),
+      ran.meta.cursor,
+      "the next poll asks from the new watermark",
+    );
+    assertEquals(next.body, `{"after":"${ran.meta.cursor}"}`);
+    assertEquals(next.headers["If-None-Match"], `"v2"`, "and asks conditionally again");
+
+    const refusal = async (sheet_id: string, cursor: unknown, status: number, headline: string) => {
+      const res = await app.request(`/library/${sheet_id}/run`, {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        body: JSON.stringify({ cursor }),
+      });
+      const text = await res.text();
+      assertEquals(res.status, status, text);
+      assert(text.includes(headline), `${sheet_id} with cursor ${cursor} names ${headline}: ${text}`);
+    };
+    await refusal(feed_id, "yesterday", 400, "That cursor is not a timestamp.");
+    await refusal(feed_id, "2024-01-31T00:00:00", 400, "That cursor is not a timestamp.");
+    const alert = automerge.create<{ data: [{ code: string; to: string; interval: number }] }>({
+      data: [{ code: "select 1 as n", to: "", interval: 3600 }],
+    });
+    const alert_id = `alert:${alert.documentId}`;
+    await put(jwt, `/library/${alert_id}`, { name: "backfill alert" });
+    await refusal(alert_id, "2024-01-31", 400, "An alert sheet has no watermark to rerun from.");
+    const replace = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "http://93.184.216.91/latest", interval: 3600, mode: "replace" }],
+    });
+    const replace_id = `net-http:${replace.documentId}`;
+    await put(jwt, `/library/${replace_id}`, { name: "replace feed" });
+    await refusal(replace_id, "2024-01-31", 409, "A replace feed cannot rerun from a cursor.");
+    // Nowhere to send the watermark: the run would be an ordinary poll that
+    // answered as if it had backfilled.
+    const plain = automerge.create<Sheet>({
+      type: "net-http",
+      data: [{ url: "http://93.184.216.91/plain", interval: 3600 }],
+    });
+    const plain_id = `net-http:${plain.documentId}`;
+    await put(jwt, `/library/${plain_id}`, { name: "plain feed" });
+    await refusal(plain_id, "2024-01-31", 409, "This feed has nowhere to send a cursor.");
+    // Date.parse answers March 2 for this one rather than refusing it.
+    await refusal(feed_id, "2026-02-30", 400, "That cursor is not a timestamp.");
   });
 
   await t.step("Within a cycle, the feeds an alert reads are polled before the alert", async () => {

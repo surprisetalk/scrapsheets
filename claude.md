@@ -126,7 +126,10 @@ A change that breaks one of these is a bug even if the suite is green.
 - **One definition each:** `POLL_OK`, `ALERT_OK`, `RUN_OF`, `RUN_OK`, `pauseSwitch`. `GET /status` and
   `library:freshness` read them. A `null` from `pauseSwitch` is "unknown" in freshness and "running" in status.
 - **The status check grades, never maximizes.** 1.0 is the minimum pass, `grade()` floors, and a condition that cannot
-  compute throws by name.
+  compute throws by name. The usage conditions are spelled once in `USAGE`, keyed by their `overTime` alias: a sheet
+  made, a signup, a signup who made a sheet, a payment with `amount > 0`, and an `audit` row from an account outside
+  `house` (the sentinel and the trimmed `OPERATOR_EMAIL`). Each is a count against a bar of one, and `REPORTED_ONLY`
+  reports them beside `OVERDUE_CONDITION` and never pages.
 - **Secrets never reach a document.** A net-http header says `{{secret:name}}`, resolved at fetch time into a separate
   object. `assertNoKeys()` scans on `POST /library/:id/public` and a priced `POST /sell/:id`, after the owner check,
   bounded by `KEY_SCAN_CELLS` and `KEY_SCAN_BYTES`. `KEY_SHAPES` has no override. `PII_SHAPES` (email, phone, US SSN, a
@@ -172,7 +175,7 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   `library:audit`, `net-hook:errors`, `net-hook:reports`. `isOperator()` is whoever reads `net-hook:errors`;
   `OPERATOR_EMAIL` gets it at seed.
 - A new computed sheet registers in three places: the early return in `sheet()`, `assertNoKeys`'s skip list, and its
-  `GET /library/...` route.
+  `GET /library/...` route. One with a `sheet` row also goes in `GET /library.zip`'s exclusion list.
 
 **Access**
 
@@ -183,8 +186,9 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - Sync: automerge `NodeWSServerAdapter` behind a ws-shim over Hono's `upgradeWebSocket`. `syncRole` checks access per
   message. A viewer's frames are decoded and refused if they carry changes.
 - Audit: the `audit` table, read as `library:audit`. `record()` is the one writer. HTTP routes in `AUDITED` log after
-  success; the socket logs `open` and a first `edit` per peer per document; MCP logs `mcp <tool>`; a query logs `query`
-  per sheet it resolves. A row that cannot be written fails its request.
+  success; `GET /library.zip` logs `export` per sheet it holds; the socket logs `open` and a first `edit` per peer per
+  document; MCP logs `mcp <tool>`; a query logs `query` per sheet it resolves. A row that cannot be written fails its
+  request.
 
 **Inbound**
 
@@ -201,8 +205,9 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   error and spends its own cycle budget (`POLL_CYCLE_MS`, `ALERT_CYCLE_MS`). `pollNetSheet` / `pollAlertSheet` are the
   one-sheet halves the timer and `POST /library/:id/run` share.
 - Request: `method` is one of `NET_METHODS`; `netRequest` refuses a GET with a body. Headers and `body` resolve
-  `{{secret:name}}` and `{{cursor}}`; a failure row's repro keeps the unresolved text. Conditional requests, per-host
-  `Retry-After`, bounded retries. One `net` row per run, quiet runs too. Every row carries its verb and the watermark.
+  `{{secret:name}}`; only `body` resolves `{{cursor}}`, and the `cursor` field names the URL parameter that carries the
+  same watermark. A failure row's repro keeps the unresolved text. Conditional requests, per-host `Retry-After`, bounded
+  retries. One `net` row per run, quiet runs too. Every row carries its verb and the watermark.
 - Shape: `meta.shape` from `shapeOf`. A different shape adds `meta.shape_change` (`shapeChange`), and `POLL_OK` grades
   that run failed.
 - Repeats: a good body's digest goes in `meta.sig`. `net_hook_signature_idx` refuses the repeat, and `netRow` moves the
@@ -224,7 +229,10 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   leaves the two liveness conditions until `OVERDUE_MAX`. `INTERVAL_MAX_S` clamps `interval`. `POST /library/:id/run`
   needs `assertSheetEditor`, spends `runs`, and answers the newest `net` row at or after a watermark from Postgres's
   clock, as epoch seconds (`net.created_at` has no timezone). Refusals: paused 409, wrong type 400, nothing recorded
-  409\. Freshness adds `paused` and `next_run`.
+  409\. A body may carry `cursor`, an ISO date or a zoned date and time: `pollNetSheet`'s `since` replaces the stored
+  watermark in the cursor parameter and in `{{cursor}}`, and sends no conditional header. A good run still writes
+  `cursor` as now. A bad cursor is 400, a cursor on an alert 400, a cursor on a `replace` feed 409, a cursor on a feed
+  with no `cursor` field and no `{{cursor}}` in its body 409. Freshness adds `paused` and `next_run`.
 
 **Feed bodies**
 
@@ -236,8 +244,8 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - `jsonMeant()`: a declared `application/json` is trusted. A type this server guessed (a gzip's content, a zip member's
   name) must pass `JSON.parse`. The text that arrived is stored, so `meta.sig` stays stable.
 - CSV and TSV go through `parseDelimited`, shared with `readImport()`. NDJSON is one value per line.
-- `expand()` is the one bounded decompressor, fed `EXPAND_SLICE` at a time. A gzip's content is JSON if it starts with
-  `[` or `{`, else CSV.
+- `expand()` is the one bounded decompressor, fed `EXPAND_SLICE` at a time. A gzip's content is Parquet if
+  `parquetFramed()` finds `PARQUET_MAGIC` at both ends, else JSON if it starts with `[` or `{`, else CSV.
 - Zip: `zipMembers()` reads the central directory; `zipData()` checks the length and `crc32()`. `ZIP_MEMBERS` maps
   extension to type and names no archive; with `BODY_DEPTH_MAX` that bounds nesting. Exactly one nameable member;
   directories and `__MACOSX/` are not candidates. Refused: zip64, encryption, a method other than stored or deflate. A
@@ -250,9 +258,9 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - HTML: `npm:linkedom`. `htmlDelimited()` takes the page's one `<table>` (more is refused, named by id, caption or
   text), orders rows by `SECTION_RANK`, reads cells through `markupCell()`, and writes a quoted file for
   `parseDelimited`. An empty table or row is refused.
-- Parquet: read as bytes. `parquetRows()` checks `PARQUET_MAGIC` at both ends. Compressed codecs are not supported. An
-  INT64 is a number inside the safe range, else decimal text. A Date is ISO text. `application/octet-stream` is not
-  parsed.
+- Parquet: read as bytes. `parquetRows()` checks `PARQUET_MAGIC` at both ends through `parquetFramed()`. Compressed
+  codecs are not supported. An INT64 is a number inside the safe range, else decimal text. A Date is ISO text.
+  `application/octet-stream` is not parsed.
 - Encoding: `decodeAs()` is the one decoder: fatal, keeps a second BOM. `readFeedBody` honors the answer's `charset`;
   with none it decodes UTF-8 non-fatally and sniffs nothing. `markupText()` for XML and HTML: BOM or NUL sniff, then the
   answer's `charset`, then `XML_ENCODING` / `HTML_CHARSET` in the first `MARKUP_HEAD_BYTES` (comments and scripts cut),
@@ -285,7 +293,14 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   column, width bounded by `XLSX_WIDTH_MAX`, dates through `dateMs()` as UTC, a value past `XLSX_CELL_MAX` refused by
   place and length, the sheet name cut to `XLSX_NAME_MAX`. Parquet: `npm:hyparquet-writer`, built off `named()`.
   `PARQUET_TYPES` through `canonicalType`; `parquetColumn()` writes a column whole as STRING when any value does not
-  fit.
+  fit. `exportRows()` is the one read both export routes share.
+- Workspace: `GET /library.zip` is every sheet the caller owns (`sheet_usr.role = 'owner'`), less `codex-*` and the
+  computed net-hook sheets, bounded by `USER_SHEETS_MAX`, as one stored zip. A table is `table/<doc_id>.csv`, byte-equal
+  to its `.csv` export, one spend on its own budget. Any other sheet is `<type>/<doc_id>.json`, its `data[0]`, read
+  through `docData` with no spend. `manifest.json` lists `sheet_id`, `name`, `type`, `tags`, `license`, and a table's
+  columns by name and type. Member names are types and doc_ids only. Any refusal from any sheet fails the whole zip.
+  `WORKSPACE_BYTES_MAX` caps it and names the member it stopped at. One `record()` row per sheet, after the zip is
+  built.
 
 **Codex (external databases)**
 
@@ -346,6 +361,11 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   name is exempt. `MAX_NAMES` bounds the count.
 - `cohortSql({ source, date, key, value, grain })` writes a cohort table once, at creation, as an ordinary query's
   `code`. `grain` is a key of `COHORT_LABEL`. No input may collide with an output name or with another input.
+- `rfmSql({ source, date, key, value, buckets })` writes a score table the same way: one row per key with `last_seen`,
+  `orders`, the summed value under its own name, and `r`, `f`, `m`, each a separate top-level `ntile(buckets)` item. The
+  highest bucket is the best. Recency orders by `last_seen`, never `now()`. It is quantile scoring, not clustering.
+  `buckets` runs from 2 to `RFM_BUCKETS_MAX`. `writtenFrom()` is the one source check for `chartSql`, `cohortSql` and
+  `rfmSql`; `refuseTaken()` is the collision check for the last two.
 - Types: `COLUMN_TYPES`, `knownType()` (the `enum:` family by prefix). `checkColumnTypes()` is where a cell becomes its
   column's type. `selectTypes()` and `WINDOW_TYPES` type a result off its select item.
 - Fits: `fit_exponential()`, `fit_power()` through `curve()`. `fit_hyperbolic()` is Arps decline by Levenberg-Marquardt,
@@ -400,8 +420,9 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - Multi-sort, hide (`skipHidden`), resize, reorder, pin, row insert / duplicate / fill-down, find/replace, undo/redo,
   palette (Ctrl/⌘+K), shortcuts (Ctrl/⌘+/). `shortcutGroups` carries each key's `Msg`, and `paletteCommands` reads it.
 - The palette opens with nothing selected (`selected = -1`). `paletteRows` adds "subscribe to this sheet" (logged in,
-  over a table, query, net-http or net-hook) and "build a cohort table" (a date and a key column known) ahead of
-  `paletteCommands`.
+  over a table, query, net-http or net-hook) "build a cohort table" (a date and a key column known), and "score this
+  sheet's customers (RFM)" (a date, a key and a usd column known) ahead of `paletteCommands`. The last two read the same
+  guesses.
 - Export chips link to `/export/<id>.<format>` for csv and xlsx.
 - `arrangeControls` decides where the arrangement is offered: table, query, library, shop.
 - The arrangement (sort/`rank`, `filter`, `hidden`, `pinned`, `width`, `decimals`, `format`, `shade`) lives on the
@@ -473,15 +494,20 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - Offline: `src/sw.js`, registered by `navigator.serviceWorker?.register("/sw.js")`; a refusal logs. Same-origin GETs go
   network first, cache second. `SHELL` is every `_redirects` path plus `/`, keyed by pathname. Nothing cross-origin is
   answered. Only the shell works offline.
-- Accessibility: `viewModal` takes a label and sets `role="dialog"`, `aria-modal`, `aria-label`. Icon-only buttons and
-  placeholder-only inputs carry `aria-label`. The table is `role="grid"`.
+- Accessibility: `viewModal` takes a label and sets `role="dialog"`, `aria-modal`, `aria-label`. One is up at a time:
+  `closeModals` clears the palette and the shortcut sheet and closes settings through `SettingsClose`, so `#settings`
+  leaves the URL; `UrlChange` onto `#settings` clears the other two; the toggles open nothing over the import preview or
+  the delete confirm. The palette input is a `combobox` over `#palette-list` (`listbox`) of `palette-<i>` options, and
+  `aria-activedescendant` names a row only while it is drawn. Icon-only buttons and placeholder-only inputs carry
+  `aria-label`. The table is `role="grid"` and `aria-multiselectable`; `inSelection` decides both the `selected` class
+  and `aria-selected`; a header cell is a `columnheader`.
 
 **Known gaps**
 
 - `@library:freshness` and `@library:lineage` resolve on the server, not in the page.
 - `describe` results carry no type in the page, and `WINDOW_TYPES` is server-only.
-- No modal focus trap or restore, no keyboard path for `.grab` / `.grip`, no `gridcell` / `aria-selected`, no
-  `aria-activedescendant` in the palette, and two `aria-modal` panels can mount at once.
+- No modal focus trap or restore, and no keyboard path for `.grab` / `.grip`. A back or forward onto `#settings` while
+  the import preview is up mounts both.
 
 ## Schema (`schema/db.sql`)
 

@@ -2105,6 +2105,15 @@ const PAUSE_LOOKUP_MS = 5_000;
 // answers 500 when it does not -- an interpolated literal written out twice
 // would only be caught by a request.
 const OVERDUE_CONDITION = `No more than ${OVERDUE_MAX} net-http or alert sheets are overdue, paused ones included.`;
+// Keyed by the overTime alias each sentence grades, for the same reason: the
+// sentences are spelled here once and read by status() and REPORTED_ONLY.
+const USAGE = {
+  sheets_created: "Somebody created a sheet in the past 24 hours.",
+  signed_up: "Somebody signed up in the past week.",
+  signed_up_made_sheet: "Somebody who signed up in the past week made a sheet.",
+  paid: "Somebody paid in the past week.",
+  used_by_others: "Somebody other than the operator used the app in the past day.",
+};
 const DB_BYTES_CAP = 4_000_000_000;
 const HEAP_BYTES_CAP = 512_000_000;
 
@@ -2154,9 +2163,15 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
   // is all digits and still out of range for an int. That took this endpoint to
   // 500 on one row nobody here wrote, which is the exact failure this guard is
   // for -- and this endpoint is the alarm.
+  // `|| null`: seed() skips a blank OPERATOR_EMAIL, and postgres.js refuses an
+  // undefined parameter. `email = null` matches no row.
+  const operator = Deno.env.get("OPERATOR_EMAIL")?.trim() || null;
   const overTime = await sql`
     with at as (select seconds, now() - make_interval(secs => seconds) as t
-                from unnest(${STATUS_AGO}::int[]) as seconds)
+                from unnest(${STATUS_AGO}::int[]) as seconds),
+    -- The accounts that are the product's own: the sentinel, and the operator
+    -- the way seed() names it. Neither one using the app is somebody using it.
+    house as (select usr_id from usr where email = '' or email = ${operator})
     select
       at.seconds,
       -- Each row stands for itself plus whatever logFailure folded into it, or
@@ -2188,7 +2203,24 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
          and n.created_at > at.t - interval '1 day' and n.created_at <= at.t) as alerts_delivered,
       (select count(*) from sheet s
        where s.created_at > at.t - interval '1 day' and s.created_at <= at.t
-         and s.created_by <> (select usr_id from usr where email = '')) as sheets_created
+         and s.created_by <> (select usr_id from usr where email = '')) as sheets_created,
+      (select count(*) from usr u
+       where u.created_at > at.t - interval '7 days' and u.created_at <= at.t
+         and u.usr_id not in (select usr_id from house)) as signed_up,
+      (select count(*) from usr u
+       where u.created_at > at.t - interval '7 days' and u.created_at <= at.t
+         and u.usr_id not in (select usr_id from house)
+         and exists (select from sheet s where s.created_by = u.usr_id
+                     and s.created_at > at.t - interval '7 days' and s.created_at <= at.t)) as signed_up_made_sheet,
+      -- A row with a stripe_session_id is written only by the
+      -- checkout.session.completed webhook, once Stripe says payment_status
+      -- is paid, so no row stands for a payment still in flight. A free claim
+      -- writes amount 0 with no session.
+      (select count(*) from payment p
+       where p.amount > 0 and p.created_at > at.t - interval '7 days' and p.created_at <= at.t) as paid,
+      (select count(*) from audit a
+       where a.created_at > at.t - interval '1 day' and a.created_at <= at.t
+         and a.usr_id is not null and a.usr_id not in (select usr_id from house)) as used_by_others
     from at
   `;
 
@@ -2344,11 +2376,11 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
     now("No sheet's net log has grown past its retention cap.", live.log_capped),
     now(`The database is under ${DB_BYTES_CAP / 1e9} GB.`, live.db_size),
     now(`The server heap is under ${HEAP_BYTES_CAP / 1e6} MB.`, HEAP_BYTES_CAP / Deno.memoryUsage().heapUsed),
-    byAgo("Somebody created a sheet in the past 24 hours.", (r) => r.sheets_created),
     now("Every seeded dataset is still in the shop.", live.datasets_present),
     now("No shop report is waiting for review.", live.reports_reviewed),
     now("No account hit a quota in the past day.", live.quotas_hit),
     now("Every webhook's last delivery in the past day was accepted.", live.webhooks_ok),
+    ...Object.entries(USAGE).map(([alias, condition]) => byAgo(condition, (r) => r[alias])),
   ]);
 };
 
@@ -2364,7 +2396,7 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
 // sheet paused and forgotten stays visible here, in library:freshness, and in
 // the cap it counts against -- and past the cap the two liveness conditions
 // page on it themselves.
-const REPORTED_ONLY = ["Somebody created a sheet in the past 24 hours.", OVERDUE_CONDITION];
+const REPORTED_ONLY = [...Object.values(USAGE), OVERDUE_CONDITION];
 
 // Public, because an uptime check carries no bearer token. It answers grades and
 // no rows -- no ids, no names, no addresses -- though a grade is a ratio against
@@ -4078,7 +4110,7 @@ const zipBad = (source: string, headline: string, received: string, fix: string)
  * for its sizes in the local header, and the directory is the copy that is
  * always right. Every offset is checked against the bytes actually in hand, so a
  * truncated or lying archive is a named refusal and never a read past the end. */
-const zipMembers = (raw: Uint8Array<ArrayBuffer>, source: string): ZipMember[] => {
+export const zipMembers = (raw: Uint8Array<ArrayBuffer>, source: string): ZipMember[] => {
   const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
   const names = new TextDecoder();
   let end = -1;
@@ -4165,7 +4197,7 @@ const zipMembers = (raw: Uint8Array<ArrayBuffer>, source: string): ZipMember[] =
  * The local header is read for its own name and extra lengths only -- the data
  * begins past them, and they are the two fields a writer is free to spell
  * differently there than in the directory. */
-const zipData = async (
+export const zipData = async (
   raw: Uint8Array<ArrayBuffer>,
   member: ZipMember,
   source: string,
@@ -4227,20 +4259,25 @@ const zipData = async (
 // rather than read past what arrived.
 const PARQUET_MAGIC = "PAR1";
 
+const parquetFramed = (bytes: Uint8Array) => {
+  const magic = new TextEncoder().encode(PARQUET_MAGIC);
+  const carries = (start: number) => magic.every((byte, i) => bytes[start + i] === byte);
+  return bytes.byteLength >= magic.length * 2 && carries(0) && carries(bytes.byteLength - magic.length);
+};
+
 /** The rows of a parquet body. A body that declares parquet and is not one is a
  * refusal, the way xmlFeedRoot refuses a document that is not the feed it says
  * it is: an empty green run row says nothing and is never corrected. */
 const parquetRows = async (bytes: Uint8Array<ArrayBuffer>, source: string): Promise<Record<string, unknown>[]> => {
-  const magic = new TextEncoder().encode(PARQUET_MAGIC);
-  const carries = (start: number) => magic.every((byte, i) => bytes[start + i] === byte);
-  if (bytes.byteLength < magic.length * 2 || !carries(0) || !carries(bytes.byteLength - magic.length)) {
+  if (!parquetFramed(bytes)) {
     // Hex, because whatever is there instead is arbitrary bytes and a refusal is
     // read by a person.
     const hex = (start: number) =>
-      [...bytes.subarray(start, start + magic.length)].map((byte) => byte.toString(16).padStart(2, "0")).join(" ");
+      [...bytes.subarray(start, start + PARQUET_MAGIC.length)].map((byte) => byte.toString(16).padStart(2, "0"))
+        .join(" ");
     bad(400, `This body is not a parquet file.`, {
       Received: `${bytes.byteLength} bytes opening ${hex(0)} and ending ${
-        hex(Math.max(0, bytes.byteLength - magic.length))
+        hex(Math.max(0, bytes.byteLength - PARQUET_MAGIC.length))
       }`,
       Expected: `${PARQUET_MAGIC} at byte 0 and at the last four bytes, which every parquet file carries`,
       Source: source,
@@ -4278,7 +4315,7 @@ const parquetRows = async (bytes: Uint8Array<ArrayBuffer>, source: string): Prom
   // outside it, its decimal text and never a rounded number -- the worry
   // rowKeys() has about 2^53, since two distinct ids that round together are
   // one id downstream. A Uint8Array is left alone: it is a BYTE_ARRAY read with
-  // no UTF8 logical type, out of scope here the way a gzipped parquet body is.
+  // no UTF8 logical type, and out of scope here.
   const parquetValue = (val: unknown): unknown =>
     typeof val === "bigint"
       ? (Number.isSafeInteger(Number(val)) ? Number(val) : val.toString())
@@ -4377,7 +4414,12 @@ const readFeedBody = async (
   // moves is one whose stated label is wrong, and that one is storing the
   // replacement character today.
   const answered = contentType.match(CHARSET_PARAM)?.[1] ?? "";
-  const text = how === "parquet"
+  // What a gzip holds is the one thing neither door can be told: one header says
+  // the body is compressed and nothing says what came out of it. Parquet is the
+  // one content that says so itself, with its magic at both ends -- both, so a
+  // CSV whose first header opens with those four letters stays a CSV.
+  const parquet = how === "parquet" || (how === "gzip" && parquetFramed(bytes));
+  const text = parquet
     // There is no text in a parquet body to decode: it is read as bytes by the
     // arm below, and a fatal decode here would refuse every file there is.
     ? ""
@@ -4388,11 +4430,10 @@ const readFeedBody = async (
     : answered
     ? decodeAs(bytes, answered, source)
     : new TextDecoder().decode(bytes);
-  // What a gzip holds is the one thing neither door can be told: one header says
-  // the body is compressed and nothing says what came out of it. The first
-  // character that is not whitespace is the whole of the sniff -- JSON opens with
-  // a bracket or a brace, and everything else is read as a delimited file.
-  const reading = how === "gzip" ? (/^\s*[[{]/.test(text) ? "json" : "csv") : how;
+  // Past parquet, the first character that is not whitespace is the whole of a
+  // gzip's sniff -- JSON opens with a bracket or a brace, and everything else is
+  // read as a delimited file.
+  const reading = parquet ? "parquet" : how === "gzip" ? (/^\s*[[{]/.test(text) ? "json" : "csv") : how;
   let meant: string;
   if (reading === undefined) {
     // A type on none of the list is answered as the text it arrived as, which is
@@ -4437,8 +4478,7 @@ const readFeedBody = async (
     meant = JSON.stringify(xmlDoc(text, source, rowsPath));
   } else if (reading === "parquet") {
     // The bytes, never `text`: parquet is the one body on this list with no text
-    // in it. A gzip answers only `json` or `csv` off its first character, so a
-    // gzipped parquet body is a sheet that stays one cell.
+    // in it.
     meant = JSON.stringify(await parquetRows(bytes, source));
   } else {
     // Keyed by column name, which is what every reader downstream keys on and
@@ -5088,6 +5128,7 @@ export const pollNetSheet = async (
   doc_id: string,
   fetcher = safeFetch,
   now = Date.now(),
+  since?: string,
 ): Promise<void> => {
   // Where this sheet was due before the poll, so a paused one can be put back
   // exactly as it was: a paused feed is looked at on every tick, and a feed
@@ -5173,17 +5214,20 @@ export const pollNetSheet = async (
     // one day prints more than the keys. The conditional headers are ours and
     // not the sheet's, for that rule in reverse: the repro line's job is to
     // fetch the body by hand, and a conditional request answers 304.
+    // A backfill asks from a watermark the validators were not taken at, so a
+    // 304 to it would answer a question nobody asked.
     const sending = {
       ...await resolveSecrets(sheet_id, headers),
-      ...(was.etag ? { "If-None-Match": was.etag } : {}),
-      ...(was.last_modified ? { "If-Modified-Since": was.last_modified } : {}),
+      ...(since === undefined && was.etag ? { "If-None-Match": was.etag } : {}),
+      ...(since === undefined && was.last_modified ? { "If-Modified-Since": was.last_modified } : {}),
     };
+    const from = since ?? (was.cursor ? String(was.cursor) : "");
     // The body is templated where a header already was, and resolved into a
     // second object for the same reason. `{{cursor}}` is the watermark the
     // cursor parameter would have carried; the first poll has none, and asks
     // for everything the way an unset parameter does.
     const sendingBody = body === undefined ? undefined : (await resolveSecrets(sheet_id, {
-      body: body.replaceAll("{{cursor}}", was.cursor ? String(was.cursor) : ""),
+      body: body.replaceAll("{{cursor}}", from),
     }))
       .body;
     // The watermark is when the last good poll started, not when it finished:
@@ -5202,7 +5246,7 @@ export const pollNetSheet = async (
           }),
         );
       }
-      if (was.cursor) url = withParam(url, config.cursor, was.cursor);
+      if (from) url = withParam(url, config.cursor, from);
     }
     // How this feed hands out its pages, and where page one is: a page number
     // and an offset ride the first request, a cursor and a Link header only
@@ -5313,6 +5357,7 @@ export const pollNetSheet = async (
     const kept = {
       etag: validator(res.headers.get("etag")) ?? was.etag ?? null,
       last_modified: validator(res.headers.get("last-modified")) ?? was.last_modified ?? null,
+      // Now after a backfill too: asking from `since` fetched everything up to now.
       cursor: new Date(now).toISOString(),
     };
     if (res.status === 304) {
@@ -5325,7 +5370,7 @@ export const pollNetSheet = async (
       // created_at rather than appending an empty one is what a quiet alert
       // tick does: liveness reads max(created_at), and 23 blank rows a day
       // would push the feed's own data out past NET_KEEP.
-      if (!prev || !(was.etag || was.last_modified)) {
+      if (since !== undefined || !prev || !(was.etag || was.last_modified)) {
         throw new Error(
           explain("This feed answered 304 to a request that carried no validator.", {
             Received: "HTTP 304 Not Modified",
@@ -6104,7 +6149,7 @@ export const pollOnce = async (
 };
 
 let polling = false;
-setInterval(() => {
+export const pollTimer = setInterval(() => {
   // A tick that finds the cycle before it still running does nothing rather
   // than starting a second one over the same due sheets.
   if (polling) return;
@@ -7703,6 +7748,32 @@ app.post("/library/:id/run", async (c) => {
       Fix: "run the feed or the alert that reads this sheet instead",
     });
   }
+  const { cursor } = await jsonBody(c);
+  // Date.parse takes "1" as the year 2001 and reads a time with no zone in this
+  // server's local time, so the shape comes first. It also rolls a day past its
+  // month's end into the next month (Feb 30 is March 2), so the date must come
+  // back out of it as it went in.
+  const stamped = typeof cursor === "string" &&
+    /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2}))?$/.test(cursor) &&
+    Number.isFinite(Date.parse(cursor)) &&
+    new Date(Date.parse(cursor.slice(0, 10))).toISOString().startsWith(cursor.slice(0, 10));
+  if (cursor !== undefined && !stamped) {
+    bad(400, "That cursor is not a timestamp.", {
+      Received: show(cursor),
+      Expected: "an ISO 8601 date, or a date and time with Z or an offset, such as 2024-01-31T00:00:00Z",
+      Source: `the "cursor" field of the request body`,
+      Fix: "send the moment the rerun should ask the feed from, or leave cursor out",
+    });
+  }
+  const since = stamped ? cursor : undefined;
+  if (since !== undefined && sheet.type === "alert") {
+    bad(400, "An alert sheet has no watermark to rerun from.", {
+      Received: `a cursor for ${sheet_id}, which is an alert sheet`,
+      Expected: "a cursor on a net-http sheet only",
+      Source: `the "cursor" field of the request body`,
+      Fix: "leave cursor out to run the alert now",
+    });
+  }
   const config = (await automerge.find<{ data: [NetHttp | Alert] }>(sheet.doc_id as AnyDocumentId))
     .doc()?.data?.[0];
   if (!config) {
@@ -7721,6 +7792,27 @@ app.post("/library/:id/run", async (c) => {
       Fix: "clear the paused box on the sheet, then run it",
     });
   }
+  // storeConfig reads nothing but the literal "replace" as replace, and a mode it
+  // refuses is the poll's own failure row, the same as on a run with no cursor.
+  if (since !== undefined && "mode" in config && config.mode === "replace") {
+    bad(409, "A replace feed cannot rerun from a cursor.", {
+      Received: `a cursor for ${sheet_id}, whose mode is replace`,
+      Expected: "a net-http sheet whose mode is append or upsert, because a replace run deletes every earlier good row",
+      Source: `the "cursor" field of the request body, and data[0].mode on the document behind ${sheet_id}`,
+      Fix: "set the mode to append or upsert, then run it from the cursor",
+    });
+  }
+  if (
+    since !== undefined && !("cursor" in config && config.cursor) &&
+    !("body" in config && config.body?.includes("{{cursor}}"))
+  ) {
+    bad(409, "This feed has nowhere to send a cursor.", {
+      Received: `a cursor for ${sheet_id}, which has no cursor parameter and no {{cursor}} in its body`,
+      Expected: "a net-http sheet whose cursor field names a query parameter, or whose body says {{cursor}}",
+      Source: `the "cursor" field of the request body, and data[0] on the document behind ${sheet_id}`,
+      Fix: "name the parameter this feed takes a since-value in, then run it from the cursor",
+    });
+  }
   // After every refusal above, so a refused run spends nothing, and before the
   // poll, because the poll is the thing that costs.
   spend(sheet_id, "runs", 1, 0, "let the sheet's own interval run it");
@@ -7734,7 +7826,7 @@ app.post("/library/:id/run", async (c) => {
   // from ...)` reads both sides under the one convention, so whatever the
   // session's timezone is, the two are the same clock.
   const [{ started }] = await sql`select extract(epoch from now()::timestamp)::float8 as started`;
-  if (sheet.type === "net-http") await pollNetSheet(sheet_id, sheet.doc_id);
+  if (sheet.type === "net-http") await pollNetSheet(sheet_id, sheet.doc_id, safeFetch, Date.now(), since);
   else await pollAlertSheet(sheet);
   // Whatever this run stamped: a row it appended, or -- where a 304 or a
   // repeated body or a quiet alert tick moves the row it matched rather than
@@ -8770,12 +8862,13 @@ const EXPORTS: Record<
   },
 };
 
-app.get(`/export/:id{.+\\.(${Object.keys(EXPORTS).join("|")})}`, async (c) => {
-  const raw = c.req.param("id");
-  const format = raw.slice(raw.lastIndexOf(".") + 1);
-  const sheet_id = raw.slice(0, raw.lastIndexOf("."));
+const exportRows = async (
+  c: Context,
+  sheet_id: string,
+  qs: Record<string, string>,
+): Promise<{ cols: Col[]; rows: Row[] }> => {
   // sheet() paginates net and query sheets at 50 rows; an export wants the whole sheet.
-  const { data } = await sheet(c, sheet_id, { limit: "100000", ...c.req.query() });
+  const { data } = await sheet(c, sheet_id, { limit: "100000", ...qs });
   const [colsRow, ...rows] = data;
   if (!colsRow) {
     bad(400, `That sheet has no columns to export.`, {
@@ -8785,11 +8878,150 @@ app.get(`/export/:id{.+\\.(${Object.keys(EXPORTS).join("|")})}`, async (c) => {
       Fix: "add a column before exporting",
     });
   }
+  return { cols: Object.values(colsRow) as Col[], rows };
+};
+
+app.get(`/export/:id{.+\\.(${Object.keys(EXPORTS).join("|")})}`, async (c) => {
+  const raw = c.req.param("id");
+  const format = raw.slice(raw.lastIndexOf(".") + 1);
+  const sheet_id = raw.slice(0, raw.lastIndexOf("."));
+  const { cols, rows } = await exportRows(c, sheet_id, c.req.query());
   const { mime, render } = EXPORTS[format];
-  return new Response(render(sheet_id, Object.values(colsRow) as Col[], rows), {
+  return new Response(render(sheet_id, cols, rows), {
     headers: {
       "Content-Type": mime,
       "Content-Disposition": `attachment; filename="${sheet_id.replace(/[^a-zA-Z0-9-_]/g, "_")}.${format}"`,
+    },
+  });
+});
+
+// The zip is built whole in memory, so this is sized to the server, far under
+// the 4 GB past which a zip needs the zip64 records zipMembers refuses.
+export const WORKSPACE_BYTES_MAX = 64 * 1024 * 1024;
+
+// Every sheet the caller owns, as one stored (method 0) zip. A table is its
+// .csv export; any other sheet is its document's data[0], the settings, never
+// the run log. Member names are a type from the sheet table's check constraint
+// and a doc_id. A claim holds only a doc_id automerge finds, and automerge
+// refuses any id that is not its own base58, so no member name holds text a
+// person chose.
+app.get("/library.zip", async (c) => {
+  const usr_id = c.get("usr_id");
+  // The two computed net-hook sheets have a row and no document. The library:*
+  // computed sheets have no row: the sheet table's type check admits no "library".
+  const mine: {
+    sheet_id: string;
+    type: string;
+    doc_id: string;
+    name: string;
+    tags: string[];
+    license: string | null;
+  }[] = await sql`
+      select s.sheet_id, s.type, s.doc_id, s.name, s.tags, s.license
+      from sheet s inner join sheet_usr su using (sheet_id)
+      where su.usr_id = ${usr_id} and su.role = 'owner' and s.type not like 'codex-%'
+        and s.sheet_id not in ${sql([ERROR_SHEET, REPORT_SHEET])}
+      order by s.sheet_id
+      limit ${USER_SHEETS_MAX + 1}
+    `;
+  if (mine.length > USER_SHEETS_MAX) {
+    bad(413, `Your library is past what one download can hold.`, {
+      Received: `more than ${USER_SHEETS_MAX} sheets you own`,
+      Limit: `${USER_SHEETS_MAX} sheets, the quota an account's own sheets are capped at`,
+      Source: "sheet_usr, counted for this account's owner rows",
+      Fix: "export sheets one at a time with GET /export/<sheet id>.csv",
+    });
+  }
+  const utf8 = new TextEncoder();
+  const files: Uint8Array[] = [];
+  const directory: Uint8Array[] = [];
+  let offset = 0;
+  let directoryBytes = 0;
+  const add = (name: string, bytes: Uint8Array) => {
+    const path = utf8.encode(name);
+    const total = offset + 30 + path.length + bytes.length + directoryBytes + 46 + path.length + 22;
+    if (total > WORKSPACE_BYTES_MAX) {
+      bad(413, `Your library is past what one download can hold.`, {
+        Received: `${total} bytes once ${name} is added`,
+        Limit: `${WORKSPACE_BYTES_MAX} bytes per zip`,
+        Source: `the sheets you own, added in sheet id order`,
+        Fix: "export the largest tables one at a time with GET /export/<sheet id>.csv",
+      });
+    }
+    const crc = crc32(bytes);
+    const local = new Uint8Array(30 + path.length);
+    const central = new Uint8Array(46 + path.length);
+    const localView = new DataView(local.buffer);
+    const centralView = new DataView(central.buffer);
+    localView.setUint32(0, ZIP_LOCAL, true);
+    centralView.setUint32(0, ZIP_ENTRY, true);
+    // Version 1.0, the one that reads a stored member. DOS date 1980-01-01, the
+    // format's epoch: a zero date is not a date, and some readers refuse it.
+    for (const [view, base] of [[localView, 4], [centralView, 6]] as const) {
+      view.setUint16(base, 10, true);
+      view.setUint16(base + 8, 0x21, true);
+      view.setUint32(base + 10, crc, true);
+      view.setUint32(base + 14, bytes.length, true);
+      view.setUint32(base + 18, bytes.length, true);
+      view.setUint16(base + 22, path.length, true);
+    }
+    centralView.setUint16(4, 10, true);
+    centralView.setUint32(42, offset, true);
+    local.set(path, 30);
+    central.set(path, 46);
+    files.push(local, bytes);
+    directory.push(central);
+    offset += local.length + bytes.length;
+    directoryBytes += central.length;
+  };
+  const manifest: Record<string, unknown>[] = [];
+  for (const s of mine) {
+    const entry: Record<string, unknown> = {
+      sheet_id: s.sheet_id,
+      name: s.name,
+      type: s.type,
+      tags: s.tags,
+      license: s.license,
+    };
+    if (s.type === "table") {
+      const { cols, rows } = await exportRows(c, s.sheet_id, {});
+      add(`table/${s.doc_id}.csv`, utf8.encode(EXPORTS.csv.render(s.sheet_id, cols, rows) as string));
+      entry.columns = cols.map((col) => ({ name: col.name, type: col.type }));
+    } else {
+      const hand = await automerge.find<{ data: Sheet["data"] }>(s.doc_id as AnyDocumentId).catch(() =>
+        bad(404, `Sheet ${s.sheet_id} has a row but no document.`, {
+          Expected: "an automerge document",
+          Received: "none",
+          Source: `doc_id ${s.doc_id}, read for GET /library.zip`,
+          Fix:
+            `the document is missing or unreadable; re-create the sheet, or claim it again with PUT /library/${s.sheet_id}`,
+        })
+      );
+      // null where the document holds no settings row, as a net-hook's may not.
+      add(`${s.type}/${s.doc_id}.json`, utf8.encode(JSON.stringify(docData(hand, s.sheet_id)[0] ?? null, null, 2)));
+    }
+    manifest.push(entry);
+  }
+  add("manifest.json", utf8.encode(JSON.stringify(manifest, null, 2)));
+  const end = new Uint8Array(22);
+  const tail = new DataView(end.buffer);
+  tail.setUint32(0, ZIP_EOCD, true);
+  tail.setUint16(8, directory.length, true);
+  tail.setUint16(10, directory.length, true);
+  tail.setUint32(12, directoryBytes, true);
+  tail.setUint32(16, offset, true);
+  const zip = new Uint8Array(offset + directoryBytes + end.length);
+  let cursor = 0;
+  for (const part of [...files, ...directory, end]) {
+    zip.set(part, cursor);
+    cursor += part.length;
+  }
+  for (const s of mine)
+    await record(s.sheet_id, usr_id, "export", c.get("via") ?? "jwt", { route: "GET /library.zip" });
+  return new Response(zip, {
+    headers: {
+      "Content-Type": "application/zip",
+      "Content-Disposition": `attachment; filename="library.zip"`,
     },
   });
 });

@@ -56,6 +56,7 @@
         formatQueryError,
         profileRef,
         register,
+        rfmSql,
       } from "/sql.mjs";
       import alasql from "/alasql.mjs";
       // The same host the fetches use, over the scheme a socket takes.
@@ -1126,10 +1127,14 @@
               // Elm cannot import src/sql.mjs, so the palette sends the columns
               // it guessed and the statement is written here. What lands is an
               // ordinary query sheet: the guesses do not travel with it, and
-              // `cohortSql`'s refusal rides `catchy` to the page.
+              // `cohortSql`'s and `rfmSql`'s refusals ride `catchy` to the page.
               if (data?.[0]?.cohort) {
                 const { cohort, ...rest } = data[0];
                 data = [{ ...rest, code: cohortSql(cohort) }];
+              }
+              if (data?.[0]?.rfm) {
+                const { rfm, ...rest } = data[0];
+                data = [{ ...rest, code: rfmSql(rfm) }];
               }
 
               // Create document and wait for it to be ready
