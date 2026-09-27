@@ -327,6 +327,9 @@ export const PARSERS = { "application/atom+xml": atomToJson };
 // re-running every query under it from the leaves.
 
 export const QUERY_CACHE_MAX = 64;
+// The most sheets `src/index.html` follows for the open query: every sheet its
+// last run read that is not bundled, nested runs included.
+export const FOLLOW_MAX = 64;
 
 // A call whose answer changes with no document changing. `sample_*` is seeded
 // off its own arguments, so it is not here. It reads the raw text: AlaSQL
@@ -408,7 +411,12 @@ export const sheets = (alasql, shelf, find, heads) => {
             `  Fix:          ${hit ? `write @${hit} instead` : "open the sheet once so it loads, or check the id"}`,
           ].join("\n"));
         }
-        if (heads) reads.deps.set(id, at);
+        // A sheet read twice in one run -- directly and again under a nested
+        // @query: -- keeps the first heads it read. The second read runs later,
+        // so its heads and the current heads always agree; recording it instead
+        // would hide that an earlier read (a nested answer already computed)
+        // ran against the sheet before whatever changed it.
+        if (heads && !reads.deps.has(id)) reads.deps.set(id, at);
         // A referenced query runs through runSql too, so a window inside one is
         // computed rather than handed to AlaSQL. The server recurses in `sheet()`
         // instead, which is the one place the two engines are shaped differently.
@@ -424,7 +432,7 @@ export const sheets = (alasql, shelf, find, heads) => {
         if (hit && path.length + hit.depth < MAX_REF_DEPTH) {
           const now = await Promise.all(hit.deps.map(([dep]) => headsOf(dep)));
           if (hit.deps.every(([, then], i) => now[i] === then)) {
-            for (const [dep, then] of hit.deps) reads.deps.set(dep, then);
+            for (const [dep, then] of hit.deps) if (!reads.deps.has(dep)) reads.deps.set(dep, then);
             reads.depth = Math.max(reads.depth, 1 + hit.depth);
             return hit.answer;
           }
@@ -444,7 +452,7 @@ export const sheets = (alasql, shelf, find, heads) => {
           }])),
           ...inner.data,
         ];
-        for (const [dep, then] of nested.deps) reads.deps.set(dep, then);
+        for (const [dep, then] of nested.deps) if (!reads.deps.has(dep)) reads.deps.set(dep, then);
         reads.depth = Math.max(reads.depth, 1 + nested.depth);
         reads.volatile ||= nested.volatile;
         if (heads && !nested.volatile) {

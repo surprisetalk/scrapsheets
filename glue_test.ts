@@ -8,8 +8,9 @@
 //
 // This half is the document: the arrangement held for a sheet this browser
 // cannot write, the cleaning and splitting verbs landing as patches, a cell
-// edit, a sort that must not re-run the SQL, and the share and publish
-// requests. sync_test.ts is the other half -- what arrives from outside.
+// edit, a sort that must not re-run the SQL and a change under a query that
+// must, and the share and publish requests. sync_test.ts is the other half --
+// what arrives from outside.
 //
 // The two are kept even in `glue()` calls, because one of those is a jsdom, an
 // evaluation of src/index.html's module script and Elm's first paint, and that
@@ -395,47 +396,82 @@ Deno.test({
 // A sort, a filter and a dragged width land on the same document as the query,
 // and every change to that document used to start the SQL again. A synced sheet
 // is where that shows: the write goes to the handle, the handle reports a
-// change, and the change is what used to re-run the query.
+// change, and the change is what used to re-run the query. A change to a sheet
+// the query reads is the other way round: it is a new answer to the same
+// question, and nothing else asks it.
 Deno.test({
-  name: "sorting a query result does not run its SQL again",
+  name: "sorting a query result does not run its SQL again, and a change to a sheet it reads does",
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
     let runs = 0;
-    const asked = { type: "query", data: [{ lang: "sql", code: "select 1 as n", cols: {} }] } as {
-      data: Record<string, unknown>[];
-    };
+    const found: string[] = [];
+    const finds = (doc_id: string) => found.filter((f) => f === doc_id).length;
+    const ints = (n: number) => ({ type: "table", data: [{ 0: { key: "0", name: "n", type: "int" } }, { 0: n }] });
+    const asked = {
+      type: "query",
+      data: [{ lang: "sql", code: "select n from @query:mid1 union all select n from @table:u1", cols: {} }],
+    } as { data: Record<string, unknown>[] };
+    let opened!: () => void;
+    const open = new Promise<void>((resolve) => (opened = resolve));
+    const change = (n: number) => page.handles.u1.change((d) => ((d.data as unknown[])[1] = { 0: n }));
     const page = await glue("http://localhost/query:asked1", {
-      docs: { asked1: asked },
+      docs: {
+        asked1: asked,
+        mid1: { type: "query", data: [{ lang: "sql", code: "select n from @table:t1" }] },
+        t1: ints(31),
+        u1: ints(32),
+      },
       watching: {
-        sheets: (...args: Parameters<typeof sheets>) => {
-          const made = sheets(...args);
-          const run = made.runSql as (...a: unknown[]) => unknown;
-          return { ...made, runSql: (...q: unknown[]) => (runs++, run(...q)) };
+        sheets: (...[engine, shelf, find, heads]: Parameters<typeof sheets>) => {
+          const made = sheets(engine, shelf, (doc_id: string) => (found.push(doc_id), find(doc_id)), heads);
+          const run = made.runSql as (...a: unknown[]) => Promise<unknown>;
+          return {
+            ...made,
+            runSql: async (...q: unknown[]) => {
+              const first = ++runs === 1;
+              const answer = await run(...q);
+              // The first run has read u1, and nothing listens to u1 until the
+              // run has returned: a change now is heard by nobody.
+              if (first) await open.then(() => change(417));
+              return answer;
+            },
+          };
         },
       },
     });
-    await until(page.settle, "the debounce to run the query once", () => runs === 1);
-    assertEquals(runs, 1, "opening a query sheet runs it once");
+    opened();
+    const drawn = (n: number) => page.all("td").some((td) => td.textContent?.trim() === `${n}`);
+    await until(page.settle, "the debounce to run the query once", () => runs >= 1);
+    await until(page.settle, "a change the first run missed to draw the new answer", () => drawn(417));
+    assertEquals(runs, 2, "opening a query sheet runs it once, and a change under that run asks it once more");
 
-    // runs === 1 is runSql entered, not its answer drawn, and the header this
-    // clicks exists only once the result rendered. Waiting for the count alone
-    // clicked nothing about one run in three on a loaded machine.
+    change(418);
+    await until(page.settle, "a change to a sheet the query reads to draw the new answer", () => drawn(418));
+    assertEquals(runs, 3, "the change asks the question once, with no keystroke");
+    assertEquals(
+      { u1: finds("u1"), t1: finds("t1") },
+      { u1: 3, t1: 1 },
+      "the changed table is read again, and the table under the unchanged nested query is not",
+    );
+
     const sortN = () => page.all("span.sort").find((s) => s.textContent?.startsWith("n"));
-    await until(page.settle, "the query's answer to draw its columns", () => !!sortN());
     await page.click(sortN());
-    // Proving nothing ran has no earlier moment than the debounce itself, so
-    // this one stays a flat wait -- 320 for src/index.html's 300, and not a
-    // rounder number, because every millisecond over is one the suite spends
-    // watching a clock.
-    await page.settle(320);
-    assertEquals(runs, 1, "sorting the result is not a new question to ask the engine");
     assertEquals(
       (asked.data[0] as { view?: unknown }).view,
       { n: { sort: "asc", rank: 1 } },
       "the arrangement went to the document, under the name its select list gave the column",
     );
     assertEquals(page.held(), null, "and this browser has no reason to hold a copy");
+    await page.go("/");
+    change(419);
+    // Proving nothing ran has no earlier moment than the debounce itself, so
+    // this one stays a flat wait -- 320 for src/index.html's 300, and not a
+    // rounder number, because every millisecond over is one the suite spends
+    // watching a clock. One wait covers both: a run the sort started would
+    // land in it too.
+    await page.settle(320);
+    assertEquals(runs, 3, "neither the sort nor a change after the sheet closed asks the engine anything");
     page.close();
   },
 });

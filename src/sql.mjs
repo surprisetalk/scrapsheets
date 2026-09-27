@@ -581,6 +581,8 @@ export const COLUMN_TYPES = {
   float: { json: { type: "number" }, numeric: true },
   usd: { json: { type: "number" }, numeric: true },
   percentage: { json: { type: "number" }, numeric: true },
+  ratio: { json: { type: "number" }, numeric: true },
+  bps: { json: { type: "number" }, numeric: true },
   duration: { json: { type: "number" }, numeric: true },
   bool: { json: { type: "boolean" } },
   date: { json: { type: "string", format: "date" } },

@@ -43,7 +43,7 @@ import {
   sheets,
 } from "./src/page.mjs";
 import alasql from "./src/alasql.mjs";
-import { boot, El, refused, resolver, rowsOf, shelf } from "./page_harness.ts";
+import { boot, El, refused, resolver, rowsOf, shelf, until } from "./page_harness.ts";
 
 // Three tests boot the library and then only read what it rendered, so they
 // share one page. What that saves is Elm's first paint and not the harness
@@ -764,16 +764,56 @@ Deno.test("the keyboard moves over a query's result, and a write to it is refuse
   };
   const selected = () => all("td.selected:not(.r0)").map((td) => td.textContent?.trim());
 
+  // jsdom lays nothing out, so this test draws the geometry that `follow`
+  // measures, on this page's window only. Every row is 20px tall and every cell
+  // 100px wide. The box is 70px tall and cuts the first data row in half at
+  // scroll 0. The header sticks at -1px, where src/style.css puts it. A follow
+  // is a chain of `Dom` calls that each wait a frame, which outlasts a settle.
+  type Laid = {
+    scrollTop: number;
+    parentElement: Laid;
+    children: Iterable<Laid>;
+    classList: { contains: (name: string) => boolean };
+  };
+  const box = doc.getElementById("table-scroll") as unknown as Laid;
+  Object.defineProperty(box, "clientHeight", { value: 70 });
+  Object.defineProperty(box, "clientWidth", { value: 1000 });
+  const rect = (top: number, left: number, width: number, height: number) => ({
+    top,
+    left,
+    width,
+    height,
+    x: left,
+    y: top,
+    right: left + width,
+    bottom: top + height,
+  });
+  dom.window.HTMLElement.prototype.getBoundingClientRect = function (this: Laid) {
+    if (this === box) return rect(0, 0, 1000, 70);
+    const row = this.parentElement;
+    const top = [...row.parentElement.children].indexOf(row) * 20 - box.scrollTop;
+    const left = [...row.children].indexOf(this) * 100;
+    return rect(this.classList.contains("r0") ? Math.max(top, -1) : top, left, 100, 20);
+  };
+
   const police = all("td").find((td) => td.textContent?.trim() === "Police");
   assert(police, "the result is drawn");
   await fire(police, "mouseenter");
   await fire(police, "mousedown");
   await fire(police, "mouseup");
+  const scrolled = (top: number) => until(settle, `the box scrolled to ${top}px`, () => box.scrollTop === top);
   assertEquals(selected(), ["Police"], "a click selects the cell it lands on");
+  await settle();
+  await settle();
+  assertEquals(box.scrollTop, 0, "and scrolls nothing, though the cell is half in view");
 
   await key({ key: "ArrowDown" });
+  // Parks lands whole on the bottom edge. The header has not stuck yet, so it
+  // covers only its own height, not the rows above it.
+  await scrolled(30);
   await key({ key: "ArrowDown" });
   assertEquals(selected(), ["Fire"], "ArrowDown walks the result's rows");
+  await scrolled(50);
   await key({ key: "ArrowRight" });
   assertEquals(selected(), ["0.3"], "ArrowRight walks its columns");
   assertEquals(
@@ -792,10 +832,21 @@ Deno.test("the keyboard moves over a query's result, and a write to it is refuse
   assertEquals(selected(), ["0.3"], "and the edge of the result is the edge");
   await key({ key: "Home", ctrlKey: true });
   assertEquals(selected(), ["Police"], "Ctrl+Home is the first cell");
+  await scrolled(41); // Police just below the stuck header, not at the box's top
   await key({ key: "End", ctrlKey: true });
   assertEquals(selected(), ["0.3"], "Ctrl+End is the last");
+  await scrolled(50);
   await key({ key: "a", ctrlKey: true });
   assertEquals(selected().length, 6, "Ctrl+A selects the whole result");
+
+  // A modal covers the table, so a background scroll under it would only show
+  // once the modal closes, moved by a key the modal itself never saw.
+  await key({ key: "/", ctrlKey: true });
+  await key({ key: "ArrowUp" });
+  await settle();
+  await settle();
+  assertEquals(box.scrollTop, 50, "a keyboard move under the shortcut sheet scrolls nothing");
+  await key({ key: "/", ctrlKey: true });
 
   await key({ key: "x" });
   assertEquals(all("#new-cell").length, 0, "a computed cell opens no editor");
@@ -841,7 +892,7 @@ Deno.test("a query sheet opens arranged the way it was left", async () => {
 // the widths of the sticky columns before it, so a column that sizes itself gets
 // one written when it is pinned -- an inexact sum overlaps the columns.
 Deno.test("pinning a column sticks it at the sum of the widths before it, and a grip resizes from the keyboard", async () => {
-  const { app, all, click, dom, settle } = await boot("http://localhost/table:countries");
+  const { app, all, click, doc, dom, fire, settle } = await boot("http://localhost/table:countries");
   const patches: { action: string; path: unknown[]; value: unknown }[] = [];
   app.ports.arrangeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
 
@@ -855,8 +906,9 @@ Deno.test("pinning a column sticks it at the sum of the widths before it, and a 
             { name: "a", type: "text", key: "0", width: 100 },
             { name: "b", type: "text", key: "1", width: 60 },
             { name: "c", type: "text", key: "2" },
+            { name: "d", type: "text", key: "3" },
           ],
-          { "0": "x", "1": "y", "2": "z" },
+          { "0": "x", "1": "y", "2": "z", "3": "w" },
         ],
       },
     },
@@ -894,6 +946,46 @@ Deno.test("pinning a column sticks it at the sum of the widths before it, and a 
     pinned.some((style) => style.includes("left: 100px")),
     `the pinned column should sit past column 0, got: ${JSON.stringify(pinned)}`,
   );
+
+  // The keyboard follow counts a sticky column where it sticks, not where it
+  // sits. This test draws the geometry jsdom lacks: every cell 100px wide, a
+  // box 320px wide, and a sticky cell at no less than its `left`. At scroll 0,
+  // c sits at 200 and sticks at 100. So End onto d scrolls 80px and d lands
+  // whole. Counted where c sits, d would not fit right of it and stay cut.
+  type Laid = {
+    scrollLeft: number;
+    style: { left: string };
+    parentElement: Laid;
+    children: Iterable<Laid>;
+    classList: { contains: (name: string) => boolean };
+  };
+  const box = doc.getElementById("table-scroll") as unknown as Laid;
+  Object.defineProperty(box, "clientHeight", { value: 1000 });
+  Object.defineProperty(box, "clientWidth", { value: 320 });
+  dom.window.HTMLElement.prototype.getBoundingClientRect = function (this: Laid) {
+    const rect = (top: number, left: number, width: number, height: number) => ({
+      top,
+      left,
+      width,
+      height,
+      x: left,
+      y: top,
+      right: left + width,
+      bottom: top + height,
+    });
+    if (this === box) return rect(0, 0, 320, 1000);
+    const row = this.parentElement;
+    const left = [...row.children].indexOf(this) * 100 - box.scrollLeft;
+    const stuck = this.classList.contains("pin") ? Math.max(left, parseFloat(this.style.left)) : left;
+    return rect([...row.parentElement.children].indexOf(row) * 20, stuck, 100, 20);
+  };
+  const x = all("td").find((td) => td.textContent?.trim() === "x");
+  assert(x, "the row is drawn");
+  await fire(x, "mouseenter");
+  await fire(x, "mousedown");
+  await fire(x, "mouseup");
+  doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "End", bubbles: true }));
+  await until(settle, "the box scrolled 80px sideways", () => box.scrollLeft === 80);
 
   // Column 0 sizes itself here, so nothing knows how wide it renders and the sum
   // would be a guess: a narrow column 0 leaves a gap the rows scroll through, a

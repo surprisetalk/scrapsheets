@@ -44,6 +44,7 @@ import {
   OVERDUE_MAX,
   PAGE_MAX,
   parseNetHeaders,
+  pendingSync,
   POLL_STALE_S,
   pollAlertOnce,
   pollAlertSheet,
@@ -2672,6 +2673,8 @@ Deno.test(async function allTests(t) {
             // memory -- a sync peer can write anything into data[0] -- and this
             // render is the one export that reads it as anything but a string.
             { name: null, type: "text", key: 6 } as unknown as Col,
+            { name: "leverage", type: "ratio", key: 7 },
+            { name: "spread", type: "bps", key: 8 },
           ]),
           {
             0: 1234.5,
@@ -2685,6 +2688,8 @@ Deno.test(async function allTests(t) {
             // UTC. A stored instant with no zone still means one thing.
             5: "2026-07-04T18:30:00",
             6: "kept",
+            7: 1.5,
+            8: 0.0125,
           },
         ],
       });
@@ -2696,6 +2701,7 @@ Deno.test(async function allTests(t) {
       const m = cells.Sheets[cells.SheetNames[0]];
       assertEquals([m.A2.z, m.A2.v], ["$#,##0.00", 1234.5]);
       assertEquals([m.B2.z, m.B2.v], ["0.00%", 0.155]);
+      assertEquals([m.H2.z, m.H2.v, m.I2.z, m.I2.v], ['General":1"', 1.5, "0.00%", 0.0125]);
       // A date is a number wearing a date format, so what it shows is the
       // assertion: the serial is computed off the UTC instant, and the day it
       // opens on must not follow the server's timezone.
@@ -5893,9 +5899,30 @@ Deno.test(async function allTests(t) {
 
     // write_cells failures name the problem.
     {
-      const badCol = await call(jwt, "write_cells", { cells: [{ row: 0, col: "nope", value: "x" }] });
+      const badCol = await call(jwt, "write_cells", { cells: [{ row: 0, col: "prise", value: 1 }] });
       assertEquals(badCol.isError, true);
-      assert(badCol.content[0].text.includes("item"), `should list valid columns, got: ${badCol.content[0].text}`);
+      assert(
+        badCol.content[0].text.includes(`"item"`) && /Did you mean: *string "price"/.test(badCol.content[0].text),
+        `should list the names and suggest the near one, got: ${badCol.content[0].text}`,
+      );
+      // A cell is addressed by column name only. The key is the document's own spelling: accepted, it named a
+      // column by something no read answers, and the refusal listed every column's key back to the caller.
+      const byKey = await call(jwt, "write_cells", { cells: [{ row: 0, col: "1", value: 3 }] });
+      assertEquals(byKey.isError, true, "a column key is not a column name");
+      assert(!byKey.content[0].text.includes(`"0"`), `and no key comes back: ${byKey.content[0].text}`);
+      // A cell that is not an object was a TypeError out of the destructuring, answered as its bare message.
+      const notCell = await call(jwt, "write_cells", { cells: [null] });
+      assert(notCell.content[0].text.startsWith("That is not a cell."), notCell.content[0].text);
+      // Two columns of one name cannot key a cell, the way they cannot key a read.
+      hand.change((d) => {
+        (d.data as Table)[0][1].name = "item";
+      });
+      const twice = await call(jwt, "write_cells", { cells: [{ row: 0, col: "item", value: "fig" }] });
+      hand.change((d) => {
+        (d.data as Table)[0][1].name = "price";
+      });
+      assert(twice.content[0].text.includes("two columns with the same name"), twice.content[0].text);
+      assertEquals(JSON.stringify(hand.doc().data[1]), `{"0":"apple","1":2.25}`, "and nothing was written");
       const badType = await call(jwt, "write_cells", { cells: [{ row: 0, col: "price", value: "expensive" }] });
       assertEquals(badType.isError, true);
       assert(
@@ -5905,6 +5932,19 @@ Deno.test(async function allTests(t) {
       const badRow = await call(jwt, "write_cells", { cells: [{ row: 9, col: "price", value: 1 }] });
       assertEquals(badRow.isError, true);
       assert(badRow.content[0].text.includes("appends"), badRow.content[0].text);
+      // The suggestion is an edit distance, col.length times each name's length, on the one thread every request
+      // shares. A col near the body cap against a long name stalled the whole server for seconds.
+      hand.change((d) => {
+        (d.data as Table)[0][1].name = "p".repeat(1000);
+      });
+      const t0 = performance.now();
+      const huge = await call(jwt, "write_cells", { cells: [{ row: 0, col: "z".repeat(900_000), value: 1 }] });
+      const took = performance.now() - t0;
+      hand.change((d) => {
+        (d.data as Table)[0][1].name = "price";
+      });
+      assert(huge.content[0].text.startsWith("That sheet has no column of that name."), huge.content[0].text);
+      assert(took < 500, `an oversized col must not run the edit distance: took ${took} ms`);
     }
 
     // query_sheet resolves @refs; list_sheets scopes to the caller.
@@ -5925,6 +5965,50 @@ Deno.test(async function allTests(t) {
       assert(denied.content[0].text.includes("access"), denied.content[0].text);
       // A denial has to say how access is granted, not just that it is missing.
       assert(denied.content[0].text.includes(`/library/${sheet_id}/share`), denied.content[0].text);
+    }
+
+    // Reading a sheet is not writing it, nor reading who holds it. A viewer, a stranger on the public sheet and a
+    // buyer of its listing all read it; write_cells asked only that, so each of them wrote, and the member list
+    // handed each of them every member's address. A refused write spends nothing of the sheet's budget.
+    {
+      const viewer = await usr("mcp-viewer@example.com");
+      const editor = await usr("mcp-editor@example.com");
+      const stranger = await usr("mcp-stranger@example.com");
+      const buyer = await usr("mcp-buyer@example.com");
+      await post(jwt, `/library/${sheet_id}/share`, { email: "mcp-viewer@example.com", role: "viewer" });
+      await post(jwt, `/library/${sheet_id}/share`, { email: "mcp-editor@example.com", role: "editor" });
+      await post(jwt, `/library/${sheet_id}/public`, { public: true });
+      await post(jwt, `/sell/${sheet_id}`, { price: 0, license: "own" });
+      const [{ sell_id }] = await sql`select sell_id from sheet where sheet_id = ${sheet_id}`;
+      await post(buyer.jwt, `/buy/${sell_id}`, {});
+      const members = (who: string) =>
+        app.request(`/library/${sheet_id}/share`, { headers: new Headers({ Authorization: `Bearer ${who}` }) });
+      for (const [name, who] of [["public stranger", stranger], ["buyer", buyer]] as const) {
+        const list = await members(who.jwt);
+        const said = await list.text();
+        assertEquals(list.status, 403, `a ${name} cannot read the members: ${said}`);
+        assert(said.includes("/share") && !said.includes("@example.com"), `naming the door, no address: ${said}`);
+      }
+      const listed = await members(viewer.jwt);
+      assertEquals(listed.status, 200, `a viewer is a member and reads the members: ${await listed.text()}`);
+
+      // The budget refills while calls run, so only the write calls sit between the reset and the refusal.
+      const before = JSON.stringify(hand.doc().data);
+      hookBuckets.delete(sheet_id);
+      hookBucket(sheet_id).rows = 1;
+      for (const [name, who] of [["viewer", viewer], ["public stranger", stranger], ["buyer", buyer]] as const) {
+        const denied = await call(who.jwt, "write_cells", { cells: [{ row: 0, col: "item", value: "pear" }] });
+        assertEquals(denied.isError, true, `a ${name} cannot write`);
+        assert(denied.content[0].text.includes("owner or editor"), denied.content[0].text);
+      }
+      assertEquals(JSON.stringify(hand.doc().data), before, "no refused write reached the document");
+
+      const wrote = await call(editor.jwt, "write_cells", { cells: [{ row: 0, col: "item", value: "pear" }] });
+      assertEquals(wrote.structuredContent, { written: 1, rows: 2 }, "an editor writes, on the unit nobody spent");
+      const spent = await call(editor.jwt, "write_cells", { cells: [{ row: 0, col: "item", value: "plum" }] });
+      assert(spent.content[0].text.includes("too many writes"), spent.content[0].text);
+      hookBuckets.delete(sheet_id);
+      assertEquals((await call(jwt, "read_sheet", {})).structuredContent.rows[0].item, "pear");
     }
 
     // Protocol errors.
@@ -6020,6 +6104,23 @@ Deno.test(async function allTests(t) {
       const elsewhere = await call(key, "read_sheet", { sheet_id: b });
       assertEquals(elsewhere.isError, true);
       assert(elsewhere.content[0].text.includes(`opens ${a}`), elsewhere.content[0].text);
+    }
+
+    // A key's authority is the sheet's created_by, read again on every request through assertSheetEditor, so a
+    // downgrade of the creator reaches a key already minted. PUT /library/:id grants "owner" through pendingSync for
+    // 30 seconds, until its sheet_usr row exists; a finished claim must leave no grant to outvote the downgrade.
+    {
+      const [{ usr_id }] = await sql`select usr_id from usr where email = 'iris@example.com'`;
+      assert(
+        !pendingSync.has(`${usr_id}/${a.split(":")[1]}`),
+        "the claim that made a owner already finished, so nothing should still be pending for it",
+      );
+      await post(jwt, `/library/${a}/share`, { email: "iris@example.com", role: "viewer" });
+      const after = await call(write, "write_cells", { cells: [{ row: 0, col: "n", value: 99 }] });
+      assertEquals(after.isError, true, `a downgraded creator's key should stop writing: ${JSON.stringify(after)}`);
+      assert(after.content[0].text.includes("owner or editor"), after.content[0].text);
+      assertEquals((await get<Table>(jwt, `/sheet/${a}`)).slice(1), [{ n: 1 }, { n: 2 }], "and nothing was written");
+      await post(jwt, `/library/${a}/share`, { email: "iris@example.com", role: "owner" });
     }
   });
 

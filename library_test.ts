@@ -1363,6 +1363,7 @@ Deno.test("the selected library rows are trashed and tagged together, and an emp
     "table:a": { name: "a", tags: ["keep"], doc: { type: "table", data: [[]] } },
     "table:b": { name: "b", tags: [], doc: { type: "table", data: [[]] } },
     "table:c": { name: "c", tags: [], doc: { type: "table", data: [[]] } },
+    "table:d": { name: "countries", tags: [], doc: { type: "table", data: [[]] } },
   };
   for (const { id, data } of sent)
     store[id] = { ...store[id], ...Object.fromEntries(Object.entries(data).filter(([, v]) => v !== null)) };
@@ -1378,9 +1379,18 @@ Deno.test("the selected library rows are trashed and tagged together, and an emp
     ["work/2026", "work/2026", ""],
     "each moved row's folder cell reads the name",
   );
-  await type_(all("main > input").find((i) => i.getAttribute("aria-label") === "search the rows"), "work/");
-  assertEquals(["a", "b", "c"].map((n) => cellsOf(n).length > 0), [true, true, false], "search matches the folder");
-  await type_(all("main > input").find((i) => i.getAttribute("aria-label") === "search the rows"), "");
+  const search = all("main > input").find((i) => i.getAttribute("aria-label") === "search the rows");
+  const found = () => ["a", "b", "c", "countries"].map((n) => cellsOf(n).length > 0);
+  await type_(search, "work/");
+  assertEquals(found(), [true, true, false, false], "search matches the folder");
+  await type_(search, "Countries");
+  assertEquals(found(), [false, false, false, true], "a mixed-case search finds a lower-case name");
+  await type_(search, "-work/");
+  assertEquals(found(), [false, false, true, true], "-term hides the rows that hold the term and keeps the rest");
+  // Every row's id holds an "a" ("table:"). Only an exact match leaves b, c and countries out.
+  await type_(search, "=a");
+  assertEquals(found(), [true, false, false, false], "=name finds the exact name only");
+  await type_(search, "");
 
   // The cell holds the box's rule: one folder, no comma. Unfiling is blanking
   // the cell, which writes "" and never null.
@@ -1833,6 +1843,43 @@ Deno.test("the nested query cache holds the newest answers, and nothing without 
   const uncached = sheets(alasql, () => ({}), bare.find);
   for (let i = 0; i < 2; i++) await answer(uncached, "select n from @query:mid");
   assertEquals(bare.finds("t"), 2, "no heads, no cache");
+});
+
+Deno.test("a sheet read directly and through a nested query keeps the first heads it read, not the last", async () => {
+  // @query:mid is named before @table:t, so mid's own read of "t" (inside its
+  // recursion) happens before the direct read of "t" that follows it in the
+  // from clause. A change lands in between: the direct read sees it, mid's
+  // already-computed answer does not.
+  const t1 = { data: ints(1) };
+  const t2 = { data: ints(2) };
+  const docs: Record<string, { data: unknown[] }> = { t: t1, mid: code("select sum(n) as s from @table:t") };
+  const spy = spied(docs);
+  let finds = 0;
+  const find = (doc_id: string) => {
+    const found = spy.find(doc_id);
+    if (doc_id === "t" && ++finds === 1) {
+      // The change: a fresh document object, not a mutation of t1, so the
+      // promise already handed to mid's read keeps pointing at the old one.
+      docs.t = t2;
+      spy.at.t = 1;
+    }
+    return found;
+  };
+  const engine = sheets(alasql, () => ({}), find, spy.heads);
+  const reads = { deps: new Map<string, string>(), depth: 0, volatile: false };
+  const { data: rows } = await engine.runSql(
+    "select m.s, t.n from @query:mid as m, @table:t as t",
+    { "": null },
+    [],
+    reads,
+  );
+  // mid's sum was computed off t1 (n=1); the direct "t.n" reflects t2, read after.
+  assertEquals(rows, [{ s: 1, n: 2 }]);
+  // The recorded heads for "table:t" must be the first (pre-change) heads mid's
+  // answer actually reflects. Recording the later, direct read's heads instead
+  // tells a caller (the cache's own hit-check, B1's follow) that the whole
+  // answer is current, when part of it -- mid's "s" -- is not.
+  assertEquals(reads.deps.get("table:t"), "0");
 });
 
 Deno.test("a cached answer neither hides a volatile call between quotes nor a chain nested too deep", async () => {

@@ -53,6 +53,8 @@ port module Main exposing
     , expandSelection
     , fillSeries
     , filterAndSortIndexed
+    , followIds
+    , followScroll
     , formatNumber
     , freshnessCell
     , freshnessDecoder
@@ -607,9 +609,9 @@ usd places amount =
 the separator every three digits money already puts in; `Scientific` is a
 mantissa and a signed exponent.
 
-Neither is a column type. A currency symbol and a percent sign are `usd` and
-`percentage`, which a column already declares, so a format says how the digits
-read and never what they mean.
+Neither is a column type. A currency symbol, a percent sign, a `:1` and a `bp`
+are `usd`, `percentage`, `ratio` and `bps`, which a column already declares, so
+a format says how the digits read and never what they mean.
 
 -}
 type NumberFormat
@@ -783,7 +785,9 @@ digitsOf decimals format v =
     in
     case format of
         Just Grouped ->
-            groupWhole plain
+            -- `formatNumber` checks the value a cell holds, and a percentage or
+            -- a bps scales it past that check.
+            iif (positional v) (groupWhole plain) plain
 
         Just Scientific ->
             scientific decimals v
@@ -803,7 +807,7 @@ its own to state.
 
 The count and the format are the column's own, and their absence is the reading
 each type had before anybody could ask: two places for money, as many as the
-value needs for the other two, and a separator every three digits where money
+value needs for the rest, and a separator every three digits where money
 already put one. A format lands on top of the type rather than instead of it --
 money asked for an exponent keeps its symbol and a percentage keeps its sign --
 so `grouped` on a usd column asks for exactly what that column already writes.
@@ -831,6 +835,12 @@ formatNumber typ decimals format v =
 
             ( Percentage, _ ) ->
                 digitsOf decimals format (v * 100) ++ "%"
+
+            ( Ratio, _ ) ->
+                digitsOf decimals format v ++ ":1"
+
+            ( Bps, _ ) ->
+                digitsOf decimals format (v * 10000) ++ " bp"
 
             ( Duration, _ ) ->
                 let
@@ -2248,6 +2258,8 @@ type Type
     | Usd
     | Boolean
     | Percentage
+    | Ratio
+    | Bps
     | Duration
     | Date
     | Many Type
@@ -2552,6 +2564,12 @@ spec typ =
         Percentage ->
             { name = "percentage", align = S.textAlignRight, width = Just 64 }
 
+        Ratio ->
+            { name = "ratio", align = S.textAlignRight, width = Just 64 }
+
+        Bps ->
+            { name = "bps", align = S.textAlignRight, width = Just 64 }
+
         Duration ->
             { name = "duration", align = S.textAlignRight, width = Just 64 }
 
@@ -2616,7 +2634,7 @@ strings, `number`'s own lenient string branch parsing "02139" same as 02139.
 -}
 numericColumn : Type -> Bool
 numericColumn typ =
-    List.member typ [ Number, Usd, Percentage, Duration ]
+    List.member typ [ Number, Usd, Percentage, Ratio, Bps, Duration ]
 
 
 {-| A column the page makes up rather than reads: the library's own columns, a
@@ -2939,6 +2957,8 @@ columnTypes =
     , ( "float", Number )
     , ( "usd", Usd )
     , ( "percentage", Percentage )
+    , ( "ratio", Ratio )
+    , ( "bps", Bps )
     , ( "duration", Duration )
     , ( "bool", Boolean )
     , ( "date", Date )
@@ -3219,6 +3239,7 @@ type Msg
     | SettingsNameChange String
     | SettingsTagsChange String
     | KeyDown KeyEvent
+    | Followed (Result Dom.Error ())
     | EditCommitMove Int Int
     | EditCancel
     | CellMouseClick
@@ -3571,6 +3592,124 @@ tableBounds model =
 
         Err _ ->
             { maxX = 0, maxY = 0 }
+
+
+{-| Scroll the table so the focus cell, the moving end of the selection, sits
+below the sticky header and right of the sticky columns. The keyboard asks for
+it and the mouse does not: a click lands on a cell the pointer can see.
+
+A `Dom` task runs on the next animation frame, so it measures the view of the
+model this update returns. `Dom.getElement` answers page coordinates and
+`Dom.getViewportOf` the box's own scroll, so every edge is taken off the box's
+top-left.
+
+The header and the sticky columns cover the box where they stick, not where
+they sit. A sticky part that the scroll has not yet brought to its stuck place
+is content in view. Its natural edge as the cover leaves a cell that fits cut,
+or off the box. The header sticks at `top: -1px` (src/style.css). A sticky
+column sticks at its `pinLeft`.
+
+A panel over the table does not stop the key subscription (see `nudge` in
+`updateKeyDown`), so a plain arrow still moves `sheet.select` under the panel.
+No follow runs there: it scrolls a table nobody can see, and the panel closes
+onto a scroll nobody asked for.
+
+-}
+follow : ( Model, Cmd Msg ) -> ( Model, Cmd Msg )
+follow ( { sheet } as model, cmd ) =
+    if List.any identity [ model.palette /= Nothing, model.showShortcuts, model.showSettings, model.importing /= Nothing, model.deleteConfirm /= Nothing, model.pending /= Nothing ] then
+        ( model, cmd )
+
+    else
+        let
+            stuck =
+                resolveTable model |> Result.toMaybe |> Maybe.andThen (\{ cols } -> followPin sheet cols (pinLeft sheet cols)) |> Maybe.map (Tuple.second >> toFloat)
+
+            -- A `Dom.getElement` fails only with the NotFound of its own id. So
+            -- this `onError` catches only a mark that `followIds` omits on purpose.
+            marked id =
+                Dom.getElement id |> Task.map (.element >> Just) |> Task.onError (\_ -> Task.succeed Nothing)
+        in
+        ( model
+        , Cmd.batch
+            [ cmd
+            , Task.map5
+                (\box head pin { element } { viewport } ->
+                    followScroll viewport
+                        { top =
+                            -- No header mark: the focus is in the header row, which
+                            -- sticks. The cover ends at the focus's own top, so the
+                            -- table does not scroll up or down.
+                            Maybe.map (\h -> h.height - 1) head |> Maybe.withDefault (element.y - box.element.y)
+                        , left =
+                            -- No sticky mark: no sticky column stands before the focus column.
+                            -- A mark that `stuck` did not plan comes from a column nudge: its
+                            -- document can land before this frame. That mark counts where it sits.
+                            Maybe.map (\p -> Maybe.withDefault (p.x - box.element.x) stuck + p.width) pin |> Maybe.withDefault 0
+                        }
+                        { element | x = element.x - box.element.x + viewport.x, y = element.y - box.element.y + viewport.y }
+                )
+                (Dom.getElement "table-scroll")
+                (marked "focus-head")
+                (marked "focus-pin")
+                -- Each `Dom` task waits its own frame, and a scroll moves only
+                -- the cell and the offset. So they are read last, side by side,
+                -- one frame before the write. A follow that starts two or more
+                -- frames earlier writes before this cell read.
+                (Dom.getElement "focus-cell")
+                (Dom.getViewportOf "table-scroll")
+                |> Task.andThen (Maybe.map (\( x, y ) -> Dom.setViewportOf "table-scroll" x y) >> Maybe.withDefault (Task.succeed ()))
+                |> Task.attempt Followed
+            ]
+        )
+
+
+{-| The last column before the focus that sticks while the focus column scrolls:
+its index and its `pinLeft`. A sticky column after the focus never covers it,
+since it sticks at or right of where it sits anyway.
+-}
+followPin : Sheet -> Array Col -> Dict String Int -> Maybe ( Int, Int )
+followPin sheet cols pins =
+    case Array.get sheet.select.b.x cols of
+        Just col ->
+            if Dict.member col.key pins then
+                Nothing
+
+            else
+                cols
+                    |> Array.toIndexedList
+                    |> List.take sheet.select.b.x
+                    |> List.filterMap (\( x, c ) -> Dict.get c.key pins |> Maybe.map (Tuple.pair x))
+                    |> List.reverse
+                    |> List.head
+
+        Nothing ->
+            Nothing
+
+
+{-| The scroll offset that brings a cell into view, or nothing while it is in
+view already. `box` is the scroll box's offset and inner size, `cover` how far
+the sticky header and the sticky columns reach into it from its top and left
+edges, and `cell` the cell in the box's scrolled content. The smallest scroll
+wins, and a cell longer than the room left on an axis aligns its start there.
+-}
+followScroll : { x : Float, y : Float, width : Float, height : Float } -> { top : Float, left : Float } -> { x : Float, y : Float, width : Float, height : Float } -> Maybe ( Float, Float )
+followScroll box cover cell =
+    let
+        axis at room inset start length =
+            if start < at + inset || length > room - inset then
+                start - inset
+
+            else if start + length > at + room then
+                start + length - room
+
+            else
+                at
+
+        to =
+            ( axis box.x box.width cover.left cell.x cell.width, axis box.y box.height cover.top cell.y cell.height )
+    in
+    iif (to == ( box.x, box.y )) Nothing (Just to)
 
 
 {-| The refusal a keystroke or a double-click earns on a cell the keyboard can
@@ -5125,6 +5264,7 @@ update msg ({ sheet, auth } as model) =
                                     sheet.select
                     in
                     ( { model | sheet = { sheet | findReplace = Just newFr, select = newSelect } }, Cmd.none )
+                        |> iif (List.isEmpty matches) identity follow
 
                 Nothing ->
                     ( model, Cmd.none )
@@ -5159,7 +5299,7 @@ update msg ({ sheet, auth } as model) =
                                     Nothing ->
                                         sheet.select
                         in
-                        ( { model | sheet = { sheet | findReplace = Just { fr | currentMatch = nextIdx }, select = newSelect } }, Cmd.none )
+                        ( { model | sheet = { sheet | findReplace = Just { fr | currentMatch = nextIdx }, select = newSelect } }, Cmd.none ) |> follow
 
                 Nothing ->
                     ( model, Cmd.none )
@@ -5189,7 +5329,7 @@ update msg ({ sheet, auth } as model) =
                                     Nothing ->
                                         sheet.select
                         in
-                        ( { model | sheet = { sheet | findReplace = Just { fr | currentMatch = prevIdx }, select = newSelect } }, Cmd.none )
+                        ( { model | sheet = { sheet | findReplace = Just { fr | currentMatch = prevIdx }, select = newSelect } }, Cmd.none ) |> follow
 
                 Nothing ->
                     ( model, Cmd.none )
@@ -5260,13 +5400,26 @@ update msg ({ sheet, auth } as model) =
                 newSel =
                     clampIndex bounds { x = sel.x + dx, y = sel.y + dy }
             in
-            ( { committed | sheet = { cs | select = Rect newSel newSel } }, cmd )
+            ( { committed | sheet = { cs | select = Rect newSel newSel } }, cmd ) |> follow
 
         EditCancel ->
             ( { model | sheet = { sheet | write = Nothing } }, Cmd.none )
 
         KeyDown event ->
             updateKeyDown event model
+
+        Followed (Ok ()) ->
+            ( model, Cmd.none )
+
+        Followed (Err (Dom.NotFound "focus-cell")) ->
+            -- No cell is drawn at the focus: the selection rests on a row the
+            -- search or a filter no longer draws (see `undrawnRows`), or in a
+            -- hidden column, or the sheet draws no table (a chart, a dashboard,
+            -- a refusal, "loading"). Nothing to follow.
+            ( model, Cmd.none )
+
+        Followed (Err (Dom.NotFound id)) ->
+            ( { model | error = "Expected an element with id " ++ id ++ " to scroll the table to the selected cell, received none. Nothing scrolled. Source: `follow`, which reads the table's scroll box by that id. Fix: give the scroll box that id in `view`." }, Cmd.none )
 
         QueryEditorUpdate { textBeforeCursor } ->
             -- Handle special keyboard navigation signals
@@ -6452,19 +6605,18 @@ updateKeyDown event ({ sheet } as model) =
             bounds =
                 tableBounds model
 
+            jump : Index -> ( Model, Cmd Msg )
+            jump to =
+                ( { model | sheet = { sheet | select = Rect to to } }, Cmd.none ) |> follow
+
             -- Move selection, clamping to bounds and stepping over hidden columns
             move : Int -> Int -> ( Model, Cmd Msg )
             move dx dy =
                 let
                     clamped =
                         clampIndex bounds { x = sel.x + dx, y = sel.y + dy }
-
-                    newSel =
-                        xy (skipHidden sheet bounds dx clamped.x) clamped.y
                 in
-                ( { model | sheet = { sheet | select = Rect newSel newSel } }
-                , Cmd.none
-                )
+                jump (xy (skipHidden sheet bounds dx clamped.x) clamped.y)
 
             -- Start editing the current cell
             startEdit =
@@ -6520,7 +6672,7 @@ updateKeyDown event ({ sheet } as model) =
                         newSelect =
                             expandSelection bounds dx dy sheet.select
                     in
-                    ( { model | sheet = { sheet | select = newSelect } }, Cmd.none )
+                    ( { model | sheet = { sheet | select = newSelect } }, Cmd.none ) |> follow
 
                 -- Not Alt alone: on Windows and Linux Alt+←/→ is the browser's
                 -- back and forward, and a subscription cannot preventDefault it.
@@ -6541,7 +6693,7 @@ updateKeyDown event ({ sheet } as model) =
                     else
                         case nudgeOf model.search sheet dx dy of
                             Ok ( edit, moved ) ->
-                                updateDocMsg edit { model | sheet = { sheet | select = moved } }
+                                updateDocMsg edit { model | sheet = { sheet | select = moved } } |> follow
 
                             Err message ->
                                 ( { model | error = message }, Cmd.none )
@@ -6638,35 +6790,11 @@ updateKeyDown event ({ sheet } as model) =
 
                 "Home" ->
                     -- Jump to beginning of row, or top-left with Ctrl
-                    if event.ctrl || event.meta then
-                        let
-                            newSel =
-                                xy 0 1
-                        in
-                        ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
-
-                    else
-                        let
-                            newSel =
-                                xy 0 sel.y
-                        in
-                        ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
+                    jump (iif (event.ctrl || event.meta) (xy 0 1) (xy 0 sel.y))
 
                 "End" ->
                     -- Jump to end of row, or bottom-right with Ctrl
-                    if event.ctrl || event.meta then
-                        let
-                            newSel =
-                                clampIndex bounds (xy bounds.maxX bounds.maxY)
-                        in
-                        ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
-
-                    else
-                        let
-                            newSel =
-                                xy bounds.maxX sel.y
-                        in
-                        ( { model | sheet = { sheet | select = Rect newSel newSel } }, Cmd.none )
+                    jump (iif (event.ctrl || event.meta) (clampIndex bounds (xy bounds.maxX bounds.maxY)) (xy bounds.maxX sel.y))
 
                 _ ->
                     if event.key == "a" && (event.ctrl || event.meta) then
@@ -8245,7 +8373,7 @@ resolveTable model =
                 { cols = libraryCols model
                 , rows =
                     model.library
-                        |> Dict.filter (\k v -> k /= "" && not v.scratch && v.trashed == model.trash && List.any (String.contains model.search) (k :: v.name :: v.folder :: v.tags))
+                        |> Dict.filter (\k v -> k /= "" && not v.scratch && v.trashed == model.trash)
                         |> Dict.toList
                         -- Starred first, and only while nobody has chosen a
                         -- sort: `filterAndSortIndexed`'s own sort is stable, so
@@ -9017,6 +9145,12 @@ seriesEncoder typ =
         Percentage ->
             Just asNumber
 
+        Ratio ->
+            Just asNumber
+
+        Bps ->
+            Just asNumber
+
         Duration ->
             Just asNumber
 
@@ -9331,6 +9465,36 @@ pinAttrs pins col =
             []
 
 
+{-| The cells `follow` measures in row n, by column: the focus cell, the header
+cell above it while it sits below the header, and the `followPin` cell beside it.
+
+A focus in a hidden column marks nothing: a `display: none` cell measures as an
+empty box at the page's corner, and following that scrolls to the top-left.
+
+-}
+followIds : Sheet -> Array Col -> Dict String Int -> Int -> Dict Int String
+followIds sheet cols pins n =
+    let
+        at =
+            sheet.select.b
+    in
+    case ( n == at.y || n == 0, Array.get at.x cols ) of
+        ( True, Just col ) ->
+            if Set.member col.key sheet.hidden then
+                Dict.empty
+
+            else
+                [ iif (n == at.y) (Just ( at.x, "focus-cell" )) Nothing
+                , iif (n == 0 && at.y > 0) (Just ( at.x, "focus-head" )) Nothing
+                , iif (n == at.y) (followPin sheet cols pins |> Maybe.map (\( x, _ ) -> ( x, "focus-pin" ))) Nothing
+                ]
+                    |> List.filterMap identity
+                    |> Dict.fromList
+
+        _ ->
+            Dict.empty
+
+
 {-| Both corners at -1 on one axis span that whole axis. Every corner at -1 is
 no selection.
 -}
@@ -9407,6 +9571,12 @@ cellDecoder typ decimals format i n =
 
             Percentage ->
                 D.oneOf [ D.map (text << formatNumber Percentage decimals format) number, D.map text string ]
+
+            Ratio ->
+                D.oneOf [ D.map (text << formatNumber Ratio decimals format) number, D.map text string ]
+
+            Bps ->
+                D.oneOf [ D.map (text << formatNumber Bps decimals format) number, D.map text string ]
 
             Duration ->
                 D.oneOf [ D.map (text << formatNumber Duration decimals format) number, D.map text string ]
@@ -9986,10 +10156,11 @@ shadeAttr shading ( lo, hi ) v =
                 )
 
 
-viewCell : Sheet -> Result String (Array Stat) -> Dict String Int -> Dict String ( Float, Float ) -> Bool -> Int -> Int -> Col -> Row -> Html Msg
-viewCell sheet stats pins extents grab i n col row =
+viewCell : Sheet -> Result String (Array Stat) -> Dict String Int -> Dict String ( Float, Float ) -> Bool -> Maybe String -> Int -> Int -> Col -> Row -> Html Msg
+viewCell sheet stats pins extents grab mark i n col row =
     H.td
-        ([ A.onClick CellMouseClick
+        ([ Maybe.map A.id mark |> Maybe.withDefault (A.classList [])
+         , A.onClick CellMouseClick
          , A.onDoubleClick <|
             CellMouseDoubleClick <|
                 case String.fromInt n of
@@ -10098,6 +10269,10 @@ viewCell sheet stats pins extents grab i n col row =
 
 viewTableRow : Sheet -> Doc -> Result String (Array Stat) -> Dict String Int -> Dict String ( Float, Float ) -> Bool -> Array Col -> Int -> Row -> Html Msg
 viewTableRow sheet doc stats pins extents grab cols n row =
+    let
+        marks =
+            followIds sheet cols pins n
+    in
     H.tr
         [ A.classList [ ( "meta", n < 0 ) ]
         , case ( String.fromInt n, stats ) of
@@ -10108,7 +10283,7 @@ viewTableRow sheet doc stats pins extents grab cols n row =
                 S.displayTableRow
         ]
     <|
-        List.indexedMap (\i col -> viewCell sheet stats pins extents grab i n col row) (Array.toList cols)
+        List.indexedMap (\i col -> viewCell sheet stats pins extents grab (Dict.get i marks) i n col row) (Array.toList cols)
             ++ [ case doc of
                     Tab _ ->
                         H.th [ A.onClick (DocMsg SheetColumnPush), A.title "add column", S.widthRem 0.001, S.whiteSpaceNowrap ] [ text (iif (n == 0) "→" "") ]
@@ -12039,7 +12214,7 @@ view ({ sheet } as model) =
             resolveTable model
 
         content =
-            H.div [ S.overflowAuto, S.height "100%", S.backgroundColor "#eee" ]
+            H.div [ A.id "table-scroll", S.overflowAuto, S.height "100%", S.backgroundColor "#eee" ]
                 [ viewError model.error
                 , case table of
                     Err "" ->

@@ -34,14 +34,19 @@ a condition in `GET /status`, not an item here.
      compares `"9" > "10"`. A sum that is not rewritten answers a number, not the `undefined` that `checkResultColumns`
      catches, so it also needs a new guard.
 
-- [ ] You see a timestamp in your own timezone, and it means the same instant to every reader.
-  1. Decide first: the zone is a per-user setting, and no per-user settings row exists. That means a `schema/db.sql`
-     change. The locale item under **Table UX** uses the same row.
+- [ ] You see timestamps in your own zone and numbers with your locale's separators, and a timestamp means the same
+      instant to every reader.
+  1. Decide first: the zone and the locale are per-user settings, and no per-user settings row exists. That means a
+     `schema/db.sql` change, applied in the order `claude.md` gives.
   2. Store UTC. Make `date`, `time`, `datetime` and `timestamptz` four types in `COLUMN_TYPES`, with the three
      language-boundary copies.
   3. Render in the viewer's zone, read from that setting, never from the browser's guess. Do the arithmetic through
      `Intl.DateTimeFormat` with `timeZone` (date arithmetic is never hand-rolled). `table:timezones` holds the offsets
      and does not hold the transition dates.
+  4. Read the locale where `formatNumber` reads the format, so the cell, the stats row and the totals row change
+     together. Today the separator is always `,` and the point is always `.`.
+  5. Add a custom mask only after a second real use asks for one. A mask is a parser, and `formatNumber` is the one
+     place a number becomes text.
 
 - [ ] You name an expression once and use it in five sheets.
   1. Decide first:
@@ -65,51 +70,83 @@ a condition in `GET /status`, not an item here.
 
 ## Types & validation
 
-- [ ] A cell holds a ratio, a multi-select, a reference, a file, or a quantity with its unit.
-  1. Build one type per item, cheapest first. Each type is one `COLUMN_TYPES` row, the three language-boundary copies
-     and a `browser_test.ts` pair.
-  2. Ratio and basis points: display only, through `formatNumber`, over the stored number. `percentage` already ships.
-  3. Multi-select: a `json` array checked against the `enum:` list. An option list from another sheet is an `@ref` that
-     the check reads.
-  4. Reference: a cell that holds another sheet's key, checked on write. It waits on row identity (see the cell-note
+- [ ] A cell holds a multi-select, a reference, a file, or a quantity with its unit.
+  1. Build one type per item, cheapest first. Each type is one `COLUMN_TYPES` row and the three language-boundary
+     copies. `browser_test.ts` reads each copy whole, so it needs no new code.
+  2. Multi-select: a JSON array checked against an option list. Decide first the spelling (`multi:a,b` is the
+     suggestion) and where it is refused (every write door, beside the constraints item's `enum:` check). Every grid
+     write stores a string today (`SheetWrite` encodes `E.string`), and `POST /sheet/:id` refuses an array value. An
+     option list from another sheet is an `@ref`, and it is not cheap: `checkColumnTypes` is synchronous and cannot load
+     a sheet, so it needs `loadRefs`, lineage, the MCP key-scope guard and a port.
+  3. Reference: a cell that holds another sheet's key, checked on write. It waits on row identity (see the cell-note
      item).
-  5. Attachment: waits on a file store, and none exists. Decide the store first.
-  6. Unit of measure: a quantity plus a unit. Adding lbs to kg is refused the same way two currencies are, so it comes
+  4. Attachment: waits on a file store, and none exists. Decide the store first.
+  5. Unit of measure: a quantity plus a unit. Adding lbs to kg is refused the same way two currencies are, so it comes
      after the money item.
 - [ ] A bad row is refused at every door and kept in a dead-letter sheet, and a sheet states what must be true of it.
-  1. Decide first where a constraint lives. The suggestion is the column object in `data[0]`, beside `type`, which is
-     where the arrangement already lives. Read it leniently, the way `viewDecoder` reads.
+  1. Decide first:
+     - The shape. The suggestion is one nested `check` object on the column in `data[0]`, beside `type`, read leniently
+       the way `viewDecoder` reads. One reader, and no collision with the arrangement's fields.
+     - A constraint the current rows already break. The suggestion is to refuse adding it, in the page.
+     - Regex. Defer it, or allow a restricted syntax with length caps. Nothing bounds a catastrophic pattern today:
+       `MAX_QUERY_MS` bounds how long the caller waits, not how long the event loop burns.
+     - The dead letter's store. `net` is wrong: its check constraint admits no table id, `trimNet` keeps `NET_KEEP` rows
+       across every account's rejects, and the error log never stores values. `audit` is wrong: it is never trimmed, and
+       a refused request writes nothing. A new `reject` table is a `schema/db.sql` change.
   2. Constraints: not-null, unique, range, regex, allowed values, row-count range, freshness bound, referential
-     integrity.
-  3. `POST /net/:id`, `POST /sheet/:id`, `write_cells` and a cell edit run the same check that `readImport()` runs,
-     through `checkColumnTypes`.
-  4. A refused row goes to a computed dead-letter sheet, with the reason, and it can be requeued. Register the sheet in
-     the three places `claude.md` names for a computed sheet.
+     integrity. Allowed values are the `enum:` options. Their membership is checked nowhere today: not in
+     `checkColumnTypes`, not at `POST /sheet/:id`, not in `write_cells`.
+  3. A `checkConstraints` in `src/sql.mjs`, beside `checkColumnTypes`, runs at `POST /sheet/:id` and in `write_cells`
+     over the rows as they will be after the write. The glue's `changeDoc` runs the same function for a cell edit. That
+     check is advisory: the server cannot refuse a socket edit, because the editor's copy already holds the change and a
+     dropped frame wedges sync. `readImport()` always makes a new sheet, so it has nothing to enforce. `POST /net/:id`
+     is out of scope: a net sheet has no columns.
+  4. A refused batch stays all-or-nothing. It goes to a computed dead-letter sheet with the reason. A requeue only
+     appends, because rows are positional and an overwrite's target may have moved. Register the sheet in the three
+     places `claude.md` names for a computed sheet.
   5. Row provenance: which source and which run wrote the row. For a net sheet this is `net.net_id`.
 
-- [ ] You add a column that is an expression over its own row.
-  1. A computed column on a table sheet is an `expr` field on the column object. `src/sql.mjs` evaluates it in both
-     hosts, and it is never stored.
-  2. Defaults and generated values use the same field: created-at, row hash, sequence.
+- [ ] You add a column that is an expression over its own row, and colour a cell by a rule over that row.
+  1. Decide first:
+     - What the grid shows. Elm decodes cells straight from the document, so a computed cell renders blank. Either the
+       glue computes on each `docChanged` and overlays read-only values before sort, filter, shade and stats read them,
+       or the grid shows the expression's text.
+     - A row whose expression throws: refuse the read and name the row, or a null cell.
+     - The type: declared on the column and checked, or inferred through `selectTypes`.
+  2. A computed column is an `expr` field on the column object. `src/sql.mjs` evaluates it in both hosts through AlaSQL,
+     one `select (<expr>) as [v] from ?` per computed column, zipped back by row index. It is never stored.
+  3. An expression refuses refs, subqueries and `SHEET(`, `AGGREGATES` calls, `over`, `?` parameters, another computed
+     column, and `VOLATILE` calls (the page's `http()` would fetch once per row per render). `namesIn()` checks that
+     every name is a stored column of the same sheet, with `nearest()`. Its bracket pattern admits identifier characters
+     only.
+  4. Coerce through `checkColumnTypes` before evaluating, or `"3" + "2"` concatenates. `GET /sheet/:id` does not run
+     that check today, so adding it makes a sheet with one bad numeric cell refuse `GET`.
+  5. Every read computes: `sheet()` into `named()` (`GET /sheet/:id`, every export, every MCP read, `library.zip`), and
+     `loadRefs` in both hosts, which gains an engine argument in `main.ts`, `src/page.mjs` and the `examples_test.ts`
+     replay. A server query must not compute twice. `GET /sheet/:id` gains the `MAX_QUERY_MS` race, and a cap on
+     computed columns per sheet and on expression length.
+  6. Every write refuses a computed column: `POST /sheet/:id` drops it from the required names; `write_cells`, paste,
+     fill-down, the cleaning verbs and split refuse it; OpenAPI marks it `readOnly`. `atRisk` warns when a rename or
+     delete takes a column an expression names.
+  7. A colour rule over the whole row is the arrangement's `shade`, driven by a per-row expression, after step 6.
+  8. Defaults and generated values (created-at, row hash, sequence) are their own item on the same field.
 
 ---
 
 ## Table UX
 
-- [ ] You read a number with your locale's separators. Today the separator is always `,` and the point is always `.`.
-  1. Add a per-user locale field, in the same settings row as the timezone item, so this starts in `schema/db.sql`. Read
-     it where `formatNumber` reads the format, so the cell, the stats row and the totals row change together.
-  2. Add a custom mask only after a second real use asks for one. A mask is a parser, and `formatNumber` is the one
-     place a number becomes text.
-
-- [ ] You colour a cell by a rule over its whole row.
-  1. A rule over the whole row comes after the computed-column item, because that item gives a per-row expression a
-     place to live.
 - [ ] You group rows and see subtotals without writing SQL.
-  1. Add collapsible groups, with subtotals over the rows on screen, the same way the totals row respects the filter. A
-     smaller alternative needs neither: one footer `tr` per group under the table, grouped by one chosen column, from
-     the fold `columnTotal` already does.
-  2. A pivot UI over the same machinery. AlaSQL's `pivot` is correct once `checkPivot()` has checked it.
+  1. Decide first:
+     - Where the chosen column lives. A column-level `group` field in the arrangement takes the `shade` path
+       (`colViewFields`, `viewOf`, `pruneView`, `viewPatches`, `onScreenView`) and is written by `arrange`. Model-only
+       state is half the code and is lost on reload. A sheet-level field cannot live on a table: its patches are rooted
+       at `data`.
+     - A cap on groups, with an "N more" row. A high-cardinality column is one footer row per row.
+     - Tables only. A query has no totals row today.
+  2. One footer `tr` per group under the table, in the `Tab` branch of `viewTableFooter`, from the fold `columnTotal`
+     already does, over the drawn rows the totals row reads. A "subtotal by this column" button in the column panel.
+  3. Collapsible groups after that.
+  4. A pivot UI over the same machinery. AlaSQL's `pivot` is correct once `checkPivot()` has checked it.
 - [ ] You write a note on a cell and discuss it in a thread.
   1. Decide row identity first. A note belongs to a row, and a row here has no id. `data` is a positional array that
      `rowSplices`, `rowDeletions` and the `move` patch address by index, so an insert above a noted row moves the note
@@ -187,8 +224,12 @@ a condition in `GET /status`, not an item here.
 ## Codex — databases
 
 - [ ] You connect the database you actually have, browse its tables, and read only the rows you filter.
-  1. A codex query path. Today the only statements are the read-only session, `information_schema` and the preview's
-     `limit`. Push down only a where clause that is provably safe.
+  1. A filtered preview, decided: owners and editors only, until masking exists. `GET /codex/:id/preview` takes up to
+     five AND-ed `where=<column>.<op>.<value>`; a codex column never holds a dot, because the route already refuses one.
+     The ops are `eq neq lt lte gt gte isnull notnull`, plus `like ilike` on text. The column passes by exact membership
+     in `codexTables()`, the op comes from the list, and the value is a bound parameter. A value that will not cast
+     (SQLSTATE class 22) or an op its type lacks (class 42) is a 400 caught inside `read`. Never the 502 and the failed
+     `codexRun` row, which `POLL_OK` grades. The page UI comes after, then a `@codex-db:` query path.
   2. A write grant per connection, off by default, with row and column masking over that path.
   3. Incremental sync by a watermark column. CDC or logical replication after that.
   4. More engines, one at a time, each with its own driver and its own `cannotConnect()` mapping: MySQL, SQLite, SQL
@@ -200,9 +241,19 @@ a condition in `GET /status`, not an item here.
 ## Alerts
 
 - [ ] An alert reaches your phone.
-  1. Web push first. It needs no vendor account: VAPID keys are secrets, each user has a subscription, and `src/sw.js`
-     receives the push. Use an established library for the signing.
-  2. SMS needs a carrier account. Choose one before this step becomes its own item. It is a sender beside
+  1. Web push first. It needs no vendor account. Decide first the signing library, and spike it:
+     - `npm:web-push` has a reported Deno failure in `generateRequestDetails`.
+     - `jsr:@negrel/webpush` sends through the global `fetch`, around `safeFetch`.
+     - `web-push-neo` exposes the request details, so `safeFetch` can send them. This is the suggestion.
+  2. Subscriptions are a new `schema/db.sql` table (`usr_id`, unique `endpoint`, `p256dh`, `auth`, `failures`), pruned
+     on a 404 or 410. The endpoint is a URL the browser supplies: allowlist the push services' hosts as well as
+     `safeFetch`.
+  3. VAPID keys are server environment variables. Missing keys follow the `RESEND_API_KEY` pattern: nothing was sent.
+     `to: push` means the alert owner's devices, and the run row writes `push`, never an endpoint. The payload is the
+     headline and a link. `sendWithinQuota` counts one delivery per run.
+  4. `src/sw.js` gains `push` and `notificationclick`. `browser_test.ts` lints it (`clients` may join
+     `BROWSER_GLOBALS`), and the `sync_test.ts` worker tests need `registration.showNotification` on their `self`.
+  5. SMS needs a carrier account. Choose one before this step becomes its own item. It is a sender beside
      `sendAlertUrl`, picked by the destination.
 
 ---
@@ -317,12 +368,15 @@ a condition in `GET /status`, not an item here.
 ## Collaboration
 
 - [ ] You see who else is in the sheet.
-  1. Decide first what a peer broadcasts. `model.auth.email` shows the editor's address to every viewer of a shared
-     sheet, and a client can claim any name.
+  1. Decide first what a peer broadcasts. The suggestion: nothing identifying now (a per-tab colour and a count), and an
+     identity the server stamps on each frame later. `model.auth.email` would show the editor's address to every viewer,
+     public readers included. A `usr.name` is claimed by the client, and nothing writes it yet.
   2. Fix the harness first. `fakeHandle.on` ignores the event name and has no `broadcast`, so a `Presence` receives
      `change` payloads and `start()` throws in every glue test. Teach it event names and add `broadcast`. Two
      `realRepo`s built with `network: []` cannot reach each other.
-  3. Check that `main.ts` relays an ephemeral frame. Only `carriesChanges` has been read.
+  3. `main.ts` relays an ephemeral frame, by reading: `carriesChanges` passes it, and automerge-repo relays it to every
+     peer on the document with no size or rate limit. Add a byte cap and a rate cap on `type === "ephemeral"` in the
+     socket handler, with a step in `main_test.ts`'s real-socket block.
   4. The vendored bundle exports `Presence` (`start({ initialState, heartbeatMs, peerTtlMs })`). Start it in
      `selectDoc`, call `stop()` where `watched` is cleared, add one port pair, bound `model.peers`, and show chips in
      `viewToolbar`.
@@ -330,10 +384,15 @@ a condition in `GET /status`, not an item here.
      queue.
 
 - [ ] You go back to a past version of a sheet.
-  1. A visual diff between two versions. `diff` answers automerge patches, and rendering them as a cell-level diff is
-     its own design.
-  2. Named snapshots, then rollback, which is a write.
-  3. A conflict view, for the merges automerge cannot decide.
+  1. Rollback first, rows only. A pure `rollbackPatches(now, past)` in `src/page.mjs` emits a `set` or `del` per cell
+     that differs (path `[y, key]`) and one tail `splice` for the row count. Its mirror is the undo entry, so one
+     automerge change goes through `changeDoc` and Ctrl/⌘+Z takes it back. It refuses when the column keys differ, and
+     past a named patch bound. Writing `data[0]` back would rewrite declared types and the arrangement, and would skip
+     the rename and delete warning.
+  2. A visual diff of the picked version against now, from the same comparison.
+  3. Named snapshots. Decide first where the names live. A root `snapshots` list needs a glue write path outside
+     `d.data`; the other places are this browser's store and a server table.
+  4. A conflict view, for the merges automerge cannot decide.
 
 ---
 
@@ -350,44 +409,82 @@ a condition in `GET /status`, not an item here.
 
 - [ ] A sheet lives in git, and you drive it from a CLI.
   1. The text definition is the workspace zip's `manifest.json` plus each sheet's settings JSON.
-  2. A CLI: push and pull CSVs, run queries, tail run logs.
+  2. A CLI: push and pull CSVs, run queries, tail run logs. Decide first the auth. A `scrapsheets-key` reaches only
+     `/sheet/:id`, `/openapi/:id` and `/mcp/:id`. Everything else needs a JWT from `POST /login`. A CSV push suggests
+     `POST /sheet/:id` taking `text/csv` through `readImport()`, so one CSV reader stays. Test it with a stubbed `fetch`
+     in its own file.
   3. Thin typed client SDKs, generated from `GET /openapi/:id`.
 
 - [ ] You change a pipeline without breaking the live one.
-  1. A staging copy: fork the sheet, change the query, review the diff, promote.
-  2. Branch and merge a sheet. Automerge makes this possible.
+  1. A staging copy: fork the sheet, change the query, review the diff, promote. `forkDoc` is `repo.create` of a copy,
+     so the fork shares no history and `merge` cannot promote it. Promote copies `code` back to the source. `forkDoc`
+     records `forked_code` and `forked_heads`, so promote warns when the source changed since the fork. A bundled source
+     is refused. The rename and delete machinery (`lineageFor`, `dependents`) warns when the new query drops a column
+     another sheet reads.
+  2. Branch and merge a sheet through automerge's `clone` and `merge`. This also merges the data and the arrangement.
   3. A sandbox: fake webhook deliveries and dry-run schedules.
 
 - [ ] You run it yourself, and you move your workspace in.
   1. A docker image, for customers who cannot send data anywhere.
-  2. Workspace import. N documents and N `sheet` and `sheet_usr` rows are written atomically. `assertSheetsQuota` runs
-     over the whole batch and `assertRoom` runs per sheet. Decide what an `@ref` to a doc_id that no longer exists
-     means.
+  2. Workspace import of the `library.zip` shape. Decide first:
+     - The body cap. `bodyLimit` caps every body at `BODY_CAP`, so no table larger than that comes back in through any
+       door. The suggestion is one exempt path, capped at `WORKSPACE_BYTES_MAX`.
+     - Ids. `automerge.create` mints them, so imported sheets get new ones. Refs are rewritten in query and alert
+       `code`, chart `source` and dashboard `tiles`, by a scanner shaped like `scanRefs`. A ref to a sheet the zip does
+       not hold is imported and listed in the answer.
+     - On arrival: feeds paused, alerts snoozed. A paused alert that never ran counts as overdue after two hours, and
+       past `OVERDUE_MAX` that pages the operator.
+     - Types. `importTypes` admits only `CANONICAL_TYPES`, which refuses `enum:`. The suggestion is any `knownType()`
+       spelling, as written.
+     - What the zip loses: column keys, the arrangement, null against `""`, JSON object cells (`csvCell` writes
+       `[object Object]`), secrets, webhooks and shares. Extend the manifest first, or import what is there.
+     - Refuse portal, template and purchased sheets. Importing a purchase would launder its license.
+  3. Validate everything, create the N documents, then insert every `sheet` and `sheet_usr` row in one transaction.
+     `assertSheetsQuota` runs on that transaction with an `adding` count, and `assertRoom` runs per sheet. On failure,
+     delete the documents already created.
 
 ---
 
 ## Navigation & workspace UX
 
+- [ ] You search the library and match only what you see: "true", "rows" or "null" does not find every sheet.
+  1. `matchesSearch` reads every cell through the lenient `string`, so the star's `{id, on}`, the thumb's
+     `{kind, cols, rows, spark}` and a `NULL` match. Add one fact to `spec`: whether a type's cell draws its text (not
+     `Star`, `Thumb`, `Trash`, `Restore` or `Delete`). Pass the columns to `matchesSearch`, and read only the cells
+     whose type draws text. Every table then searches what it draws.
+  2. Case folding goes through JS `toLowerCase`, which turns "İ" into "i" plus a combining dot, so "istanbul" misses
+     "İstanbul". A fix needs normalization, which Elm lacks. Add it only after a real search breaks.
+
+- [ ] You open settings on a sheet you only read, and it shows what you can do there, not an error.
+  1. The settings panel asks for the member list on open. A public reader or a buyer gets a 403 from
+     `GET /library/:id/share`, and the banner shows it. Decide first how the page learns that it holds no share: from
+     that 403 (the panel hides the member list and the share form, and says why in place), or from a role the server
+     sends with the document.
+
 - [ ] You find a sheet by what is in it.
-  1. Global search over sheet names, column names and cell contents. Semantic search after that.
+  1. Column names first: a bounded `names` list in `docThumb` (`src/page.mjs`). `matchesSearch` already reads thumb
+     values, so library rows match, and the palette's `matches` list adds it. A stored thumb gains names when its sheet
+     is next opened.
+  2. Cell contents need every document. Decide first whether that is a server route that spends each sheet's budget.
+  3. Semantic search after that.
 
 ---
 
 ## Performance & scale
 
-- [ ] A large sheet scrolls, a forty-sheet chain does not re-run on every keystroke, and a million-row join runs.
-  1. Virtualized rendering. Today every row renders.
-  2. A nested `@query:` answer already comes from the page cache in `sheets(..., heads)` until a document it read
-     changes heads. What is left: an open query refreshes when a dependency's heads change with no keystroke, and only
-     what is downstream of the changed document runs again. Subscribe to `change` on the handle of each document the
-     open query read, drop only the cache keys that read it, and call `runQuery` once. Today nothing subscribes: the
-     next keystroke or reopen reads the new heads.
-  3. Run a query in a Worker, with progress. The engine cannot be preempted, which is why `MAX_QUERY_ROWS` is the real
+- [ ] A large sheet scrolls, and a million-row join runs.
+  1. Virtualized rendering. Today every row renders. Decide first:
+     - The row height. Text wraps without limit today; only child media is capped.
+     - The threshold. Tests expect more than 190 rendered rows.
+     - A window floor. jsdom reports a zero viewport.
+     - The focus cell. `follow` reads the cells `followIds` marks by id, so a focus row outside the window reads as an
+       undrawn row and never scrolls into view. Keep it rendered or measured.
+  2. Run a query in a Worker, with progress. The engine cannot be preempted, which is why `MAX_QUERY_ROWS` is the real
      guard.
-  4. Chunked execution on the server past the cap, with the page reading pages of the result. `checkQueryRows()` keeps
+  3. Chunked execution on the server past the cap, with the page reading pages of the result. `checkQueryRows()` keeps
      its message and adds the route.
-  5. Document size limits, compaction and history pruning. Columnar storage for bulk data, and cold row archiving.
-  6. Per-sheet metering (rows, bytes, compute, fetches), visible before a limit hits.
+  4. Document size limits, compaction and history pruning. Columnar storage for bulk data, and cold row archiving.
+  5. Per-sheet metering (rows, bytes, compute, fetches), visible before a limit hits.
 
 ---
 

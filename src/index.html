@@ -35,6 +35,7 @@
       import {
         API_BASE,
         docThumb,
+        FOLLOW_MAX,
         foldView,
         httpErrorDetail,
         httpFailure,
@@ -55,6 +56,7 @@
         checkResultColumns,
         cohortSql,
         describeRef,
+        explain,
         formatQueryError,
         KMEANS_DIMS,
         kmeansSql,
@@ -946,6 +948,8 @@
           alasql.from.HTTP = (url, qs = {}) => alasql.fn.http(url, qs).res;
           const queryDoc = debounce(
             async (id, { code, lang, cols: cols_ = {} }) => {
+              // runSql fills it with every sheet the run read, nested runs included.
+              const reads = { deps: new Map(), depth: 0, volatile: false };
               try {
                 switch (lang) {
                   case "sql":
@@ -966,7 +970,7 @@
                     // they skip the column check. explain has already run it
                     // over the query's own answer.
                     const answered = describeRef(code) || profileRef(code);
-                    const { columns: cols, data: rows } = await runSql(code, params);
+                    const { columns: cols, data: rows } = await runSql(code, params, [], reads);
                     if (!answered) checkResultColumns(cols, rows, sheetColumns(), code);
                     app.ports.docQueried.send({
                       id,
@@ -991,6 +995,8 @@
                 const formatted = formatQueryError(error, code);
                 app.ports.docErrored.send(formatted);
               }
+              // A refused run too: a fix to a sheet it read is how it comes right.
+              follow(id, reads.deps);
             },
             300,
           );
@@ -1027,13 +1033,48 @@
           // again. Only these three decide what a run answers. One slot is
           // enough: one sheet is open at a time, and selectDoc clears it so
           // coming back to a sheet still runs its query.
-          let lastRun = { id: null, key: null };
+          let lastRun = { id: null, key: null, data: null };
           const runQuery = (id, data) => {
             const key = JSON.stringify([data?.lang, data?.code, data?.cols]);
             if (lastRun.id === id && lastRun.key === key) return;
-            lastRun = { id, key };
+            lastRun = { id, key, data };
             queryDoc(id, data);
           };
+
+          // A change to a sheet the open query read asks the same question
+          // again, so it goes past runQuery, which skips the same question.
+          const refresh = () => queryDoc(lastRun.id, lastRun.data);
+          // The handles of the sheets the open query's last run read, each
+          // listening with `refresh`. The open sheet is `watched`, and a sheet
+          // the library holds a document for is no automerge document, so
+          // neither is here.
+          let followed = [];
+          const unfollow = () => {
+            for (const handle of followed) handle.off("change", refresh);
+            followed = [];
+          };
+          const follow = catchy(async (id, deps) => {
+            const ids = [...deps.keys()].filter((dep) => dep !== id && !Library.get()[dep]?.doc);
+            const handles = ids.length > FOLLOW_MAX
+              ? null
+              : await Promise.all(ids.map((dep) => repo.find(dep.split(":")[1])));
+            // The finds can outlast the sheet: a run that ends after it closed
+            // follows nothing.
+            if (id !== lastRun.id) return;
+            unfollow();
+            if (!handles)
+              throw new Error(explain(`${id} reads ${ids.length} sheets that are not bundled, too many to follow for changes.`, {
+                Expected: `at most ${FOLLOW_MAX} sheets that are not bundled, nested queries included`,
+                Received: `${ids.length} sheets`,
+                Source: `the @refs under ${id}, and under every query they reach`,
+                Fix: "read fewer sheets; until then, edit the query to run it again after one of them changes",
+              }));
+            for (const handle of handles) handle.on("change", refresh);
+            followed = handles;
+            // A change that landed after the run read a sheet, and before its
+            // listener went on, was heard by nobody.
+            if (handles.some((handle, i) => handle.heads().join() !== deps.get(ids[i]))) refresh();
+          }, "follow");
 
           let ws;
           let netInterval;
@@ -1046,7 +1087,12 @@
             const [type, doc_id] = id.split(":");
             refused.delete(doc_id);
             debug.log('selectDoc:', id);
-            lastRun = { id: null, key: null };
+            lastRun = { id: null, key: null, data: null };
+            // Before either early return, so the library and the shop listen
+            // to nothing.
+            watched?.handle.off("change", watched.onChange);
+            watched = null;
+            unfollow();
 
             const libraryEntry = Library.get()[id];
             // A codex sheet's document is its database, read over GET /codex/:id.
@@ -1099,8 +1145,6 @@
                 : null;
             if (type === "query") runQuery(id, doc.data[0]);
             if (type === "chart" && chartQuery(doc.data?.[0])) runQuery(id, chartQuery(doc.data[0]));
-            watched?.handle.off("change", watched.onChange);
-            watched = null;
             if (sheetHandle?.on) {
               const onChange = (data) => {
                 app.ports.docChanged.send({

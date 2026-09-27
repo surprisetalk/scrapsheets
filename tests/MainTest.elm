@@ -57,6 +57,72 @@ suite =
                         clampIndex { maxX = 5, maxY = 0 } { x = 2, y = 3 }
                             |> Expect.equal { x = 2, y = 1 }
                 ]
+            , describe "follow"
+                (let
+                    box =
+                        { x = 100, y = 100, width = 400, height = 200 }
+
+                    cover =
+                        { top = 20, left = 50 }
+
+                    cell x y =
+                        { x = x, y = y, width = 80, height = 20 }
+
+                    -- Column 0 sticks whether or not it is pinned, "1" is pinned
+                    -- and "3" is hidden.
+                    marked at n =
+                        D.decodeString docDecoder """{"type":"table","data":[[{"name":"a","type":"text","key":"0"},{"name":"b","type":"text","key":"1"},{"name":"c","type":"text","key":"2"},{"name":"d","type":"text","key":"3"}]]}"""
+                            |> Result.mapError D.errorToString
+                            |> Result.andThen
+                                (\doc ->
+                                    case doc of
+                                        Tab tbl ->
+                                            let
+                                                sheet =
+                                                    { emptySheet | select = { a = at, b = at }, pinned = Set.singleton "1", hidden = Set.singleton "3" }
+                                            in
+                                            Ok (followIds sheet tbl.cols (pinLeft sheet tbl.cols) n |> Dict.toList)
+
+                                        _ ->
+                                            Err "the fixture is not a table"
+                                )
+                 in
+                 [ test "a cell under the sticky header scrolls up to sit just below it" <|
+                    \_ ->
+                        followScroll box cover (cell 200 110)
+                            |> Expect.equal (Just ( 100, 90 ))
+                 , test "a cell below the box scrolls down to sit on its bottom edge" <|
+                    \_ ->
+                        followScroll box cover (cell 200 290)
+                            |> Expect.equal (Just ( 100, 110 ))
+                 , test "a cell under the sticky columns scrolls left to sit just right of them" <|
+                    \_ ->
+                        followScroll box cover (cell 120 150)
+                            |> Expect.equal (Just ( 70, 100 ))
+                 , test "a cell past the right edge scrolls right to sit on it" <|
+                    \_ ->
+                        followScroll box cover (cell 450 150)
+                            |> Expect.equal (Just ( 130, 100 ))
+                 , test "a cell in view, below the header and right of the sticky columns, scrolls nothing" <|
+                    \_ ->
+                        followScroll box cover (cell 150 120)
+                            |> Expect.equal Nothing
+                 , test "a cell larger than the room left aligns its top-left, and one aligned already scrolls nothing" <|
+                    \_ ->
+                        ( followScroll box cover { x = 160, y = 130, width = 600, height = 300 }
+                        , followScroll box cover { x = 150, y = 120, width = 600, height = 300 }
+                        )
+                            |> Expect.equal ( Just ( 110, 110 ), Nothing )
+                 , test "the focus cell, the header above it and the last sticky cell before it are marked, one cell each" <|
+                    \_ ->
+                        [ marked (xy 2 3) 3, marked (xy 2 3) 0, marked (xy 2 3) 1 ]
+                            |> Expect.equal [ Ok [ ( 1, "focus-pin" ), ( 2, "focus-cell" ) ], Ok [ ( 2, "focus-head" ) ], Ok [] ]
+                 , test "a sticky focus column marks no sticky cell, the header row no header, and a hidden column nothing" <|
+                    \_ ->
+                        [ marked (xy 1 3) 3, marked (xy 2 0) 0, marked (xy 3 3) 3 ]
+                            |> Expect.equal [ Ok [ ( 1, "focus-cell" ) ], Ok [ ( 1, "focus-pin" ), ( 2, "focus-cell" ) ], Ok [] ]
+                 ]
+                )
             , describe "moveSelection"
                 [ test "moves right within bounds" <|
                     \_ ->
@@ -1423,17 +1489,35 @@ suite =
                 \_ ->
                     [ reads "percentage" (Just 1) Nothing 0.12345, reads "percentage" (Just 0) Nothing 0.126 ]
                         |> Expect.equal [ "12.3%", "13%" ]
+            , test "a ratio draws the number it holds against one, and bps draws the fraction it holds in basis points" <|
+                \_ ->
+                    [ reads "ratio" Nothing Nothing 1.5
+                    , reads "ratio" (Just 0) Nothing 1.5
+                    , reads "ratio" (Just 2) Nothing 1.5
+                    , reads "ratio" Nothing (Just Grouped) 1234.5
+                    , reads "bps" Nothing Nothing 0.0125
+                    , reads "bps" (Just 0) Nothing 0.01256
+                    , reads "bps" (Just 2) Nothing 0.0125
+                    , reads "bps" Nothing (Just Grouped) 1.2345
+                    ]
+                        |> Expect.equal [ "1.5:1", "2:1", "1.50:1", "1,234.5:1", "125 bp", "126 bp", "125.00 bp", "12,345 bp" ]
             , test "a big number at a count the column is allowed to ask for is still a number" <|
                 \_ ->
                     -- `value * 10 ^ places` reaches the magnitude JavaScript
                     -- writes as "1e+21" at 1e11 and ten places, and the digits
                     -- were then cut out of that: the cell read "0.000001e+21",
                     -- and a usd column with no count at all read "$1e+.21".
-                    ( [ reads "num" (Just 10) Nothing 1.0e11, reads "num" (Just 2) Nothing 1.0e19, reads "usd" Nothing Nothing 1.0e19 ]
+                    -- A bps column scales its fraction by 10000 past that
+                    -- magnitude, and grouped read "5e,+21 bp".
+                    ( [ reads "num" (Just 10) Nothing 1.0e11
+                      , reads "num" (Just 2) Nothing 1.0e19
+                      , reads "usd" Nothing Nothing 1.0e19
+                      , reads "bps" Nothing (Just Grouped) 5.0e17
+                      ]
                     , String.contains "Infinity" (reads "num" (Just 10) Nothing 1.0e300)
                     )
                         |> Expect.equal
-                            ( [ "100000000000.0000000000", "10000000000000000000.00", "$10,000,000,000,000,000,000.00" ]
+                            ( [ "100000000000.0000000000", "10000000000000000000.00", "$10,000,000,000,000,000,000.00", "5e+21 bp" ]
                             , False
                             )
             , test "a half rounds the same way whichever side of zero it is on" <|

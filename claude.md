@@ -113,18 +113,20 @@ A change that breaks one of these is a bug even if the suite is green.
   `toRecords()`, `loadRefs()` and `planQuery()`; where a sheet comes from is an argument. A query means the same in
   both.
 - **Rows are keyed by column name at every boundary**: `GET`/`POST /sheet/:id`, every export, every MCP tool. `col.key`
-  never leaves the document. Two columns of one name: refused on read and export; the importer and `nameClash()` refuse
-  to make one.
+  never leaves the document. Two columns of one name: refused on read, export and `write_cells`; the importer and
+  `nameClash()` refuse to make one.
 - **Every jsonb write goes through `sql.json(...)`**, never `JSON.stringify`.
 - **Every cast out of jsonb is guarded inside a `case`**, never beside it with `and`.
 - **Every bounded map goes through `bound(map, max)`**, exported from `src/sql.mjs` so the page and the server share it.
   Every loop, retry and recursion has a bound whose message carries the counter.
 - **One budget per sheet.** `spend(sheet_id, what, rows, bytes, fix)` on `hookBucket()`, synchronous. Every door into a
-  document sheet spends one unit: a webhook delivery, a socket report, a whole read through `sheet()`, an append (its
-  bytes as volume). Computed sheets are free. Spend after the access check. The refusal is an unlogged 429.
+  document sheet spends one unit: a webhook delivery, a socket report, a whole read through `sheet()`, an append and a
+  `write_cells` call (each with its bytes as volume). Computed sheets are free. Spend after the access check. The
+  refusal is an unlogged 429.
 - **One account is bounded.** `rateLimit()` on `accountBuckets`. `assertSheetsQuota()` at claim, import and purchase.
-  `assertRoom()` caps rows at `MAX_QUERY_ROWS` at import and append. `sendWithinQuota()` caps alert deliveries a day,
-  email and url alike. A refusal that changed what an account keeps or sends says "quota".
+  `assertRoom()` caps rows at `MAX_QUERY_ROWS` at import, at append and on a `write_cells` call that appends.
+  `sendWithinQuota()` caps alert deliveries a day, email and url alike. A refusal that changed what an account keeps or
+  sends says "quota".
 - **One definition each:** `POLL_OK`, `ALERT_OK`, `RUN_OF`, `RUN_OK`, `pauseSwitch`. `GET /status` and
   `library:freshness` read them. A `null` from `pauseSwitch` is "unknown" in freshness and "running" in status.
 - **The status check grades, never maximizes.** 1.0 is the minimum pass, `grade()` floors, and a condition that cannot
@@ -186,7 +188,11 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   `apiKeyScope` sets `key_sheet` / `key_scope` (unset under a JWT). `assertKeyWrites` refuses a read-only key where the
   verb is: the path check for `POST /sheet/:id`, and inside `write_cells`. Email through Resend.
 - Sync: automerge `NodeWSServerAdapter` behind a ws-shim over Hono's `upgradeWebSocket`. `syncRole` checks access per
-  message. A viewer's frames are decoded and refused if they carry changes.
+  message. A viewer's frames are decoded and refused if they carry changes. `grantSync` answers "owner" through
+  `pendingSync` while a claim fetches its document; `PUT /library/:id` deletes the grant once its `sheet_usr` row lands,
+  so a downgrade reaches a minted key at once.
+- Members: `GET /library/:id/share` answers only an account with a `sheet_usr` row on that sheet id, in any role. A
+  purchase and `sheet.public` read the rows, and get a 403 that names the share route and no member.
 - Audit: the `audit` table, read as `library:audit`. `record()` is the one writer. HTTP routes in `AUDITED` log after
   success; `GET /library.zip` logs `export` per sheet it holds; the socket logs `open` and a first `edit` per peer per
   document; MCP logs `mcp <tool>`; a query logs `query` per sheet it resolves. A row that cannot be written fails its
@@ -317,11 +323,12 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   a flush. Owner or editor only.
 - Exports: `GET /export/:id.{csv,json,ndjson,md,ics,xlsx,parquet}` is one route over `EXPORTS`; add a format by adding a
   row. xlsx: `npm:xlsx@0.18.5`, **write only, never read**. `xlsxCell` types by `canonicalType`, `XLSX_FORMATS` per
-  column (a duration as a day fraction under `[h]:mm:ss`, a negative one as text), width bounded by `XLSX_WIDTH_MAX`,
-  dates through `dateMs()` as UTC, a value past `XLSX_CELL_MAX` refused by place and length, the sheet name cut to
-  `XLSX_NAME_MAX`. Parquet: `npm:hyparquet-writer`, built off `named()`. `PARQUET_TYPES` through `canonicalType`;
-  `parquetColumn()` writes a column whole as STRING when any value does not fit. `exportRows()` is the one read both
-  export routes share.
+  column (a duration as a day fraction under `[h]:mm:ss`, a negative one as text; a `bps` as the percent it equals under
+  `0.00%`; a `ratio` under `General":1"`, which SheetJS's own formatter draws without the `:1`), width bounded by
+  `XLSX_WIDTH_MAX`, dates through `dateMs()` as UTC, a value past `XLSX_CELL_MAX` refused by place and length, the sheet
+  name cut to `XLSX_NAME_MAX`. Parquet: `npm:hyparquet-writer`, built off `named()`. `PARQUET_TYPES` through
+  `canonicalType`; `parquetColumn()` writes a column whole as STRING when any value does not fit. `exportRows()` is the
+  one read both export routes share.
 - Workspace: `GET /library.zip` is every sheet the caller owns (`sheet_usr.role = 'owner'`), less `codex-*` and the
   computed net-hook sheets, bounded by `USER_SHEETS_MAX`, as one stored zip. A table is `table/<doc_id>.csv`, byte-equal
   to its `.csv` export, one spend on its own budget. Any other sheet is `<type>/<doc_id>.json`, its `data[0]`, read
@@ -357,6 +364,12 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   key.
 - Under a key, the authority stops at that sheet: `mcpSheets` narrows the library, `mcpSheetId` refuses another
   `sheet_id`, and `query_sheet` refuses an `@ref` out of it before the load.
+- `write_cells` writes the way `POST /sheet/:id` does: `assertKeyWrites`, `mcpSheetId`, the table check,
+  `assertSheetEditor` (owner or editor; a viewer share, a purchase and `sheet.public` are refused), every cell checked
+  before one change, `assertRoom` when a cell appends, then `spend(sheet_id, "writes", …)`. A refused call spends
+  nothing. `col` is a column name only. An unknown name is refused with up to `NAMES_MAX` names and a `nearest()`
+  suggestion; a `col` past the handler's length bound gets no suggestion. A sheet with two columns of one name refuses
+  every call, through `named()`.
 - Resources are `sheet://<id>` as `text/csv`, rendered byte for byte like `GET /export/:id.csv`. The one prompt,
   `describe_sheet`, is built from `describeRows`. Both read the whole sheet through `MCP_WHOLE_SHEET`. An unknown uri is
   `-32002`; an unknown prompt `-32602`.
@@ -488,11 +501,19 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - `sheets(alasql, shelf, find, heads)` in `src/page.mjs` runs cross-sheet queries in the page. A nested `@query:` answer
   is cached; the open query is not. With `heads(doc_id)`, the `fetch` runSql passes to `loadRefs` keeps each nested
   answer in one map keyed by `[sheet id, code]`, beside `deps` (every sheet id the run read, nested runs included, with
-  its heads) and `depth` (the longest ref chain below it). A shelf document's heads are `"bundled"`. A hit reads every
-  dep's heads again, and any difference is a miss. A hit is served only while the path above plus its `depth` stays
-  under `MAX_REF_DEPTH`. `VOLATILE` tests the raw text with string literals blanked, and a statement it matches is never
-  cached, nor is a query that reads through one, nor a refusal. `QUERY_CACHE_MAX` bounds the map. With no `heads`,
-  nothing is cached. `index.html` passes the ready handle's `heads().join()`.
+  the first heads it read) and `depth` (the longest ref chain below it). A shelf document's heads are `"bundled"`. A hit
+  reads every dep's heads again, and any difference is a miss. A hit is served only while the path above plus its
+  `depth` stays under `MAX_REF_DEPTH`. `VOLATILE` tests the raw text with string literals blanked, and a statement it
+  matches is never cached, nor is a query that reads through one, nor a refusal. `QUERY_CACHE_MAX` bounds the map. With
+  no `heads`, nothing is cached. `index.html` passes the ready handle's `heads().join()`.
+- The open query follows what it read. `queryDoc` passes `runSql` its own `reads`. After every run, a refused one
+  included, `follow(id, reads.deps)` puts `refresh` on the `change` of each handle that is neither the open sheet nor a
+  shelf document, after `unfollow` takes the last run's off. `follow` calls `refresh` at once when a followed handle's
+  heads already differ from the ones the run read. `refresh` asks `lastRun.data` again through `queryDoc`'s debounce,
+  past `runQuery`'s same-question skip, and the heads check re-runs only what sits under the change. A run that ends
+  after its sheet closed follows nothing. Past `FOLLOW_MAX` (`src/page.mjs`) nothing is followed, and the refusal
+  reaches `docErrored` after the answer lands. `selectDoc` takes off `watched` and the followed set before either early
+  return, so the library and the shop listen to nothing.
 - Completion: `completionTrigger`, `completionRef`, `completionAt`. Columns come through the `columnsFor` /
   `columnsLoaded` port, answered by running `describe @<ref>` in the page. A failed ref logs by name and caches an empty
   answer. `ColumnsLoad` recomputes the open list. The dropdown is `id="complete"`.
@@ -529,6 +550,16 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - Resize from the keyboard: the header `.grip` is a focusable `separator` with `aria-valuenow` when the column has a
   width. Its own `keydown` (arrows only, stopped) sends `ColumnResizeStep`, model only, floored at `minColWidth`; its
   `keyup` sends `ColumnResizeEnd`, so one `arrange` per press or held run.
+- Keyboard follow: a keyboard move of the focus cell (`sheet.select.b`) goes through `follow`: the arrows, Tab, Home/End
+  and Ctrl+Home/End through `jump`, Shift+arrows, Alt+Shift nudges, `EditCommitMove`, `FindNext`, `FindPrev`, and
+  `FindTextChange` when it selects a match. A click, Ctrl+A and a replace never follow. No follow runs under an open
+  palette, shortcut sheet, settings, import preview, delete confirm or held edit; the selection still moves there. The
+  scroll box is `#table-scroll`. `followIds` puts each id on at most one cell: `focus-cell`; `focus-head`, the header
+  cell above a focus below the header; `focus-pin`, the last sticky column before a scrolling focus column. A hidden
+  focus column gets no ids. `Dom.setViewportOf` writes what `followScroll box cover cell` answers: `Nothing` when the
+  cell is in view, else the smallest scroll; a cell longer than the room aligns its top-left. The covers are where the
+  sticky parts stick: the header's height less 1px, and the pin's `pinLeft` plus its measured width. `Followed` drops
+  `NotFound "focus-cell"` (a view with no table, an undrawn row) and sends any other to `model.error`.
 - A write reaches only a drawn row. `displayYToDocY` answers `Maybe Int`: `Nothing` for y < 1 and past the drawn rows.
   `tableBounds` bounds y by the drawn rows and `clampIndex` floors y at 1 when nothing is drawn, so the keyboard stops
   at the last drawn row. A selection can still rest on an undrawn row after the rows change under it; there a keystroke
@@ -562,6 +593,9 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   values. `digitsOf`, `fixed`, `groupWhole`, `scientific`, `maxDecimals`. `NumberFormat` / `formatSpec` / `numberFormat`
   are the format list and reader. A format lands on top of the type, except on `Duration`: it draws `h:mm`, adds `:ss`
   when the seconds are not whole minutes, and ignores `decimals` and `format`, which its column panel does not offer.
+  `Ratio` stores the plain number and draws `:1` after its digits. `Bps` stores the fraction, as `Percentage` does, and
+  draws it times 10000 with `bp`. On both, `decimals` counts the digits drawn and `format` lands on top. The stats row
+  and the totals row leave out `Percentage`, `Ratio` and `Bps`. Nothing parses `1.5:1` or `125 bp` on write.
 - A `json` cell holding a number list draws a sparkline: `sparkValues`, `sparkMax`, `viewSpark` (shared with
   `viewThumb`).
 
@@ -657,6 +691,13 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - The rename and delete warning names only a column `library:lineage` claims: a name two joined refs both hold is
   claimed by neither, and a row with a null `depends_on` names no sheet, so neither warns.
 - A refused `historyView` shows its refusal in the modal, and the modal also keeps saying it is reading that version.
+- Each `Dom` call waits a frame, so a keyboard follow lands several frames after its key. Two follows that start one
+  frame apart can read one cell against the other's scroll; the next key corrects it.
+- `follow` plans `focus-pin`'s stuck left from the model at the key. A column nudge's document can land before the
+  frame, and then a mark the plan did not expect counts where it sits.
+- Library search reads every cell of the library row, so the star's `{id, on}`, the thumb's keys and a `NULL` match:
+  "true", "rows" or "null" finds every sheet, and "-on" hides the library.
+- The settings panel asks for the member list on open, so a public reader or a buyer sees the 403 in the banner.
 
 ## Schema (`schema/db.sql`)
 

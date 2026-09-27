@@ -361,6 +361,8 @@ export type Type =
   | "float"
   | "usd"
   | "percentage"
+  | "ratio"
+  | "bps"
   | "duration"
   | "bool"
   | "date"
@@ -1453,7 +1455,9 @@ const invalidateSync = (documentId: string): void => {
   for (const key of syncAccessCache.keys()) if (key.endsWith(`/${documentId}`)) syncAccessCache.delete(key);
 };
 
-const pendingSync = new Map<string, number>();
+// Exported so a test can see that a finished claim leaves no grant, the way
+// hookBuckets, netDue and hostDue are exported.
+export const pendingSync = new Map<string, number>();
 const grantSync = (usr_id: string, documentId: string): void => {
   pendingSync.set(`${usr_id}/${documentId}`, Date.now() + 30_000);
   invalidateSync(documentId);
@@ -7623,6 +7627,9 @@ app.put("/library/:id", async (c) => {
     )
     insert into sheet_usr (sheet_id, usr_id, role) select sheet_id, created_by, 'owner' from s
   `;
+  // The sheet_usr row now answers for this account. A grant left standing would
+  // answer "owner" over a downgrade for the rest of its 30 seconds.
+  pendingSync.delete(`${usr_id}/${doc_id}`);
   invalidateSync(doc_id);
 
   return c.json(null, 201);
@@ -7632,24 +7639,28 @@ app.put("/library/:id", async (c) => {
 
 const ROLES: Role[] = ["owner", "editor", "viewer"];
 
+// The member list holds email addresses, so only a member reads it. A purchase
+// or sheet.public opens the rows, never the list of who holds them.
 app.get("/library/:id/share", async (c) => {
   const sheet_id = c.req.param("id");
-  await assertSheetAccess(c, sheet_id);
+  const [sheet] = await sql`
+    select s.public from sheet s inner join sheet_usr su using (sheet_id)
+    where su.sheet_id = ${sheet_id} and su.usr_id = ${c.get("usr_id")}
+  `;
+  if (!sheet) {
+    bad(403, `Only a member of ${sheet_id} reads who its members are.`, {
+      Received: "no share on this sheet for this account",
+      Expected: "a share on this sheet, in any role",
+      Source: "sheet_usr, for this account and this sheet; a purchase or sheet.public opens the rows alone",
+      Fix: `ask an owner to run POST /library/${sheet_id}/share with your email`,
+    });
+  }
   const rows = await sql`
     select u.email, su.role, su.created_at
     from sheet_usr su inner join usr u using (usr_id)
     where su.sheet_id = ${sheet_id}
     order by su.role, u.email
   `;
-  const [sheet] = await sql`select public from sheet where sheet_id = ${sheet_id}`;
-  if (!sheet) {
-    bad(404, `This server has never heard of that sheet.`, {
-      Expected: `a sheet row for ${sheet_id}`,
-      Received: "none",
-      Source: "the sheet table",
-      Fix: `claim it first with PUT /library/${sheet_id}`,
-    });
-  }
   return c.json({ data: { members: rows, public: sheet.public } });
 });
 
@@ -8873,9 +8884,17 @@ const named = (sheet_id: string, cols: Col[], rows: Row[]): Record<string, unkno
 // formatNumber in src/Main.elm reads one, and "0.00%" is the format that says
 // so. A duration is a fraction of a day in the file format, as a date is, and
 // the brackets keep the hours counting past 24.
+//
+// A bps cell holds the fraction too (0.0125 is 125 bp). A number format
+// multiplies only through a percent sign, and it draws each one ("0.00%%"
+// reads "125.00%%"), so a bps opens as the percent it equals. A ratio keeps its
+// digits as General and writes ":1" after them; SheetJS's own formatter drops
+// that literal after General, and Excel draws it.
 const XLSX_FORMATS: Record<string, string> = {
   usd: "$#,##0.00",
   percentage: "0.00%",
+  ratio: 'General":1"',
+  bps: "0.00%",
   duration: "[h]:mm:ss",
   date: "yyyy-mm-dd",
   timestamp: "yyyy-mm-dd hh:mm:ss",
@@ -10266,7 +10285,7 @@ const mcpTools: Record<string, McpTool> = {
   },
   write_cells: {
     description:
-      "Write cells in a table sheet. row is a 0-based data-row index; row equal to the current row count appends one new row.",
+      "Write cells in a table sheet you own or edit. row is a 0-based data-row index; row equal to the current row count appends one new row.",
     inputSchema: {
       type: "object",
       required: ["cells"],
@@ -10279,7 +10298,7 @@ const mcpTools: Record<string, McpTool> = {
             required: ["row", "col", "value"],
             properties: {
               row: { type: "integer", minimum: 0 },
-              col: { type: "string", description: "column key or column name" },
+              col: { type: "string", description: "column name, as read_sheet lists it" },
               value: {
                 description: `must match the column type: number for ${
                   (NUMERIC_TYPES as string[]).join("/")
@@ -10302,6 +10321,7 @@ const mcpTools: Record<string, McpTool> = {
           Fix: "point write_cells at a table: sheet, or edit the query behind a computed one",
         });
       }
+      await assertSheetEditor(c, sheet_id, "write cells in");
       if (!Array.isArray(args.cells) || !args.cells.length) {
         bad(400, `write_cells has nothing to write.`, {
           Expected: `a non-empty "cells" array`,
@@ -10310,7 +10330,6 @@ const mcpTools: Record<string, McpTool> = {
           Fix: `pass {"cells": [{"row": 0, "col": "name", "value": "x"}]}`,
         });
       }
-      await assertSheetAccess(c, sheet_id);
       const hand = await automerge.find<{ type: string; data: Table }>(doc_id as AnyDocumentId).catch(() => {
         bad(404, `Sheet ${sheet_id} has a row but no document.`, {
           Expected: "an automerge document",
@@ -10338,17 +10357,37 @@ const mcpTools: Record<string, McpTool> = {
         });
       }
       const cols = Object.values(colsRow);
+      // Called for its refusal alone: a name two columns hold addresses no cell.
+      named(sheet_id, cols, []);
+      const names = cols.map((x) => x.name);
       // Validate every cell before mutating anything: no partial writes.
       const writes: { rowIndex: number; key: string | number; value: unknown }[] = [];
       for (const [i, cell] of args.cells.entries()) {
-        const { row, col, value } = cell as { row: unknown; col: unknown; value: unknown };
-        const target = cols.find((x) => x.key === col) ?? cols.find((x) => x.name === col);
-        if (!target) {
-          bad(400, `That sheet has no such column.`, {
-            Expected: cols.map((x) => `${x.name} (key ${JSON.stringify(x.key)})`).join(", "),
-            Received: show(col),
+        if (!cell || typeof cell !== "object" || Array.isArray(cell)) {
+          bad(400, `That is not a cell.`, {
+            Expected: `an object: {"row": 0, "col": "name", "value": "x"}`,
+            Received: show(cell),
             Source: `cells[${i}] of this tool call`,
-            Fix: "name a column by its name or its key",
+            Fix: "send each cell as an object with row, col and value",
+          });
+        }
+        const { row, col, value } = cell as { row: unknown; col: unknown; value: unknown };
+        const target = cols.find((x) => x.name === col);
+        if (!target) {
+          // nearest() in src/sql.mjs is an edit distance: it costs col.length times the length of each name, and
+          // it blocks every other request while it runs. 256 caps col's share of that cost. A longer col gets no
+          // suggestion.
+          const hit = typeof col === "string" && col.length <= 256 ? nearest(col, names) : undefined;
+          bad(400, `That sheet has no column of that name.`, {
+            Received: show(col),
+            Expected: names.length
+              ? `one of its column names, spelled exactly: ${names.slice(0, NAMES_MAX).map(show).join(", ")}${
+                names.length > NAMES_MAX ? `, and ${names.length - NAMES_MAX} more` : ""
+              }`
+              : "a column name, and this sheet has no columns",
+            "Did you mean": hit === undefined ? undefined : show(hit),
+            Source: `cells[${i}] of this tool call`,
+            Fix: "send a name exactly as the read_sheet tool lists it under cols",
           });
         }
         if (typeof row !== "number" || !Number.isInteger(row) || row < 0 || row > rows.length) {
@@ -10379,7 +10418,7 @@ const mcpTools: Record<string, McpTool> = {
         if (mismatched) {
           bad(400, `That value does not match the column it is written to.`, {
             Expected: `${t}, which column ${target.name} declares`,
-            Received: `${typeof value} ${JSON.stringify(value)}`,
+            Received: show(value),
             Source: `cells[${i}] of this tool call, row ${row}`,
             Fix: `send a ${t}, or change the column's type first`,
           });
@@ -10387,6 +10426,14 @@ const mcpTools: Record<string, McpTool> = {
         writes.push({ rowIndex: row, key: target.key, value });
       }
       const appends = writes.some((w) => w.rowIndex === rows.length);
+      if (appends) assertRoom(sheet_id, rows.length, 1);
+      spend(
+        sheet_id,
+        "writes",
+        1,
+        new TextEncoder().encode(JSON.stringify(args.cells)).byteLength,
+        "send more cells per call, and fewer calls",
+      );
       hand.change((doc) => {
         if (appends) doc.data.push({});
         for (const { rowIndex, key, value } of writes) doc.data[rowIndex + 1][key] = value;
