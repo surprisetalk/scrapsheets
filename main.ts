@@ -765,14 +765,14 @@ const sheet = async (
         ...qs,
       }, path_);
     case "template":
-      bad(400, `A template is a listing, not a sheet with rows.`, {
+      return bad(400, `A template is a listing, not a sheet with rows.`, {
         Expected: "a readable sheet",
         Received: `the template ${sheet_id}`,
         Source: "the type prefix on this sheet id",
         Fix: "buy it with POST /buy/:sell_id and read the copy you get back",
       });
     case "portal":
-      bad(400, `A portal has no stored rows.`, {
+      return bad(400, `A portal has no stored rows.`, {
         Expected: "a readable sheet",
         Received: `the portal ${sheet_id}`,
         Source: "the type prefix on this sheet id",

@@ -3,6 +3,7 @@ deno task build
 deno task dev
 deno task test
 deno task status
+git config core.hooksPath .githooks  # once per clone: the CI test job before each commit
 ```
 
 `deno task status` grades every likely failure mode of the deployed service and exits nonzero when one that pages is

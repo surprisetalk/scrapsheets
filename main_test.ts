@@ -269,7 +269,7 @@ Deno.test(async function allTests(t) {
 
   // That this suite loaded main.ts at all is the other half of the proof -- `deno task test` is the one place the
   // three are set.
-  await t.step("A secret-less boot is a crash, not a warning", async () => {
+  await t.step("A secret-less boot is a crash, not a warning", () => {
     assertThrows(
       () => requireSecret("SCRAPSHEETS_SECRET_THAT_IS_NEVER_SET"),
       Error,
@@ -6519,7 +6519,7 @@ Deno.test(async function allTests(t) {
     );
   });
 
-  await t.step("Every seeded example must survive a visit with no ?q= param", async () => {
+  await t.step("Every seeded example must survive a visit with no ?q= param", () => {
     const lines = examplesSql.split("\n");
     assert(
       lines.filter((line) => line.includes("@params->('')")).length > 10,
@@ -9121,9 +9121,9 @@ Deno.test(async function allTests(t) {
     let answer = 200;
     let inboxDoc = hand;
     const origFetch = globalThis.fetch;
-    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    globalThis.fetch = ((url: string, init?: RequestInit) => {
       heard.push({ url, headers: Object.fromEntries(new Headers(init?.headers).entries()), body: String(init?.body) });
-      return new Response("", { status: answer });
+      return Promise.resolve(new Response("", { status: answer }));
     }) as typeof fetch;
     try {
       // Registering: owner or editor, an http(s) url, a receiver that answers
@@ -9515,7 +9515,7 @@ Deno.test(async function allTests(t) {
     assertEquals(Number(mine?.failures_since_ok), 1, "which is where the failure is told");
   });
 
-  await t.step("The bucket a flood is counted against must be one the flood cannot choose", async () => {
+  await t.step("The bucket a flood is counted against must be one the flood cannot choose", () => {
     const ip = (xff: string | undefined, remote?: string) =>
       callerIp(
         {

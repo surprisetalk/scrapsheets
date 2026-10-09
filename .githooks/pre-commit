@@ -1,0 +1,8 @@
+#!/bin/sh
+# The test job of .github/workflows/test.yml. The schema job needs Postgres, so it runs only in CI.
+set -e
+deno fmt --check
+deno lint
+deno check main.ts
+deno task review
+deno task test

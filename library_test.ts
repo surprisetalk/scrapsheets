@@ -1536,9 +1536,9 @@ Deno.test("many sheets are shared four at a time, a refusal about the address st
   assertEquals(most, 4, "never more than four open at once");
 
   sent.length = 0;
-  const nobody = async (id: string) => {
+  const nobody = (id: string) => {
     sent.push(id);
-    throw refuse(404, "Nobody here goes by that address.");
+    return Promise.reject(refuse(404, "Nobody here goes by that address."));
   };
   assertEquals(
     await shareMany(["table:shipped", ...ids.slice(0, 3)], nobody, shelf),

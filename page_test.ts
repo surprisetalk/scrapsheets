@@ -22,28 +22,10 @@
 // --parallel` runs files and not tests side by side. Keep the two even in boots,
 // which is what either file costs: `grep -c "await boot(" page_test.ts
 // library_test.ts`.
-import { assert, assertEquals, assertThrows } from "@std/assert";
-import { JSDOM } from "jsdom";
+import { assert, assertEquals } from "@std/assert";
 import { EXAMPLES } from "./src/examples.mjs";
-import {
-  API_BASE,
-  atomToJson,
-  docThumb,
-  foldView,
-  httpErrorDetail,
-  httpFailure,
-  httpTarget,
-  httpUnparsed,
-  httpUnreachable,
-  importKey,
-  library,
-  mergeView,
-  PORTALS,
-  rememberedTypes,
-  sheets,
-} from "./src/page.mjs";
-import alasql from "./src/alasql.mjs";
-import { boot, El, refused, resolver, rowsOf, shelf, until } from "./page_harness.ts";
+import { foldView, mergeView } from "./src/page.mjs";
+import { boot, El, until } from "./page_harness.ts";
 
 // Three tests boot the library and then only read what it rendered, so they
 // share one page. What that saves is Elm's first paint and not the harness

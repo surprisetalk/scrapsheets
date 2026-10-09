@@ -16,13 +16,11 @@
 // evaluation of src/index.html's module script and Elm's first paint, and that
 // is what either file costs. Counted, not eyeballed:
 // `grep -c "await glue(" glue_test.ts sync_test.ts`.
-import { assert, assertEquals, assertRejects } from "@std/assert";
-import { decodeHeads, encodeHeads } from "@automerge/automerge-repo";
-import { decodeSyncMessage } from "@automerge/automerge";
+import { assert, assertEquals } from "@std/assert";
+import { decodeHeads } from "@automerge/automerge-repo";
 import { EXAMPLES } from "./src/examples.mjs";
-import { API_BASE, sheets } from "./src/page.mjs";
-import alasql from "./src/alasql.mjs";
-import { boot, El, until } from "./page_harness.ts";
+import { sheets } from "./src/page.mjs";
+import { El, until } from "./page_harness.ts";
 import { glue } from "./glue_harness.ts";
 
 // The paging mode is a field on the document like any other, and the inputs

@@ -1,3 +1,5 @@
+<!-- TODO: maybe restart this project as something more whimsical and personal like kinopio? -->
+
 # Scrapsheets — todo
 
 > Programmable data OS: every table is a database, every query is a table, every sheet is an API.

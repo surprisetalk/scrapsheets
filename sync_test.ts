@@ -8,10 +8,8 @@
 // completion, and `src/sw.js` run over a hand-made `self`, `caches` and `fetch`,
 // which is the only way to take the network away from a service worker.
 import { assert, assertEquals, assertRejects } from "@std/assert";
-import { JSDOM } from "jsdom";
-import { EXAMPLES } from "./src/examples.mjs";
 import { API_BASE } from "./src/page.mjs";
-import { boot, dir, El, until } from "./page_harness.ts";
+import { boot, dir, until } from "./page_harness.ts";
 import { glue } from "./glue_harness.ts";
 
 // CSV import, whichever way the file arrives. Both go to the server: it is the
