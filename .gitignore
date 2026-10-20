@@ -6,3 +6,6 @@ CLAUDE.local.md
 .env
 /review/elm-stuff
 /.claude
+.DS_Store
+.env.*
+!.env.example
