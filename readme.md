@@ -6,13 +6,11 @@ deno task status
 git config core.hooksPath .githooks  # once per clone: the CI test job before each commit
 ```
 
-`deno task status` grades every likely failure mode of the deployed service and exits nonzero when one that pages is
-failing. **1.0 is the minimum passing grade**, 0.0 is total failure, and anything above 1.0 is headroom. The usage goals
-(a sheet made, a signup, a signup who made a sheet, a payment, and somebody other than the operator using the app) and
-the count of overdue feeds and alerts are graded and printed but do not page: a product nobody used today is not an
-outage, and a sheet somebody paused on purpose is a switch working. `.github/workflows/status.yml` runs it every 15
-minutes; a failed scheduled run emails the repo owner, and that email is the alarm. `GET /status` is the same answer as
-JSON, and needs no login.
+`deno task status` grades every likely failure mode of the deployed service and exits nonzero when one is below 1.0.
+**1.0 is the minimum passing grade**, 0.0 is total failure, and anything above 1.0 is headroom. The usage goals (a sheet
+made, a signup, a signup who made a sheet, a payment, and somebody other than the operator using the app) count like
+every other condition. snitch runs it every hour and mails the result each morning. `GET /status` is the same answer as
+JSON, answers 503 when a condition is below 1.0, and needs no login.
 
 The server refuses to start without `JWT_SECRET`, `TOKEN_SECRET` and `DSN_ENCRYPTION_KEY`, each a long random string
 that must stay the same across restarts. They used to fall back to a random value and only warn, which dropped every
@@ -162,8 +160,8 @@ connected database opens as a list of its tables; picking one shows its first ro
 columns over the whole catalogue, so the column panel is the filter.
 
 The library table shows the same answer per row — last run, and failures since — and the demo strip marks a sheet whose
-feed is failing, so a dead feed is visible where you open it rather than only in the 15-minute alarm email. Ctrl/⌘+K
-opens a palette over every sheet and every shortcut; Ctrl/⌘+/ still lists the keys.
+feed is failing, so a dead feed is visible where you open it rather than only in snitch's morning mail. Ctrl/⌘+K opens a
+palette over every sheet and every shortcut; Ctrl/⌘+/ still lists the keys.
 
 A sheet you are done with goes in the trash, and asks nothing first, because the trash is undoable: the 🗑 chip beside
 the demo strip counts what is in it, and each row there offers restore, with the sort and the column widths you had

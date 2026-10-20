@@ -9788,9 +9788,8 @@ Deno.test(async function allTests(t) {
     await sql`delete from sheet_usr where sheet_id like 'alert:%'`;
     await sql`delete from sheet where type = 'alert'`;
 
-    // A condition that is reported but does not page: a service with no users is
-    // not a service that is down. It still has to be graded and still has to be
-    // in the answer.
+    // A usage goal is a condition like any other: graded, in the answer, and a
+    // failing status when nobody meets it.
     assert(
       (await status())["Somebody created a sheet in the past 24 hours."]["0"] >= 0,
       "the usage condition is still graded",
@@ -9816,7 +9815,7 @@ Deno.test(async function allTests(t) {
              ('net-hook:errors', null, 'read', 'link')
     `;
     const idle = await app.request("/status");
-    assertEquals(idle.status, 200, "a product nobody used today is not an outage");
+    assertEquals(idle.status, 503, "a product nobody used today is failing");
     const idleGrades = await idle.json();
     for (
       const condition of ["Somebody created a sheet in the past 24 hours.", signedUp, madeSheet, paid, usedByOthers]
@@ -9849,21 +9848,16 @@ Deno.test(async function allTests(t) {
       insert into audit (sheet_id, usr_id, action, via)
       values ('table:newcomer-probe', ${newcomer.usr_id}, 'read', 'jwt')
     `;
-    const active = await app.request("/status");
-    assertEquals(active.status, 200, "a usage goal never pages");
-    const activeGrades = await active.json();
-    assertEquals(activeGrades[madeSheet]["0"], 1, "the newcomer's first sheet is the activation");
-    assertEquals(activeGrades[paid]["0"], 1, "a paid Checkout Session is somebody paying");
-    assertEquals(activeGrades[usedByOthers]["0"], 1, "an account other than the operator's is somebody using the app");
-    await sql`delete from audit where usr_id = ${newcomer.usr_id}`;
-    await sql`delete from payment where buyer_id = ${newcomer.usr_id}`;
-    await sql`delete from sheet where created_by = ${newcomer.usr_id}`;
-    await sql`delete from usr where usr_id = ${newcomer.usr_id}`;
+    const active = await status();
+    assertEquals(active[madeSheet]["0"], 1, "the newcomer's first sheet is the activation");
+    assertEquals(active[paid]["0"], 1, "a paid Checkout Session is somebody paying");
+    assertEquals(active[usedByOthers]["0"], 1, "an account other than the operator's is somebody using the app");
 
     // 200 is reachable. The suite has spent the run filling the error log and
-    // failing net-http polls on purpose, so a clean log is what proves the
-    // healthy path exists at all -- without this the 503 below passes for
-    // whatever happens to be true, which is no test.
+    // failing net-http polls on purpose, so a clean log, with the newcomer still
+    // meeting every goal, is what proves the healthy path exists at all --
+    // without this the 503 below passes for whatever happens to be true, which
+    // is no test.
     await sql`delete from net`;
     const clean = await app.request("/status");
     assertEquals(
@@ -9871,6 +9865,10 @@ Deno.test(async function allTests(t) {
       200,
       `every condition must pass on a healthy database: ${JSON.stringify(await clean.json())}`,
     );
+    await sql`delete from audit where usr_id = ${newcomer.usr_id}`;
+    await sql`delete from payment where buyer_id = ${newcomer.usr_id}`;
+    await sql`delete from sheet where created_by = ${newcomer.usr_id}`;
+    await sql`delete from usr where usr_id = ${newcomer.usr_id}`;
 
     // The refusals condition reads `meta->>'status'`, which answers null on a
     // jsonb string -- so a log written as one made the check count nothing and

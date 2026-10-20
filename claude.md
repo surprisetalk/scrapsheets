@@ -39,8 +39,8 @@ is a shareable table, every sheet is an API.
   the run, runs the files in parallel, and fails past ten seconds. Time one file with `deno test --allow-all <file>`.
   Check `top` first: a build job on the machine makes every timing wrong.
 - `deno task review` — elm-review. Keep it at zero suppressions.
-- `deno task status` — grade the deployed `GET /status`; exit nonzero below 1.0. `.github/workflows/status.yml` runs it
-  every 15 minutes. The failure email is the alarm.
+- `deno task status` — grade the deployed `GET /status`; exit nonzero below 1.0. snitch runs it every hour and mails the
+  result each morning.
 - `deno task vendor` — rebuild the browser bundles after you bump the versions at the top of `vendor.ts`.
 - `deno task db:plan` / `db:apply` — read the generated migration, then apply it. **Check `.env` first: `DATABASE_URL`
   may point at production.** `db:apply` does not prompt. It allows only `INDEX_BUILD,INDEX_DROPPED`. For a migration
@@ -132,8 +132,8 @@ A change that breaks one of these is a bug even if the suite is green.
 - **The status check grades, never maximizes.** 1.0 is the minimum pass, `grade()` floors, and a condition that cannot
   compute throws by name. The usage conditions are spelled once in `USAGE`, keyed by their `overTime` alias: a sheet
   made, a signup, a signup who made a sheet, a payment with `amount > 0`, and an `audit` row from an account outside
-  `house` (the sentinel and the trimmed `OPERATOR_EMAIL`). Each is a count against a bar of one, and `REPORTED_ONLY`
-  reports them beside `OVERDUE_CONDITION` and never pages.
+  `house` (the sentinel and the trimmed `OPERATOR_EMAIL`). Each is a count against a bar of one, and fails `GET /status`
+  like any other condition.
 - **Secrets never reach a document.** A net-http header says `{{secret:name}}`, resolved at fetch time into a separate
   object. `assertNoKeys()` scans on `POST /library/:id/public` and a priced `POST /sell/:id`, after the owner check,
   bounded by `KEY_SCAN_CELLS` and `KEY_SCAN_BYTES`. `KEY_SHAPES` has no override. `PII_SHAPES` (email, phone, US SSN, a

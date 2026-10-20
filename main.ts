@@ -2111,12 +2111,7 @@ export const OVERDUE_MAX = 10;
 // status() call's walk, and one row's own budget in freshness(), where a page
 // of rows is already bounded by the page it was asked for.
 const PAUSE_LOOKUP_MS = 5_000;
-// Bound to a const because REPORTED_ONLY has to match it exactly and the route
-// answers 500 when it does not -- an interpolated literal written out twice
-// would only be caught by a request.
-const OVERDUE_CONDITION = `No more than ${OVERDUE_MAX} net-http or alert sheets are overdue, paused ones included.`;
-// Keyed by the overTime alias each sentence grades, for the same reason: the
-// sentences are spelled here once and read by status() and REPORTED_ONLY.
+// Keyed by the overTime alias each sentence grades.
 const USAGE = {
   sheets_created: "Somebody created a sheet in the past 24 hours.",
   signed_up: "Somebody signed up in the past week.",
@@ -2151,7 +2146,7 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
   // TLS and auth on it, and a Neon instance that has suspended pays its own
   // wake-up -- about a second against 98ms warm. Timing that graded how cold
   // the caller was, not how fast the database answers, and since nothing keeps
-  // a 15-minute cron warm it failed nearly every scheduled run. Connection
+  // a scheduled check warm it failed nearly every scheduled run. Connection
   // setup is a different failure mode, and the endpoint timing out is where it
   // already shows.
   await sql`select 1`;
@@ -2390,7 +2385,10 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
       live.alerts_floor,
       live.alerts_behind,
     ),
-    now(OVERDUE_CONDITION, OVERDUE_MAX / Math.max(1, Number(live.overdue))),
+    now(
+      `No more than ${OVERDUE_MAX} net-http or alert sheets are overdue, paused ones included.`,
+      OVERDUE_MAX / Math.max(1, Number(live.overdue)),
+    ),
     now("No sheet's net log has grown past its retention cap.", live.log_capped),
     now(`The database is under ${DB_BYTES_CAP / 1e9} GB.`, live.db_size),
     now(`The server heap is under ${HEAP_BYTES_CAP / 1e6} MB.`, HEAP_BYTES_CAP / Deno.memoryUsage().heapUsed),
@@ -2402,40 +2400,16 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
   ]);
 };
 
-// Reported, but not paged on. A product nobody is using is failing, and that
-// grade belongs in the answer -- but a service with no users is not a service
-// that is down, and an alarm that fires every fifteen minutes about it is an
-// alarm that gets muted, taking every technical condition with it.
-//
-// The overdue cap is here for the other half of that sentence. A paused sheet
-// is somebody's own switch, and an alarm that fires because a person turned a
-// sheet off is an alarm about a switch working. It is still graded, and the
-// grade still falls the whole way from the first paused sheet to the cap, so a
-// sheet paused and forgotten stays visible here, in library:freshness, and in
-// the cap it counts against -- and past the cap the two liveness conditions
-// page on it themselves.
-const REPORTED_ONLY = [...Object.values(USAGE), OVERDUE_CONDITION];
-
 // Public, because an uptime check carries no bearer token. It answers grades and
 // no rows -- no ids, no names, no addresses -- though a grade is a ratio against
 // a limit named in this file, so a reader can invert one back to the count it
-// came from. 503 rather than 200 when a condition that pages is failing now, so
-// a checker that reads only the status line still learns the answer, and
-// `deno task status` reads exactly that rather than deciding again.
+// came from. 503 rather than 200 when any condition is below 1.0 now, usage
+// goals included, so a checker that reads only the status line still learns
+// the answer, and `deno task status` reads exactly that rather than deciding
+// again.
 app.get("/status", async (c) => {
   const grades = await status();
-  const missing = REPORTED_ONLY.filter((condition) => !(condition in grades));
-  if (missing.length) {
-    bad(500, `A condition excused from paging is not one this check grades.`, {
-      Received: missing.join("; "),
-      Expected: "a sentence that status() actually returns",
-      Source: "REPORTED_ONLY",
-      Fix: "match the sentence exactly, or it silently starts paging again",
-    });
-  }
-  const failing = Object.entries(grades)
-    .filter(([condition]) => !REPORTED_ONLY.includes(condition))
-    .filter(([, series]) => !(series["0"] >= 1));
+  const failing = Object.values(grades).filter((series) => !(series["0"] >= 1));
   return c.json(grades, failing.length ? 503 : 200);
 });
 

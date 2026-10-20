@@ -10,25 +10,6 @@ a condition in `GET /status`, not an item here.
 
 ---
 
-## Status
-
-- [ ] snitch's daily report shows scrapsheets red while a usage goal is below 1.0, and the 15-minute alarm still pages
-      only on an outage.
-  1. Decide first: `status.yml` and snitch both run `deno task status`, and they want different answers. The suggestion:
-     the workflow's last step becomes `curl -sS --fail-with-body --max-time 30 https://api.sheets.scrap.land/status`, so
-     the HTTP code stays the paging verdict. Tradeoff: the workflow loses the "at least 13 conditions" guard, so an
-     empty 200 no longer pages. A `jq 'length >= 13'` step keeps it.
-  2. The `status` task in `deno.json` exits nonzero when any condition is below 1.0, `REPORTED_ONLY` included. It still
-     prints every grade first, and it still fails on an answer that is not 2xx.
-  3. Rewrite the paragraph under the commands in `readme.md`, the `deno task status` and `REPORTED_ONLY` lines in
-     `claude.md`, and the step comment in `status.yml`. The task fails on every condition. The 503 from `GET /status`
-     pages.
-  4. `GET /status` and `REPORTED_ONLY` stay as they are.
-  - Why: on 2026-10-09 the task exited 0 with five usage goals at 0, so snitch listed scrapsheets as passing. snitch
-    mails one report a day, so a red goal there is not an alarm that gets muted.
-
----
-
 ## Query engine
 
 - [ ] You write a money column in a currency other than dollars, and an addition of two currencies is refused.
