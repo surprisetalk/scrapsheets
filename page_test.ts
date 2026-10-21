@@ -245,7 +245,26 @@ Deno.test("renaming a column leaves its type exactly as the document spelled it"
 
 Deno.test("a share answer that cannot be read says which field failed", async () => {
   const here = { id: "table:countries", action: "list" };
-  const { app, settle, text } = await boot("http://localhost/table:countries");
+  const { app, settle, text, all } = await boot("http://localhost/table:countries#settings");
+
+  // A reader or a buyer is refused the list: members null is "no share", not an
+  // empty list and not an error.
+  app.ports.shareLoaded.send({ ...here, members: null, public: null });
+  await settle();
+  assert(text().includes("You read this sheet without a share"), `expected the line, got: ${text().slice(0, 400)}`);
+  assert(!text().includes("Only you."), "and not the empty-list line");
+  assert(!text().includes("could not read") && !text().includes("missing, not empty"), "and no error");
+  assertEquals(all("[role=dialog] input[type=email]").length, 0, "and no share form");
+  assert(
+    !text().includes("private") && !text().includes("public: anyone can read"),
+    "and no claim about public or private: the answer that held the flag was refused, and a public sheet read here is not private",
+  );
+
+  // A hook answer is about something else: it must not bring the form back.
+  app.ports.shareLoaded.send({ ...here, action: "hook", hook: { url: "u", secret: "s", repro: "r" } });
+  await settle();
+  assert(text().includes("You read this sheet without a share"), "a hook answer keeps the no-share line");
+  assertEquals(all("[role=dialog] input[type=email]").length, 0, "and the form stays gone");
 
   // A member with no role. The panel used to keep the last list it understood
   // and say nothing, which is a permissions UI showing stale permissions as

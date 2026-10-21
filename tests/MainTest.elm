@@ -13,6 +13,11 @@ import Test.Html.Query as Query
 import Test.Html.Selector as Selector
 
 
+cols0 : Array.Array Col
+cols0 =
+    Array.fromList [ { key = "0", name = "a", typ = Text, raw = "text" } ]
+
+
 suite : Test
 suite =
     describe "Main"
@@ -241,7 +246,7 @@ suite =
                                     , Dict.fromList [ ( "0", E.string "z" ) ]
                                     ]
                         in
-                        List.map (displayYToDocY "" emptySheet rows) [ 1, 2, 3 ]
+                        List.map (displayYToDocY "" emptySheet cols0 rows) [ 1, 2, 3 ]
                             |> Expect.equal [ Just 1, Just 2, Just 3 ]
                 , test "sorted display rows map back to their document rows" <|
                     \_ ->
@@ -257,7 +262,7 @@ suite =
                                 { emptySheet | sort = [ ( "0", Ascending ) ] }
                         in
                         -- display order apple, banana, cherry -> document rows 2, 1, 3
-                        List.map (displayYToDocY "" sheet rows) [ 1, 2, 3 ]
+                        List.map (displayYToDocY "" sheet cols0 rows) [ 1, 2, 3 ]
                             |> Expect.equal [ Just 2, Just 1, Just 3 ]
                 , test "search hides rows but preserves original document indices, and a row past the drawn ones maps to nothing" <|
                     \_ ->
@@ -270,10 +275,41 @@ suite =
                                     ]
                         in
                         -- only avocado (document row 3) contains "av"
-                        ( filterAndSortIndexed "av" emptySheet rows |> Array.map Tuple.first |> Array.toList
-                        , List.map (displayYToDocY "av" emptySheet rows) [ 1, 2, 3 ]
+                        ( filterAndSortIndexed "av" emptySheet cols0 rows |> Array.map Tuple.first |> Array.toList
+                        , List.map (displayYToDocY "av" emptySheet cols0 rows) [ 1, 2, 3 ]
                         )
                             |> Expect.equal ( [ 2 ], [ Just 3, Nothing, Nothing ] )
+                , test "search reads only the cells that draw text" <|
+                    \_ ->
+                        let
+                            cols =
+                                Array.fromList
+                                    [ { key = "0", name = "name", typ = Text, raw = "text" }
+                                    , { key = "1", name = "star", typ = Star, raw = "star" }
+                                    ]
+
+                            rows =
+                                Array.fromList
+                                    [ Dict.fromList [ ( "0", E.string "apple" ), ( "1", E.object [ ( "id", E.string "x" ), ( "on", E.bool True ) ] ) ]
+                                    , Dict.fromList [ ( "0", E.null ), ( "1", E.null ) ]
+                                    ]
+
+                            hits term =
+                                Array.length (filterAndSortIndexed term emptySheet cols rows)
+                        in
+                        List.map hits [ "true", "null", "on", "apple" ]
+                            |> Expect.equal [ 0, 0, 0, 1 ]
+                , test "a create cell draws a button, so search does not read its template" <|
+                    \_ ->
+                        let
+                            cols =
+                                Array.fromList [ { key = "0", name = "add", typ = Create, raw = "create" } ]
+
+                            rows =
+                                Array.fromList [ Dict.fromList [ ( "0", E.object [ ( "name", E.string "Orders" ) ] ) ] ]
+                        in
+                        Array.length (filterAndSortIndexed "orders" emptySheet cols rows)
+                            |> Expect.equal 0
                 , test "header rows (y <= 0) map to no document row" <|
                     \_ ->
                         let
@@ -283,7 +319,7 @@ suite =
                             sheet =
                                 { emptySheet | sort = [ ( "0", Descending ) ] }
                         in
-                        List.map (displayYToDocY "" sheet rows) [ 0, -1, -2 ]
+                        List.map (displayYToDocY "" sheet cols0 rows) [ 0, -1, -2 ]
                             |> Expect.equal [ Nothing, Nothing, Nothing ]
                 ]
             , describe "multi-column sort"
@@ -301,7 +337,7 @@ suite =
                                 { emptySheet | sort = [ ( "0", Ascending ), ( "1", Descending ) ] }
                         in
                         -- a/2, a/1, b/2 -> document rows 2, 3, 1
-                        filterAndSortIndexed "" sheet rows
+                        filterAndSortIndexed "" sheet cols0 rows
                             |> Array.map Tuple.first
                             |> Array.toList
                             |> Expect.equal [ 1, 2, 0 ]
@@ -319,7 +355,7 @@ suite =
                                 { emptySheet | sort = [ ( "0", Descending ) ] }
                         in
                         -- b first, then the two a rows in their original order
-                        filterAndSortIndexed "" sheet rows
+                        filterAndSortIndexed "" sheet cols0 rows
                             |> Array.map Tuple.first
                             |> Array.toList
                             |> Expect.equal [ 2, 0, 1 ]
@@ -335,7 +371,7 @@ suite =
                             sheet =
                                 { emptySheet | sort = [ ( "0", Ascending ) ] }
                         in
-                        filterAndSortIndexed "" sheet rows
+                        filterAndSortIndexed "" sheet cols0 rows
                             |> Array.map Tuple.first
                             |> Array.toList
                             |> Expect.equal [ 1, 0 ]
@@ -1647,6 +1683,29 @@ suite =
                         |> (\shelf -> paletteCommands shelf "table:")
                         |> List.map .label
                         |> Expect.equal [ "us states", "countries" ]
+            , test "a sheet is found by a column name its thumb holds" <|
+                \_ ->
+                    paletteShelf
+                        |> Dict.map
+                            (\k v ->
+                                { v
+                                    | thumb =
+                                        E.object
+                                            [ ( "names"
+                                              , E.list E.string
+                                                    (if k == "table:countries" then
+                                                        [ "gdp_usd_b" ]
+
+                                                     else
+                                                        []
+                                                    )
+                                              )
+                                            ]
+                                }
+                            )
+                        |> (\shelf -> paletteCommands shelf "gdp_usd")
+                        |> List.map .label
+                        |> Expect.equal [ "countries" ]
             , test "the library itself is not a destination" <|
                 \_ ->
                     paletteCommands (libraryOf [ ( "", "library-root", False ) ]) "library-root"
@@ -1660,6 +1719,17 @@ suite =
                         |> (\shelf -> paletteCommands shelf "sheet")
                         |> List.length
                         |> Expect.equal 12
+            ]
+        , describe "A thumb's column names"
+            [ test "names read in order" <|
+                \_ -> thumbNames (E.object [ ( "names", E.list E.string [ "b", "a" ] ) ]) |> Expect.equal [ "b", "a" ]
+            , test "a thumb stored before names existed has none" <|
+                \_ -> thumbNames (E.object [ ( "cols", E.int 2 ) ]) |> Expect.equal []
+            , test "names that are not a list of strings are a decode error" <|
+                \_ ->
+                    D.decodeValue thumbNamesDecoder (E.object [ ( "names", E.list E.int [ 1 ] ) ])
+                        |> Result.toMaybe
+                        |> Expect.equal Nothing
             ]
         , describe "Hidden columns"
             [ test "moving right steps over a hidden column" <|

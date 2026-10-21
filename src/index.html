@@ -593,7 +593,7 @@
               return app.ports.docErrored.send("Log in to share a sheet.");
             }
             const api = `${API_BASE}/library/${id}`;
-            const send = async (path, method, body) => {
+            const send = async (path, method, body, noShare) => {
               const res = await fetch(api + path, {
                 method,
                 headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
@@ -605,6 +605,9 @@
               // text -- so reading it as JSON threw, was swallowed, and left
               // "POST /link failed (400)." in place of a message that named the
               // field, the bound and the fix.
+              // A reader or a buyer holds no share: the list answers 403, and
+              // the panel says so in place of the banner.
+              if (res.status === 403 && noShare) return null;
               if (!res.ok) {
                 throw new Error(
                   httpErrorDetail(await res.text(), res.headers.get("Content-Type") ?? "") ||
@@ -640,7 +643,9 @@
               return app.ports.shareLoaded.send({ id, action, hook: data });
             }
 
-            const { data } = await send("/share", "GET");
+            const list = await send("/share", "GET", undefined, true);
+            if (!list) return app.ports.shareLoaded.send({ id, action, members: null, public: null });
+            const { data } = list;
             app.ports.shareLoaded.send({ id, action, members: data.members, public: data.public, ...(link ? { link } : {}) });
           }, 'shareAction'));
 

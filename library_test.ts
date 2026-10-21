@@ -1363,7 +1363,12 @@ Deno.test("the selected library rows are trashed and tagged together, and an emp
     "table:a": { name: "a", tags: ["keep"], doc: { type: "table", data: [[]] } },
     "table:b": { name: "b", tags: [], doc: { type: "table", data: [[]] } },
     "table:c": { name: "c", tags: [], doc: { type: "table", data: [[]] } },
-    "table:d": { name: "countries", tags: [], doc: { type: "table", data: [[]] } },
+    "table:d": {
+      name: "countries",
+      tags: [],
+      doc: { type: "table", data: [[]] },
+      thumb: docThumb({ type: "table", data: [{ 0: { key: "0", name: "gdp_usd_b", type: "usd" } }] }),
+    },
   };
   for (const { id, data } of sent)
     store[id] = { ...store[id], ...Object.fromEntries(Object.entries(data).filter(([, v]) => v !== null)) };
@@ -1385,11 +1390,18 @@ Deno.test("the selected library rows are trashed and tagged together, and an emp
   assertEquals(found(), [true, true, false, false], "search matches the folder");
   await type_(search, "Countries");
   assertEquals(found(), [false, false, false, true], "a mixed-case search finds a lower-case name");
+  await type_(search, "gdp_usd_b");
+  assertEquals(found(), [false, false, false, true], "search finds a table by a column name its thumb holds");
   await type_(search, "-work/");
   assertEquals(found(), [false, false, true, true], "-term hides the rows that hold the term and keeps the rest");
   // Every row's id holds an "a" ("table:"). Only an exact match leaves b, c and countries out.
   await type_(search, "=a");
   assertEquals(found(), [true, false, false, false], "=name finds the exact name only");
+  // The star's {id, on}, the thumb's {kind, cols, rows, spark} and a NULL draw no text, so no term finds them.
+  for (const term of ["true", "rows", "null"]) {
+    await type_(search, term);
+    assertEquals(found(), [false, false, false, false], `"${term}" finds no sheet by what a cell does not draw`);
+  }
   await type_(search, "");
 
   // The cell holds the box's rule: one folder, no comma. Unfiling is blanking
@@ -1618,16 +1630,35 @@ Deno.test("a thumbnail is the first numeric column, scaled, or nothing to draw",
   // The text column is skipped; the numeric one is scaled across 0..1.
   assertEquals(
     docThumb(table({ 0: "a", 1: 10 }, { 0: "b", 1: 20 }, { 0: "c", 1: 30 })),
-    { kind: "table", cols: 2, rows: 3, spark: [0, 0.5, 1] },
+    { kind: "table", cols: 2, rows: 3, spark: [0, 0.5, 1], names: ["label", "n"] },
   );
+  // Names are bounded, in document order.
+  const wide = {
+    type: "table",
+    data: [
+      Object.fromEntries(Array.from({ length: 40 }, (_, i) => [i, { key: String(i), name: `c${i}`, type: "text" }])),
+    ],
+  };
+  assertEquals(docThumb(wide).names, Array.from({ length: 32 }, (_, i) => `c${i}`));
+  // A column that holds no text for a name is no name: the Thumb cell decodes names as strings and fails the cell otherwise.
+  const nameless = docThumb({
+    type: "table",
+    data: [{
+      0: { key: "0", type: "text" },
+      1: { key: "1", name: 5, type: "num" },
+      2: { key: "2", name: "ok", type: "text" },
+    }],
+  });
+  assertEquals(nameless.names, ["ok"], "only text names reach the thumb");
+  assertEquals(nameless.cols, 3, "and the column count is unchanged");
   // Fewer than three numbers is not a line.
   assertEquals(docThumb(table({ 0: "a", 1: 10 }, { 0: "b", 1: 20 })).spark, []);
   // A flat column has no range to scale against, so every point sits in the middle
   // rather than dividing by zero.
   assertEquals(docThumb(table({ 0: "a", 1: 7 }, { 0: "b", 1: 7 }, { 0: "c", 1: 7 })).spark, [0.5, 0.5, 0.5]);
   // A sheet that is not a table has a shape but no line.
-  assertEquals(docThumb({ type: "query", data: [] }), { kind: "query", cols: 0, rows: 0, spark: [] });
-  assertEquals(docThumb(undefined), { kind: "unknown", cols: 0, rows: 0, spark: [] });
+  assertEquals(docThumb({ type: "query", data: [] }), { kind: "query", cols: 0, rows: 0, spark: [], names: [] });
+  assertEquals(docThumb(undefined), { kind: "unknown", cols: 0, rows: 0, spark: [], names: [] });
 });
 
 Deno.test("only a third-party url goes through the proxy", () => {

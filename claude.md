@@ -190,9 +190,15 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - Sync: automerge `NodeWSServerAdapter` behind a ws-shim over Hono's `upgradeWebSocket`. `syncRole` checks access per
   message. A viewer's frames are decoded and refused if they carry changes. `grantSync` answers "owner" through
   `pendingSync` while a claim fetches its document; `PUT /library/:id` deletes the grant once its `sheet_usr` row lands,
-  so a downgrade reaches a minted key at once.
+  so a downgrade reaches a minted key at once. An `ephemeral` frame over `EPHEMERAL_BYTES_MAX` bytes, or past a
+  per-connection bucket of `EPHEMERAL_RATE` a second with a burst of `EPHEMERAL_BURST`, is dropped before the access
+  check and the shim, so automerge-repo never relays it and a flood costs no `syncRole` query. The sender gets at most
+  one `error` frame per `EPHEMERAL_NOTICE_MS`, and the socket stays open.
 - Members: `GET /library/:id/share` answers only an account with a `sheet_usr` row on that sheet id, in any role. A
-  purchase and `sheet.public` read the rows, and get a 403 that names the share route and no member.
+  purchase and `sheet.public` read the rows, and get a 403 that names the share route and no member. The settings panel
+  reads that 403 on the list call alone as no share: `shareAction` answers `members: null`, `updateShareLoad` keeps
+  `noShare` until an answer carries `members`, and the panel hides the member list, the share form and the public flag,
+  and says why.
 - Audit: the `audit` table, read as `library:audit`. `record()` is the one writer. HTTP routes in `AUDITED` log after
   success; `GET /library.zip` logs `export` per sheet it holds; the socket logs `open` and a first `edit` per peer per
   document; MCP logs `mcp <tool>`; a query logs `query` per sheet it resolves. A row that cannot be written fails its
@@ -352,6 +358,12 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   suggestion. The statement names the columns and `public.<table>` through the driver's `sql(name)`, never `select *`. A
   table or column name holding a dot is refused, because the driver splits identifiers on `.`. It is in `AUDITED`. No
   `scrapsheets-key` reaches `/codex/`.
+- Filters: `where` repeats up to `CODEX_FILTERS_MAX`, as `<column>.<op>.<value>` split on the first two dots, AND-ed.
+  The ops are the keys of `CODEX_OPS`; `isnull` and `notnull` refuse a value. A `where` needs `assertSheetEditor`, and
+  every filter parses before anything connects. Inside `read`, the column must be one of that table's `codexTables()`
+  columns (else up to `NAMES_MAX` names and a `nearest()` suggestion), it goes through `far(column)`, the value is a
+  bound parameter, and the op is a fixed fragment. A far SQLSTATE class 22, 42883, 42804 or 42846 is caught inside
+  `read` and answered 400, so the run is good. The rest of class 42 (permission, a dropped table) stays a failed run.
 - `checkCodexDsn()` refusals never roll over. `canonicalHost()` normalizes the host; `assertPublicHost()` checks it,
   unless our own database is on loopback.
 - Every attempt writes a `codexRun()` row with `meta.rolled_over`; `POLL_OK` grades a rollover failed. No refusal quotes
@@ -493,6 +505,10 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   every refusal in `ids` order. `send` is `POST /library/:id/share` through `API_BASE`. `SharedMany` writes a full
   success to `sheet.shareNote` (`role="status"`) and anything refused to `model.error` as one line naming each sheet by
   its library name.
+- Search reads only what a cell draws: `spec`'s `drawsText` is false for `Star`, `Thumb`, `Trash`, `Restore`, `Delete`
+  and `Create`, and `matchesSearch` takes the columns. A `NULL` cell matches nothing. A thumb's `names` (from
+  `docThumb`, the first `THUMB_NAMES_MAX` column names, `[]` off a table) match through `thumbNames`, in the library and
+  the palette. A thumb stored before `names` reads as `[]` until its sheet is next opened.
 - Freshness: `index.html` reads `library:freshness` into `freshnessLoaded`. The column shows only when the answer is
   non-empty.
 
@@ -695,9 +711,8 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   frame apart can read one cell against the other's scroll; the next key corrects it.
 - `follow` plans `focus-pin`'s stuck left from the model at the key. A column nudge's document can land before the
   frame, and then a mark the plan did not expect counts where it sits.
-- Library search reads every cell of the library row, so the star's `{id, on}`, the thumb's keys and a `NULL` match:
-  "true", "rows" or "null" finds every sheet, and "-on" hides the library.
-- The settings panel asks for the member list on open, so a public reader or a buyer sees the 403 in the banner.
+- Search reads a `json` cell's text, so a number list that draws a sparkline matches "1, 2", and a null nested in a
+  `json` cell matches "null". `drawsText` is per type, not per cell.
 
 ## Schema (`schema/db.sql`)
 

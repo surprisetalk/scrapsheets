@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertThrows } from "@std/assert";
+import { assert, assertEquals, assertStringIncludes, assertThrows } from "@std/assert";
 import { PGlite } from "@electric-sql/pglite";
 import { PostgresConnection } from "pg-gateway";
 import { citext } from "@electric-sql/pglite/contrib/citext";
@@ -214,6 +214,8 @@ Deno.test(async function allTests(t) {
         create table widget (widget_id int, name text);
         insert into widget values (1, 'bolt'), (2, 'nut');
         create table "odd.name" (x int);
+        create table gadget (gadget_id int, note text);
+        insert into gadget values (1, null), (2, 'v1.5'), (3, 'x');
       `);
       return db;
     })();
@@ -474,6 +476,88 @@ Deno.test(async function allTests(t) {
       }));
       assertEquals((await unavailable).type, "doc-unavailable", "a NUL in a document id is a document nobody has");
       ws.close();
+    }
+
+    // A peer cannot flood the document's other peers with ephemeral frames: an
+    // oversize frame and a burst stop at the server, the sender is told once,
+    // and its sync frames keep flowing.
+    {
+      const adapter = new WebSocketClientAdapter(wsUrl(jwt), 100);
+      const reader = new AM.Repo({ network: [adapter], peerId: "client-ephemeral-reader" as AM.PeerId });
+      const handle = await reader.find<Sheet>(hand.documentId);
+      let heard = 0;
+      handle.on("ephemeral-message", () => heard++);
+
+      const until = async (what: string, done: () => boolean) => {
+        for (let i = 0; i < 100 && !done(); i++) await new Promise((r) => setTimeout(r, 20));
+        if (!done()) throw new Error(`No ${what} within 2s.`);
+      };
+      // Each connection keeps its own bucket and its own notice clock, so the
+      // oversize case gets a second connection instead of a wait past the notice.
+      const flooder = async (senderId: string) => {
+        const ws = new WebSocket(wsUrl(jwt));
+        ws.binaryType = "arraybuffer";
+        const frames: Record<string, unknown>[] = [];
+        ws.onmessage = (e) =>
+          frames.push(AM.cbor.decode(new Uint8Array(e.data as ArrayBuffer)) as Record<string, unknown>);
+        await new Promise<void>((resolve) => {
+          ws.onopen = () => resolve();
+        });
+        ws.send(AM.cbor.encode({ type: "join", senderId, peerMetadata: {}, supportedProtocolVersions: ["1"] }));
+        await until("peer reply", () => frames.some((f) => f.type === "peer"));
+        let count = 0;
+        return {
+          ws,
+          frames,
+          errors: () => frames.filter((f) => f.type === "error" && String(f.message).startsWith("Ephemeral")),
+          send: (bytes: number) =>
+            ws.send(AM.cbor.encode({
+              type: "ephemeral",
+              senderId,
+              targetId: automerge.peerId,
+              documentId: hand.documentId,
+              count: ++count,
+              sessionId: `${senderId}-session`,
+              data: AM.cbor.encode({ pad: new Uint8Array(bytes) }),
+            })),
+        };
+      };
+
+      // The relay is live: a small frame reaches the reader.
+      const burst = await flooder("raw-flooder");
+      burst.send(10);
+      await until("relayed ephemeral frame", () => heard === 1);
+
+      // A burst of 30: the bucket holds 20 and has spent one, and the refill
+      // during the burst is a few tokens at most. An oversize frame inside the
+      // same second is dropped with no second notice.
+      for (let i = 0; i < 30; i++) burst.send(10);
+      burst.send(5000);
+      await until("rate error", () => burst.errors().length === 1);
+      assertStringIncludes(String(burst.errors()[0].message), "a second");
+      assertEquals(burst.frames.some((f) => f.type === "disconnect"), false);
+
+      // A sync frame on the same connection still reaches the server, and its
+      // reply comes after every frame queued before it.
+      const before = burst.frames.length;
+      burst.ws.send(AM.cbor.encode({
+        type: "request",
+        senderId: "raw-flooder",
+        targetId: automerge.peerId,
+        documentId: "no\u0000such",
+        data: new Uint8Array(),
+      }));
+      await until("sync reply", () => burst.frames.slice(before).some((f) => f.type === "doc-unavailable"));
+      assertEquals(burst.errors().length, 1, "one error frame per second per connection");
+      assert(heard <= 1 + 20 + 5, `the reader heard ${heard} frames, past the burst`);
+
+      const big = await flooder("raw-oversize");
+      big.send(5000);
+      await until("oversize error", () => big.errors().length === 1);
+      assertStringIncludes(String(big.errors()[0].message), "at most");
+      burst.ws.close();
+      big.ws.close();
+      adapter.disconnect();
     }
 
     // An authenticated client repo syncs a shared doc end-to-end.
@@ -8608,8 +8692,44 @@ Deno.test(async function allTests(t) {
     assertEquals((await runs()).length, 1, "one run row for the one connection");
     assertEquals((await get<Table>(jwt, `/codex/${sheet_id}/preview`, { table: "widget", limit: 1 })).length, 2);
 
+    const filtered = async (query: string) => {
+      const res = await preview(query);
+      const said = await res.text();
+      assertEquals(res.status, 200, said);
+      return JSON.parse(said).data.slice(1) as Record<string, unknown>[];
+    };
+    assertEquals(await filtered("table=widget&where=name.eq.nut&where=widget_id.gte.2"), [{
+      widget_id: 2,
+      name: "nut",
+    }]);
+    assertEquals((await filtered("table=gadget&where=note.isnull")).map((r) => r.gadget_id), [1]);
+    assertEquals((await filtered("table=gadget&where=note.notnull&where=note.like.v1.%25")).map((r) => r.gadget_id), [
+      2,
+    ]);
+    assertEquals(
+      (await filtered("table=gadget&where=note.eq.v1.5")).map((r) => r.gadget_id),
+      [2],
+      "a value holds a dot",
+    );
+    const { jwt: viewer } = await usr("peekview@example.com");
+    await post(jwt, `/library/${sheet_id}/share`, { email: "peekview@example.com", role: "viewer" });
+    const viewed = await preview("table=widget&where=name.eq.nut", viewer);
+    assertEquals(viewed.status, 403, "a viewer may not filter");
+    await viewed.text();
+
     for (
       const [query, needle] of [
+        [
+          "table=widget&where=name.eq.a&where=name.eq.b&where=name.eq.c&where=name.eq.d&where=name.eq.e&where=name.eq.f",
+          "at most 5 where filters",
+        ],
+        ["table=widget&where=name", "<column>.<op>.<value>"],
+        ["table=widget&where=name.eq", "<column>.<op>.<value>"],
+        ["table=widget&where=name.regex.x", "one of eq, neq"],
+        ["table=widget&where=name.isnull.x", "takes no value"],
+        ["table=widget&where=nam.eq.x", "Did you mean"],
+        ["table=widget&where=widget_id.eq.abc", "cannot apply that filter"],
+        ["table=widget&where=widget_id.like.1", "cannot apply that filter"],
         ["table=widget%3B%20drop%20table%20widget", "is not in the database"],
         ["table=Widget", "Did you mean"],
         ["table=odd.name", "cannot be previewed by name"],
@@ -8625,7 +8745,13 @@ Deno.test(async function allTests(t) {
       assertEquals(res.status, 400, `?${query} must refuse: ${said}`);
       assert(said.includes(needle), `?${query} must say ${needle}: ${said}`);
     }
-    assertEquals((await runs()).length, 5, "a refused name is one good run, a refused limit is none");
+    // Five before the filters, four filtered reads, and the three refusals that
+    // had to connect (an unknown column, a cast, an op its type lacks).
+    assertEquals(
+      (await runs()).map((run: { status: number }) => run.status),
+      Array(12).fill(200),
+      "a refused name, column or cast is one good run; a refused limit, shape or op is none",
+    );
 
     const shut = await preview("table=widget", stranger);
     assertEquals(shut.status, 403);

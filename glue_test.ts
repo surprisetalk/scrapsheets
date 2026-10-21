@@ -622,10 +622,12 @@ Deno.test({
   sanitizeOps: false,
   sanitizeResources: false,
   fn: async () => {
+    let listStatus = 200;
     const page = await glue("http://localhost/table:countries#settings", {
       stored: { user: { usr_id: "u1", jwt: "a-token" } },
       respond: (url) => {
         if (url.includes("/link")) return { data: { token: "minted-token" } };
+        if (url.includes("/share") && listStatus !== 200) return new Response("the list broke", { status: listStatus });
         if (url.includes("/share"))
           return { data: { members: [{ email: "her@example.com", role: "viewer" }], public: false } };
         return { data: [] };
@@ -649,6 +651,22 @@ Deno.test({
       `the server's token should be in the link on screen, got: ${JSON.stringify(shown)}`,
     );
     assert(page.text().includes("her@example.com"), "and the members it answered with are listed");
+
+    // A reader or a buyer holds no share: the list answers 403, and the panel
+    // says so in place of the banner. Any other refusal still reaches it.
+    const mint = () => page.click(page.all("button").find((b) => b.textContent?.includes("view-only link")));
+    const sayings = "You read this sheet without a share";
+    listStatus = 403;
+    await mint();
+    assert(page.text().includes(sayings), `a 403 on the list should say so, got: ${page.text().slice(-300)}`);
+    assert(!page.text().includes("shareAction"), "and log no error");
+    assert(!page.text().includes("her@example.com"), "and the member list is gone");
+    listStatus = 500;
+    await mint();
+    assert(
+      page.text().includes("the list broke"),
+      `a 500 still reaches the banner, got: ${page.text().slice(0, 300)}`,
+    );
     page.close();
   },
 });

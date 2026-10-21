@@ -1516,6 +1516,13 @@ const peerCanSync = async (peerId: AM.PeerId, documentId?: AM.DocumentId): Promi
 
 const SERVER_PEER_ID = `server-${Deno.hostname()}` as AM.PeerId;
 
+// automerge-repo relays an "ephemeral" frame to every peer on the document
+// with no bound of its own. Presence cursors are far below both numbers.
+const EPHEMERAL_BYTES_MAX = 4096;
+const EPHEMERAL_RATE = 10; // frames per second, per connection
+const EPHEMERAL_BURST = 2 * EPHEMERAL_RATE;
+const EPHEMERAL_NOTICE_MS = 1000; // one error frame per connection per second
+
 export const automerge = new Repo({
   network: [wsAdapter],
   storage: new NodeFSStorageAdapter(`${path.dirname(path.fromFileUrl(Deno.mainModule))}/data/automerge`),
@@ -1534,6 +1541,7 @@ app.get(
     let queue = Promise.resolve();
     // Documents this connection has been audited on, as doc_id and doc_id:edit.
     const audited = new Set<string>();
+    const ephemeral = { tokens: EPHEMERAL_BURST, at: Date.now(), noticed: 0 };
     const cleanup = () => {
       if (!shim) return;
       wss.clients.delete(shim);
@@ -1575,6 +1583,33 @@ app.get(
             peerUserMap.set(joined, { auth, shim });
           }
           if (msg?.documentId) {
+            // Before the access check: syncRole caches by document id, so a flood
+            // that varies the id would cost a database query per frame.
+            if (msg.type === "ephemeral") {
+              const now = Date.now();
+              ephemeral.tokens = Math.min(
+                EPHEMERAL_BURST,
+                ephemeral.tokens + (now - ephemeral.at) / 1000 * EPHEMERAL_RATE,
+              );
+              ephemeral.at = now;
+              const tooBig = data.length > EPHEMERAL_BYTES_MAX;
+              if (tooBig || ephemeral.tokens < 1) {
+                if (now - ephemeral.noticed >= EPHEMERAL_NOTICE_MS) {
+                  ephemeral.noticed = now;
+                  shim.send(AM.cbor.encode({
+                    type: "error",
+                    senderId: SERVER_PEER_ID,
+                    targetId: msg.senderId,
+                    documentId: msg.documentId,
+                    message: tooBig
+                      ? `Ephemeral frames hold at most ${EPHEMERAL_BYTES_MAX} bytes, and this one held ${data.length}, so it was dropped. Send less presence data per frame.`
+                      : `Ephemeral frames are limited to ${EPHEMERAL_RATE} a second with a burst of ${EPHEMERAL_BURST}, so this one was dropped. Send presence less often.`,
+                  }));
+                }
+                return;
+              }
+              ephemeral.tokens -= 1;
+            }
             const role = await syncRole(auth, msg.documentId);
             if (!shim) return;
             // Once per document per connection: the open on the first frame
@@ -9627,6 +9662,26 @@ export const DSN_KEEP = 2;
 // pays for.
 export const CODEX_PREVIEW_MAX = 100;
 
+// A filter narrows a preview to the rows a person means to read, so the far
+// server does the cutting. Five, AND-ed, is a screen of conditions.
+export const CODEX_FILTERS_MAX = 5;
+
+// Each op is a fixed fragment. The column is an identifier and the value a bound
+// parameter, so nothing the caller sent becomes statement text.
+type Far = typeof sql;
+const CODEX_OPS: Record<string, (far: Far, col: unknown, value: string) => unknown> = {
+  eq: (far, col, v) => far`${col} = ${v}`,
+  neq: (far, col, v) => far`${col} <> ${v}`,
+  lt: (far, col, v) => far`${col} < ${v}`,
+  lte: (far, col, v) => far`${col} <= ${v}`,
+  gt: (far, col, v) => far`${col} > ${v}`,
+  gte: (far, col, v) => far`${col} >= ${v}`,
+  like: (far, col, v) => far`${col} like ${v}`,
+  ilike: (far, col, v) => far`${col} ilike ${v}`,
+  isnull: (far, col) => far`${col} is null`,
+  notnull: (far, col) => far`${col} is not null`,
+};
+
 /** Did this credential fail to get in, as opposed to the far server answering
  * about the statement it was sent?
  *
@@ -9955,18 +10010,87 @@ app.get("/codex/:id/preview", async (c) => {
       Fix: `send ?limit=${CODEX_PREVIEW_MAX}, or leave it out`,
     });
   }
-  const { tables, columns, rows } = await codexConnect(sheet_id, async (far) => {
+  const wheres = c.req.queries("where") ?? [];
+  const filters: { column: string; op: string; value: string }[] = [];
+  if (wheres.length) {
+    await assertSheetEditor(c, sheet_id, "filter the rows of");
+    if (wheres.length > CODEX_FILTERS_MAX) {
+      bad(400, `That is too many filters for a preview.`, {
+        Received: `${wheres.length} where parameters`,
+        Expected: `at most ${CODEX_FILTERS_MAX} where filters`,
+        Source: "the where query parameters",
+        Fix: `keep the ${CODEX_FILTERS_MAX} that narrow the rows most, or read the table through a query`,
+      });
+    }
+    for (const where of wheres) {
+      const first = where.indexOf(".");
+      const rest = first < 0 ? "" : where.slice(first + 1);
+      const second = rest.indexOf(".");
+      const column = first < 0 ? "" : where.slice(0, first);
+      const op = second < 0 ? rest : rest.slice(0, second);
+      const value = second < 0 ? undefined : rest.slice(second + 1);
+      const bare = op === "isnull" || op === "notnull";
+      if (!column || !op || (!bare && value === undefined)) {
+        bad(400, `That filter is not a column, an op and a value.`, {
+          Received: show(where),
+          Expected: "<column>.<op>.<value>, or <column>.isnull and <column>.notnull",
+          Source: "a where query parameter",
+          Fix: "send e.g. where=status.eq.paid",
+        });
+      }
+      if (!Object.hasOwn(CODEX_OPS, op)) {
+        bad(400, `That filter op is not one this server knows.`, {
+          Received: show(op),
+          Expected: `one of ${Object.keys(CODEX_OPS).join(", ")}`,
+          Source: `the op in where=${show(where)}`,
+          Fix: "send one of those ops, spelled exactly",
+        });
+      }
+      if (bare && value) {
+        bad(400, `That filter op takes no value.`, {
+          Received: show(value),
+          Expected: `${column}.${op} with nothing after it`,
+          Source: `the value in where=${show(where)}`,
+          Fix: `send where=${column}.${op}`,
+        });
+      }
+      filters.push({ column, op, value: value ?? "" });
+    }
+  }
+  const { tables, columns, rows, unknown, refused } = await codexConnect(sheet_id, async (far) => {
     const tables = await codexTables(far);
     const columns: string[] | undefined = tables.find((row: { name: string }) => row.name === table)?.columns
       .slice(1).map((col: { column_name: string }) => col.column_name);
     // postgres.js reads a dot inside an identifier as a schema qualifier, so a
     // name holding one would name another relation. Refused below, never read.
     const plain = columns && ![table, ...columns].some((name) => name.includes("."));
-    return {
-      tables: tables.map((row: { name: string }) => row.name),
-      columns,
-      rows: plain ? await far`select ${far(columns)} from public.${far(table)} limit ${limit}` : null,
-    };
+    const names = tables.map((row: { name: string }) => row.name);
+    const unknown = columns && filters.find((f) => !columns.includes(f.column));
+    if (!plain || unknown)
+      return { tables: names, columns, rows: null, unknown, refused: undefined as string | undefined };
+    const where = filters.length
+      ? far`where ${
+        filters.map((f) => CODEX_OPS[f.op](far, far(f.column), f.value)).reduce((a, b) => far`${a} and ${b}`)
+      }`
+      : far``;
+    try {
+      const rows = await far`select ${far(columns)} from public.${far(table)} ${where} limit ${limit}`;
+      return { tables: names, columns, rows, unknown, refused: undefined as string | undefined };
+    } catch (err) {
+      // The far server answered about the statement: a value its column's type
+      // will not read (class 22), or an op that type lacks (42883 undefined
+      // function, 42804 datatype mismatch, 42846 cannot coerce). Caught here, the
+      // connection still counts as a good run. The rest of class 42 (42501
+      // permission denied, 42P01 table gone) is the database's fault, not the
+      // filter's, and stays a failed run.
+      if (
+        filters.length && err instanceof pg.PostgresError &&
+        /^(22...|42883|42804|42846)$/.test(String((err as { code?: string }).code))
+      ) {
+        return { tables: names, columns, rows: null, unknown, refused: reason(err) };
+      }
+      throw err;
+    }
   });
   if (!columns) {
     // Postgres cuts an identifier at 63 bytes, so a longer name is no table's,
@@ -9982,6 +10106,26 @@ app.get("/codex/:id/preview", async (c) => {
       "Did you mean": hit === undefined ? undefined : show(hit),
       Source: `the table query parameter, against GET /codex/${sheet_id}`,
       Fix: hit === undefined ? `send one name GET /codex/${sheet_id} lists` : `send ?table=${encodeURIComponent(hit)}`,
+    });
+  }
+  if (unknown) {
+    const hit = unknown.column.length > 63 ? undefined : nearest(unknown.column, columns);
+    bad(400, `That filter names a column the table does not have.`, {
+      Received: show(unknown.column),
+      Expected: `one of the columns of ${table}, spelled exactly: ${columns.slice(0, NAMES_MAX).map(show).join(", ")}${
+        columns.length > NAMES_MAX ? `, and ${columns.length - NAMES_MAX} more` : ""
+      }`,
+      "Did you mean": hit === undefined ? undefined : show(hit),
+      Source: `the column in a where query parameter, against GET /codex/${sheet_id}`,
+      Fix: hit === undefined ? `send one column GET /codex/${sheet_id} lists` : `spell the column ${show(hit)}`,
+    });
+  }
+  if (refused) {
+    bad(400, `The database cannot apply that filter to that column.`, {
+      Received: filters.map((f) => show(`${f.column}.${f.op}.${f.value}`)).join(", "),
+      Expected: "a value the column's type reads, with an op that type has",
+      Source: `the where query parameters, as the database behind ${sheet_id} answered: ${show(refused)}`,
+      Fix: "send a value of the column's type, or like and ilike on a text column only",
     });
   }
   if (!rows) {

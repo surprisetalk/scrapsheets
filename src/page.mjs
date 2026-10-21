@@ -104,13 +104,16 @@ export const library = (stored = {}) => {
   );
 };
 
+const THUMB_NAMES_MAX = 32;
+
 /** The sparkline behind a library row: the first column of a table that holds at
- * least three numbers, scaled to 0..1 over its first 16 values. A sheet that is
+ * least three numbers, scaled to 0..1 over its first 16 values, and the first
+ * `THUMB_NAMES_MAX` column names, which library search matches. A sheet that is
  * not a table has a shape but no line to draw.
  */
 export const docThumb = (doc) => {
   if (doc?.type !== "table" || !Array.isArray(doc.data))
-    return { kind: doc?.type ?? "unknown", cols: 0, rows: 0, spark: [] };
+    return { kind: doc?.type ?? "unknown", cols: 0, rows: 0, spark: [], names: [] };
   const cols = Object.values(doc.data[0] ?? {});
   let spark = [];
   for (const col of cols) {
@@ -121,7 +124,13 @@ export const docThumb = (doc) => {
     spark = take.map((n) => Math.round((max === min ? 0.5 : (n - min) / (max - min)) * 1000) / 1000);
     break;
   }
-  return { kind: "table", cols: cols.length, rows: doc.data.length - 1, spark };
+  return {
+    kind: "table",
+    cols: cols.length,
+    rows: doc.data.length - 1,
+    spark,
+    names: cols.map((col) => col.name).filter((name) => typeof name === "string").slice(0, THUMB_NAMES_MAX),
+  };
 };
 
 // --- a view this browser holds

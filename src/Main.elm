@@ -95,6 +95,8 @@ port module Main exposing
     , sparkMax
     , sparkValues
     , tableHome
+    , thumbNames
+    , thumbNamesDecoder
     , typeName
     , unviewable
     , usd
@@ -1279,6 +1281,10 @@ on somebody's screen share.
 -}
 type alias Share =
     { members : List Member
+
+    -- The server answered 403 to the member list: this account reads the
+    -- sheet without a share. Not the same as an empty list ("Only you").
+    , noShare : Bool
     , public : Bool
 
     -- What the publisher says about the personal data in the sheet. The server
@@ -1309,6 +1315,7 @@ type alias Hook =
 emptyShare : Share
 emptyShare =
     { members = []
+    , noShare = False
     , public = False
     , personal = False
     , link = Nothing
@@ -1922,9 +1929,9 @@ nothing sorted, and nothing filtered or searched away. Only then is a display
 row a document row, which is what a row drag needs at both ends -- the handle
 is withheld without it, and a drop after a sort taken mid-drag is refused.
 -}
-inDocumentOrder : String -> Sheet -> Array Row -> Bool
-inDocumentOrder search sheet rows =
-    List.isEmpty sheet.sort && Array.length (filterAndSort search sheet rows) == Array.length rows
+inDocumentOrder : String -> Sheet -> Array Col -> Array Row -> Bool
+inDocumentOrder search sheet cols rows =
+    List.isEmpty sheet.sort && Array.length (filterAndSort search sheet cols rows) == Array.length rows
 
 
 {-| Where a drag lands when the pointer lets go, or nowhere.
@@ -2004,7 +2011,7 @@ nudgeOf search sheet dx dy =
     case sheet.doc of
         Ok (Tab tbl) ->
             if dy /= 0 then
-                if not (inDocumentOrder search sheet tbl.rows) then
+                if not (inDocumentOrder search sheet tbl.cols tbl.rows) then
                     Err "Expected the rows on screen in the document's order, received a sorted, filtered or searched view, where a row on screen is not the row it stands for. Nothing was moved. Source: Alt+Shift+↑/↓. Fix: clear the sort, the filters and the search, then move the rows again."
 
                 else if r.a.y < 1 || r.b.y > Array.length tbl.rows then
@@ -2541,82 +2548,83 @@ kindDecoder name =
 way its cells read, and how wide it starts, in px. One table with no wildcard,
 so a new constructor fails to compile here rather than rendering left-aligned at
 the default width and saying nothing. `width = Nothing` is a column that sizes
-itself.
+itself. `drawsText` is whether the cell draws its text, which is all search reads:
+the star, the thumb and the buttons draw a picture or a control.
 -}
-spec : Type -> { name : String, align : H.Attribute Msg, width : Maybe Int }
+spec : Type -> { name : String, align : H.Attribute Msg, width : Maybe Int, drawsText : Bool }
 spec typ =
     case typ of
         Unknown ->
-            { name = "unknown", align = S.textAlignLeft, width = Nothing }
+            { name = "unknown", align = S.textAlignLeft, width = Nothing, drawsText = True }
 
         Text ->
-            { name = "text", align = S.textAlignLeft, width = Nothing }
+            { name = "text", align = S.textAlignLeft, width = Nothing, drawsText = True }
 
         Number ->
-            { name = "num", align = S.textAlignRight, width = Just 80 }
+            { name = "num", align = S.textAlignRight, width = Just 80, drawsText = True }
 
         Usd ->
-            { name = "usd", align = S.textAlignRight, width = Just 80 }
+            { name = "usd", align = S.textAlignRight, width = Just 80, drawsText = True }
 
         Boolean ->
-            { name = "bool", align = S.textAlignCenter, width = Just 32 }
+            { name = "bool", align = S.textAlignCenter, width = Just 32, drawsText = True }
 
         Percentage ->
-            { name = "percentage", align = S.textAlignRight, width = Just 64 }
+            { name = "percentage", align = S.textAlignRight, width = Just 64, drawsText = True }
 
         Ratio ->
-            { name = "ratio", align = S.textAlignRight, width = Just 64 }
+            { name = "ratio", align = S.textAlignRight, width = Just 64, drawsText = True }
 
         Bps ->
-            { name = "bps", align = S.textAlignRight, width = Just 64 }
+            { name = "bps", align = S.textAlignRight, width = Just 64, drawsText = True }
 
         Duration ->
-            { name = "duration", align = S.textAlignRight, width = Just 64 }
+            { name = "duration", align = S.textAlignRight, width = Just 64, drawsText = True }
 
         Date ->
-            { name = "date", align = S.textAlignLeft, width = Just 112 }
+            { name = "date", align = S.textAlignLeft, width = Just 112, drawsText = True }
 
         Many typ_ ->
-            { name = "list " ++ typeName typ_, align = S.textAlignLeft, width = Nothing }
+            { name = "list " ++ typeName typ_, align = S.textAlignLeft, width = Nothing, drawsText = True }
 
         Link ->
-            { name = "link", align = S.textAlignLeft, width = Nothing }
+            { name = "link", align = S.textAlignLeft, width = Nothing, drawsText = True }
 
         SheetId ->
-            { name = "sheet_id", align = S.textAlignCenter, width = Just 48 }
+            { name = "sheet_id", align = S.textAlignCenter, width = Just 48, drawsText = True }
 
         Json ->
-            { name = "json", align = S.textAlignLeft, width = Nothing }
+            { name = "json", align = S.textAlignLeft, width = Nothing, drawsText = True }
 
         Timestamp ->
-            { name = "timestamp", align = S.textAlignLeft, width = Nothing }
+            { name = "timestamp", align = S.textAlignLeft, width = Nothing, drawsText = True }
 
         Image ->
-            { name = "image", align = S.textAlignLeft, width = Nothing }
+            { name = "image", align = S.textAlignLeft, width = Nothing, drawsText = True }
 
         Delete ->
-            { name = "delete", align = S.textAlignCenter, width = Just 64 }
+            { name = "delete", align = S.textAlignCenter, width = Just 64, drawsText = False }
 
         Trash ->
-            { name = "trash", align = S.textAlignCenter, width = Just 64 }
+            { name = "trash", align = S.textAlignCenter, width = Just 64, drawsText = False }
 
         Restore ->
-            { name = "restore", align = S.textAlignCenter, width = Just 72 }
+            { name = "restore", align = S.textAlignCenter, width = Just 72, drawsText = False }
 
         Star ->
-            { name = "star", align = S.textAlignCenter, width = Just 40 }
+            { name = "star", align = S.textAlignCenter, width = Just 40, drawsText = False }
 
         Create ->
-            { name = "create", align = S.textAlignRight, width = Just 160 }
+            { name = "create", align = S.textAlignRight, width = Just 160, drawsText = False }
 
         Form ->
-            { name = "form", align = S.textAlignCenter, width = Nothing }
+            { name = "form", align = S.textAlignCenter, width = Nothing, drawsText = True }
 
         Enum options ->
-            { name = "enum:" ++ String.join "," options, align = S.textAlignLeft, width = Nothing }
+            { name = "enum:" ++ String.join "," options, align = S.textAlignLeft, width = Nothing, drawsText = True }
 
         Thumb ->
-            { name = "thumb", align = S.textAlignLeft, width = Just 64 }
+            { name = "thumb", align = S.textAlignLeft, width = Just 64, drawsText = False }
 
 
 typeName : Type -> String
@@ -3553,7 +3561,7 @@ libraryIdAtRow : Model -> Int -> Maybe String
 libraryIdAtRow model y =
     resolveTable model
         |> Result.toMaybe
-        |> Maybe.andThen (\tbl -> Array.get (y - 1) (filterAndSort model.search model.sheet tbl.rows))
+        |> Maybe.andThen (\tbl -> Array.get (y - 1) (filterAndSort model.search model.sheet tbl.cols tbl.rows))
         |> Maybe.andThen (Dict.get "sheet_id")
         |> Maybe.andThen (D.decodeValue D.string >> Result.toMaybe)
 
@@ -3588,7 +3596,7 @@ tableBounds : Model -> TableBounds
 tableBounds model =
     case resolveTable model of
         Ok tbl ->
-            { maxX = Array.length tbl.cols - 1, maxY = Array.length (filterAndSort model.search model.sheet tbl.rows) }
+            { maxX = Array.length tbl.cols - 1, maxY = Array.length (filterAndSort model.search model.sheet tbl.cols tbl.rows) }
 
         Err _ ->
             { maxX = 0, maxY = 0 }
@@ -5111,7 +5119,7 @@ update msg ({ sheet, auth } as model) =
                         ordered =
                             case moving of
                                 MovingRow _ ->
-                                    inDocumentOrder model.search sheet tbl.rows
+                                    inDocumentOrder model.search sheet tbl.cols tbl.rows
 
                                 MovingCol _ ->
                                     True
@@ -5222,7 +5230,7 @@ update msg ({ sheet, auth } as model) =
                                         []
 
                                     else
-                                        filterAndSortIndexed model.search sheet tbl.rows
+                                        filterAndSortIndexed model.search sheet tbl.cols tbl.rows
                                             |> Array.toIndexedList
                                             |> List.concatMap
                                                 (\( dispIdx, ( _, row ) ) ->
@@ -5587,7 +5595,7 @@ update msg ({ sheet, auth } as model) =
                                                     Array.get x tbl.cols
                                                         |> Maybe.andThen
                                                             (\col ->
-                                                                displayYToDocY model.search sheet tbl.rows y
+                                                                displayYToDocY model.search sheet tbl.cols tbl.rows y
                                                                     |> Maybe.andThen (\docY -> Array.get (docY - 1) tbl.rows)
                                                                     |> Maybe.andThen (Dict.get col.key)
                                                                     |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
@@ -5692,7 +5700,7 @@ updateDocMsg edit ({ sheet } as model) =
                 -- Map a display row coordinate to its document row coordinate (accounts for sort/filter/search)
                 toDoc : Int -> Maybe Int
                 toDoc y =
-                    displayYToDocY model.search sheet table.rows y
+                    displayYToDocY model.search sheet table.cols table.rows y
 
                 -- The display rows this edit names that no drawn row stands
                 -- behind. Any one refuses the whole edit, so the patches below
@@ -6627,7 +6635,7 @@ updateKeyDown event ({ sheet } as model) =
                                 Array.get sel.x tbl.cols
 
                             row =
-                                displayYToDocY model.search sheet tbl.rows sel.y |> Maybe.andThen (\docY -> Array.get (docY - 1) tbl.rows)
+                                displayYToDocY model.search sheet tbl.cols tbl.rows sel.y |> Maybe.andThen (\docY -> Array.get (docY - 1) tbl.rows)
                         in
                         case ( col, row ) of
                             ( Just c, Just r ) ->
@@ -6804,7 +6812,7 @@ updateKeyDown event ({ sheet } as model) =
                         -- A printable character starts editing with it
                         case sheet.doc of
                             Ok (Tab tbl) ->
-                                case ( Array.get sel.x tbl.cols, sel.y >= 1 && displayYToDocY model.search sheet tbl.rows sel.y == Nothing ) of
+                                case ( Array.get sel.x tbl.cols, sel.y >= 1 && displayYToDocY model.search sheet tbl.cols tbl.rows sel.y == Nothing ) of
                                     ( Just _, True ) ->
                                         ( { model | error = undrawnRows [ sel.y ] }, Cmd.none )
 
@@ -6867,12 +6875,12 @@ updatePaste text ({ sheet } as model) =
 
                 -- Rows currently visible (after sort/filter/search); paste targets display positions
                 visibleCount =
-                    Array.length (filterAndSortIndexed model.search sheet tbl.rows)
+                    Array.length (filterAndSortIndexed model.search sheet tbl.cols tbl.rows)
 
                 -- `sel.y` is at least 1, so a row that maps to nothing is past the drawn rows, and the paste appends it.
                 docRowFor : Int -> Int
                 docRowFor dispY =
-                    case displayYToDocY model.search sheet tbl.rows dispY of
+                    case displayYToDocY model.search sheet tbl.cols tbl.rows dispY of
                         Just docY ->
                             docY
 
@@ -7015,6 +7023,10 @@ updateShareLoad value model =
                                     (D.list (D.map2 Member (D.field "email" D.string) (D.field "role" D.string)))
                                 )
 
+                    -- members: null is the glue's word for "403 on the list".
+                    noShare =
+                        value |> D.decodeValue (D.field "members" (D.null ())) |> Result.toMaybe |> (/=) Nothing
+
                     public =
                         value |> D.decodeValue (D.field "public" D.bool)
 
@@ -7047,7 +7059,7 @@ updateShareLoad value model =
                                 [ "members", "public" ]
 
                     checked what field decoded =
-                        if not (List.member field promised) then
+                        if not (List.member field promised) || (noShare && List.member field [ "members", "public" ]) then
                             Nothing
 
                         else
@@ -7081,6 +7093,12 @@ updateShareLoad value model =
                     | share =
                         { share
                             | members = members |> Result.withDefault share.members
+                            , noShare =
+                                if sent "members" == Nothing then
+                                    share.noShare
+
+                                else
+                                    noShare
                             , public = public |> Result.withDefault share.public
                             , link = link |> Result.toMaybe |> orElse share.link
                             , hook = hook |> Result.toMaybe |> orElse share.hook
@@ -7188,21 +7206,27 @@ viewSettings show info share =
                 ]
             , H.div [ S.marginBottom "1rem" ]
                 [ H.label [ S.display "block", S.marginBottom "0.25rem", S.fontWeight "600" ] [ text "Sharing" ]
-                , H.div [ S.displayFlex, S.gapRem 0.25, S.marginBottom "0.5rem" ]
-                    [ H.input
-                        [ A.type_ "email"
-                        , A.value share.email
-                        , A.onInput ShareEmailChange
-                        , A.placeholder "name@example.com"
-                        , S.flexGrow "1"
+                , iif share.noShare
+                    (H.small [ S.color "#666" ] [ text "You read this sheet without a share, so only its members see who it is shared with." ])
+                    (H.div [ S.displayFlex, S.gapRem 0.25, S.marginBottom "0.5rem" ]
+                        [ H.input
+                            [ A.type_ "email"
+                            , A.value share.email
+                            , A.onInput ShareEmailChange
+                            , A.placeholder "name@example.com"
+                            , S.flexGrow "1"
+                            ]
+                            []
+                        , H.select [ A.onInput ShareRoleChange, A.value share.role ]
+                            (List.map (\r -> H.option [ A.value r, A.selected (r == share.role) ] [ text r ]) [ "viewer", "editor", "owner" ])
+                        , H.button [ A.onClick ShareAdd ] [ text "Share" ]
                         ]
-                        []
-                    , H.select [ A.onInput ShareRoleChange, A.value share.role ]
-                        (List.map (\r -> H.option [ A.value r, A.selected (r == share.role) ] [ text r ]) [ "viewer", "editor", "owner" ])
-                    , H.button [ A.onClick ShareAdd ] [ text "Share" ]
-                    ]
+                    )
                 , H.div [ S.fontSizeRem 0.875 ]
-                    (if List.isEmpty share.members then
+                    (if share.noShare then
+                        []
+
+                     else if List.isEmpty share.members then
                         [ H.small [ S.color "#666" ] [ text "Only you." ] ]
 
                      else
@@ -7224,10 +7248,14 @@ viewSettings show info share =
             , H.div [ S.marginBottom "1rem" ]
                 [ H.label [ S.display "block", S.marginBottom "0.25rem", S.fontWeight "600" ] [ text "Anyone with the link" ]
                 , H.div [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.5 ]
-                    [ H.label [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ]
-                        [ H.input [ A.type_ "checkbox", A.checked share.public, A.onCheck SharePublic ] []
-                        , text (iif share.public "public: anyone can read" "private")
-                        ]
+                    [ -- The flag came in the refused list answer, so a reader of a public sheet would be told "private".
+                      iif share.noShare
+                        (text "")
+                        (H.label [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ]
+                            [ H.input [ A.type_ "checkbox", A.checked share.public, A.onCheck SharePublic ] []
+                            , text (iif share.public "public: anyone can read" "private")
+                            ]
+                        )
                     , H.button [ A.onClick ShareLink ] [ text "mint view-only link" ]
                     ]
 
@@ -7530,7 +7558,7 @@ paletteCommands shelf query =
 
         sheets =
             shelf
-                |> Dict.filter (\k v -> k /= "" && not v.scratch && not v.trashed && matches [ k, v.name ])
+                |> Dict.filter (\k v -> k /= "" && not v.scratch && not v.trashed && matches ([ k, v.name ] ++ thumbNames v.thumb))
                 |> Dict.toList
                 -- Starred first, the way the library table draws them, and the
                 -- rest in the order the dictionary gave: `List.sortBy` is
@@ -8161,7 +8189,7 @@ replaceMatches : Model -> Sheet -> FindReplace -> Table -> List Index -> ( Model
 replaceMatches model sheet fr tbl matches =
     let
         toDoc =
-            displayYToDocY model.search sheet tbl.rows
+            displayYToDocY model.search sheet tbl.cols tbl.rows
 
         -- A match found before the search or a filter changed can name a row
         -- that is no longer drawn. Any one refuses the whole replace.
@@ -8537,15 +8565,31 @@ applyFilter filter key row =
             String.contains (String.toLower substr) (String.toLower val)
 
 
-matchesSearch : String -> Row -> Bool
-matchesSearch search row =
+{-| The text a cell draws, or nothing: a NULL draws nothing, though `string`
+reads it as "null".
+-}
+drawnText : D.Value -> Maybe String
+drawnText v =
+    case D.decodeValue (D.null ()) v of
+        Ok () ->
+            Nothing
+
+        Err _ ->
+            D.decodeValue string v |> Result.toMaybe
+
+
+matchesSearch : String -> Array Col -> Row -> Bool
+matchesSearch search cols row =
     if String.isEmpty search then
         True
 
     else
         let
             vals =
-                Dict.values row |> List.filterMap (D.decodeValue string >> Result.toMaybe)
+                Array.toList cols
+                    |> List.filter (\col -> (spec col.typ).drawsText)
+                    |> List.filterMap (\col -> Dict.get col.key row |> Maybe.andThen drawnText)
+                    |> (++) (Array.toList cols |> List.filter (\col -> col.typ == Thumb) |> List.concatMap (\col -> Dict.get col.key row |> Maybe.map thumbNames |> Maybe.withDefault []))
 
             lower =
                 String.toLower
@@ -8564,16 +8608,16 @@ matchesSearch search row =
                 List.any (\v -> String.contains (lower search) (lower v)) vals
 
 
-filterAndSort : String -> Sheet -> Array Row -> Array Row
-filterAndSort search sheet rows =
-    filterAndSortIndexed search sheet rows |> Array.map Tuple.second
+filterAndSort : String -> Sheet -> Array Col -> Array Row -> Array Row
+filterAndSort search sheet cols rows =
+    filterAndSortIndexed search sheet cols rows |> Array.map Tuple.second
 
 
-filterAndSortIndexed : String -> Sheet -> Array Row -> Array ( Int, Row )
-filterAndSortIndexed search sheet rows =
+filterAndSortIndexed : String -> Sheet -> Array Col -> Array Row -> Array ( Int, Row )
+filterAndSortIndexed search sheet cols rows =
     let
         passes ( _, row ) =
-            matchesSearch search row
+            matchesSearch search cols row
                 && Dict.foldl (\key filter acc -> acc && applyFilter filter key row) True sheet.filters
 
         filtered =
@@ -9402,9 +9446,9 @@ undrawnRows ys =
         ++ ", which this view does not draw. Nothing was written. Source: the search or a filter hides that row, or the rows changed after you selected it or found it. Fix: select a drawn row, or clear the search or the filter, and edit again."
 
 
-displayYToDocY : String -> Sheet -> Array Row -> Int -> Maybe Int
-displayYToDocY search sheet rows y =
-    filterAndSortIndexed search sheet rows
+displayYToDocY : String -> Sheet -> Array Col -> Array Row -> Int -> Maybe Int
+displayYToDocY search sheet cols rows y =
+    filterAndSortIndexed search sheet cols rows
         |> Array.get (y - 1)
         |> Maybe.map (\( orig, _ ) -> orig + 1)
 
@@ -9628,10 +9672,11 @@ cellDecoder typ decimals format i n =
                     (D.field "on" D.bool)
 
             Thumb ->
-                D.map3 viewThumb
+                D.map4 (\cols rows spark _ -> viewThumb cols rows spark)
                     (D.field "cols" D.int)
                     (D.field "rows" D.int)
                     (D.oneOf [ D.field "spark" (D.list D.float), D.succeed [] ])
+                    thumbNamesDecoder
 
             Create ->
                 D.value |> D.map (\val -> H.button [ A.onClick (DocNew val) ] [ text "add to library" ])
@@ -9698,6 +9743,26 @@ viewSpark : List Float -> Html Msg
 viewSpark scaled =
     H.div [ S.displayFlex, S.alignItemsFlexEnd, S.gap "1px", S.heightPx 14 ] <|
         List.map (\h -> H.div [ S.widthPx 3, S.height (String.fromFloat (4 + h * 10) ++ "px"), S.backgroundColor "#bbb" ] []) scaled
+
+
+
+-- A thumb stored before `names` existed (old localStorage) has none, and reads as
+-- []; a `names` that is not a list of strings is a decode error.
+
+
+thumbNamesDecoder : D.Decoder (List String)
+thumbNamesDecoder =
+    optionalField "names" (D.list D.string) []
+
+
+
+-- Search reads a thumb that may be malformed as no names: the Thumb cell decoder
+-- is the loud path and fails the same thumb when it is drawn.
+
+
+thumbNames : D.Value -> List String
+thumbNames =
+    D.decodeValue thumbNamesDecoder >> Result.withDefault []
 
 
 viewThumb : Int -> Int -> List Float -> Html Msg
@@ -12226,7 +12291,7 @@ view ({ sheet } as model) =
                     Ok { cols, rows } ->
                         let
                             sortedRows =
-                                filterAndSort model.search sheet rows
+                                filterAndSort model.search sheet cols rows
 
                             doc =
                                 sheet.doc |> Result.withDefault Library
@@ -12267,7 +12332,7 @@ view ({ sheet } as model) =
                                     _ ->
                                         False
                                 )
-                                    && inDocumentOrder model.search sheet rows
+                                    && inDocumentOrder model.search sheet cols rows
                         in
                         case doc of
                             Chart cfg ->
