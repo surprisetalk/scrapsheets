@@ -29,7 +29,7 @@
       await initializeWasm(fetch("/automerge.wasm"));
 
       // Import Automerge packages
-      import { cbor, decodeHeads, Repo } from "@automerge/automerge-repo";
+      import { cbor, decodeHeads, Presence, Repo } from "@automerge/automerge-repo";
       import { IndexedDBStorageAdapter } from "/automerge-repo-idb.mjs";
       import { BrowserWebSocketClientAdapter } from "/automerge-repo-ws.mjs";
       import {
@@ -485,15 +485,22 @@
             }
           };
           app.ports.codexLoad.subscribe(loadCodex);
-          app.ports.codexPreview.subscribe(async ({ id, table }) => {
-            const ask = {};
+          app.ports.codexPreview.subscribe(async ({ id, table, filters }) => {
+            const ask = { id };
             previewing = ask;
-            const refuse = (error) => previewing === ask && app.ports.codexLoaded.send({ id, error });
+            // A refused filter keeps the pick, the filter rows and the last rows: the banner says why.
+            const refuse = (error) =>
+              previewing === ask &&
+              (filters.length ? app.ports.docErrored.send(error) : app.ports.codexLoaded.send({ id, error }));
             const token = getAuthToken();
             if (!token) return refuse("Log in to read a connected database: its rows are read under your account.");
             try {
+              // A column never holds a dot, so the server's split on the first two is safe.
+              const wheres = filters
+                .map((f) => `&where=${encodeURIComponent(`${f.column}.${f.op}.${f.value}`)}`)
+                .join("");
               // No limit: the server's own cap is the one spelling of a preview's size.
-              const res = await fetch(`${API_BASE}/codex/${id}/preview?table=${encodeURIComponent(table)}`, {
+              const res = await fetch(`${API_BASE}/codex/${id}/preview?table=${encodeURIComponent(table)}${wheres}`, {
                 headers: { Authorization: `Bearer ${token}` },
               });
               if (!res.ok) return refuse(await codexRefusal(res));
@@ -846,6 +853,7 @@
           // takes it off: `repo.find` hands back the same handle every time,
           // and a listener per open delivered every change once per open.
           let watched = null;
+          let presence = null;
 
           const setupDragDrop = () => {
             document.body.addEventListener("dragover", (e) => {
@@ -1093,10 +1101,16 @@
             refused.delete(doc_id);
             debug.log('selectDoc:', id);
             lastRun = { id: null, key: null, data: null };
+            // A filtered refusal carries no sheet id, so one for another sheet must not land on this banner.
+            // Opening settings selects the same sheet again, and its answer still lands.
+            if (previewing?.id !== id) previewing = null;
             // Before either early return, so the library and the shop listen
             // to nothing.
             watched?.handle.off("change", watched.onChange);
             watched = null;
+            presence?.stop();
+            presence = null;
+            app.ports.peersChanged.send({ id: "", data: [] });
             unfollow();
 
             const libraryEntry = Library.get()[id];
@@ -1167,6 +1181,22 @@
               };
               sheetHandle.on("change", onChange);
               watched = { handle: sheetHandle, onChange };
+              // A bundled sheet's handle has no `broadcast`: nobody else is in it.
+              if (sheetHandle.broadcast) {
+                // Nothing identifying: a colour this tab picks for this open, kept nowhere.
+                const colour = "#" + [...crypto.getRandomValues(new Uint8Array(3))].map((b) => b.toString(16).padStart(2, "0")).join("");
+                const here = new Presence({ handle: sheetHandle });
+                const send = () =>
+                  app.ports.peersChanged.send({
+                    id,
+                    // A peer's state is whatever it sent: only a string can ride the port.
+                    data: Object.values(here.getPeerStates().value).map((p) => p.value.colour).filter((c) => typeof c === "string").sort(),
+                  });
+                for (const event of ["snapshot", "update", "goodbye", "pruning"]) here.on(event, send);
+                // 15s heartbeats and a 45s ttl: three missed beats drop a peer.
+                here.start({ initialState: { colour }, heartbeatMs: 15000, peerTtlMs: 45000 });
+                presence = here;
+              }
             }
             if (type === "portal") {
               const portalUrl = `${WS_BASE}/${type}/${doc_id}/sync`;
@@ -1440,6 +1470,7 @@
                 ...JSON.parse(JSON.stringify(source)),
                 name,
                 forked_from: sourceId,
+                ...(type === "query" && typeof source.data[0]?.code === "string" ? { forked_code: source.data[0].code } : {}),
               });
               if (copy.whenReady) await copy.whenReady();
               const id = `${type}:${copy.documentId}`;
@@ -1455,6 +1486,54 @@
               sheet = copy;
               await selectDoc(id, copy);
             }, "forkDoc"),
+          );
+
+          // Promote: copy a forked query's code back to the sheet it came from, and
+          // refuse when that sheet's code is no longer the code the fork started
+          // from. Two writes, source then fork, so a crash between them leaves the
+          // source equal to the fork's code, and the rerun writes only `forked_code`.
+          app.ports.promoteDoc.subscribe(
+            catchy(async (forkId) => {
+              const refuse = (...lines) => app.ports.docErrored.send([`I could not promote "@${forkId}".`, ``, ...lines].join("\n"));
+              const forkHandle = await repo.find(forkId.split(":")[1]);
+              await forkHandle?.whenReady?.();
+              const fork = forkHandle?.doc();
+              const sourceId = fork?.forked_from;
+              if (!forkId.startsWith("query:") || typeof fork?.forked_code !== "string" || typeof fork.data?.[0]?.code !== "string" || !sourceId?.startsWith("query:")) {
+                return refuse(
+                  `  Expected:     a fork of a query made after promote shipped`,
+                  `  Received:     this fork has no forked_code`,
+                  `  Source:       forkDoc`,
+                  `  Fix:          fork the source again`,
+                );
+              }
+              const sourceHandle = Library.get()[sourceId]?.doc ? null : await repo.find(sourceId.split(":")[1]);
+              await sourceHandle?.whenReady?.();
+              const source = sourceHandle?.doc();
+              if (!source) {
+                return refuse(
+                  `  Expected:     a source sheet this browser holds`,
+                  `  Received:     "@${sourceId}", which ships with the page or has not loaded`,
+                  `  Source:       forked_from on this fork`,
+                  `  Fix:          open the source once so it loads, then promote`,
+                );
+              }
+              const live = source.data?.[0]?.code;
+              const code = fork.data[0].code;
+              if (live !== code && live !== fork.forked_code) {
+                return refuse(
+                  `  Expected:     the source's query to equal the one you forked from`,
+                  `  Received:     "@${sourceId}" now reads \`${Array.from(String(live)).slice(0, 80).join("")}\``,
+                  `  Source:       forked_code on this fork`,
+                  `  Fix:          copy the source's new query into the fork, then promote. Nothing was written`,
+                );
+              }
+              if (live !== code) sourceHandle.change((d) => { d.data[0].code = code; });
+              if (fork.forked_code !== code) forkHandle.change((d) => { d.forked_code = code; });
+              window.history.pushState({}, "", `/${sourceId}`);
+              sheet = sourceHandle;
+              await selectDoc(sourceId, sourceHandle);
+            }, "promoteDoc"),
           );
 
           // The chart on screen is the chart you save: the SVG is serialized out of

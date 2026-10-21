@@ -113,7 +113,7 @@ Deno.test("a first visit gets the tutorial, and -1 dismisses it", async () => {
 });
 
 Deno.test("a bundled table renders its rows, its grips and its stats", async () => {
-  const { doc, all, text } = await boot("http://localhost/table:countries");
+  const { doc, all, text, app, settle } = await boot("http://localhost/table:countries");
   const rows = all("tbody tr");
   assert(rows.length > 190, `expected a row per country, got ${rows.length}`);
   assert(text().includes("China"), "expected the countries themselves");
@@ -121,6 +121,23 @@ Deno.test("a bundled table renders its rows, its grips and its stats", async () 
   assert(doc.querySelector("td.c0"), "the first column should be addressable for the frozen-column style");
   // The totals row sums the numeric columns over the rows on screen.
   assert(doc.querySelector("tr.totals"), "expected a totals row");
+
+  // The tabs sharing a sheet: a dot each, from the colours the glue sends. A bad
+  // colour is dropped unseen, another sheet's list is ignored, and none draws nothing.
+  assert(!doc.querySelector(".peer"), "a sheet nobody else has open draws no dots");
+  app.ports.peersChanged.send({ id: "table:countries", data: ["#4a8000", "red", "#0000ff", "url(x)"] });
+  await settle();
+  assertEquals(all(".peer").map((d) => (d as unknown as { style: { background: string } }).style.background), [
+    "rgb(74, 128, 0)",
+    "rgb(0, 0, 255)",
+  ]);
+  assert(text().includes("2 here"), "the toolbar counts the dots drawn");
+  app.ports.peersChanged.send({ id: "table:other", data: [] });
+  await settle();
+  assertEquals(all(".peer").length, 2, "a list for another sheet changes nothing");
+  app.ports.peersChanged.send({ id: "table:countries", data: [] });
+  await settle();
+  assert(!doc.querySelector(".peer"), "an empty list draws nothing");
 });
 
 Deno.test("clicking a header sorts, and shift-clicking adds a second key", async () => {
@@ -601,7 +618,7 @@ Deno.test("every modal, icon button and bare input says what it is", async () =>
 });
 
 Deno.test("a sheet opens arranged the way it was left", async () => {
-  const { dom, doc, app, all, text, fire, settle } = await boot("http://localhost/table:countries");
+  const { dom, doc, app, all, text, fire, settle, type_ } = await boot("http://localhost/table:countries");
   app.ports.docSelected.send({
     id: "table:arranged",
     data: {
@@ -714,6 +731,60 @@ Deno.test("a sheet opens arranged the way it was left", async () => {
     headerBefore,
     "an arrow key on an empty filter must never land the selection on the header, so a keystroke cannot rename the column",
   );
+
+  // A multi column stores the picks as an array, draws them joined, and refuses a pick its type does not list.
+  app.ports.docSelected.send({
+    id: "table:tagged",
+    data: {
+      doc: {
+        type: "table",
+        data: [[{ name: "tags", type: "multi:red,green,blue", key: "0" }], { "0": ["green"] }],
+      },
+    },
+  });
+  await settle();
+  const cell = all("tbody td").find((td) => td.textContent?.trim() === "green");
+  assert(cell, "an array cell draws its picks joined");
+  patches.length = 0;
+  const write = async (picks: string) => {
+    for (const type of ["mouseenter", "mousedown", "mouseup", "click", "dblclick"]) await fire(cell, type);
+    await type_(all("#new-cell")[0], picks);
+    all("#new-cell")[0].dispatchEvent(new dom.window.FocusEvent("blur"));
+    await settle();
+  };
+  await write("purple");
+  assertEquals(patches, [], "a pick outside the options writes nothing");
+  assert(text().includes('received "purple"'), `the refusal names the pick, got: ${text().slice(0, 300)}`);
+  await write("red, blue");
+  assertEquals(patches.map((p) => [p.action, p.path, p.value]), [["set", [1, "0"], ["red", "blue"]]]);
+
+  // A blank multi cell copies as nothing, so pasting it back is a blank and not the word NULL, which no option lists.
+  app.ports.docSelected.send({
+    id: "table:tagged",
+    data: {
+      doc: {
+        type: "table",
+        data: [[{ name: "tags", type: "multi:red,green,blue", key: "0" }], { "0": ["red", "blue"] }, { "0": null }],
+      },
+    },
+  });
+  await settle();
+  const copied: string[] = [];
+  app.ports.copyToClipboard.subscribe((text: string) => copied.push(text));
+  const blank = all("tbody td").find((td) => td.textContent?.trim() === "NULL");
+  assert(blank, "a null multi cell draws NULL");
+  for (const type of ["mouseenter", "mousedown", "mouseup", "click"]) await fire(blank, type);
+  app.ports.requestCopy.send(null);
+  await settle();
+  assertEquals(copied.map((t) => t.trim()), [""]);
+
+  // Opening a blank multi cell and leaving it unchanged keeps it blank and refuses nothing.
+  patches.length = 0;
+  for (const type of ["mouseenter", "mousedown", "mouseup", "click", "dblclick"]) await fire(blank, type);
+  all("#new-cell")[0].dispatchEvent(new dom.window.FocusEvent("blur"));
+  await settle();
+  assertEquals(patches.map((p) => p.value), [null], "an untouched blank multi cell stays null");
+  assert(!text().includes('received "NULL"'), `a blank multi cell is not refused as NULL: ${text().slice(0, 300)}`);
 });
 
 // A query's rows are computed, so there are no stored columns to write an

@@ -596,6 +596,22 @@ Deno.test("the page offers exactly the methods the poller sends", async () => {
   same(quoted(poller, /"([^"]+)"/g), quoted(page, /"([^"]+)"/g), "main.ts's NET_METHODS", "src/Main.elm's netMethods");
 });
 
+// A connected database's preview filters are spelled in main.ts and offered by Main.elm.
+Deno.test("the page offers exactly the filter ops and the filter count the preview route takes", async () => {
+  const ts = await Deno.readTextFile(dir + "main.ts");
+  const elm = await Deno.readTextFile(dir + "src/Main.elm");
+  const ops = new Set(
+    [...(ts.split("const CODEX_OPS")[1]?.split("\n};")[0] ?? "").matchAll(/^ {2}(\w+): \(far/gm)].map((m) => m[1]),
+  );
+  assert(ops.size > 0, "CODEX_OPS should still be an object of ops in main.ts");
+  const page = elm.split("codexOps =")[1]?.split("]")[0] ?? "";
+  assert(page.includes('"'), "codexOps should still be a list of spellings in src/Main.elm");
+  same(ops, quoted(page, /"([^"]+)"/g), "main.ts's CODEX_OPS", "src/Main.elm's codexOps");
+  const max = ts.match(/CODEX_FILTERS_MAX = (\d+)/)?.[1];
+  assert(max, "CODEX_FILTERS_MAX should still be a number in main.ts");
+  assertEquals(elm.match(/codexFiltersMax =\s+(\d+)/)?.[1], max, "codexFiltersMax and CODEX_FILTERS_MAX");
+});
+
 // A feed's paging mode is spelled on the document too: read by pageConfig in
 // main.ts and offered by the select in Main.elm. Same reason, same guard.
 Deno.test("the page offers exactly the paging modes the poller reads", async () => {

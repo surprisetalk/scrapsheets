@@ -27,6 +27,8 @@ import {
   errorLogged,
   flushFolds,
   flushWebhooks,
+  FRAME_BURST,
+  FRAME_RATE,
   HOOK_BYTES_PER_WINDOW,
   HOOK_ROWS_PER_WINDOW,
   HOOK_WINDOW_S,
@@ -60,6 +62,7 @@ import {
   sendDigestOnce,
   sql,
   status,
+  syncAccessCache,
   trimNet,
   USER_AGENT,
   USER_ALERTS_PER_DAY,
@@ -558,6 +561,112 @@ Deno.test(async function allTests(t) {
       burst.ws.close();
       big.ws.close();
       adapter.disconnect();
+    }
+
+    // Frames that name a document stop at one bucket before the access check, so
+    // a flood of random document ids costs a bounded number of database lookups.
+    // A real repo opening ten documents is nowhere near it.
+    {
+      const docs = Array.from(
+        { length: 10 },
+        (_, i) =>
+          automerge.create<Sheet>({ type: "table", data: [arrayify([{ name: "a", type: "num", key: 0 }]), { 0: i }] }),
+      );
+      for (const d of docs) await put(jwt, `/library/table:${d.documentId}`, {});
+      const adapter = new WebSocketClientAdapter(wsUrl(jwt), 100);
+      const repo = new AM.Repo({ network: [adapter], peerId: "client-opens-ten" as AM.PeerId });
+      await repo.networkSubsystem.whenReady();
+      let sent = 0;
+      const sock = (adapter as unknown as { socket: WebSocket }).socket;
+      const send = sock.send.bind(sock);
+      sock.send = (data) => {
+        sent++;
+        return send(data);
+      };
+      const found = await Promise.all(docs.map((d) => repo.find<Sheet>(d.documentId)));
+      found.forEach((h, i) => assertEquals(JSON.parse(JSON.stringify(h.doc().data[1])), { 0: i }));
+      assert(sent < FRAME_BURST / 5, `a real client sent ${sent} frames to open ten documents`);
+      adapter.disconnect();
+
+      const ws = new WebSocket(wsUrl(jwt));
+      ws.binaryType = "arraybuffer";
+      const replies: Record<string, unknown>[] = [];
+      ws.onmessage = (e) =>
+        replies.push(AM.cbor.decode(new Uint8Array(e.data as ArrayBuffer)) as Record<string, unknown>);
+      await new Promise<void>((resolve) => {
+        ws.onopen = () => resolve();
+      });
+      ws.send(
+        AM.cbor.encode({
+          type: "join",
+          senderId: "raw-id-flooder",
+          peerMetadata: {},
+          supportedProtocolVersions: ["1"],
+        }),
+      );
+      for (let i = 0; i < 100 && !replies.some((f) => f.type === "peer"); i++)
+        await new Promise((r) => setTimeout(r, 20));
+      // A document id is a cache key held 30 s: a 100 kB id must not be kept.
+      ws.send(AM.cbor.encode({
+        type: "request",
+        senderId: "raw-id-flooder",
+        targetId: automerge.peerId,
+        documentId: "x".repeat(100_000),
+        data: new Uint8Array(),
+      }));
+      for (let i = 0; i < 100 && !replies.some((f) => f.type === "doc-unavailable"); i++)
+        await new Promise((r) => setTimeout(r, 20));
+      assert(replies.some((f) => f.type === "doc-unavailable"), "an oversize document id is a document nobody has");
+      for (const key of syncAccessCache.keys()) assert(key.length < 1000, `cache holds a ${key.length}-char key`);
+      // A document id that is not text is a document nobody has, and the frames after it still get answers.
+      for (const odd of [7, { a: 1 }, ["x"], true]) {
+        const seenBefore = replies.length;
+        ws.send(AM.cbor.encode({
+          type: "request",
+          senderId: "raw-id-flooder",
+          targetId: automerge.peerId,
+          documentId: odd,
+          data: new Uint8Array(),
+        }));
+        ws.send(AM.cbor.encode({
+          type: "request",
+          senderId: "raw-id-flooder",
+          targetId: automerge.peerId,
+          documentId: `after-${JSON.stringify(odd)}`,
+          data: new Uint8Array(),
+        }));
+        for (
+          let i = 0;
+          i < 100 && !replies.slice(seenBefore).some((f) => f.documentId === `after-${JSON.stringify(odd)}`);
+          i++
+        ) { await new Promise((r) => setTimeout(r, 20)); }
+        assert(
+          replies.slice(seenBefore).some((f) => f.documentId === `after-${JSON.stringify(odd)}`),
+          `no answer after a document id of ${JSON.stringify(odd)}`,
+        );
+      }
+      // Past the bound the socket closes, so a flood of new ids costs a bounded
+      // number of lookups and a real client reconnects with fresh state.
+      let shut = false;
+      ws.onclose = () => shut = true;
+      const cached = syncAccessCache.size;
+      for (let i = 0; i < 4 * FRAME_BURST; i++) {
+        ws.send(AM.cbor.encode({
+          type: "request",
+          senderId: "raw-id-flooder",
+          targetId: automerge.peerId,
+          documentId: crypto.randomUUID(),
+          data: new Uint8Array(),
+        }));
+      }
+      for (let i = 0; i < 100 && !shut; i++) await new Promise((r) => setTimeout(r, 20));
+      assert(shut, "Expected the server to close a flooding socket within 2s; it stayed open.");
+      assert(
+        replies.some((f) => f.type === "error" && String(f.message).includes("this connection was closed")),
+        "the flooder is told why before the close",
+      );
+      const lookups = syncAccessCache.size - cached;
+      assert(lookups > 0 && lookups <= FRAME_BURST + FRAME_RATE, `${lookups} lookups for ${4 * FRAME_BURST} frames`);
     }
 
     // An authenticated client repo syncs a shared doc end-to-end.
@@ -6296,6 +6405,38 @@ Deno.test(async function allTests(t) {
       const rows = JSON.stringify(await get<Table>(jwt, `/sheet/library:audit`));
       assert(rows.includes("mcp resources/read") && rows.includes("mcp prompts/get"), rows.slice(0, 500));
     }
+
+    // A multi column takes an array of its options through write_cells, and refuses a pick outside them.
+    {
+      const tagged = automerge.create<Sheet>({
+        type: "table",
+        data: [arrayify([{ name: "tags", type: "multi:red,green,blue", key: "0" }]), { 0: ["red"] }],
+      });
+      const tagged_id = `table:${tagged.documentId}`;
+      await put(jwt, `/library/${tagged_id}`, {});
+      const tag = async (value: unknown) =>
+        (await (await app.request(`/mcp/${tagged_id}`, {
+          method: "POST",
+          headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "write_cells", arguments: { cells: [{ row: 0, col: "tags", value }] } },
+          }),
+        })).json()).result;
+      assertEquals((await tag(["green", "blue"])).structuredContent, { written: 1, rows: 1 });
+      assertEquals(JSON.stringify(tagged.doc().data[1]), `{"0":["green","blue"]}`);
+      for (const bad of [["purple"], ["red", "red"], "red"]) {
+        const refusal = await tag(bad);
+        assertEquals(refusal.isError, true);
+        assert(
+          refusal.content[0].text.includes("red, green, blue") || refusal.content[0].text.includes("multi:"),
+          refusal.content[0].text,
+        );
+      }
+      assertEquals(JSON.stringify(tagged.doc().data[1]), `{"0":["green","blue"]}`, "a refused pick wrote nothing");
+    }
   });
 
   // The boundary is the whole feature: a row that does not match the columns, or a value that does not parse at its
@@ -6380,6 +6521,53 @@ Deno.test(async function allTests(t) {
       assert(nested.text.includes("no cell can hold"), nested.text);
       const empty = await refused({ rows: [] });
       assert(empty.text.includes("empty rows array"), empty.text);
+    }
+
+    // A multi column takes an array of its options, a blank, and nothing else; the array is stored as sent and every
+    // export writes it.
+    {
+      const tagged = automerge.create<Sheet>({
+        type: "table",
+        data: [
+          arrayify([{ name: "tags", type: "multi:red,green,blue", key: "0" }, { name: "n", type: "text", key: "1" }]),
+          {
+            0: ["red"],
+            1: "a",
+          },
+        ],
+      });
+      const tagged_id = `table:${tagged.documentId}`;
+      await put(jwt, `/library/${tagged_id}`, {});
+      const { data } = await post(jwt, `/sheet/${tagged_id}`, {
+        rows: [{ tags: ["red", "blue"], n: "b" }, { tags: null, n: "c" }, { tags: [], n: "d" }],
+      });
+      assertEquals(data, { appended: 3, rows: 4 });
+      assertEquals((await get<Table>(jwt, `/sheet/${tagged_id}`)).slice(1), [
+        { tags: ["red"], n: "a" },
+        { tags: ["red", "blue"], n: "b" },
+        { tags: null, n: "c" },
+        { tags: [], n: "d" },
+      ]);
+      for (const tags of [["purple"], ["red", "red"], "red", [1]]) {
+        const res = await refused({ rows: [{ tags, n: "x" }] }, tagged_id);
+        assert(res.text.includes("multi:red,green,blue") && res.text.includes("row 1"), res.text);
+      }
+      const text = await refused({ rows: [{ item: ["a"], qty: 1 }] });
+      assert(text.text.includes("no cell can hold"), "an array under a text column is still refused");
+      const { data: [, ...queried] }: { data: Table } = await post(jwt, `/query`, {
+        lang: "sql",
+        code: `select n from @${tagged_id} order by n`,
+        args: [],
+      });
+      assertEquals(queried.length, 4);
+      for (const format of ["csv", "md", "xlsx", "parquet", "json", "ndjson"]) {
+        const res = await app.request(`/export/${tagged_id}.${format}`, {
+          headers: { Authorization: `Bearer ${jwt}` },
+        });
+        assertEquals(res.status, 200, `${format}: ${await res.clone().text()}`);
+        if (format === "csv") assertEquals((await res.text()).split("\n")[2], `"red,blue",b`);
+        else await res.arrayBuffer();
+      }
     }
 
     // No access at all, and read access that is not write access.

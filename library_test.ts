@@ -43,7 +43,7 @@ import { boot, El, refused, resolver, rowsOf, shelf, until } from "./page_harnes
 // secret. The button asks for the request now, and what comes back is shown
 // where the fields are, before the sheet has to wait for the poller.
 Deno.test("a feed's request can be tested before the poller runs it", async () => {
-  const { app, all, text, click, settle } = await boot("http://localhost/");
+  const { app, all, text, click, settle, type_ } = await boot("http://localhost/");
   const asked: { id: string; data: { url: string; headers: string; method: string; body: string } }[] = [];
   app.ports.preflight.subscribe((ask: (typeof asked)[number]) => asked.push(ask));
   app.ports.docSelected.send({
@@ -103,7 +103,7 @@ Deno.test("a feed's request can be tested before the poller runs it", async () =
   // A connected database, on the same page: its tables are asked for once as it
   // opens, and a table's rows only once one is picked.
   const loads: string[] = [];
-  const previews: { id: string; table: string }[] = [];
+  const previews: { id: string; table: string; filters: { column: string; op: string; value: string }[] }[] = [];
   app.ports.codexLoad.subscribe((id: string) => loads.push(id));
   app.ports.codexPreview.subscribe((ask: (typeof previews)[number]) => previews.push(ask));
   app.ports.docSelected.send({ id: "codex-db:abc", data: { doc: { type: "codex-db" } } });
@@ -139,7 +139,7 @@ Deno.test("a feed's request can be tested before the poller runs it", async () =
   assert(text().includes("Pick a table to read its first rows."), `the grid waits on a pick: ${text().slice(-300)}`);
 
   await click(orders);
-  assertEquals(previews, [{ id: "codex-db:abc", table: "orders" }]);
+  assertEquals(previews, [{ id: "codex-db:abc", table: "orders", filters: [] }]);
   assertEquals(all("button.codex-table")[0]?.getAttribute("aria-pressed"), "true", "the pick is marked");
 
   app.ports.docQueried.send({
@@ -151,6 +151,38 @@ Deno.test("a feed's request can be tested before the poller runs it", async () =
   });
   await settle();
   assert(all("td").some((td) => td.textContent?.trim() === "2026-09-01"), "the preview draws as the grid");
+
+  // Filters ride the apply button, never a keystroke, and a refusal keeps the page as it was.
+  const filterRows = () => all("div.codex-filter");
+  const addFilter = () => all("button.chip").find((b) => b.textContent === "add filter");
+  const apply = () => all("button[aria-label='apply filters']")[0];
+  assertEquals(filterRows().length, 0, "no filter until one is added");
+  await click(addFilter());
+  assertEquals(filterRows().length, 1);
+  await type_(all("select[aria-label='filter operator']")[0], "gte");
+  await type_(all("input[aria-label='filter value']")[0], "7");
+  assertEquals(previews.length, 1, "typing asks nothing");
+  await click(apply());
+  assertEquals(previews[1], {
+    id: "codex-db:abc",
+    table: "orders",
+    filters: [{ column: "id", op: "gte", value: "7" }],
+  });
+  await type_(all("select[aria-label='filter operator']")[0], "isnull");
+  assertEquals(all("input[aria-label='filter value']").length, 0, "isnull takes no value");
+  for (let i = 0; i < 4; i++) await click(addFilter());
+  assertEquals(filterRows().length, 5);
+  assert(!addFilter(), "five filters is the most");
+  await click(all("button[aria-label='remove filter']")[0]);
+  assertEquals(filterRows().length, 4);
+  app.ports.docErrored.send("That filter names a column the table does not have.");
+  await settle();
+  assert(text().includes("That filter names a column"), "the refusal shows in the banner");
+  assertEquals(all("button.codex-table")[0]?.getAttribute("aria-pressed"), "true", "the pick stays");
+  assertEquals(filterRows().length, 4, "and so do the filters");
+  assert(all("td").some((td) => td.textContent?.trim() === "2026-09-01"), "and the last rows");
+  await click(all("button.codex-table")[0]);
+  assertEquals(filterRows().length, 0, "another pick starts without filters");
 
   // codex-scrapsheets answers no preview. jsdom, like a screen reader, delivers
   // a click dispatched at a disabled button, so the update must refuse it too.
@@ -168,6 +200,7 @@ Deno.test("a feed's request can be tested before the poller runs it", async () =
   );
   assert(text().includes("only a connected database answers a preview"), "the aside says why");
   await click(shopButton);
+  assertEquals(filterRows().length, 0, "and draws no filter row");
   assertEquals(previews, [], "a disabled table asks for no preview, even from a dispatched click");
   assertEquals(shopButton?.getAttribute("aria-pressed"), "false", "still not picked");
 });

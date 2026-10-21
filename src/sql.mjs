@@ -661,7 +661,20 @@ const textType = (type) => TEXT_TYPES.includes(type) || /^enum:.+/.test(type);
 
 /** `enum:a,b` carries its own options, so it is a family rather than a name and
  * is matched by its prefix. */
-export const knownType = (type) => Object.hasOwn(COLUMN_TYPES, type) || /^enum:.+/.test(type);
+export const knownType = (type) => {
+  const picks = multiOptions(type);
+  return picks
+    ? picks.length > 0 && new Set(picks).size === picks.length
+    : Object.hasOwn(COLUMN_TYPES, type) || /^enum:.+/.test(type);
+};
+
+/** `multi:a,b` is a family like `enum:`, and its cell is an array of its options.
+ * Options split on `,` and are trimmed, as the page's colDecoder reads `enum:`.
+ * Null for any other type. */
+export const multiOptions = (type) =>
+  typeof type === "string" && type.startsWith("multi:")
+    ? type.slice(6).split(",").map((x) => x.trim()).filter(Boolean)
+    : null;
 
 export const checkColumnTypes = (id, cols, rows) => {
   for (const col of cols) {
@@ -675,7 +688,7 @@ export const checkColumnTypes = (id, cols, rows) => {
       // `percentage`. Searching the canonical half alone sent `PCT` to `int`.
       const meant = nearest(String(col.type), Object.keys(COLUMN_TYPES));
       throw new Error(explain(`Column "${col.name}" of @${id} declares a type nobody knows.`, {
-        Expected: `one of ${CANONICAL_TYPES.join(", ")}, or enum: followed by the options`,
+        Expected: `one of ${CANONICAL_TYPES.join(", ")}, or enum: or multi: followed by the options`,
         Received: show(col.type),
         Source: `data[0] of @${id}, column "${col.name}"`,
         "Did you mean": meant && canonicalType(meant),
@@ -683,6 +696,26 @@ export const checkColumnTypes = (id, cols, rows) => {
           ? `set that column's type to ${canonicalType(meant)}, or run describe @${id} to see the sheet as it stands`
           : `set that column's type to one of those, or run describe @${id} to see the sheet as it stands`,
       }));
+    }
+    const picks = multiOptions(col.type);
+    if (picks) {
+      for (let i = 0; i < rows.length; i++) {
+        const v = rows[i][col.name];
+        if (absent(v)) {
+          rows[i][col.name] = null;
+          continue;
+        }
+        const bad = !Array.isArray(v) || v.some((x) => typeof x !== "string" || !picks.includes(x)) ||
+          new Set(v).size !== v.length;
+        if (!bad) continue;
+        throw new Error(explain(`Column "${col.name}" of @${id} holds a value its type does not allow.`, {
+          Expected: `${col.type}, so an array of those options with none twice, or a blank`,
+          Received: show(v),
+          Source: `row ${i + 1} of @${id}, column "${col.name}"`,
+          Fix: `use only ${picks.join(", ")}, or add the option to the column's type`,
+        }));
+      }
+      continue;
     }
     if (!NUMERIC_TYPES.includes(col.type)) continue;
     const duration = canonicalType(col.type) === "duration";

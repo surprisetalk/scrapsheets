@@ -5,7 +5,14 @@
 // both of them.
 
 import { assert, assertEquals } from "@std/assert";
-import { cbor, decodeHeads, encodeHeads, Repo as AutomergeRepo } from "@automerge/automerge-repo";
+import {
+  cbor,
+  decodeHeads,
+  encodeHeads,
+  NetworkAdapter,
+  Presence,
+  Repo as AutomergeRepo,
+} from "@automerge/automerge-repo";
 import { decodeSyncMessage, encodeSyncMessage, getHistory, view } from "@automerge/automerge";
 import { JSDOM } from "jsdom";
 import { BrowserWebSocketClientAdapter } from "./src/automerge-repo-ws.mjs";
@@ -62,7 +69,7 @@ const glueSource = async (deps: Record<string, unknown>) => {
  * `Promise.race` cannot cancel, and a test does not need to leave that behind.
  */
 const fakeHandle = (documentId: string, doc: Record<string, unknown>) => {
-  let listeners: ((d: unknown) => void)[] = [];
+  const listeners: Record<string, ((d: unknown) => void)[]> = {};
   // Every change moves the heads on, the way a real document's do.
   let changes = 0;
   const handle = {
@@ -75,15 +82,41 @@ const fakeHandle = (documentId: string, doc: Record<string, unknown>) => {
       changes++;
       // The shape automerge sends and `DocDelta` in src/Main.elm decodes. A field
       // short of it and the port refuses the whole value.
-      for (const listener of listeners) listener({ doc, handle, patchInfo: null, patches: [] });
+      for (const listener of listeners.change ?? []) listener({ doc, handle, patchInfo: null, patches: [] });
     },
-    on: (_event: string, cb: (d: unknown) => void) => listeners.push(cb),
-    off: (_event: string, cb: (d: unknown) => void) => {
-      listeners = listeners.filter((l) => l !== cb);
+    on: (event: string, cb: (d: unknown) => void) => (listeners[event] ??= []).push(cb),
+    off: (event: string, cb: (d: unknown) => void) => {
+      listeners[event] = (listeners[event] ?? []).filter((l) => l !== cb);
+    },
+    /** What this tab sent to its peers, in order. */
+    broadcasts: [] as unknown[],
+    broadcast: (message: unknown) => handle.broadcasts.push(message),
+    /** A frame a peer sent, as the real handle emits it. */
+    hear: (senderId: string, message: unknown) => {
+      for (const listener of listeners["ephemeral-message"] ?? []) listener({ handle, senderId, message });
     },
   };
   return handle;
 };
+
+/** Two ends of one in-memory wire, for two real repos in one test. */
+class Pipe extends NetworkAdapter {
+  other!: Pipe;
+  isReady = () => true;
+  whenReady = () => Promise.resolve();
+  connect(peerId: never, peerMetadata: never) {
+    this.peerId = peerId;
+    this.peerMetadata = peerMetadata;
+    if (this.other.peerId) {
+      this.emit("peer-candidate", { peerId: this.other.peerId, peerMetadata: this.other.peerMetadata! });
+      this.other.emit("peer-candidate", { peerId, peerMetadata });
+    }
+  }
+  send(message: never) {
+    queueMicrotask(() => this.other.emit("message", message));
+  }
+  disconnect() {}
+}
 
 export const glue = async (
   url: string,
@@ -192,6 +225,7 @@ export const glue = async (
     initializeWasm: () => Promise.resolve(),
     cbor,
     decodeHeads,
+    Presence,
     decodeSyncMessage,
     getHistory,
     view,
@@ -283,6 +317,14 @@ export const glue = async (
     document: async (id: string) => (await repo.find(id.split(":")[1]))?.doc(),
     path: () => dom.window.location.pathname.slice(1),
     handles,
+    /** A second real repo on the page's repo, over an in-memory wire. */
+    link: () => {
+      const [mine, theirs] = [new Pipe(), new Pipe()];
+      mine.other = theirs;
+      theirs.other = mine;
+      (repo as unknown as AutomergeRepo).networkSubsystem.addNetworkAdapter(mine);
+      return new AutomergeRepo({ network: [theirs] });
+    },
     // The address bar: a new path, then the popstate Elm's navigation listens to.
     go: async (path: string) => {
       dom.window.history.pushState({}, "", path);

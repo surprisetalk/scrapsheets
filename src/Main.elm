@@ -25,7 +25,9 @@ port module Main exposing
     , blankRows
     , canonicalTypeNames
     , cellDecoder
+    , cellRefusal
     , cellRewrites
+    , cellValue
     , chartAt
     , chartBoxes
     , chartFold
@@ -61,6 +63,7 @@ port module Main exposing
     , kindSpec
     , knownTypeName
     , legendLayout
+    , madeCol
     , main
     , maxFuzzyPairs
     , maxFuzzyRows
@@ -77,6 +80,8 @@ port module Main exposing
     , parseDay
     , parseJson
     , parseTsv
+    , peerColours
+    , peersMax
     , pinLeft
     , pruneView
     , queryHome
@@ -893,6 +898,11 @@ port newDoc : E.Value -> Cmd msg
 port forkDoc : String -> Cmd msg
 
 
+{-| Copy the fork's query back to the sheet it came from, if that sheet's query is still the one the fork started from.
+-}
+port promoteDoc : String -> Cmd msg
+
+
 {-| Save the chart on screen as "svg" or "png".
 -}
 port downloadChart : String -> Cmd msg
@@ -927,6 +937,9 @@ port docQueried : (Idd D.Value -> msg) -> Sub msg
 
 
 port docErrored : (String -> msg) -> Sub msg
+
+
+port peersChanged : (Idd (List String) -> msg) -> Sub msg
 
 
 {-| The poller's request, once, now: what the sheet would fetch with what it
@@ -1044,9 +1057,10 @@ port codexLoaded : (D.Value -> msg) -> Sub msg
 
 
 {-| One table's first rows. The rows come back on `docQueried`, and a refusal on
-`codexLoaded` as `{ id, error }`.
+`codexLoaded` as `{ id, error }`. With filters, a refusal comes back on
+`docErrored` and the pick, the filters and the last rows stay.
 -}
-port codexPreview : { id : String, table : String } -> Cmd msg
+port codexPreview : { id : String, table : String, filters : List CodexFilter } -> Cmd msg
 
 
 {-| Which sheets read this one, asked for when a rename or a delete would break
@@ -1175,10 +1189,11 @@ type alias Model =
     -- A past version of the open sheet. Its own field and never `sheet`: every
     -- view of a `Sheet` is wired to writes, and this one is read and nothing else.
     , history : Maybe History
+    , peers : List String
 
     -- The open connected database's tables and the one picked, if the open
     -- sheet is a codex.
-    , codex : Maybe { id : Id, tables : Maybe (Result String (List CodexTable)), picked : Maybe String }
+    , codex : Maybe { id : Id, tables : Maybe (Result String (List CodexTable)), picked : Maybe String, filters : List CodexFilter }
     , freshness : Dict Id Freshness
     , tutorial : Maybe Int
     , embed : Bool
@@ -1402,6 +1417,7 @@ type alias Sheet =
     -- I did not touch, I do not write.
     , storedView : SheetView
     , lineage : Maybe String
+    , promotable : Bool
     }
 
 
@@ -1429,6 +1445,7 @@ emptySheet =
     , preflight = Nothing
     , run = Nothing
     , lineage = Nothing
+    , promotable = False
     , widths = Dict.empty
     , decimals = Dict.empty
     , formats = Dict.empty
@@ -2282,6 +2299,7 @@ type Type
     | Create
     | Form
     | Enum (List String)
+    | Multi (List String)
     | Thumb
 
 
@@ -2623,6 +2641,9 @@ spec typ =
         Enum options ->
             { name = "enum:" ++ String.join "," options, align = S.textAlignLeft, width = Nothing, drawsText = True }
 
+        Multi options ->
+            { name = "multi:" ++ String.join "," options, align = S.textAlignLeft, width = Nothing, drawsText = True }
+
         Thumb ->
             { name = "thumb", align = S.textAlignLeft, width = Just 64, drawsText = False }
 
@@ -2858,6 +2879,32 @@ tableDecoder =
         (D.map (Array.slice 1 -1 << Array.push Dict.empty) (D.array rowDecoder))
 
 
+{-| One `where` of a preview. `codexOps` is the ops `CODEX_OPS` in `main.ts`
+serves, and `codexFiltersMax` is its `CODEX_FILTERS_MAX`.
+-}
+type alias CodexFilter =
+    { column : String
+    , op : String
+    , value : String
+    }
+
+
+codexOps : List String
+codexOps =
+    [ "eq", "neq", "lt", "lte", "gt", "gte", "like", "ilike", "isnull", "notnull" ]
+
+
+codexFiltersMax : Int
+codexFiltersMax =
+    5
+
+
+type CodexFilterField
+    = FilterColumn
+    | FilterOp
+    | FilterValue
+
+
 {-| One table of a connected database, as `GET /codex/:id` lists it.
 -}
 type alias CodexTable =
@@ -2941,7 +2988,12 @@ colDecoder =
                     |> Enum
 
             else
-                Dict.get typeStr typeSpellings |> Maybe.withDefault Unknown
+                case multiOptions typeStr of
+                    Just options ->
+                        Multi options
+
+                    Nothing ->
+                        Dict.get typeStr typeSpellings |> Maybe.withDefault Unknown
     in
     D.oneOf
         [ D.map3 (\key name raw -> Col key name (parseType raw) raw)
@@ -3007,7 +3059,80 @@ its prefix -- the same rule `knownType` applies in `src/sql.mjs`.
 -}
 knownTypeName : String -> Bool
 knownTypeName name =
-    List.any (Tuple.first >> (==) name) columnTypes || (String.startsWith "enum:" name && String.length name > 5)
+    case multiOptions name of
+        Just options ->
+            not (List.isEmpty options) && Set.size (Set.fromList options) == List.length options
+
+        Nothing ->
+            List.any (Tuple.first >> (==) name) columnTypes || (String.startsWith "enum:" name && String.length name > 5)
+
+
+{-| The options of a `multi:a,b` type string, split and trimmed the way
+`multiOptions` in `src/sql.mjs` reads them. Nothing for any other type.
+-}
+multiOptions : String -> Maybe (List String)
+multiOptions typeStr =
+    if String.startsWith "multi:" typeStr then
+        Just (picks (String.dropLeft 6 typeStr))
+
+    else
+        Nothing
+
+
+picks : String -> List String
+picks text =
+    text |> String.split "," |> List.map String.trim |> List.filter (not << String.isEmpty)
+
+
+{-| What a typed cell becomes in the document. A multi column holds the array
+of its picks, and null when blank; every other type holds the text.
+-}
+cellValue : Col -> String -> E.Value
+cellValue col text =
+    case col.typ of
+        Multi _ ->
+            iif (String.trim text == "") E.null (E.list E.string (picks text))
+
+        _ ->
+            E.string text
+
+
+{-| What the editor opens with. A blank multi cell opens empty: `NULL` is how a
+blank draws, and no option lists it, so leaving the cell unchanged would be
+refused.
+-}
+editSeed : Col -> Row -> String
+editSeed col row =
+    case col.typ of
+        Multi _ ->
+            iif (blankCell col.key row) "" (cellText col.key row)
+
+        _ ->
+            row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
+
+
+{-| Why a typed cell cannot be stored in this column, if it cannot: a pick
+outside the multi column's options, or one named twice.
+-}
+cellRefusal : Col -> String -> Maybe String
+cellRefusal col text =
+    case col.typ of
+        Multi options ->
+            let
+                chosen =
+                    picks text
+            in
+            case List.filter (\pick -> not (List.member pick options)) chosen of
+                bad :: _ ->
+                    Just ("Expected picks from " ++ String.join ", " options ++ ", received \"" ++ bad ++ "\". Source: the " ++ col.name ++ " cell. Fix: pick from those options, comma separated, or add the option to the column type.")
+
+                [] ->
+                    iif (Set.size (Set.fromList chosen) /= List.length chosen)
+                        (Just ("Expected each pick of " ++ String.join ", " options ++ " once, received \"" ++ text ++ "\". Source: the " ++ col.name ++ " cell. Fix: name each option once."))
+                        Nothing
+
+        _ ->
+            Nothing
 
 
 {-| What the refusal offers. The names themselves, not the types behind them:
@@ -3123,6 +3248,7 @@ init flags url nav =
                 , showShortcuts = False
                 , palette = Nothing
                 , history = Nothing
+                , peers = []
                 , codex = Nothing
                 , freshness = Dict.empty
                 , tutorial = iif (tutorialStep < 0) Nothing (Just (clamp 0 4 tutorialStep))
@@ -3188,9 +3314,11 @@ type Msg
     | DocNotify (Idd D.Value)
     | DocQuery (Idd D.Value)
     | DocError String
+    | PeersLoad (Idd (List String))
     | DocMsg DocMsg
     | DocNew E.Value
     | DocFork
+    | DocPromote
     | ChartDownload String
     | DocNewQuery
     | DocNewTable
@@ -3224,6 +3352,10 @@ type Msg
     | CodexLoad D.Value
     | CodexPick String
     | CodexRefresh
+    | CodexFilterAdd
+    | CodexFilterEdit Int CodexFilterField String
+    | CodexFilterRemove Int
+    | CodexFilterApply
     | HistoryMsg HistoryMsg
     | ShareEmailChange String
     | ShareRoleChange String
@@ -3403,6 +3535,7 @@ subs model =
         , docNotified DocNotify
         , docQueried DocQuery
         , docErrored DocError
+        , peersChanged PeersLoad
         , authResult AuthResult
         , Browser.onKeyDown keyEventDecoder
         , pasteFromClipboard ClipboardPaste
@@ -3764,6 +3897,7 @@ update msg ({ sheet, auth } as model) =
                 , showShortcuts = next.showShortcuts && not next.showSettings
                 , pending = iif (next.showSettings || next.id /= model.id) Nothing next.pending
                 , history = iif (next.showSettings || next.id /= model.id) Nothing next.history
+                , peers = iif (next.id /= model.id) [] next.peers
                 , share =
                     -- Whatever the panel holds belongs to the sheet it was
                     -- loaded for, so a navigation empties it. A secret goes
@@ -3860,6 +3994,7 @@ update msg ({ sheet, auth } as model) =
                     , preflight = Nothing
                     , run = Nothing
                     , lineage = data.data.doc |> D.decodeValue (D.field "forked_from" D.string) |> Result.toMaybe
+                    , promotable = isPromotable data.data.doc
                     , widths = stored.widths
                     , decimals = stored.decimals
                     , formats = stored.formats
@@ -3878,7 +4013,7 @@ update msg ({ sheet, auth } as model) =
                 , codex =
                     case doc of
                         Ok (Codex _) ->
-                            iif reopened model.codex (Just { id = data.id, tables = Nothing, picked = Nothing })
+                            iif reopened model.codex (Just { id = data.id, tables = Nothing, picked = Nothing, filters = [] })
 
                         _ ->
                             Nothing
@@ -3921,6 +4056,7 @@ update msg ({ sheet, auth } as model) =
                                             data.data.doc
                                                 |> D.decodeValue (D.field "forked_from" D.string)
                                                 |> Result.toMaybe
+                                        , promotable = isPromotable data.data.doc
                                     }
                         }
             , Cmd.none
@@ -4006,6 +4142,13 @@ update msg ({ sheet, auth } as model) =
             ( { model | error = error }
             , Cmd.none
             )
+
+        PeersLoad { id, data } ->
+            if id /= model.sheet.id then
+                ( model, Cmd.none )
+
+            else
+                ( { model | peers = peerColours data }, Cmd.none )
 
         DocMsg edit ->
             updateDocMsg edit model
@@ -4322,8 +4465,8 @@ update msg ({ sheet, auth } as model) =
             -- disabled button (a screen reader, a test) still reaches here.
             case ( model.codex, model.sheet.doc ) of
                 ( Just codex, Ok (Codex "codex-db") ) ->
-                    ( { model | codex = Just { codex | picked = Just table }, sheet = { sheet | table = Err "" } }
-                    , codexPreview { id = codex.id, table = table }
+                    ( { model | codex = Just { codex | picked = Just table, filters = [] }, sheet = { sheet | table = Err "" } }
+                    , codexPreview { id = codex.id, table = table, filters = [] }
                     )
 
                 _ ->
@@ -4332,11 +4475,73 @@ update msg ({ sheet, auth } as model) =
         CodexRefresh ->
             case model.codex of
                 Just codex ->
-                    ( { model | codex = Just { codex | tables = Nothing, picked = Nothing }, sheet = { sheet | table = Err "" } }
+                    ( { model | codex = Just { codex | tables = Nothing, picked = Nothing, filters = [] }, sheet = { sheet | table = Err "" } }
                     , codexLoad codex.id
                     )
 
                 Nothing ->
+                    ( model, Cmd.none )
+
+        CodexFilterAdd ->
+            case model.codex of
+                Just codex ->
+                    case codexPickedColumns codex of
+                        ( column, _ ) :: _ ->
+                            if List.length codex.filters >= codexFiltersMax then
+                                ( model, Cmd.none )
+
+                            else
+                                ( { model | codex = Just { codex | filters = codex.filters ++ [ { column = column, op = "eq", value = "" } ] } }, Cmd.none )
+
+                        [] ->
+                            ( model, Cmd.none )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        CodexFilterEdit index field value ->
+            let
+                edit filter =
+                    case field of
+                        FilterColumn ->
+                            { filter | column = value }
+
+                        FilterOp ->
+                            { filter | op = value, value = iif (List.member value [ "isnull", "notnull" ]) "" filter.value }
+
+                        FilterValue ->
+                            { filter | value = value }
+            in
+            ( { model
+                | codex =
+                    Maybe.map
+                        (\codex -> { codex | filters = List.indexedMap (\i filter -> iif (i == index) (edit filter) filter) codex.filters })
+                        model.codex
+              }
+            , Cmd.none
+            )
+
+        CodexFilterRemove index ->
+            ( { model
+                | codex =
+                    Maybe.map
+                        (\codex -> { codex | filters = List.indexedMap Tuple.pair codex.filters |> List.filter (\( i, _ ) -> i /= index) |> List.map Tuple.second })
+                        model.codex
+              }
+            , Cmd.none
+            )
+
+        CodexFilterApply ->
+            case ( model.codex, model.sheet.doc ) of
+                ( Just { id, picked, filters }, Ok (Codex "codex-db") ) ->
+                    case picked of
+                        Just table ->
+                            ( model, codexPreview { id = id, table = table, filters = filters } )
+
+                        Nothing ->
+                            ( model, Cmd.none )
+
+                _ ->
                     ( model, Cmd.none )
 
         HistoryMsg historyMsg ->
@@ -4583,6 +4788,9 @@ update msg ({ sheet, auth } as model) =
 
         DocFork ->
             ( model, forkDoc sheet.id )
+
+        DocPromote ->
+            ( model, promoteDoc sheet.id )
 
         ChartDownload format ->
             ( model, downloadChart format )
@@ -5598,7 +5806,7 @@ update msg ({ sheet, auth } as model) =
                                                                 displayYToDocY model.search sheet tbl.cols tbl.rows y
                                                                     |> Maybe.andThen (\docY -> Array.get (docY - 1) tbl.rows)
                                                                     |> Maybe.andThen (Dict.get col.key)
-                                                                    |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
+                                                                    |> Maybe.andThen (D.decodeValue (D.nullable string) >> Result.toMaybe >> Maybe.andThen identity)
                                                             )
                                                         |> Maybe.withDefault ""
                                                 )
@@ -5929,7 +6137,7 @@ updateDocMsg edit ({ sheet } as model) =
                                                 Just docY ->
                                                     ( [ { action = "set"
                                                         , path = [ E.int docY, E.string col.key ]
-                                                        , value = E.string write
+                                                        , value = cellValue col write
                                                         }
                                                       ]
                                                     , [ { action = "set"
@@ -6223,7 +6431,7 @@ updateDocMsg edit ({ sheet } as model) =
                                                     (\col docY ->
                                                         ( { action = "set"
                                                           , path = [ E.int docY, E.string col.key ]
-                                                          , value = E.string ""
+                                                          , value = cellValue col ""
                                                           }
                                                         , { action = "set"
                                                           , path = [ E.int docY, E.string col.key ]
@@ -6312,10 +6520,10 @@ updateDocMsg edit ({ sheet } as model) =
                                         ++ write
                                         ++ "\". A type nobody knows reads back as unknown, and a numeric column that reads back as unknown stops being checked -- its blanks start summing as zeros. Known types: "
                                         ++ String.join ", " canonicalTypeNames
-                                        ++ ", or enum: followed by the options, e.g. enum:small,large."
+                                        ++ ", or enum: or multi: followed by the options, e.g. enum:small,large."
 
                             else
-                                Nothing
+                                Array.get x table.cols |> Maybe.andThen (\col -> cellRefusal col write)
 
                         _ ->
                             Nothing
@@ -6641,10 +6849,7 @@ updateKeyDown event ({ sheet } as model) =
                             ( Just c, Just r ) ->
                                 let
                                     val =
-                                        r
-                                            |> Dict.get c.key
-                                            |> Maybe.andThen (D.decodeValue string >> Result.toMaybe)
-                                            |> Maybe.withDefault ""
+                                        editSeed c r
                                 in
                                 ( { model | sheet = { sheet | write = Just val } }
                                 , Task.attempt (always NoOp) (Dom.focus "new-cell")
@@ -6955,7 +7160,7 @@ updatePaste text ({ sheet } as model) =
                                             in
                                             { action = "set"
                                             , path = [ E.int y, E.string (colKey x) ]
-                                            , value = E.string value
+                                            , value = Array.get x tbl.cols |> Maybe.map (\col -> cellValue col value) |> Maybe.withDefault (E.string value)
                                             }
                                         )
                             )
@@ -6964,12 +7169,25 @@ updatePaste text ({ sheet } as model) =
                 -- Combine all patches: columns first, then rows, then values
                 allPatches =
                     newColPatches ++ newRowPatches ++ cellPatches
-            in
-            if List.isEmpty allPatches then
-                ( model, Cmd.none )
 
-            else
-                ( model, changeDoc { id = sheet.id, data = allPatches } )
+                -- A pick the column cannot hold refuses the whole paste.
+                refusal =
+                    data
+                        |> List.concatMap
+                            (\row -> List.indexedMap (\colOffset value -> Array.get (sel.x + colOffset) tbl.cols |> Maybe.andThen (\col -> cellRefusal col value)) row)
+                        |> List.filterMap identity
+                        |> List.head
+            in
+            case refusal of
+                Just why ->
+                    ( { model | error = why }, Cmd.none )
+
+                Nothing ->
+                    if List.isEmpty allPatches then
+                        ( model, Cmd.none )
+
+                    else
+                        ( model, changeDoc { id = sheet.id, data = allPatches } )
 
         Ok _ ->
             ( { model | error = computedCell }, Cmd.none )
@@ -8210,7 +8428,7 @@ replaceMatches model sheet fr tbl matches =
                                 in
                                 ( { action = "set"
                                   , path = [ E.int docY, E.string col.key ]
-                                  , value = E.string fr.replaceText
+                                  , value = cellValue col fr.replaceText
                                   }
                                 , { action = "set"
                                   , path = [ E.int docY, E.string col.key ]
@@ -8224,23 +8442,34 @@ replaceMatches model sheet fr tbl matches =
 
         forward =
             List.map Tuple.first patchPairs
+
+        refusal =
+            matches
+                |> List.filterMap (\matchIdx -> Array.get matchIdx.x tbl.cols |> Maybe.andThen (\col -> cellRefusal col fr.replaceText))
+                |> List.head
     in
     if not (List.isEmpty undrawn) then
         ( { model | error = undrawnRows undrawn }, Cmd.none )
 
-    else if List.isEmpty forward then
-        ( model, Cmd.none )
-
     else
-        ( { model
-            | sheet =
-                { sheet
-                    | undoStack = { forward = forward, backward = List.map Tuple.second patchPairs } :: sheet.undoStack |> List.take 50
-                    , redoStack = []
-                }
-          }
-        , changeDoc { id = sheet.id, data = forward }
-        )
+        case refusal of
+            Just why ->
+                ( { model | error = why }, Cmd.none )
+
+            Nothing ->
+                if List.isEmpty forward then
+                    ( model, Cmd.none )
+
+                else
+                    ( { model
+                        | sheet =
+                            { sheet
+                                | undoStack = { forward = forward, backward = List.map Tuple.second patchPairs } :: sheet.undoStack |> List.take 50
+                                , redoStack = []
+                            }
+                      }
+                    , changeDoc { id = sheet.id, data = forward }
+                    )
 
 
 {-| The column this rename would collide with, if any. Every read of a sheet is
@@ -8262,6 +8491,16 @@ nameClash cols x write =
 
     else
         cols |> Array.filter (\col -> col.name == write) |> Array.get 0 |> Maybe.map .name
+
+
+isPromotable : D.Value -> Bool
+isPromotable doc =
+    case D.decodeValue (D.field "forked_code" D.string) doc of
+        Ok _ ->
+            True
+
+        Err _ ->
+            False
 
 
 {-| The `library:lineage` rows that name a sheet they depend on. A row with a
@@ -9018,6 +9257,30 @@ firstNear closeness value held =
                 firstNear closeness value rest
 
 
+{-| The most dots the toolbar draws for the tabs sharing a sheet.
+-}
+peersMax : Int
+peersMax =
+    20
+
+
+{-| What a peer sent as its colour, kept only when it is `#` and six lowercase
+hex digits: the string lands in a style, so anything else is dropped unseen.
+-}
+peerColours : List String -> List String
+peerColours colours =
+    let
+        isColour colour =
+            case String.uncons colour of
+                Just ( '#', hex ) ->
+                    String.length hex == 6 && String.all (\c -> Char.isDigit c || (c >= 'a' && c <= 'f')) hex
+
+                _ ->
+                    False
+    in
+    colours |> List.filter isColour |> List.take peersMax
+
+
 {-| The most columns one split may push. A cell with more parts than this says
 the delimiter matches something the values are made of rather than something
 between them -- a space against a column of sentences -- and the sheet it would
@@ -9179,6 +9442,9 @@ seriesEncoder typ =
 
         Enum _ ->
             Just E.string
+
+        Multi _ ->
+            Nothing
 
         Number ->
             Just asNumber
@@ -9646,6 +9912,9 @@ cellDecoder typ decimals format i n =
             Enum _ ->
                 D.map text string
 
+            Multi _ ->
+                D.map text string
+
             Delete ->
                 D.string |> D.map (\sheet_id -> H.button [ A.onClick (DocDelete sheet_id) ] [ text "delete" ])
 
@@ -9934,6 +10203,18 @@ viewHeaderCell sheet col =
                         _ ->
                             False
 
+                -- The cleaning verbs read and write text. A multi cell is a list,
+                -- which they would skip, so the panel does not offer them.
+                cleanable =
+                    movable
+                        && (case col.typ of
+                                Multi _ ->
+                                    False
+
+                                _ ->
+                                    True
+                           )
+
                 -- Only a column whose cells are numbers has a decimal count to
                 -- ask for; every other type reads its cells as the text they
                 -- already are.
@@ -10077,7 +10358,7 @@ viewHeaderCell sheet col =
                                 ]
                             )
                             (text "")
-                        , if movable then
+                        , if cleanable then
                             H.div [ S.displayFlex, S.flexWrapWrap, S.gapRem 0.25, S.marginTop "0.25rem" ]
                                 [ H.button [ A.onClick (DocMsg (SheetColumnTrim col.key)), A.title "drop the spaces around every value in this column" ] [ text "Trim" ]
                                 , H.button [ A.onClick (DocMsg (SheetColumnCase col.key Upper)) ] [ text "UPPER" ]
@@ -10122,7 +10403,7 @@ viewHeaderCell sheet col =
                           -- sheet's rows are its document, which is also where
                           -- `updateDocMsg` reads them, so the preview and the
                           -- verb cannot be looking at two different sheets.
-                          case ( movable, String.toInt sheet.near, sheet.doc ) of
+                          case ( cleanable, String.toInt sheet.near, sheet.doc ) of
                             ( True, Just closeness, Ok (Tab tbl) ) ->
                                 viewNearPreview col closeness tbl.rows
 
@@ -10239,7 +10520,7 @@ viewCell sheet stats pins extents grab mark i n col row =
                         col.raw
 
                     _ ->
-                        row |> Dict.get col.key |> Maybe.andThen (D.decodeValue string >> Result.toMaybe) |> Maybe.withDefault ""
+                        editSeed col row
          , A.onMouseDown CellMouseDown
          , A.onMouseUp CellMouseUp
          , A.onMouseEnter (CellHover (xy i n))
@@ -10681,6 +10962,12 @@ viewToolbar model info =
             , iif (sheet.id == "")
                 []
                 [ H.button [ A.class "chip", A.onClick DocFork, A.title "copy this sheet into one of your own", S.marginLeftAuto ] [ text "fork" ] ]
+            , case ( sheet.doc, sheet.promotable ) of
+                ( Ok (Query _), True ) ->
+                    [ H.button [ A.class "chip", A.onClick DocPromote, A.title "copy this query back to the sheet it was forked from" ] [ text "promote" ] ]
+
+                _ ->
+                    []
             , [ H.button [ A.class "chip", A.onClick (ShortcutsToggle True), iif (sheet.id == "") S.marginLeftAuto (A.classList []) ] [ text "keys" ] ]
             , case sheet.doc of
                 Ok (Tab _) ->
@@ -10703,7 +10990,23 @@ viewToolbar model info =
 
                 _ ->
                     []
+            , viewPeers model.peers
             ]
+
+
+viewPeers : List String -> List (Html Msg)
+viewPeers colours =
+    if List.isEmpty colours then
+        []
+
+    else
+        let
+            n =
+                String.fromInt (List.length colours)
+        in
+        [ H.span [ A.attribute "role" "status", A.attribute "aria-label" "others here", S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ]
+            (List.map (\colour -> H.span [ A.class "peer", S.background colour ] []) colours ++ [ text (n ++ " here") ])
+        ]
 
 
 viewTutorial : Maybe Int -> Html Msg
@@ -12124,6 +12427,61 @@ viewChart cfg tbl =
             ]
 
 
+codexPickedColumns : { a | tables : Maybe (Result String (List CodexTable)), picked : Maybe String } -> List ( String, String )
+codexPickedColumns codex =
+    case ( codex.tables, codex.picked ) of
+        ( Just (Ok tables), Just name ) ->
+            tables |> List.filter (\t -> t.name == name) |> List.head |> Maybe.map .columns |> Maybe.withDefault []
+
+        _ ->
+            []
+
+
+viewCodexFilters : { a | tables : Maybe (Result String (List CodexTable)), picked : Maybe String, filters : List CodexFilter } -> Html Msg
+viewCodexFilters codex =
+    let
+        columns =
+            codexPickedColumns codex
+
+        row index filter =
+            H.div [ A.class "codex-filter", S.displayFlex, S.gapRem 0.25 ]
+                ([ H.select [ A.attribute "aria-label" "filter column", A.onInput (CodexFilterEdit index FilterColumn), A.value filter.column ]
+                    (List.map (\( name, _ ) -> H.option [ A.value name, A.selected (name == filter.column) ] [ text name ]) columns)
+                 , H.select [ A.attribute "aria-label" "filter operator", A.onInput (CodexFilterEdit index FilterOp), A.value filter.op ]
+                    (List.map (\op -> H.option [ A.value op, A.selected (op == filter.op) ] [ text op ]) codexOps)
+                 ]
+                    ++ (if List.member filter.op [ "isnull", "notnull" ] then
+                            []
+
+                        else
+                            [ H.input
+                                [ A.type_ "text"
+                                , A.attribute "aria-label" "filter value"
+                                , A.value filter.value
+                                , A.onInput (CodexFilterEdit index FilterValue)
+                                , onEnter CodexFilterApply
+                                ]
+                                []
+                            ]
+                       )
+                    ++ [ H.button [ A.class "chip", A.attribute "aria-label" "remove filter", A.onClick (CodexFilterRemove index) ] [ text "x" ] ]
+                )
+    in
+    H.div [ S.displayFlex, S.flexDirectionColumn, S.gapRem 0.25 ]
+        (List.indexedMap row codex.filters
+            ++ [ H.div [ S.displayFlex, S.gapRem 0.25 ]
+                    ((if List.length codex.filters < codexFiltersMax then
+                        [ H.button [ A.class "chip", A.onClick CodexFilterAdd ] [ text "add filter" ] ]
+
+                      else
+                        []
+                     )
+                        ++ [ H.button [ A.class "chip", A.attribute "aria-label" "apply filters", A.onClick CodexFilterApply ] [ text "apply" ] ]
+                    )
+               ]
+        )
+
+
 viewCodex : Model -> String -> Html Msg
 viewCodex model typ =
     let
@@ -12160,6 +12518,13 @@ viewCodex model typ =
                                     [ text (table.name ++ " · " ++ String.fromInt (List.length table.columns) ++ iif (List.length table.columns == 1) " column" " columns") ]
                             )
                             tables
+                            ++ (case ( typ, model.codex ) of
+                                    ( "codex-db", Just codex ) ->
+                                        iif (picked == Nothing) [] [ viewCodexFilters codex ]
+
+                                    _ ->
+                                        []
+                               )
                             ++ [ H.p [ S.fontSizeRem 0.875, S.color "#666" ]
                                     [ text
                                         (iif (typ == "codex-db")

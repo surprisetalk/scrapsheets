@@ -127,6 +127,34 @@ Deno.test({
 
     await page.key({ key: "z", ctrlKey: true });
     assertEquals(JSON.stringify(doc.data), was, "undo takes the pushed columns off and the cells it wrote back out");
+
+    // Presence: opening the sheet announces this tab by a colour and nothing
+    // else; a peer's colour reaches the toolbar, its goodbye takes it away, and
+    // leaving the sheet says goodbye and empties the row.
+    const handle = page.handles.split1;
+    const marker = "__presence";
+    const hello = (handle.broadcasts[0] as Record<string, { type: string; state: { colour: string } }>)[marker];
+    assertEquals(hello.type, "snapshot", "opening a sheet announces this tab");
+    assertEquals(Object.keys(hello.state), ["colour"], "the announcement carries a colour and nothing identifying");
+    assert(/^#[0-9a-f]{6}$/.test(hello.state.colour), `expected a #rrggbb colour, received ${hello.state.colour}`);
+    const sent: { id: string; data: string[] }[] = [];
+    const send = page.app.ports.peersChanged.send;
+    page.app.ports.peersChanged.send = (d: unknown) => (sent.push(d as (typeof sent)[0]), send(d));
+    handle.hear("peer-b", { [marker]: { type: "snapshot", state: { colour: "#4a8000" } } });
+    assertEquals(sent.at(-1), { id: "table:split1", data: ["#4a8000"] }, "a peer's colour, and not this tab's own");
+    await page.settle();
+    assert(page.text().includes("1 here"), `expected the toolbar to count one other tab, got: ${page.text()}`);
+    handle.hear("peer-b", { [marker]: { type: "goodbye" } });
+    assertEquals(sent.at(-1)?.data, [], "a goodbye takes the peer's colour away");
+    // A peer's state is whatever it sent over the wire: a colour with no toString crashed the listener.
+    handle.hear("bad-1", { [marker]: { type: "snapshot", state: { colour: { toString: 1 } } } });
+    handle.hear("bad-2", { [marker]: { type: "snapshot", state: { colour: "#4a8000" } } });
+    assertEquals(sent.at(-1)?.data, ["#4a8000"], "a hostile colour is dropped and the listener lives");
+    handle.hear("bad-2", { [marker]: { type: "goodbye" } });
+    handle.hear("peer-b", { [marker]: { type: "snapshot", state: { colour: "#4a8000" } } });
+    await page.go("/table:countries");
+    assertEquals(handle.broadcasts.at(-1), { [marker]: { type: "goodbye" } }, "leaving the sheet says goodbye");
+    assertEquals(sent.at(-1), { id: "", data: [] }, "and empties the row, a bundled sheet having no peers to add");
     page.close();
   },
 });

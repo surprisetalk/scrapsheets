@@ -53,6 +53,7 @@ import {
   loadRefs,
   MAX_QUERY_MS,
   MAX_QUERY_ROWS,
+  multiOptions,
   namesIn,
   nearest,
   nthWeekday,
@@ -380,6 +381,7 @@ export type Type =
   | "pct"
   | "percent"
   | "datetime"
+  | `multi:${string}`
   | ["array", Type]
   | ["tuple", Type[]]
   | { [k: string]: Type };
@@ -1447,7 +1449,9 @@ const peerUserMap = new Map<AM.PeerId, { auth: WsAuth; shim: WsSocketShim }>();
 // path below, so both call this.
 export type Role = "owner" | "editor" | "viewer";
 
-const syncAccessCache = new Map<string, { role: Role | null; expires: number }>();
+const DOCUMENT_ID_MAX = 128; // automerge ids are about 30 characters
+// Exported so a test can count the lookups a flood causes: one entry per distinct document id.
+export const syncAccessCache = new Map<string, { role: Role | null; expires: number }>();
 
 // PUT /library/:id must fetch a client-created doc over sync BEFORE its sheet
 // row exists; grantSync bridges that window (and clears any cached denial).
@@ -1471,6 +1475,8 @@ const syncRole = async (auth: WsAuth, documentId: string): Promise<Role | null> 
   // Postgres text cannot hold a NUL, so a document id carrying one has no row
   // to look up and no role -- asking threw, and closed the socket asking.
   if (documentId.includes("\0")) return null;
+  // The id is part of a cache key kept 30 s, so an id of any length is memory a peer chooses.
+  if (documentId.length > DOCUMENT_ID_MAX) return null;
   if (usr_id && (pendingSync.get(`${usr_id}/${documentId}`) ?? 0) > Date.now()) return "owner";
   const key = `${usr_id ?? "-"}:${share ?? "-"}/${documentId}`;
   const hit = syncAccessCache.get(key);
@@ -1521,7 +1527,14 @@ const SERVER_PEER_ID = `server-${Deno.hostname()}` as AM.PeerId;
 const EPHEMERAL_BYTES_MAX = 4096;
 const EPHEMERAL_RATE = 10; // frames per second, per connection
 const EPHEMERAL_BURST = 2 * EPHEMERAL_RATE;
-const EPHEMERAL_NOTICE_MS = 1000; // one error frame per connection per second
+const NOTICE_MS = 1000; // one error frame per connection per second, for either bucket
+// Every frame that names a document costs syncRole a database query when the
+// id is new to the cache. A real client opening 10 documents sends 32 frames
+// (about 3 each, measured in main_test.ts); a burst of 500 covers a library of
+// over a hundred sheets opened at once. Past it the socket closes: a dropped
+// sync frame would wedge the stateful protocol, and a reconnect starts fresh.
+export const FRAME_RATE = 100; // frames per second, per connection
+export const FRAME_BURST = 5 * FRAME_RATE;
 
 export const automerge = new Repo({
   network: [wsAdapter],
@@ -1541,7 +1554,9 @@ app.get(
     let queue = Promise.resolve();
     // Documents this connection has been audited on, as doc_id and doc_id:edit.
     const audited = new Set<string>();
-    const ephemeral = { tokens: EPHEMERAL_BURST, at: Date.now(), noticed: 0 };
+    const ephemeral = { tokens: EPHEMERAL_BURST, at: Date.now() };
+    const frames = { tokens: FRAME_BURST, at: Date.now() };
+    let noticed = 0;
     const cleanup = () => {
       if (!shim) return;
       wss.clients.delete(shim);
@@ -1582,11 +1597,41 @@ app.get(
             joined = msg.senderId as AM.PeerId;
             peerUserMap.set(joined, { auth, shim });
           }
+          // A frame is untrusted CBOR: a number or a map here would throw inside
+          // syncRole, and a rejected link in `queue` ends every later frame.
+          if (msg?.documentId !== undefined && typeof msg.documentId !== "string") {
+            shim.send(AM.cbor.encode({
+              type: "error",
+              senderId: SERVER_PEER_ID,
+              targetId: msg.senderId,
+              message: `Sync frames name a document by its text id. This one named a ${
+                Array.isArray(msg.documentId) ? "list" : typeof msg.documentId
+              }, so it was dropped. Send the document id as a string.`,
+            }));
+            return;
+          }
           if (msg?.documentId) {
             // Before the access check: syncRole caches by document id, so a flood
             // that varies the id would cost a database query per frame.
+            const now = Date.now();
+            frames.tokens = Math.min(FRAME_BURST, frames.tokens + Math.max(0, now - frames.at) / 1000 * FRAME_RATE);
+            frames.at = now;
+            if (frames.tokens < 1) {
+              const message =
+                `Sync frames are limited to ${FRAME_RATE} a second with a burst of ${FRAME_BURST}, so this connection was closed. Reconnect, and open fewer documents at once.`;
+              console.error(`/library/sync (usr ${auth.usr_id}): ${message}`);
+              shim.send(AM.cbor.encode({
+                type: "error",
+                senderId: SERVER_PEER_ID,
+                targetId: msg.senderId,
+                documentId: msg.documentId,
+                message,
+              }));
+              shim.close();
+              return;
+            }
+            frames.tokens -= 1;
             if (msg.type === "ephemeral") {
-              const now = Date.now();
               ephemeral.tokens = Math.min(
                 EPHEMERAL_BURST,
                 ephemeral.tokens + (now - ephemeral.at) / 1000 * EPHEMERAL_RATE,
@@ -1594,8 +1639,8 @@ app.get(
               ephemeral.at = now;
               const tooBig = data.length > EPHEMERAL_BYTES_MAX;
               if (tooBig || ephemeral.tokens < 1) {
-                if (now - ephemeral.noticed >= EPHEMERAL_NOTICE_MS) {
-                  ephemeral.noticed = now;
+                if (now - noticed >= NOTICE_MS) {
+                  noticed = now;
                   shim.send(AM.cbor.encode({
                     type: "error",
                     senderId: SERVER_PEER_ID,
@@ -9401,6 +9446,7 @@ app.post("/sheet/:id", async (c) => {
   // A short or long row is the commonest broken batch, and filling one in loses
   // data silently, exactly as it does in a CSV. Name both counts, the field it
   // stops at, and the row as sent.
+  const multis = new Set(cols.filter((col) => multiOptions(col.type)).map((col) => col.name));
   for (const [i, row] of rows.entries()) {
     if (!row || typeof row !== "object" || Array.isArray(row)) {
       bad(400, `Row ${i + 1} of the request is not an object.`, {
@@ -9427,6 +9473,7 @@ app.post("/sheet/:id", async (c) => {
     for (const name of names) {
       const val = (row as Row)[name];
       if (val === null || ["string", "number", "boolean"].includes(typeof val)) continue;
+      if (Array.isArray(val) && multis.has(name)) continue;
       bad(400, `Row ${i + 1}, column "${name}" holds a value no cell can hold.`, {
         Received: `a ${Array.isArray(val) ? "array" : typeof val}: ${JSON.stringify(val ?? null).slice(0, 200)}`,
         Expected: "a string, a number, a boolean, or null",
@@ -10526,7 +10573,10 @@ const mcpTools: Record<string, McpTool> = {
           });
         }
         const t = target.type;
-        const mismatched = (NUMERIC_TYPES as string[]).includes(t)
+        const picks = multiOptions(t);
+        const mismatched = picks
+          ? !Array.isArray(value) && value !== null
+          : (NUMERIC_TYPES as string[]).includes(t)
           ? typeof value !== "number" || (t === "int" && !Number.isInteger(value))
           : t === "bool"
           ? typeof value !== "boolean"
@@ -10540,6 +10590,13 @@ const mcpTools: Record<string, McpTool> = {
             Source: `cells[${i}] of this tool call, row ${row}`,
             Fix: `send a ${t}, or change the column's type first`,
           });
+        }
+        if (picks) {
+          try {
+            checkColumnTypes(sheet_id, [target], [{ [target.name]: value }]);
+          } catch (err) {
+            throw new HTTPException(400, { message: reason(err) });
+          }
         }
         writes.push({ rowIndex: row, key: target.key, value });
       }

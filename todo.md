@@ -12,12 +12,21 @@ here.
 
 ## Next batch
 
-- [ ] A socket peer cannot cost the server a database query per frame.
-  1. Bug fix, no design. `syncRole` caches by `(usr, share, documentId)`, so a flood of sync frames that varies the
-     document id misses the cache and runs one query each. The cache also clears whole past its size bound.
-  2. A peer with no access gets one `doc-unavailable` per frame, with no bound. It goes only to the sender.
-  3. Put every frame with a `documentId` under one per-connection bucket before `syncRole`, beside the ephemeral bucket.
-     Choose the numbers from a real client's sync burst on open: measure first, in `main_test.ts`'s socket step.
+- [ ] A socket flood across many connections of one account cannot cost the server a query per frame.
+  1. Bug fix, no design. The frame buckets are per connection, so N connections multiply `syncRole` lookups.
+  2. Add a per-account frame budget beside `FRAME_RATE`, shared by that account's connections.
+  3. Replace `syncRole`'s whole-cache clear past its bound with evicting the oldest entry, so one flood cannot flush
+     other peers' roles.
+
+- [ ] A filter apply that the server refuses keeps the pick, even with no filters.
+  1. Bug fix, no design. A zero-filter apply refused with a 429 or 403 takes the unfiltered path (`codexLoaded` error)
+     and clears the pick and the grid.
+  2. Add a field to `codexPreview` that tells an apply from a pick, and send an apply's refusal to `docErrored`.
+  3. Extend the codex test in `sync_test.ts`; add no `glue()` call.
+
+- [ ] `main_test.ts` "right password opens the link" passes every run, under load too.
+  1. Bug fix, no design. It failed once at load 7 and passed on rerun (run 13 seam breaker).
+  2. Find the timing it depends on with a failing run first, then replace the wait with a bounded poll.
 
 ---
 
@@ -25,12 +34,32 @@ here.
 
 Each feature here needs its design approved before the build.
 
-- [ ] You filter a connected database's preview from the page, and query the filtered table.
-  1. In `viewCodex`, a filter row beside the picked table: a column select, an op select from `CODEX_OPS`'s keys, a
-     value input, up to `CODEX_FILTERS_MAX`. Hidden for a viewer.
-  2. `codexPreview` carries the filters; `index.html` sends them as repeated `where`. A refusal reaches `model.error`
-     and keeps the pick.
-  3. A `@codex-db:` query path reads the filtered table through the same door, under the same editor-only rule.
+- [ ] You query a connected database's filtered table with a ref in a query sheet, on the server and in the page.
+  1. Design the ref syntax first: `scanRefs` reads `@type:id.column` as a scalar cell, so a table and its filters need
+     their own form. Write it as example records.
+  2. Make `sheet()` answer a `codex-db` id through `codexConnect` and the preview statement, editor-only through
+     `assertSheetEditor`, rows capped at `CODEX_PREVIEW_MAX`.
+  3. Answer `assertNoKeys`, `library:lineage` and one `record()` row per query for the new ref.
+  4. Run it in the page through `sheets()` too, and add the pair to `examples_test.ts`.
+
+- [ ] A multi-select cell offers checkboxes, its options can come from another sheet, and every tool reads it as a list.
+  1. Edit: a `viewEditCell` branch for `Multi` draws one checkbox per option and writes through `cellValue`.
+  2. Import: the preview offers `multi:` for a column of comma-separated repeats.
+  3. API: `GET /openapi/:id` writes `{ type: array, items: { enum: options } }` for the column.
+  4. Query: `has_pick(cell, 'red')` in `src/sql.mjs`, so a where clause tests membership.
+  5. Options from another sheet (`multi:@table:x.col`) wait for a sheet that needs them.
+
+- [ ] You see who else is in the sheet by name, and where their cursor is.
+  1. Stamp each ephemeral frame server-side in `/library/sync` with the sender's display name, never the email.
+  2. Derive the colour from that identity, so one person keeps one colour.
+  3. Broadcast the focus cell on a `cell` channel, throttled to 200 ms or more, and outline it in the peer's colour.
+
+- [ ] You promote a fork and learn what it breaks, and branch a pipeline.
+  1. Before promote writes, call `lineageFor` on the source and `dependents` on the columns the old query returned and
+     the new one does not; hold the write in `model.pending` as a rename does.
+  2. Add `forked_heads` so promote also catches non-code edits to the source.
+  3. Branch and merge a query through automerge `clone` and `merge`. A sandbox of fake deliveries comes after.
+  4. Extend promote to alert, chart and net-http sheets.
 
 - [ ] You write a money column in a currency other than dollars, and an addition of two currencies is refused.
   1. Decided: a code is checked by shape only, `^money:[A-Z]{3}$`. `usd` stays canonical for now. Sums stay floats, with
@@ -87,24 +116,6 @@ Each feature here needs its design approved before the build.
      - No difference: "That version's rows equal today's. Source: history restore. Fix: pick another version."
   5. A visual diff of the picked version against now comes after, from the same comparison.
 
-- [ ] You change a pipeline without breaking the live one.
-  1. Staging copy: fork the sheet, change the query, review the diff, promote. `forkDoc` is `repo.create` of a copy, so
-     the fork shares no history and `merge` cannot promote it. Promote copies `code` back to the source.
-  2. `forkDoc` records `forked_code` and `forked_heads`, so promote warns when the source changed since the fork. A
-     bundled source is refused.
-  3. The rename and delete machinery (`lineageFor`, `dependents`) warns when the new query drops a column another sheet
-     reads.
-  4. Branch and merge a sheet through automerge's `clone` and `merge`. This also merges the data and the arrangement.
-  5. A sandbox: fake webhook deliveries and dry-run schedules.
-
-- [ ] A cell holds a multi-select from the options its column type lists.
-  1. Decided: the spelling is `multi:a,b`, options inline in the type, matched by prefix the way `knownType()` matches
-     `enum:`. An option list from another sheet waits until a real sheet needs one.
-  2. A cell is a JSON array checked against the options, refused at every write door: `POST /sheet/:id`, `write_cells`,
-     the importer, and the grid. Every grid write stores a string today (`SheetWrite` encodes `E.string`), and
-     `POST /sheet/:id` refuses an array value.
-  3. One `COLUMN_TYPES` row and the three language-boundary copies.
-
 - [ ] A sheet states what must be true of its rows, and a bad row is refused at every door.
   1. Decided: one nested `check` object on the column in `data[0]`, beside `type`, read leniently the way `viewDecoder`
      reads. A constraint the current rows already break is refused in the page. No regex yet: nothing bounds a
@@ -124,16 +135,6 @@ Each feature here needs its design approved before the build.
      already does, over the drawn rows. A "subtotal by this column" button in the column panel.
   3. Collapsible groups after that.
   4. A pivot UI over the same machinery. AlaSQL's `pivot` is correct once `checkPivot()` has checked it.
-
-- [ ] You see who else is in the sheet.
-  1. Decided: a peer broadcasts a per-tab colour, and the page shows a count. Nothing identifying. An identity the
-     server stamps on each frame comes later. `model.auth.email` would show the editor's address to every viewer.
-  2. Fix the harness first. `fakeHandle.on` ignores the event name and has no `broadcast`. Teach it event names and add
-     `broadcast`. Two `realRepo`s built with `network: []` cannot reach each other.
-  3. The vendored bundle exports `Presence` (`start({ initialState, heartbeatMs, peerTtlMs })`). Start it in
-     `selectDoc`, call `stop()` where `watched` is cleared, add one port pair, bound `model.peers`, and show chips in
-     `viewToolbar`.
-  4. Cursor presence after that, throttled to 200ms or more.
 
 ---
 
@@ -163,12 +164,9 @@ Each feature here needs its design approved before the build.
      after the money item.
 
 - [ ] You add a column that is an expression over its own row, and colour a cell by a rule over that row.
-  1. Decide first:
-     - What the grid shows. Elm decodes cells straight from the document, so a computed cell renders blank. Either the
-       glue computes on each `docChanged` and overlays read-only values before sort, filter, shade and stats read them,
-       or the grid shows the expression's text.
-     - A row whose expression throws: refuse the read and name the row, or a null cell.
-     - The type: declared on the column and checked, or inferred through `selectTypes`.
+  1. Decided: the glue computes on each `docChanged` and overlays read-only values before sort, filter, shade and stats
+     read them. A row whose expression throws refuses the read and names the row and the column.
+     - Decide first: the type, declared on the column and checked, or inferred through `selectTypes`.
   2. A computed column is an `expr` field on the column object. `src/sql.mjs` evaluates it in both hosts through AlaSQL,
      one `select (<expr>) as [v] from ?` per computed column, zipped back by row index. It is never stored.
   3. An expression refuses refs, subqueries and `SHEET(`, `AGGREGATES` calls, `over`, `?` parameters, another computed
@@ -366,9 +364,9 @@ Each feature here needs its design approved before the build.
 ### Performance & scale
 
 - [ ] A large sheet scrolls, and a million-row join runs.
-  1. Virtualized rendering. Decide first: the row height (text wraps without limit today), the threshold (tests expect
-     more than 190 rendered rows), a window floor (jsdom reports a zero viewport), and how the focus cell stays
-     rendered.
+  1. Virtualized rendering. Decided: past 500 drawn rows, rows take a fixed height and clip wrapped text, and only the
+     window plus the focus row render. Design first: the window floor (jsdom reports a zero viewport) and how the focus
+     cell stays rendered for `follow`.
   2. Run a query in a Worker, with progress.
   3. Chunked execution on the server past the cap, with the page reading pages of the result.
   4. Document size limits, compaction and history pruning. Columnar storage for bulk data, and cold row archiving.

@@ -140,6 +140,12 @@ button:hover {
   overflow-y: auto;
 }
 
+.peer {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+}
+
 .chip {
   font-size: 0.75rem;
   padding: 2px 8px;

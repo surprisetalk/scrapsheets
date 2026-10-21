@@ -35,6 +35,17 @@ suite =
                             , Tuple.second >> String.contains "Buy it from the shop" >> Expect.equal True
                             ]
             ]
+        , describe "peerColours"
+            [ test "bounds the list" <|
+                \_ ->
+                    List.repeat (peersMax + 5) "#0a1b2c"
+                        |> peerColours
+                        |> Expect.equal (List.repeat peersMax "#0a1b2c")
+            , test "drops what is not a colour" <|
+                \_ ->
+                    peerColours [ "#ABCDEF", "#abc", "#0a1b2g", "0a1b2c1", "url(x)", "", "#4a8000" ]
+                        |> Expect.equal [ "#4a8000" ]
+            ]
         , describe "Navigation"
             [ describe "clampIndex"
                 [ test "clamps x to lower bound" <|
@@ -1778,8 +1789,22 @@ suite =
                             )
             , test "a type the page cannot read back is not a type it will write" <|
                 \_ ->
-                    List.map knownTypeName [ "int", "float", "percentage", "enum:a,b", "wat", "enum:", "" ]
-                        |> Expect.equal [ True, True, True, True, False, False, False ]
+                    List.map knownTypeName [ "int", "float", "percentage", "enum:a,b", "wat", "enum:", "", "multi:a,b", "multi:", "multi:,", "multi:a,a" ]
+                        |> Expect.equal [ True, True, True, True, False, False, False, True, False, False, False ]
+            , test "a multi cell is the list of its picks, null when blank, and a bad pick is named" <|
+                \_ ->
+                    let
+                        tags =
+                            madeCol "1" "tags" (Multi [ "red", "green" ])
+                    in
+                    [ E.encode 0 (cellValue tags "red,  green")
+                    , E.encode 0 (cellValue tags " ")
+                    , E.encode 0 (cellValue (madeCol "2" "t" Text) "a, b")
+                    , Debug.toString (cellRefusal tags "red, purple" |> Maybe.map (String.contains "received \"purple\""))
+                    , Debug.toString (cellRefusal tags "red, red" /= Nothing)
+                    , Debug.toString (cellRefusal tags "green")
+                    ]
+                        |> Expect.equal [ "[\"red\",\"green\"]", "null", "\"a, b\"", "Just True", "True", "Nothing" ]
             , test "the refusal offers every type the engine tells apart" <|
                 \_ ->
                     -- int, float and num are one Type in the page and three to the

@@ -151,6 +151,7 @@ A change that breaks one of these is a bug even if the suite is green.
 - **Language-boundary copies.** `browser_test.ts` reads both sides as source text and fails on drift, compared as sets:
   - `CHART_KINDS` (`src/sql.mjs`) ↔ `kindSpec` (`Main.elm`)
   - `NET_METHODS` (`main.ts`) ↔ `netMethods`
+  - `CODEX_OPS`'s keys ↔ `codexOps`, and `CODEX_FILTERS_MAX` ↔ `codexFiltersMax`
   - `NET_MODES` ↔ `netModes`
   - `PAGE_BY` ↔ `pageBy`
   - `ALERT_WHEN` ↔ `whenSpec`
@@ -190,10 +191,14 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - Sync: automerge `NodeWSServerAdapter` behind a ws-shim over Hono's `upgradeWebSocket`. `syncRole` checks access per
   message. A viewer's frames are decoded and refused if they carry changes. `grantSync` answers "owner" through
   `pendingSync` while a claim fetches its document; `PUT /library/:id` deletes the grant once its `sheet_usr` row lands,
-  so a downgrade reaches a minted key at once. An `ephemeral` frame over `EPHEMERAL_BYTES_MAX` bytes, or past a
-  per-connection bucket of `EPHEMERAL_RATE` a second with a burst of `EPHEMERAL_BURST`, is dropped before the access
-  check and the shim, so automerge-repo never relays it and a flood costs no `syncRole` query. The sender gets at most
-  one `error` frame per `EPHEMERAL_NOTICE_MS`, and the socket stays open.
+  so a downgrade reaches a minted key at once. Before `syncRole`, every frame that names a document spends one token
+  from a per-connection bucket (`FRAME_RATE` a second, `FRAME_BURST` deep, far above a real client's open), and an
+  `ephemeral` frame also spends one from its own (`EPHEMERAL_RATE`, `EPHEMERAL_BURST`) and is refused past
+  `EPHEMERAL_BYTES_MAX` bytes. Past the frame bound the socket gets one `error` frame and closes, because a dropped sync
+  frame wedges the protocol and a reconnect starts fresh. An ephemeral frame over its bound is dropped, with at most one
+  `error` frame per `NOTICE_MS`, and the socket stays open. A document id past `DOCUMENT_ID_MAX` has no role and is
+  never cached; one that is not text gets an `error` frame and is dropped before the bucket, since a throw inside the
+  queue silences the connection.
 - Members: `GET /library/:id/share` answers only an account with a `sheet_usr` row on that sheet id, in any role. A
   purchase and `sheet.public` read the rows, and get a 403 that names the share route and no member. The settings panel
   reads that 403 on the list call alone as no share: `shareAction` answers `members: null`, `updateShareLoad` keeps
@@ -435,7 +440,11 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   by `segment`, then the key. `k` runs from 2 to `KMEANS_K_MAX`, and `columns` holds 1 to `KMEANS_DIMS` names. Refused:
   a key or a column spelled `segment`, and a column that repeats the key or another column. The statement scales
   nothing.
-- Types: `COLUMN_TYPES`, `knownType()` (the `enum:` family by prefix). `checkColumnTypes()` is where a cell becomes its
+- Types: `COLUMN_TYPES`, `knownType()` (the `enum:` and `multi:` families by prefix, with no `COLUMN_TYPES` row and no
+  boundary copy). A `multi:a,b` cell is a JSON array of its options, null when blank, `[]` allowed; `multiOptions()`
+  splits and trims, `knownType()` needs a non-empty list with no repeats, and `checkColumnTypes()` refuses a non-array,
+  a pick outside the list and a pick twice. `POST /sheet/:id` and `write_cells` take an array only under a multi column.
+  Exports write an array as `String(array)`; json and ndjson keep it. `checkColumnTypes()` is where a cell becomes its
   column's type. A `duration` cell holds seconds; in a duration column the function also reads `h:mm` and `h:mm:ss`.
   `selectTypes()` and `WINDOW_TYPES` type a result off its select item.
 - Business days: `weekday()` is the one definition, Monday to Friday in UTC, holidays included; `business_days()` counts
@@ -561,6 +570,11 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   far side; a column's neighbour is the nearest one not hidden. `nudgeOf` refuses by name: a row move off
   `inDocumentOrder`, a row outside the data rows, either end, a sheet that is not a `Tab`. A row handle shows only while
   `inDocumentOrder`. `pinLeft` sums sticky widths, column 0 included.
+- `cellValue` is the one door from typed text to a data cell: a `Multi` splits on commas, trims and drops empties, blank
+  is null, every other type is the text. `cellRefusal` names a bad pick, and nothing is written. The data-cell
+  `SheetWrite`, clear, paste and find/replace go through both; fill-down repeats the raw array; `cleanable` hides the
+  cleaning verbs on a `Multi` column. `ClipboardCopy` copies a null cell as empty text, and `editSeed` opens a blank
+  `Multi` cell's editor empty.
 - Fill-down: `fillSeries` continues dates (`justinmimbs/date`, stepped off the last seed), numbers and trailing digits,
   else repeats. `parseDay` decides a date. `blankCell` decides blank. `seriesEncoder` writes by column type.
 - Resize from the keyboard: the header `.grip` is a focusable `separator` with `aria-valuenow` when the column has a
@@ -653,10 +667,32 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - `loadCodex` answers `codexLoaded` with `{ id, tables }` or `{ id, error }` on every path, logged out included, matched
   by id. `codexTablesDecoder` reads both server shapes through `tableDecoder` by column name.
 - `viewCodex` lists `button.chip.codex-table` ("name · N columns", a `title` of each column and type, `aria-pressed` on
-  the pick). `CodexPick` acts only on codex-db and sends `codexPreview { id, table }`; `index.html` GETs
-  `/codex/<id>/preview?table=` with no `limit` and answers through `docQueried`. A refusal answers
-  `codexLoaded { id, error }` and clears the pick. `previewing` lets only the newest preview land. `resolveTable` says
-  what the grid waits on. codex-scrapsheets lists its tables with the buttons disabled.
+  the pick). `CodexPick` acts only on codex-db and sends `codexPreview { id, table, filters }`; `index.html` GETs
+  `/codex/<id>/preview?table=` with no `limit`, one `where=` per filter, and answers through `docQueried`. An unfiltered
+  refusal answers `codexLoaded { id, error }` and clears the pick; a filtered one goes to `docErrored` and keeps the
+  pick, the filters and the rows. `previewing` lets only the newest preview land, and `selectDoc` drops it for another
+  sheet. `resolveTable` says what the grid waits on. codex-scrapsheets lists its tables with the buttons disabled.
+- Filters: `viewCodexFilters` draws one row per `CodexFilter` (`column`, `op`, `value`) under a picked codex-db table: a
+  column select, an op select over `codexOps`, a value input (none for `isnull` and `notnull`), `remove filter`; then
+  `add filter` (up to `codexFiltersMax`) and `apply filters`. Only `CodexFilterApply` and Enter in a value input send,
+  because every preview opens a far connection and writes an audit row. A pick, a refresh and a reopen clear the
+  filters. Every reader sees the row; a viewer's apply gets the server's 403.
+
+**Presence and promote**
+
+- Presence: `selectDoc` starts a `Presence` on a handle that has `broadcast`, with `{ colour }`, a random `#rrggbb` per
+  open, kept nowhere; heartbeat 15 s, peer ttl 45 s. Its `snapshot`, `update`, `goodbye` and `pruning` send
+  `peersChanged { id, data }` with the other tabs' string colours. `selectDoc` stops it and sends `{ id: "", data: [] }`
+  before either early return. A bundled sheet and a codex have no `broadcast`. `PeersLoad` ignores another sheet's id
+  and keeps `#` plus six lowercase hex digits, then `peersMax`. `viewPeers` ends `viewToolbar`: `role=status`, one
+  `span.peer` per colour, the text `N here`. Two tabs of one browser count as two.
+- Promote: `forkDoc` writes `forked_code` (the source's `data[0].code`, when it is text) on a fork of a query. The
+  `promote` chip follows `fork` when `isPromotable` and the doc is a `Query`, and sends `promoteDoc`. The glue refuses a
+  fork with no `forked_code`, a bundled or unloaded source, and a source whose code equals neither `forked_code` nor the
+  fork's code; a refusal writes nothing. Else it writes the source's code, then the fork's `forked_code`, each skipped
+  when equal, so a rerun after a crash between them writes only the second. Then it opens the source.
+- Glue harness: `fakeHandle` keeps listeners per event, records `broadcasts`, and `hear(senderId, message)` plays a
+  peer's frame. `glue().link()` joins a second real repo over `Pipe`.
 
 **Charts**
 
@@ -700,6 +736,12 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 
 **Known gaps**
 
+- The page checks no role before promote. A viewer's promote shows in the page, and the sync server refuses the source
+  write after.
+- A fork made before promote shipped has no `forked_code` and shows no chip; fork the source again.
+- A zero-filter apply that the server refuses (429, 403) takes the unfiltered path and clears the pick.
+- More than `peersMax` peers draws `peersMax here`.
+- Per-connection frame buckets multiply with connections, and `syncRole` clears its whole cache past its bound.
 - `@library:freshness` and `@library:lineage` resolve on the server, not in the page.
 - `describe` results carry no type in the page, and `WINDOW_TYPES` is server-only.
 - A back or forward onto `#settings` while the import preview is up mounts both, and the Tab trap holds only the later

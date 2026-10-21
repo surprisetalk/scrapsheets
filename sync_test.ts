@@ -8,6 +8,7 @@
 // completion, and `src/sw.js` run over a hand-made `self`, `caches` and `fetch`,
 // which is the only way to take the network away from a service worker.
 import { assert, assertEquals, assertRejects } from "@std/assert";
+import { Presence } from "@automerge/automerge-repo";
 import { API_BASE } from "./src/page.mjs";
 import { boot, dir, until } from "./page_harness.ts";
 import { glue } from "./glue_harness.ts";
@@ -255,6 +256,9 @@ Deno.test({
   sanitizeResources: false,
   fn: async () => {
     const found: string[] = [];
+    // A filtered preview is refused only on `refuseLater()`, so the refusal can
+    // arrive before or after the page leaves the sheet.
+    let refuseLater = () => {};
     // The preview's body arrives only on `release()`, so the answer is still in
     // flight when the url changes under it.
     let release = () => {};
@@ -293,6 +297,18 @@ Deno.test({
               },
             ],
           }
+          : url.includes("&where=")
+          ? new Response(
+            new ReadableStream({
+              start: (body) => {
+                refuseLater = () => {
+                  body.enqueue(new TextEncoder().encode("The database cannot apply that filter to that column."));
+                  body.close();
+                };
+              },
+            }),
+            { status: 400, headers: { "Content-Type": "text/plain" } },
+          )
           : url.includes("/preview?")
           ? new Response(rows, { headers: { "Content-Type": "application/json" } })
           : { data: [] },
@@ -314,6 +330,30 @@ Deno.test({
     await page.go("/codex-db:abc");
     assert(drawn(), `the rows survive closing settings: ${page.text().slice(-200)}`);
     assertEquals(codex().length, before, "and neither url change reads the database again");
+
+    // A refused filter reaches the banner, and the pick and its rows stay.
+    await page.click(page.all("button").find((b) => b.textContent === "add filter"));
+    await page.type_(page.all('input[aria-label="filter value"]')[0], "A.1 é");
+    await page.click(page.all('button[aria-label="apply filters"]')[0]);
+    assertEquals(
+      codex().at(-1),
+      `${API_BASE}/codex/codex-db:abc/preview?table=order%20items&where=${encodeURIComponent("sku.eq.A.1 é")}`,
+      "one where per filter, the value whole",
+    );
+    refuseLater();
+    await until(page.settle, "the refusal in the banner", () => page.text().includes("cannot apply that filter"));
+    assert(drawn(), `a refused filter keeps the last rows: ${page.text().slice(-200)}`);
+
+    // A refusal that lands after the page left the sheet reaches no banner.
+    await page.click(page.all('button[aria-label="apply filters"]')[0]);
+    await page.go("/table:countries");
+    refuseLater();
+    await page.settle(20);
+    assertEquals(
+      page.text().match(/cannot apply that filter/g)?.length ?? 0,
+      0,
+      "a late refusal for the sheet just left is dropped",
+    );
     page.close();
   },
 });
@@ -338,6 +378,65 @@ Deno.test({
       entry.tags.filter((t) => t === "demo" || t === "example"),
       [],
       "and does not inherit the tags that would put it in the gallery pretending to be an original",
+    );
+
+    // Promote. A bundled source has no document here: refused, nothing written.
+    const promote = () => page.click(page.all("button").find((b) => b.textContent?.trim() === "promote"));
+    const body = () => page.text();
+    const code = (id: string) => ((page.handles[id.split(":")[1]].doc() as { data: { code: string }[] }).data[0].code);
+    await promote();
+    assert(
+      body().includes("which ships with the page or has not loaded"),
+      `bundled source refused: ${body().slice(-300)}`,
+    );
+    assertEquals(page.created.length, 1, "and the refusal writes nothing");
+
+    // A held source: fork the fork, edit the grandchild, promote it.
+    await page.click(page.all("button").find((b) => b.textContent?.trim() === "fork"));
+    assertEquals(page.created.length, 2);
+    assertEquals(
+      (page.created[1] as { forked_code: string }).forked_code,
+      code("query:made1"),
+      "forked_code is the source's code",
+    );
+    page.handles.made2.change((d) => ((d as { data: { code: string }[] }).data[0].code = "select 2"));
+    await promote();
+    assertEquals(code("query:made1"), "select 2", "the source takes the fork's code");
+    assertEquals(
+      (page.handles.made2.doc() as { forked_code: string }).forked_code,
+      "select 2",
+      "and the fork compares against it next time",
+    );
+    assertEquals(page.path(), "query:made1", "the page opens the source");
+
+    // The source moves on after a fork: refused, nothing written.
+    await page.click(page.all("button").find((b) => b.textContent?.trim() === "fork"));
+    page.handles.made3.change((d) => ((d as { data: { code: string }[] }).data[0].code = "select 3"));
+    page.handles.made1.change((d) => ((d as { data: { code: string }[] }).data[0].code = "select 4"));
+    await promote();
+    assert(body().includes("now reads `select 4`"), `changed source refused: ${body().slice(-300)}`);
+    assertEquals(code("query:made1"), "select 4", "the source is untouched");
+
+    // A crash after the source write: the source already equals the fork's code,
+    // and the rerun writes only forked_code. A third promote changes nothing.
+    page.handles.made1.change((d) => ((d as { data: { code: string }[] }).data[0].code = "select 3"));
+    await promote();
+    assertEquals(code("query:made1"), "select 3", "the rerun leaves the source alone");
+    assertEquals(
+      (page.handles.made3.doc() as { forked_code: string }).forked_code,
+      "select 3",
+      "and fixes forked_code",
+    );
+    assertEquals(page.path(), "query:made1");
+    await page.click(page.all("button").find((b) => b.textContent?.trim() === "fork"));
+    assertEquals(page.created.length, 4);
+    page.handles.made4.change((d) => ((d as { data: { code: string }[] }).data[0].code = "select 5"));
+    page.handles.made1.change((d) => ((d as { data: { code: string }[] }).data[0].code = "a" + "\u{1F600}".repeat(50)));
+    await promote();
+    assertEquals(code("query:made1"), "a" + "\u{1F600}".repeat(50), "a changed source is untouched, emoji or not");
+    assert(
+      !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(body()),
+      "the refusal cuts the query between characters, not inside one",
     );
     page.close();
   },
@@ -487,6 +586,25 @@ Deno.test({
     for (const type of ["mouseenter", "click", "dblclick"]) await page.fire(cell, type);
     await page.type_(page.all("#new-cell")[0], "once");
     assertEquals(sent, 1, "one change is delivered to the page once");
+
+    // Two real repos on one wire: the page's presence reaches a second repo, and
+    // that repo's reaches the page. Each sees one peer, and a goodbye empties it.
+    const seen: { id: string; data: string[] }[] = [];
+    const peersSend = page.app.ports.peersChanged.send;
+    page.app.ports.peersChanged.send = (d: unknown) => (seen.push(d as (typeof seen)[0]), peersSend(d));
+    const theirs = await page.link().find(id.split(":")[1]);
+    await theirs.whenReady();
+    const there = new Presence({ handle: theirs });
+    there.start({ initialState: { colour: "#102030" } });
+    await until(page.settle, "the page to hear the second repo's colour", () => seen.at(-1)?.data[0] === "#102030");
+    assertEquals(seen.at(-1)?.id, id, "the list names the sheet it is for");
+    await until(
+      page.settle,
+      "the second repo to hear the page's colour",
+      () => Object.keys(there.getPeerStates().value).length === 1,
+    );
+    there.stop();
+    await until(page.settle, "the page to hear the goodbye", () => seen.at(-1)?.data.length === 0);
 
     // The same document read back as its history: every change, newest first,
     // and the version before the typed cell holds the row without it.
