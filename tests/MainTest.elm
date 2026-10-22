@@ -15,7 +15,7 @@ import Test.Html.Selector as Selector
 
 cols0 : Array.Array Col
 cols0 =
-    Array.fromList [ { key = "0", name = "a", typ = Text, raw = "text" } ]
+    Array.fromList [ { key = "0", name = "a", typ = Text, raw = "text", check = noCheck } ]
 
 
 suite : Test
@@ -295,8 +295,8 @@ suite =
                         let
                             cols =
                                 Array.fromList
-                                    [ { key = "0", name = "name", typ = Text, raw = "text" }
-                                    , { key = "1", name = "star", typ = Star, raw = "star" }
+                                    [ { key = "0", name = "name", typ = Text, raw = "text", check = noCheck }
+                                    , { key = "1", name = "star", typ = Star, raw = "star", check = noCheck }
                                     ]
 
                             rows =
@@ -314,7 +314,7 @@ suite =
                     \_ ->
                         let
                             cols =
-                                Array.fromList [ { key = "0", name = "add", typ = Create, raw = "create" } ]
+                                Array.fromList [ { key = "0", name = "add", typ = Create, raw = "create", check = noCheck } ]
 
                             rows =
                                 Array.fromList [ Dict.fromList [ ( "0", E.object [ ( "name", E.string "Orders" ) ] ) ] ]
@@ -676,6 +676,53 @@ suite =
                             ]
              ]
             )
+        , describe "a column's check"
+            [ test "the decoder reads each key it understands and drops the rest, never failing" <|
+                \_ ->
+                    let
+                        checks json =
+                            D.decodeString docDecoder ("""{"type":"table","data":[[{"name":"a","type":"int","key":"7","check":""" ++ json ++ """}]]}""")
+                                |> Result.map
+                                    (\doc ->
+                                        case doc of
+                                            Tab tbl ->
+                                                Array.toList tbl.cols |> List.map .check
+
+                                            _ ->
+                                                []
+                                    )
+                    in
+                    Expect.equal
+                        [ checks """{"required":true,"unique":true,"min":0,"max":100}"""
+                        , checks """{"required":true,"min":"x","bogus":1}"""
+                        , checks "5"
+                        ]
+                        [ Ok [ { required = True, unique = True, min = Just 0, max = Just 100 } ]
+                        , Ok [ { noCheck | required = True } ]
+                        , Ok [ noCheck ]
+                        ]
+            , test "checkBreaks blames the first row that breaks a rule, numbered from 1, and says nothing when none does" <|
+                \_ ->
+                    let
+                        col =
+                            { key = "7", name = "n", typ = Number, raw = "int", check = noCheck }
+
+                        rows values =
+                            Array.fromList (List.map (\v -> Dict.fromList [ ( "7", v ) ]) values)
+
+                        broke check values =
+                            checkBreaks col check (rows values) |> Maybe.map (String.contains "row")
+                    in
+                    Expect.equal
+                        [ broke { noCheck | required = True } [ E.int 1, E.null ]
+                        , broke { noCheck | unique = True } [ E.int 1, E.null, E.int 1 ]
+                        , broke { noCheck | min = Just 2 } [ E.int 3, E.int 1 ]
+                        , broke { noCheck | max = Just 2 } [ E.int 1, E.int 3 ]
+                        , broke { required = True, unique = True, min = Just 0, max = Just 9 } [ E.int 1, E.int 2 ]
+                        , broke { noCheck | unique = True } [ E.null, E.null ]
+                        ]
+                        [ Just True, Just True, Just True, Just True, Nothing, Nothing ]
+            ]
         , describe "docDecoder"
             [ test "net-http decodes url and interval; headers, method, body and the paging fields default to one plain GET" <|
                 \_ ->
@@ -1513,6 +1560,15 @@ suite =
                 \_ ->
                     [ reads "usd" (Just 0) Nothing 1234.6, reads "usd" (Just 4) Nothing -1234.5 ]
                         |> Expect.equal [ "$1,235", "-$1,234.5000" ]
+            , test "a money column prints its code before grouped digits, and the sign before the code" <|
+                \_ ->
+                    [ reads "money:EUR" Nothing Nothing 1234.5
+                    , reads "money:EUR" Nothing Nothing -0.4
+                    , reads "money:EUR" (Just 0) Nothing -0.4
+                    , reads "money:EUR" Nothing Nothing (1.0e308 + 1.0e308)
+                    , reads "money:eur" Nothing Nothing 1
+                    ]
+                        |> Expect.equal [ "EUR 1,234.50", "-EUR 0.40", "EUR 0", "Infinity", "1" ]
             , test "a duration column holds seconds and reads hours and minutes, and seconds only when there are some" <|
                 \_ ->
                     [ 0, 59, 60, 3599, 3600, 5400, 5405, -2700, 360000 ]
@@ -1789,8 +1845,8 @@ suite =
                             )
             , test "a type the page cannot read back is not a type it will write" <|
                 \_ ->
-                    List.map knownTypeName [ "int", "float", "percentage", "enum:a,b", "wat", "enum:", "", "multi:a,b", "multi:", "multi:,", "multi:a,a" ]
-                        |> Expect.equal [ True, True, True, True, False, False, False, True, False, False, False ]
+                    List.map knownTypeName [ "int", "float", "percentage", "enum:a,b", "wat", "enum:", "", "multi:a,b", "multi:", "multi:,", "multi:a,a", "money:EUR", "money:eur", "money:EURO", "money:" ]
+                        |> Expect.equal [ True, True, True, True, False, False, False, True, False, False, False, True, False, False, False ]
             , test "a multi cell is the list of its picks, null when blank, and a bad pick is named" <|
                 \_ ->
                     let

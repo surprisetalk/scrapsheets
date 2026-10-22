@@ -485,13 +485,13 @@
             }
           };
           app.ports.codexLoad.subscribe(loadCodex);
-          app.ports.codexPreview.subscribe(async ({ id, table, filters }) => {
+          app.ports.codexPreview.subscribe(async ({ id, table, filters, apply }) => {
             const ask = { id };
             previewing = ask;
-            // A refused filter keeps the pick, the filter rows and the last rows: the banner says why.
+            // A refused apply keeps the pick, the filter rows and the last rows: the banner says why.
             const refuse = (error) =>
               previewing === ask &&
-              (filters.length ? app.ports.docErrored.send(error) : app.ports.codexLoaded.send({ id, error }));
+              (apply ? app.ports.docErrored.send(error) : app.ports.codexLoaded.send({ id, error }));
             const token = getAuthToken();
             if (!token) return refuse("Log in to read a connected database: its rows are read under your account.");
             try {

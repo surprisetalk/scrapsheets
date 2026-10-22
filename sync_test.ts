@@ -262,6 +262,8 @@ Deno.test({
     // The preview's body arrives only on `release()`, so the answer is still in
     // flight when the url changes under it.
     let release = () => {};
+    // While true, an unfiltered preview is refused with a 429.
+    let throttled = false;
     const rows = new ReadableStream({
       start: (body) => {
         release = () => {
@@ -309,6 +311,8 @@ Deno.test({
             }),
             { status: 400, headers: { "Content-Type": "text/plain" } },
           )
+          : url.includes("/preview?") && throttled
+          ? new Response("Too many previews.", { status: 429, headers: { "Content-Type": "text/plain" } })
           : url.includes("/preview?")
           ? new Response(rows, { headers: { "Content-Type": "application/json" } })
           : { data: [] },
@@ -344,7 +348,21 @@ Deno.test({
     await until(page.settle, "the refusal in the banner", () => page.text().includes("cannot apply that filter"));
     assert(drawn(), `a refused filter keeps the last rows: ${page.text().slice(-200)}`);
 
+    // An apply with no filters is still an apply: its refusal keeps the pick and the rows.
+    await page.click(page.all('button[aria-label="remove filter"]')[0]);
+    throttled = true;
+    await page.click(page.all('button[aria-label="apply filters"]')[0]);
+    await until(page.settle, "the 429 in the banner", () => page.text().includes("Too many previews"));
+    assert(drawn(), `a refused unfiltered apply keeps the last rows: ${page.text().slice(-200)}`);
+    assert(page.all("button.codex-table").length > 0, "and the table list");
+    assert(
+      page.all("button.codex-table")[0].getAttribute("aria-pressed") === "true",
+      "and the pick",
+    );
+
     // A refusal that lands after the page left the sheet reaches no banner.
+    throttled = false;
+    await page.click(page.all("button").find((b) => b.textContent === "add filter"));
     await page.click(page.all('button[aria-label="apply filters"]')[0]);
     await page.go("/table:countries");
     refuseLater();

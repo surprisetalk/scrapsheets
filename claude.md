@@ -145,13 +145,23 @@ A change that breaks one of these is a bug even if the suite is green.
   wildcard.
 - **A column type is one word everywhere.** `COLUMN_TYPES` in `src/sql.mjs` is the list; an `as` alias is read and never
   written. `CANONICAL_TYPES` is what may be written. `NUMERIC_TYPES` and `JSON_TYPES` derive through `canonicalType()`.
-  `checkColumnTypes` refuses a spelling outside the list.
+  `checkColumnTypes` refuses a spelling outside the list. `money:` plus three capitals (`MONEY_SHAPE`, shape only) is a
+  family like `enum:` and `multi:`, never a key; `numericType()` is `NUMERIC_TYPES` plus that family and is every
+  numeric test (`checkColumnTypes`, xlsx, parquet, `write_cells`). `money:USD` is legal and counts as `usd`.
+- **A column's check runs at both write doors.** `check: { required, unique, min, max }` sits beside `type` in
+  `data[0]`. `checkConstraints()` runs in `POST /sheet/:id` and `write_cells`, after `checkColumnTypes` and before
+  `spend`, so a refusal writes and spends nothing. It blames only the rows the write touched; `unique` compares them
+  with every row, ignores blanks and matches the exact value; `min` and `max` need a numeric column and read a numeric
+  string there as its number. An `enum:` column is held to its options only where a check is present (`{}` counts, so
+  the panel deletes an empty check). A check that cannot be read refuses every write. Rows are keyed by column name
+  inside it. The socket, `readImport` and `POST /net/:id` do not enforce it.
 - **A column's declared type is never rewritten.** `col.raw` is the document's spelling. A header write patches
   `[0, x, "name"]`, never the whole column object.
 - **Language-boundary copies.** `browser_test.ts` reads both sides as source text and fails on drift, compared as sets:
   - `CHART_KINDS` (`src/sql.mjs`) ↔ `kindSpec` (`Main.elm`)
   - `NET_METHODS` (`main.ts`) ↔ `netMethods`
   - `CODEX_OPS`'s keys ↔ `codexOps`, and `CODEX_FILTERS_MAX` ↔ `codexFiltersMax`
+  - `MONEY_SHAPE` ↔ `isMoney`, and `CHECK_KEYS` ↔ `checkDecoder`
   - `NET_MODES` ↔ `netModes`
   - `PAGE_BY` ↔ `pageBy`
   - `ALERT_WHEN` ↔ `whenSpec`
@@ -192,13 +202,16 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   message. A viewer's frames are decoded and refused if they carry changes. `grantSync` answers "owner" through
   `pendingSync` while a claim fetches its document; `PUT /library/:id` deletes the grant once its `sheet_usr` row lands,
   so a downgrade reaches a minted key at once. Before `syncRole`, every frame that names a document spends one token
-  from a per-connection bucket (`FRAME_RATE` a second, `FRAME_BURST` deep, far above a real client's open), and an
-  `ephemeral` frame also spends one from its own (`EPHEMERAL_RATE`, `EPHEMERAL_BURST`) and is refused past
-  `EPHEMERAL_BYTES_MAX` bytes. Past the frame bound the socket gets one `error` frame and closes, because a dropped sync
-  frame wedges the protocol and a reconnect starts fresh. An ephemeral frame over its bound is dropped, with at most one
-  `error` frame per `NOTICE_MS`, and the socket stays open. A document id past `DOCUMENT_ID_MAX` has no role and is
-  never cached; one that is not text gets an `error` frame and is dropped before the bucket, since a throw inside the
-  queue silences the connection.
+  from a per-connection bucket (`FRAME_RATE` a second, `FRAME_BURST` deep, far above a real client's open) and one from
+  `accountFrames`, shared by a signed-in account's connections (`ACCOUNT_FRAME_RATE`, `ACCOUNT_FRAME_BURST`, keyed by
+  `usr_id`, bounded by `bound()`, swept with the rate-limit buckets; a signed-out socket has only its own bucket, since
+  readers behind one address must not close together), and an `ephemeral` frame also spends one from its own
+  (`EPHEMERAL_RATE`, `EPHEMERAL_BURST`) and is refused past `EPHEMERAL_BYTES_MAX` bytes. Past either frame bound the
+  socket gets one `error` frame and closes, because a dropped sync frame wedges the protocol and a reconnect starts
+  fresh. An ephemeral frame over its bound is dropped, with at most one `error` frame per `NOTICE_MS`, and the socket
+  stays open. A document id past `DOCUMENT_ID_MAX` has no role and is never cached; one that is not text gets an `error`
+  frame and is dropped before the bucket, since a throw inside the queue silences the connection. `syncRole` evicts its
+  oldest cache entry through `bound()`.
 - Members: `GET /library/:id/share` answers only an account with a `sheet_usr` row on that sheet id, in any role. A
   purchase and `sheet.public` read the rows, and get a 403 that names the share route and no member. The settings panel
   reads that 403 on the list call alone as no share: `shareAction` answers `members: null`, `updateShareLoad` keeps
@@ -315,12 +328,13 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - Upstream: `upstream: true` in an alert's `data[0]` also makes it due when a feed it reads stores a new row; it sits
   beside `interval` or `cron` and never replaces them. A good run of an upstream alert records the net-* sheets it read
   in `alertReads` (`bound(alertReads, RATE_LIMIT_KEYS_MAX)`), with that run's clock, found after its query succeeds:
-  `scanRefs` over its code, then each `query:` ref's live `data[0].code`, bounded by `checkRefPath`. Charts, tables and
-  other alerts are not followed. `netRow` calls `upstreamChanged(sheet_id, now)` only when a 2xx run inserted its row,
-  never on a repeat, a failure or a 304; `POST /net/:id` calls it when a delivery is stored. `upstreamChanged` moves
-  `alertDue` to the later of now and the last run plus `INTERVAL_MIN_S`, never later than the due time already there. A
-  failed run, or a run without `upstream`, drops the entry. An `upstream` that is not a boolean is an error run. After a
-  restart `alertReads` is empty until each alert's first run, which is immediate because `alertDue` is empty too.
+  `expandSnippets` then `scanRefs` over its code, then the same over each `query:` ref's live `data[0].code`, bounded by
+  `checkRefPath`. Charts, tables and other alerts are not followed. `netRow` calls `upstreamChanged(sheet_id, now)` only
+  when a 2xx run inserted its row, never on a repeat, a failure or a 304; `POST /net/:id` calls it when a delivery is
+  stored. `upstreamChanged` moves `alertDue` to the later of now and the last run plus `INTERVAL_MIN_S`, never later
+  than the due time already there. A failed run, or a run without `upstream`, drops the entry. An `upstream` that is not
+  a boolean is an error run. After a restart `alertReads` is empty until each alert's first run, which is immediate
+  because `alertDue` is empty too.
 
 **Outbound**
 
@@ -380,7 +394,8 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   `list_sheets`, `write_cells`), `resources/list`, `resources/read`, `prompts/list`, `prompts/get`. JWT or one sheet's
   key.
 - Under a key, the authority stops at that sheet: `mcpSheets` narrows the library, `mcpSheetId` refuses another
-  `sheet_id`, and `query_sheet` refuses an `@ref` out of it before the load.
+  `sheet_id`, and `query_sheet` refuses an `@ref` out of it on the raw text; `executeSql` runs `assertKeyRefs` again on
+  the expanded text, so a snippet body cannot reach another sheet.
 - `write_cells` writes the way `POST /sheet/:id` does: `assertKeyWrites`, `mcpSheetId`, the table check,
   `assertSheetEditor` (owner or editor; a viewer share, a purchase and `sheet.public` are refused), every cell checked
   before one change, `assertRoom` when a cell appends, then `spend(sheet_id, "writes", …)`. A refused call spends
@@ -395,8 +410,9 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 
 - One row per edge (`sheet_id`, `name`, `type`, `depends_on`, `depends_on_name`, `depends_on_type`, `columns`) for every
   query, alert and chart sheet the caller holds. The code comes from the live document (`data[0].code`, or `chartSql`),
-  never `sheet.row_0`, through `scanRefs`, deduped. Bounded by `USER_SHEETS_MAX` documents and `MAX_QUERY_ROWS` edges.
-  An unloadable document is a row with null `depends_on` and the refusal in `name`.
+  never `sheet.row_0`, through `expandSnippets` then `scanRefs`, deduped. A snippet table is an edge with `columns`
+  `expr, name`; one outside the caller's library is the null-`depends_on` row. Bounded by `USER_SHEETS_MAX` documents
+  and `MAX_QUERY_ROWS` edges. An unloadable document is a row with null `depends_on` and the refusal in `name`.
 - `columns`: the names the statement mentions (`namesIn()`) that exactly one ref holds (`readColumns()`), sorted and
   comma-joined; `*` when `SELECT_STAR` matches; `?` when a ref's columns cannot be read.
 
@@ -412,7 +428,21 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 `planQuery()` runs the pre-engine passes in order.
 
 - Refs: `@type:doc_id` is a sheet; `@type:doc_id.column` is a scalar from a one-row sheet. `scanRefs()` is the one
-  scanner. `checkRefPath` bounds depth and names a cycle; `main.ts` imports it for the alert's upstream walk.
+  scanner, and it reads expanded text only. `checkRefPath` bounds depth and names a cycle; `main.ts` imports it for the
+  alert's upstream walk.
+- Snippets: `expandSnippets(code, load)` runs before `scanRefs` in every reader of raw query code: `executeSql`,
+  `runSql`, `lineage()` and the alert upstream walk; a new reader calls it first. `using @table:<id>` leads the query
+  (elsewhere it is refused); the table holds text columns `name` and `expr`, validated whole on every use, row by row.
+  `{{name}}` outside a `'...'` or `"..."` span (backslash escapes) becomes `(expr)`, nested bodies depth first, bounded
+  by `SNIPPET_DEPTH_MAX` and `SNIPPET_EXPANSIONS_MAX`; a cycle reads `{{a}} -> {{b}} -> {{a}}`. Any other `{{` outside a
+  string is refused. An unaliased `{{x}}` column is named by its expanded text. The page cache's `VOLATILE` test reads
+  the expanded text, and the snippet table is in `reads.deps`.
+- Currency: `rejectMixedCurrency()` runs in `planQuery()` after `checkPivot`. It splits each top-level select item on
+  top-level `+` and `-`, strips an alias and bare parentheses, peels `sum`, `avg`, `min`, `max`, `round`, splits what it
+  peeled (a snippet body included) on its own top-level `+` and `-` (`termsOf`, bounded by `SELECT_DEPTH`), and refuses
+  two columns of different currencies (`usd` is `USD`), and a name two loaded sheets type in two currencies when the
+  statement adds it. It is textual: `case`, `where`, joins, scalar multiples and `coalesce` pass. Sums are IEEE doubles:
+  n additions err by at most (n-1)·2^-53 of the largest partial sum; keep amounts under 2^53 cents.
 - `rewriteExtremes()` runs first. It aims `min(x)` / `max(x)` at `min_text` / `max_text` when `x` is a bare column every
   loaded sheet types as one of `TEXT_TYPES`. It skips a windowed call, an expression, a name typed two ways, and a name
   the query aliases. `MAX_EXTREMES` bounds the calls.
@@ -575,6 +605,12 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   `SheetWrite`, clear, paste and find/replace go through both; fill-down repeats the raw array; `cleanable` hides the
   cleaning verbs on a `Multi` column. `ClipboardCopy` copies a null cell as empty text, and `editSeed` opens a blank
   `Multi` cell's editor empty.
+- Money: `Money String` draws `EUR 1,234.50`, sign first (`-EUR 12.00`), two places for every code, through `currency`,
+  which `usd` shares. It is in `numericColumn`, the stats row and `columnTotal`. The type row takes `money:EUR` through
+  `knownTypeName`, as it takes `enum:`. xlsx writes `"EUR "#,##0.00`, parquet DOUBLE, OpenAPI a number.
+- Column check: `Col.check` is read by the lenient `checkDecoder`. The column panel of a `Tab` offers `required`,
+  `unique`, and `min` / `max` on a numeric column; `ColumnCheck` writes one `[0, x, "check"]` patch through `changeDoc`,
+  or a `del` when no rule is left. `checkBreaks` refuses a rule the current rows break, nothing written.
 - Fill-down: `fillSeries` continues dates (`justinmimbs/date`, stepped off the last seed), numbers and trailing digits,
   else repeats. `parseDay` decides a date. `blankCell` decides blank. `seriesEncoder` writes by column type.
 - Resize from the keyboard: the header `.grip` is a focusable `separator` with `aria-valuenow` when the column has a
@@ -667,11 +703,12 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - `loadCodex` answers `codexLoaded` with `{ id, tables }` or `{ id, error }` on every path, logged out included, matched
   by id. `codexTablesDecoder` reads both server shapes through `tableDecoder` by column name.
 - `viewCodex` lists `button.chip.codex-table` ("name · N columns", a `title` of each column and type, `aria-pressed` on
-  the pick). `CodexPick` acts only on codex-db and sends `codexPreview { id, table, filters }`; `index.html` GETs
-  `/codex/<id>/preview?table=` with no `limit`, one `where=` per filter, and answers through `docQueried`. An unfiltered
-  refusal answers `codexLoaded { id, error }` and clears the pick; a filtered one goes to `docErrored` and keeps the
-  pick, the filters and the rows. `previewing` lets only the newest preview land, and `selectDoc` drops it for another
-  sheet. `resolveTable` says what the grid waits on. codex-scrapsheets lists its tables with the buttons disabled.
+  the pick). `CodexPick` acts only on codex-db and sends `codexPreview { id, table, filters, apply }`; `index.html` GETs
+  `/codex/<id>/preview?table=` with no `limit`, one `where=` per filter, and answers through `docQueried`. A pick's
+  refusal answers `codexLoaded { id, error }` and clears the pick; an apply's (`CodexFilterApply` or Enter, any filter
+  count) goes to `docErrored` and keeps the pick, the filters and the rows. `previewing` lets only the newest preview
+  land, and `selectDoc` drops it for another sheet. `resolveTable` says what the grid waits on. codex-scrapsheets lists
+  its tables with the buttons disabled.
 - Filters: `viewCodexFilters` draws one row per `CodexFilter` (`column`, `op`, `value`) under a picked codex-db table: a
   column select, an op select over `codexOps`, a value input (none for `isnull` and `notnull`), `remove filter`; then
   `add filter` (up to `codexFiltersMax`) and `apply filters`. Only `CodexFilterApply` and Enter in a value input send,
@@ -736,12 +773,13 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 
 **Known gaps**
 
+- `checkBreaks` (Elm) and `checkConstraints` (JS) are two copies of the check rules, and the check patch has no undo.
+- Snippets expand `{{x}}` inside a comment, so a commented-out reference to a deleted snippet is refused.
+- Money prints two decimals for every code, so JPY is wrong.
 - The page checks no role before promote. A viewer's promote shows in the page, and the sync server refuses the source
   write after.
 - A fork made before promote shipped has no `forked_code` and shows no chip; fork the source again.
-- A zero-filter apply that the server refuses (429, 403) takes the unfiltered path and clears the pick.
 - More than `peersMax` peers draws `peersMax here`.
-- Per-connection frame buckets multiply with connections, and `syncRole` clears its whole cache past its bound.
 - `@library:freshness` and `@library:lineage` resolve on the server, not in the page.
 - `describe` results carry no type in the page, and `WINDOW_TYPES` is server-only.
 - A back or forward onto `#settings` while the import preview is up mounts both, and the Tab trap holds only the later

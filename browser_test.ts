@@ -10,7 +10,7 @@
 // typed into -- and that is a real hole, not an oversight.
 import { assert, assertEquals } from "@std/assert";
 import { serveDir } from "@std/http/file-server";
-import { CANONICAL_TYPES, CHART_KINDS, COLUMN_TYPES } from "./src/sql.mjs";
+import { CANONICAL_TYPES, CHART_KINDS, CHECK_KEYS, COLUMN_TYPES, MONEY_SHAPE } from "./src/sql.mjs";
 
 const dir = new URL(".", import.meta.url).pathname;
 
@@ -548,6 +548,15 @@ Deno.test("the page and the engine accept exactly the same column types", async 
     "src/Main.elm's typeAliases",
     "src/sql.mjs's aliases",
   );
+  // The money family is a prefix and a shape, not a key, so no list above holds it. The page spells the shape
+  // as code (a length and a letter range) and the engine as a regex; both are held to the same three capitals.
+  assertEquals(MONEY_SHAPE.source, "^money:[A-Z]{3}$", "src/sql.mjs's MONEY_SHAPE");
+  const isMoney = elm.split("isMoney name =")[1]?.split("\n\n\n")[0] ?? "";
+  assert(
+    isMoney.includes('"money:"') && isMoney.includes(`== ${"money:".length + 3}`) && isMoney.includes("'A'") &&
+      isMoney.includes("'Z'"),
+    `src/Main.elm's isMoney should hold the same shape as MONEY_SHAPE, got: ${isMoney}`,
+  );
 });
 
 // A chart's kind used to be a plain string nothing checked: the decoder took
@@ -634,6 +643,14 @@ Deno.test("the page offers exactly the storage modes the poller reads", async ()
   const page = elm.split("netModes =")[1]?.split("]")[0] ?? "";
   assert(page.includes('"'), "netModes should still be a list of spellings in src/Main.elm");
   same(quoted(poller, /"([^"]+)"/g), quoted(page, /"([^"]+)"/g), "main.ts's NET_MODES", "src/Main.elm's netModes");
+});
+
+// A column's check is spelled in data[0] by both sides: refused by checkConstraints, read by checkDecoder.
+Deno.test("the page reads exactly the check keys the server enforces", async () => {
+  const elm = await Deno.readTextFile(dir + "src/Main.elm");
+  const page = elm.split("checkDecoder =")[1]?.split("\n\n\n")[0] ?? "";
+  assert(page.includes('key "'), "checkDecoder should still read each key by name in src/Main.elm");
+  same(new Set(CHECK_KEYS), quoted(page, /key "([^"]+)"/g), "src/sql.mjs's CHECK_KEYS", "src/Main.elm's checkDecoder");
 });
 
 Deno.test("the server's union admits exactly the column types the engine knows", async () => {

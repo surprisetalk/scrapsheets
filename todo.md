@@ -12,27 +12,35 @@ here.
 
 ## Next batch
 
-- [ ] A socket flood across many connections of one account cannot cost the server a query per frame.
-  1. Bug fix, no design. The frame buckets are per connection, so N connections multiply `syncRole` lookups.
-  2. Add a per-account frame budget beside `FRAME_RATE`, shared by that account's connections.
-  3. Replace `syncRole`'s whole-cache clear past its bound with evicting the oldest entry, so one flood cannot flush
-     other peers' roles.
-
-- [ ] A filter apply that the server refuses keeps the pick, even with no filters.
-  1. Bug fix, no design. A zero-filter apply refused with a 429 or 403 takes the unfiltered path (`codexLoaded` error)
-     and clears the pick and the grid.
-  2. Add a field to `codexPreview` that tells an apply from a pick, and send an apply's refusal to `docErrored`.
-  3. Extend the codex test in `sync_test.ts`; add no `glue()` call.
-
-- [ ] `main_test.ts` "right password opens the link" passes every run, under load too.
-  1. Bug fix, no design. It failed once at load 7 and passed on rerun (run 13 seam breaker).
-  2. Find the timing it depends on with a failing run first, then replace the wait with a bounded poll.
+- [ ] A rule you set on a column is checked by the same engine in the page and on the server.
+  1. Bug fix, no design. `checkBreaks` in `Main.elm` copies `checkConstraints`. The copies drifted once already (a
+     numeric string under `min` and `max`, fixed on the server in run 14), and `unique` compares by `E.encode` there.
+  2. Add a `checkColumn` port in `src/index.html` that runs `checkConstraints` and answers `checkLoaded`; hold the
+     panel's write until the answer lands. Delete `checkBreaks`.
+  3. Give the check patch an undo entry.
 
 ---
 
 ## Ready, needs a design
 
 Each feature here needs its design approved before the build.
+
+- [ ] You import a money column, JPY has no decimals, and a conversion is a function.
+  1. Accept `money:XXX` in `/import/csv?types=`; `inferType` never guesses it.
+  2. An ISO exponent per code replaces the fixed 2 places (JPY 0, BWP 3).
+  3. Extend `rejectMixedCurrency` to `where`, `case`, `sum(a + b)` and join keys.
+  4. Add `convert(amount, from, to, rate)`.
+
+- [ ] You use snippets from several tables, from a query sheet, and with completion in the editor.
+  1. Accept `using @table:a, @table:b`; refuse a name two tables define, naming both.
+  2. Allow `using @query:x`, requiring `name` and `expr` in its answer.
+  3. Complete `{{` in the editor from the snippet table's `name` column through `columnsFor`.
+  4. Arguments (`{{f(x)}}`) wait for a real snippet that needs one.
+
+- [ ] A cell edit tells you at once when it breaks its column's check, and the import and webhook doors enforce it.
+  1. Run `checkConstraints` over the edited row in `changeDoc` as advice only: a socket edit is never refused.
+  2. Call it in `readImport` and `POST /net/:id`; a bad row fails the whole batch, never skipped.
+  3. Row-count range, freshness bound and referential integrity each become one `CHECK_KEYS` key when picked up.
 
 - [ ] You query a connected database's filtered table with a ref in a query sheet, on the server and in the page.
   1. Design the ref syntax first: `scanRefs` reads `@type:id.column` as a scalar cell, so a table and its filters need
@@ -61,33 +69,6 @@ Each feature here needs its design approved before the build.
   3. Branch and merge a query through automerge `clone` and `merge`. A sandbox of fake deliveries comes after.
   4. Extend promote to alert, chart and net-http sheets.
 
-- [ ] You write a money column in a currency other than dollars, and an addition of two currencies is refused.
-  1. Decided: a code is checked by shape only, `^money:[A-Z]{3}$`. `usd` stays canonical for now. Sums stay floats, with
-     the error bound written in `claude.md`.
-  2. Design first: what `formatNumber` prints for a currency whose symbol it does not know. Today it hard-codes `$`. The
-     suggestion is the code before the digits, `EUR 12.00`.
-  3. Replace every `NUMERIC_TYPES.includes(...)` with a family predicate: `checkColumnTypes` in `src/sql.mjs`, and the
-     xlsx, parquet and MCP casts in `main.ts`. Do this before you add the family. Otherwise a `money:EUR` column skips
-     the numeric check and exports as a parquet STRING.
-  4. Add a parametric `money:XXX` family to `COLUMN_TYPES`, matched by prefix the way `knownType()` matches `enum:`. The
-     three language-boundary copies move with it: a `` `money:${string}` `` arm in `Type` in `main.ts`, and
-     `columnTypes`, `typeAliases` and `spec` in `Main.elm`. `browser_test.ts` reads only the `| "x"` arms of the union,
-     so widen its regex.
-  5. An addition across two codes is an error that names both, with the fix "join a rate table". `itemType` peels only
-     function calls, so this check is a new walk over the select list, in `planQuery()` beside `rewriteExtremes()`.
-
-- [ ] You name an expression once and use it in five sheets.
-  1. Decided: a `using @table:x` clause over an ordinary table of `name`/`expr` rows. No new sheet type. `using` is
-     already a join keyword in `KEYWORD`, so the parser requires `@` after it and strips the clause before `scanRefs`.
-  2. Design first: the reference syntax inside the query. A bare name collides with columns, `namesIn()` and `KEYWORD`,
-     so it needs a sigil or a call form.
-  3. Add one async `expandSnippets(code, fetch)` in `src/sql.mjs`. Call it before `scanRefs` in `executeSql`
-     (`main.ts`), in `runSql` (`src/page.mjs`) and in the `examples_test.ts` replay, with the loader `loadRefs` gets.
-  4. Also expand before the scan in `lineage()`, and before the MCP key-scope guard in `query_sheet`. If you do not, a
-     snippet body that holds `@other` gets past a key scoped to the snippet sheet.
-  5. Give it its own bound, not `MAX_REF_DEPTH`. Report a cycle as the path that closes it, in the shape `checkRefPath`
-     uses.
-
 - [ ] You name a snapshot of a sheet and go back to it from the history modal.
   1. Decided: the names live in this browser's store under `Stored`, keyed by sheet id and change hash, like folders.
      They do not sync and are not in `library.zip`.
@@ -115,18 +96,6 @@ Each feature here needs its design approved before the build.
        restore. Fix: restore a nearer version."
      - No difference: "That version's rows equal today's. Source: history restore. Fix: pick another version."
   5. A visual diff of the picked version against now comes after, from the same comparison.
-
-- [ ] A sheet states what must be true of its rows, and a bad row is refused at every door.
-  1. Decided: one nested `check` object on the column in `data[0]`, beside `type`, read leniently the way `viewDecoder`
-     reads. A constraint the current rows already break is refused in the page. No regex yet: nothing bounds a
-     catastrophic pattern. No dead-letter store: a refused row is gone, and the refusal names it.
-  2. Constraints: not-null, unique, range, allowed values, row-count range, freshness bound, referential integrity.
-     Allowed values are the `enum:` options, whose membership is checked nowhere today.
-  3. A `checkConstraints` in `src/sql.mjs`, beside `checkColumnTypes`, runs at `POST /sheet/:id` and in `write_cells`
-     over the rows as they will be after the write. The glue's `changeDoc` runs it for a cell edit, as advice only: the
-     server cannot refuse a socket edit, because a dropped frame wedges sync.
-  4. A refused batch stays all-or-nothing.
-  5. Row provenance: which source and which run wrote the row. For a net sheet this is `net.net_id`.
 
 - [ ] You group rows and see subtotals without writing SQL.
   1. Decided: the chosen column is model-only state, lost on reload. Tables only: a query has no totals row today. A cap

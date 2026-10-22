@@ -454,6 +454,188 @@ export const checkRefPath = (path, id) => {
   }
 };
 
+// --- snippets
+//
+// `using @table:id` at the very start of a query names a table of `name`/`expr`
+// rows, and `{{name}}` in the query becomes `(expr)`. It runs before scanRefs on
+// both hosts, because a body may hold an @ref of its own and scanRefs must see it.
+// Every reader of a query's raw code (executeSql, runSql, lineage, the alert's
+// upstream walk) expands first, or it misses what the bodies read.
+
+export const SNIPPET_DEPTH_MAX = 4;
+export const SNIPPET_EXPANSIONS_MAX = 200;
+const SNIPPET_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const SNIPPET_USING = /^\s*using\s+@([a-z-]+:[A-Za-z0-9_-]+)(?=\s)/i;
+
+// Calls `onText(text)` for each stretch outside a quoted string and returns
+// the pieces joined with the quoted ones untouched. `inside` is true when the
+// text ends in an unterminated string.
+const outsideStrings = (text, onText) => {
+  let out = "", plain = "", quote = "", skip = false;
+  for (const ch of text) {
+    if (quote) {
+      out += ch;
+      // AlaSQL reads \' and \" inside a string as the quote character itself.
+      if (skip) skip = false;
+      else if (ch === "\\") skip = true;
+      else if (ch === quote) quote = "";
+    } else if (ch === "'" || ch === '"') {
+      out += onText(plain) + ch;
+      plain = "";
+      quote = ch;
+    } else { plain += ch; }
+  }
+  return { text: out + onText(plain), inside: quote !== "" };
+};
+
+export const expandSnippets = async (code, load) => {
+  const lead = code.match(SNIPPET_USING);
+  const rest = lead ? code.slice(lead[0].length) : code;
+  let stray = false, refs = false;
+  outsideStrings(rest, (t) => {
+    if (/\busing\s+@/i.test(t)) stray = true;
+    if (/\{\{/.test(t)) refs = true;
+    return t;
+  });
+  if (stray) {
+    throw new Error(explain(`using @table:… can only open a query.`, {
+      Expected: "using @table:<snippets> as the first words of the query",
+      Received: shorten(rest.trim()),
+      Source: "the query's text",
+      Fix: "move `using @table:<snippets>` to the start of the query, before the select",
+    }));
+  }
+  if (!lead) {
+    if (!refs) return { code, used: [] };
+    throw new Error(explain(`A {{name}} snippet reference has no snippet table to read.`, {
+      Expected: "using @table:<snippets> at the start of the query",
+      Received: shorten(rest.trim()),
+      Source: "the query's text",
+      Fix: "write `using @table:<snippets>` first, or quote the text if {{…}} is meant literally",
+    }));
+  }
+  const id = lead[1];
+  if (!id.startsWith("table:")) {
+    throw new Error(explain(`Snippets come from a table sheet, and @${id} is not one.`, {
+      Expected: "using @table:<id>",
+      Received: `using @${id}`,
+      Source: "the start of the query",
+      Fix: "put the name and expr rows in a table sheet, and point using at it",
+    }));
+  }
+  const { docs, colsOf } = await load(id);
+  const names = colsOf[id].map((col) => col.name);
+  for (const need of ["name", "expr"]) {
+    if (names.includes(need)) continue;
+    const hit = nearest(need, names);
+    throw new Error(explain(`The snippet table @${id} has no column named "${need}".`, {
+      Expected: "columns named name and expr",
+      Received: names.join(", ") || "(no columns)",
+      ...(hit ? { "Did you mean": hit } : {}),
+      Source: `the column row of @${id}`,
+      Fix: `rename a column to ${need}`,
+    }));
+  }
+  const body = new Map();
+  docs[id].forEach((row, i) => {
+    const at = `row ${i + 1} of @${id}`;
+    const { name, expr } = row;
+    if (typeof name !== "string" || !SNIPPET_NAME.test(name)) {
+      throw new Error(explain(`A snippet name is not a name.`, {
+        Expected: "letters, digits and _, starting with a letter or _",
+        Received: show(name),
+        Source: at,
+        Fix: "rename the snippet",
+      }));
+    }
+    if (body.has(name)) {
+      throw new Error(explain(`The snippet "${name}" is defined twice.`, {
+        Expected: "one row per name",
+        Received: `${name} again`,
+        Source: at,
+        Fix: "delete or rename one of the two rows",
+      }));
+    }
+    if (typeof expr !== "string" || !expr.trim()) {
+      throw new Error(explain(`The snippet "${name}" has no text to expand to.`, {
+        Expected: "a non-empty text expr",
+        Received: show(expr),
+        Source: at,
+        Fix: "write the SQL expression in the expr cell",
+      }));
+    }
+    let depth = 0, broken = "";
+    const { inside } = outsideStrings(expr, (t) => {
+      if (/;|--|\/\*/.test(t)) broken ||= "a ; or a comment";
+      for (const ch of t) {
+        if (ch === "(") depth++;
+        if (ch === ")" && --depth < 0) broken ||= "a ) with no (";
+      }
+      return t;
+    });
+    if (depth > 0) broken ||= "a ( with no )";
+    if (inside) broken ||= "a quote that never closes";
+    if (broken) {
+      throw new Error(explain(`The snippet "${name}" cannot stand alone as an expression.`, {
+        Expected: "one balanced expression: no ;, no comment, every ( closed, every quote closed",
+        Received: `${broken} in ${shorten(expr)}`,
+        Source: at,
+        Fix: "write one expression; a body wraps in parentheses when it is used",
+      }));
+    }
+    body.set(name, expr);
+  });
+  let count = 0;
+  const expand = (text, stack) =>
+    outsideStrings(text, (t) =>
+      t.replace(/\{\{([^{}]*)\}\}/g, (_, raw) => {
+        const name = raw.trim();
+        if (!SNIPPET_NAME.test(name)) {
+          throw new Error(explain(`A {{…}} snippet reference is not a name.`, {
+            Expected: "{{name}}: letters, digits and _, starting with a letter or _",
+            Received: `{{${raw}}}`,
+            Source: stack.length ? `the body of {{${stack.at(-1)}}}` : "the query",
+            Fix: "write the snippet's name, or quote the text if {{…}} is meant literally",
+          }));
+        }
+        const path = [...stack, name].map((n) => `{{${n}}}`).join(" -> ");
+        if (!body.has(name)) {
+          const hit = nearest(name, [...body.keys()]);
+          throw new Error(explain(`There is no snippet named "${name}" in @${id}.`, {
+            ...(hit ? { "Did you mean": `{{${hit}}}` } : { Available: [...body.keys()].join(", ") || "(no snippets)" }),
+            Source: `{{${name}}} in ${stack.length ? `the body of {{${stack.at(-1)}}}` : "the query"}`,
+            Fix: hit ? `write {{${hit}}}` : `add a row named ${name} to @${id}`,
+          }));
+        }
+        if (stack.includes(name)) {
+          throw new Error(explain(`Snippets form a cycle: ${path}.`, {
+            Expected: "bodies that end in plain SQL",
+            Received: path,
+            Source: `@${id}`,
+            Fix: "break the loop by writing one of these bodies without the others",
+          }));
+        }
+        if (stack.length >= SNIPPET_DEPTH_MAX) {
+          throw new Error(explain(`Snippets nest more than ${SNIPPET_DEPTH_MAX} deep: ${path}.`, {
+            Expected: `at most ${SNIPPET_DEPTH_MAX} levels`,
+            Received: path,
+            Source: `@${id}`,
+            Fix: "write an inner snippet out in the outer one",
+          }));
+        }
+        if (++count > SNIPPET_EXPANSIONS_MAX) {
+          throw new Error(explain(`This query expands more than ${SNIPPET_EXPANSIONS_MAX} snippets.`, {
+            Expected: `at most ${SNIPPET_EXPANSIONS_MAX} expansions, nested ones included`,
+            Received: `${count} by {{${name}}}`,
+            Source: "the query and the snippets it uses",
+            Fix: "use fewer snippets, or compute the shared part once in a subquery",
+          }));
+        }
+        return `(${expand(body.get(name), [...stack, name])})`;
+      })).text;
+  return { code: expand(rest, []), used: [id] };
+};
+
 // --- schema introspection
 //
 // `describe @table:abc` is not SQL AlaSQL can parse, so both engines intercept it
@@ -638,6 +820,13 @@ export const CANONICAL_TYPES = Object.keys(COLUMN_TYPES).filter((type) => !COLUM
 // "pct" happened.
 export const NUMERIC_TYPES = Object.keys(COLUMN_TYPES).filter((type) => COLUMN_TYPES[canonicalType(type)].numeric);
 
+// `money:EUR` is a family like `enum:`: a prefix and an ISO 4217 shape, not a key of COLUMN_TYPES. The shape is
+// checked and the code is not, so a code nobody issued is a column that draws and sums like any other.
+export const MONEY_SHAPE = /^money:[A-Z]{3}$/;
+
+/** A column type whose cells are numbers: NUMERIC_TYPES, plus the money family. */
+export const numericType = (type) => NUMERIC_TYPES.includes(type) || MONEY_SHAPE.test(type);
+
 // The column types AlaSQL's own min()/max() drop: every one whose cells reach
 // the engine as a string. Read off the JSON shape rather than listed beside
 // COLUMN_TYPES -- a second list is exactly how "pct" happened.
@@ -665,7 +854,7 @@ export const knownType = (type) => {
   const picks = multiOptions(type);
   return picks
     ? picks.length > 0 && new Set(picks).size === picks.length
-    : Object.hasOwn(COLUMN_TYPES, type) || /^enum:.+/.test(type);
+    : Object.hasOwn(COLUMN_TYPES, type) || /^enum:.+/.test(type) || MONEY_SHAPE.test(type);
 };
 
 /** `multi:a,b` is a family like `enum:`, and its cell is an array of its options.
@@ -688,7 +877,9 @@ export const checkColumnTypes = (id, cols, rows) => {
       // `percentage`. Searching the canonical half alone sent `PCT` to `int`.
       const meant = nearest(String(col.type), Object.keys(COLUMN_TYPES));
       throw new Error(explain(`Column "${col.name}" of @${id} declares a type nobody knows.`, {
-        Expected: `one of ${CANONICAL_TYPES.join(", ")}, or enum: or multi: followed by the options`,
+        Expected: `one of ${
+          CANONICAL_TYPES.join(", ")
+        }, or enum: or multi: followed by the options, or money: followed by three capital letters, like money:EUR`,
         Received: show(col.type),
         Source: `data[0] of @${id}, column "${col.name}"`,
         "Did you mean": meant && canonicalType(meant),
@@ -717,7 +908,7 @@ export const checkColumnTypes = (id, cols, rows) => {
       }
       continue;
     }
-    if (!NUMERIC_TYPES.includes(col.type)) continue;
+    if (!numericType(col.type)) continue;
     const duration = canonicalType(col.type) === "duration";
     for (let i = 0; i < rows.length; i++) {
       const v = rows[i][col.name];
@@ -749,6 +940,118 @@ export const checkColumnTypes = (id, cols, rows) => {
         Source: `row ${i + 1} of @${id}, column "${col.name}"`,
         Fix: `clear that cell, or change the column's type to text`,
       }));
+    }
+  }
+};
+
+// A column's `check` in data[0]: what must be true of its cells. src/Main.elm's
+// checkDecoder reads the same four keys; browser_test.ts holds them equal.
+export const CHECK_KEYS = ["required", "unique", "min", "max"];
+
+const blank = (v) => absent(v) || (Array.isArray(v) && v.length === 0);
+
+/** Refuses the first touched row that breaks a column's `check`. `rows` are the
+ * whole table as it will stand after the write, keyed by column name; `touched`
+ * are the indexes the write changed. An untouched row is never blamed, so a
+ * sheet that already breaks a check still takes a good write; `unique` still
+ * compares a touched row with every row. A check that cannot be read is refused
+ * on every call. An `enum:` cell outside its options is refused only on a column
+ * that carries a check, so no sheet written before checks starts refusing. */
+export const checkConstraints = (id, cols, rows, touched) => {
+  for (const col of cols) {
+    const check = col.check;
+    if (check === undefined) continue;
+    const misread = (received, fix) =>
+      new Error(explain(`Column "${col.name}" of @${id} carries a check nobody can read.`, {
+        Expected: `an object with any of ${
+          CHECK_KEYS.join(", ")
+        }: required and unique true or false, min and max numbers (min at most max) on a numeric column`,
+        Received: show(received),
+        Source: `data[0] of @${id}, column "${col.name}", key "check"`,
+        Fix: fix,
+      }));
+    if (check === null || typeof check !== "object" || Array.isArray(check))
+      throw misread(check, `set that column's check to an object like {"required": true}, or remove it`);
+    for (const [k, v] of Object.entries(check)) {
+      if (!CHECK_KEYS.includes(k))
+        throw misread(k, `remove "${k}" from the check, or use one of ${CHECK_KEYS.join(", ")}`);
+      if (k === "required" || k === "unique") {
+        if (typeof v !== "boolean") throw misread(`${k}: ${show(v)}`, `set ${k} to true or false`);
+      } else if (typeof v !== "number" || !Number.isFinite(v))
+        throw misread(`${k}: ${show(v)}`, `set ${k} to a number`);
+      else if (!numericType(col.type))
+        throw misread(`${k} on a ${show(col.type)} column`, `use ${k} on a numeric column, or remove it`);
+    }
+    if (check.min !== undefined && check.max !== undefined && check.min > check.max)
+      throw misread(`min ${check.min} above max ${check.max}`, `set min at or below max`);
+  }
+  for (const col of cols) {
+    const check = col.check;
+    if (check === undefined) continue;
+    const options = typeof col.type === "string" && col.type.startsWith("enum:")
+      ? col.type.slice(5).split(",").map((x) => x.trim()).filter(Boolean)
+      : null;
+    // value -> the first two rows that hold it, so a touched row finds a twin that is not itself.
+    const seen = new Map();
+    if (check.unique) {
+      for (let i = 0; i < rows.length; i++) {
+        const v = rows[i][col.name];
+        if (blank(v)) continue;
+        const k = JSON.stringify(v);
+        const at = seen.get(k);
+        if (!at) seen.set(k, [i]);
+        else if (at.length < 2) at.push(i);
+      }
+    }
+    for (const i of touched) {
+      const v = rows[i][col.name];
+      const refuse = (headline, fields) =>
+        new Error(explain(headline, { ...fields, Source: `row ${i + 1} of @${id}, column "${col.name}"` }));
+      if (blank(v)) {
+        if (!check.required) continue;
+        throw refuse(`Column "${col.name}" of @${id} is required, and this row leaves it blank.`, {
+          Expected: `a value in "${col.name}", since its check says required`,
+          Received: show(v),
+          Fix: `give that cell a value, or remove required from the column's check`,
+        });
+      }
+      if (options && !options.includes(v)) {
+        throw refuse(`Column "${col.name}" of @${id} holds a value its options do not allow.`, {
+          Expected: `one of ${options.join(", ")}, or a blank`,
+          Received: show(v),
+          Fix: `use one of those, or add the option to the column's type`,
+        });
+      }
+      // A number the column holds as text counts as that number, as the page reads it.
+      const n = typeof v === "number"
+        ? v
+        : typeof v === "string" && numericType(col.type) && Number.isFinite(Number(v.trim()))
+        ? Number(v.trim())
+        : NaN;
+      if (check.min !== undefined && n < check.min) {
+        throw refuse(`Column "${col.name}" of @${id} holds a value below its min.`, {
+          Expected: `at least ${check.min}, which the column's check says as min`,
+          Received: show(v),
+          Fix: `use a value of ${check.min} or more, or lower min in the column's check`,
+        });
+      }
+      if (check.max !== undefined && n > check.max) {
+        throw refuse(`Column "${col.name}" of @${id} holds a value above its max.`, {
+          Expected: `at most ${check.max}, which the column's check says as max`,
+          Received: show(v),
+          Fix: `use a value of ${check.max} or less, or raise max in the column's check`,
+        });
+      }
+      if (check.unique) {
+        const twin = seen.get(JSON.stringify(v)).find((j) => j !== i);
+        if (twin !== undefined) {
+          throw refuse(`Column "${col.name}" of @${id} must be unique, and this value is already in row ${twin + 1}.`, {
+            Expected: `a value no other row holds, since the column's check says unique`,
+            Received: show(v),
+            Fix: `use another value, or remove unique from the column's check`,
+          });
+        }
+      }
     }
   }
 };
@@ -1931,6 +2234,21 @@ const itemType = (expr, nameToType) => {
   return undefined;
 };
 
+/** The [start, end) of each top-level select item, empty when there is no select. */
+const selectSpans = (code, depth) => {
+  const select = findAt(code, depth, /\bselect\b/gi, 0);
+  if (!select) return [];
+  const listStart = select.index + select[0].length;
+  const tail = findAt(
+    code,
+    depth,
+    /\b(?:from|where|group|having|qualify|order|limit|offset|union|into)\b/gi,
+    0,
+    listStart,
+  );
+  return splitAt(code, depth, listStart, tail ? tail.index : code.length, 0);
+};
+
 /** The type each top-level select item produces, keyed by the name its column
  * will carry: its alias, or the column's own name.
  *
@@ -1941,18 +2259,8 @@ const itemType = (expr, nameToType) => {
  */
 export const selectTypes = (code, nameToType) => {
   const depth = topLevel(code);
-  const select = findAt(code, depth, /\bselect\b/gi, 0);
-  if (!select) return {};
-  const listStart = select.index + select[0].length;
-  const tail = findAt(
-    code,
-    depth,
-    /\b(?:from|where|group|having|qualify|order|limit|offset|union|into)\b/gi,
-    0,
-    listStart,
-  );
   const out = {};
-  for (const [a, b] of splitAt(code, depth, listStart, tail ? tail.index : code.length, 0)) {
+  for (const [a, b] of selectSpans(code, depth)) {
     // The first `as` written at the item's own depth. The one inside
     // `cast(x as int)` sits a bracket deeper and is not an alias.
     const as = findAt(code, depth, /\bas\s+["'`[]?([A-Za-z_][A-Za-z0-9_]*)/gi, 0, a, b);
@@ -1963,6 +2271,93 @@ export const selectTypes = (code, nameToType) => {
     if (type) out[name] = type;
   }
   return out;
+};
+
+// --- currencies
+//
+// Two amounts in different currencies have no sum. This reads the author's own text, so it sees only a
+// select item that adds or subtracts bare columns, each one maybe wrapped in sum, avg, min, max, round or
+// parentheses (a snippet body arrives in them), which are split again. A case, a where and a join slip
+// through: the check is textual, not typed. `usd` counts
+// as the code USD, so `usd` and `money:USD` mix. A name is read by itself, so the same name in two sheets
+// stands for one column, and two currencies on it are refused whenever the statement adds it.
+const currencyOf = (type) => type === "usd" ? "USD" : MONEY_SHAPE.test(type) ? type.slice(6) : null;
+
+// A wrapped item (a snippet body arrives in parentheses) is split again on its own top-level + and -.
+const termsOf = (text, hops) => {
+  let wrapped = false;
+  for (let i = 0; i < SELECT_DEPTH; i++) {
+    const head = text.match(/^(?:(?:sum|avg|min|max|round)\s*)?\(/i);
+    if (!head) break;
+    const d = topLevel(text);
+    const open = head[0].length - 1;
+    if (closeAt(text, d, open) !== text.length - 1) break;
+    text = splitAt(text, d, open + 1, text.length - 1, d[open] + 1).map(([x, y]) => text.slice(x, y))[0] ?? "";
+    text = text.trim();
+    wrapped = true;
+  }
+  if (!wrapped || hops >= SELECT_DEPTH) return [text];
+  const d = topLevel(text);
+  const parts = [];
+  let from = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (d[i] === 0 && (text[i] === "+" || text[i] === "-")) {
+      parts.push(text.slice(from, i));
+      from = i + 1;
+    }
+  }
+  parts.push(text.slice(from));
+  return parts.length > 1 ? parts.flatMap((part) => termsOf(part.trim(), hops + 1)) : [text];
+};
+
+export const rejectMixedCurrency = (code, colsOf) => {
+  const held = new Map();
+  for (const [id, cols] of Object.entries(colsOf ?? {})) {
+    for (const col of cols) {
+      if (!currencyOf(col.type)) continue;
+      held.set(col.name, [...(held.get(col.name) ?? []), { id, type: col.type }]);
+    }
+  }
+  if (!held.size) return;
+  const depth = topLevel(code);
+  for (const [a, whole] of selectSpans(code, depth)) {
+    const b = findAt(code, depth, /\bas\b/gi, 0, a, whole)?.index ?? whole;
+    const cuts = [a - 1];
+    for (let i = a; i < b; i++) if (depth[i] === 0 && (code[i] === "+" || code[i] === "-")) cuts.push(i);
+    cuts.push(b);
+    const seen = [];
+    for (let k = 0; k + 1 < cuts.length; k++) {
+      let text = code.slice(cuts[k] + 1, cuts[k + 1]).trim();
+      // An alias written without `as`, and the dot of a qualified name stays whole.
+      const unaliased = text.replace(/\s+(?:"[^"]*"|`[^`]*`|[A-Za-z_][A-Za-z0-9_]*)$/, "");
+      if (unaliased && !unaliased.endsWith(".")) text = unaliased;
+      for (const term of termsOf(text, 0)) {
+        const name = bare(term).match(/^(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)$/)?.[1];
+        const sheets = name && held.get(name);
+        if (!sheets) continue;
+        const codes = new Set(sheets.map((x) => currencyOf(x.type)));
+        if (codes.size > 1) {
+          throw new Error(explain(`The column "${name}" is typed in two currencies.`, {
+            Received: sheets.map((x) => `${x.type} in @${x.id}`).join(", "),
+            Expected: "one currency for one column name in a statement that adds or subtracts it",
+            Source: "the select list of this query",
+            Fix: `rename "${name}" in one sheet, or select it from one sheet only`,
+          }));
+        }
+        seen.push({ name, type: sheets[0].type, code: [...codes][0] });
+      }
+    }
+    const first = seen[0];
+    const clash = first && seen.find((x) => x.code !== first.code);
+    if (clash) {
+      throw new Error(explain(`This query adds or subtracts two currencies.`, {
+        Received: `"${first.name}" is ${first.type} and "${clash.name}" is ${clash.type}`,
+        Expected: "amounts in one currency on both sides of + and -",
+        Source: "the select list of this query",
+        Fix: "convert one side first, or select the two columns apart",
+      }));
+    }
+  }
 };
 
 // --- pivot and unpivot
@@ -2513,6 +2908,7 @@ export const planQuery = (sql, cells, docs, colsOf) => {
   checkCells(cells, docs, colsOf);
   checkJoinRows(sql, docs);
   checkPivot(sql);
+  rejectMixedCurrency(sql, colsOf);
   return rewriteWindows(rewriteUnpivot(rewriteExtremes(sql, colsOf), colsOf));
 };
 

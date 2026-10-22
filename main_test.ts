@@ -12,6 +12,8 @@ import { parquetReadObjects } from "hyparquet";
 import { ByteWriter, parquetWrite, parquetWriteBuffer } from "hyparquet-writer";
 import { Cron } from "croner";
 import {
+  ACCOUNT_FRAME_BURST,
+  ACCOUNT_FRAME_RATE,
   accountBuckets,
   app,
   APPEND_ROWS_MAX,
@@ -659,14 +661,113 @@ Deno.test(async function allTests(t) {
           data: new Uint8Array(),
         }));
       }
-      for (let i = 0; i < 100 && !shut; i++) await new Promise((r) => setTimeout(r, 20));
-      assert(shut, "Expected the server to close a flooding socket within 2s; it stayed open.");
+      // The server reads the flood one frame at a time, a role lookup each until
+      // the bucket runs dry, so under load the close lands seconds later.
+      for (let i = 0; i < 400 && !shut; i++) await new Promise((r) => setTimeout(r, 25));
+      assert(shut, "Expected the server to close a flooding socket within 10s; it stayed open.");
       assert(
         replies.some((f) => f.type === "error" && String(f.message).includes("this connection was closed")),
         "the flooder is told why before the close",
       );
       const lookups = syncAccessCache.size - cached;
       assert(lookups > 0 && lookups <= FRAME_BURST + FRAME_RATE, `${lookups} lookups for ${4 * FRAME_BURST} frames`);
+    }
+
+    // Connections of one account share a bucket, so N sockets do not multiply
+    // the lookups; and a full cache evicts its oldest roles, never everyone's.
+    {
+      const { jwt: flooderJwt } = await usr("account-flooder@example.com");
+      const sockets = await Promise.all([0, 1, 2].map(async (n) => {
+        const ws = new WebSocket(wsUrl(flooderJwt));
+        ws.binaryType = "arraybuffer";
+        const replies: Record<string, unknown>[] = [];
+        ws.onmessage = (e) =>
+          replies.push(AM.cbor.decode(new Uint8Array(e.data as ArrayBuffer)) as Record<string, unknown>);
+        const state = { ws, replies, shut: false, senderId: `account-flooder-${n}` };
+        ws.onclose = () => state.shut = true;
+        await new Promise<void>((resolve) => {
+          ws.onopen = () => resolve();
+        });
+        ws.send(AM.cbor.encode({
+          type: "join",
+          senderId: state.senderId,
+          peerMetadata: {},
+          supportedProtocolVersions: ["1"],
+        }));
+        for (let i = 0; i < 100 && !replies.some((f) => f.type === "peer"); i++)
+          await new Promise((r) => setTimeout(r, 20));
+        return state;
+      }));
+      const cached = syncAccessCache.size;
+      for (let i = 0; i < 4 * FRAME_BURST; i++) {
+        for (const s of sockets) {
+          if (s.shut) continue;
+          s.ws.send(AM.cbor.encode({
+            type: "request",
+            senderId: s.senderId,
+            targetId: automerge.peerId,
+            documentId: crypto.randomUUID(),
+            data: new Uint8Array(),
+          }));
+        }
+      }
+      for (let i = 0; i < 400 && !sockets.every((s) => s.shut); i++) await new Promise((r) => setTimeout(r, 25));
+      assert(sockets.every((s) => s.shut), "Expected every connection of a flooding account to close within 10s.");
+      const accountLookups = syncAccessCache.size - cached;
+      assert(
+        accountLookups > 0 && accountLookups <= ACCOUNT_FRAME_BURST + ACCOUNT_FRAME_RATE,
+        `${accountLookups} lookups for three connections of one account`,
+      );
+      assert(
+        sockets.some((s) => s.replies.some((f) => f.type === "error" && String(f.message).includes("across"))),
+        "a connection is told the account bound, not its own, was the one it crossed",
+      );
+
+      // Fill the cache with 2,000 older fakes, one real peer's role, and fakes to the bound.
+      const fakes: string[] = [];
+      const fake = () => {
+        const key = `fake-${fakes.length}/doc`;
+        fakes.push(key);
+        syncAccessCache.set(key, { role: null, expires: Date.now() + 30_000 });
+      };
+      for (let i = 0; i < 2000; i++) fake();
+      const peerKey = "peer-with-a-role:-/doc";
+      syncAccessCache.set(peerKey, { role: "editor", expires: Date.now() + 30_000 });
+      while (syncAccessCache.size < 10_000) fake();
+      const { jwt: otherJwt } = await usr("account-flooder-two@example.com");
+      const ws = new WebSocket(wsUrl(otherJwt));
+      ws.binaryType = "arraybuffer";
+      let shut = false;
+      let joined = false;
+      ws.onclose = () => shut = true;
+      ws.onmessage = (e) => {
+        if ((AM.cbor.decode(new Uint8Array(e.data as ArrayBuffer)) as { type: string }).type === "peer") joined = true;
+      };
+      await new Promise<void>((resolve) => {
+        ws.onopen = () => resolve();
+      });
+      ws.send(AM.cbor.encode({
+        type: "join",
+        senderId: "cache-flooder",
+        peerMetadata: {},
+        supportedProtocolVersions: ["1"],
+      }));
+      for (let i = 0; i < 100 && !joined; i++) await new Promise((r) => setTimeout(r, 20));
+      assert(joined, "Expected the cache flooder to join within 2s.");
+      for (let i = 0; i < 4 * FRAME_BURST; i++) {
+        ws.send(AM.cbor.encode({
+          type: "request",
+          senderId: "cache-flooder",
+          targetId: automerge.peerId,
+          documentId: crypto.randomUUID(),
+          data: new Uint8Array(),
+        }));
+      }
+      for (let i = 0; i < 400 && !shut; i++) await new Promise((r) => setTimeout(r, 25));
+      assert(shut, "Expected the cache flooder to close within 10s; it stayed open.");
+      assert(syncAccessCache.size <= 10_000, `cache holds ${syncAccessCache.size} entries`);
+      assert(syncAccessCache.has(peerKey), "a flood evicted another peer's cached role");
+      for (const key of [...fakes, peerKey]) syncAccessCache.delete(key);
     }
 
     // An authenticated client repo syncs a shared doc end-to-end.
@@ -883,6 +984,65 @@ Deno.test(async function allTests(t) {
       ]);
       assertEquals(outcome, "shared", "a public sheet should be readable anonymously");
       adapter.disconnect();
+
+      // Signed-out readers share an address in an office or a classroom, so each
+      // socket spends only its own bucket: three sockets that together pass one
+      // account's burst, each under its own, all stay open.
+      const readers = await Promise.all([0, 1, 2].map(async (n) => {
+        const ws = new WebSocket(wsUrl(undefined));
+        ws.binaryType = "arraybuffer";
+        const replies: Record<string, unknown>[] = [];
+        ws.onmessage = (e) =>
+          replies.push(AM.cbor.decode(new Uint8Array(e.data as ArrayBuffer)) as Record<string, unknown>);
+        const reader = { ws, replies, shut: false, senderId: `public-reader-${n}` };
+        ws.onclose = () => reader.shut = true;
+        await new Promise<void>((resolve) => {
+          ws.onopen = () => resolve();
+        });
+        ws.send(
+          AM.cbor.encode({
+            type: "join",
+            senderId: reader.senderId,
+            peerMetadata: {},
+            supportedProtocolVersions: ["1"],
+          }),
+        );
+        for (let i = 0; i < 100 && !replies.some((f) => f.type === "peer"); i++)
+          await new Promise((r) => setTimeout(r, 20));
+        return reader;
+      }));
+      const each = Math.ceil(ACCOUNT_FRAME_BURST / readers.length) + 50;
+      assert(each < FRAME_BURST, `each reader sends ${each}, under its own burst of ${FRAME_BURST}`);
+      for (const reader of readers) {
+        for (let i = 0; i < each; i++) {
+          reader.ws.send(AM.cbor.encode({
+            type: "ephemeral",
+            senderId: reader.senderId,
+            targetId: automerge.peerId,
+            documentId: hand.documentId,
+            count: i,
+            sessionId: reader.senderId,
+            data: AM.cbor.encode({}),
+          }));
+        }
+        // Answered only after every frame queued before it, so it proves the socket read them all.
+        reader.ws.send(AM.cbor.encode({
+          type: "request",
+          senderId: reader.senderId,
+          targetId: automerge.peerId,
+          documentId: crypto.randomUUID(),
+          data: new Uint8Array(),
+        }));
+      }
+      const answered = (r: (typeof readers)[number]) => r.shut || r.replies.some((f) => f.type === "doc-unavailable");
+      for (let i = 0; i < 400 && !readers.every(answered); i++) await new Promise((r) => setTimeout(r, 25));
+      assert(readers.every(answered), "Expected every public reader's barrier frame answered within 10s.");
+      assertEquals(
+        readers.map((r) => r.shut),
+        [false, false, false],
+        "no signed-out reader is closed by the others' frames",
+      );
+      for (const reader of readers) reader.ws.close();
       const [anonymous]: { via: string }[] = await sql`
         select via from audit where sheet_id = ${sheet_id} and usr_id is null order by audit_id desc limit 1
       `;
@@ -2613,6 +2773,34 @@ Deno.test(async function allTests(t) {
         `expected the error to name the path that closes the cycle, got: ${body}`,
       );
     }
+
+    // `using @table:` makes {{name}} a snippet: the same expansion as the page.
+    {
+      const mk = (cols: Col[], ...rows: Record<number, unknown>[]) => {
+        const doc = automerge.create<{ data: Sheet["data"] }>({ data: [arrayify(cols), ...rows] });
+        return `table:${doc.documentId}`;
+      };
+      const snips = mk(
+        [{ name: "name", type: "text", key: 0 }, { name: "expr", type: "text", key: 1 }],
+        { 0: "total", 1: "sum(n)" },
+      );
+      const nums = mk([{ name: "n", type: "int", key: 0 }], { 0: 2 }, { 0: 5 });
+      for (const id of [snips, nums]) await put(jwt, `/library/${id}`, {});
+      const ok: { data: Table } = await post(jwt, `/query`, {
+        lang: "sql",
+        code: `using @${snips} select {{total}} as t from @${nums}`,
+        args: [],
+      });
+      assertEquals(ok.data.slice(1), [{ t: 7 }]);
+      const res = await app.request(`/query`, {
+        method: "POST",
+        headers: new Headers({ Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" }),
+        body: JSON.stringify({ lang: "sql", code: `using @${snips} select {{totl}} as t`, args: [] }),
+      });
+      assertEquals(res.status, 400);
+      const said = await res.text();
+      for (const part of ["Did you mean", "{{total}}", "Source", "Fix"]) assert(said.includes(part), said);
+    }
   });
 
   await t.step("CSV import -> export round-trip", async () => {
@@ -3044,6 +3232,20 @@ Deno.test(async function allTests(t) {
         [second.n, second.paid, second.ok, second.day, second.blob, second.note, second.when],
         [null, null, null, null, null, null, null],
       );
+
+      // A money column is a number in both files. The workbook draws the code before the digits.
+      const euros = automerge.create<Sheet>({
+        type: "table",
+        data: [arrayify([{ name: "fee", type: "money:EUR", key: "0" }]), { 0: 12.5 }],
+      });
+      await put(jwt, `/library/table:${euros.documentId}`, {});
+      const book = XLSX.read(
+        new Uint8Array(await (await exp(`table:${euros.documentId}`, "xlsx")).arrayBuffer()),
+        { type: "array", cellNF: true },
+      );
+      const cell = book.Sheets[book.SheetNames[0]].A2;
+      assertEquals([cell.t, cell.v, cell.z], ["n", 12.5, '"EUR "#,##0.00']);
+      assertEquals((await read(await exp(`table:${euros.documentId}`, "parquet")))[0].fee, 12.5);
     }
   });
 
@@ -3516,6 +3718,99 @@ Deno.test(async function allTests(t) {
     const stops = await halted.text();
     assert(stops.includes(`row 2 of @table:${stopped.documentId}, column "took"`), stops);
     assert(stops.includes("h:mm"), stops);
+
+    // A money column is `money:` and a three-letter code. Its cells are numbers like a usd column's, and
+    // adding two currencies is refused where the statement names both.
+    const ledger = async (name: string, type: string, cells: unknown[]) => {
+      const doc = automerge.create<{ data: Sheet["data"] }>({
+        data: [arrayify([{ name, type, key: 0 } as unknown as Col]), ...cells.map((v) => ({ 0: v }))],
+      });
+      await put(jwt, `/library/table:${doc.documentId}`, {});
+      return `table:${doc.documentId}`;
+    };
+    const ask = async (code: string) => {
+      const res = await app.request("/query", {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        body: JSON.stringify({ lang: "sql", code, args: [] }),
+      });
+      return { status: res.status, text: await res.text() };
+    };
+    const eur = await ledger("eur", "money:EUR", ["12.5", 12.5, ""]);
+    const gbp = await ledger("gbp", "money:GBP", [1]);
+    const dollars = await ledger("usd_col", "usd", [2]);
+    const usdCode = await ledger("usd_code", "money:USD", [3]);
+    const eurAgain = await ledger("eur2", "money:EUR", [4]);
+    const sums = await ask(`select sum(eur) as s, count(eur) as n from @${eur}`);
+    assertEquals(sums.status, 200, sums.text);
+    assertEquals(
+      JSON.parse(sums.text).data[1],
+      { s: 25, n: 2 },
+      "a string and a number both store as 12.5, a blank is null",
+    );
+    const word = await ledger("eur", "money:EUR", ["abc"]);
+    const wordRefused = await ask(`select * from @${word}`);
+    assertEquals(wordRefused.status, 400);
+    assert(wordRefused.text.includes("money:EUR, so a number or a blank"), wordRefused.text);
+    for (const type of ["money:eur", "money:EURO", "money:"]) {
+      const shapeless = await ask(`select * from @${await ledger("x", type, [1])}`);
+      assertEquals(shapeless.status, 400, type);
+      assert(shapeless.text.includes("money:EUR"), `${type}: ${shapeless.text}`);
+    }
+    const mixed = await ask(`select a.eur + b.gbp as t from @${eur} a, @${gbp} b`);
+    assertEquals(mixed.status, 400, mixed.text);
+    assert(mixed.text.includes("money:EUR") && mixed.text.includes("money:GBP"), mixed.text);
+    for (
+      const code of [
+        `select sum(a.eur) - max(b.gbp) as t from @${eur} a, @${gbp} b`,
+        `select a.eur + b.usd_col as t from @${eur} a, @${dollars} b`,
+        `select b.usd_col - a.eur as t from @${eur} a, @${dollars} b`,
+        `select a.eur + b.gbp total from @${eur} a, @${gbp} b`,
+        `select (a.eur) + b.gbp "t" from @${eur} a, @${gbp} b`,
+      ]
+    ) { assertEquals((await ask(code)).status, 400, code); }
+    for (
+      const code of [
+        `select a.eur + b.eur2 as t from @${eur} a, @${eurAgain} b`,
+        `select sum(a.eur) as t from @${eur} a, @${gbp} b`,
+        `select a.usd_col + b.usd_code as t from @${dollars} a, @${usdCode} b`,
+      ]
+    ) {
+      const ok = await ask(code);
+      assertEquals(ok.status, 200, `${code}: ${ok.text}`);
+    }
+    // A name typed two currencies across the loaded sheets names both sheets.
+    const other = await ledger("eur", "money:GBP", [5]);
+    const twice = await ask(`select a.eur + 1 as t from @${eur} a, @${other} b`);
+    assertEquals(twice.status, 400, twice.text);
+    assert(twice.text.includes(eur) && twice.text.includes(other), twice.text);
+
+    // A snippet body that adds two currencies is refused: planQuery reads the expanded text. A body that only
+    // names a money column is an ordinary column in the statement around it.
+    {
+      const snips = automerge.create<{ data: Sheet["data"] }>({
+        data: [
+          arrayify([{ name: "name", type: "text", key: 0 }, { name: "expr", type: "text", key: 1 }]),
+          { 0: "both", 1: "a.eur + b.gbp" },
+          { 0: "fee", 1: "a.eur" },
+        ],
+      });
+      const snipId = `table:${snips.documentId}`;
+      await put(jwt, `/library/${snipId}`, {});
+      for (
+        const code of [
+          `using @${snipId} select {{both}} as t from @${eur} a, @${gbp} b`,
+          `using @${snipId} select {{fee}} + b.gbp as t from @${eur} a, @${gbp} b`,
+          `select sum(a.eur + b.gbp) as t from @${eur} a, @${gbp} b`,
+        ]
+      ) {
+        const res = await ask(code);
+        assertEquals(res.status, 400, `${code}: ${res.text}`);
+        assert(res.text.includes("money:EUR") && res.text.includes("money:GBP"), res.text);
+      }
+      const named = await ask(`using @${snipId} select sum({{fee}}) as t from @${eur} a`);
+      assertEquals(named.status, 200, named.text);
+    }
 
     // And a spelling nobody knows is refused by name rather than skipped, which
     // is the same failure wearing a typo.
@@ -6299,6 +6594,43 @@ Deno.test(async function allTests(t) {
       assert(elsewhere.content[0].text.includes(`opens ${a}`), elsewhere.content[0].text);
     }
 
+    // A snippet body is a ref too: a key on the snippet table cannot reach another sheet through one, and a key on
+    // a sheet cannot name another sheet as its snippet table.
+    {
+      const hand = automerge.create<Sheet>({
+        type: "table",
+        data: [
+          arrayify([{ name: "name", type: "text", key: "0" }, { name: "expr", type: "text", key: "1" }]),
+          { 0: "mine", 1: "1" },
+          { 0: "theirs", 1: `(select max(n) from @${b})` },
+        ],
+      });
+      const snips = `table:${hand.documentId}`;
+      await put(jwt, `/library/${snips}`, { name: "snippets" });
+      const key = (await post(jwt, `/library/${snips}/secret`, { name: "api" })).data.key as string;
+      const callOn = async (code: string) => {
+        const res = await app.request(`/mcp/${snips}`, {
+          method: "POST",
+          headers: new Headers({ "Content-Type": "application/json", "scrapsheets-key": key }),
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "query_sheet", arguments: { code } },
+          }),
+        });
+        return JSON.parse(await res.text()).result;
+      };
+      const own = await callOn(`using @${snips} select {{mine}} as one`);
+      assertEquals(own.isError, false, own.content?.[0]?.text);
+      assertEquals(own.structuredContent.rows, [{ one: 1 }]);
+      for (const code of [`using @${snips} select {{theirs}} as x`, `using @${b} select 1 as x`]) {
+        const refused = await callOn(code);
+        assertEquals(refused.isError, true, code);
+        assert(refused.content[0].text.includes(`This key opens ${snips}`), refused.content[0].text);
+      }
+    }
+
     // A key's authority is the sheet's created_by, read again on every request through assertSheetEditor, so a
     // downgrade of the creator reaches a key already minted. PUT /library/:id grants "owner" through pendingSync for
     // 30 seconds, until its sheet_usr row exists; a finished claim must leave no grant to outvote the downgrade.
@@ -6437,6 +6769,30 @@ Deno.test(async function allTests(t) {
       }
       assertEquals(JSON.stringify(tagged.doc().data[1]), `{"0":["green","blue"]}`, "a refused pick wrote nothing");
     }
+
+    // A money column takes a number, as a usd column does, and refuses text.
+    {
+      const priced = automerge.create<Sheet>({
+        type: "table",
+        data: [arrayify([{ name: "fee", type: "money:EUR", key: "0" }]), { 0: 1 }],
+      });
+      const priced_id = `table:${priced.documentId}`;
+      await put(jwt, `/library/${priced_id}`, {});
+      const fee = async (value: unknown) =>
+        (await (await app.request(`/mcp/${priced_id}`, {
+          method: "POST",
+          headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "write_cells", arguments: { cells: [{ row: 0, col: "fee", value }] } },
+          }),
+        })).json()).result;
+      assertEquals((await fee(12.5)).structuredContent, { written: 1, rows: 1 });
+      assertEquals((await fee("12.5")).isError, true);
+      assertEquals(JSON.stringify(priced.doc().data[1]), `{"0":12.5}`);
+    }
   });
 
   // The boundary is the whole feature: a row that does not match the columns, or a value that does not parse at its
@@ -6570,6 +6926,155 @@ Deno.test(async function allTests(t) {
       }
     }
 
+    // A column's check is enforced at both doors, on the rows the write touched, and a refusal writes nothing. The
+    // keys differ from the names, so a check that read the wrong spelling would check nothing. The first two rows
+    // already repeat a sku: they are not blamed, and a good append still lands.
+    {
+      const checked = automerge.create<Sheet>({
+        type: "table",
+        data: [
+          arrayify([
+            { name: "sku", type: "text", key: "7", check: { required: true, unique: true } },
+            { name: "pct", type: "int", key: "3", check: { min: 0, max: 100 } },
+            { name: "size", type: "enum:s,m,l", key: "5", check: {} },
+            { name: "note", type: "enum:a,b", key: "9" },
+          ]) as never,
+          { 7: "a1", 3: 10, 5: "s", 9: "zzz" },
+          { 7: "a1", 3: 20, 5: "m", 9: "zzz" },
+        ],
+      });
+      const checked_id = `table:${checked.documentId}`;
+      await put(jwt, `/library/${checked_id}`, {});
+      const row = (over: Record<string, unknown>) => ({ sku: "b2", pct: 50, size: "l", note: "anything", ...over });
+      const snapshot = () => JSON.stringify(checked.doc().data);
+      const refuse = async (rows: unknown[], want: string[]) => {
+        const before = snapshot();
+        const res = await refused({ rows }, checked_id);
+        for (const w of want) assert(res.text.includes(w), `${w}: ${res.text}`);
+        assertEquals(snapshot(), before, "a refused append wrote nothing");
+      };
+      const cell = async (cells: unknown[]) =>
+        (await (await app.request(`/mcp/${checked_id}`, {
+          method: "POST",
+          headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "write_cells", arguments: { cells } },
+          }),
+        })).json()).result;
+
+      assertEquals((await post(jwt, `/sheet/${checked_id}`, { rows: [row({})] })).data, { appended: 1, rows: 3 });
+      await refuse([row({ sku: "" })], ["required", `"sku"`, "row 4"]);
+      await refuse([row({ sku: null })], ["required"]);
+      await refuse([row({ sku: "b2" })], ["unique", `"b2"`, "row 3"]);
+      await refuse([row({ sku: "c3" }), row({ sku: "c3" })], ["unique", "row 5"]);
+      await refuse([row({ sku: "z9", pct: 101 })], ["max", "100", "101"]);
+      await refuse([row({ sku: "z9", pct: -1 })], ["min", "-1"]);
+      await refuse([row({ sku: "z9", size: "xl" })], ["size", "xl", "s, m, l"]);
+      assertEquals(
+        (await post(jwt, `/sheet/${checked_id}`, { rows: [row({ sku: "d4", pct: 100, note: "free" })] })).data,
+        {
+          appended: 1,
+          rows: 4,
+        },
+      );
+
+      // write_cells: the same rule, a cell written with its own value passes, and a refused call changes nothing.
+      const before = snapshot();
+      for (
+        const [cells, want] of [
+          [[{ row: 2, col: "sku", value: "a1" }], "unique"],
+          [[{ row: 2, col: "pct", value: 101 }], "max"],
+          [[{ row: 2, col: "size", value: "xl" }], "size"],
+          [[{ row: 4, col: "pct", value: 5 }], "required"],
+        ] as const
+      ) {
+        const res = await cell([...cells]);
+        assert(res.isError === true && res.content[0].text.includes(want), JSON.stringify(res));
+      }
+      assertEquals(snapshot(), before, "every refused call left the document as it was");
+      assertEquals((await cell([{ row: 2, col: "sku", value: "b2" }])).structuredContent, { written: 1, rows: 4 });
+      assertEquals((await cell([{ row: 4, col: "sku", value: "e5" }])).structuredContent, { written: 1, rows: 5 });
+
+      // Seams: a check on a multi: column (an empty array is a blank), on a money column (a numeric string is the
+      // number the column holds), and a stored numeric string in a touched row (the page reads it as a number).
+      {
+        const seam = automerge.create<Sheet>({
+          type: "table",
+          data: [
+            arrayify([
+              { name: "tags", type: "multi:a,b", key: "0", check: { required: true, unique: true } },
+              { name: "fee", type: "money:EUR", key: "1", check: { min: 0, max: 100 } },
+              { name: "qty", type: "int", key: "2", check: { max: 100 } },
+              { name: "note", type: "text", key: "3" },
+            ]) as never,
+            { 0: ["a"], 1: "500", 2: "500", 3: "x" },
+          ],
+        });
+        const seam_id = `table:${seam.documentId}`;
+        await put(jwt, `/library/${seam_id}`, {});
+        const mk = (over: Record<string, unknown>) => ({ tags: ["b"], fee: 5, qty: 1, note: "", ...over });
+        for (
+          const [over, want] of [
+            [{ tags: [] }, "required"],
+            [{ tags: null }, "required"],
+            [{ tags: ["a"] }, "unique"],
+            [{ fee: 101 }, "max"],
+            [{ fee: "101" }, "max"],
+            [{ fee: -1 }, "min"],
+          ] as const
+        ) {
+          const res = await refused({ rows: [mk(over)] }, seam_id);
+          assert(res.text.includes(want), `${JSON.stringify(over)}: ${res.text}`);
+        }
+        assertEquals((await post(jwt, `/sheet/${seam_id}`, { rows: [mk({ fee: "7.5" })] })).data.appended, 1);
+        const call = async (cells: unknown[]) =>
+          (await (await app.request(`/mcp/${seam_id}`, {
+            method: "POST",
+            headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "tools/call",
+              params: { name: "write_cells", arguments: { cells } },
+            }),
+          })).json()).result;
+        for (
+          const [cells, want] of [
+            [[{ row: 1, col: "fee", value: "5" }], "does not match"],
+            [[{ row: 1, col: "fee", value: 150 }], "max"],
+            [[{ row: 1, col: "tags", value: [] }], "required"],
+            [[{ row: 0, col: "note", value: "y" }], "max"],
+          ] as const
+        ) {
+          const res = await call([...cells]);
+          assert(res.isError === true && res.content[0].text.includes(want), JSON.stringify(res));
+        }
+      }
+
+      // A check that cannot be read is refused where it is read, never skipped.
+      for (const check of [{ min: "0" }, { bogus: true }, { required: "yes" }, { min: 5, max: 1 }, 5]) {
+        const odd = automerge.create<Sheet>({
+          type: "table",
+          data: [arrayify([{ name: "n", type: "int", key: "0", check }]) as never, { 0: 1 }],
+        });
+        const odd_id = `table:${odd.documentId}`;
+        await put(jwt, `/library/${odd_id}`, {});
+        const res = await refused({ rows: [{ n: 2 }] }, odd_id);
+        assertEquals(res.status, 400);
+        for (const w of ["Expected", "Received", "Source", "Fix", "check"]) assert(res.text.includes(w), res.text);
+      }
+      const text = automerge.create<Sheet>({
+        type: "table",
+        data: [arrayify([{ name: "t", type: "text", key: "0", check: { min: 1 } }]) as never, { 0: "a" }],
+      });
+      await put(jwt, `/library/table:${text.documentId}`, {});
+      const res = await refused({ rows: [{ t: "b" }] }, `table:${text.documentId}`);
+      assert(res.text.includes("numeric"), res.text);
+    }
+
     // No access at all, and read access that is not write access.
     {
       const stranger = await usr("pablo@example.com");
@@ -6701,6 +7206,7 @@ Deno.test(async function allTests(t) {
           { name: "price", type: "usd", key: "2" },
           { name: "due", type: "date", key: "3" },
           { name: "paid", type: "bool", key: "4" },
+          { name: "fee", type: "money:EUR", key: "5" },
         ]),
       ],
     });
@@ -6709,13 +7215,14 @@ Deno.test(async function allTests(t) {
     const doc = await request(jwt, `/openapi/${sheet_id}`);
 
     assertEquals(doc.openapi, "3.1.0");
-    assertEquals(doc.components.schemas.Row.required, ["item", "qty", "price", "due", "paid"]);
+    assertEquals(doc.components.schemas.Row.required, ["item", "qty", "price", "due", "paid", "fee"]);
     assertEquals(doc.components.schemas.Row.properties, {
       item: { type: "string" },
       qty: { type: "integer" },
       price: { type: "number" },
       due: { type: "string", format: "date" },
       paid: { type: "boolean" },
+      fee: { type: "number" },
     });
     // The header a key is presented in is part of the document, or the spec
     // describes a sheet nobody can call.
@@ -7190,12 +7697,32 @@ Deno.test(async function allTests(t) {
         100,
       );
       const repo = new AM.Repo({ network: [adapter], peerId: peer as AM.PeerId });
-      const outcome = await Promise.race([
-        repo.find<Sheet>(hand.documentId).then(() => "shared", () => "denied"),
-        new Promise<string>((resolve) => setTimeout(() => resolve("refused"), 2000)),
-      ]);
-      adapter.disconnect();
-      return outcome;
+      // Slowness is not a refusal: only find's own answer or its rejection
+      // counts. The bound is a crash that reports the time it waited.
+      const started = Date.now();
+      const bound = 30000;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          repo.find<Sheet>(hand.documentId).then(() => "shared", () => "denied"),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `${peer}: repo.find gave no answer after ${
+                      Date.now() - started
+                    } ms (bound ${bound} ms); the machine may be overloaded`,
+                  ),
+                ),
+              bound,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+        adapter.disconnect();
+      }
     };
     assertEquals(await reads("client-locked-ok", locked, password), "shared", "the right password opens the link");
     assertEquals(await reads("client-plain", plain), "shared", "an unlocked link is untouched by any of this");
@@ -8165,6 +8692,39 @@ Deno.test(async function allTests(t) {
 
     assertEquals(edges(aId).map((r) => String(r.depends_on)), [bId], "a names b");
     assertEquals(edges(bId).map((r) => String(r.depends_on)), [aId], "b names a, and the read still finished");
+
+    // A query that uses snippets depends on the snippet table, and on what its bodies read.
+    const snipTable = automerge.create<Sheet>({
+      type: "table",
+      data: [
+        arrayify([{ name: "name", type: "text", key: "0" }, { name: "expr", type: "text", key: "1" }]),
+        { 0: "big", 1: `(select max(n) from @${aId.replace("query:", "table:")})` },
+      ],
+    });
+    const snipId = `table:${snipTable.documentId}`;
+    await put(jwt, `/library/${snipId}`, { name: "lineage snippets" });
+    const dep = automerge.create<{ data: Sheet["data"] }>({
+      data: [{ lang: "sql", code: `using @${snipId} select {{big}} as m`, args: [] }],
+    });
+    const depId = `query:${dep.documentId}`;
+    await put(jwt, `/library/${depId}`, { name: "snippet user" });
+    const after = (await get<Table>(jwt, "/library/lineage")).filter((r) => String(r.sheet_id) === depId);
+    const snipEdge = after.find((r) => String(r.depends_on) === snipId);
+    assertEquals(snipEdge?.columns, "expr, name", "the snippet table is an edge, read by its two columns");
+    assert(
+      after.some((r) => String(r.depends_on).startsWith("table:") && String(r.depends_on) !== snipId),
+      "and a ref inside a body is an edge of its own",
+    );
+    const lost = automerge.create<{ data: Sheet["data"] }>({
+      data: [{ lang: "sql", code: `using @table:not-mine select {{big}} as m`, args: [] }],
+    });
+    await put(jwt, `/library/query:${lost.documentId}`, { name: "snippet stranger" });
+    const stranger = (await get<Table>(jwt, "/library/lineage")).filter((r) =>
+      String(r.sheet_id) === `query:${lost.documentId}`
+    );
+    assertEquals(stranger.length, 1);
+    assertEquals(stranger[0].depends_on, null);
+    assert(String(stranger[0].name).includes("could not be read"), String(stranger[0].name));
   });
 
   // It must carry the path and the status, and it must never carry a header value: an Authorization in a log outlives
@@ -10802,6 +11362,29 @@ Deno.test(async function allTests(t) {
     assertEquals(moved.meta.repeated, true, "the feed's poll was a repeat");
     assertEquals(await runs(up_id), 3, "a repeated body does not make the alert due");
     assertEquals(await runs(plain_id), 1, "the plain alert still waits for its hour");
+
+    // A feed named only in a snippet body wakes an upstream alert like any other.
+    const bodyTable = automerge.create<Sheet>({
+      type: "table",
+      data: [
+        arrayify([{ name: "name", type: "text", key: "0" }, { name: "expr", type: "text", key: "1" }]),
+        { 0: "feed", 1: `(select count(*) from @${upFeed_id})` },
+      ],
+    });
+    const bodyTable_id = `table:${bodyTable.documentId}`;
+    await put(jwt, `/library/${bodyTable_id}`, { name: "feed snippets" });
+    const viaBody = automerge.create<{ data: [Alert] }>({
+      data: [{ code: `using @${bodyTable_id} select {{feed}} as n`, to: "", interval: 3600, upstream: true }],
+    });
+    const viaBody_id = `alert:${viaBody.documentId}`;
+    await put(jwt, `/library/${viaBody_id}`, { name: "upstream via snippet" });
+    await pollOnce(upFetcher, () => Promise.resolve("sent"), t1 + 300_000);
+    const ranVia = await runs(viaBody_id);
+    body = `[{"n":4}]`;
+    netDue.set(upFeed_id, 0);
+    await pollOnce(upFetcher, () => Promise.resolve("sent"), t1 + 400_000);
+    assertEquals(await runs(upFeed_id) > 3, true, "the feed stored a fourth row");
+    assertEquals(await runs(viaBody_id), ranVia + 1, "an alert whose snippet body names the feed ran in that cycle");
 
     // A delivery a net-hook stores counts the same as a feed's new row.
     const hook = automerge.create<Sheet>({ type: "net-hook", data: [] });

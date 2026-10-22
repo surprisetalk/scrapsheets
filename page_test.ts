@@ -381,7 +381,7 @@ Deno.test("hiding a column stops it rendering, and show-all brings it back", asy
 // die with the tab. They live on the columns in data[0] now, which is both where
 // applyPatches can reach (it is rooted at `data`) and where a share carries them.
 Deno.test("arranging a sheet writes the arrangement onto its columns", async () => {
-  const { app, all, click, settle, type_ } = await boot("http://localhost/table:countries");
+  const { app, dom, doc, all, click, settle, type_ } = await boot("http://localhost/table:countries");
   const patches: { action: string; path: unknown[]; value: unknown }[] = [];
   app.ports.arrangeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
 
@@ -416,7 +416,7 @@ Deno.test("arranging a sheet writes the arrangement onto its columns", async () 
   app.ports.docSelected.send({
     id: "table:shaded",
     data: {
-      doc: { type: "table", data: [[{ name: "n", type: "num", key: "0" }], { "0": 1 }, { "0": 5 }, { "0": 9 }] },
+      doc: { type: "table", data: [[{ name: "n", type: "money:EUR", key: "0" }], { "0": 1 }, { "0": 5 }, { "0": 9 }] },
     },
   });
   await settle();
@@ -427,6 +427,11 @@ Deno.test("arranging a sheet writes the arrangement onto its columns", async () 
     [["0", "shade", "bar"]],
     "choosing a shade stores one word on the column",
   );
+
+  // A money column draws its code before the digits, sums in its totals row, and takes a shade like any number.
+  const drawn = all("tbody td").map((td) => td.textContent ?? "").filter((cell) => /^EUR \d+\.\d\d$/.test(cell));
+  assertEquals(drawn, ["EUR 1.00", "EUR 5.00", "EUR 9.00"]);
+  assertEquals(all("tr.totals")[0]?.textContent?.includes("EUR 15.00"), true);
 
   const shaded = all("tbody td div.shade").map((d) => d.getAttribute("style") ?? "");
   assertEquals(shaded.length, 3, `every data cell of a shaded column draws the wrapper, got ${shaded.join(" | ")}`);
@@ -451,9 +456,64 @@ Deno.test("arranging a sheet writes the arrangement onto its columns", async () 
   const arrows = all("tbody td div.shade");
   assertEquals(
     arrows.map((d) => [d.getAttribute("data-icon"), d.textContent, d.getAttribute("style") ?? ""]),
-    [["▼", "1", ""], ["▬", "5", ""], ["▲", "9", ""]],
+    [["▼", "EUR 1.00", ""], ["▬", "EUR 5.00", ""], ["▲", "EUR 9.00", ""]],
     "arrows point down for the bottom third, flat for the middle, up for the top, and draw no bar",
   );
+
+  // A column's check is one patch at `check` beside its type, addressed by the column's position and not by its key.
+  // A rule the rows already break is refused in the page and writes nothing.
+  const checks: { action: string; path: unknown[]; value: unknown }[] = [];
+  app.ports.changeDoc.subscribe((sent: { data: typeof checks }) => checks.push(...sent.data));
+  app.ports.docSelected.send({
+    id: "table:checked",
+    data: {
+      doc: {
+        type: "table",
+        data: [[{ name: "sku", type: "text", key: "7" }, { name: "n", type: "int", key: "3" }], { "7": "a", "3": 1 }, {
+          "7": "a",
+          "3": 5,
+        }],
+      },
+    },
+  });
+  await settle();
+  await click(all("span.funnel")[0]);
+  await click(all("input[aria-label='unique sku']")[0]);
+  assertEquals(checks, [], "two rows repeat a sku, so unique is refused");
+  assert(doc.body.textContent?.includes("unique"), "the refusal reaches the banner");
+  await click(all("input[aria-label='required sku']")[0]);
+  assertEquals(checks.map((c) => [c.path, c.value]), [[[0, "0", "check"], { required: true }]]);
+  await click(all("span.funnel")[0]);
+  await click(all("span.funnel")[1]);
+  const change = async (el: { dispatchEvent: (e: unknown) => boolean } | undefined, value: string) => {
+    (el as unknown as { value: string }).value = value;
+    el?.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+    await settle();
+  };
+  checks.length = 0;
+  await change(all("input[aria-label='max n']")[0], "3");
+  assertEquals(checks, [], "a row holds 5, so a max of 3 is refused");
+  await change(all("input[aria-label='max n']")[0], "9");
+  assertEquals(checks.map((c) => [c.path, c.value]), [[[0, "1", "check"], { max: 9 }]]);
+  await click(all("span.funnel")[1]);
+
+  // Clearing the last rule removes the check. An empty one would still count as a check on the server, which
+  // holds an enum column to its options only where a check is present.
+  app.ports.docSelected.send({
+    id: "table:cleared",
+    data: {
+      doc: {
+        type: "table",
+        data: [[{ name: "size", type: "enum:s,m", key: "4", check: { required: true } }], { "4": "s" }],
+      },
+    },
+  });
+  await settle();
+  checks.length = 0;
+  await click(all("span.funnel")[0]);
+  await click(all("input[aria-label='required size']")[0]);
+  assertEquals(checks.map((c) => [c.action, c.path]), [["del", [0, "0", "check"]]]);
+  await click(all("span.funnel")[0]);
 
   // A shade written directly on a text column -- never offered by this panel,
   // whose select sits behind the same numeric gate as decimals and format, but

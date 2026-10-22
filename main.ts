@@ -40,6 +40,7 @@ import {
   canonicalType,
   chartSql,
   checkColumnTypes,
+  checkConstraints,
   checkQueryRows,
   checkRefPath,
   checkResultColumns,
@@ -48,16 +49,19 @@ import {
   DESCRIBE_COLUMNS,
   describeRef,
   describeRows,
+  expandSnippets,
   explain,
   formatQueryError,
   loadRefs,
   MAX_QUERY_MS,
   MAX_QUERY_ROWS,
+  MONEY_SHAPE,
   multiOptions,
   namesIn,
   nearest,
   nthWeekday,
   NUMERIC_TYPES,
+  numericType,
   planQuery,
   PROFILE_COLUMNS,
   profileRef,
@@ -67,6 +71,7 @@ import {
   selectTypes,
   show,
   timed,
+  toRecords,
   WINDOW_TYPES,
 } from "./src/sql.mjs";
 import Stripe from "stripe";
@@ -382,11 +387,17 @@ export type Type =
   | "percent"
   | "datetime"
   | `multi:${string}`
+  | `money:${string}`
   | ["array", Type]
   | ["tuple", Type[]]
   | { [k: string]: Type };
 export type Row<T = unknown> = Record<string | number, T>;
-export type Col = { name: string; type: Type; key: string | number };
+export type Col = {
+  name: string;
+  type: Type;
+  key: string | number;
+  check?: { required?: boolean; unique?: boolean; min?: number; max?: number };
+};
 export type Table = [Row<Col>, ...Row[]];
 export type Args = { key: string; value: unknown }[];
 export type Template =
@@ -790,6 +801,21 @@ const sheet = async (
   }
 };
 
+// A key opens one sheet. A ref is not a way around that, and neither is a
+// snippet body: executeSql checks again on the expanded text.
+const assertKeyRefs = (c: Context, ids: string[]) => {
+  const key_sheet = c.get("key_sheet");
+  const foreign = key_sheet ? ids.find((id) => id !== key_sheet) : undefined;
+  if (foreign === undefined) return;
+  bad(403, `This key opens ${key_sheet} and nothing else.`, {
+    Received: `a query referencing @${foreign}`,
+    Expected: `@${key_sheet} alone`,
+    Source: `the ${API_KEY_HEADER} request header, which names the one sheet it is for`,
+    Fix: `select from @${key_sheet}, or run this with the Authorization header of an account that can ` +
+      `reach @${foreign}`,
+  });
+};
+
 const executeSql = async (
   c: Context,
   sqlCode: string,
@@ -815,21 +841,16 @@ const executeSql = async (
   } catch (err) {
     asBadRequest(err);
   }
-  const query = profiled ?? sqlCode;
   const stages = profiled === undefined ? undefined : [] as Record<string, unknown>[];
-  // scanRefs is shared with the page, so @type:doc_id resolves identically here.
-  const { sql: scanned, ids: sheet_ids, cells } = described
-    ? { sql: "", ids: [described], cells: [] }
-    : scanRefs(query);
 
   // Source column types by name, and then what each select item makes of them.
   // Two sheets with a column of one name and two types still collide here; the
   // select list is read last, so a query's own alias wins over both.
   const nameToType: Record<string, Type> = {};
   let loaded = 0;
-  const { docs, colsOf } = await loadRefs(sheet_ids, {
+  const opts = {
     path: path_,
-    describing: !!described,
+    describing: false,
     stages,
     // Where a sheet comes from is the only real difference between the engines:
     // here it is sheet(), which enforces access and recurses into a query sheet
@@ -861,10 +882,27 @@ const executeSql = async (
     onLoad: (sheet_id: string, rows: Record<string, unknown>[]) => {
       loaded = checkQueryRows(loaded + rows.length, sheet_id);
     },
-  }).catch(asBadRequest) as {
-    docs: Record<string, Record<string, unknown>[]>;
-    colsOf: Record<string, Col[]>;
   };
+  type Loaded = { docs: Record<string, Record<string, unknown>[]>; colsOf: Record<string, Col[]> };
+  // Snippets expand before the scan, so a body's @ref is loaded, scoped and
+  // audited like one the author wrote. The snippet table loads through the same
+  // door as any ref.
+  let query = profiled ?? sqlCode;
+  if (!described) {
+    try {
+      const expanded = await expandSnippets(query, (id: string) => loadRefs([id], opts) as Promise<Loaded>);
+      query = expanded.code;
+      if (c.get("key_sheet") && path_.length === 0) assertKeyRefs(c, [...expanded.used, ...scanRefs(query).ids]);
+    } catch (err) {
+      asBadRequest(err);
+    }
+  }
+  // scanRefs is shared with the page, so @type:doc_id resolves identically here.
+  const { sql: scanned, ids: sheet_ids, cells } = described
+    ? { sql: "", ids: [described], cells: [] }
+    : scanRefs(query);
+  const { docs, colsOf } = await (loadRefs(sheet_ids, { ...opts, describing: !!described }) as Promise<Loaded>)
+    .catch(asBadRequest);
 
   for (const cols of Object.values(colsOf)) for (const col of cols) nameToType[col.name] = col.type;
   // The columns the referenced sheets actually have, taken before anything the
@@ -1481,7 +1519,6 @@ const syncRole = async (auth: WsAuth, documentId: string): Promise<Role | null> 
   const key = `${usr_id ?? "-"}:${share ?? "-"}/${documentId}`;
   const hit = syncAccessCache.get(key);
   if (hit && hit.expires > Date.now()) return hit.role;
-  if (syncAccessCache.size > 10_000) syncAccessCache.clear();
   const [access] = await sql`
     select coalesce(
       (select su.role from sheet_usr su inner join sheet s using (sheet_id)
@@ -1496,7 +1533,10 @@ const syncRole = async (auth: WsAuth, documentId: string): Promise<Role | null> 
     ) as role
   `;
   const role = (access?.role ?? null) as Role | null;
+  // Delete first so a refreshed key moves to the back; bound() evicts from the front.
+  syncAccessCache.delete(key);
   syncAccessCache.set(key, { role, expires: Date.now() + 30_000 });
+  bound(syncAccessCache, 10_000);
   return role;
 };
 
@@ -1535,6 +1575,16 @@ const NOTICE_MS = 1000; // one error frame per connection per second, for either
 // sync frame would wedge the stateful protocol, and a reconnect starts fresh.
 export const FRAME_RATE = 100; // frames per second, per connection
 export const FRAME_BURST = 5 * FRAME_RATE;
+// One account opens several tabs, and every tab is a connection with its own
+// bucket above; N connections would cost N times the lookups. Twice the
+// per-connection numbers leaves two busy tabs room and stops the third from
+// multiplying the cost.
+export const ACCOUNT_FRAME_RATE = 2 * FRAME_RATE;
+export const ACCOUNT_FRAME_BURST = 2 * FRAME_BURST;
+// Keyed by usr_id and swept with the rate-limit buckets. A signed-out socket has
+// only its own bucket: many readers share one office or school address, and one
+// address-wide bucket would close them together (owner decision, run 14).
+export const accountFrames = new Map<string, { tokens: number; lastRefill: number }>();
 
 export const automerge = new Repo({
   network: [wsAdapter],
@@ -1616,9 +1666,23 @@ app.get(
             const now = Date.now();
             frames.tokens = Math.min(FRAME_BURST, frames.tokens + Math.max(0, now - frames.at) / 1000 * FRAME_RATE);
             frames.at = now;
-            if (frames.tokens < 1) {
-              const message =
-                `Sync frames are limited to ${FRAME_RATE} a second with a burst of ${FRAME_BURST}, so this connection was closed. Reconnect, and open fewer documents at once.`;
+            let account = auth.usr_id ? accountFrames.get(auth.usr_id) : undefined;
+            if (auth.usr_id && !account) {
+              account = { tokens: ACCOUNT_FRAME_BURST, lastRefill: now };
+              accountFrames.set(auth.usr_id, account);
+              bound(accountFrames, RATE_LIMIT_KEYS_MAX);
+            }
+            if (account) {
+              account.tokens = Math.min(
+                ACCOUNT_FRAME_BURST,
+                account.tokens + Math.max(0, now - account.lastRefill) / 1000 * ACCOUNT_FRAME_RATE,
+              );
+              account.lastRefill = now;
+            }
+            if (frames.tokens < 1 || (account && account.tokens < 1)) {
+              const message = frames.tokens < 1
+                ? `Sync frames are limited to ${FRAME_RATE} a second with a burst of ${FRAME_BURST}, so this connection was closed. Reconnect, and open fewer documents at once.`
+                : `Sync frames are limited to ${ACCOUNT_FRAME_RATE} a second with a burst of ${ACCOUNT_FRAME_BURST} across all connections of one account, so this connection was closed. Close other tabs, reconnect, and open fewer documents at once.`;
               console.error(`/library/sync (usr ${auth.usr_id}): ${message}`);
               shim.send(AM.cbor.encode({
                 type: "error",
@@ -1631,6 +1695,7 @@ app.get(
               return;
             }
             frames.tokens -= 1;
+            if (account) account.tokens -= 1;
             if (msg.type === "ephemeral") {
               ephemeral.tokens = Math.min(
                 EPHEMERAL_BURST,
@@ -2005,7 +2070,7 @@ export const flushFolds = async (now = Date.now()): Promise<void> => {
 // budget is a full one, so dropping it loses nothing.
 setInterval(() => {
   const now = Date.now();
-  for (const buckets of [rateLimitBuckets, accountBuckets]) {
+  for (const buckets of [rateLimitBuckets, accountBuckets, accountFrames]) {
     for (const [key, bucket] of buckets)
       if (now - bucket.lastRefill > RATE_LIMIT_WINDOW_MS) buckets.delete(key);
   }
@@ -6242,7 +6307,13 @@ export const pollAlertSheet = async (
     else {
       const reads = new Set<string>();
       const walked = new Set<string>();
-      const walk = async (text: string, path: string[]): Promise<void> => {
+      const walk = async (raw: string, path: string[]): Promise<void> => {
+        // A body can name a feed, so the walk reads the expanded text.
+        const text = (await expandSnippets(raw, async (id: string) => {
+          const hand = await automerge.find<{ data: Sheet["data"] }>(id.split(":")[1] as AnyDocumentId);
+          const data = docData(hand, id);
+          return { docs: { [id]: toRecords(data as never) }, colsOf: { [id]: Object.values(data[0] as Row<Col>) } };
+        })).code;
         for (const id of scanRefs(text).ids) {
           checkRefPath(path, id);
           if (id.startsWith("net-")) reads.add(id);
@@ -7470,6 +7541,7 @@ const lineage = async (c: Context): Promise<Page> => {
       columns: cols,
     });
     let code: string;
+    let snippetIds: string[];
     try {
       const data = await automerge
         .find<{ data: Sheet["data"] }>(s.doc_id as AnyDocumentId)
@@ -7480,7 +7552,29 @@ const lineage = async (c: Context): Promise<Page> => {
       // chartSql is where those settings become the query it runs.
       if (s.type !== "chart" && typeof head.code !== "string")
         throw new Error(`its data[0].code is ${show(head.code)}`);
-      code = s.type === "chart" ? chartSql(head as unknown as Chart) : head.code as string;
+      // A body's refs are this sheet's dependencies. Only a table the caller holds
+      // is read, so lineage never opens a document outside the library.
+      const expanded = await expandSnippets(
+        s.type === "chart" ? chartSql(head as unknown as Chart) : head.code as string,
+        async (id: string) => {
+          const hold = byId.get(id);
+          if (hold?.type !== "table") {
+            throw new Error(explain(`The snippet table @${id} is not a table you hold a role on.`, {
+              Expected: "a table sheet in your library",
+              Received: `@${id}`,
+              Source: `using @${id} in ${s.sheet_id}`,
+              Fix: "ask for a role on the table, or point using at one you hold",
+            }));
+          }
+          const rows = await automerge
+            .find<{ data: Sheet["data"] }>(hold.doc_id as AnyDocumentId)
+            .then((hand) => hand.doc()?.data);
+          if (!Array.isArray(rows)) throw new Error(`the snippet table @${id} arrived holding no rows`);
+          return { docs: { [id]: toRecords(rows as never) }, colsOf: { [id]: Object.values(rows[0] as Row<Col>) } };
+        },
+      );
+      code = expanded.code;
+      snippetIds = expanded.used;
     } catch (err) {
       // A scan that could not run is not a scan that passed. The row stays, so
       // a sheet whose document is gone is in the graph as a sheet nobody can
@@ -7510,7 +7604,7 @@ const lineage = async (c: Context): Promise<Page> => {
       // neither claims a name nor takes one off the ref that does. Its own edge
       // is the "?" below, whatever this counts.
       const holders = new Map<string, Set<string>>();
-      for (const id of ids)
+      for (const id of ids.filter((id) => !snippetIds.includes(id)))
         for (const name of (await columnsOf(id)) ?? []) holders.set(name, (holders.get(name) ?? new Set()).add(id));
       try {
         for (const name of namesIn(code)) {
@@ -7523,12 +7617,18 @@ const lineage = async (c: Context): Promise<Page> => {
         overflowed = true;
       }
     }
-    if (!ids.length) rows.push(edge(null, s.name, null));
-    for (const id of ids) {
+    if (!ids.length && !snippetIds.length) rows.push(edge(null, s.name, null));
+    for (const id of new Set([...snippetIds, ...ids])) {
       rows.push(edge(
         id,
         s.name,
-        star ? "*" : overflowed || (await columnsOf(id)) === null ? "?" : (claimed.get(id) ?? []).sort().join(", "),
+        snippetIds.includes(id)
+          ? "expr, name"
+          : star
+          ? "*"
+          : overflowed || (await columnsOf(id)) === null
+          ? "?"
+          : (claimed.get(id) ?? []).sort().join(", "),
       ));
     }
     // Nothing caps the refs one sheet's code holds: it is text a browser syncs
@@ -9003,8 +9103,8 @@ const assertXlsxCell = (sheet_id: string, where: string, len: number) => {
 // SheetJS's own formatter alike. Text is what the sheet actually holds, so it
 // goes out as its seconds rather than as a cell nothing can read.
 const xlsxCell = (type: string, val: unknown, text: string): XLSX.CellObject => {
-  const z = XLSX_FORMATS[type];
-  if ((NUMERIC_TYPES as string[]).includes(type) && typeof val === "number" && Number.isFinite(val)) {
+  const z = XLSX_FORMATS[type] ?? (MONEY_SHAPE.test(type) ? `"${type.slice(6)} "#,##0.00` : undefined);
+  if (numericType(type) && typeof val === "number" && Number.isFinite(val)) {
     if (type === "duration") return val < 0 ? { t: "s", v: text } : { t: "n", v: (val * 1000) / XLSX_DAY_MS, z };
     return z === undefined ? { t: "n", v: val } : { t: "n", v: val, z };
   }
@@ -9033,7 +9133,7 @@ const PARQUET_TYPES: Record<string, "INT64" | "BOOLEAN" | "TIMESTAMP" | "JSON" |
  * blank is already null and stays one -- parquet has a null of its own. */
 const parquetColumn = (type: string, values: unknown[]) => {
   const want = PARQUET_TYPES[type] ??
-    ((NUMERIC_TYPES as string[]).includes(type) ? "DOUBLE" as const : "STRING" as const);
+    (numericType(type) ? "DOUBLE" as const : "STRING" as const);
   const data: unknown[] = [];
   for (const val of values) {
     if (val === null || val === undefined) {
@@ -9488,6 +9588,12 @@ app.post("/sheet/:id", async (c) => {
   // nothing has landed yet.
   try {
     checkColumnTypes(sheet_id, cols, rows as Row[]);
+    if (cols.some((col) => col.check !== undefined)) {
+      // The rows as they will stand, keyed by name; the request's rows are the touched ones.
+      const [, ...old] = docData(hand, sheet_id) as Row[];
+      const stand = old.map((row) => Object.fromEntries(cols.map((col) => [col.name, row[col.key]])));
+      checkConstraints(sheet_id, cols, [...stand, ...rows as Row[]], rows.map((_, i) => old.length + i));
+    }
   } catch (err) {
     throw new HTTPException(400, { message: reason(err) });
   }
@@ -9555,7 +9661,11 @@ app.get("/openapi/:id", async (c) => {
     type: "object",
     additionalProperties: false,
     required: cols.map((col) => col.name),
-    properties: Object.fromEntries(cols.map((col) => [col.name, JSON_TYPES[String(col.type)] ?? {}])),
+    properties: Object.fromEntries(
+      cols.map((
+        col,
+      ) => [col.name, JSON_TYPES[String(col.type)] ?? (MONEY_SHAPE.test(String(col.type)) ? { type: "number" } : {})]),
+    ),
   };
   return c.json({
     openapi: "3.1.0",
@@ -10427,17 +10537,7 @@ const mcpTools: Record<string, McpTool> = {
       }
       // A ref is not a way around the one sheet a key opens either. Refused on
       // the text, before the load, where the answer would be the creator's.
-      const key_sheet = c.get("key_sheet");
-      const foreign = key_sheet ? scanRefs(args.code).ids.find((id: string) => id !== key_sheet) : undefined;
-      if (foreign !== undefined) {
-        bad(403, `This key opens ${key_sheet} and nothing else.`, {
-          Received: `a query referencing @${foreign}`,
-          Expected: `@${key_sheet} alone`,
-          Source: `the ${API_KEY_HEADER} request header, which names the one sheet it is for`,
-          Fix: `select from @${key_sheet}, or run this with the Authorization header of an account that can ` +
-            `reach @${foreign}`,
-        });
-      }
+      assertKeyRefs(c, scanRefs(args.code).ids);
       const { data, count } = await querify(c, { lang: "sql", code: args.code, args: [] }, {});
       const [cols, ...rows] = data;
       return { cols: Object.values(cols), rows, count };
@@ -10466,7 +10566,7 @@ const mcpTools: Record<string, McpTool> = {
               col: { type: "string", description: "column name, as read_sheet lists it" },
               value: {
                 description: `must match the column type: number for ${
-                  (NUMERIC_TYPES as string[]).join("/")
+                  [...(NUMERIC_TYPES as string[]), "money:EUR and the other codes"].join("/")
                 }, boolean for bool, string otherwise`,
               },
             },
@@ -10576,7 +10676,7 @@ const mcpTools: Record<string, McpTool> = {
         const picks = multiOptions(t);
         const mismatched = picks
           ? !Array.isArray(value) && value !== null
-          : (NUMERIC_TYPES as string[]).includes(t)
+          : numericType(t)
           ? typeof value !== "number" || (t === "int" && !Number.isInteger(value))
           : t === "bool"
           ? typeof value !== "boolean"
@@ -10599,6 +10699,17 @@ const mcpTools: Record<string, McpTool> = {
           }
         }
         writes.push({ rowIndex: row, key: target.key, value });
+      }
+      if (cols.some((col) => col.check !== undefined)) {
+        // The rows as they will stand, keyed by name; the rows a write names are the touched ones.
+        const stand = rows.map((r) => Object.fromEntries(cols.map((col) => [col.name, (r as Row)[col.key]])));
+        if (writes.some((w) => w.rowIndex === rows.length)) stand.push({});
+        for (const w of writes) stand[w.rowIndex][cols.find((col) => col.key === w.key)!.name] = w.value;
+        try {
+          checkConstraints(sheet_id, cols, stand, [...new Set(writes.map((w) => w.rowIndex))]);
+        } catch (err) {
+          throw new HTTPException(400, { message: reason(err) });
+        }
       }
       const appends = writes.some((w) => w.rowIndex === rows.length);
       if (appends) assertRoom(sheet_id, rows.length, 1);

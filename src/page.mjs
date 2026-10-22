@@ -18,6 +18,7 @@ import {
   DESCRIBE_COLUMNS,
   describeRef,
   describeRows,
+  expandSnippets,
   explain,
   loadedOf,
   loadRefs,
@@ -392,12 +393,9 @@ export const sheets = (alasql, shelf, find, heads) => {
     // `explain <query>` runs the query and answers with its profile instead.
     const describing = describeRef(code);
     const profiling = profileRef(code);
-    const query = profiling ?? code;
     const started = performance.now();
     const stages = profiling === undefined ? undefined : [];
-    const { sql: out, ids, cells } = describing ? { sql: "", ids: [describing], cells: [] } : scanRefs(query);
-
-    const { docs, colsOf } = await loadRefs(ids, {
+    const opts = {
       path,
       describing: !!describing,
       stages,
@@ -447,7 +445,7 @@ export const sheets = (alasql, shelf, find, heads) => {
           }
         }
         cached.delete(key);
-        const nested = { deps: new Map(), depth: 0, volatile: VOLATILE.test(text) };
+        const nested = { deps: new Map(), depth: 0, volatile: false };
         const inner = await runSql(text, { "": null }, [...path, id], nested);
         // A query sheet's columns carry the types its select list produced,
         // which runSql has already stamped on them. Without them
@@ -473,7 +471,13 @@ export const sheets = (alasql, shelf, find, heads) => {
       // Kept as they load, so SHEET can serve them and a nested query sees what
       // its parent already fetched.
       onLoad: (id, loaded) => rows.set(id, loaded),
-    });
+    };
+    // Before scanRefs: a snippet body may hold a ref of its own. What runs, and
+    // what VOLATILE reads, is the expanded text.
+    const query = describing ? code : (await expandSnippets(profiling ?? code, (id) => loadRefs([id], opts))).code;
+    reads.volatile ||= VOLATILE.test(query);
+    const { sql: out, ids, cells } = describing ? { sql: "", ids: [describing], cells: [] } : scanRefs(query);
+    const { docs, colsOf } = await loadRefs(ids, opts);
     // The declared type row, kept beside the rows: it is what names the columns
     // for unpivot and what describe reports.
     for (const id of Object.keys(colsOf)) if (id.startsWith("table:")) types.set(id, colsOf[id]);
@@ -529,7 +533,7 @@ export const sheets = (alasql, shelf, find, heads) => {
     // that means: "text" for a referenced sheet above, the query document's own
     // declared cols in src/index.html.
     const known = Object.fromEntries([...types.values()].flatMap((cs) => cs.map((c) => [c.name, c.type])));
-    const typed = selectTypes(code, known);
+    const typed = selectTypes(query, known);
     return {
       ...answer,
       columns: answer.columns.map((c) => ({ ...c, type: typed[c.columnid] ?? known[c.columnid] })),

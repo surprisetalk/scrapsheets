@@ -103,7 +103,12 @@ Deno.test("a feed's request can be tested before the poller runs it", async () =
   // A connected database, on the same page: its tables are asked for once as it
   // opens, and a table's rows only once one is picked.
   const loads: string[] = [];
-  const previews: { id: string; table: string; filters: { column: string; op: string; value: string }[] }[] = [];
+  const previews: {
+    id: string;
+    table: string;
+    filters: { column: string; op: string; value: string }[];
+    apply: boolean;
+  }[] = [];
   app.ports.codexLoad.subscribe((id: string) => loads.push(id));
   app.ports.codexPreview.subscribe((ask: (typeof previews)[number]) => previews.push(ask));
   app.ports.docSelected.send({ id: "codex-db:abc", data: { doc: { type: "codex-db" } } });
@@ -139,7 +144,7 @@ Deno.test("a feed's request can be tested before the poller runs it", async () =
   assert(text().includes("Pick a table to read its first rows."), `the grid waits on a pick: ${text().slice(-300)}`);
 
   await click(orders);
-  assertEquals(previews, [{ id: "codex-db:abc", table: "orders", filters: [] }]);
+  assertEquals(previews, [{ id: "codex-db:abc", table: "orders", filters: [], apply: false }]);
   assertEquals(all("button.codex-table")[0]?.getAttribute("aria-pressed"), "true", "the pick is marked");
 
   app.ports.docQueried.send({
@@ -167,6 +172,7 @@ Deno.test("a feed's request can be tested before the poller runs it", async () =
     id: "codex-db:abc",
     table: "orders",
     filters: [{ column: "id", op: "gte", value: "7" }],
+    apply: true,
   });
   await type_(all("select[aria-label='filter operator']")[0], "isnull");
   assertEquals(all("input[aria-label='filter value']").length, 0, "isnull takes no value");
@@ -1861,6 +1867,126 @@ const ints = (...ns: number[]) => [{ 0: { key: "0", name: "n", type: "int" } }, 
 const code = (sql: string) => ({ data: [{ code: sql }] });
 const answer = async (engine: ReturnType<typeof sheets>, sql: string) =>
   (await engine.runSql(sql, { "": null })).data as Record<string, unknown>[];
+
+// A snippet table: one `name`/`expr` row per snippet, as an ordinary table sheet.
+const snippets = (...rows: unknown[][]) => ({
+  data: [
+    { 0: { key: "0", name: "name", type: "text" }, 1: { key: "1", name: "expr", type: "text" } },
+    ...rows.map(([name, expr]) => ({ 0: name, 1: expr })),
+  ],
+});
+const orders = {
+  data: [
+    {
+      0: { key: "0", name: "region", type: "text" },
+      1: { key: "1", name: "price", type: "num" },
+      2: { key: "2", name: "qty", type: "num" },
+    },
+    { 0: "a", 1: 2, 2: 3 },
+    { 0: "a", 1: 5, 2: 1 },
+    { 0: "b", 1: 1, 2: 1 },
+  ],
+};
+
+Deno.test("using @table: expands {{name}} bodies, nested, aggregates included, and leaves string literals alone", async () => {
+  const docs = {
+    s: snippets(
+      ["revenue", "sum(price * qty)"],
+      ["big", "{{revenue}} > 3"],
+      ["double", "{{revenue}} * 2"],
+      ["pull", "(select count(*) from @table:o)"],
+    ),
+    o: orders,
+  };
+  const spy = spied(docs);
+  const engine = sheets(alasql, () => ({}), spy.find, spy.heads);
+  assertEquals(
+    await answer(
+      engine,
+      "using @table:s select region, {{revenue}} as r, {{double}} as d from @table:o group by region having {{big}}",
+    ),
+    [{ region: "a", r: 11, d: 22 }],
+  );
+  assertEquals(await answer(engine, "using @table:s select {{pull}} as n, '{{revenue}}' as lit"), [
+    { n: 3, lit: "{{revenue}}" },
+  ]);
+  // AlaSQL reads \' as part of the string, so the {{…}} after it is still text.
+  assertEquals(await answer(engine, "using @table:s select 'it\\'s {{revenue}}' as lit"), [
+    { lit: "it's {{revenue}}" },
+  ]);
+});
+
+Deno.test("a nested query that uses snippets re-runs when the snippet table changes, and a volatile body is never cached", async () => {
+  const docs: Record<string, { data: unknown[] }> = {
+    s: snippets(["v", "n + 1"]),
+    t: { data: ints(1) },
+    mid: code("using @table:s select {{v}} as v from @table:t"),
+  };
+  const spy = spied(docs);
+  const engine = sheets(alasql, () => ({}), spy.find, spy.heads);
+  assertEquals(await answer(engine, "select v from @query:mid"), [{ v: 2 }]);
+  docs.s = snippets(["v", "n + 10"]);
+  spy.at.s = 1;
+  assertEquals(await answer(engine, "select v from @query:mid"), [{ v: 11 }]);
+
+  docs.s = snippets(["v", "n + now() * 0"]);
+  spy.at.s = 2;
+  await answer(engine, "select v from @query:mid");
+  const before = spy.finds("t");
+  await answer(engine, "select v from @query:mid");
+  assertEquals(spy.finds("t"), before + 1, "now() inside a body keeps the answer out of the cache");
+});
+
+Deno.test("snippet refusals name the row, the path or the fix", async () => {
+  const run = async (table: ReturnType<typeof snippets>, sql: string, extra = {}) => {
+    const spy = spied({ s: table, o: orders, ...extra });
+    const engine = sheets(alasql, () => ({}), spy.find, spy.heads);
+    try {
+      await engine.runSql(sql, { "": null });
+    } catch (err) {
+      return (err as Error).message;
+    }
+    throw new Error(`expected a refusal for: ${sql}`);
+  };
+  const q = "using @table:s select {{a}} as x";
+  const cycle = await run(snippets(["a", "{{b}}"], ["b", "{{a}}"]), q);
+  assert(cycle.includes("{{a}} -> {{b}} -> {{a}}"), cycle);
+  const deep = await run(
+    snippets(["a", "{{b}}"], ["b", "{{c}}"], ["c", "{{d}}"], ["d", "{{e}}"], ["e", "{{f}}"], ["f", "1"]),
+    q,
+  );
+  assert(deep.includes("more than 4 deep"), deep);
+  const wide = await run(
+    snippets(["a", "{{b}} + {{b}}"], ["b", "{{c}} + {{c}}"], ["c", "{{d}} + {{d}}"], ["d", "1"]),
+    `${q.replace("{{a}}", Array(14).fill("{{a}}").join(" + "))}`,
+  );
+  assert(wide.includes("200"), wide);
+  const unknown = await run(snippets(["revenue", "1"]), "using @table:s select {{revnue}}");
+  assert(unknown.includes("Did you mean") && unknown.includes("{{revenue}}"), unknown);
+  const unicode = await run(snippets(["a", "1"]), "using @table:s select {{名前}} as x");
+  assert(unicode.includes("not a name") && unicode.includes("{{名前}}"), unicode);
+  const bare = await run(snippets(["a", "1"]), "select {{a}} as x");
+  assert(bare.includes("using @table:"), bare);
+  const late = await run(snippets(["a", "1"]), "select 1 as x from @table:o using @table:s");
+  assert(late.includes("start of the query"), late);
+  const query = await run(snippets(["a", "1"]), "using @query:s select {{a}}");
+  assert(query.includes("table"), query);
+  const noExpr = await run(
+    { data: [{ 0: { key: "0", name: "name", type: "text" } }, { 0: "a" }] } as ReturnType<typeof snippets>,
+    q,
+  );
+  assert(noExpr.includes("expr"), noExpr);
+  const dup = await run(snippets(["a", "1"], ["a", "2"]), q);
+  assert(dup.includes("row 2") && dup.includes("a"), dup);
+  const badName = await run(snippets(["a b", "1"]), q);
+  assert(badName.includes("row 1"), badName);
+  const num = await run(snippets(["a", 1]), q);
+  assert(num.includes("row 1") && num.includes("text"), num);
+  for (const body of ["1; drop", "1 -- x", "(1", "1)", "'x", "1 /* x"]) {
+    const said = await run(snippets(["z", "1"], ["a", body]), q);
+    assert(said.includes("row 2"), `${body}: ${said}`);
+  }
+});
 
 Deno.test("a nested query answer is reused until a document it read changes", async () => {
   const docs = {

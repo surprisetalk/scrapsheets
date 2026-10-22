@@ -1,5 +1,6 @@
 port module Main exposing
     ( ChartKind(..)
+    , Check
     , ClipboardData
     , ClipboardFormat(..)
     , CodexTable
@@ -36,6 +37,7 @@ port module Main exposing
     , chartPointsMax
     , chartRuns
     , chartSpan
+    , checkBreaks
     , civilDays
     , clampIndex
     , codexTablesDecoder
@@ -72,6 +74,7 @@ port module Main exposing
     , nameClash
     , nearDuplicates
     , nextSortOrder
+    , noCheck
     , normalizeRect
     , nudgeOf
     , paletteCommands
@@ -599,7 +602,14 @@ not money either, and `formatNumber` hands that one back before it ever reaches
 here.
 -}
 usd : Int -> Float -> String
-usd places amount =
+usd =
+    currency "$"
+
+
+{-| `usd` with any prefix: a currency's code and a space, as `EUR 12.00`.
+-}
+currency : String -> Int -> Float -> String
+currency prefix places amount =
     let
         digits =
             fixed places (abs amount)
@@ -608,7 +618,7 @@ usd places amount =
     -- `fixed` takes it: -0.4 at no places is written "0", and a "-$0" beside a
     -- "$0" reads as two different amounts in one column.
     iif (amount < 0 && String.any (\c -> Char.isDigit c && c /= '0') digits) "-" ""
-        ++ "$"
+        ++ prefix
         ++ groupWhole digits
 
 
@@ -840,6 +850,12 @@ formatNumber typ decimals format v =
             ( Usd, _ ) ->
                 usd (Maybe.withDefault 2 decimals) v
 
+            ( Money code, Just Scientific ) ->
+                iif (v < 0) "-" "" ++ code ++ " " ++ scientific (Just (Maybe.withDefault 2 decimals)) (abs v)
+
+            ( Money code, _ ) ->
+                currency (code ++ " ") (Maybe.withDefault 2 decimals) v
+
             ( Percentage, _ ) ->
                 digitsOf decimals format (v * 100) ++ "%"
 
@@ -1057,10 +1073,11 @@ port codexLoaded : (D.Value -> msg) -> Sub msg
 
 
 {-| One table's first rows. The rows come back on `docQueried`, and a refusal on
-`codexLoaded` as `{ id, error }`. With filters, a refusal comes back on
-`docErrored` and the pick, the filters and the last rows stay.
+`codexLoaded` as `{ id, error }`. With `apply` (a filter apply, whatever its
+filter count), a refusal comes back on `docErrored` and the pick, the filters
+and the last rows stay.
 -}
-port codexPreview : { id : String, table : String, filters : List CodexFilter } -> Cmd msg
+port codexPreview : { id : String, table : String, filters : List CodexFilter, apply : Bool } -> Cmd msg
 
 
 {-| Which sheets read this one, asked for when a rename or a delete would break
@@ -2264,7 +2281,25 @@ type alias Col =
     -- did not know. Nothing normalizes a spelling now -- it is displayed as
     -- written, edited as written and written back as written.
     , raw : String
+
+    -- What must be true of this column's cells, from `check` beside `type` in
+    -- the document. Read leniently: a key that is not understood is no rule.
+    -- The server refuses what it cannot read; the page never blocks on it.
+    , check : Check
     }
+
+
+type alias Check =
+    { required : Bool
+    , unique : Bool
+    , min : Maybe Float
+    , max : Maybe Float
+    }
+
+
+noCheck : Check
+noCheck =
+    Check False False Nothing Nothing
 
 
 type alias Row =
@@ -2280,6 +2315,7 @@ type Type
     | Text
     | Number
     | Usd
+    | Money String
     | Boolean
     | Percentage
     | Ratio
@@ -2584,6 +2620,9 @@ spec typ =
         Usd ->
             { name = "usd", align = S.textAlignRight, width = Just 80, drawsText = True }
 
+        Money code ->
+            { name = "money:" ++ code, align = S.textAlignRight, width = Just 80, drawsText = True }
+
         Boolean ->
             { name = "bool", align = S.textAlignCenter, width = Just 32, drawsText = True }
 
@@ -2663,7 +2702,12 @@ strings, `number`'s own lenient string branch parsing "02139" same as 02139.
 -}
 numericColumn : Type -> Bool
 numericColumn typ =
-    List.member typ [ Number, Usd, Percentage, Ratio, Bps, Duration ]
+    case typ of
+        Money _ ->
+            True
+
+        _ ->
+            List.member typ [ Number, Usd, Percentage, Ratio, Bps, Duration ]
 
 
 {-| A column the page makes up rather than reads: the library's own columns, a
@@ -2672,7 +2716,7 @@ have spelled its type, so `spec` supplies the spelling.
 -}
 madeCol : String -> String -> Type -> Col
 madeCol key name typ =
-    Col key name typ (typeName typ)
+    Col key name typ (typeName typ) noCheck
 
 
 
@@ -2987,6 +3031,9 @@ colDecoder =
                     |> List.filter (not << String.isEmpty)
                     |> Enum
 
+            else if isMoney typeStr then
+                Money (String.dropLeft 6 typeStr)
+
             else
                 case multiOptions typeStr of
                     Just options ->
@@ -2996,12 +3043,26 @@ colDecoder =
                         Dict.get typeStr typeSpellings |> Maybe.withDefault Unknown
     in
     D.oneOf
-        [ D.map3 (\key name raw -> Col key name (parseType raw) raw)
+        [ D.map4 (\key name raw check -> Col key name (parseType raw) raw check)
             (D.field "key" string)
             (D.field "name" D.string)
             (D.field "type" (D.nullable D.string |> D.map (Maybe.withDefault "")))
+            (D.oneOf [ D.field "check" checkDecoder, D.succeed noCheck ])
         , D.succeed (madeCol "" "" Text)
         ]
+
+
+checkDecoder : D.Decoder Check
+checkDecoder =
+    let
+        key name decoder fallback =
+            D.oneOf [ D.field name decoder, D.succeed fallback ]
+    in
+    D.map4 Check
+        (key "required" D.bool False)
+        (key "unique" D.bool False)
+        (key "min" (D.map Just D.float) Nothing)
+        (key "max" (D.map Just D.float) Nothing)
 
 
 {-| Every type a column may declare, in the one spelling the page writes.
@@ -3064,7 +3125,17 @@ knownTypeName name =
             not (List.isEmpty options) && Set.size (Set.fromList options) == List.length options
 
         Nothing ->
-            List.any (Tuple.first >> (==) name) columnTypes || (String.startsWith "enum:" name && String.length name > 5)
+            List.any (Tuple.first >> (==) name) columnTypes || (String.startsWith "enum:" name && String.length name > 5) || isMoney name
+
+
+{-| `money:EUR`: the prefix and three capital letters, the shape `MONEY_SHAPE` checks in `src/sql.mjs`.
+-}
+isMoney : String -> Bool
+isMoney name =
+    String.startsWith "money:" name
+        && String.length name
+        == 9
+        && String.all (\c -> c >= 'A' && c <= 'Z') (String.dropLeft 6 name)
 
 
 {-| The options of a `multi:a,b` type string, split and trimmed the way
@@ -3394,6 +3465,7 @@ type Msg
     | ColumnDecimals String String
     | ColumnFormat String String
     | ColumnShade String String
+    | ColumnCheck String CheckField String
     | ColumnMoveStart String
     | RowMoveStart Int
     | MoveEnd
@@ -3477,6 +3549,13 @@ type DocMsg
     | SheetRowsDedupeNear String Int
     | SheetColumnSplit String String
     | CellCheck Index Bool
+
+
+type CheckField
+    = CheckRequired
+    | CheckUnique
+    | CheckMin
+    | CheckMax
 
 
 type Casing
@@ -4466,7 +4545,7 @@ update msg ({ sheet, auth } as model) =
             case ( model.codex, model.sheet.doc ) of
                 ( Just codex, Ok (Codex "codex-db") ) ->
                     ( { model | codex = Just { codex | picked = Just table, filters = [] }, sheet = { sheet | table = Err "" } }
-                    , codexPreview { id = codex.id, table = table, filters = [] }
+                    , codexPreview { id = codex.id, table = table, filters = [], apply = False }
                     )
 
                 _ ->
@@ -4536,7 +4615,7 @@ update msg ({ sheet, auth } as model) =
                 ( Just { id, picked, filters }, Ok (Codex "codex-db") ) ->
                     case picked of
                         Just table ->
-                            ( model, codexPreview { id = id, table = table, filters = filters } )
+                            ( model, codexPreview { id = id, table = table, filters = filters, apply = True } )
 
                         Nothing ->
                             ( model, Cmd.none )
@@ -5249,6 +5328,34 @@ update msg ({ sheet, auth } as model) =
               }
             , Cmd.none
             )
+
+        ColumnCheck key field input ->
+            case sheet.doc of
+                Ok (Tab table) ->
+                    case table.cols |> Array.toIndexedList |> List.filter (\( _, c ) -> c.key == key) |> List.head of
+                        Just ( x, col ) ->
+                            case setCheck field input col.check |> Result.andThen (\check -> checkBreaks col check table.rows |> Maybe.map Err |> Maybe.withDefault (Ok check)) of
+                                Err message ->
+                                    ( { model | error = message }, Cmd.none )
+
+                                Ok check ->
+                                    ( model
+                                    , changeDoc
+                                        { id = sheet.id
+                                        , data =
+                                            [ { action = iif (check == noCheck) "del" "set"
+                                              , path = [ E.int 0, E.string (String.fromInt x), E.string "check" ]
+                                              , value = encodeCheck check
+                                              }
+                                            ]
+                                        }
+                                    )
+
+                        Nothing ->
+                            ( model, Cmd.none )
+
+                _ ->
+                    ( model, Cmd.none )
 
         ColumnFormat key name ->
             -- One click is one arrangement, unlike the count beside it: there
@@ -6520,7 +6627,7 @@ updateDocMsg edit ({ sheet } as model) =
                                         ++ write
                                         ++ "\". A type nobody knows reads back as unknown, and a numeric column that reads back as unknown stops being checked -- its blanks start summing as zeros. Known types: "
                                         ++ String.join ", " canonicalTypeNames
-                                        ++ ", or enum: or multi: followed by the options, e.g. enum:small,large."
+                                        ++ ", or enum: or multi: followed by the options, e.g. enum:small,large, or money: and a three-letter code, e.g. money:EUR."
 
                             else
                                 Array.get x table.cols |> Maybe.andThen (\col -> cellRefusal col write)
@@ -8595,6 +8702,9 @@ computeStats doc =
                             Usd ->
                                 computeNumericStats tbl.rows col.key
 
+                            Money _ ->
+                                computeNumericStats tbl.rows col.key
+
                             Duration ->
                                 computeNumericStats tbl.rows col.key
 
@@ -8943,6 +9053,149 @@ cellRewrites col change rows =
                     )
     in
     ( List.map Tuple.first pairs, List.map Tuple.second pairs )
+
+
+setCheck : CheckField -> String -> Check -> Result String Check
+setCheck field input check =
+    let
+        asNumber : (Maybe Float -> Check) -> Result String Check
+        asNumber make =
+            case ( String.trim input, String.toFloat (String.trim input) ) of
+                ( "", _ ) ->
+                    Ok (make Nothing)
+
+                ( _, Just n ) ->
+                    Ok (make (Just n))
+
+                ( text, Nothing ) ->
+                    Err ("Expected a number or nothing for a column's min or max, received " ++ quoted text ++ ". Nothing was written. Source: the min and max boxes in the column panel. Fix: type digits like 0 or 99.5, or clear the box.")
+    in
+    (case field of
+        CheckRequired ->
+            Ok { check | required = input == "true" }
+
+        CheckUnique ->
+            Ok { check | unique = input == "true" }
+
+        CheckMin ->
+            asNumber (\n -> { check | min = n })
+
+        CheckMax ->
+            asNumber (\n -> { check | max = n })
+    )
+        |> Result.andThen
+            (\next ->
+                case ( next.min, next.max ) of
+                    ( Just low, Just high ) ->
+                        if low > high then
+                            Err ("Expected min at or below max, received min " ++ String.fromFloat low ++ " above max " ++ String.fromFloat high ++ ". Nothing was written. Source: the min and max boxes in the column panel. Fix: set min at or below max.")
+
+                        else
+                            Ok next
+
+                    _ ->
+                        Ok next
+            )
+
+
+encodeCheck : Check -> E.Value
+encodeCheck check =
+    E.object
+        (List.filterMap identity
+            [ iif check.required (Just ( "required", E.bool True )) Nothing
+            , iif check.unique (Just ( "unique", E.bool True )) Nothing
+            , Maybe.map (\n -> ( "min", E.float n )) check.min
+            , Maybe.map (\n -> ( "max", E.float n )) check.max
+            ]
+        )
+
+
+{-| The first thing the rows already break in this column's check, worded as the
+server words it, or nothing. The page checks the whole table: setting a rule the
+rows contradict would be a rule nobody could write under. The server blames only
+the rows a write touches. A row is numbered from 1, as the server numbers it.
+-}
+checkBreaks : Col -> Check -> Array Row -> Maybe String
+checkBreaks col check rows =
+    let
+        source i =
+            " Source: row " ++ String.fromInt (i + 1) ++ ", column " ++ quoted col.name ++ ". Nothing was written."
+
+        empty row =
+            blankCell col.key row
+                || (Dict.get col.key row |> Maybe.map (\v -> D.decodeValue (D.list D.value) v == Ok []) |> Maybe.withDefault False)
+
+        cells =
+            rows
+                |> Array.toIndexedList
+                |> List.filter (\( _, row ) -> not (empty row))
+                |> List.filterMap (\( i, row ) -> Dict.get col.key row |> Maybe.map (Tuple.pair i))
+
+        cellNumber v =
+            D.decodeValue (D.oneOf [ D.float, D.string |> D.andThen (String.trim >> String.toFloat >> Maybe.map D.succeed >> Maybe.withDefault (D.fail "text")) ]) v |> Result.toMaybe
+
+        required =
+            if check.required then
+                rows
+                    |> Array.toIndexedList
+                    |> List.filter (\( _, row ) -> empty row)
+                    |> List.head
+                    |> Maybe.map (\( i, _ ) -> "Expected a value in " ++ quoted col.name ++ ", received a blank, since its check says required." ++ source i ++ " Fix: give that cell a value, or turn required off.")
+
+            else
+                Nothing
+
+        unique =
+            if check.unique then
+                cells
+                    |> List.foldl
+                        (\( i, v ) ( seen, found ) ->
+                            let
+                                text =
+                                    E.encode 0 v
+                            in
+                            case ( found, Dict.get text seen ) of
+                                ( Nothing, Just first ) ->
+                                    ( seen, Just ("Expected " ++ quoted col.name ++ " to hold no value twice, received " ++ text ++ " in rows " ++ String.fromInt (first + 1) ++ " and " ++ String.fromInt (i + 1) ++ ", since its check says unique." ++ source i ++ " Fix: change one of them, or turn unique off.") )
+
+                                _ ->
+                                    ( Dict.update text (Maybe.withDefault i >> Just) seen, found )
+                        )
+                        ( Dict.empty, Nothing )
+                    |> Tuple.second
+
+            else
+                Nothing
+
+        outside name test limit =
+            Maybe.andThen
+                (\bound ->
+                    cells
+                        |> List.filterMap (\( i, v ) -> cellNumber v |> Maybe.andThen (\n -> iif (test n bound) (Just ( i, n )) Nothing))
+                        |> List.head
+                        |> Maybe.map
+                            (\( i, n ) ->
+                                "Expected "
+                                    ++ quoted col.name
+                                    ++ " at "
+                                    ++ iif (name == "min") "least " "most "
+                                    ++ String.fromFloat bound
+                                    ++ ", received "
+                                    ++ String.fromFloat n
+                                    ++ ", since its check says "
+                                    ++ name
+                                    ++ "."
+                                    ++ source i
+                                    ++ " Fix: change that cell, or move "
+                                    ++ name
+                                    ++ "."
+                            )
+                )
+                limit
+    in
+    [ required, unique, outside "min" (<) check.min, outside "max" (>) check.max ]
+        |> List.filterMap identity
+        |> List.head
 
 
 {-| Nothing in this cell: the column is missing from the row, its value is null,
@@ -9452,6 +9705,9 @@ seriesEncoder typ =
         Usd ->
             Just asNumber
 
+        Money _ ->
+            Just asNumber
+
         Percentage ->
             Just asNumber
 
@@ -9878,6 +10134,9 @@ cellDecoder typ decimals format i n =
 
             Usd ->
                 D.oneOf [ D.map (text << formatNumber Usd decimals format) number, D.map text string ]
+
+            Money code ->
+                D.oneOf [ D.map (text << formatNumber (Money code) decimals format) number, D.map text string ]
 
             Percentage ->
                 D.oneOf [ D.map (text << formatNumber Percentage decimals format) number, D.map text string ]
@@ -10340,6 +10599,19 @@ viewHeaderCell sheet col =
                                 ]
                             )
                             (text "")
+                        , iif movable
+                            (H.div [ A.class "check", S.displayFlex, S.flexWrapWrap, S.alignItemsCenter, S.gapRem 0.5, S.marginTop "0.25rem" ]
+                                ([ H.label [] [ H.input [ A.type_ "checkbox", A.attribute "aria-label" ("required " ++ col.name), A.checked col.check.required, A.onCheck (\on -> ColumnCheck col.key CheckRequired (iif on "true" "")) ] [], text "required" ]
+                                 , H.label [] [ H.input [ A.type_ "checkbox", A.attribute "aria-label" ("unique " ++ col.name), A.checked col.check.unique, A.onCheck (\on -> ColumnCheck col.key CheckUnique (iif on "true" "")) ] [], text "unique" ]
+                                 ]
+                                    ++ iif numeric
+                                        [ H.label [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ] [ text "min", H.input [ A.type_ "number", A.attribute "aria-label" ("min " ++ col.name), A.value (col.check.min |> Maybe.map String.fromFloat |> Maybe.withDefault ""), A.on "change" (D.map (ColumnCheck col.key CheckMin) A.targetValue), S.widthRem 4 ] [] ]
+                                        , H.label [ S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ] [ text "max", H.input [ A.type_ "number", A.attribute "aria-label" ("max " ++ col.name), A.value (col.check.max |> Maybe.map String.fromFloat |> Maybe.withDefault ""), A.on "change" (D.map (ColumnCheck col.key CheckMax) A.targetValue), S.widthRem 4 ] [] ]
+                                        ]
+                                        []
+                                )
+                            )
+                            (text "")
                         , iif numeric
                             (H.label [ A.class "shading", S.displayFlex, S.alignItemsCenter, S.gapRem 0.25, S.marginTop "0.25rem" ]
                                 [ text "shade"
@@ -10682,6 +10954,9 @@ columnTotal rows col =
             Just (sumColumn rows col.key)
 
         Usd ->
+            Just (sumColumn rows col.key)
+
+        Money _ ->
             Just (sumColumn rows col.key)
 
         Duration ->
