@@ -663,6 +663,20 @@ Deno.test({
       `[historyView] Expected a past version of ${id}, received no rows for hash ${bogus}. Source: history. Fix: reopen the sheet's history and pick another version.`;
     assertEquals([errored, shown.length], [[refusal], 1], "a hash this document never had is refused by name");
     assert(page.text().includes(refusal), "inside the modal, where the scrim does not cover it");
+
+    // A column's rule goes through the glue's engine before it is written: `checkColumn` out, the open
+    // document's rows checked, and the patch lands in the real document.
+    await page.key({ key: "Escape" });
+    await page.click(page.all("span.funnel")[0]);
+    await page.click(page.all("input[aria-label='unique a']")[0]);
+    const columns = async () =>
+      Object.values(((await page.document(id)) as { data: Record<string, { check?: unknown }>[] }).data[0]);
+    for (let tries = 0; tries < 40 && (await columns())[0].check === undefined; tries++) await page.settle(25);
+    assertEquals(
+      { ...((await columns())[0].check as object) },
+      { unique: true },
+      "the glue answered clean and Elm wrote the rule",
+    );
     page.close();
   },
 });

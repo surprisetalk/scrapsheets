@@ -701,27 +701,6 @@ suite =
                         , Ok [ { noCheck | required = True } ]
                         , Ok [ noCheck ]
                         ]
-            , test "checkBreaks blames the first row that breaks a rule, numbered from 1, and says nothing when none does" <|
-                \_ ->
-                    let
-                        col =
-                            { key = "7", name = "n", typ = Number, raw = "int", check = noCheck }
-
-                        rows values =
-                            Array.fromList (List.map (\v -> Dict.fromList [ ( "7", v ) ]) values)
-
-                        broke check values =
-                            checkBreaks col check (rows values) |> Maybe.map (String.contains "row")
-                    in
-                    Expect.equal
-                        [ broke { noCheck | required = True } [ E.int 1, E.null ]
-                        , broke { noCheck | unique = True } [ E.int 1, E.null, E.int 1 ]
-                        , broke { noCheck | min = Just 2 } [ E.int 3, E.int 1 ]
-                        , broke { noCheck | max = Just 2 } [ E.int 1, E.int 3 ]
-                        , broke { required = True, unique = True, min = Just 0, max = Just 9 } [ E.int 1, E.int 2 ]
-                        , broke { noCheck | unique = True } [ E.null, E.null ]
-                        ]
-                        [ Just True, Just True, Just True, Just True, Nothing, Nothing ]
             ]
         , describe "docDecoder"
             [ test "net-http decodes url and interval; headers, method, body and the paging fields default to one plain GET" <|

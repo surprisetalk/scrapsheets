@@ -14,6 +14,7 @@ import { PORTALS as FEEDS } from "./portals.mjs";
 import {
   applyWindows,
   bound,
+  checkConstraints,
   checkResultColumns,
   DESCRIBE_COLUMNS,
   describeRef,
@@ -635,4 +636,38 @@ export const trapStep = (count, index, back) => {
   if (count === 0) return -1;
   if (index === -1) return back ? count - 1 : 0;
   return (index + (back ? count - 1 : 1)) % count;
+};
+
+/** The answer to a proposed column check, over a table document's `data`. The
+ * server's engine, over every row: a rule the rows already break is refused,
+ * where a write blames only the rows it touches. An empty check is no check,
+ * which is what the page writes it as. */
+export const checkAnswer = (id, key, check, data) => {
+  const cols = Object.values(data[0]);
+  const col = cols.find((c) => c.key === key);
+  try {
+    if (!col) {
+      throw new Error(explain(`Column key ${show(key)} is not in @${id}.`, {
+        Expected: `a column of @${id}`,
+        Received: show(key),
+        Source: "the column panel's check",
+        Fix: "open the sheet again, then set the rule",
+      }));
+    }
+    const proposed = Object.keys(check).length === 0 ? undefined : check;
+    // `toRecords` keys rows by name, so a twin would shadow this column's cells and the rule would pass on the twin's.
+    if (proposed && cols.some((c) => c !== col && c.name === col.name)) {
+      throw new Error(explain(`Column ${show(col.name)} of @${id} shares its name with another column.`, {
+        Expected: "one column of that name, since rows are keyed by column name",
+        Received: `${cols.filter((c) => c.name === col.name).length} columns named ${show(col.name)}`,
+        Source: "the column panel's check",
+        Fix: "rename one of them, then set the rule",
+      }));
+    }
+    const rows = toRecords(data);
+    checkConstraints(id, [{ ...col, check: proposed }], rows, rows.map((_, i) => i));
+    return { id, key, check };
+  } catch (err) {
+    return { id, key, check, error: err.message };
+  }
 };

@@ -34,6 +34,7 @@
       import { BrowserWebSocketClientAdapter } from "/automerge-repo-ws.mjs";
       import {
         API_BASE,
+        checkAnswer,
         docThumb,
         FOLLOW_MAX,
         foldView,
@@ -558,6 +559,13 @@
               .map(({ change: { hash, time, actor, seq, message } }) => ({ hash, time, actor, seq, message }));
             app.ports.historyLoaded.send({ id, data: { versions, left: history.length - versions.length } });
           }, 'historyLoad'));
+
+          // A column's proposed check, run by the server's engine over every
+          // row of the open document. Elm writes nothing until this answers.
+          app.ports.checkColumn.subscribe(catchy(({ id, key, check }) => {
+            // A bundled sheet has no handle: `changeDoc` writes its module object, so the rows come from there too.
+            app.ports.checkLoaded.send(checkAnswer(id, key, check, (Library.get()[id]?.doc ?? openDoc(id)).data));
+          }, 'checkColumn'));
           // By position under the names: `col.key` stays in the document, and a
           // new column is named "" until somebody types a name, so rows keyed by
           // name would keep one of a table's unnamed columns and drop the rest.

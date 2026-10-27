@@ -259,8 +259,7 @@ watch src { try { cp -vu src/* dist ; elm make src/Main.elm --debug --output=dis
 Where it is going. Scrapsheets is not Google Sheets and not Airtable. Every table is a queryable database, every query
 result is a shareable table, every portal is a live data stream, and every sheet is an API. The shop takes payment
 through Stripe Checkout. The MCP server lets a model read and write sheets. Pipelines keep sheets up to date.
-Scrapscript formulas, which are content-addressed programs, are the part nobody else can copy. `todo.md` is the queue,
-and the usage conditions in `deno task status` measure whether anybody outside this repo uses it.
+Scrapscript formulas, which are content-addressed programs, are the part nobody else can copy. `todo.md` is the queue.
 
 The library works anonymously out of the box: bundled datasets (countries, US states, periodic table, CSS colors,
 events), example queries that join them with `@sheet_id` refs, seven live portals, and a first-run tutorial.

@@ -186,6 +186,14 @@ Deno.test({
       "table:countries"
     ];
     assertEquals(bundled.doc.data[0][1].sort, "asc", "the document the session reads is patched as well");
+
+    // A bundled sheet has no handle: the rule is graded off its module object and written there.
+    await first.click(first.all("span.funnel")[1]);
+    await first.click(first.all("input[aria-label='unique name']")[0]);
+    const first0 = bundled.doc.data[0][1] as unknown as { check?: unknown };
+    for (let tries = 0; tries < 40 && first0.check === undefined; tries++) await first.settle(25);
+    assertEquals(first0.check, { unique: true }, "the rule reached the bundled document");
+    delete first0.check;
     first.close();
 
     // A bundled document is a module object, and the page patched it in place. A

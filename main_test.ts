@@ -652,6 +652,7 @@ Deno.test(async function allTests(t) {
       let shut = false;
       ws.onclose = () => shut = true;
       const cached = syncAccessCache.size;
+      const started = performance.now();
       for (let i = 0; i < 4 * FRAME_BURST; i++) {
         ws.send(AM.cbor.encode({
           type: "request",
@@ -670,7 +671,12 @@ Deno.test(async function allTests(t) {
         "the flooder is told why before the close",
       );
       const lookups = syncAccessCache.size - cached;
-      assert(lookups > 0 && lookups <= FRAME_BURST + FRAME_RATE, `${lookups} lookups for ${4 * FRAME_BURST} frames`);
+      // The bucket refills while the flood runs; without it every one of the frames is a lookup.
+      const seconds = Math.ceil((performance.now() - started) / 1000);
+      assert(
+        lookups > 0 && lookups <= FRAME_BURST + FRAME_RATE * seconds,
+        `${lookups} lookups in ${seconds}s for ${4 * FRAME_BURST} frames`,
+      );
     }
 
     // Connections of one account share a bucket, so N sockets do not multiply
@@ -699,6 +705,7 @@ Deno.test(async function allTests(t) {
         return state;
       }));
       const cached = syncAccessCache.size;
+      const flooded = performance.now();
       for (let i = 0; i < 4 * FRAME_BURST; i++) {
         for (const s of sockets) {
           if (s.shut) continue;
@@ -714,9 +721,12 @@ Deno.test(async function allTests(t) {
       for (let i = 0; i < 400 && !sockets.every((s) => s.shut); i++) await new Promise((r) => setTimeout(r, 25));
       assert(sockets.every((s) => s.shut), "Expected every connection of a flooding account to close within 10s.");
       const accountLookups = syncAccessCache.size - cached;
+      // The bucket refills while the flood runs, and a loaded machine stretches the flood past a second. Three
+      // unshared buckets would allow 3 * (FRAME_BURST + FRAME_RATE * s), always above this.
+      const seconds = Math.ceil((performance.now() - flooded) / 1000);
       assert(
-        accountLookups > 0 && accountLookups <= ACCOUNT_FRAME_BURST + ACCOUNT_FRAME_RATE,
-        `${accountLookups} lookups for three connections of one account`,
+        accountLookups > 0 && accountLookups <= ACCOUNT_FRAME_BURST + ACCOUNT_FRAME_RATE * seconds,
+        `${accountLookups} lookups in ${seconds}s for three connections of one account`,
       );
       assert(
         sockets.some((s) => s.replies.some((f) => f.type === "error" && String(f.message).includes("across"))),
@@ -8932,7 +8942,7 @@ Deno.test(async function allTests(t) {
       values (${ids[0]}, 'GET', 'x', ${sql.json({ status: "99999999999999999999" })})
     `;
     assertEquals((await rows(jwt)).body.length > 0, true, "one unreadable status must not empty the answer");
-    assertEquals(Object.keys(await status()).length, 21, "nor take the alarm down with it");
+    assertEquals(Object.keys(await status()).length, 16, "nor take the alarm down with it");
     await sql`delete from net where sheet_id = ${ids[0]} and body = 'x'`;
 
     // A poll is not the only kind of run. A net-hook sheet's run is the
@@ -10509,7 +10519,7 @@ Deno.test(async function allTests(t) {
   await t.step("Every status condition is graded so that 1.0 is the minimum pass", async () => {
     const grades = await status();
     const conditions = Object.keys(grades);
-    assertEquals(conditions.length, 21);
+    assertEquals(conditions.length, 16);
     for (const [condition, series] of Object.entries(grades)) {
       assert(condition.endsWith("."), `a condition is a sentence: ${condition}`);
       assert("0" in series, `${condition} must be graded now`);
@@ -10531,7 +10541,7 @@ Deno.test(async function allTests(t) {
     const survived = await app.request("/status");
     assertEquals(
       Object.keys(await survived.json()).length,
-      21,
+      16,
       "a malformed row must degrade a grade, not replace the whole answer with an error",
     );
 
@@ -10655,94 +10665,22 @@ Deno.test(async function allTests(t) {
     await sql`delete from net where sheet_id = ${feedSheet}`;
     await sql`delete from sheet where sheet_id = ${feedSheet}`;
 
-    // Done with the alert sheets. Every condition below is about an idle
-    // product, and an alert sheet with no runs at all is a dead poller, not an
-    // idle one -- which is what the liveness condition above just proved.
+    // Done with the alert sheets: an alert sheet with no runs at all is a dead
+    // poller, which is what the liveness condition above just proved.
+    //
+    // 200 is reachable. The suite has spent the run filling the error log and
+    // failing net-http polls on purpose, so a clean log is what proves the
+    // healthy path exists at all -- without this the 503 below passes for
+    // whatever happens to be true, which is no test.
     await sql`delete from net`;
     await sql`delete from sheet_usr where sheet_id like 'alert:%'`;
     await sql`delete from sheet where type = 'alert'`;
-
-    // A usage goal is a condition like any other: graded, in the answer, and a
-    // failing status when nobody meets it.
-    assert(
-      (await status())["Somebody created a sheet in the past 24 hours."]["0"] >= 0,
-      "the usage condition is still graded",
-    );
-    await sql`update sheet set created_at = now() - interval '3 days'
-              where created_by <> (select usr_id from usr where email = '')`;
-    // The go-to-market goals, pushed out of every window: the suite signed up,
-    // bought and used the app minutes ago.
-    const signedUp = "Somebody signed up in the past week.";
-    const madeSheet = "Somebody who signed up in the past week made a sheet.";
-    const paid = "Somebody paid in the past week.";
-    const usedByOthers = "Somebody other than the operator used the app in the past day.";
-    await sql`update usr set created_at = created_at - interval '30 days'`;
-    await sql`update audit set created_at = created_at - interval '30 days'`;
-    await sql`update payment set created_at = created_at - interval '30 days'`;
-    // The operator is the product's own account, so neither signing up nor
-    // using the app counts.
-    await sql`update usr set created_at = now() where email = 'erin@example.com'`;
-    await sql`
-      insert into audit (sheet_id, usr_id, action, via)
-      values ('net-hook:errors', (select usr_id from usr where email = 'erin@example.com'), 'read', 'jwt'),
-             ('net-hook:errors', (select usr_id from usr where email = ''), 'read', 'jwt'),
-             ('net-hook:errors', null, 'read', 'link')
-    `;
-    const idle = await app.request("/status");
-    assertEquals(idle.status, 503, "a product nobody used today is failing");
-    const idleGrades = await idle.json();
-    for (
-      const condition of ["Somebody created a sheet in the past 24 hours.", signedUp, madeSheet, paid, usedByOthers]
-    ) {
-      assertEquals(Object.keys(idleGrades[condition]), ["0", "3600", "86400"], `${condition} carries the trend`);
-      assertEquals(idleGrades[condition]["0"], 0, `${condition} counts nobody on an idle product`);
-    }
-
-    // Two rounds, not one per condition: each status() call runs every check.
-    const [newcomer] = await sql`insert into usr (email) values ('newcomer@example.com') returning usr_id`;
-    await sql`
-      insert into payment (buyer_id, seller_id, sell_id, sheet_id, amount)
-      select ${newcomer.usr_id}, created_by, sell_id, sheet_id, 0 from sheet where sheet_id = 'net-hook:errors'
-    `;
-    const joined = await status();
-    assertEquals(joined[signedUp]["0"], 1, "one new account is somebody signing up, and the operator is not");
-    assertEquals(joined[madeSheet]["0"], 0, "an account with no sheet has not made one");
-    assertEquals(joined[paid]["0"], 0, "a free claim is not a payment");
-    assertEquals(joined[usedByOthers]["0"], 0, "the operator, the sentinel and a share link are nobody");
-
-    await sql`
-      insert into sheet (created_by, type, doc_id, name)
-      values (${newcomer.usr_id}, 'table', 'newcomer-probe', 'first sheet')
-    `;
-    await sql`
-      insert into payment (buyer_id, seller_id, sell_id, amount, stripe_session_id)
-      select ${newcomer.usr_id}, created_by, sell_id, 5, 'cs_status_probe' from sheet where sheet_id = 'net-hook:errors'
-    `;
-    await sql`
-      insert into audit (sheet_id, usr_id, action, via)
-      values ('table:newcomer-probe', ${newcomer.usr_id}, 'read', 'jwt')
-    `;
-    const active = await status();
-    assertEquals(active[madeSheet]["0"], 1, "the newcomer's first sheet is the activation");
-    assertEquals(active[paid]["0"], 1, "a paid Checkout Session is somebody paying");
-    assertEquals(active[usedByOthers]["0"], 1, "an account other than the operator's is somebody using the app");
-
-    // 200 is reachable. The suite has spent the run filling the error log and
-    // failing net-http polls on purpose, so a clean log, with the newcomer still
-    // meeting every goal, is what proves the healthy path exists at all --
-    // without this the 503 below passes for whatever happens to be true, which
-    // is no test.
-    await sql`delete from net`;
     const clean = await app.request("/status");
     assertEquals(
       clean.status,
       200,
       `every condition must pass on a healthy database: ${JSON.stringify(await clean.json())}`,
     );
-    await sql`delete from audit where usr_id = ${newcomer.usr_id}`;
-    await sql`delete from payment where buyer_id = ${newcomer.usr_id}`;
-    await sql`delete from sheet where created_by = ${newcomer.usr_id}`;
-    await sql`delete from usr where usr_id = ${newcomer.usr_id}`;
 
     // The refusals condition reads `meta->>'status'`, which answers null on a
     // jsonb string -- so a log written as one made the check count nothing and

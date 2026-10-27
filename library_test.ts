@@ -18,6 +18,7 @@ import { JSDOM } from "jsdom";
 import {
   API_BASE,
   atomToJson,
+  checkAnswer,
   docThumb,
   foldView,
   httpErrorDetail,
@@ -1545,6 +1546,28 @@ Deno.test("a remembered header lays its types over the server's guesses", () => 
     ["num", "text"],
     "no memory keeps the guess",
   );
+});
+
+Deno.test("a proposed column check is graded over every row by the server's engine", () => {
+  const ask = (check: object, key: string, ...data: unknown[]) =>
+    checkAnswer("table:t", key, check, data as never) as { check: object; error?: string };
+  const col = (type: string, extra = {}) => ({ key: "k", name: "名前", type, ...extra });
+  // 1 and "1" are two values, as on the server.
+  assertEquals(ask({ unique: true }, "k", [col("text")], { k: 1 }, { k: "1" }).error, undefined);
+  assert(ask({ unique: true }, "k", [col("text")], { k: "é" }, { k: "é" }).error?.includes("row 1"), "unicode name");
+  // A numeric string counts as its number, spaces trimmed; a blank string is blank, not 0.
+  assert(ask({ max: 3 }, "k", [col("int")], { k: " 5 " }).error?.includes("above its max"));
+  assertEquals(ask({ min: 1 }, "k", [col("int")], { k: "  " }).error, undefined);
+  // [] is blank to required.
+  assert(ask({ required: true }, "k", [col("multi:a,b")], { k: [] }).error?.includes("required"));
+  // {} clears the rule even where the old rule held the cells to enum options.
+  assertEquals(ask({}, "k", [col("enum:a,b", { check: { required: true } })], { k: "z" }).error, undefined);
+  // A key the table lost is refused by name.
+  assert(ask({ unique: true }, "gone", [col("text")]).error?.includes("is not in @table:t"));
+  // Two columns of one name: the twin would shadow the cells, so the rule is refused.
+  const twins = [col("text"), { ...col("text"), key: "j" }];
+  assert(ask({ required: true }, "k", twins, { k: "", j: "x" }).error?.includes("shares its name"));
+  assertEquals(ask({}, "k", twins, { k: "", j: "x" }).error, undefined, "clearing a rule is not blocked");
 });
 
 Deno.test("a Tab inside a modal wraps at both ends, and lands nowhere in an empty one", () => {

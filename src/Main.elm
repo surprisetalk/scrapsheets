@@ -37,7 +37,6 @@ port module Main exposing
     , chartPointsMax
     , chartRuns
     , chartSpan
-    , checkBreaks
     , civilDays
     , clampIndex
     , codexTablesDecoder
@@ -1088,6 +1087,16 @@ port lineageFor : String -> Cmd msg
 
 
 port lineageLoaded : (D.Value -> msg) -> Sub msg
+
+
+{-| A column's proposed check, for the glue to run through the server's engine
+over every row. The answer carries `id`, `key` and `check` back, and `error`
+when a row breaks it.
+-}
+port checkColumn : { id : String, key : String, check : E.Value } -> Cmd msg
+
+
+port checkLoaded : (D.Value -> msg) -> Sub msg
 
 
 {-| Sharing runs through JS because the JWT lives there, same as changeDoc.
@@ -3441,6 +3450,7 @@ type Msg
     | ShortcutsToggle Bool
     | FreshnessLoad D.Value
     | LineageLoad D.Value
+    | CheckLoad D.Value
     | PendingConfirm
     | PendingCancel
     | Goto Id
@@ -3631,6 +3641,7 @@ subs model =
         , freshnessLoaded FreshnessLoad
         , codexLoaded CodexLoad
         , lineageLoaded LineageLoad
+        , checkLoaded CheckLoad
         , case model.sheet.resizing of
             Just _ ->
                 Sub.batch
@@ -5332,30 +5343,65 @@ update msg ({ sheet, auth } as model) =
         ColumnCheck key field input ->
             case sheet.doc of
                 Ok (Tab table) ->
-                    case table.cols |> Array.toIndexedList |> List.filter (\( _, c ) -> c.key == key) |> List.head of
-                        Just ( x, col ) ->
-                            case setCheck field input col.check |> Result.andThen (\check -> checkBreaks col check table.rows |> Maybe.map Err |> Maybe.withDefault (Ok check)) of
+                    case table.cols |> Array.toList |> List.filter (\c -> c.key == key) |> List.head of
+                        Just col ->
+                            case setCheck field input col.check of
                                 Err message ->
                                     ( { model | error = message }, Cmd.none )
 
                                 Ok check ->
-                                    ( model
-                                    , changeDoc
-                                        { id = sheet.id
-                                        , data =
-                                            [ { action = iif (check == noCheck) "del" "set"
-                                              , path = [ E.int 0, E.string (String.fromInt x), E.string "check" ]
-                                              , value = encodeCheck check
-                                              }
-                                            ]
-                                        }
-                                    )
+                                    ( model, checkColumn { id = sheet.id, key = key, check = encodeCheck check } )
 
                         Nothing ->
                             ( model, Cmd.none )
 
                 _ ->
                     ( model, Cmd.none )
+
+        CheckLoad value ->
+            -- The glue ran the server's engine over the whole table. Everything
+            -- the write needs rides in the answer; the column is found again by
+            -- key, because the document may have moved since the ask.
+            case D.decodeValue (D.map3 (\id key error -> ( id, key, error )) (D.field "id" D.string) (D.field "key" D.string) (optionalField "error" (D.map Just D.string) Nothing)) value of
+                Err err ->
+                    ( { model | error = "The column check answer arrived in a shape I could not read: " ++ D.errorToString err }, Cmd.none )
+
+                Ok ( id, key, error ) ->
+                    case ( id == sheet.id, sheet.doc ) of
+                        ( True, Ok (Tab table) ) ->
+                            case ( error, D.decodeValue (D.field "check" checkDecoder) value, table.cols |> Array.toIndexedList |> List.filter (\( _, c ) -> c.key == key) |> List.head ) of
+                                ( Just message, _, _ ) ->
+                                    ( { model | error = message }, Cmd.none )
+
+                                ( Nothing, Ok check, Just ( x, col ) ) ->
+                                    let
+                                        patch next =
+                                            { action = iif (next == noCheck) "del" "set"
+                                            , path = [ E.int 0, E.string (String.fromInt x), E.string "check" ]
+                                            , value = encodeCheck next
+                                            }
+
+                                        forward =
+                                            [ patch check ]
+                                    in
+                                    ( { model
+                                        | sheet =
+                                            { sheet
+                                                | undoStack = { forward = forward, backward = [ patch col.check ] } :: sheet.undoStack |> List.take 50
+                                                , redoStack = []
+                                            }
+                                      }
+                                    , changeDoc { id = sheet.id, data = forward }
+                                    )
+
+                                ( Nothing, Err err, _ ) ->
+                                    ( { model | error = "The column check answer arrived in a shape I could not read: " ++ D.errorToString err }, Cmd.none )
+
+                                ( Nothing, Ok _, Nothing ) ->
+                                    ( model, Cmd.none )
+
+                        _ ->
+                            ( model, Cmd.none )
 
         ColumnFormat key name ->
             -- One click is one arrangement, unlike the count beside it: there
@@ -9108,94 +9154,6 @@ encodeCheck check =
             , Maybe.map (\n -> ( "max", E.float n )) check.max
             ]
         )
-
-
-{-| The first thing the rows already break in this column's check, worded as the
-server words it, or nothing. The page checks the whole table: setting a rule the
-rows contradict would be a rule nobody could write under. The server blames only
-the rows a write touches. A row is numbered from 1, as the server numbers it.
--}
-checkBreaks : Col -> Check -> Array Row -> Maybe String
-checkBreaks col check rows =
-    let
-        source i =
-            " Source: row " ++ String.fromInt (i + 1) ++ ", column " ++ quoted col.name ++ ". Nothing was written."
-
-        empty row =
-            blankCell col.key row
-                || (Dict.get col.key row |> Maybe.map (\v -> D.decodeValue (D.list D.value) v == Ok []) |> Maybe.withDefault False)
-
-        cells =
-            rows
-                |> Array.toIndexedList
-                |> List.filter (\( _, row ) -> not (empty row))
-                |> List.filterMap (\( i, row ) -> Dict.get col.key row |> Maybe.map (Tuple.pair i))
-
-        cellNumber v =
-            D.decodeValue (D.oneOf [ D.float, D.string |> D.andThen (String.trim >> String.toFloat >> Maybe.map D.succeed >> Maybe.withDefault (D.fail "text")) ]) v |> Result.toMaybe
-
-        required =
-            if check.required then
-                rows
-                    |> Array.toIndexedList
-                    |> List.filter (\( _, row ) -> empty row)
-                    |> List.head
-                    |> Maybe.map (\( i, _ ) -> "Expected a value in " ++ quoted col.name ++ ", received a blank, since its check says required." ++ source i ++ " Fix: give that cell a value, or turn required off.")
-
-            else
-                Nothing
-
-        unique =
-            if check.unique then
-                cells
-                    |> List.foldl
-                        (\( i, v ) ( seen, found ) ->
-                            let
-                                text =
-                                    E.encode 0 v
-                            in
-                            case ( found, Dict.get text seen ) of
-                                ( Nothing, Just first ) ->
-                                    ( seen, Just ("Expected " ++ quoted col.name ++ " to hold no value twice, received " ++ text ++ " in rows " ++ String.fromInt (first + 1) ++ " and " ++ String.fromInt (i + 1) ++ ", since its check says unique." ++ source i ++ " Fix: change one of them, or turn unique off.") )
-
-                                _ ->
-                                    ( Dict.update text (Maybe.withDefault i >> Just) seen, found )
-                        )
-                        ( Dict.empty, Nothing )
-                    |> Tuple.second
-
-            else
-                Nothing
-
-        outside name test limit =
-            Maybe.andThen
-                (\bound ->
-                    cells
-                        |> List.filterMap (\( i, v ) -> cellNumber v |> Maybe.andThen (\n -> iif (test n bound) (Just ( i, n )) Nothing))
-                        |> List.head
-                        |> Maybe.map
-                            (\( i, n ) ->
-                                "Expected "
-                                    ++ quoted col.name
-                                    ++ " at "
-                                    ++ iif (name == "min") "least " "most "
-                                    ++ String.fromFloat bound
-                                    ++ ", received "
-                                    ++ String.fromFloat n
-                                    ++ ", since its check says "
-                                    ++ name
-                                    ++ "."
-                                    ++ source i
-                                    ++ " Fix: change that cell, or move "
-                                    ++ name
-                                    ++ "."
-                            )
-                )
-                limit
-    in
-    [ required, unique, outside "min" (<) check.min, outside "max" (>) check.max ]
-        |> List.filterMap identity
-        |> List.head
 
 
 {-| Nothing in this cell: the column is missing from the row, its value is null,

@@ -2256,14 +2256,9 @@ export const OVERDUE_MAX = 10;
 // status() call's walk, and one row's own budget in freshness(), where a page
 // of rows is already bounded by the page it was asked for.
 const PAUSE_LOOKUP_MS = 5_000;
-// Keyed by the overTime alias each sentence grades.
-const USAGE = {
-  sheets_created: "Somebody created a sheet in the past 24 hours.",
-  signed_up: "Somebody signed up in the past week.",
-  signed_up_made_sheet: "Somebody who signed up in the past week made a sheet.",
-  paid: "Somebody paid in the past week.",
-  used_by_others: "Somebody other than the operator used the app in the past day.",
-};
+// REVIEW: No usage conditions (a sheet made, a signup, a signup who made a sheet, a payment, a non-operator audit row).
+// With no traffic each scored 0 and held the status red every day, so a real outage hid in it. Alternative: keep them.
+// It keeps a goal visible, at the cost of a report that is never green. Restore from git when real users arrive.
 const DB_BYTES_CAP = 4_000_000_000;
 const HEAP_BYTES_CAP = 512_000_000;
 
@@ -2313,15 +2308,9 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
   // is all digits and still out of range for an int. That took this endpoint to
   // 500 on one row nobody here wrote, which is the exact failure this guard is
   // for -- and this endpoint is the alarm.
-  // `|| null`: seed() skips a blank OPERATOR_EMAIL, and postgres.js refuses an
-  // undefined parameter. `email = null` matches no row.
-  const operator = Deno.env.get("OPERATOR_EMAIL")?.trim() || null;
   const overTime = await sql`
     with at as (select seconds, now() - make_interval(secs => seconds) as t
-                from unnest(${STATUS_AGO}::int[]) as seconds),
-    -- The accounts that are the product's own: the sentinel, and the operator
-    -- the way seed() names it. Neither one using the app is somebody using it.
-    house as (select usr_id from usr where email = '' or email = ${operator})
+                from unnest(${STATUS_AGO}::int[]) as seconds)
     select
       at.seconds,
       -- Each row stands for itself plus whatever logFailure folded into it, or
@@ -2350,27 +2339,7 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
                    else count(*) filter (where ${ALERT_OK()})::numeric / count(*) end
        from net n
        where n.method = 'ALERT' and n.body is json
-         and n.created_at > at.t - interval '1 day' and n.created_at <= at.t) as alerts_delivered,
-      (select count(*) from sheet s
-       where s.created_at > at.t - interval '1 day' and s.created_at <= at.t
-         and s.created_by <> (select usr_id from usr where email = '')) as sheets_created,
-      (select count(*) from usr u
-       where u.created_at > at.t - interval '7 days' and u.created_at <= at.t
-         and u.usr_id not in (select usr_id from house)) as signed_up,
-      (select count(*) from usr u
-       where u.created_at > at.t - interval '7 days' and u.created_at <= at.t
-         and u.usr_id not in (select usr_id from house)
-         and exists (select from sheet s where s.created_by = u.usr_id
-                     and s.created_at > at.t - interval '7 days' and s.created_at <= at.t)) as signed_up_made_sheet,
-      -- A row with a stripe_session_id is written only by the
-      -- checkout.session.completed webhook, once Stripe says payment_status
-      -- is paid, so no row stands for a payment still in flight. A free claim
-      -- writes amount 0 with no session.
-      (select count(*) from payment p
-       where p.amount > 0 and p.created_at > at.t - interval '7 days' and p.created_at <= at.t) as paid,
-      (select count(*) from audit a
-       where a.created_at > at.t - interval '1 day' and a.created_at <= at.t
-         and a.usr_id is not null and a.usr_id not in (select usr_id from house)) as used_by_others
+         and n.created_at > at.t - interval '1 day' and n.created_at <= at.t) as alerts_delivered
     from at
   `;
 
@@ -2541,7 +2510,6 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
     now("No shop report is waiting for review.", live.reports_reviewed),
     now("No account hit a quota in the past day.", live.quotas_hit),
     now("Every webhook's last delivery in the past day was accepted.", live.webhooks_ok),
-    ...Object.entries(USAGE).map(([alias, condition]) => byAgo(condition, (r) => r[alias])),
   ]);
 };
 

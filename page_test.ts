@@ -24,7 +24,7 @@
 // library_test.ts`.
 import { assert, assertEquals } from "@std/assert";
 import { EXAMPLES } from "./src/examples.mjs";
-import { foldView, mergeView } from "./src/page.mjs";
+import { checkAnswer, foldView, mergeView } from "./src/page.mjs";
 import { boot, El, until } from "./page_harness.ts";
 
 // Three tests boot the library and then only read what it rendered, so they
@@ -461,27 +461,34 @@ Deno.test("arranging a sheet writes the arrangement onto its columns", async () 
   );
 
   // A column's check is one patch at `check` beside its type, addressed by the column's position and not by its key.
-  // A rule the rows already break is refused in the page and writes nothing.
+  // The rule goes to the glue's engine first (`checkAnswer`, the function the glue calls), over every row of the
+  // document: a rule the rows already break is refused and writes nothing.
   const checks: { action: string; path: unknown[]; value: unknown }[] = [];
   app.ports.changeDoc.subscribe((sent: { data: typeof checks }) => checks.push(...sent.data));
-  app.ports.docSelected.send({
-    id: "table:checked",
-    data: {
-      doc: {
-        type: "table",
-        data: [[{ name: "sku", type: "text", key: "7" }, { name: "n", type: "int", key: "3" }], { "7": "a", "3": 1 }, {
-          "7": "a",
-          "3": 5,
-        }],
-      },
-    },
-  });
+  const tables: Record<string, unknown[]> = {};
+  app.ports.checkColumn.subscribe(
+    ({ id, key, check }: { id: string; key: string; check: Record<string, unknown> }) =>
+      app.ports.checkLoaded.send(checkAnswer(id, key, check, tables[id])),
+  );
+  const open = (id: string, data: unknown[]) => {
+    tables[id] = data;
+    app.ports.docSelected.send({ id, data: { doc: { type: "table", data } } });
+  };
+  open("table:checked", [[{ name: "sku", type: "text", key: "7" }, { name: "n", type: "int", key: "3" }], {
+    "7": "a",
+    "3": 1,
+  }, { "7": "a", "3": 5 }]);
   await settle();
   await click(all("span.funnel")[0]);
   await click(all("input[aria-label='unique sku']")[0]);
+  await until(
+    settle,
+    "the unique refusal in the banner",
+    () => doc.body.textContent?.includes("must be unique") ?? false,
+  );
   assertEquals(checks, [], "two rows repeat a sku, so unique is refused");
-  assert(doc.body.textContent?.includes("unique"), "the refusal reaches the banner");
   await click(all("input[aria-label='required sku']")[0]);
+  await until(settle, "the required patch", () => checks.length === 1);
   assertEquals(checks.map((c) => [c.path, c.value]), [[[0, "0", "check"], { required: true }]]);
   await click(all("span.funnel")[0]);
   await click(all("span.funnel")[1]);
@@ -492,26 +499,52 @@ Deno.test("arranging a sheet writes the arrangement onto its columns", async () 
   };
   checks.length = 0;
   await change(all("input[aria-label='max n']")[0], "3");
+  await until(settle, "the max refusal in the banner", () => doc.body.textContent?.includes("above its max") ?? false);
   assertEquals(checks, [], "a row holds 5, so a max of 3 is refused");
   await change(all("input[aria-label='max n']")[0], "9");
+  await until(settle, "the max patch", () => checks.length === 1);
   assertEquals(checks.map((c) => [c.path, c.value]), [[[0, "1", "check"], { max: 9 }]]);
   await click(all("span.funnel")[1]);
 
+  // Ctrl+Z takes the rule back as a `del` (the column had none), and Ctrl+Y puts it again.
+  checks.length = 0;
+  doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true }));
+  await until(settle, "the undo patch", () => checks.length === 1);
+  assertEquals(checks.map((c) => [c.action, c.path]), [["del", [0, "1", "check"]]], "undo removes the rule");
+  doc.body.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "y", ctrlKey: true, bubbles: true }));
+  await until(settle, "the redo patch", () => checks.length === 2);
+  assertEquals(checks[1].value, { max: 9 }, "redo writes the rule again");
+
+  // A number the column holds as text counts as that number, as the server reads it.
+  open("table:textual", [[{ name: "n", type: "int", key: "3" }], { "3": "5" }]);
+  await settle();
+  checks.length = 0;
+  await click(all("span.funnel")[0]);
+  await change(all("input[aria-label='max n']")[0], "3");
+  await until(
+    settle,
+    "the max refusal for a numeric string",
+    () => doc.body.textContent?.includes("above its max") ?? false,
+  );
+  assertEquals(checks, [], 'a "5" in an int column refuses a max of 3');
+  // An answer whose error is not text is refused as unreadable, never read as a clean one.
+  app.ports.checkLoaded.send({ id: "table:textual", key: "3", check: { max: 9 }, error: 5 });
+  await until(
+    settle,
+    "the unreadable answer in the banner",
+    () => doc.body.textContent?.includes("could not read") ?? false,
+  );
+  assertEquals(checks, [], "an error that is not text writes nothing");
+  await click(all("span.funnel")[0]);
+
   // Clearing the last rule removes the check. An empty one would still count as a check on the server, which
   // holds an enum column to its options only where a check is present.
-  app.ports.docSelected.send({
-    id: "table:cleared",
-    data: {
-      doc: {
-        type: "table",
-        data: [[{ name: "size", type: "enum:s,m", key: "4", check: { required: true } }], { "4": "s" }],
-      },
-    },
-  });
+  open("table:cleared", [[{ name: "size", type: "enum:s,m", key: "4", check: { required: true } }], { "4": "s" }]);
   await settle();
   checks.length = 0;
   await click(all("span.funnel")[0]);
   await click(all("input[aria-label='required size']")[0]);
+  await until(settle, "the del patch", () => checks.length === 1);
   assertEquals(checks.map((c) => [c.action, c.path]), [["del", [0, "0", "check"]]]);
   await click(all("span.funnel")[0]);
 

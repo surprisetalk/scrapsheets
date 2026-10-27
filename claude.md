@@ -38,7 +38,8 @@ is a shareable table, every sheet is an API.
   `DSN_ENCRYPTION_KEY`, and `main.ts` refuses to load without them. The task builds `dist` once, type checks once beside
   the run, runs the files in parallel, and fails past ten seconds. Time one file with `deno test --allow-all <file>`.
   Check `top` first: a build job on the machine makes every timing wrong.
-- `deno task review` — elm-review. Keep it at zero suppressions.
+- `deno task review` — elm-review. Keep it at zero suppressions. It and `elm_test.ts` run under `npx -p elm@0.19.2-0`,
+  because elm.json pins 0.19.2 and Homebrew's `elm` is 0.19.3; a cached `elm-stuff` hides the mismatch.
 - `deno task status` — grade the deployed `GET /status`; exit nonzero below 1.0. snitch runs it every hour and mails the
   result each morning.
 - `deno task vendor` — rebuild the browser bundles after you bump the versions at the top of `vendor.ts`.
@@ -130,10 +131,7 @@ A change that breaks one of these is a bug even if the suite is green.
 - **One definition each:** `POLL_OK`, `ALERT_OK`, `RUN_OF`, `RUN_OK`, `pauseSwitch`. `GET /status` and
   `library:freshness` read them. A `null` from `pauseSwitch` is "unknown" in freshness and "running" in status.
 - **The status check grades, never maximizes.** 1.0 is the minimum pass, `grade()` floors, and a condition that cannot
-  compute throws by name. The usage conditions are spelled once in `USAGE`, keyed by their `overTime` alias: a sheet
-  made, a signup, a signup who made a sheet, a payment with `amount > 0`, and an `audit` row from an account outside
-  `house` (the sentinel and the trimmed `OPERATOR_EMAIL`). Each is a count against a bar of one, and fails `GET /status`
-  like any other condition.
+  compute throws by name. No condition counts usage (see the `REVIEW:` note above `DB_BYTES_CAP`).
 - **Secrets never reach a document.** A net-http header says `{{secret:name}}`, resolved at fetch time into a separate
   object. `assertNoKeys()` scans on `POST /library/:id/public` and a priced `POST /sell/:id`, after the owner check,
   bounded by `KEY_SCAN_CELLS` and `KEY_SCAN_BYTES`. `KEY_SHAPES` has no override. `PII_SHAPES` (email, phone, US SSN, a
@@ -154,7 +152,8 @@ A change that breaks one of these is a bug even if the suite is green.
   with every row, ignores blanks and matches the exact value; `min` and `max` need a numeric column and read a numeric
   string there as its number. An `enum:` column is held to its options only where a check is present (`{}` counts, so
   the panel deletes an empty check). A check that cannot be read refuses every write. Rows are keyed by column name
-  inside it. The socket, `readImport` and `POST /net/:id` do not enforce it.
+  inside it. The socket, `readImport` and `POST /net/:id` do not enforce it. The column panel runs the same function
+  through `checkAnswer()` before it writes a rule.
 - **A column's declared type is never rewritten.** `col.raw` is the document's spelling. A header write patches
   `[0, x, "name"]`, never the whole column object.
 - **Language-boundary copies.** `browser_test.ts` reads both sides as source text and fails on drift, compared as sets:
@@ -609,8 +608,16 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   which `usd` shares. It is in `numericColumn`, the stats row and `columnTotal`. The type row takes `money:EUR` through
   `knownTypeName`, as it takes `enum:`. xlsx writes `"EUR "#,##0.00`, parquet DOUBLE, OpenAPI a number.
 - Column check: `Col.check` is read by the lenient `checkDecoder`. The column panel of a `Tab` offers `required`,
-  `unique`, and `min` / `max` on a numeric column; `ColumnCheck` writes one `[0, x, "check"]` patch through `changeDoc`,
-  or a `del` when no rule is left. `checkBreaks` refuses a rule the current rows break, nothing written.
+  `unique`, and `min` / `max` on a numeric column. `ColumnCheck` parses the field through `setCheck` and sends
+  `checkColumn { id, key, check }`; it writes nothing yet. The glue answers `checkLoaded` from
+  `checkAnswer(id, key,
+  check, data)` in `src/page.mjs`, read off the open handle or, for a bundled sheet, its library
+  document. That runs `checkConstraints` over the proposed column and every row, so a rule the rows already break is
+  refused. An empty check is no check. A rule on a column whose name another column shares is refused; clearing one is
+  not. The answer is `{ id, key, check }`, or the same with `error`, which goes to `model.error`; an `error` that is not
+  text is refused as unreadable. `CheckLoad` holds no state: an answer for a sheet not open, or a key no longer in the
+  table, writes nothing. Else it finds the column by key and writes one `[0, x, "check"]` patch through `changeDoc` (a
+  `del` for `noCheck`), with one `UndoEntry` whose backward restores the previous check.
 - Fill-down: `fillSeries` continues dates (`justinmimbs/date`, stepped off the last seed), numbers and trailing digits,
   else repeats. `parseDay` decides a date. `blankCell` decides blank. `seriesEncoder` writes by column type.
 - Resize from the keyboard: the header `.grip` is a focusable `separator` with `aria-valuenow` when the column has a
@@ -773,7 +780,8 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 
 **Known gaps**
 
-- `checkBreaks` (Elm) and `checkConstraints` (JS) are two copies of the check rules, and the check patch has no undo.
+- `ColumnCheck` builds the whole check from `col.check`, so a second rule sent before the first one's patch lands
+  overwrites it. The glue answers in the same turn, so only a harness interleaves them.
 - Snippets expand `{{x}}` inside a comment, so a commented-out reference to a deleted snippet is refused.
 - Money prints two decimals for every code, so JPY is wrong.
 - The page checks no role before promote. A viewer's promote shows in the page, and the sync server refuses the source

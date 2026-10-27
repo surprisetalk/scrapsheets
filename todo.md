@@ -1,5 +1,3 @@
-<!-- TODO: maybe restart this project as something more whimsical and personal like kinopio? -->
-
 # Scrapsheets — todo
 
 > Programmable data OS: every table is a database, every query is a table, every sheet is an API.
@@ -10,20 +8,10 @@ here.
 
 ---
 
-## Next batch
+## Ready
 
-- [ ] A rule you set on a column is checked by the same engine in the page and on the server.
-  1. Bug fix, no design. `checkBreaks` in `Main.elm` copies `checkConstraints`. The copies drifted once already (a
-     numeric string under `min` and `max`, fixed on the server in run 14), and `unique` compares by `E.encode` there.
-  2. Add a `checkColumn` port in `src/index.html` that runs `checkConstraints` and answers `checkLoaded`; hold the
-     panel's write until the answer lands. Delete `checkBreaks`.
-  3. Give the check patch an undo entry.
-
----
-
-## Ready, needs a design
-
-Each feature here needs its design approved before the build.
+Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature builds its recommended design, with
+`REVIEW:` notes for the owner.
 
 - [ ] You import a money column, JPY has no decimals, and a conversion is a function.
   1. Accept `money:XXX` in `/import/csv?types=`; `inferType` never guesses it.
