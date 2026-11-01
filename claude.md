@@ -64,11 +64,13 @@ that file. Keep the jsdom pairs even in boots: `grep -c "await boot(" page_test.
 
 - `main_test.ts` — the server. One `Deno.test` of ordered `t.step`s against in-process PGlite behind pg-gateway on
   `5434`. The steps share one database, so a step depends on the steps before it. `--filter` does not match step names.
-  A second PGlite on `5435` is the codex external database, cloned from the first before the schema applies, built on
-  first connect. `serve()` gives each PGlite session to one connection at a time, until that connection's Terminate or a
-  timeout. A DSN that must fail names a loopback port nobody listens on, never a hostname. `request()` clears
-  `rateLimitBuckets`; the limiter steps call `app.request` directly. **Do not split this file**: it was built and
-  measured. The halves share `Deno.env` and `data/automerge`, and the gain was about half a second.
+  The empty cluster loads from `data/pglite-<key>.tar`, keyed by the resolved PGlite path; the first run on a machine
+  writes it. If PGlite refuses it, delete the file. A second PGlite on `5435` is the codex external database, cloned
+  from that cluster, built on first connect. `serve()` gives each PGlite session to one connection at a time, until that
+  connection's Terminate or a timeout. A DSN that must fail names a loopback port nobody listens on, never a hostname.
+  `request()` clears `rateLimitBuckets`; the limiter steps call `app.request` directly. **Do not split this file** while
+  the halves share one process (todo.md has the plan): `main.ts` reads `DATABASE_URL` from the shared env at import and
+  in the codex check, steps set and delete the Stripe and Resend keys, and both write `data/automerge`.
 - `examples_test.ts` — every bundled sheet through both engines (`npm:alasql`, `src/alasql.mjs`), row for row. Refuses a
   chart source with a repeated (series, x) pair.
 - `page_test.ts` — the table and the query sheet: render, sort, arrange, keyboard.

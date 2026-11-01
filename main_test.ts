@@ -189,8 +189,27 @@ Deno.test(async function allTests(t) {
   // passes 15 seconds and write DNS-failure rows over fixtures on `.test`
   // hosts; every step here drives the poller itself.
   clearInterval(pollTimer);
-  const pglite = new PGlite({ extensions: { citext } });
-  await pglite.waitReady;
+  // Booting a PGlite from nothing runs initdb: a second and a half, the largest
+  // single cost in this file. The empty cluster it makes depends only on the
+  // PGlite build, so the first run on a machine saves it, keyed by the resolved
+  // package path, which carries the version, and every later run loads it.
+  const key = Array.from(
+    new Uint8Array(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(import.meta.resolve("@electric-sql/pglite"))),
+    ),
+    (b) => b.toString(16).padStart(2, "0"),
+  ).join("").slice(0, 16);
+  const cached = `data/pglite-${key}.tar`;
+  const saved = await Deno.readFile(cached).catch((e) => {
+    if (e instanceof Deno.errors.NotFound) return undefined;
+    throw e;
+  });
+  const pglite = new PGlite({ extensions: { citext }, ...(saved && { loadDataDir: new Blob([saved]) }) });
+  await pglite.waitReady.catch((e) => {
+    throw new Error(`PGlite would not load the saved empty cluster at ${cached}. Delete that file and run again.`, {
+      cause: e,
+    });
+  });
   // The empty cluster, taken before our own schema is applied. Booting a PGlite
   // is about a second and a half of WebAssembly bringing up a Postgres data
   // directory from nothing, and this suite needs two of them -- so the second is
@@ -201,7 +220,15 @@ Deno.test(async function allTests(t) {
   // Taken before `exec(dbSql)` deliberately: the codex database is a *foreign*
   // one, and a clone holding our own tables would have `codexTables()` listing
   // them.
-  const bare = await pglite.dumpDataDir("none");
+  const bare = saved ? new Blob([saved]) : await pglite.dumpDataDir("none");
+  if (!saved) {
+    // Written aside and renamed, so a run killed mid-write or a second run
+    // beside this one never reads half a cluster.
+    const aside = `${cached}.${crypto.randomUUID()}`;
+    await Deno.mkdir("data", { recursive: true });
+    await Deno.writeFile(aside, new Uint8Array(await bare.arrayBuffer()));
+    await Deno.rename(aside, cached);
+  }
   // The database a codex sheet points at: its own PGlite, behind its own
   // address, because the gateway hands every connection onto one PGlite
   // session -- a codex connection setting its session read only would set it
