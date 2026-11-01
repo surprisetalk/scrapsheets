@@ -10,7 +10,7 @@
 // typed into -- and that is a real hole, not an oversight.
 import { assert, assertEquals } from "@std/assert";
 import { serveDir } from "@std/http/file-server";
-import { CANONICAL_TYPES, CHART_KINDS, CHECK_KEYS, COLUMN_TYPES, MONEY_SHAPE } from "./src/sql.mjs";
+import { CANONICAL_TYPES, CHART_KINDS, CHECK_KEYS, COLUMN_TYPES, MINOR_UNITS, MONEY_SHAPE } from "./src/sql.mjs";
 
 const dir = new URL(".", import.meta.url).pathname;
 
@@ -557,6 +557,12 @@ Deno.test("the page and the engine accept exactly the same column types", async 
       isMoney.includes("'Z'"),
     `src/Main.elm's isMoney should hold the same shape as MONEY_SHAPE, got: ${isMoney}`,
   );
+  const minor = (elm.split("minorUnits =")[1]?.split("\n    ]")[0] ?? "").matchAll(/\( "([A-Z]{3})", (\d) \)/g);
+  assertEquals(
+    Object.fromEntries([...minor].map(([, code, digits]) => [code, Number(digits)])),
+    MINOR_UNITS,
+    "src/Main.elm's minorUnits should hold the same codes and digits as src/sql.mjs's MINOR_UNITS",
+  );
 });
 
 // A chart's kind used to be a plain string nothing checked: the decoder took
@@ -668,4 +674,14 @@ Deno.test("the server's union admits exactly the column types the engine knows",
     "main.ts's Type union",
     "src/sql.mjs's COLUMN_TYPES",
   );
+});
+
+// ISO 4217 is the outside fact: MINOR_UNITS lists the codes whose minor unit is not 2, and Intl knows the same table.
+Deno.test("MINOR_UNITS holds the digits Intl draws for each code", () => {
+  const digits = (currency: string) =>
+    new Intl.NumberFormat("en", { style: "currency", currency }).resolvedOptions().maximumFractionDigits;
+  // REVIEW: IQD is the one disagreement. ISO 4217 says 3 and Intl follows CLDR, which draws 0 for everyday use. The table
+  // keeps ISO's 3 and the test skips IQD. Alternative: write 0 and skip nothing; that matches Intl but contradicts ISO.
+  for (const [code, minor] of Object.entries(MINOR_UNITS)) if (code !== "IQD") assertEquals(digits(code), minor, code);
+  for (const code of ["USD", "EUR"]) assertEquals(digits(code), 2, code);
 });

@@ -59,6 +59,7 @@ port module Main exposing
     , followIds
     , followScroll
     , formatNumber
+    , freshColKey
     , freshnessCell
     , freshnessDecoder
     , kindSpec
@@ -101,6 +102,8 @@ port module Main exposing
     , soundex
     , sparkMax
     , sparkValues
+    , subtotalGroups
+    , subtotalGroupsMax
     , tableHome
     , thumbNames
     , thumbNamesDecoder
@@ -850,10 +853,10 @@ formatNumber typ decimals format v =
                 usd (Maybe.withDefault 2 decimals) v
 
             ( Money code, Just Scientific ) ->
-                iif (v < 0) "-" "" ++ code ++ " " ++ scientific (Just (Maybe.withDefault 2 decimals)) (abs v)
+                iif (v < 0) "-" "" ++ code ++ " " ++ scientific (Just (Maybe.withDefault (minorDigits code) decimals)) (abs v)
 
             ( Money code, _ ) ->
-                currency (code ++ " ") (Maybe.withDefault 2 decimals) v
+                currency (code ++ " ") (Maybe.withDefault (minorDigits code) decimals) v
 
             ( Percentage, _ ) ->
                 digitsOf decimals format (v * 100) ++ "%"
@@ -982,6 +985,21 @@ port historyView : { id : String, hash : String } -> Cmd msg
 
 
 port historyShown : (Idd D.Value -> msg) -> Sub msg
+
+
+{-| The patches that make a version's rows today's, and the ones that undo them.
+Asked by sheet and version; the answer comes back on `historyRestorable`.
+-}
+port historyRestore : { id : String, hash : String } -> Cmd msg
+
+
+port historyRestorable : (Idd D.Value -> msg) -> Sub msg
+
+
+{-| A version's name, kept in this browser's store by sheet and change hash. An
+empty name deletes it.
+-}
+port nameVersion : { id : String, hash : String, name : String } -> Cmd msg
 
 
 {-| The sheet's own poll, now rather than on its timer: the row it writes comes
@@ -1278,6 +1296,7 @@ type alias History =
     , versions : Maybe (Result String (List Version))
     , left : Int
     , hash : Maybe String
+    , naming : String
     , past : Maybe (Result String { columns : List String, rows : List (List String) })
     }
 
@@ -1286,7 +1305,14 @@ type alias History =
 the writer stamped none.
 -}
 type alias Version =
-    { hash : String, time : Int, actor : String, seq : Int, message : Maybe String }
+    { hash : String, time : Int, actor : String, seq : Int, message : Maybe String, name : Maybe String }
+
+
+{-| The longest name one version takes, in characters.
+-}
+versionNameMax : Int
+versionNameMax =
+    80
 
 
 type alias Auth =
@@ -1379,6 +1405,7 @@ type alias Sheet =
     , stats : Result String (Array Stat)
     , hidden : Set String
     , pinned : Set String
+    , subtotal : Maybe String
     , sort : List ( String, SortOrder )
     , filters : Dict String Filter
     , filterOpen : Maybe String
@@ -1459,6 +1486,7 @@ emptySheet =
     , stats = Err ""
     , hidden = Set.empty
     , pinned = Set.empty
+    , subtotal = Nothing
     , sort = []
     , filters = Dict.empty
     , filterOpen = Nothing
@@ -1627,6 +1655,7 @@ type alias QueryAutocomplete =
     { trigger : String -- The text that triggered autocomplete (e.g., "@tab")
     , suggestions : List String -- Matching sheet IDs
     , selectedIndex : Int -- Currently highlighted suggestion
+    , sources : List String -- The sheets the query's `using` names: where a `{{` trigger finds its names
     }
 
 
@@ -1822,9 +1851,9 @@ viewOf cols =
 
 An arrangement belongs to a column, so it goes when the column does. Kept, it
 came back wrong twice: an undo restored the sort rank the column had when it was
-deleted, colliding with a rank written since; and `SheetColumnPush` keys a new
-column by the column count, so deleting the last column and adding one inherited
-its hidden flag and its sort.
+deleted, colliding with a rank written since; and `freshColKey` can hand a new
+column the key of the last one deleted, so deleting the last column and adding one
+inherited its hidden flag and its sort.
 
 Runs where the document is re-read rather than where a column is deleted, so a
 collaborator's delete is pruned too. It only ever removes, so it cannot overwrite
@@ -3137,6 +3166,45 @@ knownTypeName name =
             List.any (Tuple.first >> (==) name) columnTypes || (String.startsWith "enum:" name && String.length name > 5) || isMoney name
 
 
+{-| ISO 4217 minor units: the codes whose digits after the point are not 2. `MINOR_UNITS` in `src/sql.mjs` is the
+other copy, and `browser_test.ts` holds the two equal.
+-}
+minorUnits : List ( String, Int )
+minorUnits =
+    [ ( "BIF", 0 )
+    , ( "CLP", 0 )
+    , ( "DJF", 0 )
+    , ( "GNF", 0 )
+    , ( "ISK", 0 )
+    , ( "JPY", 0 )
+    , ( "KMF", 0 )
+    , ( "KRW", 0 )
+    , ( "PYG", 0 )
+    , ( "RWF", 0 )
+    , ( "UGX", 0 )
+    , ( "UYI", 0 )
+    , ( "VND", 0 )
+    , ( "VUV", 0 )
+    , ( "XAF", 0 )
+    , ( "XOF", 0 )
+    , ( "XPF", 0 )
+    , ( "BHD", 3 )
+    , ( "IQD", 3 )
+    , ( "JOD", 3 )
+    , ( "KWD", 3 )
+    , ( "LYD", 3 )
+    , ( "OMR", 3 )
+    , ( "TND", 3 )
+    , ( "CLF", 4 )
+    , ( "UYW", 4 )
+    ]
+
+
+minorDigits : String -> Int
+minorDigits code =
+    List.filter (Tuple.first >> (==) code) minorUnits |> List.head |> Maybe.map Tuple.second |> Maybe.withDefault 2
+
+
 {-| `money:EUR`: the prefix and three capital letters, the shape `MONEY_SHAPE` checks in `src/sql.mjs`.
 -}
 isMoney : String -> Bool
@@ -3472,6 +3540,7 @@ type Msg
     | ColumnHide String
     | ColumnsShowAll
     | ColumnPin String
+    | ColumnSubtotal String
     | ColumnDecimals String String
     | ColumnFormat String String
     | ColumnShade String String
@@ -3531,7 +3600,11 @@ type HistoryMsg
     = HistoryOpen
     | HistoryLoad (Idd D.Value)
     | HistoryPick String
+    | HistoryNameInput String
+    | HistoryNameSave
     | HistoryShow (Idd D.Value)
+    | HistoryRestore
+    | HistoryRestorable (Idd D.Value)
     | HistoryClose
 
 
@@ -3636,6 +3709,7 @@ subs model =
         , preflightLoaded PreflightLoad
         , historyLoaded (HistoryMsg << HistoryLoad)
         , historyShown (HistoryMsg << HistoryShow)
+        , historyRestorable (HistoryMsg << HistoryRestorable)
         , runLoaded RunLoad
         , importPreviewed ImportPreviewed
         , freshnessLoaded FreshnessLoad
@@ -4072,6 +4146,7 @@ update msg ({ sheet, auth } as model) =
                     , stats = Result.andThen computeStats doc
                     , hidden = stored.hidden
                     , pinned = stored.pinned
+                    , subtotal = Nothing
                     , sort = stored.sort
                     , filters = stored.filters
                     , filterOpen = Nothing
@@ -5460,6 +5535,9 @@ update msg ({ sheet, auth } as model) =
                     , filterOpen = Nothing
                 }
 
+        ColumnSubtotal key ->
+            ( { model | sheet = { sheet | subtotal = iif (sheet.subtotal == Just key) Nothing (Just key) } }, Cmd.none )
+
         ColumnMoveStart key ->
             ( { model | sheet = { sheet | moving = Just (MovingCol key), filterOpen = Nothing } }, Cmd.none )
 
@@ -5816,21 +5894,39 @@ update msg ({ sheet, auth } as model) =
 
                 _ ->
                     let
+                        sources =
+                            usingRefs textBeforeCursor
+
                         trigger =
-                            completionTrigger textBeforeCursor
+                            case snippetTrigger textBeforeCursor of
+                                Just typed ->
+                                    Just typed
+
+                                Nothing ->
+                                    completionTrigger textBeforeCursor
 
                         -- Asked for once per ref and kept: the answer runs a
                         -- describe through the page's engine, and asking again
                         -- on every keystroke would run it per character typed.
+                        -- A `{{` trigger asks for the snippet names of each
+                        -- source, under the key `{{<ref>`.
                         ask =
-                            case Maybe.andThen completionRef trigger of
-                                Just ref ->
-                                    iif (Dict.member ref sheet.queryColumns) Cmd.none (columnsFor ref)
+                            if Maybe.map (String.startsWith "{{") trigger == Just True then
+                                sources
+                                    |> List.map (\ref -> "{{" ++ ref)
+                                    |> List.filter (\key -> not (Dict.member key sheet.queryColumns))
+                                    |> List.map columnsFor
+                                    |> Cmd.batch
 
-                                Nothing ->
-                                    Cmd.none
+                            else
+                                case Maybe.andThen completionRef trigger of
+                                    Just ref ->
+                                        iif (Dict.member ref sheet.queryColumns) Cmd.none (columnsFor ref)
+
+                                    Nothing ->
+                                        Cmd.none
                     in
-                    ( { model | sheet = { sheet | queryAutocomplete = Maybe.map (completionAt model.library sheet.queryColumns) trigger } }, ask )
+                    ( { model | sheet = { sheet | queryAutocomplete = Maybe.map (completionAt model.library sheet.queryColumns sources) trigger } }, ask )
 
         ColumnsLoad { id, data } ->
             -- Held even when it is empty: a ref whose columns could not be read
@@ -5849,7 +5945,7 @@ update msg ({ sheet, auth } as model) =
                 | sheet =
                     { sheet
                         | queryColumns = known
-                        , queryAutocomplete = Maybe.map (completionAt model.library known << .trigger) sheet.queryAutocomplete
+                        , queryAutocomplete = Maybe.map (\ac -> completionAt model.library known ac.sources ac.trigger) sheet.queryAutocomplete
                     }
               }
             , Cmd.none
@@ -5862,7 +5958,11 @@ update msg ({ sheet, auth } as model) =
                     let
                         -- Calculate what to insert (reference minus what's already typed)
                         toInsert =
-                            String.dropLeft (String.length ac.trigger) ref
+                            if String.startsWith "{{" ac.trigger then
+                                String.dropLeft (String.length ac.trigger - 2) ref ++ "}}"
+
+                            else
+                                String.dropLeft (String.length ac.trigger) ref
                     in
                     ( { model | sheet = { sheet | queryAutocomplete = Nothing } }
                     , insertAtCursor toInsert
@@ -6335,7 +6435,7 @@ updateDocMsg edit ({ sheet } as model) =
                                 forward =
                                     [ { action = "push"
                                       , path = [ E.int 0 ]
-                                      , value = E.list identity [ E.object [ ( "name", E.string "" ), ( "type", E.string "text" ), ( "key", E.int colCount ) ] ]
+                                      , value = E.list identity [ E.object [ ( "name", E.string "" ), ( "type", E.string "text" ), ( "key", E.int (freshColKey table.cols) ) ] ]
                                       }
                                     ]
 
@@ -6799,7 +6899,7 @@ updateHistory msg model =
                     ( closed, leave ) =
                         closeModals model
                 in
-                ( { closed | history = Just { id = model.sheet.id, versions = Nothing, left = 0, hash = Nothing, past = Nothing } }
+                ( { closed | history = Just { id = model.sheet.id, versions = Nothing, left = 0, hash = Nothing, naming = "", past = Nothing } }
                 , Cmd.batch [ leave, historyLoad model.sheet.id ]
                 )
 
@@ -6816,12 +6916,13 @@ updateHistory msg model =
                             else
                                 let
                                     version =
-                                        D.map5 Version
+                                        D.map6 Version
                                             (D.field "hash" D.string)
                                             (D.field "time" D.int)
                                             (D.field "actor" D.string)
                                             (D.field "seq" D.int)
                                             (D.field "message" (D.nullable D.string))
+                                            (D.field "name" (D.nullable D.string))
                                 in
                                 case D.decodeValue (D.map2 Tuple.pair (D.field "versions" (D.list version)) (D.field "left" D.int)) data.data of
                                     Ok ( versions, left ) ->
@@ -6838,7 +6939,56 @@ updateHistory msg model =
         HistoryPick hash ->
             case model.history of
                 Just h ->
-                    ( { model | history = Just { h | hash = Just hash, past = Nothing } }, historyView { id = h.id, hash = hash } )
+                    let
+                        named =
+                            h.versions
+                                |> Maybe.andThen Result.toMaybe
+                                |> Maybe.andThen (List.filter (\v -> v.hash == hash) >> List.head)
+                                |> Maybe.andThen .name
+                    in
+                    ( { model | history = Just { h | hash = Just hash, naming = Maybe.withDefault "" named, past = Nothing } }
+                    , historyView { id = h.id, hash = hash }
+                    )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        HistoryNameInput name ->
+            ( { model | history = Maybe.map (\h -> { h | naming = name }) model.history }, Cmd.none )
+
+        HistoryNameSave ->
+            case model.history of
+                Just ({ hash } as h) ->
+                    let
+                        name =
+                            String.trim h.naming
+                    in
+                    case hash of
+                        Nothing ->
+                            ( model, Cmd.none )
+
+                        Just picked ->
+                            if String.length name > versionNameMax then
+                                ( { model | error = "Expected a name of at most " ++ String.fromInt versionNameMax ++ " characters, received " ++ String.fromInt (String.length name) ++ ". Source: the history's name box. Fix: shorten the name, then press Enter." }, Cmd.none )
+
+                            else
+                                ( { model
+                                    | history =
+                                        Just
+                                            { h
+                                                | naming = name
+                                                , versions =
+                                                    Maybe.map
+                                                        (Result.map
+                                                            (List.map
+                                                                (\v -> iif (v.hash == picked) { v | name = iif (name == "") Nothing (Just name) } v)
+                                                            )
+                                                        )
+                                                        h.versions
+                                            }
+                                  }
+                                , nameVersion { id = h.id, hash = picked, name = name }
+                                )
 
                 Nothing ->
                     ( model, Cmd.none )
@@ -6874,6 +7024,60 @@ updateHistory msg model =
               }
             , Cmd.none
             )
+
+        HistoryRestore ->
+            case model.history of
+                Just h ->
+                    case h.hash of
+                        Just picked ->
+                            ( model, historyRestore { id = h.id, hash = picked } )
+
+                        Nothing ->
+                            ( model, Cmd.none )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        HistoryRestorable data ->
+            -- By sheet, as `HistoryLoad` is, and by version: the one on screen is the one restored.
+            case model.history of
+                Just h ->
+                    let
+                        sheet =
+                            model.sheet
+
+                        patch =
+                            D.map3 Patch
+                                (D.field "action" D.string)
+                                (D.field "path" (D.list D.value))
+                                (D.oneOf [ D.field "value" D.value, D.succeed E.null ])
+
+                        answer =
+                            D.map3 (\hash forward backward -> ( hash, { forward = forward, backward = backward } ))
+                                (D.field "hash" D.string)
+                                (D.field "forward" (D.list patch))
+                                (D.field "backward" (D.list patch))
+                    in
+                    if data.id /= h.id || data.id /= sheet.id then
+                        ( model, Cmd.none )
+
+                    else
+                        case D.decodeValue answer data.data of
+                            Ok ( hash, entry ) ->
+                                if h.hash /= Just hash then
+                                    ( model, Cmd.none )
+
+                                else
+                                    -- REVIEW: One undo entry for the whole restore, a new write that clears redo as any edit does. Alternative: a redo-preserving rollback. It costs a second kind of undo entry.
+                                    ( { model | history = Nothing, sheet = { sheet | undoStack = entry :: sheet.undoStack |> List.take 50, redoStack = [] } }
+                                    , changeDoc { id = sheet.id, data = entry.forward }
+                                    )
+
+                            Err err ->
+                                ( { model | error = "Expected the restore's patches in the history answer. Received: " ++ D.errorToString err ++ ". Source: history restore. Fix: reload the page, then restore again." }, Cmd.none )
+
+                Nothing ->
+                    ( model, Cmd.none )
 
         HistoryClose ->
             ( { model | history = Nothing }, Cmd.none )
@@ -7259,7 +7463,7 @@ updatePaste text ({ sheet } as model) =
                             (\i ->
                                 let
                                     newKey =
-                                        String.fromInt (currentColCount + i)
+                                        String.fromInt (freshColKey tbl.cols + i)
                                 in
                                 { action = "push"
                                 , path = [ E.int 0 ]
@@ -7722,8 +7926,9 @@ viewImport importing =
                                     H.th []
                                         [ H.select [ A.onInput (ImportTypeChange col.name), A.value col.typ, A.title ("the type of " ++ col.name) ]
                                             (List.map
-                                                (\( spelling, _ ) -> H.option [ A.value spelling, A.selected (spelling == col.typ) ] [ text spelling ])
-                                                importTypes
+                                                (\spelling -> H.option [ A.value spelling, A.selected (spelling == col.typ) ] [ text spelling ])
+                                                -- A guessed multi: carries its own options, so it has no row in the list.
+                                                (List.map Tuple.first importTypes ++ iif (String.startsWith "multi:" col.typ) [ col.typ ] [])
                                             )
                                         , iif col.remembered (H.span [ S.fontSizeRem 0.75, S.color "#666" ] [ text " remembered" ]) (text "")
                                         ]
@@ -8249,7 +8454,12 @@ viewHistory refusal history =
                     Just (Err error) ->
                         failed error
 
-                    Just (Ok versions) ->
+                    Just (Ok listed) ->
+                        let
+                            versions =
+                                -- Named ones first; the partition keeps each side newest first.
+                                (\( named, rest ) -> named ++ rest) (List.partition (\v -> v.name /= Nothing) listed)
+                        in
                         H.div [ A.id "versions", S.displayFlex, S.flexDirectionColumn, S.maxHeight "30vh", S.overflowYAuto, S.fontSizeRem 0.875 ] <|
                             List.map
                                 (\v ->
@@ -8263,7 +8473,8 @@ viewHistory refusal history =
                                         , S.padding "0.25rem 0.375rem"
                                         , S.background (iif (h.hash == Just v.hash) "#e8e8f8" "transparent")
                                         ]
-                                        [ text (iif (v.time == 0) ("change " ++ String.fromInt v.seq) (isoStamp (v.time * 1000)))
+                                        [ H.strong [] [ text (Maybe.withDefault "" v.name) ]
+                                        , text (iif (v.time == 0) ("change " ++ String.fromInt v.seq) (isoStamp (v.time * 1000)))
                                         , H.span [ A.class "mono", S.color "#666" ] [ text (String.left 8 v.actor) ]
                                         , text (Maybe.withDefault "" v.message)
                                         ]
@@ -8272,6 +8483,21 @@ viewHistory refusal history =
                                 ++ iif (h.left > 0)
                                     [ H.span [ S.color "#666" ] [ text (String.fromInt h.left ++ iif (h.left == 1) " older version is" " older versions are" ++ " not listed.") ] ]
                                     []
+                , case h.hash of
+                    Nothing ->
+                        text ""
+
+                    Just _ ->
+                        H.input
+                            [ A.value h.naming
+                            , A.onInput (HistoryMsg << HistoryNameInput)
+                            , onEnter (HistoryMsg HistoryNameSave)
+                            , A.placeholder "name this version"
+                            , A.attribute "aria-label" "name this version"
+                            , A.title "Enter keeps the name in this browser; an empty name removes it"
+                            , S.marginTopRem 0.5
+                            ]
+                            []
                 , case ( h.hash, h.past ) of
                     ( Nothing, _ ) ->
                         text ""
@@ -8284,7 +8510,9 @@ viewHistory refusal history =
 
                     ( Just _, Just (Ok past) ) ->
                         H.div [ S.maxHeight "40vh", S.overflowAuto, S.marginTopRem 0.5 ]
-                            [ H.table [ A.id "past", S.fontSizeRem 0.875 ]
+                            [ -- REVIEW: Offered to every reader, because the page holds no role (promote is the same). A viewer's write is refused by the sync server. Alternative: send the role down with the document. It costs a new field in the sync handshake.
+                              H.button [ A.class "chip", A.onClick (HistoryMsg HistoryRestore) ] [ text "restore these rows" ]
+                            , H.table [ A.id "past", S.fontSizeRem 0.875 ]
                                 [ H.thead [] [ H.tr [] (List.map (\name -> H.th [] [ text name ]) past.columns) ]
                                 , H.tbody [] (List.map (\row -> H.tr [] (List.map (\cell -> H.td [] [ text cell ]) row)) past.rows)
                                 ]
@@ -9502,6 +9730,22 @@ maxSplitColumns =
     64
 
 
+{-| The first key a new column may take: past every number the sheet's keys
+already use, and past the column count. A sheet that has had a column deleted
+carries a key at its own length, and a second column of that key would take its
+cells over.
+-}
+freshColKey : Array Col -> Int
+freshColKey cols =
+    cols
+        |> Array.toList
+        |> List.filterMap (.key >> String.toInt)
+        |> List.maximum
+        |> Maybe.map ((+) 1)
+        |> Maybe.withDefault 0
+        |> max (Array.length cols)
+
+
 {-| One text column, split into columns of its own. Every row's cell is split on
 the delimiter as text -- `String.split` matches the characters it is given, so a
 "." is a dot and a "|" is a bar, never a pattern -- and the widest split says how
@@ -9524,22 +9768,12 @@ and the clashing one left out -- is the shape `nameClash` exists to refuse.
 columnSplit : Array Col -> Array Row -> String -> String -> Result String ( List Patch, List Patch )
 columnSplit cols rows key delimiter =
     let
-        -- Where the pushed columns land, which is the end of the column list,
-        -- and what they are keyed. The key is a number the way `SheetColumnPush`
-        -- writes one, but past every number this sheet already uses: a sheet
-        -- that has had a column deleted carries a key at its own length, and a
-        -- second column of that key would take its cells over.
+        -- Where the pushed columns land: the end of the column list.
         at =
             Array.length cols
 
         base =
-            cols
-                |> Array.toList
-                |> List.filterMap (.key >> String.toInt)
-                |> List.maximum
-                |> Maybe.map ((+) 1)
-                |> Maybe.withDefault 0
-                |> max at
+            freshColKey cols
     in
     case cols |> Array.filter (\c -> c.key == key) |> Array.get 0 of
         Nothing ->
@@ -10523,6 +10757,9 @@ viewHeaderCell sheet col =
                         [ H.input [ A.placeholder "contains...", A.attribute "aria-label" ("filter " ++ col.name), A.value currentFilterValue, A.onInput (FilterInput col.key), S.width "100%" ] []
                         , H.button [ A.onClick (ColumnHide col.key), S.marginTop "0.25rem" ] [ text "Hide column" ]
                         , H.button [ A.onClick (ColumnPin col.key), S.marginTop "0.25rem" ] [ text (iif isPinned "Unpin column" "Pin column") ]
+                        , iif movable
+                            (H.button [ A.onClick (ColumnSubtotal col.key), A.attribute "aria-pressed" (iif (sheet.subtotal == Just col.key) "true" "false"), S.marginTop "0.25rem" ] [ text "subtotal by this column" ])
+                            (text "")
                         , iif counted
                             (H.label [ A.class "decimals", S.displayFlex, S.alignItemsCenter, S.gapRem 0.25, S.marginTop "0.25rem" ]
                                 [ text "decimals"
@@ -10660,6 +10897,29 @@ viewEditCell sheet col =
                 [ A.id "new-cell", onEditorKeydown, A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.height "100%", S.border "none", S.borderRadius "0", S.padding "0" ]
                 (H.option [ A.value "" ] [ text "-- select --" ]
                     :: List.map (\opt -> H.option [ A.value opt, A.selected (Just opt == sheet.write) ] [ text opt ]) options
+                )
+            ]
+
+        Multi options ->
+            let
+                chosen =
+                    picks (Maybe.withDefault "" sheet.write)
+
+                toggle option on =
+                    String.join ", " (iif on (chosen ++ [ option ]) (List.filter ((/=) option) chosen))
+            in
+            -- REVIEW: A box edits the typed text, and the cell commits on Enter or blur through SheetWrite, as every cell does. Alternative: write on each click. It costs one undo entry per click and a second write on Enter.
+            -- The mousedown default is the focus move that would blur the text input and commit before the click lands.
+            [ H.input [ A.id "new-cell", onEditorKeydown, A.value (Maybe.withDefault "" sheet.write), A.onInput (InputChange CellWrite), A.onBlur (DocMsg (SheetWrite sheet.select.a)), S.width "100%", S.minWidthRem 8, S.border "none", S.borderRadius "0", S.padding "0" ] []
+            , H.span [ A.preventDefaultOn "mousedown" (D.succeed ( NoOp, True )) ]
+                (options
+                    |> List.map
+                        (\option ->
+                            H.label [ S.marginRight "0.5rem" ]
+                                [ H.input [ A.type_ "checkbox", A.attribute "aria-label" option, A.checked (List.member option chosen), A.onCheck (\on -> InputChange CellWrite (toggle option on)) ] []
+                                , text option
+                                ]
+                        )
                 )
             ]
 
@@ -11082,6 +11342,73 @@ viewGallery model =
         )
 
 
+{-| A group is every drawn row sharing one value of the grouping column, a blank
+cell being a value of its own. Groups come in the order the drawn rows first
+show them.
+-}
+subtotalGroups : Col -> Array Row -> { groups : List ( String, Array Row ), more : Int }
+subtotalGroups by rows =
+    let
+        step row ( firsts, members ) =
+            let
+                value =
+                    iif (blankCell by.key row) "" (cellText by.key row)
+            in
+            ( iif (Dict.member value members) firsts (value :: firsts)
+            , Dict.update value (\rs -> Just (row :: Maybe.withDefault [] rs)) members
+            )
+
+        ( order, seen ) =
+            Array.foldl step ( [], Dict.empty ) rows
+
+        ordered =
+            List.reverse order
+    in
+    { groups =
+        ordered
+            |> List.take subtotalGroupsMax
+            |> List.map (\value -> ( value, Array.fromList (List.reverse (Maybe.withDefault [] (Dict.get value seen))) ))
+    , more = List.length ordered - subtotalGroupsMax |> max 0
+    }
+
+
+
+-- Each group is a footer row; a table of unique keys would draw one per row.
+
+
+subtotalGroupsMax : Int
+subtotalGroupsMax =
+    50
+
+
+viewSubtotals : Sheet -> Dict String Int -> Array Col -> Array Row -> List (Html Msg)
+viewSubtotals sheet pins cols rows =
+    case sheet.subtotal |> Maybe.andThen (\key -> cols |> Array.toList |> List.filter (\c -> c.key == key) |> List.head) of
+        Nothing ->
+            []
+
+        Just by ->
+            let
+                { groups, more } =
+                    subtotalGroups by rows
+
+                cell group col =
+                    H.td ([ S.textAlignRight, S.fontWeight "600", iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) ] ++ pinAttrs pins col)
+                        [ text
+                            (if col.key == by.key then
+                                iif (Tuple.first group == "") "(blank)" (Tuple.first group)
+
+                             else
+                                Maybe.withDefault "" (Maybe.map (formatNumber col.typ (Dict.get col.key sheet.decimals) (Dict.get col.key sheet.formats)) (columnTotal (Tuple.second group) col))
+                            )
+                        ]
+            in
+            List.map
+                (\group -> H.tr [ A.class "subtotal", A.title ("subtotals for " ++ by.name) ] (List.map (cell group) (Array.toList cols) ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [] ]))
+                groups
+                ++ iif (more == 0) [] [ H.tr [ A.class "subtotal" ] [ H.td [ A.colspan (Array.length cols + 1) ] [ text (String.fromInt more ++ " more groups") ] ] ]
+
+
 viewTableFooter : Bool -> Sheet -> Dict String Int -> Array Col -> Array Row -> Html Msg
 viewTableFooter trash sheet pins cols rows =
     H.tfoot [] <|
@@ -11117,7 +11444,7 @@ viewTableFooter trash sheet pins cols rows =
                            ]
 
             Ok (Tab _) ->
-                [ H.tr [ A.class "totals", A.title "totals for the rows shown" ] <|
+                (H.tr [ A.class "totals", A.title "totals for the rows shown" ] <|
                     List.map
                         (\col ->
                             H.td ([ S.textAlignRight, S.fontWeight "600", iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) ] ++ pinAttrs pins col)
@@ -11125,10 +11452,12 @@ viewTableFooter trash sheet pins cols rows =
                         )
                         (Array.toList cols)
                         ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [] ]
-                , H.tr [ A.onClick (DocMsg SheetRowPush), A.title "add row" ] <|
-                    List.map (\col -> H.td (iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) :: pinAttrs pins col) [ text col.raw ]) (Array.toList cols)
-                        ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [ text "↴" ] ]
-                ]
+                )
+                    :: viewSubtotals sheet pins cols rows
+                    ++ [ H.tr [ A.onClick (DocMsg SheetRowPush), A.title "add row" ] <|
+                            List.map (\col -> H.td (iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) :: pinAttrs pins col) [ text col.raw ]) (Array.toList cols)
+                                ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [ text "↴" ] ]
+                       ]
 
             _ ->
                 []
@@ -11796,6 +12125,80 @@ completionTrigger textBeforeCursor =
         |> Maybe.andThen (\t -> iif (String.contains " " t || String.contains "\n" t) Nothing (Just t))
 
 
+{-| The `{{name` the cursor is sitting in, or nothing: a `{{` with no `}}` after
+it and no space, which is a snippet reference still being typed.
+-}
+snippetTrigger : String -> Maybe String
+snippetTrigger textBeforeCursor =
+    String.indices "{{" textBeforeCursor
+        |> List.reverse
+        |> List.head
+        |> Maybe.andThen
+            (\at ->
+                -- The engine leaves `{{` inside a quoted string alone, so it completes nothing there.
+                -- AlaSQL reads \' and \" inside a string as the quote itself.
+                if inString (String.left at textBeforeCursor) then
+                    Nothing
+
+                else
+                    Just (String.dropLeft at textBeforeCursor)
+            )
+        |> Maybe.andThen (\t -> iif (String.contains "}}" t || String.contains " " t || String.contains "\n" t) Nothing (Just t))
+
+
+inString : String -> Bool
+inString text =
+    let
+        step ch ( quote, skip ) =
+            case quote of
+                Just q ->
+                    if skip then
+                        ( quote, False )
+
+                    else if ch == '\\' then
+                        ( quote, True )
+
+                    else if ch == q then
+                        ( Nothing, False )
+
+                    else
+                        ( quote, False )
+
+                Nothing ->
+                    ( iif (ch == '\'' || ch == '"') (Just ch) Nothing, False )
+    in
+    String.foldl step ( Nothing, False ) text |> Tuple.first |> (/=) Nothing
+
+
+{-| The snippet sources a query names after `using`: `using @table:a, @query:b
+select …` is `[ "table:a", "query:b" ]`. Only the words that lead the query count,
+which is where the engine reads them.
+-}
+usingRefs : String -> List String
+usingRefs code =
+    let
+        leading words =
+            case words of
+                word :: rest ->
+                    iif (String.startsWith "@" word) (String.dropLeft 1 word :: leading rest) []
+
+                [] ->
+                    []
+    in
+    case String.words (String.replace "," " " code) of
+        using :: refs ->
+            if String.toLower using == "using" then
+                leading refs
+                    |> List.filter (\ref -> String.startsWith "table:" ref || String.startsWith "query:" ref)
+                    |> List.foldr (\ref kept -> ref :: List.filter ((/=) ref) kept) []
+
+            else
+                []
+
+        [] ->
+            []
+
+
 {-| The sheet a trigger is asking about the columns of, which is what a dot after
 the ref says: `@table:x.co` is `co` against the columns of `table:x`. No dot is
 somebody still naming the sheet, and there is nothing to ask.
@@ -11824,33 +12227,41 @@ which is what lets the list be recomputed when a sheet's columns arrive, rather
 than held back until the next keystroke rebuilds it.
 
 -}
-completionAt : Library -> Dict String (List String) -> String -> QueryAutocomplete
-completionAt shelf known trigger =
+completionAt : Library -> Dict String (List String) -> List String -> String -> QueryAutocomplete
+completionAt shelf known sources trigger =
     let
         matching typed =
             List.filter (String.toLower >> String.contains (String.toLower typed))
     in
     { trigger = trigger
     , selectedIndex = 0
+    , sources = sources
     , suggestions =
-        case String.split "." (String.dropLeft 1 trigger) of
-            ref :: rest ->
-                if List.isEmpty rest then
-                    shelf
-                        |> Dict.keys
-                        |> List.filter (\k -> String.startsWith "table:" k || String.startsWith "query:" k)
-                        |> matching ref
-                        |> List.take 8
+        if String.startsWith "{{" trigger then
+            sources
+                |> List.concatMap (\ref -> Dict.get ("{{" ++ ref) known |> Maybe.withDefault [])
+                |> List.filter (String.startsWith (String.toLower (String.dropLeft 2 trigger)) << String.toLower)
+                |> List.take 8
 
-                else
-                    Dict.get ref known
-                        |> Maybe.withDefault []
-                        |> matching (String.join "." rest)
-                        |> List.take 8
-                        |> List.map (\col -> ref ++ "." ++ col)
+        else
+            case String.split "." (String.dropLeft 1 trigger) of
+                ref :: rest ->
+                    if List.isEmpty rest then
+                        shelf
+                            |> Dict.keys
+                            |> List.filter (\k -> String.startsWith "table:" k || String.startsWith "query:" k)
+                            |> matching ref
+                            |> List.take 8
 
-            [] ->
-                []
+                    else
+                        Dict.get ref known
+                            |> Maybe.withDefault []
+                            |> matching (String.join "." rest)
+                            |> List.take 8
+                            |> List.map (\col -> ref ++ "." ++ col)
+
+                [] ->
+                    []
     }
 
 
@@ -12824,7 +13235,7 @@ viewQueryEditor model query =
                                     |> List.indexedMap
                                         (\i ref ->
                                             H.div [ A.onClick (AutocompleteSelect ref), S.padding "0.5rem 0.75rem", S.cursorPointer, S.backgroundColor (iif (i == ac.selectedIndex) "#dce7f7" "transparent"), S.borderBottom "1px solid #eee" ]
-                                                [ H.span [ S.color "#666" ] [ text "@" ], text ref ]
+                                                [ H.span [ S.color "#666" ] [ text (iif (String.startsWith "{{" ac.trigger) "{{" "@") ], text ref ]
                                         )
                                 )
                 ]

@@ -18,10 +18,41 @@ cols0 =
     Array.fromList [ { key = "0", name = "a", typ = Text, raw = "text", check = noCheck } ]
 
 
+col0 : Col
+col0 =
+    { key = "0", name = "a", typ = Text, raw = "text", check = noCheck }
+
+
 suite : Test
 suite =
     describe "Main"
-        [ describe "unviewable"
+        [ describe "subtotalGroups"
+            [ test "first-seen order, and a blank is its own group" <|
+                \_ ->
+                    let
+                        row v =
+                            Dict.fromList [ ( "0", v ) ]
+                    in
+                    subtotalGroups col0 (Array.fromList (List.map row [ E.string "b", E.string "a", E.null, E.string "b", E.string "", E.string "c" ]))
+                        |> Expect.equal
+                            { groups =
+                                [ ( "b", Array.fromList [ row (E.string "b"), row (E.string "b") ] )
+                                , ( "a", Array.fromList [ row (E.string "a") ] )
+                                , ( "", Array.fromList [ row E.null, row (E.string "") ] )
+                                , ( "c", Array.fromList [ row (E.string "c") ] )
+                                ]
+                            , more = 0
+                            }
+            , test "past subtotalGroupsMax the rest is counted" <|
+                \_ ->
+                    List.range 1 (subtotalGroupsMax + 3)
+                        |> List.map (\n -> Dict.fromList [ ( "0", E.int n ) ])
+                        |> Array.fromList
+                        |> subtotalGroups col0
+                        |> (\r -> ( List.length r.groups, r.more ))
+                        |> Expect.equal ( subtotalGroupsMax, 3 )
+            ]
+        , describe "unviewable"
             [ test "names no codex route: a codex sheet has its own view" <|
                 \_ ->
                     unviewable "codex-db" "codex-db:abc"
@@ -621,6 +652,19 @@ suite =
                 \_ ->
                     dropOf (MovingRow 1) (xy 0 9) tbl
                         |> Expect.equal (Just (SheetRowMove 1 4))
+             , test "a new column is keyed past every key the sheet holds, so it never takes a live column's cells" <|
+                \_ ->
+                    D.decodeString docDecoder """{"type":"table","data":[[{"name":"a","type":"text","key":"a"},{"name":"c","type":"text","key":"2"}],{"a":"x","2":"y"}]}"""
+                        |> Result.map
+                            (\doc ->
+                                case doc of
+                                    Tab t ->
+                                        freshColKey t.cols
+
+                                    _ ->
+                                        -1
+                            )
+                        |> Expect.equal (Ok 3)
              , test "a column is found by key and dropped by position" <|
                 \_ ->
                     dropOf (MovingCol "2") (xy 0 0) tbl
@@ -1546,8 +1590,11 @@ suite =
                     , reads "money:EUR" (Just 0) Nothing -0.4
                     , reads "money:EUR" Nothing Nothing (1.0e308 + 1.0e308)
                     , reads "money:eur" Nothing Nothing 1
+                    , reads "money:JPY" Nothing Nothing 1234.4
+                    , reads "money:JPY" (Just 2) Nothing 1234.4
+                    , reads "money:KWD" Nothing Nothing 1.5
                     ]
-                        |> Expect.equal [ "EUR 1,234.50", "-EUR 0.40", "EUR 0", "Infinity", "1" ]
+                        |> Expect.equal [ "EUR 1,234.50", "-EUR 0.40", "EUR 0", "Infinity", "1", "JPY 1,234", "JPY 1,234.40", "KWD 1.500" ]
             , test "a duration column holds seconds and reads hours and minutes, and seconds only when there are some" <|
                 \_ ->
                     [ 0, 59, 60, 3599, 3600, 5400, 5405, -2700, 360000 ]

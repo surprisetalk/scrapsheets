@@ -181,6 +181,9 @@ const usr = async (email: string) => {
   return { usr_id, jwt: await createJwt(usr_id) };
 };
 
+// A flood must exceed what a bucket allows by a margin: twice the burst, since the bucket empties at one burst.
+const FLOOD = 2 * FRAME_BURST;
+
 Deno.test(async function allTests(t) {
   // The production poller would fire with the real safeFetch once a slow run
   // passes 15 seconds and write DNS-failure rows over fixtures on `.test`
@@ -494,7 +497,7 @@ Deno.test(async function allTests(t) {
       handle.on("ephemeral-message", () => heard++);
 
       const until = async (what: string, done: () => boolean) => {
-        for (let i = 0; i < 100 && !done(); i++) await new Promise((r) => setTimeout(r, 20));
+        for (let i = 0; i < 400 && !done(); i++) await new Promise((r) => setTimeout(r, 5));
         if (!done()) throw new Error(`No ${what} within 2s.`);
       };
       // Each connection keeps its own bucket and its own notice clock, so the
@@ -606,8 +609,8 @@ Deno.test(async function allTests(t) {
           supportedProtocolVersions: ["1"],
         }),
       );
-      for (let i = 0; i < 100 && !replies.some((f) => f.type === "peer"); i++)
-        await new Promise((r) => setTimeout(r, 20));
+      for (let i = 0; i < 400 && !replies.some((f) => f.type === "peer"); i++)
+        await new Promise((r) => setTimeout(r, 5));
       // A document id is a cache key held 30 s: a 100 kB id must not be kept.
       ws.send(AM.cbor.encode({
         type: "request",
@@ -616,8 +619,8 @@ Deno.test(async function allTests(t) {
         documentId: "x".repeat(100_000),
         data: new Uint8Array(),
       }));
-      for (let i = 0; i < 100 && !replies.some((f) => f.type === "doc-unavailable"); i++)
-        await new Promise((r) => setTimeout(r, 20));
+      for (let i = 0; i < 400 && !replies.some((f) => f.type === "doc-unavailable"); i++)
+        await new Promise((r) => setTimeout(r, 5));
       assert(replies.some((f) => f.type === "doc-unavailable"), "an oversize document id is a document nobody has");
       for (const key of syncAccessCache.keys()) assert(key.length < 1000, `cache holds a ${key.length}-char key`);
       // A document id that is not text is a document nobody has, and the frames after it still get answers.
@@ -639,9 +642,9 @@ Deno.test(async function allTests(t) {
         }));
         for (
           let i = 0;
-          i < 100 && !replies.slice(seenBefore).some((f) => f.documentId === `after-${JSON.stringify(odd)}`);
+          i < 400 && !replies.slice(seenBefore).some((f) => f.documentId === `after-${JSON.stringify(odd)}`);
           i++
-        ) { await new Promise((r) => setTimeout(r, 20)); }
+        ) { await new Promise((r) => setTimeout(r, 5)); }
         assert(
           replies.slice(seenBefore).some((f) => f.documentId === `after-${JSON.stringify(odd)}`),
           `no answer after a document id of ${JSON.stringify(odd)}`,
@@ -653,7 +656,7 @@ Deno.test(async function allTests(t) {
       ws.onclose = () => shut = true;
       const cached = syncAccessCache.size;
       const started = performance.now();
-      for (let i = 0; i < 4 * FRAME_BURST; i++) {
+      for (let i = 0; i < FLOOD; i++) {
         ws.send(AM.cbor.encode({
           type: "request",
           senderId: "raw-id-flooder",
@@ -664,7 +667,7 @@ Deno.test(async function allTests(t) {
       }
       // The server reads the flood one frame at a time, a role lookup each until
       // the bucket runs dry, so under load the close lands seconds later.
-      for (let i = 0; i < 400 && !shut; i++) await new Promise((r) => setTimeout(r, 25));
+      for (let i = 0; i < 2000 && !shut; i++) await new Promise((r) => setTimeout(r, 5));
       assert(shut, "Expected the server to close a flooding socket within 10s; it stayed open.");
       assert(
         replies.some((f) => f.type === "error" && String(f.message).includes("this connection was closed")),
@@ -675,7 +678,7 @@ Deno.test(async function allTests(t) {
       const seconds = Math.ceil((performance.now() - started) / 1000);
       assert(
         lookups > 0 && lookups <= FRAME_BURST + FRAME_RATE * seconds,
-        `${lookups} lookups in ${seconds}s for ${4 * FRAME_BURST} frames`,
+        `${lookups} lookups in ${seconds}s for ${FLOOD} frames`,
       );
     }
 
@@ -700,13 +703,13 @@ Deno.test(async function allTests(t) {
           peerMetadata: {},
           supportedProtocolVersions: ["1"],
         }));
-        for (let i = 0; i < 100 && !replies.some((f) => f.type === "peer"); i++)
-          await new Promise((r) => setTimeout(r, 20));
+        for (let i = 0; i < 400 && !replies.some((f) => f.type === "peer"); i++)
+          await new Promise((r) => setTimeout(r, 5));
         return state;
       }));
       const cached = syncAccessCache.size;
       const flooded = performance.now();
-      for (let i = 0; i < 4 * FRAME_BURST; i++) {
+      for (let i = 0; i < FLOOD; i++) {
         for (const s of sockets) {
           if (s.shut) continue;
           s.ws.send(AM.cbor.encode({
@@ -718,7 +721,7 @@ Deno.test(async function allTests(t) {
           }));
         }
       }
-      for (let i = 0; i < 400 && !sockets.every((s) => s.shut); i++) await new Promise((r) => setTimeout(r, 25));
+      for (let i = 0; i < 2000 && !sockets.every((s) => s.shut); i++) await new Promise((r) => setTimeout(r, 5));
       assert(sockets.every((s) => s.shut), "Expected every connection of a flooding account to close within 10s.");
       const accountLookups = syncAccessCache.size - cached;
       // The bucket refills while the flood runs, and a loaded machine stretches the flood past a second. Three
@@ -762,9 +765,9 @@ Deno.test(async function allTests(t) {
         peerMetadata: {},
         supportedProtocolVersions: ["1"],
       }));
-      for (let i = 0; i < 100 && !joined; i++) await new Promise((r) => setTimeout(r, 20));
+      for (let i = 0; i < 400 && !joined; i++) await new Promise((r) => setTimeout(r, 5));
       assert(joined, "Expected the cache flooder to join within 2s.");
-      for (let i = 0; i < 4 * FRAME_BURST; i++) {
+      for (let i = 0; i < FLOOD; i++) {
         ws.send(AM.cbor.encode({
           type: "request",
           senderId: "cache-flooder",
@@ -773,7 +776,7 @@ Deno.test(async function allTests(t) {
           data: new Uint8Array(),
         }));
       }
-      for (let i = 0; i < 400 && !shut; i++) await new Promise((r) => setTimeout(r, 25));
+      for (let i = 0; i < 2000 && !shut; i++) await new Promise((r) => setTimeout(r, 5));
       assert(shut, "Expected the cache flooder to close within 10s; it stayed open.");
       assert(syncAccessCache.size <= 10_000, `cache holds ${syncAccessCache.size} entries`);
       assert(syncAccessCache.has(peerKey), "a flood evicted another peer's cached role");
@@ -927,9 +930,9 @@ Deno.test(async function allTests(t) {
         (d.data as unknown as Record<string, unknown>[])[1] = { 0: 4242 };
       });
       const written = AM.decodeHeads(eHandle.heads()!);
-      for (let i = 0; i < 500; i++) {
+      for (let i = 0; i < 1000; i++) {
         if (heard.some((heads) => written.every((h) => heads.includes(h)))) break;
-        await new Promise((r) => setTimeout(r, 10));
+        await new Promise((r) => setTimeout(r, 5));
       }
       assert(
         JSON.stringify((await automerge.find<Sheet>(hand.documentId)).doc()).includes("4242"),
@@ -1017,8 +1020,8 @@ Deno.test(async function allTests(t) {
             supportedProtocolVersions: ["1"],
           }),
         );
-        for (let i = 0; i < 100 && !replies.some((f) => f.type === "peer"); i++)
-          await new Promise((r) => setTimeout(r, 20));
+        for (let i = 0; i < 400 && !replies.some((f) => f.type === "peer"); i++)
+          await new Promise((r) => setTimeout(r, 5));
         return reader;
       }));
       const each = Math.ceil(ACCOUNT_FRAME_BURST / readers.length) + 50;
@@ -1045,7 +1048,7 @@ Deno.test(async function allTests(t) {
         }));
       }
       const answered = (r: (typeof readers)[number]) => r.shut || r.replies.some((f) => f.type === "doc-unavailable");
-      for (let i = 0; i < 400 && !readers.every(answered); i++) await new Promise((r) => setTimeout(r, 25));
+      for (let i = 0; i < 2000 && !readers.every(answered); i++) await new Promise((r) => setTimeout(r, 5));
       assert(readers.every(answered), "Expected every public reader's barrier frame answered within 10s.");
       assertEquals(
         readers.map((r) => r.shut),
@@ -2810,6 +2813,30 @@ Deno.test(async function allTests(t) {
       assertEquals(res.status, 400);
       const said = await res.text();
       for (const part of ["Did you mean", "{{total}}", "Source", "Fix"]) assert(said.includes(part), said);
+
+      // A second source, and a query that answers name and expr: the same expansion, one door.
+      const more = mk(
+        [{ name: "name", type: "text", key: 0 }, { name: "expr", type: "text", key: 1 }],
+        { 0: "rows", 1: "count(*)" },
+      );
+      const answers = automerge.create<{ data: Sheet["data"] }>({
+        data: [{ lang: "sql", code: `select 'top' as name, 'max(n)' as expr`, args: [] }],
+      });
+      await put(jwt, `/library/${more}`, {});
+      await put(jwt, `/library/query:${answers.documentId}`, {});
+      const many: { data: Table } = await post(jwt, `/query`, {
+        lang: "sql",
+        code: `using @${snips}, @${more}, @query:${answers.documentId} ` +
+          `select {{total}} as t, {{rows}} as r, {{top}} as m from @${nums}`,
+        args: [],
+      });
+      assertEquals(many.data.slice(1), [{ t: 7, r: 2, m: 5 }]);
+      const clash = await app.request(`/query`, {
+        method: "POST",
+        headers: new Headers({ Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" }),
+        body: JSON.stringify({ lang: "sql", code: `using @${snips}, @${snips} select 1 as x`, args: [] }),
+      });
+      assertEquals(clash.status, 400);
     }
   });
 
@@ -3129,6 +3156,33 @@ Deno.test(async function allTests(t) {
       const l = lapBook.Sheets[lapBook.SheetNames[0]];
       assertEquals([l.B2.z, l.B2.v, l.B3.v], ["[h]:mm:ss", 0.0625, 0.0625]);
 
+      // A money type is chosen by the importer, never guessed, and a spelling outside the family is refused.
+      const priced = async (type: string) => {
+        const form = new FormData();
+        form.append("file", new File(["item,fee\na,1250\nb,30"], "fees.csv", { type: "text/csv" }));
+        return await app.request(`/import/csv?types=${encodeURIComponent(JSON.stringify({ fee: type }))}`, {
+          method: "POST",
+          headers: new Headers({ Authorization: `Bearer ${jwt}` }),
+          body: form,
+        });
+      };
+      const fees = await priced("money:JPY");
+      assertEquals(fees.status, 201, await fees.clone().text());
+      const feeId = (await fees.json()).sheet_id;
+      const [, ...feeRows] = await get<Table>(jwt, `/sheet/${feeId}`);
+      assertEquals(feeRows.map((r) => r.fee), [1250, 30]);
+      const feeXlsx = XLSX.read(new Uint8Array(await (await exp(feeId, "xlsx")).arrayBuffer()), {
+        type: "array",
+        cellNF: true,
+      });
+      assertEquals(feeXlsx.Sheets[feeXlsx.SheetNames[0]].B2.z, '"JPY "#,##0');
+      for (const type of ["money:jpy", "money:", "money:JPYY"]) {
+        const refused = await priced(type);
+        assertEquals(refused.status, 400, type);
+        const said = await refused.text();
+        assert(said.includes("money:EUR") && said.includes("num"), `${type}: ${said}`);
+      }
+
       // A negative day fraction opens blank under [h]:mm:ss, so a negative
       // duration goes out as text.
       const negBook = XLSX.read(
@@ -3255,6 +3309,16 @@ Deno.test(async function allTests(t) {
       );
       const cell = book.Sheets[book.SheetNames[0]].A2;
       assertEquals([cell.t, cell.v, cell.z], ["n", 12.5, '"EUR "#,##0.00']);
+      const yen = automerge.create<Sheet>({
+        type: "table",
+        data: [arrayify([{ name: "fee", type: "money:JPY", key: "0" }]), { 0: 1250 }],
+      });
+      await put(jwt, `/library/table:${yen.documentId}`, {});
+      const yenBook = XLSX.read(
+        new Uint8Array(await (await exp(`table:${yen.documentId}`, "xlsx")).arrayBuffer()),
+        { type: "array", cellNF: true },
+      );
+      assertEquals(yenBook.Sheets[yenBook.SheetNames[0]].A2.z, '"JPY "#,##0');
       assertEquals((await read(await exp(`table:${euros.documentId}`, "parquet")))[0].fee, 12.5);
     }
   });
@@ -3794,6 +3858,42 @@ Deno.test(async function allTests(t) {
     const twice = await ask(`select a.eur + 1 as t from @${eur} a, @${other} b`);
     assertEquals(twice.status, 400, twice.text);
     assert(twice.text.includes(eur) && twice.text.includes(other), twice.text);
+
+    // convert() answers amount * rate and is typed by its literal `to`: the converted euros add to a euro
+    // column, and a `from` that is not the column's currency is refused by the column's name.
+    {
+      const rows = (r: { text: string }) => JSON.parse(r.text).data.slice(1);
+      const ok = await ask(
+        `select sum(a.eur) + sum(convert(b.usd_col, 'USD', 'EUR', 0.5)) as t from @${eur} a, @${dollars} b`,
+      );
+      assertEquals(ok.status, 200, ok.text);
+      assertEquals(rows(ok), [{ t: 28 }], "25 euros plus one dollar at 0.5 on each of three joined rows");
+      const each = await ask(`select convert(eur, 'EUR', 'USD', 2) as v from @${eur}`);
+      assertEquals(rows(each), [{ v: 25 }, { v: 25 }, { v: null }], "a blank amount answers null");
+      const wrongFrom = await ask(
+        `select a.eur + convert(b.usd_col, 'EUR', 'USD', 1.1) as t from @${eur} a, @${dollars} b`,
+      );
+      assertEquals(wrongFrom.status, 400, wrongFrom.text);
+      assert(wrongFrom.text.includes("usd_col"), wrongFrom.text);
+      const wrongTo = await ask(
+        `select sum(a.eur) + sum(convert(b.usd_col, 'USD', 'GBP', 0.8)) as t from @${eur} a, @${dollars} b`,
+      );
+      assertEquals(wrongTo.status, 400, wrongTo.text);
+      for (
+        const call of [
+          "'usd', 'EUR', 2",
+          "'USD', 'EURO', 2",
+          "'USD', 'EUR', 0",
+          "'USD', 'EUR', -1",
+          "'USD', 'EUR', 'x'",
+        ]
+      ) {
+        const refused = await ask(`select convert(eur, ${call}) as v from @${eur}`);
+        assertEquals(refused.status, 400, `${call}: ${refused.text}`);
+      }
+      const word = await ask(`select convert('abc', 'USD', 'EUR', 2) as v from @${eur}`);
+      assertEquals(word.status, 400, word.text);
+    }
 
     // A snippet body that adds two currencies is refused: planQuery reads the expanded text. A body that only
     // names a money column is an ordinary column in the statement around it.
@@ -8725,6 +8825,20 @@ Deno.test(async function allTests(t) {
       after.some((r) => String(r.depends_on).startsWith("table:") && String(r.depends_on) !== snipId),
       "and a ref inside a body is an edge of its own",
     );
+    // A query is a source too: its answer holds the bodies, and it is an edge beside the table.
+    const answers = automerge.create<{ data: Sheet["data"] }>({
+      data: [{ lang: "sql", code: `select 'one' as name, '(select 1)' as expr`, args: [] }],
+    });
+    const answersId = `query:${answers.documentId}`;
+    await put(jwt, `/library/${answersId}`, { name: "lineage answers" });
+    const both = automerge.create<{ data: Sheet["data"] }>({
+      data: [{ lang: "sql", code: `using @${snipId}, @${answersId} select {{big}} as m, {{one}} as o`, args: [] }],
+    });
+    const bothId = `query:${both.documentId}`;
+    await put(jwt, `/library/${bothId}`, { name: "two sources" });
+    const sources = (await get<Table>(jwt, "/library/lineage")).filter((r) => String(r.sheet_id) === bothId);
+    for (const id of [snipId, answersId])
+      assertEquals(sources.find((r) => String(r.depends_on) === id)?.columns, "expr, name", `${id} is an edge`);
     const lost = automerge.create<{ data: Sheet["data"] }>({
       data: [{ lang: "sql", code: `using @table:not-mine select {{big}} as m`, args: [] }],
     });
@@ -10274,6 +10388,52 @@ Deno.test(async function allTests(t) {
     );
     assertEquals((await send("/import/csv?types=not-json")).status, 400, "types that are not JSON are refused");
     assertEquals(await sheets(), 1, "and none of those made a sheet");
+
+    // A text column of comma lists over few options is guessed as multi:, options in first-seen order, and imports as arrays.
+    const picks = 'id,tags,note\n1,"red, blue",x\n2,green,y\n3,,z\n4,"blue,green",w\n';
+    const guess = await (await send("/import/preview", picks)).json();
+    assertEquals(
+      guess.data.cols.map((c: { type: string }) => c.type),
+      ["num", "multi:red,blue,green", "text"],
+    );
+    const multi = await send("/import/csv" + types({ tags: "multi:red,blue,green" }), picks);
+    assertEquals(multi.status, 201);
+    const { sheet_id: multi_id } = await multi.json();
+    assertEquals((await get<Table>(jwt, `/sheet/${multi_id}`)).slice(1).map((r) => r.tags), [
+      ["red", "blue"],
+      ["green"],
+      null,
+      ["blue", "green"],
+    ]);
+    const spec = await request(jwt, `/openapi/${multi_id}`);
+    assertEquals(spec.components.schemas.Row.properties.tags, {
+      type: "array",
+      items: { type: "string", enum: ["red", "blue", "green"] },
+    });
+    const outside = await send("/import/csv" + types({ tags: "multi:red,blue" }), picks);
+    assertEquals(outside.status, 400);
+    assert((await outside.text()).includes("Line 3"), "a pick outside the options names its line");
+    // One token per cell is not a list, and a pick named twice in one cell would be refused, so neither is guessed.
+    for (const body of ["t\na\nb\n", 't\n"a,a"\nb\n']) {
+      const g = await (await send("/import/preview", body)).json();
+      assertEquals(g.data.cols[0].type, "text");
+    }
+
+    // has_pick answers membership over the array or its JSON text, null for a null cell, and refuses what is neither.
+    const has = await post(jwt, `/query`, {
+      lang: "sql",
+      code:
+        `select has_pick(tags, 'blue') b, has_pick('["a"]', 'a') j, has_pick(null, 'a') n from @${multi_id} where id = 1`,
+      args: [],
+    });
+    assertEquals(has.data[1], { b: true, j: true, n: null });
+    const noPick = await app.request("/query", {
+      method: "POST",
+      headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+      body: JSON.stringify({ lang: "sql", code: `select has_pick(note, 'a') h from @${multi_id}`, args: [] }),
+    });
+    assertEquals(noPick.status, 400);
+    assert((await noPick.text()).includes("has_pick() argument 1"));
   });
 
   // A feed that drops a column read as a sheet of blanks and graded as
@@ -11323,6 +11483,32 @@ Deno.test(async function allTests(t) {
     await pollOnce(upFetcher, () => Promise.resolve("sent"), t1 + 400_000);
     assertEquals(await runs(upFeed_id) > 3, true, "the feed stored a fourth row");
     assertEquals(await runs(viaBody_id), ranVia + 1, "an alert whose snippet body names the feed ran in that cycle");
+
+    // A query that answers the snippets is a source: the feed in its answer's body wakes the alert too.
+    const bodyQuery = automerge.create<{ data: [Query] }>({
+      data: [{
+        lang: "sql",
+        code: `select 'feed' as name, '(select count(*) from @${upFeed_id})' as expr`,
+        args: [],
+      } as Query],
+    });
+    const bodyQuery_id = `query:${bodyQuery.documentId}`;
+    await put(jwt, `/library/${bodyQuery_id}`, { name: "feed snippet query" });
+    const viaQuery = automerge.create<{ data: [Alert] }>({
+      data: [{ code: `using @${bodyQuery_id} select {{feed}} as n`, to: "", interval: 3600, upstream: true }],
+    });
+    const viaQuery_id = `alert:${viaQuery.documentId}`;
+    await put(jwt, `/library/${viaQuery_id}`, { name: "upstream via snippet query" });
+    await pollOnce(upFetcher, () => Promise.resolve("sent"), t1 + 500_000);
+    const ranQuery = await runs(viaQuery_id);
+    body = `[{"n":5}]`;
+    netDue.set(upFeed_id, 0);
+    await pollOnce(upFetcher, () => Promise.resolve("sent"), t1 + 600_000);
+    assertEquals(
+      await runs(viaQuery_id),
+      ranQuery + 1,
+      "an alert whose snippet query names the feed ran in that cycle",
+    );
 
     // A delivery a net-hook stores counts the same as a feed's new row.
     const hook = automerge.create<Sheet>({ type: "net-hook", data: [] });

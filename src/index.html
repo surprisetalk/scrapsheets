@@ -36,6 +36,7 @@
         API_BASE,
         checkAnswer,
         docThumb,
+        editAdvice,
         FOLLOW_MAX,
         foldView,
         httpErrorDetail,
@@ -48,6 +49,7 @@
         mergeView,
         rememberedTypes,
         PARSERS,
+        rollbackPatches,
         shareMany,
         sheets,
         trapStep,
@@ -555,10 +557,22 @@
           };
           app.ports.historyLoad.subscribe(catchy((id) => {
             const history = getHistory(openDoc(id));
+            const names = Stored.get("versions")[id] ?? {};
             const versions = history.slice(-HISTORY_MAX).reverse()
-              .map(({ change: { hash, time, actor, seq, message } }) => ({ hash, time, actor, seq, message }));
+              .map(({ change: { hash, time, actor, seq, message } }) => ({
+                hash, time, actor, seq, message,
+                // REVIEW: A stored name that is not text reads as no name, as an unreadable arrangement does. Alternative: refuse the whole history. It costs the list over one bad entry.
+                name: typeof names[hash] === "string" ? names[hash] : null,
+              }));
             app.ports.historyLoaded.send({ id, data: { versions, left: history.length - versions.length } });
           }, 'historyLoad'));
+
+          // Names sit by sheet id, then change hash, in this browser only, as folders do.
+          app.ports.nameVersion.subscribe(catchy(({ id, hash, name }) => {
+            const all = Stored.get("versions");
+            const { [hash]: _gone, ...kept } = all[id] ?? {};
+            Stored.set("versions", { ...all, [id]: name === "" ? kept : { ...kept, [hash]: name } });
+          }, 'nameVersion'));
 
           // A column's proposed check, run by the server's engine over every
           // row of the open document. Elm writes nothing until this answers.
@@ -581,6 +595,20 @@
               data: { hash, columns: cols.map((col) => col.name), rows: rows.map((row) => cols.map((col) => row[col.key])) },
             });
           }, 'historyView'));
+
+          // Both directions in one answer, so Elm can push the undo entry without asking again.
+          app.ports.historyRestore.subscribe(catchy(({ id, hash }) => {
+            const now = openDoc(id).data;
+            const past = view(openDoc(id), [hash]).data;
+            if (!past?.[0])
+              throw new Error(
+                `Expected a past version of ${id}, received no rows for hash ${hash}. Source: history restore. Fix: reopen the sheet's history and pick another version.`,
+              );
+            app.ports.historyRestorable.send({
+              id,
+              data: { hash, forward: rollbackPatches(now, past), backward: rollbackPatches(past, now) },
+            });
+          }, 'historyRestore'));
 
           // The sheet's own poll, now. The answer is the row it wrote, named by
           // sheet for the same reason a pre-flight's is: a run started on one
@@ -1039,9 +1067,17 @@
           // otherwise see. So it is logged by name, the way a refused service
           // worker registration is, rather than swallowed: the dropdown stays
           // quiet either way, and the console says which of the two happened.
+          //
+          // REVIEW: A `{{` prefix on the ref reuses this port for snippet names. Alternative: a snippetsFor port. It costs a port, a Msg and a subscription.
+          // `{{table:x` asks for the snippet names a source defines instead: the
+          // values of its `name` column, answered under the same key.
           app.ports.columnsFor.subscribe(catchy(async (ref) => {
-            const columns = await runSql(`describe @${ref}`, { "": null })
-              .then(({ data }) => data.map((row) => String(row.column)))
+            const snippets = ref.startsWith('{{');
+            const columns = await runSql(snippets ? `select name from @${ref.slice(2)}` : `describe @${ref}`, { "": null })
+              .then(({ data }) => data.map((row) => {
+                if (snippets && typeof row.name !== 'string') throw new Error(`a snippet name of @${ref.slice(2)} is ${JSON.stringify(row.name)}, expected text`);
+                return String(snippets ? row.name : row.column);
+              }))
               .catch((error) => {
                 debug.error(`columnsFor: @${ref} has no columns to complete from:`, error?.message ?? error);
                 return [];
@@ -1816,7 +1852,12 @@
                 if (type === "query") runQuery(id, d.data[0]);
                 return;
               }
-              sheet?.change((d) => applyPatches(d.data, patches));
+              if (!sheet) return;
+              sheet.change((d) => applyPatches(d.data, patches));
+              // Advice: the write stays, since a socket edit cannot be refused.
+              const data = sheet.doc().data;
+              const advice = type === "table" ? editAdvice(id, data, patches) : null;
+              if (advice) app.ports.docErrored.send(advice);
             }, 'changeDoc'),
           );
 

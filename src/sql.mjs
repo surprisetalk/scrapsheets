@@ -456,8 +456,10 @@ export const checkRefPath = (path, id) => {
 
 // --- snippets
 //
-// `using @table:id` at the very start of a query names a table of `name`/`expr`
-// rows, and `{{name}}` in the query becomes `(expr)`. It runs before scanRefs on
+// `using @table:a, @query:b` at the very start of a query names sources of
+// `name`/`expr` rows, and `{{name}}` in the query becomes `(expr)`. A query source
+// is loaded like any ref: its answer is the rows, so a cycle or a missing sheet
+// refuses as it does anywhere else. It runs before scanRefs on
 // both hosts, because a body may hold an @ref of its own and scanRefs must see it.
 // Every reader of a query's raw code (executeSql, runSql, lineage, the alert's
 // upstream walk) expands first, or it misses what the bodies read.
@@ -465,7 +467,10 @@ export const checkRefPath = (path, id) => {
 export const SNIPPET_DEPTH_MAX = 4;
 export const SNIPPET_EXPANSIONS_MAX = 200;
 const SNIPPET_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const SNIPPET_USING = /^\s*using\s+@([a-z-]+:[A-Za-z0-9_-]+)(?=\s)/i;
+// REVIEW: The source bound is SNIPPET_DEPTH_MAX. Alternative: its own constant. It lets the two limits drift apart for no use we have.
+export const SNIPPET_SOURCES_MAX = SNIPPET_DEPTH_MAX;
+const SNIPPET_SOURCE = "@[a-z-]+:[A-Za-z0-9_-]+";
+const SNIPPET_USING = new RegExp(`^\\s*using\\s+${SNIPPET_SOURCE}(?:\\s*,\\s*${SNIPPET_SOURCE})*(?=\\s)`, "i");
 
 // Calls `onText(text)` for each stretch outside a quoted string and returns
 // the pieces joined with the quoted ones untouched. `inside` is true when the
@@ -497,6 +502,15 @@ export const expandSnippets = async (code, load) => {
     if (/\{\{/.test(t)) refs = true;
     return t;
   });
+  if (!lead && /^\s*using\s+@/i.test(code)) {
+    throw new Error(explain(`The using clause is not a list of snippet sources.`, {
+      Expected: "using @table:<id> or @query:<id>, separated by commas with none left over, then the query",
+      Received: shorten(code.trim()),
+      Source: "the start of the query",
+      Fix:
+        "write each source as @table:<id> or @query:<id>, drop a trailing comma, and follow the list with the select",
+    }));
+  }
   if (stray) {
     throw new Error(explain(`using @table:… can only open a query.`, {
       Expected: "using @table:<snippets> as the first words of the query",
@@ -514,77 +528,97 @@ export const expandSnippets = async (code, load) => {
       Fix: "write `using @table:<snippets>` first, or quote the text if {{…}} is meant literally",
     }));
   }
-  const id = lead[1];
-  if (!id.startsWith("table:")) {
-    throw new Error(explain(`Snippets come from a table sheet, and @${id} is not one.`, {
-      Expected: "using @table:<id>",
-      Received: `using @${id}`,
+  const ids = lead[0].match(new RegExp(SNIPPET_SOURCE, "gi")).map((ref) => ref.slice(1));
+  if (ids.length > SNIPPET_SOURCES_MAX) {
+    throw new Error(explain(`using names more than ${SNIPPET_SOURCES_MAX} snippet sources.`, {
+      Expected: `at most ${SNIPPET_SOURCES_MAX} sources`,
+      Received: `${ids.length}: ${ids.map((id) => "@" + id).join(", ")}`,
       Source: "the start of the query",
-      Fix: "put the name and expr rows in a table sheet, and point using at it",
+      Fix: "merge snippet tables, or write the rarely used snippets out in the query",
     }));
   }
-  const { docs, colsOf } = await load(id);
-  const names = colsOf[id].map((col) => col.name);
-  for (const need of ["name", "expr"]) {
-    if (names.includes(need)) continue;
-    const hit = nearest(need, names);
-    throw new Error(explain(`The snippet table @${id} has no column named "${need}".`, {
-      Expected: "columns named name and expr",
-      Received: names.join(", ") || "(no columns)",
-      ...(hit ? { "Did you mean": hit } : {}),
-      Source: `the column row of @${id}`,
-      Fix: `rename a column to ${need}`,
-    }));
-  }
+  const from = ids.map((id) => "@" + id).join(", ");
   const body = new Map();
-  docs[id].forEach((row, i) => {
-    const at = `row ${i + 1} of @${id}`;
-    const { name, expr } = row;
-    if (typeof name !== "string" || !SNIPPET_NAME.test(name)) {
-      throw new Error(explain(`A snippet name is not a name.`, {
-        Expected: "letters, digits and _, starting with a letter or _",
-        Received: show(name),
-        Source: at,
-        Fix: "rename the snippet",
+  for (const id of ids) {
+    if (!id.startsWith("table:") && !id.startsWith("query:")) {
+      throw new Error(explain(`Snippets come from a table or query sheet, and @${id} is not one.`, {
+        Expected: "using @table:<id> or using @query:<id>",
+        Received: `using @${id}`,
+        Source: "the start of the query",
+        Fix: "put the name and expr rows in a table sheet, or in a query that answers them, and point using at it",
       }));
     }
-    if (body.has(name)) {
-      throw new Error(explain(`The snippet "${name}" is defined twice.`, {
-        Expected: "one row per name",
-        Received: `${name} again`,
-        Source: at,
-        Fix: "delete or rename one of the two rows",
+    if (ids.indexOf(id) !== ids.lastIndexOf(id)) {
+      throw new Error(explain(`@${id} is named twice after using.`, {
+        Expected: "each snippet source once",
+        Received: from,
+        Source: "the start of the query",
+        Fix: `delete the second @${id}`,
       }));
     }
-    if (typeof expr !== "string" || !expr.trim()) {
-      throw new Error(explain(`The snippet "${name}" has no text to expand to.`, {
-        Expected: "a non-empty text expr",
-        Received: show(expr),
-        Source: at,
-        Fix: "write the SQL expression in the expr cell",
+    const { docs, colsOf } = await load(id);
+    const names = colsOf[id].map((col) => col.name);
+    for (const need of ["name", "expr"]) {
+      if (names.includes(need)) continue;
+      const hit = nearest(need, names);
+      throw new Error(explain(`The snippet source @${id} has no column named "${need}".`, {
+        Expected: "columns named name and expr",
+        Received: names.join(", ") || "(no columns)",
+        ...(hit ? { "Did you mean": hit } : {}),
+        Source: `the column row of @${id}`,
+        Fix: `rename a column to ${need}`,
       }));
     }
-    let depth = 0, broken = "";
-    const { inside } = outsideStrings(expr, (t) => {
-      if (/;|--|\/\*/.test(t)) broken ||= "a ; or a comment";
-      for (const ch of t) {
-        if (ch === "(") depth++;
-        if (ch === ")" && --depth < 0) broken ||= "a ) with no (";
+    docs[id].forEach((row, i) => {
+      const at = `row ${i + 1} of @${id}`;
+      const { name, expr } = row;
+      if (typeof name !== "string" || !SNIPPET_NAME.test(name)) {
+        throw new Error(explain(`A snippet name is not a name.`, {
+          Expected: "letters, digits and _, starting with a letter or _",
+          Received: show(name),
+          Source: at,
+          Fix: "rename the snippet",
+        }));
       }
-      return t;
+      const held = body.get(name);
+      if (held) {
+        throw new Error(explain(`The snippet "${name}" is defined twice.`, {
+          Expected: "one row per name",
+          Received: held.id === id ? `${name} again` : `${name} in @${held.id} and in @${id}`,
+          Source: at,
+          Fix: "delete or rename one of the two rows",
+        }));
+      }
+      if (typeof expr !== "string" || !expr.trim()) {
+        throw new Error(explain(`The snippet "${name}" has no text to expand to.`, {
+          Expected: "a non-empty text expr",
+          Received: show(expr),
+          Source: at,
+          Fix: "write the SQL expression in the expr cell",
+        }));
+      }
+      let depth = 0, broken = "";
+      const { inside } = outsideStrings(expr, (t) => {
+        if (/;|--|\/\*/.test(t)) broken ||= "a ; or a comment";
+        for (const ch of t) {
+          if (ch === "(") depth++;
+          if (ch === ")" && --depth < 0) broken ||= "a ) with no (";
+        }
+        return t;
+      });
+      if (depth > 0) broken ||= "a ( with no )";
+      if (inside) broken ||= "a quote that never closes";
+      if (broken) {
+        throw new Error(explain(`The snippet "${name}" cannot stand alone as an expression.`, {
+          Expected: "one balanced expression: no ;, no comment, every ( closed, every quote closed",
+          Received: `${broken} in ${shorten(expr)}`,
+          Source: at,
+          Fix: "write one expression; a body wraps in parentheses when it is used",
+        }));
+      }
+      body.set(name, { expr, id });
     });
-    if (depth > 0) broken ||= "a ( with no )";
-    if (inside) broken ||= "a quote that never closes";
-    if (broken) {
-      throw new Error(explain(`The snippet "${name}" cannot stand alone as an expression.`, {
-        Expected: "one balanced expression: no ;, no comment, every ( closed, every quote closed",
-        Received: `${broken} in ${shorten(expr)}`,
-        Source: at,
-        Fix: "write one expression; a body wraps in parentheses when it is used",
-      }));
-    }
-    body.set(name, expr);
-  });
+  }
   let count = 0;
   const expand = (text, stack) =>
     outsideStrings(text, (t) =>
@@ -601,17 +635,17 @@ export const expandSnippets = async (code, load) => {
         const path = [...stack, name].map((n) => `{{${n}}}`).join(" -> ");
         if (!body.has(name)) {
           const hit = nearest(name, [...body.keys()]);
-          throw new Error(explain(`There is no snippet named "${name}" in @${id}.`, {
+          throw new Error(explain(`There is no snippet named "${name}" in ${from}.`, {
             ...(hit ? { "Did you mean": `{{${hit}}}` } : { Available: [...body.keys()].join(", ") || "(no snippets)" }),
             Source: `{{${name}}} in ${stack.length ? `the body of {{${stack.at(-1)}}}` : "the query"}`,
-            Fix: hit ? `write {{${hit}}}` : `add a row named ${name} to @${id}`,
+            Fix: hit ? `write {{${hit}}}` : `add a row named ${name} to ${from}`,
           }));
         }
         if (stack.includes(name)) {
           throw new Error(explain(`Snippets form a cycle: ${path}.`, {
             Expected: "bodies that end in plain SQL",
             Received: path,
-            Source: `@${id}`,
+            Source: from,
             Fix: "break the loop by writing one of these bodies without the others",
           }));
         }
@@ -619,7 +653,7 @@ export const expandSnippets = async (code, load) => {
           throw new Error(explain(`Snippets nest more than ${SNIPPET_DEPTH_MAX} deep: ${path}.`, {
             Expected: `at most ${SNIPPET_DEPTH_MAX} levels`,
             Received: path,
-            Source: `@${id}`,
+            Source: from,
             Fix: "write an inner snippet out in the outer one",
           }));
         }
@@ -631,9 +665,9 @@ export const expandSnippets = async (code, load) => {
             Fix: "use fewer snippets, or compute the shared part once in a subquery",
           }));
         }
-        return `(${expand(body.get(name), [...stack, name])})`;
+        return `(${expand(body.get(name).expr, [...stack, name])})`;
       })).text;
-  return { code: expand(rest, []), used: [id] };
+  return { code: expand(rest, []), used: ids };
 };
 
 // --- schema introspection
@@ -823,6 +857,34 @@ export const NUMERIC_TYPES = Object.keys(COLUMN_TYPES).filter((type) => COLUMN_T
 // `money:EUR` is a family like `enum:`: a prefix and an ISO 4217 shape, not a key of COLUMN_TYPES. The shape is
 // checked and the code is not, so a code nobody issued is a column that draws and sums like any other.
 export const MONEY_SHAPE = /^money:[A-Z]{3}$/;
+
+// ISO 4217 gives each currency a minor unit, the digits after the point. Only the codes whose minor unit is not 2
+// are listed; every other code draws 2. main_test.ts holds this equal to Intl's table, and browser_test.ts holds
+// `minorUnits` in src/Main.elm equal to it.
+export const MINOR_UNITS = Object.fromEntries([
+  ...[
+    "BIF",
+    "CLP",
+    "DJF",
+    "GNF",
+    "ISK",
+    "JPY",
+    "KMF",
+    "KRW",
+    "PYG",
+    "RWF",
+    "UGX",
+    "UYI",
+    "VND",
+    "VUV",
+    "XAF",
+    "XOF",
+    "XPF",
+  ]
+    .map((code) => [code, 0]),
+  ...["BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"].map((code) => [code, 3]),
+  ...["CLF", "UYW"].map((code) => [code, 4]),
+]);
 
 /** A column type whose cells are numbers: NUMERIC_TYPES, plus the money family. */
 export const numericType = (type) => NUMERIC_TYPES.includes(type) || MONEY_SHAPE.test(type);
@@ -2283,6 +2345,19 @@ export const selectTypes = (code, nameToType) => {
 // stands for one column, and two currencies on it are refused whenever the statement adds it.
 const currencyOf = (type) => type === "usd" ? "USD" : MONEY_SHAPE.test(type) ? type.slice(6) : null;
 
+// convert(amount, 'USD', 'EUR', 0.92) is a term typed by its literal `to` code. The amount is a column that
+// must already be in the `from` code. A `to` that is not a literal leaves the term untyped. Null for any other term.
+const convertCall = (term) => {
+  if (!/^convert\s*\(/i.test(term)) return null;
+  const d = topLevel(term);
+  const open = term.indexOf("(");
+  if (closeAt(term, d, open) !== term.length - 1) return null;
+  const args = splitAt(term, d, open + 1, term.length - 1, d[open] + 1).map(([a, b]) => term.slice(a, b).trim());
+  if (args.length !== 4) return null;
+  const literal = (arg) => arg.match(/^'([A-Z]{3})'$/)?.[1] ?? null;
+  return { amount: args[0], from: literal(args[1]), to: literal(args[2]) };
+};
+
 // A wrapped item (a snippet body arrives in parentheses) is split again on its own top-level + and -.
 const termsOf = (text, hops) => {
   let wrapped = false;
@@ -2332,6 +2407,22 @@ export const rejectMixedCurrency = (code, colsOf) => {
       const unaliased = text.replace(/\s+(?:"[^"]*"|`[^`]*`|[A-Za-z_][A-Za-z0-9_]*)$/, "");
       if (unaliased && !unaliased.endsWith(".")) text = unaliased;
       for (const term of termsOf(text, 0)) {
+        const call = convertCall(term);
+        if (call) {
+          const column = bare(call.amount).match(/^(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)$/)?.[1];
+          const held_ = call.from && column && held.get(column);
+          const wrong = held_ && held_.find((x) => currencyOf(x.type) !== call.from);
+          if (wrong) {
+            throw new Error(explain(`The column "${column}" is converted from the wrong currency.`, {
+              Received: `${wrong.type} in @${wrong.id}, converted from '${call.from}'`,
+              Expected: `the from code '${currencyOf(wrong.type)}', the currency the column is typed in`,
+              Source: "the convert() call in the select list of this query",
+              Fix: `write '${currencyOf(wrong.type)}' as the second argument, or convert a column in ${call.from}`,
+            }));
+          }
+          if (call.to) seen.push({ name: term, type: `money:${call.to}`, code: call.to });
+          continue;
+        }
         const name = bare(term).match(/^(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)$/)?.[1];
         const sheets = name && held.get(name);
         if (!sheets) continue;
@@ -2484,6 +2575,18 @@ export const rewriteUnpivot = (code, columnsOf) => {
  * text, before this pass runs, so the result type is the same either way.
  */
 export const MAX_EXTREMES = 100;
+
+// AlaSQL reserves `convert(` for its own two-argument cast, and a four-argument call does not parse. A bracketed
+// name reaches alasql.fn.convert instead.
+// REVIEW: Every `convert(` outside a string is ours, so AlaSQL's CONVERT(expr, type) cast is unreachable. Alternative:
+// rewrite only four-argument calls. It costs an argument counter in this text pass, for a cast no sheet uses.
+export const rewriteConvert = (code) => {
+  const depth = topLevel(code);
+  return code.replace(
+    /\bconvert(\s*)\(/gi,
+    (whole, space, at) => depth[at + whole.length - 1] < 0 ? whole : `[convert]${space}(`,
+  );
+};
 
 export const rewriteExtremes = (code, colsOf) => {
   const text = new Map();
@@ -2909,7 +3012,7 @@ export const planQuery = (sql, cells, docs, colsOf) => {
   checkJoinRows(sql, docs);
   checkPivot(sql);
   rejectMixedCurrency(sql, colsOf);
-  return rewriteWindows(rewriteUnpivot(rewriteExtremes(sql, colsOf), colsOf));
+  return rewriteWindows(rewriteUnpivot(rewriteConvert(rewriteExtremes(sql, colsOf)), colsOf));
 };
 
 // --- registration
@@ -4105,6 +4208,29 @@ export const register = (alasql) => {
     return hash;
   };
 
+  // An exchange rate is the caller's: nothing here knows one, and nothing guesses.
+  fn.convert = (amount, from, to, rate) => {
+    for (const [arg, v] of [[2, from], [3, to]]) {
+      if (typeof v !== "string" || !/^[A-Z]{3}$/.test(v)) {
+        throw fail(
+          `convert() argument ${arg}`,
+          "a currency code of three capital letters, e.g. 'USD'",
+          show(v),
+          "write the code in capitals",
+        );
+      }
+    }
+    if (typeof rate !== "number" || !Number.isFinite(rate) || rate <= 0) {
+      throw fail(
+        "convert() argument 4",
+        "a positive finite number",
+        show(rate),
+        "pass the rate to multiply by, e.g. 0.92",
+      );
+    }
+    return absent(amount) ? null : num("convert", 1, amount) * rate;
+  };
+
   fn.business_days = (a, b) => {
     let [from, to] = [truncate("day", date("business_days", a)), truncate("day", date("business_days", b))];
     const sign = from <= to ? 1 : -1;
@@ -4112,6 +4238,30 @@ export const register = (alasql) => {
     let n = 0;
     for (let d = from; d < to; d = new Date(d.getTime() + DAY)) if (weekday(d)) n++;
     return n * sign;
+  };
+
+  // A multi column's cell is an array of its picks; a query that crosses a json
+  // boundary sees it as the JSON text of one.
+  fn.has_pick = (cell, pick) => {
+    str("has_pick", 2, pick);
+    if (cell === null || cell === undefined) return null;
+    let picks = cell;
+    if (typeof cell === "string") {
+      try {
+        picks = JSON.parse(cell);
+      } catch {
+        picks = cell;
+      }
+    }
+    if (!Array.isArray(picks)) {
+      throw fail(
+        "has_pick() argument 1",
+        "an array of picks, or the JSON text of one",
+        show(cell),
+        "pass a multi: column, e.g. has_pick(tags, 'red')",
+      );
+    }
+    return picks.includes(pick);
   };
 
   // JSON.

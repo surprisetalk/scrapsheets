@@ -13,22 +13,23 @@ here.
 Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature builds its recommended design, with
 `REVIEW:` notes for the owner.
 
-- [ ] You import a money column, JPY has no decimals, and a conversion is a function.
-  1. Accept `money:XXX` in `/import/csv?types=`; `inferType` never guesses it.
-  2. An ISO exponent per code replaces the fixed 2 places (JPY 0, BWP 3).
-  3. Extend `rejectMixedCurrency` to `where`, `case`, `sum(a + b)` and join keys.
-  4. Add `convert(amount, from, to, rate)`.
+- [ ] Adding two currencies inside a `where`, a `case` or a join key is refused, the way a select item is.
+  1. Extend `rejectMixedCurrency` in `src/sql.mjs` to read `where`, `case ... when` and join `on` comparisons. Keep it
+     textual, as the select check is, and name both columns in the refusal.
+  2. One `main_test.ts` case per clause beside the select cases.
 
-- [ ] You use snippets from several tables, from a query sheet, and with completion in the editor.
-  1. Accept `using @table:a, @table:b`; refuse a name two tables define, naming both.
-  2. Allow `using @query:x`, requiring `name` and `expr` in its answer.
-  3. Complete `{{` in the editor from the snippet table's `name` column through `columnsFor`.
-  4. Arguments (`{{f(x)}}`) wait for a real snippet that needs one.
+- [ ] You write a snippet that takes arguments, like `{{f(x)}}`.
+  1. Wait for a real snippet that needs one.
+  2. Parse `{{name(a, b)}}` in `expand()`, split on top-level commas outside strings, bounded by `SNIPPET_ARGS_MAX`.
+  3. A third column `args` names the parameters; a call with another count is refused, naming both counts.
+  4. Substitute each parameter as a whole word outside strings, each argument in parentheses, before the recursive
+     expand. Completion inserts `name(` for a snippet with `args`.
 
-- [ ] A cell edit tells you at once when it breaks its column's check, and the import and webhook doors enforce it.
-  1. Run `checkConstraints` over the edited row in `changeDoc` as advice only: a socket edit is never refused.
-  2. Call it in `readImport` and `POST /net/:id`; a bad row fails the whole batch, never skipped.
-  3. Row-count range, freshness bound and referential integrity each become one `CHECK_KEYS` key when picked up.
+- [ ] A table refuses a write that breaks a rule beyond one cell: a row-count range, a freshness bound, a reference.
+  1. Each rule is one `CHECK_KEYS` key, with `checkDecoder` kept equal.
+  2. Row-count range: a sheet-level `check` in `data[0]`, run in `POST /sheet/:id` and `write_cells` after `assertRoom`,
+     and in `editAdvice`.
+  3. Freshness bound and referential integrity wait on row identity (see the cell-note entry).
 
 - [ ] You query a connected database's filtered table with a ref in a query sheet, on the server and in the page.
   1. Design the ref syntax first: `scanRefs` reads `@type:id.column` as a scalar cell, so a table and its filters need
@@ -38,12 +39,10 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
   3. Answer `assertNoKeys`, `library:lineage` and one `record()` row per query for the new ref.
   4. Run it in the page through `sheets()` too, and add the pair to `examples_test.ts`.
 
-- [ ] A multi-select cell offers checkboxes, its options can come from another sheet, and every tool reads it as a list.
-  1. Edit: a `viewEditCell` branch for `Multi` draws one checkbox per option and writes through `cellValue`.
-  2. Import: the preview offers `multi:` for a column of comma-separated repeats.
-  3. API: `GET /openapi/:id` writes `{ type: array, items: { enum: options } }` for the column.
-  4. Query: `has_pick(cell, 'red')` in `src/sql.mjs`, so a where clause tests membership.
-  5. Options from another sheet (`multi:@table:x.col`) wait for a sheet that needs them.
+- [ ] A multi column takes its options from another sheet.
+  1. Wait for a sheet that needs it.
+  2. `multi:@table:<id>.<column>`; the page draws that column's distinct values as the checkboxes.
+  3. Decide first how `checkColumnTypes` learns the options on the server without a read per write.
 
 - [ ] You see who else is in the sheet by name, and where their cursor is.
   1. Stamp each ephemeral frame server-side in `/library/sync` with the sender's display name, never the email.
@@ -57,41 +56,18 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
   3. Branch and merge a query through automerge `clone` and `merge`. A sandbox of fake deliveries comes after.
   4. Extend promote to alert, chart and net-http sheets.
 
-- [ ] You name a snapshot of a sheet and go back to it from the history modal.
-  1. Decided: the names live in this browser's store under `Stored`, keyed by sheet id and change hash, like folders.
-     They do not sync and are not in `library.zip`.
-  2. The history modal lists named versions first, and a name field on the picked version.
-  3. A conflict view, for the merges automerge cannot decide, comes after and needs its own design.
+- [ ] You resolve the merges automerge cannot decide in a conflict view.
+  1. Design first: which conflicts `getConflicts` reports for a cell, and how the history modal shows them.
 
-- [ ] You restore a past version's rows from the history modal, and Ctrl/⌘+Z takes it back.
-  1. Design. Data: `rollbackPatches(now, past)` in `src/page.mjs` takes two `data` arrays and answers patches:
-     `[{ action: "set", path: [3, "k2"], value: "40" }, { action: "del", path: [5, "k1"] }, { action: "splice", path:
-     [], value: [7, 2] }]`.
-     One `set` or `del` per cell that differs, then one tail `splice` for the row count (a delete, or an insert of the
-     past rows whole).
-  2. Flow: (1) You pick a version in the history modal. (2) The past table shows, with a `restore these rows` button.
-     The button is hidden for a viewer. (3) The click sends `historyRestore { id, hash }`. (4) The glue answers
-     `historyRestorable { id, data: { hash, forward, backward } }`, where `forward = rollbackPatches(now, past)` and
-     `backward = rollbackPatches(past, now)`. (5) Elm sends `forward` through `changeDoc`, pushes
-     `{ forward,
-     backward }` as one `UndoEntry`, and closes the modal.
-  3. Rows only. `data[0]` is never written: that would rewrite declared types and the arrangement, and skip the rename
-     and delete warning.
-  4. Failure modes, each through `catchy` to `model.error`:
-     - Column keys differ: "Expected the version's columns to match today's. Received: k4 \"notes\" added since. Source:
-       history restore. Fix: add or remove the columns by hand, then restore."
-     - Past `ROLLBACK_PATCHES_MAX` (10000): "Expected at most 10000 cell changes. Received: 12408. Source: history
-       restore. Fix: restore a nearer version."
-     - No difference: "That version's rows equal today's. Source: history restore. Fix: pick another version."
-  5. A visual diff of the picked version against now comes after, from the same comparison.
+- [ ] You see what a past version changed before you restore it.
+  1. In `viewHistory`, compare the past rows with the live rows by position and mark each differing cell with a class
+     `style.css` draws. The live rows are in the model already: no port.
+  2. Mark rows added and removed since, and show the count of changed cells above `table#past`.
 
-- [ ] You group rows and see subtotals without writing SQL.
-  1. Decided: the chosen column is model-only state, lost on reload. Tables only: a query has no totals row today. A cap
-     on groups, with an "N more" row.
-  2. One footer `tr` per group under the table, in the `Tab` branch of `viewTableFooter`, from the fold `columnTotal`
-     already does, over the drawn rows. A "subtotal by this column" button in the column panel.
-  3. Collapsible groups after that.
-  4. A pivot UI over the same machinery. AlaSQL's `pivot` is correct once `checkPivot()` has checked it.
+- [ ] You collapse a subtotal group, and pivot rows by one column and columns by another, in the UI.
+  1. `collapsed : Set String` beside `sheet.subtotal`; a group's footer row toggles it and hides its rows.
+  2. A pivot panel (row, column and value columns) over the same `subtotalGroups` fold. AlaSQL's `pivot` is correct once
+     `checkPivot()` has checked it.
 
 ---
 

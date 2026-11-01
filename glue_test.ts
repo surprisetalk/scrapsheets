@@ -19,7 +19,7 @@
 import { assert, assertEquals } from "@std/assert";
 import { decodeHeads } from "@automerge/automerge-repo";
 import { EXAMPLES } from "./src/examples.mjs";
-import { sheets } from "./src/page.mjs";
+import { editAdvice, sheets } from "./src/page.mjs";
 import { El, until } from "./page_harness.ts";
 import { glue } from "./glue_harness.ts";
 
@@ -567,6 +567,83 @@ Deno.test({
     assertEquals(doc.data[1], { "0": "x", "1": "y", "2": "z" }, "rows are keyed by column, so no cell moves");
     page.close();
   },
+});
+
+// A column's check is advice on an edit: the write lands whatever the check says,
+// because a socket edit cannot be refused, and the refusal reaches the banner.
+Deno.test({
+  name: "a cell edit that breaks its column's check lands, and the check's refusal reaches the banner",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const doc = {
+      type: "table",
+      data: [[{ name: "a", type: "text", key: "0", check: { required: true } }], { "0": "before" }],
+    } as { data: [Record<string, unknown>[], Record<string, string>] };
+    const page = await glue("http://localhost/table:advised1", { docs: { advised1: doc } });
+    const cell = [...page.all("tbody tr")[3].querySelectorAll("td")][0];
+    for (const type of ["mouseenter", "click", "dblclick"]) await page.fire(cell, type);
+    await page.type_(page.all("#new-cell")[0], "");
+    assertEquals(doc.data[1], { "0": "" }, "the edit lands");
+    await until(page.settle, "the advice to reach the banner", () => page.text().includes("is required"));
+    assert(page.text().includes('Column "a" of @table:advised1 is required'), page.text().slice(0, 300));
+    page.close();
+  },
+});
+
+// Advice reads the document as it stands after the whole batch, so each case is a batch and a table.
+Deno.test("editAdvice blames the rows a batch touched, and only those", () => {
+  const cols = (...c: Record<string, unknown>[]) => c;
+  const unique = cols({ name: "a", type: "text", key: "0", check: { unique: true } });
+  const rows = (n: number, at: Record<number, string> = {}) =>
+    Array.from({ length: n }, (_, i) => ({ "0": at[i] ?? `v${i}` }));
+  const set = (y: number, value: string) => ({ path: [y, "0"], action: "set", value });
+
+  // A 50-row paste where row 40 repeats row 1: the splice blames the repeat.
+  const pasted = rows(50, { 39: "v0" });
+  const paste = { path: [], action: "splice", value: [1, 0, ...pasted] };
+  assert(
+    editAdvice("table:t", [unique, ...pasted] as never, [paste])?.includes("unique"),
+    "a repeat inside a pasted block is advised",
+  );
+  assertEquals(
+    editAdvice("table:t", [unique, ...rows(5, { 1: "v0" })] as never, [set(2, "v0")]) !== null,
+    true,
+    "a set repeating a row",
+  );
+
+  // Rows the batch never touched are not blamed, even when they already break the rule.
+  assertEquals(editAdvice("table:t", [unique, ...rows(3, { 2: "v0" })] as never, [set(3, "v0")]) !== null, true);
+  assertEquals(editAdvice("table:t", [unique, ...rows(3, { 2: "v0" })] as never, [set(2, "v1")]), null);
+
+  // Deleting the only row that held a value leaves nothing to blame.
+  assertEquals(
+    editAdvice("table:t", [unique, ...rows(2)] as never, [{ path: [], action: "splice", value: [3, 1] }]),
+    null,
+    "a delete past the table",
+  );
+
+  // Fill-down over a required column.
+  const required = cols({ name: "a", type: "text", key: "0", check: { required: true } });
+  const fill = [2, 3, 4].map((y) => set(y, ""));
+  assert(
+    editAdvice("table:t", [required, ...rows(4, { 1: "", 2: "", 3: "" })] as never, fill)?.includes("is required"),
+  );
+
+  // A check nobody can read advises on every edit; it never throws.
+  const unreadable = cols({ name: "a", type: "text", key: "0", check: "yes" });
+  assert(editAdvice("table:t", [unreadable, ...rows(2)] as never, [set(1, "x")])?.includes("nobody can read"));
+
+  // Two columns of one name: rows are keyed by name, so the twin would answer for the checked column.
+  const twins = cols(
+    { name: "a", type: "text", key: "0", check: { required: true } },
+    { name: "a", type: "text", key: "1" },
+  );
+  const twinned = [{ "0": "", "1": "filled" }];
+  assert(
+    editAdvice("table:t", [twins, ...twinned] as never, [set(1, "")]) !== null,
+    "a twin must not hide an empty required cell",
+  );
 });
 
 Deno.test({

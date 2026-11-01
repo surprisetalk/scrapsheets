@@ -642,12 +642,54 @@ Deno.test({
       "made, a row pushed, a cell typed: three changes, newest first, none left out",
     );
     assert(versions.every((v) => v.time > 0), "automerge-repo stamps every change with a time");
+    assert(
+      versions.every((v) => (v as { name?: unknown }).name === null),
+      "no name is stored, so every version reads null",
+    );
     await page.click(page.all("#versions button")[1]);
     await until(page.settle, "the older version's rows", () => shown.length > 0);
     assertEquals(
       shown[0],
       { id, data: { hash: versions[1].hash, columns: ["a"], rows: [[undefined]] } },
       "the version before the typed cell answers its one row, blank, by position under the column names",
+    );
+
+    // A name lands in this browser's store under the sheet and the hash, and the next history reads it back.
+    const nameBox = page.all("input").find((i) => i.getAttribute("aria-label") === "name this version");
+    assert(nameBox, "the picked version shows a name field");
+    await page.type_(nameBox, "before the cell");
+    const win = (nameBox as unknown as {
+      ownerDocument: { defaultView: { KeyboardEvent: new (t: string, i: unknown) => unknown } };
+    }).ownerDocument.defaultView;
+    nameBox.dispatchEvent(new win.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await page.settle();
+    assertEquals(
+      page.stored("versions"),
+      { [id]: { [versions[1].hash]: "before the cell" } },
+      "stored by sheet id, then change hash",
+    );
+    await page.key({ key: "Escape" });
+    await page.click(page.all("button").find((b) => b.textContent === "history"));
+    await until(page.settle, "the second history", () => loaded.length > 1);
+    assertEquals(
+      loaded[1].data.versions.map((v) => (v as { name?: unknown }).name),
+      [null, "before the cell", null],
+      "the next history carries the name on its version",
+    );
+
+    // A store written by another build can hold a name that is not text. History lists the versions anyway.
+    await page.key({ key: "Escape" });
+    (win as unknown as { localStorage: Storage }).localStorage.setItem(
+      "scrapsheets-versions",
+      JSON.stringify({ [id]: { [versions[0].hash]: 7, [versions[1].hash]: "kept" } }),
+    );
+    await page.click(page.all("button").find((b) => b.textContent === "history"));
+    await until(page.settle, "the third history", () => loaded.length > 2);
+    assertEquals(page.all("#versions button").length, 3, "a non-text name does not hide the list");
+    assertEquals(
+      loaded[2].data.versions.map((v) => (v as { name?: unknown }).name),
+      [null, "kept", null],
+      "a name that is not text reads as no name",
     );
 
     // `view` answers `{}` for a hash the document never had, rather than throwing.
@@ -677,6 +719,39 @@ Deno.test({
       { unique: true },
       "the glue answered clean and Elm wrote the rule",
     );
+
+    // Restoring: the newest version holds today's rows, so it is refused by name; the older one
+    // takes the typed cell back in one write, and Ctrl+Z puts it where it was.
+    const rows = async () => JSON.stringify(((await page.document(id)) as { data: unknown[] }).data.slice(1));
+    const openHistory = async (n: number) => {
+      await page.click(page.all("button").find((b) => b.textContent === "history"));
+      await until(page.settle, "the history to list", () => loaded.length > n);
+    };
+    const restore = async (button: number) => {
+      await page.click(page.all("#versions button")[button]);
+      await page.click(page.all("button").find((b) => b.textContent === "restore these rows"));
+    };
+    const today = await rows();
+    errored.length = 0;
+    await openHistory(3);
+    await restore(1);
+    await until(page.settle, "the refusal for equal rows", () => errored.length > 0);
+    assertEquals(
+      errored,
+      ["[historyRestore] That version's rows equal today's. Source: history restore. Fix: pick another version."],
+      "the newest version has today's rows",
+    );
+    await restore(0);
+    const rowsBecome = async (want: (r: string) => boolean) => {
+      for (let tries = 0; tries < 40 && !want(await rows()); tries++) await page.settle(25);
+      assert(want(await rows()), "the rows to change");
+    };
+    await rowsBecome((r) => r !== today);
+    const restored = await rows();
+    assertEquals(page.all("#versions").length, 0, "the modal closes on a restore");
+    await page.key({ key: "z", ctrlKey: true });
+    await rowsBecome((r) => r === today);
+    assert(restored !== today, "and Ctrl+Z takes the restore back");
     page.close();
   },
 });
@@ -1040,6 +1115,15 @@ Deno.test({
       docs: {
         cities,
         q1: { type: "query", data: [{ lang: "sql", code: "", cols: {} }] },
+        snips: {
+          type: "table",
+          data: [
+            [{ name: "name", type: "text", key: "0" }, { name: "expr", type: "text", key: "1" }],
+            { "0": "alpha", "1": "1" },
+            { "0": "beta", "1": "2" },
+          ],
+        },
+        found: { type: "query", data: [{ lang: "sql", code: "select 'cnt' as name, '3' as expr", cols: {} }] },
       },
     });
     const editor = page.all("#code")[0];
@@ -1084,6 +1168,38 @@ Deno.test({
 
     await typed("select * from @table:nobody.");
     assertEquals(page.all("#complete").length, 0, "a sheet nobody has draws no dropdown rather than an empty one");
+
+    // `{{` completes the names every source of the using clause defines, a
+    // query's answer included, and a pick closes the braces.
+    await typed("using @table:snips, @query:found select {{");
+    assertEquals(
+      page.all("#complete div").map((el) => el.textContent).sort(),
+      ["{{alpha", "{{beta", "{{cnt"],
+      "every source's names are offered",
+    );
+    await typed("using @table:snips, @query:found select {{b");
+    assertEquals(page.all("#complete div").map((el) => el.textContent), ["{{beta"], "what is typed narrows them");
+    await page.click(page.all("#complete div")[0]);
+    await page.settle();
+    assertEquals((editor as unknown as { value: string }).value, "using @table:snips, @query:found select {{beta}}");
+    await typed("select {{");
+    assertEquals(page.all("#complete").length, 0, "no using clause, no sources, no dropdown");
+    await typed("using @table:snips select 'it\\'s {{");
+    assertEquals(page.all("#complete").length, 0, "a {{ inside a string literal is text, so it completes nothing");
+    await typed("using @table:snips select 'x' as a, {{");
+    assertEquals(page.all("#complete div").length, 2, "a closed string before the {{ does not hide it");
+    await typed("using @table:snips, @table:nobody select {{");
+    assertEquals(
+      page.all("#complete div").map((el) => el.textContent).sort(),
+      ["{{alpha", "{{beta"],
+      "a source that will not load offers nothing and does not hide the others",
+    );
+    await typed("using @table:snips, @table:snips select {{");
+    assertEquals(
+      page.all("#complete div").map((el) => el.textContent).sort(),
+      ["{{alpha", "{{beta"],
+      "a source named twice offers each name once",
+    );
     page.close();
   },
 });

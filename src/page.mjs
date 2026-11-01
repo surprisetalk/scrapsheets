@@ -671,3 +671,85 @@ export const checkAnswer = (id, key, check, data) => {
     return { id, key, check, error: err.message };
   }
 };
+
+/** The refusal, or null, for the rows a `changeDoc` batch wrote, read off the
+ * document as it now stands. Advice: the caller shows it and keeps the write. A
+ * row index is the patch's `path[0]` less the header; a row `splice` touches the
+ * rows it inserts. Rows a patch deleted are no longer there to blame. */
+export const editAdvice = (id, data, patches) => {
+  const touched = new Set();
+  for (const { path, action, value } of patches) {
+    if (path.length > 0 && typeof path[0] === "number" && path[0] >= 1 && action !== "move") touched.add(path[0] - 1);
+    else if (path.length === 0 && action === "splice") {
+      const [start, , ...added] = value;
+      added.forEach((_, i) => touched.add(start - 1 + i));
+    }
+  }
+  const cols = Object.values(data[0]);
+  const rows = toRecords(data);
+  try {
+    // `toRecords` keys rows by name, so a twin shadows the checked column's cells and its rule would pass on the twin's.
+    const twin = cols.find((c) => c.check !== undefined && cols.some((o) => o !== c && o.name === c.name));
+    if (twin) {
+      throw new Error(explain(`Column ${show(twin.name)} of @${id} shares its name with another column.`, {
+        Expected: "one column of that name, since rows are keyed by column name",
+        Received: `${cols.filter((c) => c.name === twin.name).length} columns named ${show(twin.name)}`,
+        Source: "the check advice after an edit",
+        Fix: "rename one of them",
+      }));
+    }
+    checkConstraints(id, cols, rows, [...touched].filter((i) => i >= 0 && i < rows.length));
+    return null;
+  } catch (err) {
+    return err.message;
+  }
+};
+
+export const ROLLBACK_PATCHES_MAX = 10000;
+
+/** The patches that turn the data array `now` into `past`, rows only: one set
+ * or del per differing cell at [document row, column key], then one splice for
+ * the row count. `data[0]` is never written, so a differing column set is
+ * refused. */
+export const rollbackPatches = (now, past) => {
+  const keys = (data) => new Map(data[0].map((col) => [col.key, col.name]));
+  const [here, there] = [keys(now), keys(past)];
+  const differ = [
+    ...[...here].filter(([key]) => !there.has(key)).map(([key, name]) => `${key} ${JSON.stringify(name)} added since`),
+    ...[...there].filter(([key]) => !here.has(key)).map(([key, name]) =>
+      `${key} ${JSON.stringify(name)} removed since`
+    ),
+  ];
+  if (differ.length > 0) {
+    throw new Error(
+      `Expected the version's columns to match today's. Received: ${
+        differ.join("; ")
+      }. Source: history restore. Fix: add or remove the columns by hand, then restore.`,
+    );
+  }
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+  const patches = [];
+  let changes = 0;
+  const common = Math.min(now.length, past.length);
+  for (let y = 1; y < common; y++) {
+    for (const key of new Set([...Object.keys(now[y]), ...Object.keys(past[y])])) {
+      if (!(key in past[y])) patches.push({ action: "del", path: [y, key] });
+      else if (!(key in now[y]) || JSON.stringify(now[y][key]) !== JSON.stringify(past[y][key]))
+        patches.push({ action: "set", path: [y, key], value: plain(past[y][key]) });
+    }
+  }
+  changes += patches.length;
+  const tail = (data) => data.slice(common);
+  // A row with no cells still costs one change, so empty rows cannot dodge the bound.
+  changes += tail(now).concat(tail(past)).reduce((sum, row) => sum + Math.max(1, Object.keys(row).length), 0);
+  if (now.length > past.length) patches.push({ action: "splice", path: [], value: [common, now.length - common] });
+  if (past.length > now.length) patches.push({ action: "splice", path: [], value: [common, 0, ...plain(tail(past))] });
+  if (patches.length === 0)
+    throw new Error("That version's rows equal today's. Source: history restore. Fix: pick another version.");
+  if (changes > ROLLBACK_PATCHES_MAX) {
+    throw new Error(
+      `Expected at most ${ROLLBACK_PATCHES_MAX} cell changes. Received: ${changes}. Source: history restore. Fix: restore a nearer version.`,
+    );
+  }
+  return patches;
+};

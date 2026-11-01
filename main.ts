@@ -52,9 +52,11 @@ import {
   expandSnippets,
   explain,
   formatQueryError,
+  knownType,
   loadRefs,
   MAX_QUERY_MS,
   MAX_QUERY_ROWS,
+  MINOR_UNITS,
   MONEY_SHAPE,
   multiOptions,
   namesIn,
@@ -6252,22 +6254,22 @@ export const pollAlertSheet = async (
         Fix: "drop the explain and watch the query itself",
       }));
     }
-    let rows: Row[] = [];
-    if (code) {
-      // Run it as the owner would, through the same authenticated path, so an
-      // alert can never read a sheet its owner cannot.
+    // Run as the owner would, through the same authenticated path, so an
+    // alert can never read a sheet its owner cannot.
+    const ownerAnswer = async (sqlCode: string): Promise<Row[]> => {
       const res = await app.request(`/query`, {
         method: "POST",
         headers: new Headers({
           Authorization: `Bearer ${await createJwt(created_by)}`,
           "Content-Type": "application/json",
         }),
-        body: JSON.stringify({ lang: "sql", code, args: [] }),
+        body: JSON.stringify({ lang: "sql", code: sqlCode, args: [] }),
       });
       const text = await res.text();
       if (!res.ok) throw new Error(`the query failed with ${res.status}: ${text.slice(0, 400)}`);
-      rows = (JSON.parse(text) as { data: Row[] }).data.slice(1);
-    }
+      return (JSON.parse(text) as { data: Row[] }).data;
+    };
+    const rows: Row[] = code ? (await ownerAnswer(code)).slice(1) : [];
     // The feeds behind the rows: the refs, and the refs of every query sheet
     // they name. After the query, so each document opened here is one the
     // owner's own query has just opened.
@@ -6277,12 +6279,17 @@ export const pollAlertSheet = async (
       const walked = new Set<string>();
       const walk = async (raw: string, path: string[]): Promise<void> => {
         // A body can name a feed, so the walk reads the expanded text.
-        const text = (await expandSnippets(raw, async (id: string) => {
-          const hand = await automerge.find<{ data: Sheet["data"] }>(id.split(":")[1] as AnyDocumentId);
-          const data = docData(hand, id);
+        const expanded = await expandSnippets(raw, async (id: string) => {
+          // A query source holds no rows of its own: its answer does, run as the owner like the alert itself.
+          const data = id.startsWith("query:")
+            ? await ownerAnswer(`select * from @${id}`)
+            : docData(await automerge.find<{ data: Sheet["data"] }>(id.split(":")[1] as AnyDocumentId), id);
           return { docs: { [id]: toRecords(data as never) }, colsOf: { [id]: Object.values(data[0] as Row<Col>) } };
-        })).code;
-        for (const id of scanRefs(text).ids) {
+        });
+        // A query source is a ref of the alert too: its own code is walked for feeds.
+        for (
+          const id of [...expanded.used.filter((id: string) => id.startsWith("query:")), ...scanRefs(expanded.code).ids]
+        ) {
           checkRefPath(path, id);
           if (id.startsWith("net-")) reads.add(id);
           if (!id.startsWith("query:") || walked.has(id)) continue;
@@ -7526,18 +7533,19 @@ const lineage = async (c: Context): Promise<Page> => {
         s.type === "chart" ? chartSql(head as unknown as Chart) : head.code as string,
         async (id: string) => {
           const hold = byId.get(id);
-          if (hold?.type !== "table") {
-            throw new Error(explain(`The snippet table @${id} is not a table you hold a role on.`, {
-              Expected: "a table sheet in your library",
+          if (hold?.type !== "table" && hold?.type !== "query") {
+            throw new Error(explain(`The snippet source @${id} is not a table or query you hold a role on.`, {
+              Expected: "a table or query sheet in your library",
               Received: `@${id}`,
               Source: `using @${id} in ${s.sheet_id}`,
-              Fix: "ask for a role on the table, or point using at one you hold",
+              Fix: "ask for a role on the sheet, or point using at one you hold",
             }));
           }
-          const rows = await automerge
+          // REVIEW: Lineage runs a query source to read its bodies. Alternative: refuse a query source. It drops the edge and the bodies' refs for such a sheet.
+          const rows = hold.type === "query" ? (await sheet(c, id, {}, [s.sheet_id, id])).data : await automerge
             .find<{ data: Sheet["data"] }>(hold.doc_id as AnyDocumentId)
             .then((hand) => hand.doc()?.data);
-          if (!Array.isArray(rows)) throw new Error(`the snippet table @${id} arrived holding no rows`);
+          if (!Array.isArray(rows)) throw new Error(`the snippet source @${id} arrived holding no rows`);
           return { docs: { [id]: toRecords(rows as never) }, colsOf: { [id]: Object.values(rows[0] as Row<Col>) } };
         },
       );
@@ -8602,6 +8610,10 @@ app.delete("/library/:id/secret", async (c) => {
 // with the same header opens already corrected.
 const IMPORT_PREVIEW_ROWS = 5;
 
+// A column with more distinct tokens than this is prose or a list of names, not
+// a set of choices.
+const MULTI_GUESS_MAX = 12;
+
 /** The types a caller settled on, keyed by column name, off `?types=`. */
 const importTypes = (raw: string | undefined): Record<string, string> => {
   if (raw === undefined || raw === "") return {};
@@ -8625,12 +8637,17 @@ const importTypes = (raw: string | undefined): Record<string, string> => {
     });
   }
   for (const [name, type] of Object.entries(types)) {
-    if (!CANONICAL_TYPES.includes(type as string)) {
+    if (
+      !CANONICAL_TYPES.includes(type as string) &&
+      !(typeof type === "string" && (MONEY_SHAPE.test(type) || (multiOptions(type) && knownType(type))))
+    ) {
       bad(400, `"${name}" cannot be imported as ${show(type)}.`, {
         Received: show(type),
-        Expected: `one of ${CANONICAL_TYPES.join(", ")}`,
+        Expected: `one of ${
+          CANONICAL_TYPES.join(", ")
+        }, or money: and three capital letters, e.g. money:EUR, or multi: and options with none twice, e.g. multi:red,green`,
         Source: `the types query parameter, for column "${name}"`,
-        Fix: "pick a type from that list",
+        Fix: "pick a type from that list, the money family or the multi family",
       });
     }
   }
@@ -8750,6 +8767,14 @@ const parseDelimited = (
     if (filled.every((val) => !isNaN(Number(val)))) return "num";
     if (filled.every((val) => ["true", "false", "t", "f", "1", "0", "yes", "no"].includes(val.toLowerCase())))
       return "bool";
+    // Options in first-seen order. A comma inside an option cannot occur: the
+    // split is on commas. A pick twice in one cell would be refused on import.
+    const cells = filled.map((val) => multiOptions(`multi:${val}`)!);
+    const options = [...new Set(cells.flat())];
+    if (
+      options.length > 0 && options.length <= MULTI_GUESS_MAX && cells.some((picks) => picks.length > 1) &&
+      cells.every((picks) => new Set(picks).size === picks.length)
+    ) { return `multi:${options.join(",")}`; }
     return "text";
   };
 
@@ -8787,7 +8812,6 @@ const parseDelimited = (
     type: (types[name] ?? inferType(dataRows.map((row) => row.fields[i] || ""))) as Type,
     key: String(i),
   }));
-  const numeric = new Set(NUMERIC_TYPES as string[]);
   const rows: Row[] = dataRows.map(({ fields, line }) => {
     const obj: Row = {};
     cols.forEach((col, i) => {
@@ -8805,7 +8829,17 @@ const parseDelimited = (
       // and the query answer two different questions about one file.
       if (col.type === "text") obj[col.key] = val;
       else if (!val.trim()) obj[col.key] = null;
-      else if (numeric.has(String(col.type))) {
+      else if (multiOptions(col.type)) {
+        // The cell is its picks, split the way the page splits a typed cell;
+        // checkColumnTypes() refuses a pick outside the options.
+        const cell: Row = { [col.name]: multiOptions(`multi:${val}`) };
+        try {
+          checkColumnTypes(source, [col], [cell]);
+        } catch {
+          refuse(`picks from ${multiOptions(col.type)!.join(", ")}, each once`);
+        }
+        obj[col.key] = cell[col.name];
+      } else if (numericType(String(col.type))) {
         // checkColumnTypes() is the one place a cell becomes its column's type.
         // For a known numeric type and a non-blank cell, its one refusal is the
         // value's, so the catch answers that refusal with the file's line.
@@ -9071,7 +9105,12 @@ const assertXlsxCell = (sheet_id: string, where: string, len: number) => {
 // SheetJS's own formatter alike. Text is what the sheet actually holds, so it
 // goes out as its seconds rather than as a cell nothing can read.
 const xlsxCell = (type: string, val: unknown, text: string): XLSX.CellObject => {
-  const z = XLSX_FORMATS[type] ?? (MONEY_SHAPE.test(type) ? `"${type.slice(6)} "#,##0.00` : undefined);
+  const z = XLSX_FORMATS[type] ??
+    (MONEY_SHAPE.test(type)
+      ? `"${type.slice(6)} "#,##0${
+        (MINOR_UNITS[type.slice(6)] ?? 2) ? "." + "0".repeat(MINOR_UNITS[type.slice(6)] ?? 2) : ""
+      }`
+      : undefined);
   if (numericType(type) && typeof val === "number" && Number.isFinite(val)) {
     if (type === "duration") return val < 0 ? { t: "s", v: text } : { t: "n", v: (val * 1000) / XLSX_DAY_MS, z };
     return z === undefined ? { t: "n", v: val } : { t: "n", v: val, z };
@@ -9630,9 +9669,15 @@ app.get("/openapi/:id", async (c) => {
     additionalProperties: false,
     required: cols.map((col) => col.name),
     properties: Object.fromEntries(
-      cols.map((
-        col,
-      ) => [col.name, JSON_TYPES[String(col.type)] ?? (MONEY_SHAPE.test(String(col.type)) ? { type: "number" } : {})]),
+      cols.map((col) => {
+        const picks = multiOptions(col.type);
+        return [
+          col.name,
+          picks
+            ? { type: "array", items: { type: "string", enum: picks } }
+            : JSON_TYPES[String(col.type)] ?? (MONEY_SHAPE.test(String(col.type)) ? { type: "number" } : {}),
+        ];
+      }),
     ),
   };
   return c.json({

@@ -32,6 +32,8 @@ import {
   PORTALS,
   QUERY_CACHE_MAX,
   rememberedTypes,
+  ROLLBACK_PATCHES_MAX,
+  rollbackPatches,
   SHARE_MANY_MAX,
   shareMany,
   sheets,
@@ -913,7 +915,7 @@ Deno.test("Escape closes the palette without running anything", async () => {
 // A past version is text in a plain table, drawn over the live sheet. Every key
 // the live sheet takes is a write, so under the history none of them reaches it.
 Deno.test("the history lists a sheet's versions, draws a past one, and no key writes under it", async () => {
-  const { dom, doc, app, all, click, fire, settle, text } = await boot("http://localhost/table:countries");
+  const { dom, doc, app, all, click, fire, settle, text, type_ } = await boot("http://localhost/table:countries");
   const chip = () => all("button").find((b) => b.textContent === "history");
   assertEquals(chip(), undefined, "a bundled sheet has no automerge document, so it offers no history");
   const writes: unknown[] = [], loads: unknown[] = [], views: unknown[] = [];
@@ -949,6 +951,7 @@ Deno.test("the history lists a sheet's versions, draws a past one, and no key wr
     actor: "0123456789abcdef",
     seq,
     message: null,
+    name: null,
   });
   app.ports.historyLoaded.send({
     id: "table:mine",
@@ -975,6 +978,36 @@ Deno.test("the history lists a sheet's versions, draws a past one, and no key wr
     "the past version is its column names over its cells, as text",
   );
 
+  // A name is this browser's: Enter writes it through `nameVersion`, and the named version moves to the top.
+  const names: unknown[] = [];
+  app.ports.nameVersion.subscribe((n: unknown) => names.push(n));
+  const nameBox = () => all("input").find((i) => i.getAttribute("aria-label") === "name this version");
+  const nameEnter = async (value: string) => {
+    await type_(nameBox(), value);
+    nameBox()!.dispatchEvent(
+      new dom.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+    );
+    await settle();
+  };
+  assert(nameBox(), "the picked version shows a name field");
+  await nameEnter("  before the cull ");
+  assertEquals(names, [{ id: "table:mine", hash: "h1", name: "before the cull" }], "the name is trimmed, then written");
+  assertEquals(
+    all("#versions button").map((b) => b.textContent),
+    ["before the cull" + "change 101234567", "2026-09-21T14:13:20Z01234567"],
+    "a named version is listed first, the rest stay newest first",
+  );
+  await nameEnter("");
+  assertEquals(names[1], { id: "table:mine", hash: "h1", name: "" }, "an empty name deletes it");
+  assertEquals(
+    all("#versions button")[0].textContent,
+    "2026-09-21T14:13:20Z01234567",
+    "and the version falls back in line",
+  );
+  await nameEnter("x".repeat(81));
+  assertEquals(names.length, 2, "a name past the bound is not written");
+  assert(text().includes("Expected a name of at most 80 characters, received 81"), "and is refused by name");
+
   await key({ key: "z", ctrlKey: true });
   await key({ key: "Delete" });
   await key({ key: "x" });
@@ -984,6 +1017,90 @@ Deno.test("the history lists a sheet's versions, draws a past one, and no key wr
   assertEquals(all("#new-cell").length, 0, "and no key opened an editor");
   await key({ key: "Escape" });
   assertEquals(all("#past").length, 0, "Escape closes the history");
+
+  // Restore: the button asks the glue, the glue's patches go out as one write, and Ctrl+Z sends the inverse.
+  const restores: unknown[] = [];
+  app.ports.historyRestore.subscribe((ask: unknown) => restores.push(ask));
+  await click(chip());
+  app.ports.historyLoaded.send({ id: "table:mine", data: { versions: [version("h1", 0, 1)], left: 0 } });
+  await settle();
+  assertEquals(
+    all("button").find((b) => b.textContent === "restore these rows"),
+    undefined,
+    "no version is picked, so no restore",
+  );
+  await click(all("#versions button")[0]);
+  app.ports.historyShown.send({
+    id: "table:mine",
+    data: { hash: "h1", columns: ["city", ""], rows: [["Quito", null]] },
+  });
+  await until(settle, "the past rows again", () => all("#past td").length > 0);
+  await click(all("button").find((b) => b.textContent === "restore these rows"));
+  assertEquals(restores, [{ id: "table:mine", hash: "h1" }], "the button asks for the picked version");
+  const forward = [{ action: "set", path: [1, "a"], value: "Quito" }];
+  const backward = [{ action: "set", path: [1, "a"], value: "Lima" }];
+  app.ports.historyRestorable.send({ id: "table:other", data: { hash: "h1", forward, backward } });
+  await settle();
+  assertEquals(writes.length, 1, "an answer for another sheet writes nothing");
+  app.ports.historyRestorable.send({ id: "table:mine", data: { hash: "h1", forward, backward } });
+  await until(settle, "the restore write", () => writes.length > 1);
+  assertEquals((writes[1] as { data: unknown }).data, forward, "the forward patches are one write");
+  await settle();
+  assertEquals(all("#past").length, 0, "and the modal closes");
+  await key({ key: "z", ctrlKey: true });
+  assertEquals((writes[2] as { data: unknown }).data, backward, "Ctrl+Z writes the backward patches");
+});
+
+Deno.test("rollbackPatches turns one data array into another, cell by cell then by tail", () => {
+  const cols = [{ key: "k1", name: "a", type: "text" }, { key: "k2", name: "b", type: "text" }];
+  const now = [cols, { k1: "x", k2: "1" }, { k1: "y" }, { k1: "z", k2: "9" }];
+  const past = [cols, { k1: "x", k2: "2" }, { k2: "3" }];
+  assertEquals(rollbackPatches(now, past), [
+    { action: "set", path: [1, "k2"], value: "2" },
+    { action: "del", path: [2, "k1"] },
+    { action: "set", path: [2, "k2"], value: "3" },
+    { action: "splice", path: [], value: [3, 1] },
+  ]);
+  assertEquals(rollbackPatches(past, now).at(-1), { action: "splice", path: [], value: [3, 0, { k1: "z", k2: "9" }] });
+  const renamed = [[cols[0], { ...cols[1], key: "k4", name: "notes" }], { k1: "x" }];
+  assertThrows(
+    () => rollbackPatches(now, renamed),
+    Error,
+    `Expected the version's columns to match today's. Received: k2 "b" added since; k4 "notes" removed since. Source: history restore. Fix: add or remove the columns by hand, then restore.`,
+  );
+  assertThrows(
+    () => rollbackPatches(now, now),
+    Error,
+    "That version's rows equal today's. Source: history restore. Fix: pick another version.",
+  );
+  const wide = (n: number) => [cols, ...Array.from({ length: n }, () => ({ k1: "a", k2: "b" }))];
+  assertThrows(
+    () => rollbackPatches(wide(ROLLBACK_PATCHES_MAX), [cols]),
+    Error,
+    `Expected at most ${ROLLBACK_PATCHES_MAX} cell changes. Received: ${
+      2 * ROLLBACK_PATCHES_MAX
+    }. Source: history restore. Fix: restore a nearer version.`,
+  );
+});
+
+Deno.test("rollbackPatches holds its bound at the edges", () => {
+  const cols = [{ key: "k1", name: "a", type: "text" }];
+  const rows = (n: number, v: unknown) => Array.from({ length: n }, () => ({ k1: v }));
+  assertEquals(
+    rollbackPatches([cols, ...rows(ROLLBACK_PATCHES_MAX, "a")], [cols, ...rows(ROLLBACK_PATCHES_MAX, "b")]).length,
+    ROLLBACK_PATCHES_MAX,
+  );
+  assertThrows(
+    () =>
+      rollbackPatches([cols, ...rows(ROLLBACK_PATCHES_MAX + 1, "a")], [cols, ...rows(ROLLBACK_PATCHES_MAX + 1, "b")]),
+    Error,
+    `Received: ${ROLLBACK_PATCHES_MAX + 1}.`,
+  );
+  assertThrows(
+    () => rollbackPatches([cols, ...rows(ROLLBACK_PATCHES_MAX + 1, "a")].map((r, i) => i ? {} : r), [cols]),
+    Error,
+    "Expected at most",
+  );
 });
 
 Deno.test("?embed=1 renders the sheet with no chrome around it", async () => {
@@ -1939,6 +2056,49 @@ Deno.test("using @table: expands {{name}} bodies, nested, aggregates included, a
   ]);
 });
 
+Deno.test("using takes several sources, a query among them, and each source is a dependency", async () => {
+  const docs = {
+    s: snippets(["revenue", "sum(price * qty)"]),
+    t: snippets(["double", "{{revenue}} * 2"]),
+    q: code("select 'cnt' as name, 'count(*)' as expr"),
+    o: orders,
+  };
+  const spy = spied(docs);
+  const engine = sheets(alasql, () => ({}), spy.find, spy.heads);
+  assertEquals(
+    await answer(engine, "using @table:s, @query:q, @table:t select {{double}} as d, {{cnt}} as c from @table:o"),
+    [{ d: 24, c: 3 }],
+  );
+  const reads = { deps: new Map<string, unknown>(), depth: 0, volatile: false };
+  await engine.runSql("using @table:s, @query:q select {{cnt}} as c from @table:o", { "": null }, [], reads);
+  assertEquals([...reads.deps.keys()].sort(), ["query:q", "table:o", "table:s"]);
+});
+
+Deno.test("a using clause that is malformed or whose sources disagree is refused by name", async () => {
+  const docs = {
+    s: snippets(["revenue", "1"]),
+    u: snippets(["revenue", "2"]),
+    e: snippets(),
+    e2: snippets(),
+    n: snippets(["num", 5 as unknown as string]),
+    noexpr: code("select 'x' as name"),
+    loop: code("using @query:loop select {{a}} as x"),
+    ping: code("using @query:pong select 'a' as name, '1' as expr"),
+    pong: code("using @query:ping select 'b' as name, '1' as expr"),
+  };
+  const engine = sheets(alasql, () => ({}), spied(docs).find, spied(docs).heads);
+  const refused = (sql: string, ...parts: string[]) => assertRejects(() => answer(engine, sql), Error, parts[0]);
+  await refused("using @table:s, @table:s select 1 as x", "named twice");
+  await refused("using @table:s, select {{revenue}} as x", "not a list of snippet sources");
+  await refused("using @table:s, @table:u select {{revenue}} as x", "defined twice");
+  await refused("using @table:n select {{num}} as x", "no text to expand to");
+  await refused("using @query:noexpr select 1 as x", 'no column named "expr"');
+  await refused("using @query:loop select 1 as x", "cycle");
+  await refused("using @query:ping select 1 as x", "cycle");
+  await refused("using @table:nobody select 1 as x", "nobody");
+  assertEquals(await answer(engine, "using @table:e, @table:e2 select 1 as x"), [{ x: 1 }]);
+});
+
 Deno.test("a nested query that uses snippets re-runs when the snippet table changes, and a volatile body is never cached", async () => {
   const docs: Record<string, { data: unknown[] }> = {
     s: snippets(["v", "n + 1"]),
@@ -1992,8 +2152,20 @@ Deno.test("snippet refusals name the row, the path or the fix", async () => {
   assert(bare.includes("using @table:"), bare);
   const late = await run(snippets(["a", "1"]), "select 1 as x from @table:o using @table:s");
   assert(late.includes("start of the query"), late);
-  const query = await run(snippets(["a", "1"]), "using @query:s select {{a}}");
-  assert(query.includes("table"), query);
+  const other = await run(snippets(["a", "1"]), "using @portal:s select {{a}}");
+  assert(other.includes("table or query"), other);
+  const both = await run(snippets(["a", "1"]), "using @table:s, @table:t select {{a}}", { t: snippets(["a", "2"]) });
+  assert(both.includes("@table:s") && both.includes("@table:t") && both.includes('"a"'), both);
+  const again = await run(snippets(["a", "1"]), "using @table:s, @table:s select {{a}}");
+  assert(again.includes("twice") && again.includes("@table:s"), again);
+  const many = await run(snippets(["a", "1"]), "using @table:s, @table:s1, @table:s2, @table:s3, @table:s4 select 1");
+  assert(many.includes("at most 4"), many);
+  const shape = await run(snippets(["a", "1"]), "using @query:q select {{a}}", { q: code("select 1 as name") });
+  assert(shape.includes("expr") && shape.includes("@query:q"), shape);
+  const loop = await run(snippets(["a", "1"]), "using @query:q select {{a}}", {
+    q: code("using @query:q select 'a' as name, '1' as expr"),
+  });
+  assert(loop.includes("cycle") && loop.includes("@query:q"), loop);
   const noExpr = await run(
     { data: [{ 0: { key: "0", name: "name", type: "text" } }, { 0: "a" }] } as ReturnType<typeof snippets>,
     q,

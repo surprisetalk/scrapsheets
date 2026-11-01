@@ -146,14 +146,17 @@ A change that breaks one of these is a bug even if the suite is green.
   `checkColumnTypes` refuses a spelling outside the list. `money:` plus three capitals (`MONEY_SHAPE`, shape only) is a
   family like `enum:` and `multi:`, never a key; `numericType()` is `NUMERIC_TYPES` plus that family and is every
   numeric test (`checkColumnTypes`, xlsx, parquet, `write_cells`). `money:USD` is legal and counts as `usd`.
+  `MINOR_UNITS` lists only the ISO 4217 codes whose minor unit is not 2; every other code draws 2.
 - **A column's check runs at both write doors.** `check: { required, unique, min, max }` sits beside `type` in
   `data[0]`. `checkConstraints()` runs in `POST /sheet/:id` and `write_cells`, after `checkColumnTypes` and before
   `spend`, so a refusal writes and spends nothing. It blames only the rows the write touched; `unique` compares them
   with every row, ignores blanks and matches the exact value; `min` and `max` need a numeric column and read a numeric
   string there as its number. An `enum:` column is held to its options only where a check is present (`{}` counts, so
   the panel deletes an empty check). A check that cannot be read refuses every write. Rows are keyed by column name
-  inside it. The socket, `readImport` and `POST /net/:id` do not enforce it. The column panel runs the same function
-  through `checkAnswer()` before it writes a rule.
+  inside it. The socket does not enforce it: an edit that arrives over sync cannot be refused. The page runs it on its
+  own edits as advice, never on a peer's. `readImport` makes new sheets whose columns carry no check, and
+  `POST /net/:id` stores a body as a text row of `net`, which has no columns, so neither door has a check to run. The
+  column panel runs the same function through `checkAnswer()` before it writes a rule.
 - **A column's declared type is never rewritten.** `col.raw` is the document's spelling. A header write patches
   `[0, x, "name"]`, never the whole column object.
 - **Language-boundary copies.** `browser_test.ts` reads both sides as source text and fails on drift, compared as sets:
@@ -161,6 +164,7 @@ A change that breaks one of these is a bug even if the suite is green.
   - `NET_METHODS` (`main.ts`) ↔ `netMethods`
   - `CODEX_OPS`'s keys ↔ `codexOps`, and `CODEX_FILTERS_MAX` ↔ `codexFiltersMax`
   - `MONEY_SHAPE` ↔ `isMoney`, and `CHECK_KEYS` ↔ `checkDecoder`
+  - `MINOR_UNITS` ↔ `minorUnits`, as code and digits pairs
   - `NET_MODES` ↔ `netModes`
   - `PAGE_BY` ↔ `pageBy`
   - `ALERT_WHEN` ↔ `whenSpec`
@@ -229,7 +233,13 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   close. Freshness lists a `net-socket` sheet only after its first `SOCKET` run.
 - Import: `readImport()` is the one CSV reader. A numeric cell goes through `checkColumnTypes()` one cell at a time, and
   the refusal names the line. `POST /import/preview` answers columns, types and first rows. `POST /import/csv?types=…`
-  makes the sheet; `types` is keyed by column name and checked against `CANONICAL_TYPES`.
+  makes the sheet; `types` is keyed by column name and checked against `CANONICAL_TYPES`, the `money:` family and the
+  `multi:` family `knownType()` accepts. Inference never guesses money. A money column imports its cells as numbers
+  through `numericType()`. `inferType` proposes `multi:<options>` (first-seen order) for a column where every non-blank
+  cell splits on commas into picks, no cell names a pick twice, at least one cell holds two, and at most
+  `MULTI_GUESS_MAX` options exist; the guesses run num, bool, multi, text. `parseDelimited` turns a multi cell into its
+  array (blank is null). `GET /openapi/:id` writes a multi column as
+  `{ type: "array", items: { type: "string", enum } }`.
 
 **Polling**
 
@@ -327,13 +337,13 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - Upstream: `upstream: true` in an alert's `data[0]` also makes it due when a feed it reads stores a new row; it sits
   beside `interval` or `cron` and never replaces them. A good run of an upstream alert records the net-* sheets it read
   in `alertReads` (`bound(alertReads, RATE_LIMIT_KEYS_MAX)`), with that run's clock, found after its query succeeds:
-  `expandSnippets` then `scanRefs` over its code, then the same over each `query:` ref's live `data[0].code`, bounded by
-  `checkRefPath`. Charts, tables and other alerts are not followed. `netRow` calls `upstreamChanged(sheet_id, now)` only
-  when a 2xx run inserted its row, never on a repeat, a failure or a 304; `POST /net/:id` calls it when a delivery is
-  stored. `upstreamChanged` moves `alertDue` to the later of now and the last run plus `INTERVAL_MIN_S`, never later
-  than the due time already there. A failed run, or a run without `upstream`, drops the entry. An `upstream` that is not
-  a boolean is an error run. After a restart `alertReads` is empty until each alert's first run, which is immediate
-  because `alertDue` is empty too.
+  `expandSnippets` then `scanRefs` over its code, then the same over each `query:` ref's live `data[0].code` (a query
+  snippet source too, whose answer `ownerAnswer` reads as the owner), bounded by `checkRefPath`. Charts, tables and
+  other alerts are not followed. `netRow` calls `upstreamChanged(sheet_id, now)` only when a 2xx run inserted its row,
+  never on a repeat, a failure or a 304; `POST /net/:id` calls it when a delivery is stored. `upstreamChanged` moves
+  `alertDue` to the later of now and the last run plus `INTERVAL_MIN_S`, never later than the due time already there. A
+  failed run, or a run without `upstream`, drops the entry. An `upstream` that is not a boolean is an error run. After a
+  restart `alertReads` is empty until each alert's first run, which is immediate because `alertDue` is empty too.
 
 **Outbound**
 
@@ -409,8 +419,9 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 
 - One row per edge (`sheet_id`, `name`, `type`, `depends_on`, `depends_on_name`, `depends_on_type`, `columns`) for every
   query, alert and chart sheet the caller holds. The code comes from the live document (`data[0].code`, or `chartSql`),
-  never `sheet.row_0`, through `expandSnippets` then `scanRefs`, deduped. A snippet table is an edge with `columns`
-  `expr, name`; one outside the caller's library is the null-`depends_on` row. Bounded by `USER_SHEETS_MAX` documents
+  never `sheet.row_0`, through `expandSnippets` then `scanRefs`, deduped. Every snippet source, table or query, is an
+  edge with `columns` `expr, name`; one outside the caller's library is the null-`depends_on` row. A query source runs
+  once through `sheet()` to read its bodies: the one place lineage runs a query. Bounded by `USER_SHEETS_MAX` documents
   and `MAX_QUERY_ROWS` edges. An unloadable document is a row with null `depends_on` and the refusal in `name`.
 - `columns`: the names the statement mentions (`namesIn()`) that exactly one ref holds (`readColumns()`), sorted and
   comma-joined; `*` when `SELECT_STAR` matches; `?` when a ref's columns cannot be read.
@@ -430,18 +441,26 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   scanner, and it reads expanded text only. `checkRefPath` bounds depth and names a cycle; `main.ts` imports it for the
   alert's upstream walk.
 - Snippets: `expandSnippets(code, load)` runs before `scanRefs` in every reader of raw query code: `executeSql`,
-  `runSql`, `lineage()` and the alert upstream walk; a new reader calls it first. `using @table:<id>` leads the query
-  (elsewhere it is refused); the table holds text columns `name` and `expr`, validated whole on every use, row by row.
-  `{{name}}` outside a `'...'` or `"..."` span (backslash escapes) becomes `(expr)`, nested bodies depth first, bounded
-  by `SNIPPET_DEPTH_MAX` and `SNIPPET_EXPANSIONS_MAX`; a cycle reads `{{a}} -> {{b}} -> {{a}}`. Any other `{{` outside a
-  string is refused. An unaliased `{{x}}` column is named by its expanded text. The page cache's `VOLATILE` test reads
-  the expanded text, and the snippet table is in `reads.deps`.
+  `runSql`, `lineage()` and the alert upstream walk; a new reader calls it first. `using @table:a, @query:b` leads the
+  query (elsewhere it is refused), up to `SNIPPET_SOURCES_MAX` sources (`SNIPPET_DEPTH_MAX`), each a table or a query
+  sheet, each named once; a malformed list is refused as not a list of snippet sources. Each source loads through the
+  engine's own loader, so a query source runs like any ref. Its answer holds text columns `name` and `expr`, validated
+  whole on every use, row by row. A name two sources define is refused naming both. `{{name}}` outside a `'...'` or
+  `"..."` span (backslash escapes) becomes `(expr)`, nested bodies depth first, bounded by `SNIPPET_DEPTH_MAX` and
+  `SNIPPET_EXPANSIONS_MAX`; a cycle reads `{{a}} -> {{b}} -> {{a}}`. Any other `{{` outside a string is refused. An
+  unaliased `{{x}}` column is named by its expanded text. The page cache's `VOLATILE` test reads the expanded text, and
+  every snippet source is in `reads.deps`.
 - Currency: `rejectMixedCurrency()` runs in `planQuery()` after `checkPivot`. It splits each top-level select item on
   top-level `+` and `-`, strips an alias and bare parentheses, peels `sum`, `avg`, `min`, `max`, `round`, splits what it
   peeled (a snippet body included) on its own top-level `+` and `-` (`termsOf`, bounded by `SELECT_DEPTH`), and refuses
   two columns of different currencies (`usd` is `USD`), and a name two loaded sheets type in two currencies when the
   statement adds it. It is textual: `case`, `where`, joins, scalar multiples and `coalesce` pass. Sums are IEEE doubles:
   n additions err by at most (n-1)·2^-53 of the largest partial sum; keep amounts under 2^53 cents.
+  `convert(amount, from, to, rate)` answers amount * rate in both hosts, null for a blank amount; it refuses a code that
+  is not three capitals, a rate that is not positive and finite, and an amount that is not a finite number. AlaSQL
+  reserves `convert(`, so `rewriteConvert()` in `planQuery()` writes it `[convert](` outside strings, and AlaSQL's own
+  `CONVERT` cast is unreachable. `rejectMixedCurrency` types a `convert(...)` term by its literal `to` (else untyped)
+  and refuses a bare column amount whose currency differs from a literal `from`.
 - `rewriteExtremes()` runs first. It aims `min(x)` / `max(x)` at `min_text` / `max_text` when `x` is a bare column every
   loaded sheet types as one of `TEXT_TYPES`. It skips a windowed call, an expression, a name typed two ways, and a name
   the query aliases. `MAX_EXTREMES` bounds the calls.
@@ -473,9 +492,11 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   boundary copy). A `multi:a,b` cell is a JSON array of its options, null when blank, `[]` allowed; `multiOptions()`
   splits and trims, `knownType()` needs a non-empty list with no repeats, and `checkColumnTypes()` refuses a non-array,
   a pick outside the list and a pick twice. `POST /sheet/:id` and `write_cells` take an array only under a multi column.
-  Exports write an array as `String(array)`; json and ndjson keep it. `checkColumnTypes()` is where a cell becomes its
-  column's type. A `duration` cell holds seconds; in a duration column the function also reads `h:mm` and `h:mm:ss`.
-  `selectTypes()` and `WINDOW_TYPES` type a result off its select item.
+  `has_pick(cell, pick)` answers whether an array cell (or its JSON text) holds the pick, null for a null cell; it
+  refuses any other cell and a pick that is not text. Exports write an array as `String(array)`; json and ndjson keep
+  it. `checkColumnTypes()` is where a cell becomes its column's type. A `duration` cell holds seconds; in a duration
+  column the function also reads `h:mm` and `h:mm:ss`. `selectTypes()` and `WINDOW_TYPES` type a result off its select
+  item.
 - Business days: `weekday()` is the one definition, Monday to Friday in UTC, holidays included; `business_days()` counts
   through it. `nthWeekday(year, month, n)` answers the day of the nth weekday, from the end when n is negative, or null
   when the month holds fewer. `nextDue()` in `main.ts` is its only caller.
@@ -570,7 +591,11 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   return, so the library and the shop listen to nothing.
 - Completion: `completionTrigger`, `completionRef`, `completionAt`. Columns come through the `columnsFor` /
   `columnsLoaded` port, answered by running `describe @<ref>` in the page. A failed ref logs by name and caches an empty
-  answer. `ColumnsLoad` recomputes the open list. The dropdown is `id="complete"`.
+  answer. `ColumnsLoad` recomputes the open list. The dropdown is `id="complete"`. A `{{` with no `}}` and no space
+  after it is a snippet trigger (`snippetTrigger`), outside a quoted string only, and wins over `@`. `usingRefs` reads
+  the sources off the text before the cursor, each once; each is asked through `columnsFor` with the ref prefixed `{{`,
+  and the glue answers `select name from @ref` under that key. Picking a name inserts the rest and `}}`. A source that
+  cannot be read, or a name that is not text, logs by name and offers nothing.
 
 **Table**
 
@@ -604,20 +629,33 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   `SheetWrite`, clear, paste and find/replace go through both; fill-down repeats the raw array; `cleanable` hides the
   cleaning verbs on a `Multi` column. `ClipboardCopy` copies a null cell as empty text, and `editSeed` opens a blank
   `Multi` cell's editor empty.
-- Money: `Money String` draws `EUR 1,234.50`, sign first (`-EUR 12.00`), two places for every code, through `currency`,
-  which `usd` shares. It is in `numericColumn`, the stats row and `columnTotal`. The type row takes `money:EUR` through
-  `knownTypeName`, as it takes `enum:`. xlsx writes `"EUR "#,##0.00`, parquet DOUBLE, OpenAPI a number.
+- Money: `Money String` draws `EUR 1,234.50`, sign first (`-EUR 12.00`), through `currency`, which `usd` shares. The
+  places are the code's minor unit through `minorDigits` (`JPY 1,234`, `KWD 1.500`); a `decimals` setting wins. It is in
+  `numericColumn`, the stats row and `columnTotal`. The type row takes `money:EUR` through `knownTypeName`, as it takes
+  `enum:`. xlsx writes the code's digits (`"JPY "#,##0`), parquet DOUBLE, OpenAPI a number.
 - Column check: `Col.check` is read by the lenient `checkDecoder`. The column panel of a `Tab` offers `required`,
   `unique`, and `min` / `max` on a numeric column. `ColumnCheck` parses the field through `setCheck` and sends
   `checkColumn { id, key, check }`; it writes nothing yet. The glue answers `checkLoaded` from
-  `checkAnswer(id, key,
-  check, data)` in `src/page.mjs`, read off the open handle or, for a bundled sheet, its library
+  `checkAnswer(id, key, check, data)` in `src/page.mjs`, read off the open handle or, for a bundled sheet, its library
   document. That runs `checkConstraints` over the proposed column and every row, so a rule the rows already break is
   refused. An empty check is no check. A rule on a column whose name another column shares is refused; clearing one is
   not. The answer is `{ id, key, check }`, or the same with `error`, which goes to `model.error`; an `error` that is not
   text is refused as unreadable. `CheckLoad` holds no state: an answer for a sheet not open, or a key no longer in the
   table, writes nothing. Else it finds the column by key and writes one `[0, x, "check"]` patch through `changeDoc` (a
-  `del` for `noCheck`), with one `UndoEntry` whose backward restores the previous check.
+  `del` for `noCheck`), with one `UndoEntry` whose backward restores the previous check. After `changeDoc` writes a
+  batch to a synced table, the glue runs `editAdvice` (`src/page.mjs`) over the rows the batch touched and sends a
+  refusal through `docErrored`. It is advice: the write stays. A header patch touches no row; a checked column with a
+  twin name shows the shared-name refusal on every edit.
+- Multi edit: an open `Multi` cell draws one checkbox per option beside the text input (`aria-label` the option). A
+  click rewrites the text through `InputChange CellWrite`; Enter or blur commits through `SheetWrite`, so `cellValue`,
+  `cellRefusal`, undo and the viewer refusal apply. A mousedown on the boxes is default-prevented so the input keeps
+  focus. Unchecking the last box writes null. The import preview's select offers a guessed `multi:` spelling.
+- Subtotals: `sheet.subtotal` (a column key, model only, `Nothing` on every `selectDoc`) is set by the "subtotal by this
+  column" button in a Tab's column panel (`ColumnSubtotal`; again on the same column clears it; `aria-pressed`).
+  `viewTableFooter` draws one `tr.subtotal` per group under the totals row, from `subtotalGroups` over the drawn rows:
+  the group's raw value in the grouping column (a blank is `(blank)`), each `columnTotal` column through `formatNumber`,
+  other cells empty, groups in first-seen order. Past `subtotalGroupsMax` one row says `N more groups`. A key no column
+  holds draws nothing.
 - Fill-down: `fillSeries` continues dates (`justinmimbs/date`, stepped off the last seed), numbers and trailing digits,
   else repeats. `parseDay` decides a date. `blankCell` decides blank. `seriesEncoder` writes by column type.
 - Resize from the keyboard: the header `.grip` is a focusable `separator` with `aria-valuenow` when the column has a
@@ -653,8 +691,9 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   `SheetRowsDedupe` is in the palette. Helpers: `cellRewrites()`, `blankRows()`, `duplicateRows()` (signs a row by its
   cells), `rowDeletions()`. They read every document row and reach a table only.
 - Split: `sheet.splitOn` via `ColumnSplitInput`, never the document. `SheetColumnSplit key delimiter` → `columnSplit()`:
-  new text columns `<name> 1..n` keyed past every existing key; undo is `del`s then one `splice`. Refused with nothing
-  written: empty delimiter, unknown key, no text cell, no match, past `maxSplitColumns`, `nameClash`.
+  new text columns `<name> 1..n` keyed by `freshColKey`, the one key rule for a new column (push, paste, split); undo is
+  `del`s then one `splice`. Refused with nothing written: empty delimiter, unknown key, no text cell, no match, past
+  `maxSplitColumns`, `nameClash`.
 - Near-duplicates: `sheet.near` via `ColumnNearInput`. `nearDuplicates` buckets by `soundex`, scores by `similarity`,
   compares against rows that stay. Bounded by `maxFuzzyPairs` and `maxFuzzyRows`. Answers a `Result`; the preview reads
   `sheet.doc` and counts unreadable rows.
@@ -682,12 +721,23 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   matched by id, drawn by `viewPreflight`.
 - History: the `history` chip in `viewToolbar` on a `Tab` that is not `system` → `HistoryOpen` → `historyLoad id` →
   `getHistory(doc)` off the open handle, newest first, the newest `HISTORY_MAX` decoded through `.change` →
-  `historyLoaded { versions: [{ hash, time, actor, seq, message }], left }` → `HistoryPick hash` →
+  `historyLoaded { versions: [{ hash, time, actor, seq, message, name }], left }` → `HistoryPick hash` →
   `historyView { id, hash }` → `view(doc, [hash]).data` → `historyShown { hash, columns, rows }`. Both answers are
   matched by id, and a view also by hash. The past lives in `model.history`, never `sheet`. `updateHistory` is the one
   `HistoryMsg` case. `viewHistory` draws a plain `table#past` of text cells through `viewModal`; a `time` of 0 draws
   `change <seq>`. While it is up, `updateKeyDown` answers Escape alone and `ClipboardPaste` does nothing. The glue's
   refusals ride `catchy` to `model.error`, and `viewHistory` draws `viewError` too, because the scrim covers the banner.
+- Version names: `name` comes from `Stored` key `versions`, `{ sheet id: { hash: name } }`, this browser only, like
+  folders; a stored name that is not text reads as none. Named versions list first. The picked version's input
+  (`aria-label` `name this version`) sends `HistoryNameSave` on Enter: trimmed, refused past `versionNameMax` UTF-16
+  units, else `nameVersion { id, hash, name }`; an empty name deletes it.
+- Restore: the picked version's `restore these rows` chip sends `historyRestore { id, hash }`. The glue answers
+  `historyRestorable { id, data: { hash, forward, backward } }`, `forward = rollbackPatches(now, past)` and `backward`
+  the reverse. `HistoryRestorable`, matched by id and hash, writes `forward` through one `changeDoc`, pushes one
+  `UndoEntry`, and closes the history. `rollbackPatches` (`src/page.mjs`) writes rows only, never `data[0]`: one `set`
+  or `del` per differing cell at `[document row, column key]`, then at most one tail `splice`. It refuses differing
+  column keys (each named, added or removed), more than `ROLLBACK_PATCHES_MAX` cell changes (a row with no cells counts
+  one), and rows equal to today's.
 - Run now and pause: a `paused` checkbox, `runNow` / `runLoaded`. `runLine` picks the shape by the row's `method`.
 - Schedule: `NetCron`, `NetTimezone` and `NetBusinessDay` write `cron`, `timezone` and `business_day` through
   `changeDoc` on net-http and alert alike, beside `NetInterval`, with `aria-label` `cron schedule`, `cron timezone` and
@@ -783,9 +833,15 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - `ColumnCheck` builds the whole check from `col.check`, so a second rule sent before the first one's patch lands
   overwrites it. The glue answers in the same turn, so only a harness interleaves them.
 - Snippets expand `{{x}}` inside a comment, so a commented-out reference to a deleted snippet is refused.
-- Money prints two decimals for every code, so JPY is wrong.
-- The page checks no role before promote. A viewer's promote shows in the page, and the sync server refuses the source
-  write after.
+- IQD draws 3 places (ISO 4217); browsers draw 0 (CLDR).
+- `convert` is typed only when `to` is a literal; a column passed as `to` leaves the sum unchecked.
+- `editAdvice` reads row indexes off each patch against the final document, so a batch that moves rows before a later
+  set can blame a shifted row. Elm sends no such batch today.
+- Two tabs naming versions of one sheet overwrite each other's names: `nameVersion` writes the sheet's whole map.
+- Subtotals hide their labels when the grouping column is hidden, a text value `(blank)` draws like the blank group, and
+  a numeric group label draws raw.
+- The page checks no role before promote or restore. A viewer sees both chips, and the sync server refuses the write
+  after.
 - A fork made before promote shipped has no `forked_code` and shows no chip; fork the source again.
 - More than `peersMax` peers draws `peersMax here`.
 - `@library:freshness` and `@library:lineage` resolve on the server, not in the page.

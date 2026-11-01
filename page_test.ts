@@ -602,6 +602,35 @@ Deno.test("arranging a sheet writes the arrangement onto its columns", async () 
     "not an array",
     "a json cell that is not a numeric array still draws the text it always did, beside a sparkline row",
   );
+
+  // "subtotal by this column" groups the drawn rows under the table: a footer row per group, in first-seen order.
+  app.ports.docSelected.send({
+    id: "table:grouped",
+    data: {
+      doc: {
+        type: "table",
+        data: [
+          [{ name: "k", type: "text", key: "0" }, { name: "n", type: "number", key: "1" }],
+          { "0": "b", "1": 1 },
+          {
+            "0": "a",
+            "1": 2,
+          },
+          { "0": "b", "1": 4 },
+          { "0": "", "1": 8 },
+        ],
+      },
+    },
+  });
+  await settle();
+  assertEquals(all("tr.subtotal").length, 0, "no grouping until asked");
+  await click(all("span.funnel")[0]);
+  const group = () => all("button").find((b) => b.textContent === "subtotal by this column")!;
+  await click(group());
+  assertEquals(group().getAttribute("aria-pressed"), "true");
+  assertEquals(all("tr.subtotal").map((tr) => tr.textContent), ["b5", "a2", "(blank)8"]);
+  await click(group());
+  assertEquals(all("tr.subtotal").length, 0, "pressing again clears the grouping");
 });
 
 // One boot reaches every control a screen reader had nothing to read: the
@@ -878,6 +907,23 @@ Deno.test("a sheet opens arranged the way it was left", async () => {
   await settle();
   assertEquals(patches.map((p) => p.value), [null], "an untouched blank multi cell stays null");
   assert(!text().includes('received "NULL"'), `a blank multi cell is not refused as NULL: ${text().slice(0, 300)}`);
+
+  // An open multi cell offers one box per option, checked for the picks it holds; a click edits the text, and the
+  // write on blur is the whole array.
+  patches.length = 0;
+  const held = all("tbody td").find((td) => td.textContent?.trim() === "red, blue");
+  assert(held, "the cell holding two picks draws them joined");
+  for (const type of ["mouseenter", "mousedown", "mouseup", "click", "dblclick"]) await fire(held, type);
+  const box = (option: string) =>
+    all(`input[type='checkbox'][aria-label='${option}']`)[0] as unknown as { checked: boolean; click(): void };
+  assertEquals(["red", "green", "blue"].map((o) => box(o).checked), [true, false, true]);
+  box("green").click();
+  await settle();
+  box("red").click();
+  await settle();
+  all("#new-cell")[0].dispatchEvent(new dom.window.FocusEvent("blur"));
+  await settle();
+  assertEquals(patches.map((p) => [p.action, p.path, p.value]), [["set", [1, "0"], ["blue", "green"]]]);
 });
 
 // A query's rows are computed, so there are no stored columns to write an
