@@ -76,7 +76,8 @@ that file. Keep the jsdom pairs even in boots: `grep -c "await boot(" page_test.
   modal, and the parts of `src/page.mjs` that need no page.
 - `glue_test.ts` — what the glue does to a document.
 - `sync_test.ts` — what arrives from outside: a CSV chosen or dropped, a socket report, a fork, a real automerge
-  document and its history, the row and column verbs, and `src/sw.js` over a hand-made `self`, `caches` and `fetch`.
+  document and its history, promote (on `realRepo`; a second repo from `link()` edits the source), the row and column
+  verbs, and `src/sw.js` over a hand-made `self`, `caches` and `fetch`.
 - `page_harness.ts` — shared by the four jsdom files: compiled Elm, window globals, `boot`, `rendered()`, `until`,
   `settle(ms)`, the page-side engine. Refuses a `dist` older than `src`.
 - `glue_harness.ts` — `glue()` runs `index.html`'s module script over jsdom with `fetch` and `WebSocket` recorded.
@@ -137,7 +138,8 @@ A change that breaks one of these is a bug even if the suite is green.
   bounded by `KEY_SCAN_CELLS` and `KEY_SCAN_BYTES`. `KEY_SHAPES` has no override. `PII_SHAPES` (email, phone, US SSN, a
   card `luhn()` accepts) is overridden by `personal: true`, a boolean `claimsPersonal()` checks. Refusals name the
   column and the 1-based row, never the value. A scan that cannot run refuses: the computed ids, `library:lineage` and
-  the `codex-` prefix are named skips, and a document that will not load refuses the publish.
+  the `codex-` prefix are named skips, and a document that will not load refuses the publish. A codex ref is query code,
+  scanned as text; its rows never enter a document.
 - **One spelling per fact.** `API_BASE` in `src/page.mjs` is the only API host. `PORTALS` is the only portal list.
   `Stored` in `index.html` is the only `localStorage` prefix. `spec` in `Main.elm` is the only per-type table, with no
   wildcard.
@@ -215,6 +217,13 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   stays open. A document id past `DOCUMENT_ID_MAX` has no role and is never cached; one that is not text gets an `error`
   frame and is dropped before the bucket, since a throw inside the queue silences the connection. `syncRole` evicts its
   oldest cache entry through `bound()`.
+- Presence stamp: every `ephemeral` frame that survives the buckets goes through `stampPresence`. The connection reads
+  `peerIdentity(auth.usr_id)` once at upgrade: `usr.name` cut to `PEER_NAME_MAX`, else "someone"; no `usr_id` (signed
+  out, or a share-link token) is "guest". In a `__presence` message the server sets `state.name` (and `state.colour`, a
+  SHA-256 of `usr_id`, for a signed-in account) on a `snapshot`, and overwrites the value of an `update` whose channel
+  is `name` (or `colour` for a signed-in account), so a client cannot claim another's name or colour. The stamp looks up
+  channels with `Object.hasOwn`. A guest keeps the colour its tab sent. Any other channel (`cell`) and any frame that is
+  not CBOR presence relay unchanged. `EPHEMERAL_BYTES_MAX` is checked on the frame as sent, before the stamp.
 - Members: `GET /library/:id/share` answers only an account with a `sheet_usr` row on that sheet id, in any role. A
   purchase and `sheet.public` read the rows, and get a 403 that names the share route and no member. The settings panel
   reads that 403 on the list call alone as no share: `shareAction` answers `members: null`, `updateShareLoad` keeps
@@ -394,8 +403,17 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   `read` and answered 400, so the run is good. The rest of class 42 (permission, a dropped table) stays a failed run.
 - `checkCodexDsn()` refusals never roll over. `canonicalHost()` normalizes the host; `assertPublicHost()` checks it,
   unless our own database is on loopback.
-- Every attempt writes a `codexRun()` row with `meta.rolled_over`; `POLL_OK` grades a rollover failed. No refusal quotes
-  a DSN. A dead connection under `@codex-db:x` is a refusal, never an empty result.
+- A codex table ref reads through `sheet()`: `assertSheetAccess`, then `assertSheetEditor` on the codex sheet (a viewer
+  gets the 403 of a filtered preview), then `codexRead()`, the one statement `GET /codex/:id/preview` also runs
+  (`codexFilters()` parses the filters for both). It asks for `CODEX_PREVIEW_MAX + 1` rows and refuses 413 when they
+  come back; it never truncates. Two refs to one table with different filters are two reads. The page reads the same ref
+  through `sheets()`'s `codex(url)` door: `GET <API_BASE>/codex/<id>/preview?table=&where=...` under the account's
+  token, each filter decoded and encoded again so the route does not read `+` as a space. The page cannot ask for a row
+  past the cap, so it refuses an answer of `CODEX_PREVIEW_MAX` rows or more. A run that read a codex ref sets
+  `reads.volatile`, so no nested answer over one is cached. A page with no `codex` door refuses by name. The query
+  route's fetch audits a codex ref under its codex sheet id and skips the nearest-sheet rewrite of its refusals.
+- Every attempt, a read by ref included, writes a `codexRun()` row with `meta.rolled_over`; `POLL_OK` grades a rollover
+  failed. No refusal quotes a DSN. A dead connection under `@codex-db:x` is a refusal, never an empty result.
 
 **MCP**
 
@@ -417,6 +435,8 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 
 **Lineage (`library:lineage`)**
 
+- A codex table ref is one edge per (codex sheet, table), whatever its filters: `depends_on` the codex sheet id,
+  `depends_on_name` the table, `depends_on_type` `codex-db`, `columns` `*` on a `select *`, else `?`.
 - One row per edge (`sheet_id`, `name`, `type`, `depends_on`, `depends_on_name`, `depends_on_type`, `columns`) for every
   query, alert and chart sheet the caller holds. The code comes from the live document (`data[0].code`, or `chartSql`),
   never `sheet.row_0`, through `expandSnippets` then `scanRefs`, deduped. Every snippet source, table or query, is an
@@ -440,6 +460,14 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - Refs: `@type:doc_id` is a sheet; `@type:doc_id.column` is a scalar from a one-row sheet. `scanRefs()` is the one
   scanner, and it reads expanded text only. `checkRefPath` bounds depth and names a cycle; `main.ts` imports it for the
   alert's upstream walk.
+- Codex refs: `@codex-db:<id>/<table>` is a connected database's table. `?<column>.<op>.<value>&...` after it are the
+  codex filters, AND-ed, up to `CODEX_FILTERS_MAX`. `scanRefs` matches `CODEX_ID` before the generic ref and returns the
+  whole text as the id. `codexRef(id)` splits it (`sheet_id`, `table`, `wheres` left percent-encoded) and is null for
+  every other id. A value spells any character outside `[A-Za-z0-9_.:+-]` as `%XX`, so nothing ends a ref early or
+  reaches the `SHEET('...')` literal. A table name outside `[A-Za-z_][A-Za-z0-9_]*` has no ref form. There is no
+  `.column` cell form. `CODEX_PREVIEW_MAX` lives in `src/sql.mjs`; `main.ts` re-exports it. One run opens at most
+  `CODEX_REFS_MAX` (= `MAX_REF_DEPTH`) distinct codex refs; `loadRefs` refuses more before any fetch, on both hosts. The
+  page refuses a preview answer that is not `{ data: [columns, ...rows] }`, by name.
 - Snippets: `expandSnippets(code, load)` runs before `scanRefs` in every reader of raw query code: `executeSql`,
   `runSql`, `lineage()` and the alert upstream walk; a new reader calls it first. `using @table:a, @query:b` leads the
   query (elsewhere it is refused), up to `SNIPPET_SOURCES_MAX` sources (`SNIPPET_DEPTH_MAX`), each a table or a query
@@ -454,8 +482,14 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   top-level `+` and `-`, strips an alias and bare parentheses, peels `sum`, `avg`, `min`, `max`, `round`, splits what it
   peeled (a snippet body included) on its own top-level `+` and `-` (`termsOf`, bounded by `SELECT_DEPTH`), and refuses
   two columns of different currencies (`usd` is `USD`), and a name two loaded sheets type in two currencies when the
-  statement adds it. It is textual: `case`, `where`, joins, scalar multiples and `coalesce` pass. Sums are IEEE doubles:
-  n additions err by at most (n-1)·2^-53 of the largest partial sum; keep amounts under 2^53 cents.
+  statement adds it. It reads comparisons the same way, in the top-level where clause, each join's `on` and each `case`
+  (nested ones included): both sides of a comparison, a `+`/`-` inside one, and every `then` and `else` value of one
+  case must share a currency. Each `when` is a where comparison, and a `case x when y` operand is compared with each
+  `y`. Parenthesised groups, `not`, `between`, `in` lists and `like` are read. The refusal names both columns and says
+  "the select list", "the where clause", "a case" or "a join's on". A literal, a scalar multiple, `coalesce`, a
+  subquery's own where or on, `having`, a case inside a select-list sum and a comment pass; it is textual. A name two
+  sheets type in two currencies is refused in those clauses only beside a second term. Sums are IEEE doubles: n
+  additions err by at most (n-1)·2^-53 of the largest partial sum; keep amounts under 2^53 cents.
   `convert(amount, from, to, rate)` answers amount * rate in both hosts, null for a blank amount; it refuses a code that
   is not three capitals, a rate that is not positive and finite, and an amount that is not a finite number. AlaSQL
   reserves `convert(`, so `rewriteConvert()` in `planQuery()` writes it `[convert](` outside strings, and AlaSQL's own
@@ -655,7 +689,14 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   `viewTableFooter` draws one `tr.subtotal` per group under the totals row, from `subtotalGroups` over the drawn rows:
   the group's raw value in the grouping column (a blank is `(blank)`), each `columnTotal` column through `formatNumber`,
   other cells empty, groups in first-seen order. Past `subtotalGroupsMax` one row says `N more groups`. A key no column
-  holds draws nothing.
+  holds draws nothing. Each `tr.subtotal` is `role="button"` with `tabindex=0` and `aria-expanded`; a click or Enter
+  (stopped at the row) sends `SubtotalToggle value`, which toggles the group's `groupValue` (the raw text, `""` for the
+  blank group, so a literal `(blank)` text is its own group) in `sheet.collapsed` (model only; cleared by
+  `ColumnSubtotal` and on every `selectDoc`). `filterAndSortIndexed` drops a collapsed group's rows through
+  `subtotalCol`, so the body, `tableBounds`, `displayYToDocY` and `undrawnRows` treat them as undrawn, like a filter.
+  The totals row and the subtotal rows read the rows with `collapsed` emptied. The filter bar and the footer count rows
+  with collapse ignored (`unfolded` in `view`). The blank group draws `(blank)` in `em.blank`; a literal `(blank)` draws
+  plain.
 - Fill-down: `fillSeries` continues dates (`justinmimbs/date`, stepped off the last seed), numbers and trailing digits,
   else repeats. `parseDay` decides a date. `blankCell` decides blank. `seriesEncoder` writes by column type.
 - Resize from the keyboard: the header `.grip` is a focusable `separator` with `aria-valuenow` when the column has a
@@ -678,15 +719,19 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   `replaceMatches` checks its matches. Any undrawn row refuses the whole edit through `undrawnRows`, with nothing
   written. `rowSplices` takes `(Int -> Maybe Int)`. Paste appends past the drawn rows.
 - Rename and delete warning: in `updateDocMsg`'s Tab tail, after every refusal, `atRisk` names the columns a header
-  rename (`SheetWrite` at y = 0, name changed) or `SheetColumnDelete` takes away. A non-empty list holds the edit in
-  `model.pending` and sends `lineageFor`. `loadLineage` in `index.html` reads `GET /library/lineage` whole and answers
-  `lineageLoaded` with `{ id, rows }` or `{ id, error }`; logged out, a bundled sheet, a non-2xx, a throw and its
-  timeout are an `error`. `LineageLoad` ignores another id. `dependents` keeps rows whose `depends_on` is this sheet and
-  whose `columns` names a held column between separators, or is `*` or `?`. None: `confirmPending` writes at once.
-  Otherwise `viewPending` names each dependent and why; an `error` is the unknown state and says why. `PendingConfirm`
-  replays the edit through `updateDocMsg` under `Confirmed`, which refuses if the held names moved. `PendingCancel`,
-  Escape, `closeModals`, and `UrlChange` to another sheet or `#settings` drop it unwritten. A second rename or delete
-  while one is held, or over the import preview, the delete confirm or the history, is refused.
+  rename (`SheetWrite` at y = 0, name changed) or `SheetColumnDelete` takes away, and a promote (see Presence and
+  promote) names the source's columns the fork's answer lacks. A non-empty list holds the change in `model.pending`
+  (`edit : Held`, `Edit` of a `DocMsg` or `Promote`; `about` is the sheet whose dependents are asked) and sends
+  `lineageFor about`. `loadLineage` in `index.html` reads `GET /library/lineage` whole and answers `lineageLoaded` with
+  `{ id, rows }` or `{ id, error }`; logged out, a bundled sheet, a non-2xx, a throw and its timeout are an `error`.
+  `LineageLoad` matches `held.about` and ignores an answer unless the stage is `Asking`. `dependents` keeps rows whose
+  `depends_on` is this sheet and whose `columns` names a held column between separators, or is `*` or `?`. None:
+  `confirmPending` writes at once. Otherwise `viewPending` names each dependent and why (a held promote reads "Promoting
+  this fork, which drops ..."); an `error` is the unknown state and says why. `PendingConfirm` replays the edit through
+  `updateDocMsg` under `Confirmed`, which refuses if the held names moved ("Expected the held change to land on ...").
+  `PendingCancel`, Escape, `closeModals`, and `UrlChange` to another sheet or `#settings` drop it unwritten, a held
+  promote at either stage. A second rename, delete or promote while one is held, or over the import preview, the delete
+  confirm or the history, is refused with an error on the banner.
 - Cleaning, in the column panel behind `movable`: trim, UPPER, lower, drop blank rows, split, near-duplicates.
   `SheetRowsDedupe` is in the palette. Helpers: `cellRewrites()`, `blankRows()`, `duplicateRows()` (signs a row by its
   cells), `rowDeletions()`. They read every document row and reach a table only.
@@ -727,6 +772,14 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   `HistoryMsg` case. `viewHistory` draws a plain `table#past` of text cells through `viewModal`; a `time` of 0 draws
   `change <seq>`. While it is up, `updateKeyDown` answers Escape alone and `ClipboardPaste` does nothing. The glue's
   refusals ride `catchy` to `model.error`, and `viewHistory` draws `viewError` too, because the scrim covers the banner.
+  Under the restore button, `markRows` compares the picked past rows with the open `Tab`'s live rows (`sheet.doc`) by
+  document row position and column position, and `viewHistory` draws `table#past` from it. A cell that differs gets
+  `td.changed`. A live row the version lacks is drawn from today's cells as `tr.added`. A version row the sheet lacks is
+  `tr.removed`. `p#past-summary` reads `N cells changed, A rows added, R rows removed`. The compare is by column name,
+  since `historyShown` carries names and no keys. When the names differ from the live ones, the table is unmarked, there
+  are no counts, and the line is `rollbackPatches`' wording (`Expected the version's columns to match today's. ...`, or
+  `the same columns in another order`). A sheet that is not a `Tab` gets the unmarked table and no line. A cell compares
+  as `cellText` reads it, so a null and a blank are equal. `style.css` draws the three classes under `#past`.
 - Version names: `name` comes from `Stored` key `versions`, `{ sheet id: { hash: name } }`, this browser only, like
   folders; a stored name that is not text reads as none. Named versions list first. The picked version's input
   (`aria-label` `name this version`) sends `HistoryNameSave` on Enter: trimmed, refused past `versionNameMax` UTF-16
@@ -775,16 +828,35 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 **Presence and promote**
 
 - Presence: `selectDoc` starts a `Presence` on a handle that has `broadcast`, with `{ colour }`, a random `#rrggbb` per
-  open, kept nowhere; heartbeat 15 s, peer ttl 45 s. Its `snapshot`, `update`, `goodbye` and `pruning` send
-  `peersChanged { id, data }` with the other tabs' string colours. `selectDoc` stops it and sends `{ id: "", data: [] }`
-  before either early return. A bundled sheet and a codex have no `broadcast`. `PeersLoad` ignores another sheet's id
-  and keeps `#` plus six lowercase hex digits, then `peersMax`. `viewPeers` ends `viewToolbar`: `role=status`, one
-  `span.peer` per colour, the text `N here`. Two tabs of one browser count as two.
-- Promote: `forkDoc` writes `forked_code` (the source's `data[0].code`, when it is text) on a fork of a query. The
-  `promote` chip follows `fork` when `isPromotable` and the doc is a `Query`, and sends `promoteDoc`. The glue refuses a
-  fork with no `forked_code`, a bundled or unloaded source, and a source whose code equals neither `forked_code` nor the
-  fork's code; a refusal writes nothing. Else it writes the source's code, then the fork's `forked_code`, each skipped
-  when equal, so a rerun after a crash between them writes only the second. Then it opens the source.
+  open that the sync server overwrites with a stable per-`usr_id` colour for a signed-in account; heartbeat 15 s, peer
+  ttl 45 s. The focus cell rides the same Presence as channel `cell`: `updateCell` (the wrapper `main` runs over
+  `update`) sends the `focusCell` port when `sheet.select.b` changes, and the glue broadcasts `{x,y}` (null when a
+  corner is negative) at most once per `PRESENCE_CELL_MS` with a trailing send. Its `snapshot`, `update`, `goodbye` and
+  `pruning` send `peersChanged { id, data }`, data `[{ colour, name, cell }]` of the other tabs, name and cell null when
+  absent, sorted by colour. `selectDoc` stops it, clears the cell timer, and sends `{ id: "", data: [] }` before either
+  early return. A bundled sheet and a codex have no `broadcast`. `PeersLoad` ignores another sheet's id and reads peers
+  through `peersFrom`, a `Result String (List Peer)`: a value that is not a list goes to `model.error`; a peer with a
+  colour other than `#` plus six lowercase hex digits is dropped; `name` is text cut to `peerNameMax`, else ""; `cell`
+  is two non-negative whole numbers, else none; then `peersMax`. `viewPeers` ends `viewToolbar`: `role=status`, one
+  `span.peer` per peer (colour background, `title` the name), the text `N here`, then one `span.peer-name` per peer.
+  `viewTableRow` takes `cursors` (drawn `(column, row)` to colour, the later peer winning a shared cell); `cellClasses`
+  adds `peer-cell` and `viewCell` sets the outline colour. A cell no row draws is outlined nowhere. The cell is in the
+  peer's display coordinates, so a peer with another search, filter or sort sees it offset. Two tabs of one browser
+  count as two.
+- Promote: `forkDoc` writes `forked_code` (the source's `data[0].code`, when it is text) and `forked_heads`
+  (`decodeHeads(handle.heads())`, hex; none for a bundled source) on a fork of a query. The `promote` chip follows
+  `fork` when `isPromotable` and the doc is a `Query`, and sends `DocPromote`. With `sheet.lineage` set, `DocPromote`
+  first holds the promote in `model.pending` as `Promote` at stage `Describing` and sends `columnsFor` on the source (a
+  fresh read, never `queryColumns`' cache). `ColumnsLoad` then calls `promoteColumns`: the source's columns the fork's
+  `sheet.table` lacks are `pending.columns`. None lost confirms at once. Some lost sends `lineageFor` on the source
+  (`Pending.about`) and goes through `LineageLoad` as a rename does. An empty source answer or a fork with no answer yet
+  is the unknown state, `Warning (Err reason)`. `PendingConfirm` replays through `update DocPromote` under `Confirmed`,
+  which sends `promoteDoc`. The glue refuses: a fork with no `forked_code`; a bundled or unloaded source; a source whose
+  code equals neither `forked_code` nor the fork's code; and, when the fork has `forked_heads`, a source whose `data[0]`
+  has any key but `code` that differs (by `JSON.stringify`) from `view(source, forked_heads).data[0]`, naming the keys.
+  A fork with no `forked_heads` keeps the code-only rule. A refusal writes nothing. Else it writes the source's code,
+  then the fork's `forked_code` and `forked_heads` (the source's heads after the write), each side skipped when equal,
+  so a rerun after a crash between them writes only the second. Then it opens the source.
 - Glue harness: `fakeHandle` keeps listeners per event, records `broadcasts`, and `hear(senderId, message)` plays a
   peer's frame. `glue().link()` joins a second real repo over `Pipe`.
 
@@ -838,11 +910,16 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
 - `editAdvice` reads row indexes off each patch against the final document, so a batch that moves rows before a later
   set can blame a shifted row. Elm sends no such batch today.
 - Two tabs naming versions of one sheet overwrite each other's names: `nameVersion` writes the sheet's whole map.
-- Subtotals hide their labels when the grouping column is hidden, a text value `(blank)` draws like the blank group, and
-  a numeric group label draws raw.
+- Subtotals hide their labels when the grouping column is hidden, and a numeric group label draws raw.
 - The page checks no role before promote or restore. A viewer sees both chips, and the sync server refuses the write
   after.
-- A fork made before promote shipped has no `forked_code` and shows no chip; fork the source again.
+- A fork made before promote shipped has no `forked_code` and shows no chip; a fork made before `forked_heads` keeps the
+  code-only rule. Fork the source again.
+- Promote reads the source's columns by running `describe` on its code and the fork's from its last answer. A promote
+  clicked before the fork's first answer is the unknown state.
+- A promote of a bundled query that drops a column shows the unknown-state warning, and the glue refuses after Confirm.
+- The dependents check compares column names only: a changed type or order of a kept column warns nobody. Promote
+  compares `data[0]` keys only, so the source's document name is never compared.
 - More than `peersMax` peers draws `peersMax here`.
 - `@library:freshness` and `@library:lineage` resolve on the server, not in the page.
 - `describe` results carry no type in the page, and `WINDOW_TYPES` is server-only.
@@ -855,6 +932,12 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   frame apart can read one cell against the other's scroll; the next key corrects it.
 - `follow` plans `focus-pin`'s stuck left from the model at the key. A column nudge's document can land before the
   frame, and then a mark the plan did not expect counts where it sits.
+- A codex table whose name holds a dash or space has no ref form.
+- A codex ref in a page query refuses at `CODEX_PREVIEW_MAX` rows, the server at more than that.
+- `scanRefs` reads a ref inside a `--` SQL comment, so a commented-out codex ref still opens a far connection and can
+  refuse 413.
+- The history compare reads columns by name and position: a renamed column reads as one added and one removed, and two
+  blank-named columns compare in position.
 - Search reads a `json` cell's text, so a number list that draws a sparkline matches "1, 2", and a null nested in a
   `json` cell matches "null". `drawsText` is per type, not per cell.
 

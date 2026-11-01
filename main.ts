@@ -44,6 +44,8 @@ import {
   checkQueryRows,
   checkRefPath,
   checkResultColumns,
+  CODEX_PREVIEW_MAX,
+  codexRef,
   COLUMN_TYPES,
   DECOMPOSE,
   DESCRIBE_COLUMNS,
@@ -669,6 +671,39 @@ const sheet = async (
       offset,
     });
   }
+  // A codex table ref is no sheet row of its own: the codex sheet's membership is
+  // the access rule, and only an editor reads it, as only an editor filters a preview.
+  const ref = codexRef(sheet_id);
+  if (ref) {
+    await assertSheetAccess(c, ref.sheet_id);
+    await assertSheetEditor(c, ref.sheet_id, "read a table of");
+    // REVIEW: Ask for one row past the cap and refuse when it comes back. Alternative: truncate at the cap. A query would then answer a total over a silent slice.
+    let wheres: string[];
+    try {
+      wheres = ref.wheres.map(decodeURIComponent);
+    } catch {
+      bad(400, `A codex ref holds a % escape that is not text.`, {
+        Expected: "%XX escapes that spell UTF-8, e.g. %20 for a space",
+        Received: show(ref.wheres.join("&")),
+        Source: `@${sheet_id} in this query`,
+        Fix: "spell the value with valid escapes, e.g. status.eq.in%20stock",
+      });
+    }
+    const { columns, rows } = await codexRead(ref.sheet_id, ref.table, codexFilters(wheres), CODEX_PREVIEW_MAX + 1);
+    if (rows.length > CODEX_PREVIEW_MAX) {
+      bad(413, `The table ${ref.table} has more rows than a ref reads.`, {
+        Expected: `at most ${CODEX_PREVIEW_MAX} rows`,
+        Received: `more than ${CODEX_PREVIEW_MAX} rows from ${ref.sheet_id}`,
+        Source: `@${sheet_id} in this query`,
+        Fix: `narrow it with a filter, e.g. @${ref.sheet_id}/${ref.table}?<column>.eq.<value>`,
+      });
+    }
+    return {
+      data: [arrayify(columns.map((name) => ({ name, type: "text" as Type, key: name }))), ...rows],
+      count: rows.length,
+      offset: 0,
+    };
+  }
   await assertSheetAccess(c, sheet_id);
   // A whole read of the sheet -- GET /sheet, an export, an MCP read -- spends
   // one row of its budget, after the access check so a stranger's 403 spends
@@ -862,10 +897,13 @@ const executeSql = async (
     fetch: (sheet_id: string) =>
       sheet(c, sheet_id, {}, [...path_, sheet_id])
         .then(async (r) => {
-          await record(sheet_id, c.get("usr_id"), "query", c.get("via") ?? "jwt");
+          // A codex ref is audited under its codex sheet, the id its members read the log by.
+          await record(codexRef(sheet_id)?.sheet_id ?? sheet_id, c.get("usr_id"), "query", c.get("via") ?? "jwt");
           return r.data;
         })
         .catch(async (err) => {
+          // Only a codex ref holds a "/", and its refusals already name the table.
+          if (sheet_id.includes("/")) throw err;
           // A mistyped @ref reads as "no access". Name the sheet the author meant.
           const mine: { sheet_id: string }[] = await sql`
           select sheet_id from sheet_usr where usr_id = ${c.get("usr_id")}
@@ -1569,6 +1607,8 @@ const SERVER_PEER_ID = `server-${Deno.hostname()}` as AM.PeerId;
 const EPHEMERAL_BYTES_MAX = 4096;
 const EPHEMERAL_RATE = 10; // frames per second, per connection
 const EPHEMERAL_BURST = 2 * EPHEMERAL_RATE;
+const PRESENCE_KEY = "__presence"; // automerge-repo's Presence wraps every message under this key
+const PEER_NAME_MAX = 40;
 const NOTICE_MS = 1000; // one error frame per connection per second, for either bucket
 // Every frame that names a document costs syncRole a database query when the
 // id is new to the cache. A real client opening 10 documents sends 32 frames
@@ -1588,6 +1628,57 @@ export const ACCOUNT_FRAME_BURST = 2 * FRAME_BURST;
 // address-wide bucket would close them together (owner decision, run 14).
 export const accountFrames = new Map<string, { tokens: number; lastRefill: number }>();
 
+// Who the peers of a document see. A signed-in account is its usr.name (or
+// "someone"), with one colour per usr_id; a signed-out reader is "guest" and
+// keeps the colour its tab picked. REVIEW: the colour is derived and stamped here, beside the name. Alternative: derive it in the glue with crypto.subtle. That needs the glue to know its usr_id, and a client could still send another's colour.
+const peerIdentity = async (usr_id: string | null): Promise<{ name: string; colour: string | null }> => {
+  if (!usr_id) return { name: "guest", colour: null };
+  const [row] = await sql`select name from usr where usr_id = ${usr_id}`;
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(usr_id)));
+  const name = [...String(row?.name ?? "").trim()].slice(0, PEER_NAME_MAX).join("");
+  return {
+    name: name || "someone",
+    colour: "#" + [...digest.slice(0, 3)].map((b) => b.toString(16).padStart(2, "0")).join(""),
+  };
+};
+
+// A client's presence message says whatever it likes; the name and the colour
+// it relays are the server's. A frame that is not presence passes unchanged.
+const stampPresence = (
+  data: Uint8Array,
+  who: { name: string; colour: string | null },
+): Uint8Array => {
+  let frame: { data?: unknown };
+  try {
+    frame = AM.cbor.decode(data);
+  } catch {
+    // Not a CBOR frame, so not presence: automerge-repo's own decoder refuses it downstream.
+    return data;
+  }
+  const inner = frame.data instanceof Uint8Array ? frame.data : null;
+  if (!inner) return data;
+  let message: Record<string, Record<string, unknown>>;
+  try {
+    message = AM.cbor.decode(inner);
+  } catch {
+    // Ephemeral payloads of other users of the channel need not be CBOR; only presence is stamped.
+    return data;
+  }
+  const presence = message?.[PRESENCE_KEY];
+  if (!presence || typeof presence !== "object") return data;
+  const stamp: Record<string, unknown> = { name: who.name };
+  if (who.colour) stamp.colour = who.colour;
+  if (presence.type === "snapshot") {
+    const state = presence.state && typeof presence.state === "object" ? presence.state : {};
+    presence.state = { ...state, ...stamp };
+  } else if (
+    presence.type === "update" && typeof presence.channel === "string" && Object.hasOwn(stamp, presence.channel)
+  ) {
+    presence.value = stamp[presence.channel];
+  }
+  return AM.cbor.encode({ ...frame, data: AM.cbor.encode(message) });
+};
+
 export const automerge = new Repo({
   network: [wsAdapter],
   storage: new NodeFSStorageAdapter(`${path.dirname(path.fromFileUrl(Deno.mainModule))}/data/automerge`),
@@ -1601,6 +1692,7 @@ app.get(
   upgradeWebSocket(async (c) => {
     const query = c.req.query();
     const auth = await verifyWsAuth(query.auth, query.pass);
+    const who = await peerIdentity(auth.usr_id);
     let shim: WsSocketShim | undefined;
     let joined: AM.PeerId | undefined;
     let queue = Promise.resolve();
@@ -1635,6 +1727,7 @@ app.get(
           : null;
         if (!data) throw new Error(`Unsupported WebSocket frame: ${raw?.constructor?.name}`);
         // Messages queue so the async access check cannot reorder the sync protocol.
+        let relay: Uint8Array = data;
         queue = queue.then(async () => {
           if (!shim) return;
           let msg: { type?: string; senderId?: string; documentId?: string } | undefined;
@@ -1721,6 +1814,7 @@ app.get(
                 return;
               }
               ephemeral.tokens -= 1;
+              relay = stampPresence(data, who);
             }
             const role = await syncRole(auth, msg.documentId);
             if (!shim) return;
@@ -1758,7 +1852,7 @@ app.get(
               return;
             }
           }
-          if (shim) shim.emit("message", data);
+          if (shim) shim.emit("message", relay);
         }).catch((err) => {
           // A dropped sync message wedges the stateful protocol; close so the
           // client reconnects with fresh state instead of waiting forever.
@@ -7506,12 +7600,12 @@ const lineage = async (c: Context): Promise<Page> => {
     // The three types whose rows come from somewhere else. A table holds its
     // own cells, a feed holds what it fetched, and neither depends on a sheet.
     if (!["query", "alert", "chart"].includes(s.type)) continue;
-    const edge = (depends_on: string | null, name: string, cols: string | null) => ({
+    const edge = (depends_on: string | null, name: string, cols: string | null, table?: string) => ({
       sheet_id: s.sheet_id,
       name,
       type: s.type,
       depends_on,
-      depends_on_name: depends_on === null ? null : byId.get(depends_on)?.name ?? null,
+      depends_on_name: depends_on === null ? null : table ?? byId.get(depends_on)?.name ?? null,
       depends_on_type: depends_on === null ? null : depends_on.split(":")[0],
       columns: cols,
     });
@@ -7560,7 +7654,15 @@ const lineage = async (c: Context): Promise<Page> => {
     }
     // Deduped: a query joining one sheet to itself is one edge, and the same
     // ref written twice is the same dependency.
-    const ids = [...new Set(scanRefs(code).ids)];
+    // A codex table ref is an edge to its codex sheet named by the table, one per
+    // table whatever its filters. Its columns are the far database's, never read here.
+    const scanned = [...new Set(scanRefs(code).ids)];
+    const tables = new Map<string, { sheet_id: string; table: string }>();
+    for (const id of scanned) {
+      const ref = codexRef(id);
+      if (ref) tables.set(`${ref.sheet_id}/${ref.table}`, ref);
+    }
+    const ids = scanned.filter((id) => !codexRef(id));
     // Which columns of the ref this edge is about, in one of the three honest
     // states. A star reads every column of everything the statement names,
     // which is knowable off the statement alone and so outranks a ref whose own
@@ -7593,7 +7695,8 @@ const lineage = async (c: Context): Promise<Page> => {
         overflowed = true;
       }
     }
-    if (!ids.length && !snippetIds.length) rows.push(edge(null, s.name, null));
+    if (!ids.length && !tables.size && !snippetIds.length) rows.push(edge(null, s.name, null));
+    for (const ref of tables.values()) rows.push(edge(ref.sheet_id, s.name, star ? "*" : "?", ref.table));
     for (const id of new Set([...snippetIds, ...ids])) {
       rows.push(edge(
         id,
@@ -9829,8 +9932,8 @@ export const DSN_KEEP = 2;
 
 // A preview is what a person reads to pick a table: a screen or two of rows. A
 // read past that belongs to a query over the far database, which somebody else
-// pays for.
-export const CODEX_PREVIEW_MAX = 100;
+// pays for. The page shares the number, because a ref refuses at it on both hosts.
+export { CODEX_PREVIEW_MAX };
 
 // A filter narrows a preview to the rows a person means to read, so the far
 // server does the cutting. Five, AND-ed, is a screen of conditions.
@@ -10138,95 +10241,66 @@ app.get("/codex/:id", async (c) => {
   }
 });
 
-// The first rows of one far table, named from the list GET /codex/:id answers.
-// Membership in that list is the injection guard, and the driver's own
-// identifier escaping names the table and each column on top of it.
-app.get("/codex/:id/preview", async (c) => {
-  if (!rateLimit(`codex:${c.get("usr_id")}`)) {
-    bad(429, `Too many codex queries from this account.`, {
-      Expected: `a burst of at most ${RATE_LIMIT_MAX_TOKENS}, refilling at ${RATE_LIMIT_REFILL_RATE} per second`,
-      Received: "one query past that",
-      Source: `the codex budget for usr ${c.get("usr_id")}`,
-      Fix: "wait a second and ask again",
+type CodexFilter = { column: string; op: string; value: string };
+
+/** `<column>.<op>.<value>` strings to filters, split on the first two dots. The
+ * preview route's `where` parameters and a codex ref's `?` part are both read here. */
+const codexFilters = (wheres: string[]): CodexFilter[] => {
+  const filters: CodexFilter[] = [];
+  if (wheres.length > CODEX_FILTERS_MAX) {
+    bad(400, `That is too many filters for a preview.`, {
+      Received: `${wheres.length} where parameters`,
+      Expected: `at most ${CODEX_FILTERS_MAX} where filters`,
+      Source: "the where query parameters",
+      Fix: `keep the ${CODEX_FILTERS_MAX} that narrow the rows most, or read the table through a query`,
     });
   }
-  const sheet_id = c.req.param("id");
-  const [type] = sheet_id.split(":");
-  await assertSheetAccess(c, sheet_id);
-  if (type !== "codex-db") {
-    bad(400, `Only a connected database has rows to preview.`, {
-      Expected: "codex-db",
-      Received: show(type),
-      Source: `the type prefix on sheet id ${sheet_id}`,
-      Fix: `read GET /codex/${sheet_id} for what this codex holds`,
-    });
-  }
-  const table = c.req.query("table");
-  if (!table) {
-    bad(400, `Name the table to preview.`, {
-      Received: show(table),
-      Expected: `?table= and one name GET /codex/${sheet_id} lists`,
-      Source: "the table query parameter",
-      Fix: `read GET /codex/${sheet_id} and send one of its names, spelled exactly`,
-    });
-  }
-  const asked = c.req.query("limit");
-  const limit = asked === undefined ? CODEX_PREVIEW_MAX : /^[0-9]+$/.test(asked) ? Number(asked) : NaN;
-  if (!Number.isSafeInteger(limit) || limit < 1 || limit > CODEX_PREVIEW_MAX) {
-    bad(400, `That limit is not a preview.`, {
-      Received: show(asked),
-      Expected: `a whole number from 1 to ${CODEX_PREVIEW_MAX}`,
-      Source: "the limit query parameter",
-      Fix: `send ?limit=${CODEX_PREVIEW_MAX}, or leave it out`,
-    });
-  }
-  const wheres = c.req.queries("where") ?? [];
-  const filters: { column: string; op: string; value: string }[] = [];
-  if (wheres.length) {
-    await assertSheetEditor(c, sheet_id, "filter the rows of");
-    if (wheres.length > CODEX_FILTERS_MAX) {
-      bad(400, `That is too many filters for a preview.`, {
-        Received: `${wheres.length} where parameters`,
-        Expected: `at most ${CODEX_FILTERS_MAX} where filters`,
-        Source: "the where query parameters",
-        Fix: `keep the ${CODEX_FILTERS_MAX} that narrow the rows most, or read the table through a query`,
+  for (const where of wheres) {
+    const first = where.indexOf(".");
+    const rest = first < 0 ? "" : where.slice(first + 1);
+    const second = rest.indexOf(".");
+    const column = first < 0 ? "" : where.slice(0, first);
+    const op = second < 0 ? rest : rest.slice(0, second);
+    const value = second < 0 ? undefined : rest.slice(second + 1);
+    const bare = op === "isnull" || op === "notnull";
+    if (!column || !op || (!bare && value === undefined)) {
+      bad(400, `That filter is not a column, an op and a value.`, {
+        Received: show(where),
+        Expected: "<column>.<op>.<value>, or <column>.isnull and <column>.notnull",
+        Source: "a where query parameter",
+        Fix: "send e.g. where=status.eq.paid",
       });
     }
-    for (const where of wheres) {
-      const first = where.indexOf(".");
-      const rest = first < 0 ? "" : where.slice(first + 1);
-      const second = rest.indexOf(".");
-      const column = first < 0 ? "" : where.slice(0, first);
-      const op = second < 0 ? rest : rest.slice(0, second);
-      const value = second < 0 ? undefined : rest.slice(second + 1);
-      const bare = op === "isnull" || op === "notnull";
-      if (!column || !op || (!bare && value === undefined)) {
-        bad(400, `That filter is not a column, an op and a value.`, {
-          Received: show(where),
-          Expected: "<column>.<op>.<value>, or <column>.isnull and <column>.notnull",
-          Source: "a where query parameter",
-          Fix: "send e.g. where=status.eq.paid",
-        });
-      }
-      if (!Object.hasOwn(CODEX_OPS, op)) {
-        bad(400, `That filter op is not one this server knows.`, {
-          Received: show(op),
-          Expected: `one of ${Object.keys(CODEX_OPS).join(", ")}`,
-          Source: `the op in where=${show(where)}`,
-          Fix: "send one of those ops, spelled exactly",
-        });
-      }
-      if (bare && value) {
-        bad(400, `That filter op takes no value.`, {
-          Received: show(value),
-          Expected: `${column}.${op} with nothing after it`,
-          Source: `the value in where=${show(where)}`,
-          Fix: `send where=${column}.${op}`,
-        });
-      }
-      filters.push({ column, op, value: value ?? "" });
+    if (!Object.hasOwn(CODEX_OPS, op)) {
+      bad(400, `That filter op is not one this server knows.`, {
+        Received: show(op),
+        Expected: `one of ${Object.keys(CODEX_OPS).join(", ")}`,
+        Source: `the op in where=${show(where)}`,
+        Fix: "send one of those ops, spelled exactly",
+      });
     }
+    if (bare && value) {
+      bad(400, `That filter op takes no value.`, {
+        Received: show(value),
+        Expected: `${column}.${op} with nothing after it`,
+        Source: `the value in where=${show(where)}`,
+        Fix: `send where=${column}.${op}`,
+      });
+    }
+    filters.push({ column, op, value: value ?? "" });
   }
+  return filters;
+};
+
+/** One far table's rows, named from codexTables(): membership of that list is
+ * the injection guard, and the driver's identifier escaping names the table and
+ * each column on top of it. Asks for `limit` rows and no more. */
+const codexRead = async (
+  sheet_id: string,
+  table: string,
+  filters: CodexFilter[],
+  limit: number,
+): Promise<{ columns: string[]; rows: Record<string, unknown>[] }> => {
   const { tables, columns, rows, unknown, refused } = await codexConnect(sheet_id, async (far) => {
     const tables = await codexTables(far);
     const columns: string[] | undefined = tables.find((row: { name: string }) => row.name === table)?.columns
@@ -10306,6 +10380,54 @@ app.get("/codex/:id/preview", async (c) => {
       Fix: "preview a view over it whose names hold no dot",
     });
   }
+  return { columns, rows };
+};
+
+// The first rows of one far table, named from the list GET /codex/:id answers.
+// Membership in that list is the injection guard, and the driver's own
+// identifier escaping names the table and each column on top of it.
+app.get("/codex/:id/preview", async (c) => {
+  if (!rateLimit(`codex:${c.get("usr_id")}`)) {
+    bad(429, `Too many codex queries from this account.`, {
+      Expected: `a burst of at most ${RATE_LIMIT_MAX_TOKENS}, refilling at ${RATE_LIMIT_REFILL_RATE} per second`,
+      Received: "one query past that",
+      Source: `the codex budget for usr ${c.get("usr_id")}`,
+      Fix: "wait a second and ask again",
+    });
+  }
+  const sheet_id = c.req.param("id");
+  const [type] = sheet_id.split(":");
+  await assertSheetAccess(c, sheet_id);
+  if (type !== "codex-db") {
+    bad(400, `Only a connected database has rows to preview.`, {
+      Expected: "codex-db",
+      Received: show(type),
+      Source: `the type prefix on sheet id ${sheet_id}`,
+      Fix: `read GET /codex/${sheet_id} for what this codex holds`,
+    });
+  }
+  const table = c.req.query("table");
+  if (!table) {
+    bad(400, `Name the table to preview.`, {
+      Received: show(table),
+      Expected: `?table= and one name GET /codex/${sheet_id} lists`,
+      Source: "the table query parameter",
+      Fix: `read GET /codex/${sheet_id} and send one of its names, spelled exactly`,
+    });
+  }
+  const asked = c.req.query("limit");
+  const limit = asked === undefined ? CODEX_PREVIEW_MAX : /^[0-9]+$/.test(asked) ? Number(asked) : NaN;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > CODEX_PREVIEW_MAX) {
+    bad(400, `That limit is not a preview.`, {
+      Received: show(asked),
+      Expected: `a whole number from 1 to ${CODEX_PREVIEW_MAX}`,
+      Source: "the limit query parameter",
+      Fix: `send ?limit=${CODEX_PREVIEW_MAX}, or leave it out`,
+    });
+  }
+  const wheres = c.req.queries("where") ?? [];
+  if (wheres.length) await assertSheetEditor(c, sheet_id, "filter the rows of");
+  const { columns, rows } = await codexRead(sheet_id, table, codexFilters(wheres), limit);
   // Typed text, as GET /codex/:id types its columns: typing a far column is its own item.
   const cols = columns.map((name) => ({ name, type: "text", key: name }));
   return c.json({ data: [cols, ...rows] }, 200);

@@ -40,6 +40,7 @@ import {
   trapStep,
 } from "./src/page.mjs";
 import alasql from "./src/alasql.mjs";
+import { CODEX_PREVIEW_MAX } from "./src/sql.mjs";
 import { boot, El, refused, resolver, rowsOf, shelf, until } from "./page_harness.ts";
 
 // A feed's first poll used to be the first news of a wrong url or a missing
@@ -1049,6 +1050,45 @@ Deno.test("the history lists a sheet's versions, draws a past one, and no key wr
   assertEquals(all("#past").length, 0, "and the modal closes");
   await key({ key: "z", ctrlKey: true });
   assertEquals((writes[2] as { data: unknown }).data, backward, "Ctrl+Z writes the backward patches");
+
+  // Compare: the picked version against the open sheet, by row position and column.
+  app.ports.docSelected.send({
+    id: "table:two",
+    data: { doc: { type: "table", data: [cols, { a: "Lima", b: "x" }, { a: "Oslo", b: "y" }] } },
+  });
+  await settle();
+  await click(chip());
+  app.ports.historyLoaded.send({ id: "table:two", data: { versions: [version("h1", 0, 1)], left: 0 } });
+  await settle();
+  await click(all("#versions button")[0]);
+  const show = async (columns: string[], rows: unknown[][], drawn: number) => {
+    app.ports.historyShown.send({ id: "table:two", data: { hash: "h1", columns, rows } });
+    await until(
+      settle,
+      "the compared rows",
+      () =>
+        all("#past th").map((th) => th.textContent).join() === columns.join() &&
+        all("#past tbody tr").length === drawn,
+    );
+  };
+  const classes = () => all("#past tbody tr").map((tr) => tr.getAttribute("class") ?? "");
+  const changed = () => all("#past td.changed").map((td) => td.textContent);
+  await show(["city", ""], [["Lima", "z"], ["Oslo", "y"], ["Rome", "q"]], 3);
+  assertEquals(changed(), ["z"], "a cell that differs from the live one is marked");
+  assertEquals(classes(), ["", "", "removed"], "a row the sheet no longer has is marked removed");
+  assert(text().includes("1 cells changed, 0 rows added, 1 rows removed"), "and the counts sit above the table");
+  await show(["city", ""], [["Lima", "x"]], 2);
+  assertEquals(changed(), [], "equal cells are not marked");
+  assertEquals(classes(), ["", "added"], "a live row the version lacks is drawn as today's row, marked added");
+  assertEquals(all("#past tbody tr")[1].textContent, "Osloy", "with the live cells");
+  assert(text().includes("0 cells changed, 1 rows added, 0 rows removed"), "counted");
+  await show(["city", "notes"], [["Lima", "x"]], 1);
+  assertEquals([changed(), classes()], [[], [""]], "columns that differ leave the version unmarked");
+  assert(
+    text().includes(`Received: "" added since; "notes" removed since`),
+    "and the line names the columns, as a restore does",
+  );
+  assert(!text().includes("cells changed"), "with no counts");
 });
 
 Deno.test("rollbackPatches turns one data array into another, cell by cell then by tail", () => {
@@ -1975,6 +2015,40 @@ Deno.test("the resolver reports every way a ref can fail, by name", async () => 
   // A cell reference needs exactly one row, or it would pick one arbitrarily.
   const many = await refused("select @table:countries.name as n");
   assert(many.includes("one row"), many);
+});
+
+Deno.test("a codex table ref reads the preview route, filters spelled once, and refuses a full cap", async () => {
+  const asked: string[] = [];
+  const table = (n: number) => [
+    { 0: { key: "n", name: "n", type: "text" } },
+    ...Array.from({ length: n }, (_, i) => ({ n: i })),
+  ];
+  const engine = sheets(alasql, () => ({}), () => Promise.resolve(undefined), undefined, (url: string) => {
+    asked.push(url);
+    return Promise.resolve({ data: table(url.includes("table=crowd") ? CODEX_PREVIEW_MAX : 2) });
+  });
+  assertEquals(
+    await answer(engine, "select count(*) as c from @codex-db:k3/widget?tag.eq.in%20stock&n.gte.1+2"),
+    [{ c: 2 }],
+  );
+  assertEquals(asked.length, 1);
+  assert(
+    asked[0].endsWith("/codex/codex-db:k3/preview?table=widget&where=tag.eq.in%20stock&where=n.gte.1%2B2"),
+    `the route reads + as a space, so it is sent as %2B: ${asked[0]}`,
+  );
+  try {
+    await engine.runSql("select * from @codex-db:k3/crowd", { "": null });
+    throw new Error("a full cap should refuse");
+  } catch (err) {
+    assert((err as Error).message.includes("more rows than a ref reads"), (err as Error).message);
+  }
+  const bare = sheets(alasql, () => ({}), () => Promise.resolve(undefined));
+  try {
+    await bare.runSql("select * from @codex-db:k3/widget", { "": null });
+    throw new Error("a page with no door should refuse");
+  } catch (err) {
+    assert((err as Error).message.includes("cannot be read here"), (err as Error).message);
+  }
 });
 
 Deno.test("a reference cycle is refused as the path that closes it", async () => {

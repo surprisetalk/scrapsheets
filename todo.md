@@ -13,10 +13,22 @@ here.
 Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature builds its recommended design, with
 `REVIEW:` notes for the owner.
 
-- [ ] Adding two currencies inside a `where`, a `case` or a join key is refused, the way a select item is.
-  1. Extend `rejectMixedCurrency` in `src/sql.mjs` to read `where`, `case ... when` and join `on` comparisons. Keep it
-     textual, as the select check is, and name both columns in the refusal.
-  2. One `main_test.ts` case per clause beside the select cases.
+- [ ] A peer's edit to the code of a query you have open reruns it in your page.
+  1. Reproduce first in `sync_test.ts` with `realRepo` and `glue().link()`: open a settled query, edit its
+     `data[0].code` from the linked repo, and wait with `until()` for the new answer. A run-17 breaker saw the editor
+     and table stay stale, but only by hand.
+  2. If it fails, find why `queryDoc` misses that `change`, and fix it. If it passes, delete this entry.
+
+- [ ] A flood on one socket cannot evict another peer's cached role, and the test proves it.
+  1. In `main_test.ts`'s websocket step, the cache flooder sends fewer lookups than the older fake entries ahead of the
+     peer's, so `bound()` never reaches the peer and the assertion passes either way. Seed the cache so the peer's entry
+     is next in line, and assert it survives.
+  2. Prove it by restoring the whole-cache clear by hand: the test must fail.
+
+- [ ] The suite finishes under its 10-second gate at load 10, not only on a quiet machine.
+  1. `main_test.ts` is the long pole, about 7 s: about 1 s of PGlite boot and about 75 steps of 100-300 ms of real work.
+     Each socket flood waits on hundreds of PGlite role lookups.
+  2. Measure a faster test-only role lookup, or one fewer PGlite boot, at matched load, before anything is split.
 
 - [ ] You write a snippet that takes arguments, like `{{f(x)}}`.
   1. Wait for a real snippet that needs one.
@@ -31,42 +43,28 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
      and in `editAdvice`.
   3. Freshness bound and referential integrity wait on row identity (see the cell-note entry).
 
-- [ ] You query a connected database's filtered table with a ref in a query sheet, on the server and in the page.
-  1. Design the ref syntax first: `scanRefs` reads `@type:id.column` as a scalar cell, so a table and its filters need
-     their own form. Write it as example records.
-  2. Make `sheet()` answer a `codex-db` id through `codexConnect` and the preview statement, editor-only through
-     `assertSheetEditor`, rows capped at `CODEX_PREVIEW_MAX`.
-  3. Answer `assertNoKeys`, `library:lineage` and one `record()` row per query for the new ref.
-  4. Run it in the page through `sheets()` too, and add the pair to `examples_test.ts`.
-
 - [ ] A multi column takes its options from another sheet.
   1. Wait for a sheet that needs it.
   2. `multi:@table:<id>.<column>`; the page draws that column's distinct values as the checkboxes.
   3. Decide first how `checkColumnTypes` learns the options on the server without a read per write.
 
-- [ ] You see who else is in the sheet by name, and where their cursor is.
-  1. Stamp each ephemeral frame server-side in `/library/sync` with the sender's display name, never the email.
-  2. Derive the colour from that identity, so one person keeps one colour.
-  3. Broadcast the focus cell on a `cell` channel, throttled to 200 ms or more, and outline it in the peer's colour.
-
-- [ ] You promote a fork and learn what it breaks, and branch a pipeline.
-  1. Before promote writes, call `lineageFor` on the source and `dependents` on the columns the old query returned and
-     the new one does not; hold the write in `model.pending` as a rename does.
-  2. Add `forked_heads` so promote also catches non-code edits to the source.
-  3. Branch and merge a query through automerge `clone` and `merge`. A sandbox of fake deliveries comes after.
-  4. Extend promote to alert, chart and net-http sheets.
+- [ ] You branch a query, edit it freely, and merge it back, and you promote alert, chart and net-http sheets too.
+  1. Branch with automerge `clone` of the source handle's document: store the clone as the fork's own document, so
+     `merge` can carry both histories. A bundled source still takes the JSON copy.
+  2. Merge with `Automerge.merge(source, fork)` in `promoteDoc`; replace the `data[0].code` write and the `forked_heads`
+     key check. Show the keys that conflicted before the write.
+  3. Make `forkDoc` and `promoteDoc` accept `alert`, `chart` and `net-http`: drop the `query:` prefix tests, and write
+     `forked_code` as the sheet's own text field.
+  4. Teach `promoteColumns` the columns of an alert (its query's), a chart (its source's) and a net-http feed (its
+     stored rows' names).
+  5. Test each type with a real-automerge fork, as the query test in `sync_test.ts` does.
+  6. Skip the lineage warning for a fork of a bundled query: the glue refuses that promote anyway.
 
 - [ ] You resolve the merges automerge cannot decide in a conflict view.
   1. Design first: which conflicts `getConflicts` reports for a cell, and how the history modal shows them.
 
-- [ ] You see what a past version changed before you restore it.
-  1. In `viewHistory`, compare the past rows with the live rows by position and mark each differing cell with a class
-     `style.css` draws. The live rows are in the model already: no port.
-  2. Mark rows added and removed since, and show the count of changed cells above `table#past`.
-
-- [ ] You collapse a subtotal group, and pivot rows by one column and columns by another, in the UI.
-  1. `collapsed : Set String` beside `sheet.subtotal`; a group's footer row toggles it and hides its rows.
-  2. A pivot panel (row, column and value columns) over the same `subtotalGroups` fold. AlaSQL's `pivot` is correct once
+- [ ] You pivot rows by one column and columns by another, in the UI.
+  1. A pivot panel (row, column and value columns) over the same `subtotalGroups` fold. AlaSQL's `pivot` is correct once
      `checkPivot()` has checked it.
 
 ---

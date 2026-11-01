@@ -890,6 +890,19 @@
           // and a listener per open delivered every change once per open.
           let watched = null;
           let presence = null;
+          // The focus cell goes out at most once per PRESENCE_CELL_MS. A move inside the wait
+          // only replaces `cellNext`, so the last position is the one that lands.
+          const PRESENCE_CELL_MS = 200;
+          let cellAt = 0, cellTimer = null, cellNext = null;
+          app.ports.focusCell.subscribe((cell) => {
+            cellNext = cell;
+            if (cellTimer) return;
+            cellTimer = setTimeout(() => {
+              cellTimer = null;
+              cellAt = Date.now();
+              presence?.broadcast("cell", cellNext.x < 0 || cellNext.y < 0 ? null : cellNext);
+            }, Math.max(0, cellAt + PRESENCE_CELL_MS - Date.now()));
+          });
 
           const setupDragDrop = () => {
             document.body.addEventListener("dragover", (e) => {
@@ -951,6 +964,13 @@
             (doc_id) => repo.find(doc_id).then(async (h) => (await h.whenReady?.(), h.doc())),
             // A handle's heads() throws until it is ready.
             (doc_id) => repo.find(doc_id).then(async (h) => (await h.whenReady?.(), h.heads().join())),
+            async (url) => {
+              const token = getAuthToken();
+              if (!token) throw new Error("Log in to read a connected database: its rows are read under your account.");
+              const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+              if (!res.ok) throw new Error(await codexRefusal(res));
+              return await res.json();
+            },
           );
           // Pull the origin's own words out of an error body so the message names a cause,
           // not just a status code (arxiv hides it in <entry><summary>, most APIs in JSON).
@@ -1154,6 +1174,8 @@
             watched = null;
             presence?.stop();
             presence = null;
+            clearTimeout(cellTimer);
+            cellTimer = null;
             app.ports.peersChanged.send({ id: "", data: [] });
             unfollow();
 
@@ -1227,14 +1249,18 @@
               watched = { handle: sheetHandle, onChange };
               // A bundled sheet's handle has no `broadcast`: nobody else is in it.
               if (sheetHandle.broadcast) {
-                // Nothing identifying: a colour this tab picks for this open, kept nowhere.
+                // A signed-out tab keeps this colour; for a signed-in one the server
+                // stamps a stable colour and the name over what is sent here.
                 const colour = "#" + [...crypto.getRandomValues(new Uint8Array(3))].map((b) => b.toString(16).padStart(2, "0")).join("");
                 const here = new Presence({ handle: sheetHandle });
                 const send = () =>
                   app.ports.peersChanged.send({
                     id,
-                    // A peer's state is whatever it sent: only a string can ride the port.
-                    data: Object.values(here.getPeerStates().value).map((p) => p.value.colour).filter((c) => typeof c === "string").sort(),
+                    // A peer's state is whatever it sent: only a string colour can ride the port, and Elm reads the rest.
+                    data: Object.values(here.getPeerStates().value)
+                      .map((p) => ({ colour: p.value.colour, name: p.value.name ?? null, cell: p.value.cell ?? null }))
+                      .filter((p) => typeof p.colour === "string")
+                      .sort((a, b) => (a.colour < b.colour ? -1 : a.colour > b.colour ? 1 : 0)),
                   });
                 for (const event of ["snapshot", "update", "goodbye", "pruning"]) here.on(event, send);
                 // 15s heartbeats and a 45s ttl: three missed beats drop a peer.
@@ -1495,8 +1521,10 @@
             catchy(async (sourceId) => {
               const [type, source_doc_id] = sourceId.split(":");
               const entry = Library.get()[sourceId];
-              const source = entry?.doc ??
-                (await repo.find(source_doc_id).then(async (h) => (await h.whenReady?.(), h.doc())));
+              // A shelf document has no handle, so it has no heads to remember.
+              const sourceHandle = entry?.doc ? null : await repo.find(source_doc_id);
+              await sourceHandle?.whenReady?.();
+              const source = entry?.doc ?? sourceHandle.doc();
               if (!source?.data) {
                 app.ports.docErrored.send(
                   [
@@ -1515,6 +1543,8 @@
                 name,
                 forked_from: sourceId,
                 ...(type === "query" && typeof source.data[0]?.code === "string" ? { forked_code: source.data[0].code } : {}),
+                // Hex, the way `view` takes heads. Promote reads the source at these.
+                ...(type === "query" && sourceHandle ? { forked_heads: decodeHeads(sourceHandle.heads()) } : {}),
               });
               if (copy.whenReady) await copy.whenReady();
               const id = `${type}:${copy.documentId}`;
@@ -1534,8 +1564,11 @@
 
           // Promote: copy a forked query's code back to the sheet it came from, and
           // refuse when that sheet's code is no longer the code the fork started
-          // from. Two writes, source then fork, so a crash between them leaves the
-          // source equal to the fork's code, and the rerun writes only `forked_code`.
+          // from, or when any other key of its data[0] moved since `forked_heads`.
+          // Two writes, source then fork, so a crash between them leaves the
+          // source equal to the fork's code, and the rerun writes only the fork's
+          // `forked_code` and `forked_heads`. The code write moves no other key,
+          // so the rerun passes the same check.
           app.ports.promoteDoc.subscribe(
             catchy(async (forkId) => {
               const refuse = (...lines) => app.ports.docErrored.send([`I could not promote "@${forkId}".`, ``, ...lines].join("\n"));
@@ -1572,8 +1605,24 @@
                   `  Fix:          copy the source's new query into the fork, then promote. Nothing was written`,
                 );
               }
+              if (Array.isArray(fork.forked_heads)) {
+                const [was, now] = [view(source, fork.forked_heads).data[0], source.data[0]];
+                const moved = [...new Set([...Object.keys(was), ...Object.keys(now)])]
+                  .filter((key) => key !== "code" && JSON.stringify(was[key]) !== JSON.stringify(now[key]));
+                if (moved.length) {
+                  return refuse(
+                    `  Expected:     the source's settings to equal the ones you forked from`,
+                    `  Received:     "@${sourceId}" now has ${moved.map((key) => `\`${key}\``).join(", ")} changed`,
+                    `  Source:       forked_heads on this fork`,
+                    `  Fix:          fork the source again, or put those settings back. Nothing was written`,
+                  );
+                }
+              }
               if (live !== code) sourceHandle.change((d) => { d.data[0].code = code; });
-              if (fork.forked_code !== code) forkHandle.change((d) => { d.forked_code = code; });
+              if (fork.forked_code !== code) {
+                // REVIEW: The fork's heads move to the source's after the code lands, so the next promote compares against what this one wrote. Alternative: leave forked_heads at fork time. Then a source setting changed after a promote refuses every later promote until the fork is made again.
+                forkHandle.change((d) => { d.forked_code = code; d.forked_heads = decodeHeads(sourceHandle.heads()); });
+              }
               window.history.pushState({}, "", `/${sourceId}`);
               sheet = sourceHandle;
               await selectDoc(sourceId, sourceHandle);

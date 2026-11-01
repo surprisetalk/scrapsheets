@@ -146,6 +146,18 @@ button:hover {
   border-radius: 50%;
 }
 
+.peer-name {
+  font-size: 0.75rem;
+  /* A name with a right-to-left override must not reorder the text around it. */
+  unicode-bidi: isolate;
+}
+
+/* The colour is inline: it is the peer's. */
+td.peer-cell {
+  outline: 2px solid;
+  outline-offset: -2px;
+}
+
 .chip {
   font-size: 0.75rem;
   padding: 2px 8px;
@@ -415,6 +427,10 @@ th:hover {
   background: #f6f6f6;
 }
 
+tr.subtotal em.blank {
+  font-style: italic;
+}
+
 @media (min-width: 768px) {
   body > div {
     grid-template-columns: 1fr auto;
@@ -452,4 +468,17 @@ body.drag-over::before {
   font-size: 2rem;
   font-weight: bold;
   pointer-events: none;
+}
+
+#past tr.added td:first-child {
+  border-left: 3px solid #468;
+}
+
+#past tr.removed td {
+  text-decoration: line-through;
+  color: #888;
+}
+
+#past td.changed {
+  background: #ffe9a8;
 }

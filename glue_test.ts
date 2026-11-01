@@ -137,21 +137,51 @@ Deno.test({
     assertEquals(hello.type, "snapshot", "opening a sheet announces this tab");
     assertEquals(Object.keys(hello.state), ["colour"], "the announcement carries a colour and nothing identifying");
     assert(/^#[0-9a-f]{6}$/.test(hello.state.colour), `expected a #rrggbb colour, received ${hello.state.colour}`);
-    const sent: { id: string; data: string[] }[] = [];
+    type Peer = { colour: string; name: string | null; cell: { x: number; y: number } | null };
+    const sent: { id: string; data: Peer[] }[] = [];
     const send = page.app.ports.peersChanged.send;
     page.app.ports.peersChanged.send = (d: unknown) => (sent.push(d as (typeof sent)[0]), send(d));
-    handle.hear("peer-b", { [marker]: { type: "snapshot", state: { colour: "#4a8000" } } });
-    assertEquals(sent.at(-1), { id: "table:split1", data: ["#4a8000"] }, "a peer's colour, and not this tab's own");
+    handle.hear("peer-b", { [marker]: { type: "snapshot", state: { colour: "#4a8000", name: "Ann" } } });
+    assertEquals(
+      sent.at(-1),
+      { id: "table:split1", data: [{ colour: "#4a8000", name: "Ann", cell: null }] },
+      "a peer's colour and the name the server stamped, and not this tab's own",
+    );
     await page.settle();
     assert(page.text().includes("1 here"), `expected the toolbar to count one other tab, got: ${page.text()}`);
+    assert(page.text().includes("Ann"), `expected the toolbar to name the peer, got: ${page.text()}`);
+    handle.hear("peer-b", { [marker]: { type: "update", channel: "cell", value: { x: 1, y: 2 } } });
+    assertEquals(sent.at(-1)?.data[0].cell, { x: 1, y: 2 }, "a peer's cell rides the same list");
     handle.hear("peer-b", { [marker]: { type: "goodbye" } });
-    assertEquals(sent.at(-1)?.data, [], "a goodbye takes the peer's colour away");
+    assertEquals(sent.at(-1)?.data, [], "a goodbye takes the peer away");
     // A peer's state is whatever it sent over the wire: a colour with no toString crashed the listener.
     handle.hear("bad-1", { [marker]: { type: "snapshot", state: { colour: { toString: 1 } } } });
     handle.hear("bad-2", { [marker]: { type: "snapshot", state: { colour: "#4a8000" } } });
-    assertEquals(sent.at(-1)?.data, ["#4a8000"], "a hostile colour is dropped and the listener lives");
+    assertEquals(
+      sent.at(-1)?.data.map((p) => p.colour),
+      ["#4a8000"],
+      "a hostile colour is dropped and the listener lives",
+    );
     handle.hear("bad-2", { [marker]: { type: "goodbye" } });
     handle.hear("peer-b", { [marker]: { type: "snapshot", state: { colour: "#4a8000" } } });
+
+    // This tab's focus cell: the first move goes out at once, the moves inside
+    // the next 200 ms collapse into the last one, and a cleared selection is null.
+    const cells = () =>
+      handle.broadcasts.map((m) => (m as Record<string, { type: string; channel?: string; value: unknown }>)[marker])
+        .filter((m) => m.type === "update" && m.channel === "cell").map((m) => m.value);
+    const tds = page.all("tbody tr").map((r) => [...r.querySelectorAll("td")]);
+    const visit = async (cell: (typeof tds)[0][0]) => {
+      for (const type of ["mouseenter", "click"]) await page.fire(cell, type);
+    };
+    await visit(tds[3][0]);
+    await visit(tds[4][0]);
+    await visit(tds[3][0]);
+    await until(page.settle, "the trailing cell send", () => cells().length === 2);
+    const [first, last] = cells() as { x: number; y: number }[];
+    assertEquals(first, last, "three moves, two sends: the row between was folded away and the last position landed");
+    assertEquals(first.x, 0);
+
     await page.go("/table:countries");
     assertEquals(handle.broadcasts.at(-1), { [marker]: { type: "goodbye" } }, "leaving the sheet says goodbye");
     assertEquals(sent.at(-1), { id: "", data: [] }, "and empties the row, a bundled sheet having no peers to add");

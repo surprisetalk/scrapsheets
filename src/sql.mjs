@@ -389,13 +389,44 @@ const tCrit = (level, df) => {
 // once, so a query sheet reads its parameters out of cells the same way a
 // spreadsheet reads an assumptions block. Nothing is spliced into the SQL as a
 // literal, so nothing needs escaping.
+//
+// A connected database's table is `@codex-db:<id>/<table>`, narrowed by the codex
+// filter grammar after a `?`, AND-ed with `&`:
+//
+//   select * from @codex-db:k3/orders                       -- bare: the table's rows
+//   select * from @codex-db:k3/orders?status.eq.paid        -- one filter, <column>.<op>.<value>
+//   select * from @codex-db:k3/orders?status.between.1      -- refused: "That filter op is not one this server knows."
+//
+// A value spells any other character as %XX. The class holds no space, quote,
+// paren or comma, so none of them can end a ref early or reach the engine's
+// string literal. A table the class cannot hold (a dash, a space) is not
+// reachable by ref.
+// REVIEW: The ref is the preview route's own grammar after a `/`. Alternative: a snippet-style `using` table of connections. It adds a noun and a second place that names a table.
+const FILTER = String.raw`(?:%[0-9A-Fa-f]{2}|[A-Za-z0-9_.:+-])+`;
+const CODEX_ID = new RegExp(
+  String.raw`^(codex-db:[A-Za-z0-9_-]+)/([A-Za-z_][A-Za-z0-9_]*)(?:\?(${FILTER}(?:&${FILTER})*))?`,
+);
+
+/** The parts of a codex table ref, or null for any other id. The filters stay
+ * percent-encoded: the page sends each as a `where` value as it stands, and the
+ * server decodes them. */
+export const codexRef = (id) => {
+  const m = id.match(CODEX_ID);
+  return m?.[0] === id ? { sheet_id: m[1], table: m[2], wheres: m[3] === undefined ? [] : m[3].split("&") } : null;
+};
+
+export const CODEX_PREVIEW_MAX = 100;
+
 export const scanRefs = (code) => {
   let out = "", inStr = false;
   const ids = [], cells = [];
   for (let i = 0; i < code.length; i++) {
     const ch = code[i];
     if (ch === "'") inStr = !inStr;
-    const ref = !inStr && ch === "@"
+    const codex = !inStr && ch === "@" ? code.slice(i + 1).match(CODEX_ID) : null;
+    const ref = codex
+      ? [`@${codex[0]}`, codex[0]]
+      : !inStr && ch === "@"
       ? code.slice(i).match(/^@([a-z-]+:[A-Za-z0-9_-]+)(?:\.([A-Za-z_][A-Za-z0-9_]*))?/)
       : null;
     if (ref) {
@@ -434,6 +465,9 @@ export const checkCells = (cells, rowsOf, colsOf = {}) => {
 };
 
 export const MAX_REF_DEPTH = 8;
+
+// REVIEW: One query opens at most MAX_REF_DEPTH far connections, one per distinct codex ref. Alternative: a budget on the account's far reads. It adds a bucket and a noun.
+const CODEX_REFS_MAX = MAX_REF_DEPTH;
 
 // Bounds the @query -> @query chain. A cycle is reported as the path that closes
 // it, because "nested too deeply" sends you looking for the wrong problem.
@@ -2339,9 +2373,10 @@ export const selectTypes = (code, nameToType) => {
 //
 // Two amounts in different currencies have no sum. This reads the author's own text, so it sees only a
 // select item that adds or subtracts bare columns, each one maybe wrapped in sum, avg, min, max, round or
-// parentheses (a snippet body arrives in them), which are split again. A case, a where and a join slip
-// through: the check is textual, not typed. `usd` counts
-// as the code USD, so `usd` and `money:USD` mix. A name is read by itself, so the same name in two sheets
+// parentheses (a snippet body arrives in them), which are split again. The where clause, each join's on and
+// each case are read the same way, as comparisons: both sides of one, and every then and else value of one
+// case, share a currency, and a literal or a scalar multiple has none. The check is textual, not typed.
+// `usd` counts as the code USD, so `usd` and `money:USD` mix. A name is read by itself, so the same name in two sheets
 // stands for one column, and two currencies on it are refused whenever the statement adds it.
 const currencyOf = (type) => type === "usd" ? "USD" : MONEY_SHAPE.test(type) ? type.slice(6) : null;
 
@@ -2385,6 +2420,151 @@ const termsOf = (text, hops) => {
   return parts.length > 1 ? parts.flatMap((part) => termsOf(part.trim(), hops + 1)) : [text];
 };
 
+const NAME = /^(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)$/;
+
+// One term's currency, or null when it has none. A convert() call is checked against its amount's column
+// and typed by its `to`. A name two loaded sheets type in two currencies is refused when `strict`, else the
+// caller refuses it only beside a second term, so a comparison with a literal passes.
+const typedTerm = (term, held, strict, label) => {
+  const call = convertCall(term);
+  if (call) {
+    const column = bare(call.amount).match(NAME)?.[1];
+    const sheets = call.from && column && held.get(column);
+    const wrong = sheets && sheets.find((x) => currencyOf(x.type) !== call.from);
+    if (wrong) {
+      throw new Error(explain(`The column "${column}" is converted from the wrong currency.`, {
+        Received: `${wrong.type} in @${wrong.id}, converted from '${call.from}'`,
+        Expected: `the from code '${currencyOf(wrong.type)}', the currency the column is typed in`,
+        Source: `the convert() call in ${label} of this query`,
+        Fix: `write '${currencyOf(wrong.type)}' as the second argument, or convert a column in ${call.from}`,
+      }));
+    }
+    return call.to ? { name: term, type: `money:${call.to}`, code: call.to } : null;
+  }
+  const name = bare(term).match(NAME)?.[1];
+  const sheets = name && held.get(name);
+  if (!sheets) return null;
+  const codes = new Set(sheets.map((x) => currencyOf(x.type)));
+  return { name, type: sheets[0].type, code: [...codes][0], sheets: codes.size > 1 ? sheets : null, strict };
+};
+
+const refuseClash = (seen, label) => {
+  for (const x of seen) {
+    if (x.sheets && (x.strict || seen.length > 1)) {
+      throw new Error(explain(`The column "${x.name}" is typed in two currencies.`, {
+        Received: x.sheets.map((y) => `${y.type} in @${y.id}`).join(", "),
+        Expected: "one currency for one column name in a statement that adds, subtracts or compares it",
+        Source: `${label} of this query`,
+        Fix: `rename "${x.name}" in one sheet, or select it from one sheet only`,
+      }));
+    }
+  }
+  const first = seen[0];
+  const clash = first && seen.find((x) => x.code !== first.code);
+  if (clash) {
+    throw new Error(explain(`This query mixes two currencies in ${label}.`, {
+      Received: `"${first.name}" is ${first.type} and "${clash.name}" is ${clash.type}`,
+      Expected: "amounts in one currency on both sides of +, - and every comparison",
+      Source: `${label} of this query`,
+      Fix: "convert one side first, or keep the two columns apart",
+    }));
+  }
+};
+
+// The terms of a clause's text: cut at every top-level + - comparison sign, `not`, `like`, `in` and
+// `between`, then peeled by termsOf. A term that is not a bare column, a convert() call or a wrapped sum of
+// them (a scalar multiple, a literal, a function) has no currency here. `and` / `or` start a new group,
+// which the caller checks apart, except the `and` of a `between`. A group that is one parenthesised
+// condition is read again from inside, and an `in (a, b)` list is one term per item.
+const clauseGroups = (text, hops = 0) => {
+  if (hops > SELECT_DEPTH) {
+    throw new Error(explain(`This condition nests brackets deeper than ${SELECT_DEPTH}.`, {
+      Received: `${hops} levels in "${text.slice(0, 40)}"`,
+      Source: "a where, case or on condition of this query",
+      Fix: "flatten the brackets",
+    }));
+  }
+  const d = topLevel(text);
+  const breaks = [];
+  const plain = new Set();
+  let between = false;
+  for (let m, re = /\b(?:and|or|between)\b/gi; (m = re.exec(text));) {
+    if (d[m.index] !== 0) continue;
+    const word = m[0].toLowerCase();
+    if (word === "between") between = true;
+    else if (word === "and" && between) {
+      between = false;
+      plain.add(m.index);
+    } else { breaks.push([m.index, m[0].length]); }
+  }
+  let from = 0;
+  const pieces = [];
+  for (const [at, len] of breaks) {
+    pieces.push([from, at]);
+    from = at + len;
+  }
+  pieces.push([from, text.length]);
+  const out = [];
+  for (const [x, y] of pieces) {
+    const piece = text.slice(x, y).trim().replace(/^not\s+/i, "");
+    const open = piece.indexOf("(");
+    if (open === 0 && closeAt(piece, topLevel(piece), 0) === piece.length - 1) {
+      const inner = piece.slice(1, -1);
+      if (!/^\s*select\b/i.test(inner)) {
+        out.push(...clauseGroups(inner, hops + 1));
+        continue;
+      }
+    }
+    const cuts = [[x - 1, 1]];
+    for (let i = x; i < y; i++) if (d[i] === 0 && "+-<>=!".includes(text[i])) cuts.push([i, 1]);
+    for (let m, re = /\b(?:between|like|not|in)\b/gi; (m = re.exec(text));)
+      if (m.index >= x && m.index < y && d[m.index] === 0) cuts.push([m.index, m[0].length]);
+    for (const at of plain) if (at >= x && at < y) cuts.push([at, 3]);
+    cuts.sort((a, b) => a[0] - b[0]);
+    cuts.push([y, 0]);
+    const terms = [];
+    for (let k = 0; k + 1 < cuts.length; k++) {
+      const term = text.slice(cuts[k][0] + cuts[k][1], cuts[k + 1][0]).trim();
+      const td = topLevel(term);
+      if (/^\(\s*[^s\s]/i.test(term) && closeAt(term, td, 0) === term.length - 1 && !/^\(\s*select\b/i.test(term)) {
+        terms.push(
+          ...splitAt(term, td, 1, term.length - 1, td[0] + 1).flatMap(([a, b]) => termsOf(term.slice(a, b).trim(), 0)),
+        );
+      } else { terms.push(...termsOf(term, 0)); }
+    }
+    out.push(terms);
+  }
+  return out;
+};
+
+// Each case's then and else values share a currency; each when is read as a where comparison, against the
+// operand of a `case x when y` form. Nested cases are told apart by a stack over the code with its string
+// literals blanked.
+const caseParts = (code) => {
+  const flat = code.replace(/'(?:[^']|'')*'/g, (m) => " ".repeat(m.length));
+  const stack = [];
+  const done = [];
+  for (let m, re = /\b(case|when|then|else|end)\b/gi; (m = re.exec(flat));) {
+    const word = m[1].toLowerCase();
+    if (word === "case") {
+      stack.push({ kind: "case", from: re.lastIndex, whens: [], values: [] });
+      continue;
+    }
+    const top = stack[stack.length - 1];
+    if (!top) continue;
+    if (top.kind === "case" && word === "when") top.operand = code.slice(top.from, m.index);
+    if (top.kind === "when") top.whens.push(code.slice(top.from, m.index));
+    if (top.kind === "then" || top.kind === "else") top.values.push(code.slice(top.from, m.index));
+    if (word === "end") {
+      const inner = stack.pop();
+      done.push(inner);
+      const parent = stack[stack.length - 1];
+      if (parent && (parent.kind === "then" || parent.kind === "else")) parent.values.push(...inner.values);
+    } else { Object.assign(top, { kind: word, from: re.lastIndex }); }
+  }
+  return done;
+};
+
 export const rejectMixedCurrency = (code, colsOf) => {
   const held = new Map();
   for (const [id, cols] of Object.entries(colsOf ?? {})) {
@@ -2407,47 +2587,33 @@ export const rejectMixedCurrency = (code, colsOf) => {
       const unaliased = text.replace(/\s+(?:"[^"]*"|`[^`]*`|[A-Za-z_][A-Za-z0-9_]*)$/, "");
       if (unaliased && !unaliased.endsWith(".")) text = unaliased;
       for (const term of termsOf(text, 0)) {
-        const call = convertCall(term);
-        if (call) {
-          const column = bare(call.amount).match(/^(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)$/)?.[1];
-          const held_ = call.from && column && held.get(column);
-          const wrong = held_ && held_.find((x) => currencyOf(x.type) !== call.from);
-          if (wrong) {
-            throw new Error(explain(`The column "${column}" is converted from the wrong currency.`, {
-              Received: `${wrong.type} in @${wrong.id}, converted from '${call.from}'`,
-              Expected: `the from code '${currencyOf(wrong.type)}', the currency the column is typed in`,
-              Source: "the convert() call in the select list of this query",
-              Fix: `write '${currencyOf(wrong.type)}' as the second argument, or convert a column in ${call.from}`,
-            }));
-          }
-          if (call.to) seen.push({ name: term, type: `money:${call.to}`, code: call.to });
-          continue;
-        }
-        const name = bare(term).match(/^(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)$/)?.[1];
-        const sheets = name && held.get(name);
-        if (!sheets) continue;
-        const codes = new Set(sheets.map((x) => currencyOf(x.type)));
-        if (codes.size > 1) {
-          throw new Error(explain(`The column "${name}" is typed in two currencies.`, {
-            Received: sheets.map((x) => `${x.type} in @${x.id}`).join(", "),
-            Expected: "one currency for one column name in a statement that adds or subtracts it",
-            Source: "the select list of this query",
-            Fix: `rename "${name}" in one sheet, or select it from one sheet only`,
-          }));
-        }
-        seen.push({ name, type: sheets[0].type, code: [...codes][0] });
+        const typed = typedTerm(term, held, true, "the select list");
+        if (typed) seen.push(typed);
       }
     }
-    const first = seen[0];
-    const clash = first && seen.find((x) => x.code !== first.code);
-    if (clash) {
-      throw new Error(explain(`This query adds or subtracts two currencies.`, {
-        Received: `"${first.name}" is ${first.type} and "${clash.name}" is ${clash.type}`,
-        Expected: "amounts in one currency on both sides of + and -",
-        Source: "the select list of this query",
-        Fix: "convert one side first, or select the two columns apart",
-      }));
-    }
+    refuseClash(seen, "the select list");
+  }
+  const check = (text, label) => {
+    for (const terms of clauseGroups(text))
+      refuseClash(terms.map((t) => typedTerm(t, held, false, label)).filter(Boolean), label);
+  };
+  const ends = /\b(?:group|having|qualify|order|limit|offset|union|into)\b/gi;
+  const where = findAt(code, depth, /\bwhere\b/gi, 0);
+  if (where) {
+    const from = where.index + where[0].length;
+    check(code.slice(from, findAt(code, depth, ends, 0, from)?.index ?? code.length), "the where clause");
+  }
+  const joinEnds =
+    /\b(?:join|inner|left|right|full|cross|natural|on|where|group|having|qualify|order|limit|offset|union|into)\b/gi;
+  for (let on = findAt(code, depth, /\bon\b/gi, 0); on;) {
+    const from = on.index + on[0].length;
+    const end = findAt(code, depth, joinEnds, 0, from)?.index ?? code.length;
+    check(code.slice(from, end), "a join's on");
+    on = findAt(code, depth, /\bon\b/gi, 0, end);
+  }
+  for (const { whens, values, operand = "" } of caseParts(code)) {
+    for (const when of whens) check(operand.trim() ? `${operand} = ${when}` : when, "a case");
+    check(values.join(" + "), "a case");
   }
 };
 
@@ -2982,6 +3148,17 @@ export const toRecords = ([cols, ...rows]) =>
  */
 export const loadRefs = async (ids, { path, describing, fetch, onLoad, stages }) => {
   const docs = {}, colsOf = {};
+  const far = [...new Set(ids)].filter(codexRef);
+  if (far.length > CODEX_REFS_MAX) {
+    throw new Error(
+      explain(`This query reads ${far.length} codex table refs, and one run opens at most ${CODEX_REFS_MAX}.`, {
+        Expected: `at most ${CODEX_REFS_MAX} distinct @codex-db:<id>/<table> refs`,
+        Received: far.length,
+        Source: far.slice(0, CODEX_REFS_MAX).map((id) => "@" + id).join(", ") + ", ...",
+        Fix: "read the tables in separate queries, or filter each ref so one ref serves",
+      }),
+    );
+  }
   for (const id of ids) {
     if (docs[id]) continue;
     checkRefPath(path, id);

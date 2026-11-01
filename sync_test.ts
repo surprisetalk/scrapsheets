@@ -399,63 +399,148 @@ Deno.test({
     );
 
     // Promote. A bundled source has no document here: refused, nothing written.
-    const promote = () => page.click(page.all("button").find((b) => b.textContent?.trim() === "promote"));
+    await until(page.settle, "the fork's first answer", () => page.all("tbody tr").length > 0);
     const body = () => page.text();
-    const code = (id: string) => ((page.handles[id.split(":")[1]].doc() as { data: { code: string }[] }).data[0].code);
-    await promote();
+    // The fork reads the same columns as its source, so nothing is at risk and
+    // the glue answers at once.
+    await page.click(page.all("button").find((b) => b.textContent?.trim() === "promote"));
+    await until(page.settle, "the glue's refusal", () => body().includes("which ships with the page"));
     assert(
       body().includes("which ships with the page or has not loaded"),
       `bundled source refused: ${body().slice(-300)}`,
     );
     assertEquals(page.created.length, 1, "and the refusal writes nothing");
 
-    // A held source: fork the fork, edit the grandchild, promote it.
-    await page.click(page.all("button").find((b) => b.textContent?.trim() === "fork"));
-    assertEquals(page.created.length, 2);
-    assertEquals(
-      (page.created[1] as { forked_code: string }).forked_code,
-      code("query:made1"),
-      "forked_code is the source's code",
-    );
-    page.handles.made2.change((d) => ((d as { data: { code: string }[] }).data[0].code = "select 2"));
-    await promote();
-    assertEquals(code("query:made1"), "select 2", "the source takes the fork's code");
-    assertEquals(
-      (page.handles.made2.doc() as { forked_code: string }).forked_code,
-      "select 2",
-      "and the fork compares against it next time",
-    );
-    assertEquals(page.path(), "query:made1", "the page opens the source");
+    page.close();
+  },
+});
 
-    // The source moves on after a fork: refused, nothing written.
-    await page.click(page.all("button").find((b) => b.textContent?.trim() === "fork"));
-    page.handles.made3.change((d) => ((d as { data: { code: string }[] }).data[0].code = "select 3"));
-    page.handles.made1.change((d) => ((d as { data: { code: string }[] }).data[0].code = "select 4"));
-    await promote();
-    assert(body().includes("now reads `select 4`"), `changed source refused: ${body().slice(-300)}`);
-    assertEquals(code("query:made1"), "select 4", "the source is untouched");
+// Promote reads two things first: who reads the columns the fork would drop,
+// and whether the source moved since the fork. Real automerge, because the
+// second is a read of the source's history at `forked_heads`.
+Deno.test({
+  name: "promote asks who reads the columns it drops, and refuses a source whose settings moved",
+  sanitizeOps: false,
+  sanitizeResources: false,
+  fn: async () => {
+    const reader = {
+      sheet_id: "query:r1",
+      name: "reader",
+      type: "query",
+      depends_on: "",
+      columns: "b",
+    };
+    let readers: unknown[] = [];
+    let down = false;
+    const page = await glue("http://localhost/", {
+      realRepo: true,
+      stored: { user: { usr_id: "u1", jwt: "a-token" } },
+      respond: (url) =>
+        url.endsWith("/library/lineage")
+          ? down
+            ? new Response("no", { status: 500 })
+            : { data: [[{ name: "depends_on", type: "text", key: "depends_on" }], ...readers] }
+          : { data: [] },
+    });
+    const theirs = page.link();
+    type Doc = { data: [Record<string, unknown>]; forked_code?: string; forked_heads?: string[] };
+    const read = async (id: string) => (await page.document(id)) as Doc;
+    // A write from a second repo lands in the page's through the wire.
+    const edit = async (id: string, change: (d: Doc) => void, seen: (d: Doc) => boolean) => {
+      const handle = await theirs.find(id.split(":")[1] as never);
+      await handle.whenReady();
+      handle.change(change as never);
+      for (let tries = 1; !seen(await read(id)); tries++) {
+        if (tries > 100) throw new Error(`the page never heard the edit of ${id} (${tries} settles)`);
+        await page.settle();
+      }
+    };
+    const button = (label: string) => page.all("button").find((b) => b.textContent?.trim() === label);
+    const dialogs = () => page.all("div[role='dialog']").length;
+    const ready = () => until(page.settle, "the open query's first answer", () => page.all("tbody tr").length > 0);
 
-    // A crash after the source write: the source already equals the fork's code,
-    // and the rerun writes only forked_code. A third promote changes nothing.
-    page.handles.made1.change((d) => ((d as { data: { code: string }[] }).data[0].code = "select 3"));
-    await promote();
-    assertEquals(code("query:made1"), "select 3", "the rerun leaves the source alone");
-    assertEquals(
-      (page.handles.made3.doc() as { forked_code: string }).forked_code,
-      "select 3",
-      "and fixes forked_code",
+    await page.click(page.all("tr").find((tr) => tr.getAttribute("title") === "new query:..."));
+    const source = page.path();
+    await edit(
+      source,
+      (d) => (d.data[0].code = "select 1 as a, 2 as b"),
+      (d) => d.data[0].code === "select 1 as a, 2 as b",
     );
-    assertEquals(page.path(), "query:made1");
-    await page.click(page.all("button").find((b) => b.textContent?.trim() === "fork"));
-    assertEquals(page.created.length, 4);
-    page.handles.made4.change((d) => ((d as { data: { code: string }[] }).data[0].code = "select 5"));
-    page.handles.made1.change((d) => ((d as { data: { code: string }[] }).data[0].code = "a" + "\u{1F600}".repeat(50)));
-    await promote();
-    assertEquals(code("query:made1"), "a" + "\u{1F600}".repeat(50), "a changed source is untouched, emoji or not");
-    assert(
-      !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(body()),
-      "the refusal cuts the query between characters, not inside one",
+    readers = [{ ...reader, depends_on: source }];
+
+    // The fork drops `b`, and `reader` reads it: the promote waits, naming it.
+    await page.click(button("fork"));
+    const fork = page.path();
+    assert(fork !== source, "a fork is a sheet of its own");
+    assertEquals((await read(fork)).forked_heads?.length, 1, "the fork remembers the source's heads");
+    await edit(fork, (d) => (d.data[0].code = "select 1 as a"), (d) => d.data[0].code === "select 1 as a");
+    await until(
+      page.settle,
+      "the fork to answer with one column",
+      () => page.all("th").every((th) => !th.textContent?.includes("b")) && page.all("tbody tr").length > 0,
     );
+    await page.click(button("promote"));
+    await until(page.settle, "the warning", () => dialogs() > 0);
+    assert(page.text().includes("reader") && page.text().includes('drops "b"'), `names the reader, got ${page.text()}`);
+    await page.click(button("Cancel"));
+    assertEquals(dialogs(), 0, "Cancel closes the warning");
+    assertEquals((await read(source)).data[0].code, "select 1 as a, 2 as b", "and writes nothing");
+    assertEquals(page.path(), fork, "and stays on the fork");
+
+    await page.click(button("promote"));
+    await until(page.settle, "the warning again", () => dialogs() > 0);
+    await page.click(button("Promote"));
+    await until(page.settle, "the source to open", () => page.path() === source);
+    assertEquals((await read(source)).data[0].code, "select 1 as a", "Promote writes the fork's code into the source");
+    assertEquals((await read(fork)).forked_code, "select 1 as a", "and the fork compares against it next time");
+
+    // Nobody reads what the next fork keeps: the promote writes at once.
+    readers = [];
+    await page.click(button("fork"));
+    const second = page.path();
+    await edit(second, (d) => (d.data[0].code = "select 7 as a"), (d) => d.data[0].code === "select 7 as a");
+    await ready();
+    await page.click(button("promote"));
+    await until(page.settle, "the source to open", () => page.path() === source);
+    assertEquals((await read(source)).data[0].code, "select 7 as a");
+    assertEquals(dialogs(), 0, "a promote that drops no column asks nothing");
+
+    // A setting of the source moved after the fork: refused, naming the key.
+    await page.click(button("fork"));
+    const third = page.path();
+    await ready();
+    await edit(source, (d) => (d.data[0].interval = 60), (d) => d.data[0].interval === 60);
+    await page.go(`/${third}`);
+    await ready();
+    await page.click(button("promote"));
+    await until(page.settle, "the refusal", () => page.text().includes("Nothing was written"));
+    assert(page.text().includes("`interval`"), `names the key, got ${page.text()}`);
+    assertEquals(page.path(), third, "and stays on the fork");
+    await edit(source, (d) => delete d.data[0].interval, (d) => d.data[0].interval === undefined);
+
+    // A crash between the two writes left the source holding the fork's code:
+    // the rerun writes only the fork's side.
+    await edit(third, (d) => (d.data[0].code = "select 9 as a"), (d) => d.data[0].code === "select 9 as a");
+    await edit(source, (d) => (d.data[0].code = "select 9 as a"), (d) => d.data[0].code === "select 9 as a");
+    await ready();
+    await page.click(button("promote"));
+    await until(page.settle, "the source to open", () => page.path() === source);
+    assertEquals((await read(third)).forked_code, "select 9 as a", "the rerun fixes forked_code");
+
+    // Nobody can say who reads the source: the unknown state says why, and waits
+    // for the typist.
+    down = true;
+    await page.click(button("fork"));
+    await edit(page.path(), (d) => (d.data[0].code = "select 2 as c"), (d) => d.data[0].code === "select 2 as c");
+    await ready();
+    await page.click(button("promote"));
+    await until(
+      page.settle,
+      "the unknown state",
+      () => page.text().includes("could not be read: the read failed (500)"),
+    );
+    await page.click(button("Cancel"));
+    assertEquals((await read(source)).data[0].code, "select 9 as a", "Cancel writes nothing");
     page.close();
   },
 });
@@ -607,14 +692,18 @@ Deno.test({
 
     // Two real repos on one wire: the page's presence reaches a second repo, and
     // that repo's reaches the page. Each sees one peer, and a goodbye empties it.
-    const seen: { id: string; data: string[] }[] = [];
+    const seen: { id: string; data: { colour: string }[] }[] = [];
     const peersSend = page.app.ports.peersChanged.send;
     page.app.ports.peersChanged.send = (d: unknown) => (seen.push(d as (typeof seen)[0]), peersSend(d));
     const theirs = await page.link().find(id.split(":")[1]);
     await theirs.whenReady();
     const there = new Presence({ handle: theirs });
     there.start({ initialState: { colour: "#102030" } });
-    await until(page.settle, "the page to hear the second repo's colour", () => seen.at(-1)?.data[0] === "#102030");
+    await until(
+      page.settle,
+      "the page to hear the second repo's colour",
+      () => seen.at(-1)?.data[0]?.colour === "#102030",
+    );
     assertEquals(seen.at(-1)?.id, id, "the list names the sheet it is for");
     await until(
       page.settle,

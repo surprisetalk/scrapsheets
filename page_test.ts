@@ -122,20 +122,47 @@ Deno.test("a bundled table renders its rows, its grips and its stats", async () 
   // The totals row sums the numeric columns over the rows on screen.
   assert(doc.querySelector("tr.totals"), "expected a totals row");
 
-  // The tabs sharing a sheet: a dot each, from the colours the glue sends. A bad
-  // colour is dropped unseen, another sheet's list is ignored, and none draws nothing.
+  // The tabs sharing a sheet: a dot and a name each, from what the glue sends. A bad
+  // colour drops the peer unseen, another sheet's list is ignored, and none draws nothing.
   assert(!doc.querySelector(".peer"), "a sheet nobody else has open draws no dots");
-  app.ports.peersChanged.send({ id: "table:countries", data: ["#4a8000", "red", "#0000ff", "url(x)"] });
+  const peers = (data: unknown[]) => app.ports.peersChanged.send({ id: "table:countries", data });
+  peers([
+    { colour: "#4a8000", name: "Ann", cell: { x: 1, y: 1 } },
+    { colour: "red", name: "Bad", cell: null },
+    { colour: "#0000ff", name: "n".repeat(100), cell: { x: -1, y: 2 } },
+    { colour: "url(x)", name: "Zed", cell: null },
+  ]);
   await settle();
   assertEquals(all(".peer").map((d) => (d as unknown as { style: { background: string } }).style.background), [
     "rgb(74, 128, 0)",
     "rgb(0, 0, 255)",
   ]);
   assert(text().includes("2 here"), "the toolbar counts the dots drawn");
+  assertEquals(
+    all(".peer-name").map((n) => n.textContent),
+    ["Ann", "n".repeat(40)],
+    "each name is drawn, cut to its bound",
+  );
+  assert(!text().includes("Bad") && !text().includes("Zed"), "a dropped peer is not named");
+  const held = all("td.peer-cell");
+  assertEquals(held.length, 1, "one outline: the peer with a cell, and not the one whose cell is negative");
+  assertEquals(
+    (held[0] as unknown as { style: { outlineColor: string } }).style.outlineColor,
+    "rgb(74, 128, 0)",
+    "the outline is in the peer's colour",
+  );
+  assertEquals(
+    all("tbody tr").findIndex((r) => [...r.querySelectorAll("td.peer-cell")].length === 1) - 2,
+    1,
+    "on the row the cell names",
+  );
+  peers([{ colour: "#4a8000", name: "Ann", cell: { x: 1, y: 5000 } }]);
+  await settle();
+  assertEquals(all("td.peer-cell").length, 0, "a cell no row draws is outlined nowhere");
   app.ports.peersChanged.send({ id: "table:other", data: [] });
   await settle();
-  assertEquals(all(".peer").length, 2, "a list for another sheet changes nothing");
-  app.ports.peersChanged.send({ id: "table:countries", data: [] });
+  assertEquals(all(".peer").length, 1, "a list for another sheet changes nothing");
+  peers([]);
   await settle();
   assert(!doc.querySelector(".peer"), "an empty list draws nothing");
 });
@@ -381,7 +408,7 @@ Deno.test("hiding a column stops it rendering, and show-all brings it back", asy
 // die with the tab. They live on the columns in data[0] now, which is both where
 // applyPatches can reach (it is rooted at `data`) and where a share carries them.
 Deno.test("arranging a sheet writes the arrangement onto its columns", async () => {
-  const { app, dom, doc, all, click, settle, type_ } = await boot("http://localhost/table:countries");
+  const { app, dom, doc, all, click, settle, text, type_ } = await boot("http://localhost/table:countries");
   const patches: { action: string; path: unknown[]; value: unknown }[] = [];
   app.ports.arrangeDoc.subscribe((sent: { data: typeof patches }) => patches.push(...sent.data));
 
@@ -618,6 +645,7 @@ Deno.test("arranging a sheet writes the arrangement onto its columns", async () 
           },
           { "0": "b", "1": 4 },
           { "0": "", "1": 8 },
+          { "0": "(blank)", "1": 16 },
         ],
       },
     },
@@ -628,7 +656,40 @@ Deno.test("arranging a sheet writes the arrangement onto its columns", async () 
   const group = () => all("button").find((b) => b.textContent === "subtotal by this column")!;
   await click(group());
   assertEquals(group().getAttribute("aria-pressed"), "true");
-  assertEquals(all("tr.subtotal").map((tr) => tr.textContent), ["b5", "a2", "(blank)8"]);
+  assertEquals(all("tr.subtotal").map((tr) => tr.textContent), ["b5", "a2", "(blank)8", "(blank)16"]);
+  assertEquals(
+    all("tr.subtotal .blank").length,
+    1,
+    "only the blank group draws as blank; the text (blank) is its own group",
+  );
+
+  // A subtotal row collapses its group: its rows leave tbody, its totals stay, and the keyboard never lands on a hidden row.
+  const bodyRows = () => all("tbody tr").length;
+  const base = bodyRows();
+  const footer = (i: number) => all("tr.subtotal")[i];
+  assertEquals(footer(0).getAttribute("role"), "button");
+  assertEquals(footer(0).getAttribute("aria-expanded"), "true");
+  await click(footer(0));
+  assertEquals(bodyRows(), base - 2, "the two b rows are gone");
+  assertEquals(footer(0).getAttribute("aria-expanded"), "false");
+  assertEquals(footer(0).textContent, "b5", "its totals still show");
+  await click(footer(2));
+  assertEquals(bodyRows(), base - 3, "the blank group collapses alone, not the text (blank)");
+  footer(2).dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await settle();
+  assertEquals(bodyRows(), base - 2, "Enter expands it again");
+
+  for (const i of [1, 2, 3]) await click(footer(i));
+
+  // The filter bar counts what the filter keeps, not what a collapse folds away.
+  await type_(all("div.panel input[placeholder='contains...']")[0], "b");
+  assert(text().includes("Showing 3 of 5 rows"), `a filter keeps b, b and (blank), got ${text().slice(0, 400)}`);
+  await click(footer(0));
+  assert(
+    text().includes("Showing 3 of 5 rows"),
+    `collapsing the b group does not change what the filter keeps, got ${text().slice(0, 200)}`,
+  );
+  await click(footer(0));
   await click(group());
   assertEquals(all("tr.subtotal").length, 0, "pressing again clears the grouping");
 });

@@ -77,7 +77,7 @@ import {
 } from "./main.ts";
 import type { Alert, Col, NetHttp, Query, Sheet, Table, Template } from "./main.ts";
 import { DATASETS } from "./src/examples.mjs";
-import { cohortSql, MAX_NAMES, MAX_QUERY_ROWS } from "./src/sql.mjs";
+import { cohortSql, MAX_NAMES, MAX_QUERY_ROWS, MAX_REF_DEPTH } from "./src/sql.mjs";
 import ala from "alasql";
 import dbSql from "./schema/db.sql" with { type: "text" };
 import examplesSql from "./examples.sql" with { type: "text" };
@@ -224,6 +224,10 @@ Deno.test(async function allTests(t) {
         create table "odd.name" (x int);
         create table gadget (gadget_id int, note text);
         insert into gadget values (1, null), (2, 'v1.5'), (3, 'x');
+        create table crowd (n int, tag text);
+        insert into crowd select i, case when i = 7 then 'in stock' else 'x' end from generate_series(1, ${
+        CODEX_PREVIEW_MAX + 1
+      }) i;
       `);
       return db;
     })();
@@ -514,11 +518,11 @@ Deno.test(async function allTests(t) {
         ws.send(AM.cbor.encode({ type: "join", senderId, peerMetadata: {}, supportedProtocolVersions: ["1"] }));
         await until("peer reply", () => frames.some((f) => f.type === "peer"));
         let count = 0;
-        return {
+        const self = {
           ws,
           frames,
           errors: () => frames.filter((f) => f.type === "error" && String(f.message).startsWith("Ephemeral")),
-          send: (bytes: number) =>
+          sendData: (data: Uint8Array) =>
             ws.send(AM.cbor.encode({
               type: "ephemeral",
               senderId,
@@ -526,9 +530,11 @@ Deno.test(async function allTests(t) {
               documentId: hand.documentId,
               count: ++count,
               sessionId: `${senderId}-session`,
-              data: AM.cbor.encode({ pad: new Uint8Array(bytes) }),
+              data,
             })),
+          send: (bytes: number) => self.sendData(AM.cbor.encode({ pad: new Uint8Array(bytes) })),
         };
+        return self;
       };
 
       // The relay is live: a small frame reaches the reader.
@@ -563,6 +569,40 @@ Deno.test(async function allTests(t) {
       big.send(5000);
       await until("oversize error", () => big.errors().length === 1);
       assertStringIncludes(String(big.errors()[0].message), "at most");
+      // Presence is stamped by the server with who sent it: a client that claims
+      // another name or colour is overwritten, and a cell rides through.
+      await sql`update usr set name = 'Erin' where email = 'erin@example.com'`;
+      const heardPresence: Record<
+        string,
+        { type: string; state?: Record<string, unknown>; channel?: string; value?: unknown }
+      >[] = [];
+      handle.on("ephemeral-message", (e) => heardPresence.push(e.message as (typeof heardPresence)[0]));
+      const named = await flooder("raw-presence");
+      const presence = (message: unknown) => named.sendData(AM.cbor.encode({ __presence: message }));
+      presence({ type: "snapshot", state: { colour: "#ff0000", name: "Mallory", cell: { x: 1, y: 2 } } });
+      presence({ type: "update", channel: "name", value: "Mallory" });
+      presence({ type: "update", channel: "colour", value: "#ff0000" });
+      presence({ type: "update", channel: "cell", value: { x: 3, y: 4 } });
+      await until("four presence frames", () => heardPresence.length === 4);
+      const [snap, rename, recolour, cell] = heardPresence.map((m) => m.__presence);
+      assertEquals(snap.state?.name, "Erin", "the snapshot's name is the account's, not the claimed one");
+      assertEquals(snap.state?.cell, { x: 1, y: 2 }, "the cell is the sender's");
+      assert(
+        /^#[0-9a-f]{6}$/.test(String(snap.state?.colour)) && snap.state?.colour !== "#ff0000",
+        "the colour is derived",
+      );
+      assertEquals(rename.value, "Erin", "a name update is overwritten");
+      assertEquals(recolour.value, snap.state?.colour, "a colour update is overwritten with the same derived colour");
+      assertEquals(cell.value, { x: 3, y: 4 }, "a cell update passes through");
+      // A channel named like an Object.prototype member is not a stamped channel:
+      // it must neither throw in the relay nor get a function as its value.
+      heardPresence.length = 0;
+      for (const channel of ["constructor", "toString", "__proto__", "hasOwnProperty"])
+        presence({ type: "update", channel, value: "x" });
+      presence({ type: "update", channel: "cell", value: { x: 5, y: 6 } });
+      await until("prototype-named channels relayed", () => heardPresence.length === 5);
+      assertEquals(heardPresence.map((m) => m.__presence.value), ["x", "x", "x", "x", { x: 5, y: 6 }]);
+      named.ws.close();
       burst.ws.close();
       big.ws.close();
       adapter.disconnect();
@@ -3848,6 +3888,49 @@ Deno.test(async function allTests(t) {
         `select a.eur + b.eur2 as t from @${eur} a, @${eurAgain} b`,
         `select sum(a.eur) as t from @${eur} a, @${gbp} b`,
         `select a.usd_col + b.usd_code as t from @${dollars} a, @${usdCode} b`,
+      ]
+    ) {
+      const ok = await ask(code);
+      assertEquals(ok.status, 200, `${code}: ${ok.text}`);
+    }
+    // The where clause, each case and each join's on read as comparisons: two currencies on the two sides
+    // are refused and name the clause; a literal, a scalar multiple and one currency pass.
+    for (
+      const [code, clause] of [
+        [`select a.eur from @${eur} a, @${gbp} b where a.eur > b.gbp`, "the where clause"],
+        [`select a.eur from @${eur} a, @${gbp} b where a.eur > 1 and a.eur + b.gbp > 2`, "the where clause"],
+        [`select case when a.eur > 0 then a.eur else b.gbp end as v from @${eur} a, @${gbp} b`, "a case"],
+        [`select case when a.eur = b.gbp then 1 else 0 end as v from @${eur} a, @${gbp} b`, "a case"],
+        [`select a.eur from @${eur} a join @${gbp} b on a.eur = b.gbp`, "a join's on"],
+        [
+          `select a.eur from @${eur} a, @${gbp} b where a.eur > 1 or (a.eur > 2 and (a.eur < b.gbp))`,
+          "the where clause",
+        ],
+        [`select a.eur from @${eur} a, @${gbp} b where not a.eur = b.gbp`, "the where clause"],
+        [`select a.eur from @${eur} a, @${gbp} b where a.eur between 1 and b.gbp`, "the where clause"],
+        [`select a.eur from @${eur} a, @${gbp} b where a.eur in (2, b.gbp)`, "the where clause"],
+        [
+          `select case when 1 = 1 then case when 2 = 2 then a.eur else 0 end else b.gbp end from @${eur} a, @${gbp} b`,
+          "a case",
+        ],
+        [`select case a.eur when b.gbp then 1 else 0 end as v from @${eur} a, @${gbp} b`, "a case"],
+      ]
+    ) {
+      const refused = await ask(code);
+      assertEquals(refused.status, 400, `${code}: ${refused.text}`);
+      assert(refused.text.includes(clause), `${code}: ${refused.text}`);
+      assert(refused.text.includes("money:EUR") && refused.text.includes("money:GBP"), refused.text);
+    }
+    for (
+      const code of [
+        `select a.eur from @${eur} a, @${gbp} b where a.eur > 1 and b.gbp * 2 < 5`,
+        `select a.eur from @${eur} a, @${eurAgain} b where a.eur > b.eur2`,
+        `select case when a.eur > 1 then a.eur else 0 end as v from @${eur} a, @${gbp} b`,
+        `select a.eur from @${eur} a join @${eurAgain} b on a.eur = b.eur2`,
+        `select a.eur from @${eur} a, @${gbp} b where a.eur > 'x ' || 'b.gbp'`,
+        `select a.eur from @${eur} a, @${gbp} b where (a.eur > 1 and (b.gbp < 2)) or a.eur is null`,
+        `select a.eur from @${eur} a, @${gbp} b where a.eur between 1 and 5 and b.gbp in (1, 2)`,
+        `select a.eur from @${eur} a join @${eur} b on a.eur = b.eur`,
       ]
     ) {
       const ok = await ask(code);
@@ -9639,6 +9722,115 @@ Deno.test(async function allTests(t) {
     assertEquals(dead.status, 502, `a dead connection is a refusal, never an empty answer: ${said}`);
     assert(said.includes(`${DSN_KEEP} stored credentials`) && !said.includes("p4ssw0rd"), said);
     assertEquals((await runs()).at(-1)?.status, 502, "a failure is a run like any other");
+  });
+
+  await t.step("You query a connected database's table with a ref", async () => {
+    const { jwt } = await usr("refer@example.com");
+    const { jwt: viewer } = await usr("referview@example.com");
+    const hand = automerge.create<Sheet>({ type: "codex-db", data: [] });
+    const sheet_id = `codex-db:${hand.documentId}`;
+    await put(jwt, `/library/${sheet_id}`, { name: "the shop floor, by ref" });
+    await post(jwt, `/codex-db/${hand.documentId}`, { dsn: "postgresql://postgres@127.0.0.1:5435/postgres" });
+    await post(jwt, `/library/${sheet_id}/share`, { email: "referview@example.com", role: "viewer" });
+    const ask = async (code: string, who = jwt) => {
+      rateLimitBuckets.clear();
+      const res = await app.request("/query", {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${who}` }),
+        body: JSON.stringify({ lang: "sql", code, args: [] }),
+      });
+      return { status: res.status, text: await res.text() };
+    };
+    const rowsOf = (r: { text: string }) => JSON.parse(r.text).data.slice(1);
+    const runs = async () => (await sql`select 1 from net where sheet_id = ${sheet_id}`).length;
+
+    const bare = await ask(`select name from @${sheet_id}/widget order by widget_id`);
+    assertEquals(bare.status, 200, bare.text);
+    assertEquals(rowsOf(bare), [{ name: "bolt" }, { name: "nut" }]);
+    assertEquals(await runs(), 1, "one run row for the one read");
+    const [{ n: audited }] = await sql`
+      select count(*)::int as n from audit where sheet_id = ${sheet_id} and action = 'query'
+    `;
+    assertEquals(audited, 1, "one audit row, under the codex sheet");
+
+    const one = await ask(`select gadget_id from @${sheet_id}/gadget?note.eq.v1.5`);
+    assertEquals(rowsOf(one), [{ gadget_id: 2 }], "a filter, and a value that holds a dot");
+    const two = await ask(`select gadget_id from @${sheet_id}/gadget?note.notnull&gadget_id.gte.3`);
+    assertEquals(rowsOf(two), [{ gadget_id: 3 }], "filters are AND-ed");
+    const spaced = await ask(`select n from @${sheet_id}/crowd?tag.eq.in%20stock`);
+    assertEquals(rowsOf(spaced), [{ n: 7 }], "%20 spells a space");
+    const joined = await ask(
+      `select w.name, g.note from @${sheet_id}/widget w join @${sheet_id}/gadget?gadget_id.eq.2 g on w.widget_id = g.gadget_id`,
+    );
+    assertEquals(rowsOf(joined), [{ name: "nut", note: "v1.5" }], "two refs to one database join");
+
+    for (
+      const [code, needle] of [
+        [`select * from @${sheet_id}/crowd`, `more than ${CODEX_PREVIEW_MAX} rows`],
+        [`select * from @${sheet_id}/widget?name.between.1`, "That filter op is not one this server knows"],
+        [`select * from @${sheet_id}/widget?nam.eq.x`, "Did you mean"],
+        [`select * from @${sheet_id}/widgit`, "Did you mean"],
+        [`select * from @${sheet_id}/widget?name.eq.%FF`, "valid escapes"],
+        [`select * from @${sheet_id}/widget?${Array(6).fill("name.eq.a").join("&")}`, "at most 5 where filters"],
+      ] as const
+    ) {
+      const refused = await ask(code);
+      assertEquals(refused.status, code.includes("crowd") ? 413 : 400, `${code}: ${refused.text}`);
+      assert(refused.text.includes(needle), `${code} must say ${needle}: ${refused.text}`);
+    }
+    assertEquals(
+      rowsOf(await ask(`select count(*) as n from @${sheet_id}/crowd?n.lte.${CODEX_PREVIEW_MAX}`)),
+      [{ n: CODEX_PREVIEW_MAX }],
+      "a read of exactly the cap is not past it",
+    );
+
+    const shut = await ask(`select * from @${sheet_id}/widget`, viewer);
+    assertEquals(shut.status, 403, "a viewer may not read a table by ref");
+    assert(shut.text.includes("owner or editor"), shut.text);
+
+    // Lineage: an edge to the codex sheet, named by the table, one per table.
+    const query = automerge.create<{ data: Sheet["data"] }>({
+      data: [{
+        lang: "sql",
+        code: `select * from @${sheet_id}/widget union all select * from @${sheet_id}/widget?name.eq.nut`,
+        args: [],
+      }],
+    });
+    await put(jwt, `/library/query:${query.documentId}`, { name: "by ref" });
+    const edges = (await get<Table>(jwt, "/library/lineage")).slice(1).filter((r) =>
+      String(r.sheet_id) === `query:${query.documentId}`
+    );
+    assertEquals(edges.map((r) => [r.depends_on, r.depends_on_name, r.depends_on_type, r.columns]), [
+      [sheet_id, "widget", "codex-db", "*"],
+    ]);
+  });
+
+  await t.step("A query opens a bounded number of far connections", async () => {
+    const { jwt } = await usr("brkref@example.com");
+    const hand = automerge.create<Sheet>({ type: "codex-db", data: [] });
+    const sheet_id = `codex-db:${hand.documentId}`;
+    await put(jwt, `/library/${sheet_id}`, { name: "break by ref" });
+    await post(jwt, `/codex-db/${hand.documentId}`, { dsn: "postgresql://postgres@127.0.0.1:5435/postgres" });
+    const ask = async (n: number) => {
+      rateLimitBuckets.clear();
+      const refs = Array.from(
+        { length: n },
+        (_, i) => `(select count(*) from @${sheet_id}/widget?name.like.x%25${i}) c${i}`,
+      );
+      const res = await app.request("/query", {
+        method: "POST",
+        headers: new Headers({ "Content-Type": "application/json", Authorization: `Bearer ${jwt}` }),
+        body: JSON.stringify({ lang: "sql", code: `select ${refs.join(", ")}`, args: [] }),
+      });
+      return { status: res.status, text: await res.text() };
+    };
+    const runs = async () => (await sql`select 1 from net where sheet_id = ${sheet_id}`).length;
+    assertEquals((await ask(MAX_REF_DEPTH)).status, 200, "the bound itself passes");
+    const before = await runs();
+    const over = await ask(MAX_REF_DEPTH + 1);
+    assertEquals(over.status, 400, over.text);
+    assert(over.text.includes(`at most ${MAX_REF_DEPTH}`), over.text);
+    assertEquals(await runs(), before, "a refused query opens no connection");
   });
 
   // Two sockets into the far database at once, which only the lock in serve()

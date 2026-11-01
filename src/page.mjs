@@ -16,6 +16,8 @@ import {
   bound,
   checkConstraints,
   checkResultColumns,
+  CODEX_PREVIEW_MAX,
+  codexRef,
   DESCRIBE_COLUMNS,
   describeRef,
   describeRows,
@@ -349,7 +351,7 @@ export const FOLLOW_MAX = 64;
 const VOLATILE =
   /\b(?:http|now|random|getdate|curdate|newid|uuid|gen_random_uuid)\s*\(|\bfrom\s+http\b|\bcurrent_(?:date|time|timestamp)\b/i;
 
-export const sheets = (alasql, shelf, find, heads) => {
+export const sheets = (alasql, shelf, find, heads, codex) => {
   const rows = new Map();
   const types = new Map();
   // JSON.stringify([id, code]) -> { deps: [[sheet id, heads]], depth, answer }
@@ -381,6 +383,53 @@ export const sheets = (alasql, shelf, find, heads) => {
       [...rows].map(([id, rs]) => [id, types.get(id) ?? Object.keys(rs?.[0] ?? {}).map((name) => ({ name }))]),
     );
 
+  // The preview route is the page's door to a connected database, as sheet() is the
+  // server's: the same filters, under the account's token. `codex(url)` answers the
+  // route's JSON or throws its refusal.
+  const codexRows = async (id, { sheet_id, table, wheres }) => {
+    if (!codex) {
+      throw new Error(explain(`@${id} cannot be read here.`, {
+        Expected: "a page that can reach the server",
+        Received: "no door to a connected database",
+        Source: `@${id} in this query`,
+        Fix: "run it where the page is logged in",
+      }));
+    }
+    let query;
+    try {
+      // The route reads `+` as a space, so each filter is spelled again from its text.
+      query = wheres.map((where) => `&where=${encodeURIComponent(decodeURIComponent(where))}`).join("");
+    } catch {
+      throw new Error(explain(`A codex ref holds a % escape that is not text.`, {
+        Expected: "%XX escapes that spell UTF-8, e.g. %20 for a space",
+        Received: show(wheres.join("&")),
+        Source: `@${id} in this query`,
+        Fix: "spell the value with valid escapes, e.g. status.eq.in%20stock",
+      }));
+    }
+    const answer = await codex(`${API_BASE}/codex/${sheet_id}/preview?table=${table}${query}`);
+    const data = answer?.data;
+    if (!Array.isArray(data) || !data.length) {
+      throw new Error(explain(`The preview of ${table} did not answer rows.`, {
+        Expected: "{ data: [columns, ...rows] }",
+        Received: show(answer),
+        Source: `GET /codex/${sheet_id}/preview`,
+        Fix: "check that the server and the page are the same version",
+      }));
+    }
+    // The route cannot be asked for a row past its cap, so a full answer may be the whole
+    // table or a cut one. The server asks for one more and tells them apart; here both refuse.
+    if (data.length - 1 >= CODEX_PREVIEW_MAX) {
+      throw new Error(explain(`The table ${table} has more rows than a ref reads.`, {
+        Expected: `fewer than ${CODEX_PREVIEW_MAX} rows`,
+        Received: `${CODEX_PREVIEW_MAX} rows or more from ${sheet_id}`,
+        Source: `@${id} in this query`,
+        Fix: `narrow it with a filter, e.g. @${sheet_id}/${table}?<column>.eq.<value>`,
+      }));
+    }
+    return data;
+  };
+
   /** Every column the referenced sheets actually have: what a typo'd column
    * name gets matched against. */
   const columns = () => [...new Set([...rows.values()].flatMap((rs) => Object.keys(rs?.[0] ?? {})))];
@@ -401,6 +450,13 @@ export const sheets = (alasql, shelf, find, heads) => {
       describing: !!describing,
       stages,
       fetch: async (id) => {
+        const table = codexRef(id);
+        if (table) {
+          // Nothing the page holds says when a far table changes, so no run that read
+          // one is cached.
+          reads.volatile = true;
+          return await codexRows(id, table);
+        }
         const [type, ref_id] = id.split(":");
         if (!["table", "query"].includes(type))
           throw new Error(`@${id}: only table and query sheets can be referenced in queries.`);

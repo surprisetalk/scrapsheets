@@ -13,6 +13,7 @@ port module Main exposing
     , Moving(..)
     , Msg
     , NumberFormat(..)
+    , Peer
     , Rect
     , Shade(..)
     , Sheet
@@ -83,7 +84,8 @@ port module Main exposing
     , parseDay
     , parseJson
     , parseTsv
-    , peerColours
+    , peerNameMax
+    , peersFrom
     , peersMax
     , pinLeft
     , pruneView
@@ -957,7 +959,13 @@ port docQueried : (Idd D.Value -> msg) -> Sub msg
 port docErrored : (String -> msg) -> Sub msg
 
 
-port peersChanged : (Idd (List String) -> msg) -> Sub msg
+{-| The cell this tab holds, for the other tabs. The glue throttles it, and a
+negative corner means no cell.
+-}
+port focusCell : Index -> Cmd msg
+
+
+port peersChanged : (Idd D.Value -> msg) -> Sub msg
 
 
 {-| The poller's request, once, now: what the sheet would fetch with what it
@@ -1188,7 +1196,7 @@ main : Program Flags Model Msg
 main =
     Browser.application
         { init = init
-        , update = update
+        , update = updateCell
         , view = view
         , subscriptions = subs
         , onUrlChange = UrlChange
@@ -1233,7 +1241,7 @@ type alias Model =
     -- A past version of the open sheet. Its own field and never `sheet`: every
     -- view of a `Sheet` is wired to writes, and this one is read and nothing else.
     , history : Maybe History
-    , peers : List String
+    , peers : List Peer
 
     -- The open connected database's tables and the one picked, if the open
     -- sheet is a codex.
@@ -1264,19 +1272,29 @@ columns it touches. `write` is the header editor's text, which closes on hold.
 -}
 type alias Pending =
     { id : Id
-    , edit : DocMsg
+
+    -- The sheet whose dependents are asked: `id` for a rename or delete, the
+    -- source for a promote.
+    , about : Id
+    , edit : Held
     , write : Maybe String
     , columns : List String
     , stage : Stage
     }
 
 
-{-| `Warning` carries each dependent's name and why it is at risk, or why
-nobody could say. `Confirmed` lives for one `updateDocMsg` call: the replay
-that writes the held edit.
+type Held
+    = Edit DocMsg
+    | Promote
+
+
+{-| `Describing` waits on a promote's source columns. `Warning` carries each
+dependent's name and why it is at risk, or why nobody could say. `Confirmed`
+lives for one replay: the call that writes the held change.
 -}
 type Stage
-    = Asking
+    = Describing
+    | Asking
     | Warning (Result String (List ( String, String )))
     | Confirmed
 
@@ -1406,6 +1424,7 @@ type alias Sheet =
     , hidden : Set String
     , pinned : Set String
     , subtotal : Maybe String
+    , collapsed : Set String
     , sort : List ( String, SortOrder )
     , filters : Dict String Filter
     , filterOpen : Maybe String
@@ -1487,6 +1506,7 @@ emptySheet =
     , hidden = Set.empty
     , pinned = Set.empty
     , subtotal = Nothing
+    , collapsed = Set.empty
     , sort = []
     , filters = Dict.empty
     , filterOpen = Nothing
@@ -3462,7 +3482,7 @@ type Msg
     | DocNotify (Idd D.Value)
     | DocQuery (Idd D.Value)
     | DocError String
-    | PeersLoad (Idd (List String))
+    | PeersLoad (Idd D.Value)
     | DocMsg DocMsg
     | DocNew E.Value
     | DocFork
@@ -3541,6 +3561,7 @@ type Msg
     | ColumnsShowAll
     | ColumnPin String
     | ColumnSubtotal String
+    | SubtotalToggle String
     | ColumnDecimals String String
     | ColumnFormat String String
     | ColumnShade String String
@@ -4045,6 +4066,17 @@ each would need a `_ ->` arm for the messages it does not handle, which is the
 silent default all over again. The four branches long enough to be their own
 subject are named functions below instead.
 -}
+updateCell : Msg -> Model -> ( Model, Cmd Msg )
+updateCell msg model =
+    let
+        ( next, cmd ) =
+            update msg model
+    in
+    iif (next.sheet.select.b == model.sheet.select.b)
+        ( next, cmd )
+        ( next, Cmd.batch [ cmd, focusCell next.sheet.select.b ] )
+
+
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg ({ sheet, auth } as model) =
     case msg of
@@ -4147,6 +4179,7 @@ update msg ({ sheet, auth } as model) =
                     , hidden = stored.hidden
                     , pinned = stored.pinned
                     , subtotal = Nothing
+                    , collapsed = Set.empty
                     , sort = stored.sort
                     , filters = stored.filters
                     , filterOpen = Nothing
@@ -4313,7 +4346,12 @@ update msg ({ sheet, auth } as model) =
                 ( model, Cmd.none )
 
             else
-                ( { model | peers = peerColours data }, Cmd.none )
+                case peersFrom data of
+                    Ok peers ->
+                        ( { model | peers = peers }, Cmd.none )
+
+                    Err err ->
+                        ( { model | error = err }, Cmd.none )
 
         DocMsg edit ->
             updateDocMsg edit model
@@ -4821,7 +4859,7 @@ update msg ({ sheet, auth } as model) =
                 ( Just held, Ok id ) ->
                     -- loadLineage answers every ask, so an answer can arrive
                     -- after the edit it was for was cancelled and another held.
-                    if id /= held.id || held.stage /= Asking then
+                    if id /= held.about || held.stage /= Asking then
                         ( model, Cmd.none )
 
                     else
@@ -4834,7 +4872,7 @@ update msg ({ sheet, auth } as model) =
                                     Err _ ->
                                         D.decodeValue (D.field "rows" lineageDecoder) value
                                             |> Result.mapError (\err -> "The answer arrived in a shape I could not read: " ++ D.errorToString err)
-                                            |> Result.map (dependents held.id held.columns)
+                                            |> Result.map (dependents held.about held.columns)
                         in
                         if found == Ok [] then
                             confirmPending held model
@@ -4955,7 +4993,28 @@ update msg ({ sheet, auth } as model) =
             ( model, forkDoc sheet.id )
 
         DocPromote ->
-            ( model, promoteDoc sheet.id )
+            case ( model.pending, sheet.lineage ) of
+                ( Just held, _ ) ->
+                    if held.stage == Confirmed then
+                        ( model, promoteDoc sheet.id )
+
+                    else
+                        ( { model | error = "Expected one open question at a time, received a promote while another dialog is open or a check on who reads this sheet is still out. Nothing was written. Source: the promote chip. Fix: answer or close that dialog, then promote again." }, Cmd.none )
+
+                ( Nothing, Nothing ) ->
+                    ( model, promoteDoc sheet.id )
+
+                ( Nothing, Just source ) ->
+                    if model.importing /= Nothing || model.deleteConfirm /= Nothing || model.history /= Nothing then
+                        ( { model | error = "Expected one open question at a time, received a promote while another dialog is open. Nothing was written. Source: the promote chip. Fix: close that dialog, then promote again." }, Cmd.none )
+
+                    else
+                        -- The source's columns are read fresh, from its code as it
+                        -- is now: the page's cache of them is a completion's, kept
+                        -- for the life of the open sheet.
+                        ( { model | pending = Just { id = sheet.id, about = source, edit = Promote, write = Nothing, columns = [], stage = Describing } }
+                        , columnsFor source
+                        )
 
         ChartDownload format ->
             ( model, downloadChart format )
@@ -5536,7 +5595,10 @@ update msg ({ sheet, auth } as model) =
                 }
 
         ColumnSubtotal key ->
-            ( { model | sheet = { sheet | subtotal = iif (sheet.subtotal == Just key) Nothing (Just key) } }, Cmd.none )
+            ( { model | sheet = { sheet | subtotal = iif (sheet.subtotal == Just key) Nothing (Just key), collapsed = Set.empty } }, Cmd.none )
+
+        SubtotalToggle value ->
+            ( { model | sheet = { sheet | collapsed = iif (Set.member value sheet.collapsed) (Set.remove value sheet.collapsed) (Set.insert value sheet.collapsed) } }, Cmd.none )
 
         ColumnMoveStart key ->
             ( { model | sheet = { sheet | moving = Just (MovingCol key), filterOpen = Nothing } }, Cmd.none )
@@ -5940,16 +6002,28 @@ update msg ({ sheet, auth } as model) =
             let
                 known =
                     Dict.insert id data sheet.queryColumns
-            in
-            ( { model
-                | sheet =
-                    { sheet
-                        | queryColumns = known
-                        , queryAutocomplete = Maybe.map (\ac -> completionAt model.library known ac.sources ac.trigger) sheet.queryAutocomplete
+
+                withColumns =
+                    { model
+                        | sheet =
+                            { sheet
+                                | queryColumns = known
+                                , queryAutocomplete = Maybe.map (\ac -> completionAt model.library known ac.sources ac.trigger) sheet.queryAutocomplete
+                            }
                     }
-              }
-            , Cmd.none
-            )
+            in
+            -- A promote waits on the source's columns: the ones its answer held
+            -- and the fork's does not are what its readers can lose.
+            case model.pending of
+                Just held ->
+                    if held.stage == Describing && id == held.about then
+                        promoteColumns held data withColumns
+
+                    else
+                        ( withColumns, Cmd.none )
+
+                Nothing ->
+                    ( withColumns, Cmd.none )
 
         AutocompleteSelect ref ->
             -- Insert the selected reference and close autocomplete
@@ -6089,15 +6163,44 @@ update msg ({ sheet, auth } as model) =
 ---- VIEW ---------------------------------------------------------------------
 
 
-{-| The held edit, replayed through `updateDocMsg` against the document as it
-is now, so every refusal it would have met it meets again.
+promoteColumns : Pending -> List String -> Model -> ( Model, Cmd Msg )
+promoteColumns held source ({ sheet } as model) =
+    -- An empty list is how `columnsFor` answers a query it could not describe,
+    -- and a query that answers no column is not one to promote over silently.
+    case ( source, Result.map (.cols >> Array.toList >> List.map .name) sheet.table ) of
+        ( [], _ ) ->
+            unknownPromote held "the source's columns could not be read" model
+
+        ( _, Err reason ) ->
+            unknownPromote held ("this fork has no answer yet: " ++ reason) model
+
+        ( _, Ok kept ) ->
+            case List.filter (\name -> not (List.member name kept)) source of
+                [] ->
+                    confirmPending held model
+
+                lost ->
+                    ( { model | pending = Just { held | columns = lost, stage = Asking } }, lineageFor held.about )
+
+
+unknownPromote : Pending -> String -> Model -> ( Model, Cmd Msg )
+unknownPromote held reason model =
+    let
+        ( closed, leave ) =
+            closeModals model
+    in
+    ( { closed | pending = Just { held | stage = Warning (Err reason) } }, leave )
+
+
+{-| The held change, replayed against the document as it is now, so every
+refusal it would have met it meets again.
 -}
 confirmPending : Pending -> Model -> ( Model, Cmd Msg )
 confirmPending held ({ sheet } as model) =
     if held.id /= sheet.id then
         ( { model
             | pending = Nothing
-            , error = "Expected the rename or delete to land on " ++ held.id ++ ", received it with " ++ sheet.id ++ " open. Nothing was written. Source: the sheet changed while its dependents were read. Fix: open " ++ held.id ++ " and make the change again."
+            , error = "Expected the held change to land on " ++ held.id ++ ", received it with " ++ sheet.id ++ " open. Nothing was written. Source: the sheet changed while its dependents were read. Fix: open " ++ held.id ++ " and make the change again."
           }
         , Cmd.none
         )
@@ -6105,7 +6208,12 @@ confirmPending held ({ sheet } as model) =
     else
         let
             ( written, cmd ) =
-                updateDocMsg held.edit { model | pending = Just { held | stage = Confirmed }, sheet = { sheet | write = held.write } }
+                case held.edit of
+                    Edit edit ->
+                        updateDocMsg edit { model | pending = Just { held | stage = Confirmed }, sheet = { sheet | write = held.write } }
+
+                    Promote ->
+                        update DocPromote { model | pending = Just { held | stage = Confirmed } }
         in
         ( { written | pending = Nothing }, cmd )
 
@@ -6857,7 +6965,7 @@ updateDocMsg edit ({ sheet } as model) =
                             else
                                 ( { model
                                     | sheet = { sheet | write = Nothing }
-                                    , pending = Just { id = sheet.id, edit = edit, write = sheet.write, columns = atRisk, stage = Asking }
+                                    , pending = Just { id = sheet.id, about = sheet.id, edit = Edit edit, write = sheet.write, columns = atRisk, stage = Asking }
                                   }
                                 , lineageFor sheet.id
                                 )
@@ -7987,7 +8095,10 @@ viewPending pending =
                     let
                         ( verb, change ) =
                             case ( edit, write ) of
-                                ( SheetColumnDelete _, _ ) ->
+                                ( Promote, _ ) ->
+                                    ( "Promote", "Promoting this fork" ++ iif (List.isEmpty columns) "" (", which drops " ++ String.join ", " (List.map quoted columns) ++ ",") )
+
+                                ( Edit (SheetColumnDelete _), _ ) ->
                                     ( "Delete", "Deleting " ++ String.join ", " (List.map quoted columns) )
 
                                 ( _, Just name ) ->
@@ -8021,6 +8132,9 @@ viewPending pending =
                                 [ text verb ]
                             ]
                         ]
+
+                Describing ->
+                    text ""
 
                 Asking ->
                     text ""
@@ -8425,12 +8539,57 @@ viewPalette model =
                 ]
 
 
+{-| The past rows against the live ones, by document row and column position.
+Each row is its class and its cells, a cell with whether it differs from the
+live one. A row the sheet lacks is `removed`; a live row the version lacks is
+`added`, drawn as today's row. Columns that differ answer the line a restore
+refuses with, quoting names where it quotes keys.
+-}
+markRows : Table -> { columns : List String, rows : List (List String) } -> Result String (List ( String, List ( Bool, String ) ))
+markRows table past =
+    let
+        cols =
+            Array.toList table.cols
+
+        names =
+            List.map .name cols
+
+        liveRows =
+            List.map (\row -> List.map (\col -> cellText col.key row) cols) (Array.toList table.rows)
+
+        common =
+            min (List.length liveRows) (List.length past.rows)
+    in
+    if names /= past.columns then
+        Err
+            ("Expected the version's columns to match today's. Received: "
+                ++ (case
+                        List.map (\name -> quoted name ++ " added since") (List.filter (\name -> not (List.member name past.columns)) names)
+                            ++ List.map (\name -> quoted name ++ " removed since") (List.filter (\name -> not (List.member name names)) past.columns)
+                    of
+                        [] ->
+                            "the same columns in another order"
+
+                        differ ->
+                            String.join "; " differ
+                   )
+                ++ ". Source: history. Fix: add or remove the columns by hand, then restore."
+            )
+
+    else
+        Ok
+            (List.map2 (\then_ now -> ( "", List.map2 (\a b -> ( a /= b, a )) then_ now )) past.rows liveRows
+                ++ List.map (\row -> ( "added", List.map (\cell -> ( False, cell )) row )) (List.drop common liveRows)
+                ++ List.map (\row -> ( "removed", List.map (\cell -> ( False, cell )) row )) (List.drop common past.rows)
+            )
+
+
 {-| The past rows are text in a plain `table`, built from nothing a live sheet
 view uses: no cell takes a click, an input or a drag. The glue's refusals land
 in `model.error`, drawn here too because the scrim covers the banner.
 -}
-viewHistory : String -> Maybe History -> Html Msg
-viewHistory refusal history =
+viewHistory : String -> Result String Doc -> Maybe History -> Html Msg
+viewHistory refusal live history =
     case history of
         Nothing ->
             text ""
@@ -8509,12 +8668,55 @@ viewHistory refusal history =
                         failed error
 
                     ( Just _, Just (Ok past) ) ->
+                        let
+                            -- REVIEW: Compared by column name and position, because `historyShown` carries names and no keys. Alternative: send the keys too, so a rename reads as a rename and not as one column added and one removed. It costs a field in the port and the glue.
+                            compared =
+                                case live of
+                                    Ok (Tab table) ->
+                                        Just (markRows table past)
+
+                                    _ ->
+                                        Nothing
+
+                            plain =
+                                List.map (\row -> ( "", List.map (\cell -> ( False, cell )) row )) past.rows
+
+                            ( summary, marked ) =
+                                case compared of
+                                    Just (Ok rows) ->
+                                        let
+                                            count p =
+                                                List.length (List.filter p rows)
+                                        in
+                                        ( String.fromInt (List.sum (List.map (\( _, cells ) -> List.length (List.filter Tuple.first cells)) rows))
+                                            ++ " cells changed, "
+                                            ++ String.fromInt (count (\( class, _ ) -> class == "added"))
+                                            ++ " rows added, "
+                                            ++ String.fromInt (count (\( class, _ ) -> class == "removed"))
+                                            ++ " rows removed"
+                                        , rows
+                                        )
+
+                                    Just (Err line) ->
+                                        ( line, plain )
+
+                                    Nothing ->
+                                        ( "", plain )
+                        in
                         H.div [ S.maxHeight "40vh", S.overflowAuto, S.marginTopRem 0.5 ]
                             [ -- REVIEW: Offered to every reader, because the page holds no role (promote is the same). A viewer's write is refused by the sync server. Alternative: send the role down with the document. It costs a new field in the sync handshake.
                               H.button [ A.class "chip", A.onClick (HistoryMsg HistoryRestore) ] [ text "restore these rows" ]
+                            , iif (summary == "") (text "") (H.p [ A.id "past-summary", S.fontSizeRem 0.75, S.color "#666" ] [ text summary ])
                             , H.table [ A.id "past", S.fontSizeRem 0.875 ]
                                 [ H.thead [] [ H.tr [] (List.map (\name -> H.th [] [ text name ]) past.columns) ]
-                                , H.tbody [] (List.map (\row -> H.tr [] (List.map (\cell -> H.td [] [ text cell ]) row)) past.rows)
+                                , H.tbody []
+                                    (List.map
+                                        (\( class, cells ) ->
+                                            H.tr [ A.class class ]
+                                                (List.map (\( differs, cell ) -> H.td [ A.classList [ ( "changed", differs ) ] ] [ text cell ]) cells)
+                                        )
+                                        marked
+                                    )
                                 ]
                             ]
                 ]
@@ -9239,8 +9441,20 @@ filterAndSort search sheet cols rows =
 filterAndSortIndexed : String -> Sheet -> Array Col -> Array Row -> Array ( Int, Row )
 filterAndSortIndexed search sheet cols rows =
     let
+        grouping =
+            subtotalCol sheet cols
+
+        collapsedOut row =
+            case grouping of
+                Just by ->
+                    Set.member (groupValue by row) sheet.collapsed
+
+                Nothing ->
+                    False
+
         passes ( _, row ) =
             matchesSearch search cols row
+                && not (collapsedOut row)
                 && Dict.foldl (\key filter acc -> acc && applyFilter filter key row) True sheet.filters
 
         filtered =
@@ -9703,11 +9917,28 @@ peersMax =
     20
 
 
-{-| What a peer sent as its colour, kept only when it is `#` and six lowercase
-hex digits: the string lands in a style, so anything else is dropped unseen.
+{-| The longest name the toolbar draws for a peer. The server cuts a name to the
+same length, so this holds a peer that did not come through the server.
 -}
-peerColours : List String -> List String
-peerColours colours =
+peerNameMax : Int
+peerNameMax =
+    40
+
+
+{-| A tab sharing the sheet: its colour, the name the server stamped on it, and
+the cell it holds when it sent one.
+-}
+type alias Peer =
+    { colour : String, name : String, cell : Maybe Index }
+
+
+{-| What the glue relays, whatever a peer sent. The colour lands in a style, so
+only `#` and six lowercase hex digits is kept and the peer is dropped unseen
+otherwise. A name that is not text is no name; a cell is two non-negative whole
+numbers or no cell.
+-}
+peersFrom : D.Value -> Result String (List Peer)
+peersFrom value =
     let
         isColour colour =
             case String.uncons colour of
@@ -9716,8 +9947,19 @@ peerColours colours =
 
                 _ ->
                     False
+
+        natural =
+            D.int |> D.andThen (\n -> iif (n >= 0) (D.succeed n) (D.fail "negative"))
+
+        peer =
+            D.map3 Peer
+                (D.field "colour" D.string |> D.andThen (\c -> iif (isColour c) (D.succeed c) (D.fail "not a colour")))
+                (D.oneOf [ D.field "name" D.string |> D.map (String.left peerNameMax), D.succeed "" ])
+                (D.maybe (D.field "cell" (D.map2 xy (D.field "x" natural) (D.field "y" natural))))
     in
-    colours |> List.filter isColour |> List.take peersMax
+    D.decodeValue (D.list (D.maybe peer)) value
+        |> Result.map (List.filterMap identity >> List.take peersMax)
+        |> Result.mapError (\err -> "Expected: a list of peers from peersChanged. Received: " ++ D.errorToString err ++ ". Source: the glue's Presence in index.html. Fix: send [{ colour, name, cell }].")
 
 
 {-| The most columns one split may push. A cell with more parts than this says
@@ -10268,8 +10510,8 @@ inSelection ({ a, b } as select) i n =
     (select /= rect -1 -1 -1 -1) && (between a.x b.x i || eq a.x b.x -1) && (between a.y b.y n || eq a.y b.y -1)
 
 
-cellClasses : Sheet -> Int -> Int -> H.Attribute Msg
-cellClasses sheet i n =
+cellClasses : Sheet -> Bool -> Int -> Int -> H.Attribute Msg
+cellClasses sheet peered i n =
     let
         cellIdx =
             xy i n
@@ -10296,6 +10538,7 @@ cellClasses sheet i n =
         , ( "c0", i == 0 )
         , ( "match-highlight", isMatch && not isCurrentMatch )
         , ( "match-current", isCurrentMatch )
+        , ( "peer-cell", peered )
         ]
 
 
@@ -10992,8 +11235,8 @@ shadeAttr shading ( lo, hi ) v =
                 )
 
 
-viewCell : Sheet -> Result String (Array Stat) -> Dict String Int -> Dict String ( Float, Float ) -> Bool -> Maybe String -> Int -> Int -> Col -> Row -> Html Msg
-viewCell sheet stats pins extents grab mark i n col row =
+viewCell : Sheet -> Result String (Array Stat) -> Dict String Int -> Dict String ( Float, Float ) -> Bool -> Dict ( Int, Int ) String -> Maybe String -> Int -> Int -> Col -> Row -> Html Msg
+viewCell sheet stats pins extents grab cursors mark i n col row =
     H.td
         ([ Maybe.map A.id mark |> Maybe.withDefault (A.classList [])
          , A.onClick CellMouseClick
@@ -11015,7 +11258,8 @@ viewCell sheet stats pins extents grab mark i n col row =
          , A.onMouseUp CellMouseUp
          , A.onMouseEnter (CellHover (xy i n))
          , iif (n == 0 && sheet.filterOpen == Just col.key) (S.zIndex "2") (A.classList [])
-         , cellClasses sheet i n
+         , cellClasses sheet (Dict.member ( i, n ) cursors) i n
+         , Dict.get ( i, n ) cursors |> Maybe.map S.outlineColor |> Maybe.withDefault (A.classList [])
          , iif (inSelection sheet.select i n) (A.attribute "aria-selected" "true") (A.classList [])
          , -- A `td` in a `role="grid"` table is a gridcell already, so only a header cell names its role.
            iif (n == 0) (A.attribute "role" "columnheader") (A.classList [])
@@ -11103,8 +11347,8 @@ viewCell sheet stats pins extents grab mark i n col row =
                     ]
 
 
-viewTableRow : Sheet -> Doc -> Result String (Array Stat) -> Dict String Int -> Dict String ( Float, Float ) -> Bool -> Array Col -> Int -> Row -> Html Msg
-viewTableRow sheet doc stats pins extents grab cols n row =
+viewTableRow : Sheet -> Doc -> Result String (Array Stat) -> Dict String Int -> Dict String ( Float, Float ) -> Bool -> Dict ( Int, Int ) String -> Array Col -> Int -> Row -> Html Msg
+viewTableRow sheet doc stats pins extents grab cursors cols n row =
     let
         marks =
             followIds sheet cols pins n
@@ -11119,7 +11363,7 @@ viewTableRow sheet doc stats pins extents grab cols n row =
                 S.displayTableRow
         ]
     <|
-        List.indexedMap (\i col -> viewCell sheet stats pins extents grab (Dict.get i marks) i n col row) (Array.toList cols)
+        List.indexedMap (\i col -> viewCell sheet stats pins extents grab cursors (Dict.get i marks) i n col row) (Array.toList cols)
             ++ [ case doc of
                     Tab _ ->
                         H.th [ A.onClick (DocMsg SheetColumnPush), A.title "add column", S.widthRem 0.001, S.whiteSpaceNowrap ] [ text (iif (n == 0) "→" "") ]
@@ -11342,6 +11586,16 @@ viewGallery model =
         )
 
 
+subtotalCol : Sheet -> Array Col -> Maybe Col
+subtotalCol sheet cols =
+    sheet.subtotal |> Maybe.andThen (\key -> cols |> Array.toList |> List.filter (\c -> c.key == key) |> List.head)
+
+
+groupValue : Col -> Row -> String
+groupValue by row =
+    iif (blankCell by.key row) "" (cellText by.key row)
+
+
 {-| A group is every drawn row sharing one value of the grouping column, a blank
 cell being a value of its own. Groups come in the order the drawn rows first
 show them.
@@ -11352,7 +11606,7 @@ subtotalGroups by rows =
         step row ( firsts, members ) =
             let
                 value =
-                    iif (blankCell by.key row) "" (cellText by.key row)
+                    groupValue by row
             in
             ( iif (Dict.member value members) firsts (value :: firsts)
             , Dict.update value (\rs -> Just (row :: Maybe.withDefault [] rs)) members
@@ -11383,7 +11637,7 @@ subtotalGroupsMax =
 
 viewSubtotals : Sheet -> Dict String Int -> Array Col -> Array Row -> List (Html Msg)
 viewSubtotals sheet pins cols rows =
-    case sheet.subtotal |> Maybe.andThen (\key -> cols |> Array.toList |> List.filter (\c -> c.key == key) |> List.head) of
+    case subtotalCol sheet cols of
         Nothing ->
             []
 
@@ -11394,17 +11648,30 @@ viewSubtotals sheet pins cols rows =
 
                 cell group col =
                     H.td ([ S.textAlignRight, S.fontWeight "600", iif (Set.member col.key sheet.hidden) S.displayNone (A.classList []) ] ++ pinAttrs pins col)
-                        [ text
-                            (if col.key == by.key then
-                                iif (Tuple.first group == "") "(blank)" (Tuple.first group)
+                        [ if col.key == by.key then
+                            iif (Tuple.first group == "") (H.em [ A.class "blank" ] [ text "(blank)" ]) (text (Tuple.first group))
 
-                             else
-                                Maybe.withDefault "" (Maybe.map (formatNumber col.typ (Dict.get col.key sheet.decimals) (Dict.get col.key sheet.formats)) (columnTotal (Tuple.second group) col))
-                            )
+                          else
+                            text (Maybe.withDefault "" (Maybe.map (formatNumber col.typ (Dict.get col.key sheet.decimals) (Dict.get col.key sheet.formats)) (columnTotal (Tuple.second group) col)))
                         ]
             in
             List.map
-                (\group -> H.tr [ A.class "subtotal", A.title ("subtotals for " ++ by.name) ] (List.map (cell group) (Array.toList cols) ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [] ]))
+                (\group ->
+                    let
+                        value =
+                            Tuple.first group
+                    in
+                    H.tr
+                        [ A.class "subtotal"
+                        , A.title ("subtotals for " ++ by.name)
+                        , A.attribute "role" "button"
+                        , A.attribute "aria-expanded" (iif (Set.member value sheet.collapsed) "false" "true")
+                        , A.tabindex 0
+                        , A.onClick (SubtotalToggle value)
+                        , A.stopPropagationOn "keydown" (D.field "key" D.string |> D.andThen (\k -> iif (k == "Enter") (D.succeed ( SubtotalToggle value, True )) (D.fail "not Enter")))
+                        ]
+                        (List.map (cell group) (Array.toList cols) ++ [ H.th [ S.widthRem 0.001, S.whiteSpaceNowrap ] [] ])
+                )
                 groups
                 ++ iif (more == 0) [] [ H.tr [ A.class "subtotal" ] [ H.td [ A.colspan (Array.length cols + 1) ] [ text (String.fromInt more ++ " more groups") ] ] ]
 
@@ -11556,18 +11823,21 @@ viewToolbar model info =
             ]
 
 
-viewPeers : List String -> List (Html Msg)
-viewPeers colours =
-    if List.isEmpty colours then
+viewPeers : List Peer -> List (Html Msg)
+viewPeers peers =
+    if List.isEmpty peers then
         []
 
     else
         let
             n =
-                String.fromInt (List.length colours)
+                String.fromInt (List.length peers)
         in
         [ H.span [ A.attribute "role" "status", A.attribute "aria-label" "others here", S.displayFlex, S.alignItemsCenter, S.gapRem 0.25 ]
-            (List.map (\colour -> H.span [ A.class "peer", S.background colour ] []) colours ++ [ text (n ++ " here") ])
+            (List.map (\peer -> H.span [ A.class "peer", A.title peer.name, S.background peer.colour ] []) peers
+                ++ [ text (n ++ " here") ]
+                ++ List.map (\peer -> H.span [ A.class "peer-name" ] [ text peer.name ]) peers
+            )
         ]
 
 
@@ -13302,6 +13572,11 @@ view ({ sheet } as model) =
                             sortedRows =
                                 filterAndSort model.search sheet cols rows
 
+                            -- What the filter keeps, a collapsed group still counted: the filter bar and the footers
+                            -- speak of the filter, not of the folds.
+                            unfolded =
+                                filterAndSort model.search { sheet | collapsed = Set.empty } cols rows
+
                             doc =
                                 sheet.doc |> Result.withDefault Library
 
@@ -13332,6 +13607,14 @@ view ({ sheet } as model) =
                                         )
                                     |> Dict.fromList
 
+                            -- Where the other tabs are, by drawn cell. Two peers on
+                            -- one cell: the later in the list shows.
+                            -- REVIEW: A cell is the sender's display coordinates. Alternative: send the document row and map back through displayYToDocY. It costs an inverse mapping per row, and removes the offset between peers with a different search, filter or sort.
+                            cursors =
+                                model.peers
+                                    |> List.filterMap (\peer -> peer.cell |> Maybe.map (\cell -> ( ( cell.x, cell.y ), peer.colour )))
+                                    |> Dict.fromList
+
                             -- The row handle, only where a drop has an honest target.
                             grab =
                                 (case doc of
@@ -13353,13 +13636,13 @@ view ({ sheet } as model) =
                             _ ->
                                 H.div []
                                     [ iif (doc == Library) (viewGallery model) (text "")
-                                    , viewFilterBar sheet (Array.length sortedRows) (Array.length rows)
+                                    , viewFilterBar sheet (Array.length unfolded) (Array.length rows)
                                     , H.table [ A.onMouseLeave (CellHover (xy -1 -1)), A.attribute "role" "grid", A.attribute "aria-multiselectable" "true", A.attribute "aria-label" (iif (doc == Library) "library" (iif (String.trim info.name == "") "untitled sheet" info.name)) ]
                                         [ H.tbody [] <|
                                             Array.toList <|
-                                                Array.indexedMap (\n_ row -> viewTableRow sheet doc stats pins extents grab cols (n_ - 2) row) <|
+                                                Array.indexedMap (\n_ row -> viewTableRow sheet doc stats pins extents grab cursors cols (n_ - 2) row) <|
                                                     Array.append (Array.repeat 3 Dict.empty) sortedRows
-                                        , viewTableFooter model.trash sheet pins cols sortedRows
+                                        , viewTableFooter model.trash sheet pins cols unfolded
                                         ]
                                     ]
                 ]
@@ -13411,7 +13694,7 @@ view ({ sheet } as model) =
             , viewSettings model.showSettings info model.share
             , viewShortcuts model.showShortcuts
             , viewPalette model
-            , viewHistory model.error model.history
+            , viewHistory model.error sheet.doc model.history
             , viewTutorial model.tutorial
             , H.div [ S.displayGrid, S.gapRem 0, S.userSelectNone, A.style "-webkit-user-select" "none", S.maxWidth "100vw", S.maxHeight "100vh", S.height "100%", S.width "100%" ]
                 [ H.main_ [ S.displayFlex, S.flexDirectionColumn, S.width "100%", S.overflowXAuto, S.gapRem 0 ]

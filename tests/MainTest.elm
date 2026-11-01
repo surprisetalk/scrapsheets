@@ -52,6 +52,22 @@ suite =
                         |> (\r -> ( List.length r.groups, r.more ))
                         |> Expect.equal ( subtotalGroupsMax, 3 )
             ]
+        , describe "collapsed subtotal groups"
+            [ test "a collapsed group's rows are undrawn: the drawn list and displayYToDocY skip them" <|
+                \_ ->
+                    let
+                        row v =
+                            Dict.fromList [ ( "0", E.string v ) ]
+
+                        rows =
+                            Array.fromList (List.map row [ "b", "a", "b" ])
+
+                        sheet =
+                            { emptySheet | subtotal = Just "0", collapsed = Set.singleton "b" }
+                    in
+                    ( Array.length (filterAndSortIndexed "" sheet cols0 rows), displayYToDocY "" sheet cols0 rows 1, displayYToDocY "" sheet cols0 rows 2 )
+                        |> Expect.equal ( 1, Just 2, Nothing )
+            ]
         , describe "unviewable"
             [ test "names no codex route: a codex sheet has its own view" <|
                 \_ ->
@@ -66,16 +82,38 @@ suite =
                             , Tuple.second >> String.contains "Buy it from the shop" >> Expect.equal True
                             ]
             ]
-        , describe "peerColours"
-            [ test "bounds the list" <|
+        , describe "peersFrom"
+            [ test "refuses what is not a list" <|
                 \_ ->
-                    List.repeat (peersMax + 5) "#0a1b2c"
-                        |> peerColours
-                        |> Expect.equal (List.repeat peersMax "#0a1b2c")
+                    D.decodeString D.value "{\"colour\":\"#0a1b2c\"}"
+                        |> Result.toMaybe
+                        |> Maybe.map (peersFrom >> Result.toMaybe)
+                        |> Expect.equal (Just Nothing)
+            , test "bounds the list" <|
+                \_ ->
+                    ("[" ++ String.join "," (List.repeat (peersMax + 5) "{\"colour\":\"#0a1b2c\"}") ++ "]")
+                        |> peers
+                        |> List.length
+                        |> Expect.equal peersMax
             , test "drops what is not a colour" <|
                 \_ ->
-                    peerColours [ "#ABCDEF", "#abc", "#0a1b2g", "0a1b2c1", "url(x)", "", "#4a8000" ]
+                    "[{\"colour\":\"#ABCDEF\"},{\"colour\":\"#abc\"},{\"colour\":\"url(x)\"},{\"colour\":4},{},{\"colour\":\"#4a8000\"}]"
+                        |> peers
+                        |> List.map .colour
                         |> Expect.equal [ "#4a8000" ]
+            , test "reads a name cut to the bound, and a cell of two non-negative whole numbers" <|
+                \_ ->
+                    ("[{\"colour\":\"#4a8000\",\"name\":\"" ++ String.repeat 100 "n" ++ "\",\"cell\":{\"x\":2,\"y\":0}}]")
+                        |> peers
+                        |> Expect.equal [ { colour = "#4a8000", name = String.repeat peerNameMax "n", cell = Just { x = 2, y = 0 } } ]
+            , test "a name that is not text is no name, and a bad cell is no cell" <|
+                \_ ->
+                    [ "{\"colour\":\"#4a8000\",\"name\":7,\"cell\":{\"x\":-1,\"y\":0}}"
+                    , "{\"colour\":\"#4a8000\",\"cell\":{\"x\":1.5,\"y\":0}}"
+                    , "{\"colour\":\"#4a8000\",\"cell\":null}"
+                    ]
+                        |> List.map (\one -> peers ("[" ++ one ++ "]"))
+                        |> Expect.equal (List.repeat 3 [ { colour = "#4a8000", name = "", cell = Nothing } ])
             ]
         , describe "Navigation"
             [ describe "clampIndex"
@@ -2564,3 +2602,8 @@ extentOf cells =
                     _ ->
                         Err "the fixture decoded as something other than a table"
             )
+
+
+peers : String -> List Peer
+peers json =
+    D.decodeString D.value json |> Result.toMaybe |> Maybe.andThen (peersFrom >> Result.toMaybe) |> Maybe.withDefault []
