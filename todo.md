@@ -13,6 +13,14 @@ here.
 Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature builds its recommended design, with
 `REVIEW:` notes for the owner.
 
+- [ ] The GitHub `test` workflow passes on its slow runner, as the local hook does.
+  1. Read `gh run view 41370008421 --log-failed`. It fails "Automerge sync over the real websocket route" (16 s), "A
+     live socket is only as fresh as the last browser that watched it" ("a flood of reports must run out of budget"),
+     and a 60 s `withTimeout`. Runs since `0ee0eb9` fail the same way.
+  2. Each flood assertion races a bucket that refills on the wall clock. Bound the count by the elapsed time, as the
+     frame flood steps do, and never weaken the bound itself.
+  3. Confirm the 10 s gate in `deno task test` also holds there, or measure what the runner needs.
+
 - [ ] A peer's edit to the code of a query you have open reruns it in your page.
   1. Reproduce first in `sync_test.ts` with `realRepo` and `glue().link()`: open a settled query, edit its
      `data[0].code` from the linked repo, and wait with `until()` for the new answer. A run-17 breaker saw the editor
