@@ -25,14 +25,6 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
      is next in line, and assert it survives.
   2. Prove it by restoring the whole-cache clear by hand: the test must fail.
 
-- [ ] The suite finishes under its 10-second gate at load 10, not only on a quiet machine.
-  1. `main_test.ts` is the long pole: one serial chain of 80 steps on one thread, about 6 s quiet and 12 s at load 10.
-     It is CPU work spread across the steps, not waits: no gateway holds, no timers. Boot is cached already.
-  2. The one lever left is two processes. Give `main.ts` a database URL per test file that does not travel through the
-     process env, then move the Stripe, Resend, `DATABASE_URL` and codex steps into one half.
-  3. Give each half its own `data/automerge` directory and its own gateway port pair, and hold both under
-     `lock-test.sh`.
-
 - [ ] You write a snippet that takes arguments, like `{{f(x)}}`.
   1. Wait for a real snippet that needs one.
   2. Parse `{{name(a, b)}}` in `expand()`, split on top-level commas outside strings, bounded by `SNIPPET_ARGS_MAX`.

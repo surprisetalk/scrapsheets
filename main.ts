@@ -1180,13 +1180,24 @@ const sendVerificationEmail = async (email: string) => {
 
 // --- database
 
+const databaseUrl = Deno.env.get("DATABASE_URL");
+const poolMax = URL.parse(databaseUrl ?? "")?.searchParams.get("max") ?? (databaseUrl ? "10" : "1");
+if (!/^[1-9][0-9]{0,2}$/.test(poolMax)) {
+  throw new Error(
+    `DATABASE_URL asks for a pool of ${JSON.stringify(poolMax.slice(0, 20))} connections.\n\n` +
+      `  Expected: ?max= a whole number from 1 to 999\n  Received: ${JSON.stringify(poolMax.slice(0, 20))}\n` +
+      `  Source:   the max parameter of DATABASE_URL\n  Fix:      write ?max=1 for the test gateway, or remove it`,
+  );
+}
 export const sql = pg(
-  Deno.env.get("DATABASE_URL") ??
-    "postgresql://postgres@127.0.0.1:5434/postgres",
+  databaseUrl ?? "postgresql://postgres@127.0.0.1:5434/postgres",
   {
     // The default (test) gateway is a single PGlite session, so concurrent
-    // queries must serialize onto one connection.
-    max: Deno.env.get("DATABASE_URL") ? 10 : 1,
+    // queries must serialize onto one connection. The second test process
+    // sets DATABASE_URL and asks for that with `?max=1`. postgres.js reads
+    // `max` from the url only as a string, so this reads it as a number.
+    // REVIEW: Read `?max=` here. Alternative: a DATABASE_POOL_MAX env. It is one more setting for production to own.
+    max: Number(poolMax),
     fetch_types: true,
     onnotice: (msg: { severity?: string }) => msg.severity !== "DEBUG" && console.log(msg),
   },
@@ -1681,7 +1692,10 @@ const stampPresence = (
 
 export const automerge = new Repo({
   network: [wsAdapter],
-  storage: new NodeFSStorageAdapter(`${path.dirname(path.fromFileUrl(Deno.mainModule))}/data/automerge`),
+  // AUTOMERGE_DIR keeps two test processes off one directory.
+  storage: new NodeFSStorageAdapter(
+    Deno.env.get("AUTOMERGE_DIR") ?? `${path.dirname(path.fromFileUrl(Deno.mainModule))}/data/automerge`,
+  ),
   peerId: SERVER_PEER_ID,
   // access gates the synchronizer's outbound sharing too, not just announcements.
   shareConfig: { announce: peerCanSync, access: peerCanSync },

@@ -18,6 +18,7 @@ is a shareable table, every sheet is an API.
 | Path               | What it is                                                                                  |
 | ------------------ | ------------------------------------------------------------------------------------------- |
 | `main.ts`          | The whole server: routes, sync, polling, alerts, status, MCP                                |
+| `main_harness.ts`  | The boot and helpers `main_test.ts` and `server_test.ts` share                              |
 | `src/Main.elm`     | The whole frontend: model, update, view                                                     |
 | `src/index.html`   | The glue Elm cannot do: ports, the automerge repo, sockets, `fetch`                         |
 | `src/page.mjs`     | The parts of `index.html` that are functions of their input, so tests can reach them        |
@@ -35,9 +36,10 @@ is a shareable table, every sheet is an API.
 - `deno task build` — copy `src/*` to `dist`, then `elm make`.
 - `deno task dev` — build, then serve `dist`.
 - `deno task test` — the whole suite. Never `deno test --allow-all`: only the task sets `JWT_SECRET`, `TOKEN_SECRET` and
-  `DSN_ENCRYPTION_KEY`, and `main.ts` refuses to load without them. The task builds `dist` once, type checks once beside
-  the run, runs the files in parallel, and fails past ten seconds. Time one file with `deno test --allow-all <file>`.
-  Check `top` first: a build job on the machine makes every timing wrong.
+  `DSN_ENCRYPTION_KEY`, and `main.ts` refuses to load without them. The task builds `dist` once, then runs three jobs at
+  once: one type check, the `--parallel` run (without `server_test.ts`), and `server_test.ts` as its own process. It
+  fails if any job fails or the wall time passes ten seconds. Time one file with `deno test --allow-all <file>`. Check
+  `top` first: a build job on the machine makes every timing wrong.
 - `deno task review` — elm-review. Keep it at zero suppressions. It and `elm_test.ts` run under `npx -p elm@0.19.2-0`,
   because elm.json pins 0.19.2 and Homebrew's `elm` is 0.19.3; a cached `elm-stuff` hides the mismatch.
 - `deno task status` — grade the deployed `GET /status`; exit nonzero below 1.0. snitch runs it every hour and mails the
@@ -62,15 +64,20 @@ is `postgresql://postgres@127.0.0.1:5434/postgres`; tests need none. Deploy firs
 that file. Keep the jsdom pairs even in boots: `grep -c "await boot(" page_test.ts library_test.ts`, and the same for
 `glue(` in `glue_test.ts sync_test.ts`.
 
-- `main_test.ts` — the server. One `Deno.test` of ordered `t.step`s against in-process PGlite behind pg-gateway on
-  `5434`. The steps share one database, so a step depends on the steps before it. `--filter` does not match step names.
-  The empty cluster loads from `data/pglite-<key>.tar`, keyed by the resolved PGlite path; the first run on a machine
-  writes it. If PGlite refuses it, delete the file. A second PGlite on `5435` is the codex external database, cloned
-  from that cluster, built on first connect. `serve()` gives each PGlite session to one connection at a time, until that
-  connection's Terminate or a timeout. A DSN that must fail names a loopback port nobody listens on, never a hostname.
-  `request()` clears `rateLimitBuckets`; the limiter steps call `app.request` directly. **Do not split this file** while
-  the halves share one process (todo.md has the plan): `main.ts` reads `DATABASE_URL` from the shared env at import and
-  in the codex check, steps set and delete the Stripe and Resend keys, and both write `data/automerge`.
+- `main_test.ts` and `server_test.ts` — the server, in two halves of ordered `t.step`s (the cut is before the MCP step).
+  `main_harness.ts` holds the shared boot and helpers. Each half runs in its own OS process, because `main.ts` reads
+  `DATABASE_URL` from `Deno.env` at import and in the codex check, steps set and delete the Stripe and Resend keys, and
+  `--parallel` runs files as workers of one process. The task gives `server_test.ts` `DATABASE_URL` on `5436` with
+  `?max=1` (the gateway serves one PGlite session); `main_test.ts` keeps `5434`. Each half gets its own temp
+  `AUTOMERGE_DIR`, removed when the task ends, so tests never write the dev `data/automerge`. The harness reads its port
+  from `DATABASE_URL`; the codex PGlite is the port + 1 and a dead port is the port + 4 or + 5, so no half meets the
+  other's gateway. A step depends on the steps before it in its own file only. Run `server_test.ts` alone with
+  `DATABASE_URL` and a scratch `AUTOMERGE_DIR` set. `--filter` does not match step names. The empty cluster loads from
+  `data/pglite-<key>.tar`, keyed by the resolved PGlite path; the first run on a machine writes it. If PGlite refuses
+  it, delete the file. The codex database is cloned from that cluster, built on first connect. `serve()` gives each
+  PGlite session to one connection at a time, until that connection's Terminate or a timeout. A DSN that must fail names
+  a loopback port nobody listens on, never a hostname. `request()` clears `rateLimitBuckets`; the limiter steps call
+  `app.request` directly.
 - `examples_test.ts` — every bundled sheet through both engines (`npm:alasql`, `src/alasql.mjs`), row for row. Refuses a
   chart source with a repeated (series, x) pair.
 - `page_test.ts` — the table and the query sheet: render, sort, arrange, keyboard.
