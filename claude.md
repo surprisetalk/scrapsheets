@@ -38,8 +38,8 @@ is a shareable table, every sheet is an API.
 - `deno task test` — the whole suite. Never `deno test --allow-all`: only the task sets `JWT_SECRET`, `TOKEN_SECRET` and
   `DSN_ENCRYPTION_KEY`, and `main.ts` refuses to load without them. The task builds `dist` once, then runs three jobs at
   once: one type check, the `--parallel` run (without `server_test.ts`), and `server_test.ts` as its own process. It
-  fails if any job fails or the wall time passes ten seconds. Time one file with `deno test --allow-all <file>`. Check
-  `top` first: a build job on the machine makes every timing wrong.
+  fails if any job fails or, outside CI, the wall time passes ten seconds. Time one file with
+  `deno test --allow-all <file>`. Check `top` first: a build job on the machine makes every timing wrong.
 - `deno task review` — elm-review. Keep it at zero suppressions. It and `elm_test.ts` run under `npx -p elm@0.19.2-0`,
   because elm.json pins 0.19.2 and Homebrew's `elm` is 0.19.3; a cached `elm-stuff` hides the mismatch.
 - `deno task status` — grade the deployed `GET /status`; exit nonzero below 1.0. snitch runs it every hour and mails the

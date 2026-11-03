@@ -13,12 +13,6 @@ here.
 Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature builds its recommended design, with
 `REVIEW:` notes for the owner.
 
-- [ ] The GitHub `test` workflow passes on its slow runner, as the local hook does.
-  1. Read the first run after the `setNoDelay` fix. Its flood steps must pass. If one still fails, reproduce it in a
-     `denoland/deno` container under `colima start --cpu 4`, never by loosening the assertion.
-  2. The jsdom and Elm files took about 20 s on the 4-core runner before any database step. If the 10 s gate is the only
-     failure, skip it when `CI` is set, behind a `REVIEW:` note: the pre-commit hook already enforces it on this Mac.
-
 - [ ] A peer's edit to the code of a query you have open reruns it in your page.
   1. Reproduce first in `sync_test.ts` with `realRepo` and `glue().link()`: open a settled query, edit its
      `data[0].code` from the linked repo, and wait with `until()` for the new answer. A run-17 breaker saw the editor

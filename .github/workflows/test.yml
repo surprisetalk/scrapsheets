@@ -37,6 +37,9 @@ jobs:
 
       # deno task test, not `deno test` -- the task is the one place the three
       # boot secrets are set, and main.ts refuses to load without them.
+      # CI skips the 10 s gate; GitHub's 4-core runner takes about 36 s
+      # with every test green. The pre-commit hook still holds it on this Mac.
+      # Alternative: a larger runner, which costs money and still may not reach 10 s.
       - name: Run all tests (including backend)
         run: deno task test
         env:
