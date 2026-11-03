@@ -217,6 +217,10 @@ export const boot = async () => {
     let queue: Promise<void> = Promise.resolve();
     (async () => {
       for await (const conn of listener) {
+        // Linux pairs Nagle on this side with delayed ACK on postgres.js's
+        // side: each query through the gateway stalls about 40 ms per round
+        // trip, 126 ms against 0.8 ms measured. macOS does not show it.
+        conn.setNoDelay(true);
         const db = await (typeof of === "function" ? of() : of);
         let held: Promise<void> | undefined;
         let release: () => void = () => {};
