@@ -13,12 +13,6 @@ here.
 Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature builds its recommended design, with
 `REVIEW:` notes for the owner.
 
-- [ ] A peer's edit to the code of a query you have open reruns it in your page.
-  1. Reproduce first in `sync_test.ts` with `realRepo` and `glue().link()`: open a settled query, edit its
-     `data[0].code` from the linked repo, and wait with `until()` for the new answer. A run-17 breaker saw the editor
-     and table stay stale, but only by hand.
-  2. If it fails, find why `queryDoc` misses that `change`, and fix it. If it passes, delete this entry.
-
 - [ ] A flood on one socket cannot evict another peer's cached role, and the test proves it.
   1. In `main_test.ts`'s websocket step, the cache flooder sends fewer lookups than the older fake entries ahead of the
      peer's, so `bound()` never reaches the peer and the assertion passes either way. Seed the cache so the peer's entry

@@ -1231,7 +1231,21 @@
             if (type === "query") runQuery(id, doc.data[0]);
             if (type === "chart" && chartQuery(doc.data?.[0])) runQuery(id, chartQuery(doc.data[0]));
             if (sheetHandle?.on) {
+              // Elm draws the editor's code as its child text, which a typed editor ignores. A peer's code lands
+              // here, only while the editor still shows the code from before the change, so a keystroke is never
+              // overwritten. REVIEW: The glue writes the editor. Alternative: `A.value` in Elm. Elm draws in the
+              // input event, before `docChanged` brings the code back, so each keystroke would put the old code
+              // back and move the cursor to the end.
+              let shownCode = doc.data?.[0]?.code;
               const onChange = (data) => {
+                const code = data.doc.data?.[0]?.code;
+                const editor = type === "query" ? document.getElementById("code") : null;
+                if (editor && typeof code === "string" && code !== shownCode && editor.value === shownCode) {
+                  const at = editor.selectionStart;
+                  editor.value = code;
+                  editor.selectionStart = editor.selectionEnd = Math.min(at, code.length);
+                }
+                shownCode = code;
                 app.ports.docChanged.send({
                   id: type + ":" + data.handle.documentId,
                   data,

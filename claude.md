@@ -635,6 +635,8 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   after its sheet closed follows nothing. Past `FOLLOW_MAX` (`src/page.mjs`) nothing is followed, and the refusal
   reaches `docErrored` after the answer lands. `selectDoc` takes off `watched` and the followed set before either early
   return, so the library and the shop listen to nothing.
+- The editor draws the code as the textarea's child text, never `A.value`. A peer's code reaches a typed editor through
+  the glue's `onChange`, only while the editor still shows the code from before the change (`shownCode`).
 - Completion: `completionTrigger`, `completionRef`, `completionAt`. Columns come through the `columnsFor` /
   `columnsLoaded` port, answered by running `describe @<ref>` in the page. A failed ref logs by name and caches an empty
   answer. `ColumnsLoad` recomputes the open list. The dropdown is `id="complete"`. A `{{` with no `}}` and no space

@@ -461,11 +461,20 @@ Deno.test({
 
     await page.click(page.all("tr").find((tr) => tr.getAttribute("title") === "new query:..."));
     const source = page.path();
+    const editor = () => page.all("#code")[0] as unknown as { value: string };
+    // A header cell draws the column's name, then its filter toggle.
+    const heads = () => page.all("td[role='columnheader']").map((td) => td.textContent?.replace("▽", "").trim()).join();
+    // Typed code makes the editor dirty. A peer's edit after that must still show in the editor and the table.
+    await page.type_(page.all("#code")[0], "select 7 as z");
+    // Its answer also puts the typed change before the peer's, so the two are not concurrent.
+    await until(page.settle, "the typed query's answer", () => heads() === "z" && page.all("tbody tr").length > 0);
     await edit(
       source,
       (d) => (d.data[0].code = "select 1 as a, 2 as b"),
       (d) => d.data[0].code === "select 1 as a, 2 as b",
     );
+    await until(page.settle, "the peer's query to answer", () => heads() === "a,b");
+    assertEquals(editor().value, "select 1 as a, 2 as b", "the editor shows the peer's code");
     readers = [{ ...reader, depends_on: source }];
 
     // The fork drops `b`, and `reader` reads it: the promote waits, naming it.
@@ -477,7 +486,7 @@ Deno.test({
     await until(
       page.settle,
       "the fork to answer with one column",
-      () => page.all("th").every((th) => !th.textContent?.includes("b")) && page.all("tbody tr").length > 0,
+      () => heads() === "a" && page.all("tbody tr").length > 0,
     );
     await page.click(button("promote"));
     await until(page.settle, "the warning", () => dialogs() > 0);
