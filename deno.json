@@ -1,4 +1,5 @@
 {
+  "lock": { "frozen": true },
   "nodeModulesDir": "none",
   "unstable": [
     "raw-imports"

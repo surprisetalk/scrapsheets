@@ -13,6 +13,12 @@ here.
 Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature builds its recommended design, with
 `REVIEW:` notes for the owner.
 
+- [ ] The suite stays under 10 s with another project's tests running on the Mac.
+  1. On 6 Nov, at load average 8 from another session's tests, `deno task test` took 10.0, 10.2, 11.3 and 15.7 s on four
+     of seven runs. Alone, the `--parallel` job took 9.3 s and `sync_test.ts` took 7.7 s.
+  2. Find the bottleneck first: time each jsdom file inside the parallel run, not alone. Then cut boots or split
+     `sync_test.ts`, keeping the `glue(` pairs even.
+
 - [ ] You branch a query, edit it freely, and merge it back, and you promote alert, chart and net-http sheets too.
   1. Branch with automerge `clone` of the source handle's document: store the clone as the fork's own document, so
      `merge` can carry both histories. A bundled source still takes the JSON copy.
