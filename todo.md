@@ -13,18 +13,6 @@ here.
 Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature builds its recommended design, with
 `REVIEW:` notes for the owner.
 
-- [ ] A flood on one socket cannot evict another peer's cached role, and the test proves it.
-  1. In `main_test.ts`'s websocket step, the cache flooder sends fewer lookups than the older fake entries ahead of the
-     peer's, so `bound()` never reaches the peer and the assertion passes either way. Seed the cache so the peer's entry
-     is next in line, and assert it survives.
-  2. Prove it by restoring the whole-cache clear by hand: the test must fail.
-
-- [ ] A table refuses a write that breaks a rule beyond one cell: a row-count range, a freshness bound, a reference.
-  1. Each rule is one `CHECK_KEYS` key, with `checkDecoder` kept equal.
-  2. Row-count range: a sheet-level `check` in `data[0]`, run in `POST /sheet/:id` and `write_cells` after `assertRoom`,
-     and in `editAdvice`.
-  3. Freshness bound and referential integrity wait on row identity (see the cell-note entry).
-
 - [ ] You branch a query, edit it freely, and merge it back, and you promote alert, chart and net-http sheets too.
   1. Branch with automerge `clone` of the source handle's document: store the clone as the fork's own document, so
      `merge` can carry both histories. A bundled source still takes the JSON copy.
@@ -45,10 +33,17 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
      `checkPivot()` has checked it.
 
 - [ ] You open a demo pipeline for your line of work, and it runs on live data.
-  1. Decided (you, 6 Nov): the municipal budget watchdog first, on a Socrata open-data portal (public JSON, no key).
-  2. Then the restaurant-group weekly P&L, fund 13F drift, the contractor WIP schedule, and the solo consultant's
+  1. Decided (you, 6 Nov): the municipal budget watchdog first, on a Socrata open-data portal (public JSON, no key). The
+     static half ships: `cityCheckbook` and the budget-burn queries in `src/examples.mjs`.
+  2. A bundled sheet cannot poll, since `pollNetOnce` reads only `sheet` rows. Have `seed()` write one public `net-http`
+     sheet, owned by the sentinel, polling a Socrata `resource/<id>.json` with `page_by: offset` and `mode: replace`.
+     Pick a dataset with monthly appropriation and spend by department.
+  3. Point the demo queries at that sheet, and check how the page resolves a public `@net-http:` ref (`sheets()`'s
+     loader); the server resolves it through `sheet()`.
+  4. The feed's liveness condition in `GET /status` then covers the demo with no new condition.
+  5. Then the restaurant-group weekly P&L, fund 13F drift, the contractor WIP schedule, and the solo consultant's
      business in six sheets.
-  3. Then by field: finance, health, legal, real estate, operations, commerce, civic, energy, go-to-market.
+  6. Then by field: finance, health, legal, real estate, operations, commerce, civic, energy, go-to-market.
 
 - [ ] You see timestamps in your own zone and numbers with your locale's separators, and a timestamp means the same
       instant to every reader.
@@ -80,6 +75,12 @@ Each entry below waits for a sheet that needs it. Tell me when one does.
 - [ ] A multi column takes its options from another sheet.
   1. `multi:@table:<id>.<column>`; the page draws that column's distinct values as the checkboxes.
   2. Decide first how `checkColumnTypes` learns the options on the server without a read per write.
+
+- [ ] A table refuses a write that breaks a rule beyond one cell: a row-count range, a freshness bound, a reference.
+  1. A table's `data[0]` is its column array, so a sheet-level check needs a root key, `check`, beside `type` and
+     `data`. A row-count min cannot hold, since deletes arrive over sync, which refuses nothing; a max repeats
+     `assertRoom` per sheet. Build it only for a sheet that needs one.
+  2. Freshness bound and referential integrity wait on row identity (see the cell-note entry).
 
 ### Types & validation
 

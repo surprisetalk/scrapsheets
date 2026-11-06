@@ -538,7 +538,10 @@ Deno.test(async function allTests(t) {
         "a connection is told the account bound, not its own, was the one it crossed",
       );
 
-      // Fill the cache with 2,000 older fakes, one real peer's role, and fakes to the bound.
+      // Fill an empty cache to the bound: 2,000 fakes, one real peer's role, then fakes. The flood's k lookups must
+      // evict exactly the k oldest fakes. A whole-cache clear, or an eviction of the newest, fails below. The
+      // entries of earlier steps go first, or they would be the oldest and the flood would never reach a fake.
+      syncAccessCache.clear();
       const fakes: string[] = [];
       const fake = () => {
         const key = `fake-${fakes.length}/doc`;
@@ -580,7 +583,14 @@ Deno.test(async function allTests(t) {
       }
       for (let i = 0; i < 2000 && !shut; i++) await new Promise((r) => setTimeout(r, 5));
       assert(shut, "Expected the cache flooder to close within 10s; it stayed open.");
-      assert(syncAccessCache.size <= 10_000, `cache holds ${syncAccessCache.size} entries`);
+      assertEquals(syncAccessCache.size, 10_000, "a flood fills the cache to its bound and no further");
+      const k = fakes.filter((key) => !syncAccessCache.has(key)).length;
+      assert(k > 0 && k < 2000, `the flood evicted ${k} fakes, expected between 1 and the 2,000 ahead of the peer`);
+      assert(
+        fakes.slice(0, k).every((key) => !syncAccessCache.has(key)) &&
+          fakes.slice(k).every((key) => syncAccessCache.has(key)),
+        `the ${k} evicted fakes are the ${k} oldest`,
+      );
       assert(syncAccessCache.has(peerKey), "a flood evicted another peer's cached role");
       for (const key of [...fakes, peerKey]) syncAccessCache.delete(key);
     }
