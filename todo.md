@@ -13,6 +13,19 @@ here.
 Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature builds its recommended design, with
 `REVIEW:` notes for the owner.
 
+- [ ] CI fails when `deno.lock` holds a package with a known advisory, and today's 14 are gone.
+  1. Add a `deno audit` step to `.github/workflows/test.yml`. Dependabot cannot read `deno.lock`; its 21 open alerts
+     cite a `package-lock.json` deleted in `9fa279b`.
+  2. xlsx 0.18.5 (prototype pollution, ReDoS): move to SheetJS's fixed build, published only on `cdn.sheetjs.com`, not
+     npm. Keep it write-only.
+  3. automerge-repo-storage-nodefs pulls rimraf, then glob, minimatch 9 and brace-expansion 2 (5 advisories). Bump when
+     a stable automerge-repo drops rimraf, or replace its `rimraf(dirPath)` with `Deno.remove(path, { recursive })`.
+  4. alasql's optional `react-native-fs` pulls react-native, then shell-quote and image-size. Stop Deno installing it,
+     or drop the dependency.
+  5. uuid 9.0.1 under automerge-repo, and minimatch 3 and brace-expansion 1 under elm-review: bump, or list each in an
+     audit ignore with its reason (v4 only; our own patterns).
+  6. Dismiss the 21 Dependabot alerts as inaccurate (needs `gh api -X PATCH` allowed).
+
 - [ ] A peer's edit to the code of a query you have open reruns it in your page.
   1. Reproduce first in `sync_test.ts` with `realRepo` and `glue().link()`: open a settled query, edit its
      `data[0].code` from the linked repo, and wait with `until()` for the new answer. A run-17 breaker saw the editor
