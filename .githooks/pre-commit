@@ -4,5 +4,6 @@ set -e
 deno fmt --check
 deno lint
 deno check main.ts
+timeout 30 deno audit
 deno task review
 deno task test

@@ -13,19 +13,6 @@ here.
 Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature builds its recommended design, with
 `REVIEW:` notes for the owner.
 
-- [ ] CI fails when `deno.lock` holds a package with a known advisory, and today's 14 are gone.
-  1. Add a `deno audit` step to `.github/workflows/test.yml`. Dependabot cannot read `deno.lock`; its 21 open alerts
-     cite a `package-lock.json` deleted in `9fa279b`.
-  2. xlsx 0.18.5 (prototype pollution, ReDoS): move to SheetJS's fixed build, published only on `cdn.sheetjs.com`, not
-     npm. Keep it write-only.
-  3. automerge-repo-storage-nodefs pulls rimraf, then glob, minimatch 9 and brace-expansion 2 (5 advisories). Bump when
-     a stable automerge-repo drops rimraf, or replace its `rimraf(dirPath)` with `Deno.remove(path, { recursive })`.
-  4. alasql's optional `react-native-fs` pulls react-native, then shell-quote and image-size. Stop Deno installing it,
-     or drop the dependency.
-  5. uuid 9.0.1 under automerge-repo, and minimatch 3 and brace-expansion 1 under elm-review: bump, or list each in an
-     audit ignore with its reason (v4 only; our own patterns).
-  6. Dismiss the 21 Dependabot alerts as inaccurate (needs `gh api -X PATCH` allowed).
-
 - [ ] A peer's edit to the code of a query you have open reruns it in your page.
   1. Reproduce first in `sync_test.ts` with `realRepo` and `glue().link()`: open a settled query, edit its
      `data[0].code` from the linked repo, and wait with `until()` for the new answer. A run-17 breaker saw the editor
@@ -38,23 +25,11 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
      is next in line, and assert it survives.
   2. Prove it by restoring the whole-cache clear by hand: the test must fail.
 
-- [ ] You write a snippet that takes arguments, like `{{f(x)}}`.
-  1. Wait for a real snippet that needs one.
-  2. Parse `{{name(a, b)}}` in `expand()`, split on top-level commas outside strings, bounded by `SNIPPET_ARGS_MAX`.
-  3. A third column `args` names the parameters; a call with another count is refused, naming both counts.
-  4. Substitute each parameter as a whole word outside strings, each argument in parentheses, before the recursive
-     expand. Completion inserts `name(` for a snippet with `args`.
-
 - [ ] A table refuses a write that breaks a rule beyond one cell: a row-count range, a freshness bound, a reference.
   1. Each rule is one `CHECK_KEYS` key, with `checkDecoder` kept equal.
   2. Row-count range: a sheet-level `check` in `data[0]`, run in `POST /sheet/:id` and `write_cells` after `assertRoom`,
      and in `editAdvice`.
   3. Freshness bound and referential integrity wait on row identity (see the cell-note entry).
-
-- [ ] A multi column takes its options from another sheet.
-  1. Wait for a sheet that needs it.
-  2. `multi:@table:<id>.<column>`; the page draws that column's distinct values as the checkboxes.
-  3. Decide first how `checkColumnTypes` learns the options on the server without a read per write.
 
 - [ ] You branch a query, edit it freely, and merge it back, and you promote alert, chart and net-http sheets too.
   1. Branch with automerge `clone` of the source handle's document: store the clone as the fork's own document, so
@@ -75,16 +50,17 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
   1. A pivot panel (row, column and value columns) over the same `subtotalGroups` fold. AlaSQL's `pivot` is correct once
      `checkPivot()` has checked it.
 
----
-
-## Blocked on you
-
-### Query engine
+- [ ] You open a demo pipeline for your line of work, and it runs on live data.
+  1. Decided (you, 6 Nov): the municipal budget watchdog first, on a Socrata open-data portal (public JSON, no key).
+  2. Then the restaurant-group weekly P&L, fund 13F drift, the contractor WIP schedule, and the solo consultant's
+     business in six sheets.
+  3. Then by field: finance, health, legal, real estate, operations, commerce, civic, energy, go-to-market.
 
 - [ ] You see timestamps in your own zone and numbers with your locale's separators, and a timestamp means the same
       instant to every reader.
-  1. Decide first: the zone and the locale are per-user settings, and no per-user settings row exists. That means a
-     `schema/db.sql` change, applied in the order `claude.md` gives.
+  1. Decided (you, 6 Nov): two nullable columns, `usr.zone` (IANA name) and `usr.locale` (BCP 47). A null reads as UTC
+     and `en-US`. Alternative: a `usr_setting` table; it adds a noun before a third setting exists. You run `db:apply`
+     before the deploy.
   2. Store UTC. Make `date`, `time`, `datetime` and `timestamptz` four types in `COLUMN_TYPES`, with the three
      language-boundary copies.
   3. Render in the viewer's zone, read from that setting, never from the browser's guess. Do the arithmetic through
@@ -92,6 +68,24 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
   4. Read the locale where `formatNumber` reads the format, so the cell, the stats row and the totals row change
      together. Today the separator is always `,` and the point is always `.`.
   5. Add a custom mask only after a second real use asks for one.
+
+---
+
+## Blocked on you
+
+### Waits on a real use
+
+Each entry below waits for a sheet that needs it. Tell me when one does.
+
+- [ ] You write a snippet that takes arguments, like `{{f(x)}}`.
+  1. Parse `{{name(a, b)}}` in `expand()`, split on top-level commas outside strings, bounded by `SNIPPET_ARGS_MAX`.
+  2. A third column `args` names the parameters; a call with another count is refused, naming both counts.
+  3. Substitute each parameter as a whole word outside strings, each argument in parentheses, before the recursive
+     expand. Completion inserts `name(` for a snippet with `args`.
+
+- [ ] A multi column takes its options from another sheet.
+  1. `multi:@table:<id>.<column>`; the page draws that column's distinct values as the checkboxes.
+  2. Decide first how `checkColumnTypes` learns the options on the server without a read per write.
 
 ### Types & validation
 
@@ -167,8 +161,8 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
   5. Bidirectional sync reads the same definition in the other direction, and waits on the actions item.
 
 - [ ] You poll an XLSX or a PDF and get rows, not one cell.
-  1. XLSX is blocked by the pin. `npm:xlsx@0.18.5` is the last SheetJS version on npm. Decide first: a newer SheetJS
-     from the vendor's registry, or a different reader. Do not call `XLSX.read` on the pinned version.
+  1. XLSX: SheetJS 0.20.3 carries no known advisory, so `XLSX.read` is now allowed. Decide first how a workbook with
+     many sheets picks one, like `rows_path`.
   2. PDF: a PDF whose tables a converter turns into HTML reads through `htmlDelimited()`. A scanned PDF does not.
 
 - [ ] You post a form, forward an email or send a text, and it becomes a row.
@@ -192,9 +186,9 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
 ### Alerts
 
 - [ ] An alert reaches your phone.
-  1. Web push first. Decide the signing library, and spike it: `npm:web-push` has a reported Deno failure;
-     `jsr:@negrel/webpush` sends around `safeFetch`; `web-push-neo` exposes the request details so `safeFetch` can send
-     them (the suggestion).
+  1. Waits (you, 6 Nov): build only once you can set VAPID keys in Deno Deploy, so status does not sit red. Web push
+     first. Decide the signing library, and spike it: `npm:web-push` has a reported Deno failure; `jsr:@negrel/webpush`
+     sends around `safeFetch`; `web-push-neo` exposes the request details so `safeFetch` can send them (the suggestion).
   2. Subscriptions are a new `schema/db.sql` table (`usr_id`, unique `endpoint`, `p256dh`, `auth`, `failures`), pruned
      on a 404 or 410. Allowlist the push services' hosts as well as `safeFetch`.
   3. VAPID keys are server environment variables you set in production. Missing keys follow the `RESEND_API_KEY`
@@ -310,11 +304,3 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
   3. Chunked execution on the server past the cap, with the page reading pages of the result.
   4. Document size limits, compaction and history pruning. Columnar storage for bulk data, and cold row archiving.
   5. Per-sheet metering (rows, bytes, compute, fetches), visible before a limit hits.
-
-### Demo gallery
-
-- [ ] You open a demo pipeline for your line of work, and it runs on live data.
-  1. Decide first which flagship to connect first. Every unbuilt demo dies at its feed.
-  2. Flagships: the restaurant-group weekly P&L, fund 13F drift, the contractor WIP schedule, the municipal budget
-     watchdog, and the solo consultant's business in six sheets.
-  3. Then by field: finance, health, legal, real estate, operations, commerce, civic, energy, go-to-market.

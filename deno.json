@@ -1,4 +1,5 @@
 {
+  "nodeModulesDir": "none",
   "unstable": [
     "raw-imports"
   ],
@@ -71,10 +72,8 @@
     "croner": "npm:croner@10.0.1",
     "elm": "npm:elm@0.19.2-0",
     "elm-format": "npm:elm-format@^0.8.8",
-    "elm-review": "npm:elm-review@^2.13.5",
-    "elm-test": "npm:elm-test@0.19.2-0",
     "pg-gateway": "npm:pg-gateway@^0.3.0-beta.4",
     "stripe": "npm:stripe@22.5.0",
-    "xlsx": "npm:xlsx@0.18.5"
+    "xlsx": "npm:@e965/xlsx@0.20.3"
   }
 }

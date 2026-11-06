@@ -30,6 +30,7 @@ is a shareable table, every sheet is an API.
 | `examples.sql`     | Shop catalogue of query templates, applied by `seed()` on first request                     |
 | `vendor.ts`        | Rebuilds the vendored browser bundles in `src/` (automerge, automerge-repo, alasql)         |
 | `deno.json`        | Tasks, dependencies, import map                                                             |
+| `package.json`     | npm `overrides` only, so `deno audit` passes. No dependencies, no scripts                   |
 
 ## Commands
 
@@ -44,6 +45,8 @@ is a shareable table, every sheet is an API.
   because elm.json pins 0.19.2 and Homebrew's `elm` is 0.19.3; a cached `elm-stuff` hides the mismatch.
 - `deno task status` — grade the deployed `GET /status`; exit nonzero below 1.0. snitch runs it every hour and mails the
   result each morning.
+- `deno audit` — CI and the pre-commit hook fail on an advisory against `deno.lock`. A fix that is a transitive version
+  goes in `package.json`'s `overrides`, then the lock is regenerated.
 - `deno task vendor` — rebuild the browser bundles after you bump the versions at the top of `vendor.ts`.
 - `deno task db:plan` / `db:apply` — read the generated migration, then apply it. **Check `.env` first: `DATABASE_URL`
   may point at production.** `db:apply` does not prompt. It allows only `INDEX_BUILD,INDEX_DROPPED`. For a migration
@@ -374,13 +377,13 @@ One file on purpose; the header comment says why. The `// ---` sections, in file
   Spends `webhooks`. `WEBHOOK_FAILS_MAX` failures disable a hook, which fails `GET /status`. `WEBHOOK_FLUSH_MAX` bounds
   a flush. Owner or editor only.
 - Exports: `GET /export/:id.{csv,json,ndjson,md,ics,xlsx,parquet}` is one route over `EXPORTS`; add a format by adding a
-  row. xlsx: `npm:xlsx@0.18.5`, **write only, never read**. `xlsxCell` types by `canonicalType`, `XLSX_FORMATS` per
-  column (a duration as a day fraction under `[h]:mm:ss`, a negative one as text; a `bps` as the percent it equals under
-  `0.00%`; a `ratio` under `General":1"`, which SheetJS's own formatter draws without the `:1`), width bounded by
-  `XLSX_WIDTH_MAX`, dates through `dateMs()` as UTC, a value past `XLSX_CELL_MAX` refused by place and length, the sheet
-  name cut to `XLSX_NAME_MAX`. Parquet: `npm:hyparquet-writer`, built off `named()`. `PARQUET_TYPES` through
-  `canonicalType`; `parquetColumn()` writes a column whole as STRING when any value does not fit. `exportRows()` is the
-  one read both export routes share.
+  row. xlsx: SheetJS 0.20.3 through `npm:@e965/xlsx` (see the `REVIEW:` note above its import), **write only, never
+  read**. `xlsxCell` types by `canonicalType`, `XLSX_FORMATS` per column (a duration as a day fraction under
+  `[h]:mm:ss`, a negative one as text; a `bps` as the percent it equals under `0.00%`; a `ratio` under `General":1"`,
+  which SheetJS's own formatter draws without the `:1`), width bounded by `XLSX_WIDTH_MAX`, dates through `dateMs()` as
+  UTC, a value past `XLSX_CELL_MAX` refused by place and length, the sheet name cut to `XLSX_NAME_MAX`. Parquet:
+  `npm:hyparquet-writer`, built off `named()`. `PARQUET_TYPES` through `canonicalType`; `parquetColumn()` writes a
+  column whole as STRING when any value does not fit. `exportRows()` is the one read both export routes share.
 - Workspace: `GET /library.zip` is every sheet the caller owns (`sheet_usr.role = 'owner'`), less `codex-*` and the
   computed net-hook sheets, bounded by `USER_SHEETS_MAX`, as one stored zip. A table is `table/<doc_id>.csv`, byte-equal
   to its `.csv` export, one spend on its own budget. Any other sheet is `<type>/<doc_id>.json`, its `data[0]`, read

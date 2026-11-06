@@ -28,6 +28,11 @@ jobs:
       - name: Type check
         run: deno check main.ts
 
+      # Dependabot cannot read deno.lock. This step fails on any advisory
+      # against a locked npm package.
+      - name: Audit dependencies
+        run: deno audit
+
       # elm-review shells out to `elm`, which the runner lacks; the deno shim
       # downloads the same 0.19.2-0 binary that `deno task build` uses.
       - name: Elm review

@@ -81,6 +81,9 @@ import {
 import Stripe from "stripe";
 // Written with, never read with: every advisory SheetJS carries is in its
 // parsers, and no route here calls one.
+// REVIEW: SheetJS 0.20.3 from `npm:@e965/xlsx`, a republish whose code files match cdn.sheetjs.com's tarball byte for
+// byte; the exact pin and deno.lock's hash hold it there. Alternative: import cdn.sheetjs.com's xlsx.mjs by URL. It
+// needs `--allow-import` on every `deno check`, and Deno Deploy's build may refuse it.
 import * as XLSX from "xlsx";
 // Parquet both ways, out of one pair: hyparquet-writer depends on exactly this
 // hyparquet, so one copy loads. Pure JS with snappy built in, so there is no

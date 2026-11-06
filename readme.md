@@ -270,3 +270,17 @@ events), example queries that join them with `@sheet_id` refs, seven live portal
 <!--
 templates/pages/portals <- queries. pages can't reference anything, agents can reference pages but not queries, and queries can reference pages and agents (but not queries).
 --->
+
+## Pending design
+
+- `package.json` holds only npm `overrides`:
+
+  ```json
+  { "react-native-fs": "npm:empty-npm-package@1.0.0", "glob": "14.0.3", "uuid": "11.1.1" }
+  ```
+
+  alasql's optional `react-native-fs` pulled in react-native, shell-quote and image-size, and nothing in Deno loads
+  them. rimraf 5 under the automerge nodefs adapter calls only `glob` and `globSync`, and glob 14 keeps both.
+  automerge-repo calls only uuid's `v4`. `deno.json` sets `nodeModulesDir: "none"`, because a `package.json` alone makes
+  Deno want a `node_modules`. Alternative: `deno audit --ignore` for each advisory, with a reason. It keeps the
+  vulnerable code in the lock, and each ignore is a promise that someone has to check again on every bump.
