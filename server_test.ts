@@ -3108,6 +3108,21 @@ Deno.test(async function allTests(t) {
       const insideSaid = await inside.text();
       assertEquals(inside.status, 400, `a private address is refused before it is dialled: ${insideSaid}`);
       assert(insideSaid.includes("inside this server's own network"), insideSaid);
+      // pc's shape: the app database on a unix socket, which names no host.
+      // Every TCP address is then somebody else's, and loopback is pc's own.
+      Deno.env.set("DATABASE_URL", "postgres:///scrapsheets");
+      await post(jwt, `/codex-db/${doc_id}`, { dsn: `postgresql://postgres@127.0.0.1:${DB_PORT}/postgres` });
+      const socketed = await read();
+      const socketedSaid = await socketed.text();
+      assertEquals(socketed.status, 400, `loopback is refused beside a socket database: ${socketedSaid}`);
+      assert(socketedSaid.includes("inside this server's own network"), socketedSaid);
+      // The dialer reads 2130706433 as 127.0.0.1, and postgres.js reads a comma
+      // as a list of hosts, the first of which is loopback.
+      for (const host of ["2130706433", "127.0.0.1,example.com"]) {
+        await post(jwt, `/codex-db/${doc_id}`, { dsn: `postgresql://postgres@${host}:${DB_PORT}/postgres` });
+        const spelledInside = await read();
+        assertEquals(spelledInside.status, 400, `${host} is refused: ${await spelledInside.text()}`);
+      }
     } finally {
       if (was === undefined) Deno.env.delete("DATABASE_URL");
       else Deno.env.set("DATABASE_URL", was);

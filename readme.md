@@ -35,7 +35,7 @@ body='{"hello":"world"}'
 path="/net/$sheet_id"
 t=$(date +%s)
 sig=$(printf '%s\n%s\n%s' "$t" "$path" "$body" | openssl dgst -sha256 -hmac "$secret" -r | cut -d' ' -f1)
-curl -X POST "https://api.sheets.scrap.land$path" -H 'Content-Type: application/json' \
+curl -X POST "https://sheets-api.scrap.land$path" -H 'Content-Type: application/json' \
   -H "scrapsheets-signature: t=$t,v2=$sig" -d "$body"
 ```
 
@@ -91,7 +91,7 @@ account: it lists, reads, queries and (with the writing key) writes that one she
 an MCP resource (`sheet://<sheet_id>`, the same csv the export answers) and a `describe_sheet` prompt.
 
 ```sh
-curl -X POST "https://api.sheets.scrap.land/sheet/$sheet_id" -H "scrapsheets-key: $key" \
+curl -X POST "https://sheets-api.scrap.land/sheet/$sheet_id" -H "scrapsheets-key: $key" \
   -H 'Content-Type: application/json' -d '{"rows":[{"city":"Oslo","population":709037}]}'
 ```
 
@@ -284,3 +284,19 @@ templates/pages/portals <- queries. pages can't reference anything, agents can r
   automerge-repo calls only uuid's `v4`. `deno.json` sets `nodeModulesDir: "none"`, because a `package.json` alone makes
   Deno want a `node_modules`. Alternative: `deno audit --ignore` for each advisory, with a reason. It keeps the
   vulnerable code in the lock, and each ignore is a promise that someone has to check again on every bump.
+
+- The API runs on pc at `sheets-api.scrap.land`:
+
+  ```sh
+  curl https://sheets-api.scrap.land/status   # pc's scrapsheets unit, through the Cloudflare tunnel
+  ```
+
+  The tunnel needs a Cloudflare-proxied name, and the free certificate covers one label under `scrap.land`. So the API
+  left `api.sheets.scrap.land`. Alternative: keep that name with Advanced Certificate Manager. It costs about $10 a
+  month, and todo.md holds it until it pays.
+
+- The `scrapsheets` unit drops every packet to loopback, the LAN, the tailnet and link-local (`IPAddressDeny` in
+  `/etc/nixos/flake.nix`). It reaches Postgres on its socket, and the tunnel reaches it on `/run/scrapsheets/web.sock`.
+  `safeFetch` and the codex guard check a host by DNS, then connect by name, so a name that rebinds between the two
+  could reach pc's own services. The fence stops it in the kernel. Alternative: connect to the address the check
+  resolved. Deno's `fetch` cannot pin an address, and a pinned TLS connection needs the name for SNI.

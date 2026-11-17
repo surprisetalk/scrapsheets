@@ -83,7 +83,7 @@ import Stripe from "stripe";
 // parsers, and no route here calls one.
 // REVIEW: SheetJS 0.20.3 from `npm:@e965/xlsx`, a republish whose code files match cdn.sheetjs.com's tarball byte for
 // byte; the exact pin and deno.lock's hash hold it there. Alternative: import cdn.sheetjs.com's xlsx.mjs by URL. It
-// needs `--allow-import` on every `deno check`, and Deno Deploy's build may refuse it.
+// needs `--allow-import` on every `deno check` and on `deno task serve`.
 import * as XLSX from "xlsx";
 // Parquet both ways, out of one pair: hyparquet-writer depends on exactly this
 // hyparquet, so one copy loads. Pure JS with snappy built in, so there is no
@@ -2340,15 +2340,13 @@ const STATUS_AGO = [0, 3600, 86400];
 
 // The numbers each condition's sentence quotes. They are read into the sentence
 // rather than typed into it twice, so a changed limit cannot leave a sentence
-// claiming the old one. DB_BYTES_CAP is Neon's free-tier ceiling and
-// HEAP_BYTES_CAP the heap a Deno Deploy isolate gets: both live outside this
-// code, which is why they are written down rather than derived.
-// 250, not 100: a select 1 from Deno Deploy to Neon is ~98ms of network before
-// the database does anything, so a 100ms bar sat 2ms inside its own threshold
-// and failed one run in four on jitter alone. An alarm that fires every hour
-// with nothing wrong is one that gets muted, and it takes every real condition
-// with it. At 250 the condition means the database is degraded -- a saturated
-// pool, a cold start, a query queue -- rather than a slow packet.
+// claiming the old one. DB_BYTES_CAP bounds this database's share of pc's
+// disk, and HEAP_BYTES_CAP sits under the `scrapsheets` unit's MemoryMax in
+// /etc/nixos/flake.nix: both live outside this code, which is why they are
+// written down rather than derived.
+// 250, not 100: at 100 a hosted database's network jitter alone failed one run
+// in four. On pc's socket a select 1 is under a millisecond, so 250 means the
+// database is degraded -- a saturated pool, a query queue -- not a slow packet.
 const LATENCY_MS = 250;
 const REFUSALS_MAX = 20;
 // One open report fails the grade; this many is total failure.
@@ -2395,13 +2393,10 @@ export const status = async (): Promise<Record<string, Record<string, number>>> 
   // A round trip, not a workload: timing the aggregates below would grade the
   // heaviest statement in the file as "a query".
   //
-  // The first one is thrown away. An isolate that has just started pays TCP,
-  // TLS and auth on it, and a Neon instance that has suspended pays its own
-  // wake-up -- about a second against 98ms warm. Timing that graded how cold
-  // the caller was, not how fast the database answers, and since nothing keeps
-  // a scheduled check warm it failed nearly every scheduled run. Connection
-  // setup is a different failure mode, and the endpoint timing out is where it
-  // already shows.
+  // The first one is thrown away: a pool that has just started pays connection
+  // setup and auth on it. Timing that graded how cold the caller was, not how
+  // fast the database answers. Connection setup is a different failure mode,
+  // and the endpoint timing out is where it already shows.
   await sql`select 1`;
   const started = Date.now();
   await sql`select 1`;
@@ -10036,9 +10031,11 @@ const canonicalHost = (hostname: string, port: string): string | null => {
  *
  * The host is checked the way safeFetch checks a url's, by literal address and
  * by every address its name resolves to, on a server whose own database is
- * somewhere else. A server whose own database is on loopback is a developer's
- * machine -- this suite's, or a laptop -- and its network is the developer's
- * own; there the only refusal is this server's own database. */
+ * somewhere else. A server whose own database is on TCP loopback is a
+ * developer's machine -- this suite's, or a laptop -- and its network is the
+ * developer's own; there the only refusal is this server's own database.
+ * Production on pc reaches its database on a unix socket (`postgres:///db`
+ * with PGHOST), which names no host, so every DSN there gets the full check. */
 const checkCodexDsn = async (dsn: string, sheet_id: string): Promise<void> => {
   const appDbUrl = Deno.env.get("DATABASE_URL") ?? "postgresql://postgres@127.0.0.1:5434/postgres";
   const app_ = URL.parse(appDbUrl);
@@ -10055,12 +10052,17 @@ const checkCodexDsn = async (dsn: string, sheet_id: string): Promise<void> => {
     });
   }
   const blockedHosts = ["localhost", "127.0.0.1", "0.0.0.0", "::1"];
-  const appHostCanon = canonicalHost(app_.hostname, app_.port);
+  const appHostCanon = app_.hostname === "" ? "" : canonicalHost(app_.hostname, app_.port);
   const extHostCanon = canonicalHost(ext.hostname, ext.port);
-  if (!appHostCanon) throw new Error(`Expected DATABASE_URL to name a host, received ${show(app_.hostname)}.`);
-  if (!extHostCanon) {
+  if (appHostCanon === null) {
+    throw new Error(
+      `Expected DATABASE_URL to name a host, or none for a unix socket, received ${show(app_.hostname)}.`,
+    );
+  }
+  // A comma is a host list to postgres.js, and the guard below checks one host.
+  if (!extHostCanon || extHostCanon.includes(",")) {
     bad(400, `That connection string's host will not parse.`, {
-      Expected: "a hostname or an IP address",
+      Expected: "one hostname or IP address",
       Received: show(ext.hostname),
       Source: source,
       Fix: "re-save it as postgresql://user:password@host:port/database",
@@ -10076,7 +10078,9 @@ const checkCodexDsn = async (dsn: string, sheet_id: string): Promise<void> => {
       Fix: "point it at an external database",
     });
   }
-  if (!ipBlocked(appHost)) await assertPublicHost(ext.hostname, "connection string", source);
+  // The canonical spelling, not ext.hostname: postgres: hosts stay raw, and
+  // ipBlocked does not read 2130706433 as the 127.0.0.1 the dialer opens.
+  if (!ipBlocked(appHost)) await assertPublicHost(extHostCanon, "connection string", source);
 };
 
 /** The one connection this server opens into somebody else's database, for

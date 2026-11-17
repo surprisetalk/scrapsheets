@@ -43,14 +43,19 @@ is a shareable table, every sheet is an API.
   `deno test --allow-all <file>`. Check `top` first: a build job on the machine makes every timing wrong.
 - `deno task review` — elm-review. Keep it at zero suppressions. It and `elm_test.ts` run under `npx -p elm@0.19.2-0`,
   because elm.json pins 0.19.2 and Homebrew's `elm` is 0.19.3; a cached `elm-stuff` hides the mismatch.
+- `deno task serve` — production, on pc: the `scrapsheets` unit in `/etc/nixos/flake.nix` runs it from this clone,
+  fenced off pc's network, on the socket `/run/scrapsheets/web.sock` that the Cloudflare tunnel reaches. A change to
+  `.git/logs/HEAD` (a commit) restarts it. Documents live in `data/automerge`, and `data/nightly.dump` is the nightly
+  `pg_dump`.
 - `deno task status` — grade the deployed `GET /status`; exit nonzero below 1.0. snitch runs it every hour and mails the
   result each morning.
 - `deno audit` — CI and the pre-commit hook fail on an advisory against `deno.lock`. A fix that is a transitive version
   goes in `package.json`'s `overrides`, then the lock is regenerated.
 - `deno task vendor` — rebuild the browser bundles after you bump the versions at the top of `vendor.ts`.
-- `deno task db:plan` / `db:apply` — read the generated migration, then apply it. **Check `.env` first: `DATABASE_URL`
-  may point at production.** `db:apply` does not prompt. It allows only `INDEX_BUILD,INDEX_DROPPED`. For a migration
-  with another hazard, run `pg-schema-diff apply` by hand with that one hazard added. Do not widen the task.
+- `deno task db:plan` / `db:apply` — read the generated migration, then apply it. **On pc, `.env` is production's:
+  `DATABASE_URL` is the `scrapsheets` database.** `db:apply` does not prompt. It allows only
+  `INDEX_BUILD,INDEX_DROPPED`. For a migration with another hazard, run `pg-schema-diff apply` by hand with that one
+  hazard added. Do not widen the task.
 - `deno run -A npm:elm-format --yes src/Main.elm` — format Elm.
 - Watch: `watch src { try { cp -vu src/* dist ; elm make src/Main.elm --debug --output=dist/index.js } }`
 

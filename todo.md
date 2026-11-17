@@ -6,15 +6,6 @@ A queue, not a history. Each item is a capability someone gains, then the steps 
 delete it: `claude.md` describes what shipped. A goal that is not code is a condition in `GET /status`, not an item
 here.
 
-- [ ] api.sheets.scrap.land runs on pc against pc Postgres, so Neon and Deno Deploy bill nothing for it (tasks todo.md,
-      Neon and Deno Deploy entries, 17 Nov).
-  1. Read where api.sheets.scrap.land runs now (Deno Deploy is the likely host: the VAPID step names it) and which Neon
-     project it reads.
-  2. Dump that Neon project, restore it into pc Postgres, and run the server on pc as a NixOS unit with its env in a
-     mode-0600 file.
-  3. Point the domain at pc through the Cloudflare tunnel, then check `deno task status` against production.
-  4. Then delete the old deployment and the Neon project.
-
 ---
 
 ## Ready
@@ -22,7 +13,9 @@ here.
 Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature builds its recommended design, with
 `REVIEW:` notes for the owner.
 
-- [ ] The suite stays under 10 s with another project's tests running on the Mac.
+- [ ] The suite stays under 10 s with another project's tests running on the Mac or on pc.
+  - Fact (17 Nov): on pc, with only the idle-class dirt-farm running, `deno task test` took 16.8 and 17.0 s, all green.
+    This gate holds back `jj push` of the sheets-api.scrap.land rename, so the frontend still calls Deno Deploy.
   1. On 6 Nov, at load average 8 from another session's tests, `deno task test` took 10.0, 10.2, 11.3 and 15.7 s on four
      of seven runs. Alone, the `--parallel` job took 9.3 s and `sync_test.ts` took 7.7 s.
   2. Find the bottleneck first: time each jsdom file inside the parallel run, not alone. Then cut boots or split
@@ -76,6 +69,25 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
 ---
 
 ## Blocked on you
+
+- [ ] Email, payments and the error-log grant work on pc as they did on Deno Deploy, and Neon and Deno Deploy bill
+      nothing (17 Nov).
+  - Fact (17 Nov): sheets-api.scrap.land is the `scrapsheets` unit on pc. Deno Deploy, on Neon, still serves the old
+    api.sheets.scrap.land, which nothing ships pointing at. You cannot read Deno Deploy's keys back out.
+  1. Blocker: make new keys and add them to pc's `~/Developer/scrapsheets/.env` (mode 0600): a Resend API key
+     (`RESEND_API_KEY`), a Stripe secret key (`STRIPE_SECRET_KEY`), and `OPERATOR_EMAIL`.
+  2. Blocker: in Stripe, point the webhook endpoint at `https://sheets-api.scrap.land/stripe`. Put its signing secret in
+     `.env` as `STRIPE_WEBHOOK_SECRET`. Then `sudo systemctl restart scrapsheets`.
+  3. Blocker (deleted data): delete the Deno Deploy project, then the Neon project `ep-soft-fog-aekyeqpn`.
+  4. Asked 2026-11-17.
+
+- [ ] The API answers at api.sheets.scrap.land again, through pc's tunnel.
+  - Cloudflare's free certificate covers `*.scrap.land`, one label deep. A second label needs Advanced Certificate
+    Manager, about $10/month.
+  1. Waits: you buy Advanced Certificate Manager once it makes economic sense.
+  2. Add `api.sheets.scrap.land` to the advanced pack beside `sheets.scrap.land`, then a proxied CNAME to
+     `5fbc95ea-fe6b-42a5-81d7-a038bea896d0.cfargotunnel.com` and an ingress line in `/etc/nixos/flake.nix`.
+  3. Then decide whether `API_BASE` moves back, or both names serve.
 
 ### Waits on a real use
 
@@ -163,7 +175,7 @@ Each entry below waits for a sheet that needs it. Tell me when one does.
 - [ ] You connect a feed behind OAuth, and a SaaS source without a code change.
   1. The OAuth authorization-code flow with automatic refresh, built on the secret store. The refresh token is a secret,
      and the access token is written back beside it, never into the document.
-  2. A static egress IP. Deno Deploy has none, so decide on a proxy before promising one.
+  2. A static egress IP. pc egresses from a home connection, so decide on a proxy before promising one.
   3. A `connector` sheet holds a definition: a name, one set of net-http fields per endpoint, and auth. Applying it
      writes the net-http documents it describes. `pollNetOnce` stays the one poller.
   4. Build Google Sheets, Airtable and Notion first, then the rest by how many demos each one unblocks: accounting,
@@ -196,13 +208,13 @@ Each entry below waits for a sheet that needs it. Tell me when one does.
 ### Alerts
 
 - [ ] An alert reaches your phone.
-  1. Waits (you, 6 Nov): build only once you can set VAPID keys in Deno Deploy, so status does not sit red. Web push
+  1. Waits (you, 6 Nov): build only once you can set VAPID keys in pc's `.env`, so status does not sit red. Web push
      first. Decide the signing library, and spike it: `npm:web-push` has a reported Deno failure; `jsr:@negrel/webpush`
      sends around `safeFetch`; `web-push-neo` exposes the request details so `safeFetch` can send them (the suggestion).
   2. Subscriptions are a new `schema/db.sql` table (`usr_id`, unique `endpoint`, `p256dh`, `auth`, `failures`), pruned
      on a 404 or 410. Allowlist the push services' hosts as well as `safeFetch`.
-  3. VAPID keys are server environment variables you set in production. Missing keys follow the `RESEND_API_KEY`
-     pattern. `to: push` means the alert owner's devices, and the run row writes `push`, never an endpoint.
+  3. VAPID keys go in pc's `.env`. Missing keys follow the `RESEND_API_KEY` pattern. `to: push` means the alert owner's
+     devices, and the run row writes `push`, never an endpoint.
   4. `src/sw.js` gains `push` and `notificationclick`. `clients` may join `BROWSER_GLOBALS`, and the `sync_test.ts`
      worker tests need `registration.showNotification` on their `self`.
   5. SMS needs a carrier account. It is a sender beside `sendAlertUrl`, picked by the destination.

@@ -212,7 +212,7 @@ export const mergeView = (data0, held) => {
 // The page cannot fetch a third-party URL directly: the browser will not allow
 // it. Anything that is not ours goes through the server's proxy, which is also
 // where the SSRF guard lives.
-export const API_BASE = "https://api.sheets.scrap.land";
+export const API_BASE = "https://sheets-api.scrap.land";
 
 /** Where a `from http(...)` call actually sends its request, and whether that
  * went through our proxy — which is what decides who to blame for a 4xx.
