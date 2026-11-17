@@ -15,7 +15,6 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
 
 - [ ] The suite stays under 10 s with another project's tests running on the Mac or on pc.
   - Fact (17 Nov): on pc, with only the idle-class dirt-farm running, `deno task test` took 16.8 and 17.0 s, all green.
-    This gate holds back `jj push` of the sheets-api.scrap.land rename, so the frontend still calls Deno Deploy.
   1. On 6 Nov, at load average 8 from another session's tests, `deno task test` took 10.0, 10.2, 11.3 and 15.7 s on four
      of seven runs. Alone, the `--parallel` job took 9.3 s and `sync_test.ts` took 7.7 s.
   2. Find the bottleneck first: time each jsdom file inside the parallel run, not alone. Then cut boots or split
@@ -70,15 +69,17 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
 
 ## Blocked on you
 
-- [ ] Email, payments and the error-log grant work on pc as they did on Deno Deploy, and Neon and Deno Deploy bill
-      nothing (17 Nov).
-  - Fact (17 Nov): sheets-api.scrap.land is the `scrapsheets` unit on pc. Deno Deploy, on Neon, still serves the old
-    api.sheets.scrap.land, which nothing ships pointing at. You cannot read Deno Deploy's keys back out.
-  1. Blocker: make new keys and add them to pc's `~/Developer/scrapsheets/.env` (mode 0600): a Resend API key
-     (`RESEND_API_KEY`), a Stripe secret key (`STRIPE_SECRET_KEY`), and `OPERATOR_EMAIL`.
-  2. Blocker: in Stripe, point the webhook endpoint at `https://sheets-api.scrap.land/stripe`. Put its signing secret in
-     `.env` as `STRIPE_WEBHOOK_SECRET`. Then `sudo systemctl restart scrapsheets`.
-  3. Blocker (deleted data): delete the Deno Deploy project, then the Neon project `ep-soft-fog-aekyeqpn`.
+- [ ] Email and the error-log grant work on pc as they did on Deno Deploy, and Neon and Deno Deploy bill nothing (17
+      Nov).
+  - Fact (17 Nov): the frontend calls sheets-api.scrap.land, which is the `scrapsheets` unit on pc. Deno Deploy, on
+    Neon, still serves the old api.sheets.scrap.land, which nothing calls now.
+  - Stripe waits (you, 17 Nov). Then point the webhook at `https://sheets-api.scrap.land/stripe`.
+  1. Blocker: you sign in to the Resend MCP (`/mcp`, "claude.ai Resend"). Then I make a key, put it in pc's `.env` as
+     `RESEND_API_KEY`, and restart `scrapsheets`.
+  2. Blocker: the auto-mode classifier refused a read of Neon with its credential. Allow it, or compare Neon's row
+     counts with pc's `scrapsheets` yourself. Rows after the 14:05 UTC dump that are not net-log rows move to pc first.
+  3. Then delete the Deno Deploy project, the Neon project `ep-soft-fog-aekyeqpn`, and the api.sheets.scrap.land CNAME
+     to alias.deno.net, which would dangle.
   4. Asked 2026-11-17.
 
 - [ ] The API answers at api.sheets.scrap.land again, through pc's tunnel.
