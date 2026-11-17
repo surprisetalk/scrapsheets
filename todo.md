@@ -6,6 +6,15 @@ A queue, not a history. Each item is a capability someone gains, then the steps 
 delete it: `claude.md` describes what shipped. A goal that is not code is a condition in `GET /status`, not an item
 here.
 
+- [ ] api.sheets.scrap.land runs on pc against pc Postgres, so Neon and Deno Deploy bill nothing for it (tasks todo.md,
+      Neon and Deno Deploy entries, 17 Nov).
+  1. Read where api.sheets.scrap.land runs now (Deno Deploy is the likely host: the VAPID step names it) and which Neon
+     project it reads.
+  2. Dump that Neon project, restore it into pc Postgres, and run the server on pc as a NixOS unit with its env in a
+     mode-0600 file.
+  3. Point the domain at pc through the Cloudflare tunnel, then check `deno task status` against production.
+  4. Then delete the old deployment and the Neon project.
+
 ---
 
 ## Ready
