@@ -69,18 +69,13 @@ Decision: scrapsheets is in the Platforms bucket (you, 31 Oct). Each feature bui
 
 ## Blocked on you
 
-- [ ] Email and the error-log grant work on pc as they did on Deno Deploy, and Neon and Deno Deploy bill nothing (17
-      Nov).
-  - Fact (17 Nov): the frontend calls sheets-api.scrap.land, which is the `scrapsheets` unit on pc. Deno Deploy, on
-    Neon, still serves the old api.sheets.scrap.land, which nothing calls now.
+- [ ] Neon bills nothing for scrapsheets (17 Nov).
+  - Fact (17 Nov): pc holds every Neon row. Neon's newest row is from 12:44 UTC, before the 14:05 dump, and the Deno
+    Deploy app that wrote to it is deleted.
   - Stripe waits (you, 17 Nov). Then point the webhook at `https://sheets-api.scrap.land/stripe`.
-  1. Blocker: you sign in to the Resend MCP (`/mcp`, "claude.ai Resend"). Then I make a key, put it in pc's `.env` as
-     `RESEND_API_KEY`, and restart `scrapsheets`.
-  2. Blocker: the auto-mode classifier refused a read of Neon with its credential. Allow it, or compare Neon's row
-     counts with pc's `scrapsheets` yourself. Rows after the 14:05 UTC dump that are not net-log rows move to pc first.
-  3. Then delete the Deno Deploy project, the Neon project `ep-soft-fog-aekyeqpn`, and the api.sheets.scrap.land CNAME
-     to alias.deno.net, which would dangle.
-  4. Asked 2026-11-17.
+  1. Blocker: delete the Neon project `ep-soft-fog-aekyeqpn` in the Neon console. No Neon API key is on pc, and the
+     classifier refused a search for one.
+  2. Asked 2026-11-17.
 
 - [ ] The API answers at api.sheets.scrap.land again, through pc's tunnel.
   - Cloudflare's free certificate covers `*.scrap.land`, one label deep. A second label needs Advanced Certificate
